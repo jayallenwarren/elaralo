@@ -1,110 +1,206 @@
-/* app/companion/page.tsx */
-'use client';
+// next-frontend/app/companion/page.tsx
+import Image from "next/image";
+import Link from "next/link";
 
-import { useEffect, useMemo, useState } from 'react';
-import Image from 'next/image';
-import Link from 'next/link';
-
-type Health = { ok: boolean; ts?: string } | { detail?: string };
-
-const defaultApiBase =
-  process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, '') ||
-  'https://elaralo-api-01.azurewebsites.net';
+export const metadata = {
+  title: "Elaralo • Companion",
+  description: "Elaralo Companion Page",
+};
 
 export default function CompanionPage() {
-  const API_BASE = useMemo(() => defaultApiBase, []);
-  const [health, setHealth] = useState<Health | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      try {
-        setLoading(true);
-        const r = await fetch(`${API_BASE}/health`, { cache: 'no-store' });
-        const j = (await r.json()) as Health;
-        if (!cancelled) setHealth(j);
-      } catch {
-        if (!cancelled) setHealth({ detail: 'unreachable' });
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    run();
-    const id = setInterval(run, 30_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [API_BASE]);
-
-  const statusText = (() => {
-    if (loading && !health) return 'Checking…';
-    if (!health) return 'Unknown';
-    if ('ok' in health && health.ok) {
-      return health.ts ? `Healthy (${new Date(health.ts).toLocaleString()})` : 'Healthy';
-    }
-    if ('detail' in health) return `Error: ${health.detail}`;
-    return 'Unhealthy';
-  })();
+  const ts = new Date().toISOString();
 
   return (
-    <main className="min-h-[70vh]">
-      <div className="mx-auto mb-6 flex items-center gap-3">
-        <Image src="/elaralo-logo.png" alt="Elaralo" width={48} height={48} />
-        <h1 className="text-2xl font-bold">Elaralo Companion</h1>
-      </div>
+    <main
+      style={{
+        minHeight: "100vh",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "2.25rem",
+        padding: "2rem 1rem",
+      }}
+    >
+      {/* Header / Branding */}
+      <header
+        style={{
+          textAlign: "center",
+          display: "flex",
+          flexDirection: "column",
+          gap: "1.25rem",
+          alignItems: "center",
+        }}
+      >
+        <div
+          style={{
+            width: 120,
+            height: 120,
+            borderRadius: "9999px",
+            border: "3px solid #111",
+            display: "grid",
+            placeItems: "center",
+            overflow: "hidden",
+            background: "transparent",
+          }}
+          aria-label="Elaralo logo"
+        >
+          {/* Default avatar/logo comes from public/elaralo-logo.png */}
+          <Image
+            src="/elaralo-logo.png"
+            alt="Elaralo"
+            width={84}
+            height={84}
+            priority
+            style={{ objectFit: "contain" }}
+          />
+        </div>
 
-      <div className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm">
-        <span
-          className={[
-            'inline-block h-2.5 w-2.5 rounded-full',
-            health && 'ok' in health && health.ok ? 'bg-emerald-500' : 'bg-rose-500',
-          ].join(' ')}
+        <div>
+          <h1
+            style={{
+              fontSize: "clamp(1.75rem, 2.8vw + 1rem, 3rem)",
+              fontWeight: 800,
+              margin: 0,
+            }}
+          >
+            Companion for Elaralo
+          </h1>
+          <p
+            style={{
+              marginTop: 8,
+              color: "#444",
+              maxWidth: 720,
+            }}
+          >
+            A focused hub for starting, navigating, and testing your Elaralo
+            experience. This page reflects the latest branding and logic updates
+            discussed in this thread (logo, routes, and copy).
+          </p>
+          <p style={{ marginTop: 6, fontSize: 12, color: "#666" }}>
+            ts: <code>{ts}</code>
+          </p>
+        </div>
+      </header>
+
+      {/* Primary Actions */}
+      <section
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+          gap: "1rem",
+          width: "min(100%, 900px)",
+        }}
+      >
+        <NavCard
+          title="My Elaralo"
+          href="https://www.elaralo.com/myelaralo"
+          external
+          desc="Account, preferences, and subscriptions."
         />
-        <span className="tabular-nums">{statusText}</span>
-      </div>
 
-      <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <Action href="https://www.elaralo.com/myelaralo" title="My Elaralo" subtitle="Account" />
-        <Action href="https://www.elaralo.com/pricing-plans/list" title="Upgrade" subtitle="Plans" />
-        <Action href={`${API_BASE}/docs`} title="API Docs" subtitle="OpenAPI UI" />
-        <Action href={`${API_BASE}/site/`} title="Marketing Site" subtitle="Static pages" />
-      </div>
+        <NavCard
+          title="Upgrade"
+          href="https://www.elaralo.com/pricing-plans/list"
+          external
+          desc="Plans and billing."
+        />
 
-      <div className="mt-10 rounded-lg border p-4 text-left">
-        <h2 className="font-semibold">Developer</h2>
-        <ul className="mt-2 list-disc pl-6 text-sm text-neutral-700">
-          <li>
-            <code>NEXT_PUBLIC_API_BASE</code> ={' '}
-            <code className="select-all break-all">{API_BASE}</code>
-          </li>
-          <li>
-            Health endpoint:{' '}
-            <Link className="underline" href={`${API_BASE}/health`} target="_blank">
-              {API_BASE}/health
-            </Link>
-          </li>
-          <li>Replace <code>/public/elaralo-logo.png</code> to update the logo.</li>
-        </ul>
-      </div>
+        <NavCard
+          title="Companions (this page)"
+          href="/companion"
+          desc="You are here. Use as a quick-start hub."
+          highlight
+        />
+
+        <NavCard
+          title="Docs"
+          href="/docs"
+          desc="Project docs or API docs (wire up your route)."
+        />
+
+        <NavCard
+          title="Site"
+          href="/site"
+          desc="Static site endpoint exposed by the backend (if configured)."
+        />
+
+        <NavCard
+          title="Health"
+          href="/health"
+          desc="Backend health probe (proxied route or API path)."
+        />
+      </section>
+
+      {/* Helper notes */}
+      <footer style={{ color: "#666", fontSize: 13, textAlign: "center" }}>
+        <p style={{ margin: 0 }}>
+          Logo source: <code>/public/elaralo-logo.png</code> (default avatar).
+        </p>
+        <p style={{ margin: 0 }}>
+          To make this the landing page, either copy this component to{" "}
+          <code>app/page.tsx</code> or add a redirect from <code>/</code> to{" "}
+          <code>/companion</code> in <code>next.config.js</code>.
+        </p>
+      </footer>
     </main>
   );
 }
 
-function Action(props: { href: string; title: string; subtitle?: string }) {
-  return (
-    <Link
-      href={props.href}
-      target="_blank"
-      className="group rounded-lg border p-4 text-left transition hover:border-black/50"
+/* --------- Small, dependency-free “card” component --------- */
+function NavCard({
+  title,
+  desc,
+  href,
+  external = false,
+  highlight = false,
+}: {
+  title: string;
+  desc: string;
+  href: string;
+  external?: boolean;
+  highlight?: boolean;
+}) {
+  const card = (
+    <a
+      href={href}
+      {...(external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
+      style={{
+        display: "block",
+        border: "1px solid #e5e7eb",
+        borderRadius: 14,
+        padding: "1rem 1rem",
+        textDecoration: "none",
+        background: highlight ? "rgba(17,17,17,0.03)" : "white",
+        transition: "transform 120ms ease, box-shadow 120ms ease",
+        boxShadow: "0 1px 2px rgba(0,0,0,0.05)",
+      }}
+      onMouseOver={(e) => {
+        (e.currentTarget as HTMLAnchorElement).style.transform = "translateY(-2px)";
+        (e.currentTarget as HTMLAnchorElement).style.boxShadow =
+          "0 6px 16px rgba(0,0,0,0.08)";
+      }}
+      onMouseOut={(e) => {
+        (e.currentTarget as HTMLAnchorElement).style.transform = "none";
+        (e.currentTarget as HTMLAnchorElement).style.boxShadow =
+          "0 1px 2px rgba(0,0,0,0.05)";
+      }}
     >
-      <div className="font-semibold">{props.title}</div>
-      {props.subtitle && (
-        <div className="text-sm text-neutral-600 group-hover:text-neutral-800">
-          {props.subtitle}
-        </div>
-      )}
-    </Link>
+      <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>{title}</h3>
+      <p style={{ margin: "6px 0 0", color: "#444", lineHeight: 1.4 }}>{desc}</p>
+      <p style={{ margin: "10px 0 0", fontSize: 12, color: "#888" }}>
+        {external ? "Opens in a new tab" : "Internal route"}
+      </p>
+    </a>
   );
+
+  // Prefer Next Link for internal routes for prefetch benefits
+  if (!external && href.startsWith("/")) {
+    return (
+      <Link href={href} style={{ textDecoration: "none" }}>
+        {card}
+      </Link>
+    );
+  }
+  return card;
 }
