@@ -1,23 +1,21 @@
-# Node / Next.js
+﻿# Node / Next.js
 node_modules/
 .next/
 out/
 dist/
-pnpm-lock.yaml
-yarn.lock
-
-# Vite/React (if any old SPA stays)
-frontend/node_modules/
-frontend/dist/
-
-# OS/IDE
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
+next-frontend/node_modules/
+next-frontend/.next/
+next-frontend/out/
 
 # Python
 __pycache__/
 .antenv/
 antenv/
 .env
+.python_packages/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
