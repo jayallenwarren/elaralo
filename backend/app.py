@@ -1,140 +1,381 @@
 import os
-import os, pathlib
-DB_PATH = os.getenv("ELARALO_DB_PATH", "/home/site/wwwroot/data/elaralo.db")
-pathlib.Path(os.path.dirname(DB_PATH)).mkdir(parents=True, exist_ok=True)
-# then use DB_PATH to create the SQLAlchemy engine
+import time
+import uuid
+from io import BytesIO
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from datetime import datetime, timedelta
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends
+import requests
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session as OrmSession
+from fastapi.responses import FileResponse, JSONResponse
 
-DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./data.db")
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
+try:
+    # Optional dependency; only required if you want OpenAI-backed chat + STT.
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True)
-    tier = Column(String, default="trial")
-    dob = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    sessions = relationship("ChatSession", back_populates="user")
-    purchases = relationship("Purchase", back_populates="user")
 
-class ChatSession(Base):
-    __tablename__ = "sessions"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    mode = Column(String)
-    is_tts = Column(Boolean, default=False)
-    started_at = Column(DateTime, default=datetime.utcnow)
-    stopped_at = Column(DateTime, nullable=True)
-    active_seconds = Column(Integer, default=0)
-    user = relationship("User", back_populates="sessions")
+# -----------------------------
+# Configuration
+# -----------------------------
 
-class Purchase(Base):
-    __tablename__ = "purchases"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    channel = Column(String)
-    seconds_remaining = Column(Integer, default=0)
-    sku = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime)
-    user = relationship("User", back_populates="purchases")
+APP_NAME = "elaralo-api"
 
-Base.metadata.create_all(engine)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # safe default; override in App Settings
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip()
 
-app = FastAPI(title="Elaralo Web App Service", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+DEFAULT_ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "rJ9XoWu8gbUhVKZnKY8X").strip()
 
-static_dir = os.path.join(os.path.dirname(__file__), "static")
-if os.path.isdir(static_dir):
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+# Audio cache on disk (shared across gunicorn workers). Azure App Service: /home is writable & persistent.
+TTS_CACHE_DIR = os.getenv("TTS_CACHE_DIR", "/home/elaralo/tts_cache").strip()
+TTS_CACHE_TTL_SECONDS = int(os.getenv("TTS_CACHE_TTL_SECONDS", "3600"))  # 1 hour
 
-POOL = {"trial":600, "member_friend":900, "member_romantic":2700, "member_intimate":6300}
-CAP = {"friend":900, "romantic":1800, "intimate":3600}
+# CORS
+# Comma-separated list. Use "*" only if you understand the implications.
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 
-def get_db():
-    db = SessionLocal()
-    try: yield db
-    finally: db.close()
 
-class StartIn(BaseModel):
-    user_id:int; tier:str; mode:str; is_tts:bool=False
-class StartOut(BaseModel):
-    session_id:int; cap_seconds:int; remaining_included_30d:int; purchased_tts_seconds:int; purchased_text_seconds:int
-class TickIn(BaseModel):
-    session_id:int; delta_seconds:int; is_active:bool; tier:str; mode:str; is_tts:bool
-class TickOut(BaseModel):
-    remaining_session_seconds:int; included_remaining_30d:int; purchased_tts_seconds:int; purchased_text_seconds:int
-class PurchaseIn(BaseModel):
-    user_id:int; sku:str; channel:str
-class UsageOut(BaseModel):
-    included_remaining_30d:int; purchased_text_seconds:int; purchased_tts_seconds:int
+# -----------------------------
+# App
+# -----------------------------
+
+app = FastAPI(title=APP_NAME)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS if CORS_ORIGINS else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+
+
+# -----------------------------
+# Domain Logic
+# -----------------------------
+
+PlanName = Literal["Free", "Trial", "Starter", "Plus", "Pro"]
+Mode = Literal["friend", "romantic", "intimate", "video"]
+
+
+def normalize_mode(raw: Any) -> Mode:
+    t = str(raw or "").strip().lower()
+    if not t:
+        return "friend"
+    if t == "trial":  # Trial is a plan label; treat as Romantic mode request
+        return "romantic"
+    if t in ("friend", "friendly"):
+        return "friend"
+    if t in ("romantic", "romance"):
+        return "romantic"
+    if t in ("intimate", "explicit", "adult", "18+", "18"):
+        return "intimate"
+    if t in ("video", "call", "conference", "stream"):
+        return "video"
+    return "friend"
+
+
+def normalize_plan(raw: Any) -> PlanName:
+    t = str(raw or "").strip()
+    if t in ("Free", "Trial", "Starter", "Plus", "Pro"):
+        return t  # type: ignore
+    return "Trial"
+
+
+def allowed_modes_for_plan(plan: PlanName) -> List[Mode]:
+    allowed: List[Mode] = ["friend", "video"]
+    if plan in ("Trial", "Starter", "Plus", "Pro"):
+        allowed.append("romantic")
+    if plan in ("Starter", "Plus", "Pro"):
+        allowed.append("intimate")
+    return allowed
+
+
+def ensure_allowed_mode(requested: Mode, plan: PlanName) -> Tuple[Mode, bool]:
+    allowed = allowed_modes_for_plan(plan)
+    if requested in allowed:
+        return requested, True
+    return "friend", False
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def build_system_prompt(mode: Mode) -> str:
+    # IMPORTANT: No mention of any other companion names.
+    base = (
+        "You are Elara, the Elaralo AI companion. "
+        "You are warm, emotionally attuned, and conversational. "
+        "You do not mention policy or internal rules unless asked. "
+        "You are not a doctor or lawyer; for medical/legal issues, encourage professional help."
+    )
+
+    if mode == "friend":
+        return base + " Style: supportive friend, calm, practical, lightly playful, non-explicit."
+    if mode == "romantic":
+        return base + (
+            " Style: affectionate, romantic, emotionally intimate, but keep language tasteful and non-graphic."
+        )
+    if mode == "intimate":
+        # Keep this non-graphic; access gating is handled outside this page per product design.
+        return base + (
+            " Style: sensual and intimate, but avoid graphic sexual content. Focus on feelings, closeness, and flirtation."
+        )
+    if mode == "video":
+        return base + (
+            " Style: concise, spoken-friendly replies suitable for a video call. Use short paragraphs and clarity."
+        )
+    return base
+
+
+def get_openai_client() -> Optional[Any]:
+    if not OPENAI_API_KEY or OpenAI is None:
+        return None
+    try:
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        return None
+
+
+# In-memory chat sessions; you can replace with Redis/DB later.
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+
+def session_get(session_id: str) -> Dict[str, Any]:
+    s = SESSIONS.get(session_id)
+    if not s:
+        s = {"created_at_ms": now_ms(), "messages": []}
+        SESSIONS[session_id] = s
+    return s
+
+
+def append_history(session_id: str, role: str, content: str) -> None:
+    s = session_get(session_id)
+    msgs: List[Dict[str, str]] = s["messages"]
+    msgs.append({"role": role, "content": content})
+    # keep last N
+    if len(msgs) > 30:
+        del msgs[:-30]
+
+
+def chat_generate_reply(
+    mode: Mode,
+    user_text: str,
+    session_id: str,
+) -> str:
+    client = get_openai_client()
+    if client is None:
+        # Safe fallback (keeps app functional without keys)
+        return (
+            "Backend is running, but OPENAI_API_KEY is not set. "
+            "Set it in Azure App Service → Configuration → Application settings, then restart. "
+            f"You said: {user_text}"
+        )
+
+    # Build message list with short history.
+    s = session_get(session_id)
+    history: List[Dict[str, str]] = s.get("messages", [])
+    sys = {"role": "system", "content": build_system_prompt(mode)}
+    msgs = [sys] + history[-20:] + [{"role": "user", "content": user_text}]
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=msgs,
+            temperature=0.8 if mode in ("romantic", "intimate") else 0.6,
+        )
+        out = resp.choices[0].message.content or ""
+        return out.strip() or "…"
+    except Exception as e:
+        return f"Chat error: {str(e)}"
+
+
+def elevenlabs_tts(text: str, voice_id: str) -> bytes:
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="ELEVENLABS_API_KEY is not set. Add it in Azure App Service → Configuration → Application settings.",
+        )
+
+    vid = voice_id.strip() or DEFAULT_ELEVENLABS_VOICE_ID
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}"
+
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "accept": "audio/mpeg",
+        "content-type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": ELEVENLABS_MODEL_ID,
+        "voice_settings": {
+            "stability": 0.45,
+            "similarity_boost": 0.8,
+            "style": 0.2,
+            "use_speaker_boost": True,
+        },
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"ElevenLabs TTS failed: {r.status_code} {r.text[:500]}")
+    return r.content
+
+
+def write_tts_cache(mp3_bytes: bytes) -> str:
+    token = uuid.uuid4().hex
+    path = os.path.join(TTS_CACHE_DIR, f"{token}.mp3")
+    with open(path, "wb") as f:
+        f.write(mp3_bytes)
+    return token
+
+
+def read_tts_cache(token: str) -> Optional[str]:
+    path = os.path.join(TTS_CACHE_DIR, f"{token}.mp3")
+    if not os.path.exists(path):
+        return None
+    # TTL enforcement
+    age = time.time() - os.path.getmtime(path)
+    if age > TTS_CACHE_TTL_SECONDS:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return None
+    return path
+
+
+def openai_transcribe(audio_bytes: bytes, filename: str) -> str:
+    client = get_openai_client()
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set; STT requires it.")
+    bio = BytesIO(audio_bytes)
+    bio.name = filename
+    try:
+        # OpenAI python SDK supports file-like objects.
+        tr = client.audio.transcriptions.create(model=OPENAI_TRANSCRIBE_MODEL, file=bio)
+        # SDK returns either a dict-like or an object with `text`.
+        text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None)
+        return (text or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT error: {str(e)}")
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+
 
 @app.get("/health")
-def health(): return {"ok":True,"ts":datetime.utcnow().isoformat()}
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": APP_NAME,
+        "time_ms": now_ms(),
+        "openai_configured": bool(OPENAI_API_KEY),
+        "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
+    }
 
-from sqlalchemy import func
-def used_30d(db:OrmSession, uid:int)->int:
-    cutoff = datetime.utcnow()-timedelta(days=30)
-    rows = db.query(ChatSession).filter(ChatSession.user_id==uid, ChatSession.started_at>=cutoff).with_entities(ChatSession.active_seconds).all()
-    return sum(r[0] for r in rows)
 
-def purchased(db:OrmSession, uid:int, channel:str)->int:
-    now=datetime.utcnow()
-    rows = db.query(Purchase).filter(Purchase.user_id==uid, Purchase.channel==channel, Purchase.expires_at>now, Purchase.seconds_remaining>0).all()
-    return sum(p.seconds_remaining for p in rows)
+@app.post("/tts/audio-url")
+async def tts_audio_url(request: Request) -> Dict[str, Any]:
+    data = await request.json()
+    text = str(data.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text'.")
 
-@app.post("/seed")
-def seed(db:OrmSession=Depends(get_db)):
-    u=User(tier="trial"); db.add(u); db.commit(); db.refresh(u); return {"user_id":u.id,"tier":u.tier}
+    voice_id = str(data.get("voice_id") or DEFAULT_ELEVENLABS_VOICE_ID).strip() or DEFAULT_ELEVENLABS_VOICE_ID
 
-@app.post("/session/start", response_model=StartOut)
-def start(inp:StartIn, db:OrmSession=Depends(get_db)):
-    u = db.get(User, inp.user_id) or User(id=inp.user_id, tier=inp.tier)
-    u.tier = inp.tier; db.add(u); db.commit()
-    cap = 600 if (inp.tier=="trial" and inp.mode=="friend") else CAP.get(inp.mode,0)
-    if cap==0: raise HTTPException(403,"Upgrade required")
-    s=ChatSession(user_id=u.id, mode=inp.mode, is_tts=inp.is_tts); db.add(s); db.commit(); db.refresh(s)
-    inc = max(0, POOL.get(u.tier,0)-used_30d(db, u.id))
-    return StartOut(session_id=s.id, cap_seconds=cap, remaining_included_30d=inc,
-                    purchased_tts_seconds=purchased(db,u.id,"tts"),
-                    purchased_text_seconds=purchased(db,u.id,"text"))
+    mp3 = elevenlabs_tts(text=text, voice_id=voice_id)
+    token = write_tts_cache(mp3)
 
-@app.post("/session/tick", response_model=TickOut)
-def tick(inp:TickIn, db:OrmSession=Depends(get_db)):
-    s = db.get(ChatSession, inp.session_id) or HTTPException(404,"Session not found")
-    if inp.is_active: s.active_seconds += max(0,int(inp.delta_seconds)); db.commit()
-    cap = 600 if (inp.tier=="trial" and inp.mode=="friend") else CAP.get(inp.mode,0)
-    rem = max(0, cap - s.active_seconds)
-    if rem==0: raise HTTPException(402,"TIME LIMIT REACHED")
-    inc = max(0, POOL.get(inp.tier,0)-used_30d(db, s.user_id))
-    ch = "tts" if inp.is_tts else "text"
-    if inc==0 and purchased(db, s.user_id, ch)==0: raise HTTPException(402,"BALANCE REQUIRED")
-    return TickOut(remaining_session_seconds=rem, included_remaining_30d=inc,
-                   purchased_tts_seconds=purchased(db,s.user_id,"tts"),
-                   purchased_text_seconds=purchased(db,s.user_id,"text"))
+    base = str(request.base_url).rstrip("/")
+    return {"audio_url": f"{base}/tts/audio/{token}.mp3"}
 
-SKU_SEC={"tts_15m_499":900,"tts_30m_999":1800,"tts_60m_1499":3600,"text_15m_099":900,"text_30m_299":1800,"text_60m_599":3600}
 
-@app.post("/minutes/purchase")
-def minutes(inp:PurchaseIn, db:OrmSession=Depends(get_db)):
-    sec = SKU_SEC.get(inp.sku); 
-    if sec is None: raise HTTPException(400,"Unknown SKU")
-    p = Purchase(user_id=inp.user_id, channel=inp.channel, seconds_remaining=sec, sku=inp.sku, expires_at=datetime.utcnow()+timedelta(days=365))
-    db.add(p); db.commit(); return {"ok":True,"purchase_id":p.id,"seconds":sec}
+@app.get("/tts/audio/{token}.mp3")
+def tts_audio(token: str):
+    path = read_tts_cache(token)
+    if not path:
+        raise HTTPException(status_code=404, detail="Audio not found or expired.")
+    return FileResponse(path, media_type="audio/mpeg", filename=f"{token}.mp3")
 
-@app.get("/usage/summary", response_model=UsageOut)
-def usage(user_id:int, tier:str, db:OrmSession=Depends(get_db)):
-    inc=max(0, POOL.get(tier,0)-used_30d(db,user_id))
-    return UsageOut(included_remaining_30d=inc,
-                    purchased_text_seconds=purchased(db,user_id,"text"),
-                    purchased_tts_seconds=purchased(db,user_id,"tts"))
+
+@app.post("/stt/transcribe")
+async def stt_transcribe(
+    audio: UploadFile = File(...),
+    companion_key: str = Form(""),
+    member_id: str = Form(""),
+    plan: str = Form(""),
+) -> Dict[str, Any]:
+    # companion_key/member_id/plan are accepted for wiring parity; not strictly required here.
+    _ = companion_key, member_id, plan
+
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio upload.")
+
+    text = openai_transcribe(audio_bytes, audio.filename or "audio.webm")
+    return {"text": text}
+
+
+@app.post("/chat")
+async def chat(request: Request) -> JSONResponse:
+    body = await request.json()
+
+    user_text = str(body.get("message") or "").strip()
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Missing 'message'.")
+
+    session_state = body.get("session_state") or {}
+    session_id = str(session_state.get("session_id") or body.get("session_id") or "").strip() or uuid.uuid4().hex
+
+    plan = normalize_plan(body.get("plan") or session_state.get("plan"))
+    requested_mode = normalize_mode(body.get("mode") or session_state.get("mode"))
+    mode, ok = ensure_allowed_mode(requested_mode, plan)
+
+    # Update session meta
+    sess = session_get(session_id)
+    sess["plan"] = plan
+    sess["member_id"] = str(body.get("member_id") or session_state.get("member_id") or "")
+    sess["member_email"] = str(body.get("member_email") or session_state.get("member_email") or "")
+    sess["companion_key"] = str(body.get("companion_key") or session_state.get("companion_key") or "Elara")
+
+    append_history(session_id, "user", user_text)
+    reply = chat_generate_reply(mode=mode, user_text=user_text, session_id=session_id)
+    append_history(session_id, "assistant", reply)
+
+    # Time tracking: accept client-reported elapsed seconds
+    incoming_elapsed = session_state.get("session_elapsed_seconds")
+    if isinstance(incoming_elapsed, (int, float)):
+        sess["session_elapsed_seconds"] = float(incoming_elapsed)
+
+    out_state: Dict[str, Any] = {
+        "session_id": session_id,
+        "plan": plan,
+        "mode": mode,
+        "mode_allowed": ok,
+        "allowed_modes": allowed_modes_for_plan(plan),
+        "server_time_ms": now_ms(),
+    }
+
+    return JSONResponse({"reply": reply, "session_state": out_state})
+
+
+@app.post("/chat/save-summary")
+async def chat_save_summary(request: Request) -> Dict[str, Any]:
+    """
+    Optional endpoint: the frontend may call this after sends.
+    This implementation is intentionally lightweight (no persistence) but keeps compatibility.
+    """
+    body = await request.json()
+    # Keep compatible fields for future use:
+    _ = body.get("companion_key"), body.get("plan"), body.get("member_id"), body.get("session_state"), body.get("messages")
+    return {"ok": True}

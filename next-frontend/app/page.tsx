@@ -1,102 +1,84 @@
-/* app/page.tsx */
-'use client';
+import Link from "next/link";
 
-import { useEffect } from 'react';
-import Image from 'next/image';
-import Link from 'next/link';
-
-const AUTO = String(process.env.NEXT_PUBLIC_AUTO_REDIRECT_MY || '').toLowerCase() === 'true';
-const MY_URL = 'https://www.elaralo.com/myelaralo';
-
-export default function Home() {
-  useEffect(() => {
-    if (AUTO && typeof window !== 'undefined') {
-      const t = setTimeout(() => window.location.assign(MY_URL), 2000);
-      return () => clearTimeout(t);
-    }
-  }, []);
-
+export default function MyElaraloPage() {
   return (
-    <section className="grid gap-8">
-      <div className="flex items-center gap-4">
-        <Image src="/elaralo-logo.png" alt="Elaralo" width={64} height={64} />
-        <div>
-          <h1 className="text-3xl font-bold">My Elaralo</h1>
-          <p className="text-neutral-600">
-            Central hub for your account, subscriptions, and settings.
-          </p>
-        </div>
-      </div>
+    <main style={{ minHeight: "100vh", padding: 24 }}>
+      <div style={{ maxWidth: 980, margin: "0 auto" }}>
+        <header style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 24 }}>
+          <img
+            src="/elaralo-logo.png"
+            alt="Elaralo"
+            width={44}
+            height={44}
+            style={{ borderRadius: 9999, display: "block" }}
+          />
+          <div>
+            <div style={{ fontSize: 20, fontWeight: 700 }}>My Elaralo</div>
+            <div style={{ opacity: 0.8, fontSize: 13 }}>
+              Navigate to your Companion, Docs, and Site pages.
+            </div>
+          </div>
+        </header>
 
-      <div className="flex flex-wrap items-center gap-3">
-        <a
-          href={MY_URL}
-          target="_blank"
-          className="rounded-lg border px-4 py-2 font-medium hover:border-black/60"
+        <section
+          style={{
+            border: "1px solid rgba(255,255,255,0.12)",
+            borderRadius: 12,
+            padding: 18,
+            background: "rgba(255,255,255,0.04)",
+          }}
         >
-          Open My Elaralo
-        </a>
-        {AUTO ? (
-          <span className="text-sm text-neutral-600">Auto-redirecting…</span>
-        ) : (
-          <span className="text-sm text-neutral-600">
-            (Enable auto redirect by setting <code>NEXT_PUBLIC_AUTO_REDIRECT_MY=true</code>)
-          </span>
-        )}
+          <div style={{ display: "grid", gap: 10 }}>
+            <Link
+              href="/companion"
+              style={{
+                display: "inline-block",
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.14)",
+                textDecoration: "none",
+              }}
+            >
+              Open Companion (Elara)
+            </Link>
+
+            <a
+              href="https://www.elaralo.com/myelaralo"
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                display: "inline-block",
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.14)",
+                textDecoration: "none",
+              }}
+            >
+              Open My Elaralo (Website)
+            </a>
+
+            <a
+              href="https://www.elaralo.com/pricing-plans/list"
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                display: "inline-block",
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.14)",
+                textDecoration: "none",
+              }}
+            >
+              Pricing & Plans
+            </a>
+          </div>
+        </section>
+
+        <footer style={{ marginTop: 18, opacity: 0.7, fontSize: 12 }}>
+          If you embed the Companion inside another site (e.g., Wix), the page supports postMessage-based
+          initialization for plan, member id, and companion_key.
+        </footer>
       </div>
-
-      <hr className="my-4" />
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <Card
-          title="Companion"
-          desc="Health check and quick developer actions."
-          href="/companion"
-        />
-        <Card
-          title="Upgrade"
-          desc="Plans & billing details."
-          href="https://www.elaralo.com/pricing-plans/list"
-          external
-        />
-        <Card
-          title="API Docs"
-          desc="OpenAPI / Swagger UI for the backend."
-          href="https://elaralo-api-01.azurewebsites.net/docs"
-          external
-        />
-        <Card
-          title="Marketing Site"
-          desc="Static site served by backend."
-          href="https://elaralo-api-01.azurewebsites.net/site/"
-          external
-        />
-      </div>
-    </section>
-  );
-}
-
-function Card({
-  title,
-  desc,
-  href,
-  external = false,
-}: {
-  title: string;
-  desc: string;
-  href: string;
-  external?: boolean;
-}) {
-  const cls = 'block rounded-lg border p-4 hover:border-black/60';
-  return external ? (
-    <a href={href} target="_blank" className={cls}>
-      <div className="font-semibold">{title}</div>
-      <div className="text-sm text-neutral-600">{desc}</div>
-    </a>
-  ) : (
-    <Link href={href} className={cls}>
-      <div className="font-semibold">{title}</div>
-      <div className="text-sm text-neutral-600">{desc}</div>
-    </Link>
+    </main>
   );
 }
