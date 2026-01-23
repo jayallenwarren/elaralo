@@ -3,7 +3,7 @@ uvicorn[standard]==0.30.6
 gunicorn==22.0.0
 python-multipart==0.0.12
 requests==2.32.3
-openai==2.15.0
+openai>=2.15.0
 httpx>=0.28.0
 python-dotenv==1.0.1
 
