@@ -24,6 +24,9 @@ antenv/
 
 # Local env (never commit)
 **/.env.local
+backend/.venv/
+next-frontend/.env.local
+backend/.env
 
 # OS/IDE
 .DS_Store
@@ -40,4 +43,6 @@ next-frontend/.next/
 next-frontend/node_modules/
 backend/__pycache__/
 *.pyc
+
+
 
