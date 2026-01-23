@@ -22,11 +22,13 @@ antenv/
 **/.next/
 **/out/
 
-# Local env (never commit)
-**/.env.local
-backend/.venv/
-next-frontend/.env.local
+# secrets
+.env
 backend/.env
+next-frontend/.env.local
+
+# venv
+backend/.venv/
 
 # OS/IDE
 .DS_Store
