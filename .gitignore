@@ -8,14 +8,36 @@ next-frontend/.next/
 next-frontend/out/
 
 # Python
-__pycache__/
+**/.venv/
+**/__pycache__/
+*.pyc
+*.pyo
 .antenv/
 antenv/
 .env
 .python_packages/
+
+# Node / Next
+**/node_modules/
+**/.next/
+**/out/
+
+# Local env (never commit)
+**/.env.local
 
 # OS/IDE
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+
+# local-only / secrets
+backend/.venv/
+next-frontend/.env.local
+
+# build artifacts
+next-frontend/.next/
+next-frontend/node_modules/
+backend/__pycache__/
+*.pyc
+

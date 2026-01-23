@@ -1,1199 +1,951 @@
+\
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 
 /**
- * Elaralo Companion (Elara)
- * - Single companion (no multi-companion selection)
- * - No avatar synthesis vendors
- * - Video Mode = embedded video conference / streaming video URL (vendor-agnostic)
- * - TTS + STT remain available in all modes
- * - Mode pills are ONLY shown when allowed by the member's plan (no disabled pills)
- * - "Trial" is a plan label (shown next to Plan), not a mode pill; if an incoming mode is "trial", it maps to "romantic"
+ * Elaralo Companion Page
+ *
+ * Key requirements implemented:
+ * - Uses Elaralo branding and companion name Elara (no legacy naming).
+ * - Relationship Mode pills are NOT condensed:
+ *   - only allowed modes are shown (no disabled pill concept)
+ *   - pills are always visible underneath the "Set Mode" button
+ * - Trial mode (legacy) maps to the Romantic pill
+ * - If companion_key has no plan => default plan Trial
+ * - If companion_key has no mode => default mode Friend
+ * - Audio Mode plays TTS using a hidden <video> element (stable cross-device)
+ * - Video Mode is a hosted video conference/streaming embed (no D-ID; no ElevenLabs in this mode)
+ * - D‑ID code is retained but commented out for future use
  */
 
-type Role = "user" | "assistant" | "system";
-type Mode = "friend" | "romantic" | "intimate" | "video";
+type ExperienceMode = "chat" | "audio" | "video";
+type RelationshipMode = "friend" | "romantic" | "intimate";
+type ChatRole = "user" | "assistant";
 
-type PlanName = "Free" | "Trial" | "Starter" | "Plus" | "Pro";
+type CompanionKeyMeta = Record<string, any>;
 
-type ChatMessage = {
+const API_BASE =
+  process.env.NEXT_PUBLIC_ELARALO_API_BASE ||
+  process.env.NEXT_PUBLIC_ELARALO_API_BASE_URL ||
+  "http://127.0.0.1:8000";
+
+const VIDEO_MODE_URL =
+  process.env.NEXT_PUBLIC_ELARALO_VIDEO_MODE_URL ||
+  process.env.NEXT_PUBLIC_VIDEO_MODE_URL ||
+  "";
+
+const LS_COMPANION_KEY = "elaralo_companion_key_v1";
+const LS_PLAN_NAME = "elaralo_plan_name_v1";
+const LS_REL_MODE = "elaralo_relationship_mode_v1";
+
+const DEFAULT_COMPANION_KEY = "elaralo";
+const DEFAULT_COMPANION_NAME = "Elara";
+const DEFAULT_PLAN_NAME = "Trial";
+const DEFAULT_REL_MODE: RelationshipMode = "friend";
+const DEFAULT_AVATAR_URL = "/elaralo_logo.png";
+
+const ROMANTIC_ALLOWED_PLANS = new Set(["Trial", "Romantic", "Pro"]);
+const INTIMATE_ALLOWED_PLANS = new Set(["Intimate", "Pro"]);
+
+function safeJsonParse(s: string): any | null {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+function base64UrlToUtf8(b64url: string): string {
+  const pad = "=".repeat((4 - (b64url.length % 4)) % 4);
+  const b64 = (b64url + pad).replace(/-/g, "+").replace(/_/g, "/");
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function decodeCompanionKey(key: string): CompanionKeyMeta | null {
+  const k = (key || "").trim();
+  if (!k) return null;
+
+  // JSON
+  if (k.startsWith("{") && k.endsWith("}")) return safeJsonParse(k);
+
+  // JWT payload decode
+  const parts = k.split(".");
+  if (parts.length === 3) {
+    try {
+      const jsonStr = base64UrlToUtf8(parts[1]);
+      return safeJsonParse(jsonStr);
+    } catch {
+      return null;
+    }
+  }
+
+  // whole-key base64url JSON
+  try {
+    const jsonStr = base64UrlToUtf8(k);
+    return safeJsonParse(jsonStr);
+  } catch {
+    return null;
+  }
+}
+
+function normalizePlanName(raw?: string): string {
+  const p = (raw || "").trim().toLowerCase();
+  if (!p) return DEFAULT_PLAN_NAME;
+  if (["trial", "free"].includes(p)) return "Trial";
+  if (["friend", "basic"].includes(p)) return "Friend";
+  if (["romantic", "romance"].includes(p)) return "Romantic";
+  if (["intimate", "adult"].includes(p)) return "Intimate";
+  if (["pro", "premium", "plus"].includes(p)) return "Pro";
+  return DEFAULT_PLAN_NAME;
+}
+
+function normalizeMode(raw?: string): RelationshipMode {
+  const m = (raw || "").trim().toLowerCase();
+  if (!m) return DEFAULT_REL_MODE;
+  if (["friend", "friendly", "companion"].includes(m)) return "friend";
+  if (["romantic", "romance", "flirty"].includes(m)) return "romantic";
+  if (["trial"].includes(m)) return "romantic"; // legacy Trial pill -> Romantic pill
+  if (["intimate", "adult"].includes(m)) return "intimate";
+  return DEFAULT_REL_MODE;
+}
+
+function allowedModesForPlan(planName: string, explicitAllowed: boolean): RelationshipMode[] {
+  const plan = normalizePlanName(planName);
+  const out: RelationshipMode[] = ["friend"];
+
+  if (ROMANTIC_ALLOWED_PLANS.has(plan)) out.push("romantic");
+  if (INTIMATE_ALLOWED_PLANS.has(plan) && explicitAllowed) out.push("intimate");
+
+  // de-dup
+  return Array.from(new Set(out));
+}
+
+function pickMetaPlan(meta: CompanionKeyMeta | null): string {
+  if (!meta) return DEFAULT_PLAN_NAME;
+  return normalizePlanName(
+    meta.plan_name ?? meta.planName ?? meta.plan ?? meta.membership_plan ?? meta.membership ?? meta.tier
+  );
+}
+
+function pickMetaMode(meta: CompanionKeyMeta | null): RelationshipMode {
+  if (!meta) return DEFAULT_REL_MODE;
+  return normalizeMode(meta.mode ?? meta.relationship_mode ?? meta.relationshipMode);
+}
+
+function pickMetaCompanionName(meta: CompanionKeyMeta | null): string {
+  if (!meta) return DEFAULT_COMPANION_NAME;
+  return (
+    meta.companion_name ??
+    meta.companionName ??
+    meta.companion ??
+    meta.name ??
+    DEFAULT_COMPANION_NAME
+  );
+}
+
+function pickMetaAvatarUrl(meta: CompanionKeyMeta | null): string {
+  if (!meta) return DEFAULT_AVATAR_URL;
+  return (meta.avatar_url ?? meta.avatarUrl ?? meta.avatar ?? DEFAULT_AVATAR_URL) as string;
+}
+
+function pickMetaExplicitAllowed(meta: CompanionKeyMeta | null): boolean {
+  if (!meta) return false;
+  const v = meta.explicit_allowed ?? meta.explicitAllowed ?? meta.adult_allowed ?? meta.adultAllowed;
+  return v === true;
+}
+
+function formatSeconds(total: number): string {
+  const s = Math.max(0, Math.floor(total));
+  const hh = String(Math.floor(s / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+function todayKey(): string {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+type UiMessage = {
   id: string;
-  role: Exclude<Role, "system">;
+  role: ChatRole;
   content: string;
   ts: number;
 };
 
-type SessionState = {
-  session_id?: string;
-  member_id?: string;
-  member_email?: string;
-
-  // Elaralo fields
-  plan?: PlanName;
-  companion_key?: string; // wiring for backend
-  mode?: Mode;
-
-  // time tracking
-  session_started_at_ms?: number;
-  session_elapsed_seconds?: number;
-  mode_elapsed_seconds?: Partial<Record<Mode, number>>;
-
-  // misc
-  last_client_ts_ms?: number;
-};
-
-const BRAND = "Elaralo";
-const COMPANION_DISPLAY_NAME = "Elara";
-
-// Frontend defaults (can be overridden by env)
-const DEFAULT_PLAN: PlanName = "Trial";
-const DEFAULT_AVATAR_SRC = "/elaralo-logo.png";
-
-// This is the ElevenLabs voice_id you asked us to use (no name references in code).
-const DEFAULT_ELEVENLABS_VOICE_ID = "rJ9XoWu8gbUhVKZnKY8X";
-
-// If you embed this page (Wix, etc.), a postMessage payload can set these values.
-// Keep the allowed origin list tight; extend if needed.
-function isAllowedOrigin(origin: string) {
-  try {
-    const u = new URL(origin);
-    const host = u.hostname.toLowerCase();
-
-    // Elaralo properties
-    if (host.endsWith("elaralo.com")) return true;
-
-    // Wix hosting / embeds
-    if (host.endsWith("wix.com")) return true;
-    if (host.endsWith("wixsite.com")) return true;
-
-    // Local dev
-    if (host === "localhost" || host === "127.0.0.1") return true;
-
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-function uid(prefix = "m") {
-  return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
-}
-
-function formatHMS(totalSeconds: number) {
-  const s = Math.max(0, Math.floor(totalSeconds));
-  const hh = Math.floor(s / 3600);
-  const mm = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return hh > 0 ? `${pad(hh)}:${pad(mm)}:${pad(ss)}` : `${pad(mm)}:${pad(ss)}`;
-}
-
-// Plan -> allowed modes (ONLY show allowed pills; no disabled pills).
-function allowedModesForPlan(plan: PlanName): Mode[] {
-  const modes: Mode[] = ["friend", "video"];
-
-  // Trial plan maps to Romantic access (no Trial mode pill).
-  if (plan === "Trial" || plan === "Starter" || plan === "Plus" || plan === "Pro") {
-    modes.push("romantic");
-  }
-
-  if (plan === "Starter" || plan === "Plus" || plan === "Pro") {
-    modes.push("intimate");
-  }
-
-  return modes;
-}
-
-// Normalize incoming "mode" strings (from parent embed, query params, etc.).
-function normalizeMode(raw: any): Mode | null {
-  const t = String(raw ?? "").trim().toLowerCase();
-  if (!t) return null;
-
-  // Important: map "trial" => "romantic" (Trial is a plan label, not a mode pill).
-  if (t === "trial") return "romantic";
-
-  if (t === "friend" || t === "friendly") return "friend";
-  if (t === "romantic" || t === "romance") return "romantic";
-  if (t === "intimate" || t === "explicit" || t === "adult" || t === "18+" || t === "18") return "intimate";
-  if (t === "video" || t === "call" || t === "conference" || t === "stream") return "video";
-
-  return null;
-}
-
-// Detects a mode switch request in user text and removes explicit tokens.
-function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: string } {
-  const raw = text || "";
-  const t = raw.toLowerCase();
-
-  // explicit tokens
-  const tokenRe =
-    /\[mode:(friend|romantic|romance|intimate|explicit|video|trial)\]|mode:(friend|romantic|romance|intimate|explicit|video|trial)/gi;
-
-  let tokenMode: Mode | null = null;
-  let cleaned = raw.replace(tokenRe, (m) => {
-    const mm = m.toLowerCase();
-    if (mm.includes("friend")) tokenMode = "friend";
-    else if (mm.includes("romantic") || mm.includes("romance") || mm.includes("trial")) tokenMode = "romantic";
-    else if (mm.includes("intimate") || mm.includes("explicit")) tokenMode = "intimate";
-    else if (mm.includes("video")) tokenMode = "video";
-    return "";
-  });
-
-  cleaned = cleaned.trim();
-  if (tokenMode) return { mode: tokenMode, cleaned };
-
-  // soft phrasing
-  const soft = t.trim();
-
-  const wantsFriend =
-    /\b(switch|set|turn|go|back)\b.*\bfriend\b/.test(soft) || /\bfriend mode\b/.test(soft);
-
-  const wantsRomantic =
-    /\b(romantic|romance)\s+mode\b/.test(soft) ||
-    /\b(switch|set|turn|go|back)\b.*\b(romantic|romance|trial)\b/.test(soft) ||
-    /\b(let['’]?s|lets)\b.*\b(romantic|romance)\b/.test(soft) ||
-    /\b(try|trying)\b.*\b(romantic|romance)\b/.test(soft) ||
-    /\bromantic conversation\b/.test(soft);
-
-  const wantsIntimate =
-    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
-    /\b(intimate|explicit)\s+mode\b/.test(soft);
-
-  const wantsVideo =
-    /\b(switch|set|turn|go|back)\b.*\b(video|call|conference)\b/.test(soft) || /\bvideo mode\b/.test(soft);
-
-  if (wantsFriend) return { mode: "friend", cleaned: raw };
-  if (wantsRomantic) return { mode: "romantic", cleaned: raw };
-  if (wantsIntimate) return { mode: "intimate", cleaned: raw };
-  if (wantsVideo) return { mode: "video", cleaned: raw };
-
-  return { mode: null, cleaned: raw.trim() };
-}
-
-function modeLabel(mode: Mode): string {
-  switch (mode) {
-    case "friend":
-      return "Friend";
-    case "romantic":
-      return "Romantic";
-    case "intimate":
-      return "Intimate";
-    case "video":
-      return "Video";
-  }
-}
-
-function planLabel(plan: PlanName): string {
-  return plan;
-}
-
-function ensureAllowedMode(requested: Mode, plan: PlanName): { ok: boolean; fallback: Mode } {
-  const allowed = allowedModesForPlan(plan);
-  if (allowed.includes(requested)) return { ok: true, fallback: requested };
-  // fallback default if not allowed
-  return { ok: false, fallback: "friend" };
-}
-
-function HoverLink(props: React.PropsWithChildren<{ href: string; target?: string; rel?: string }>) {
-  const [hover, setHover] = useState(false);
-  return (
-    <a
-      href={props.href}
-      target={props.target}
-      rel={props.rel}
-      onMouseOver={() => setHover(true)}
-      onMouseOut={() => setHover(false)}
-      style={{
-        display: "inline-block",
-        padding: "8px 10px",
-        borderRadius: 10,
-        border: hover ? "1px solid rgba(255,255,255,0.25)" : "1px solid rgba(255,255,255,0.12)",
-        background: hover ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.04)",
-        textDecoration: "none",
-        fontSize: 12,
-      }}
-    >
-      {props.children}
-    </a>
-  );
-}
-
-function ModePills({
-  allowed,
-  active,
-  onPick,
-}: {
-  allowed: Mode[];
-  active: Mode;
-  onPick: (m: Mode) => void;
-}) {
-  return (
-    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-      {allowed.map((m) => {
-        const isActive = m === active;
-        return (
-          <button
-            key={m}
-            type="button"
-            onClick={() => onPick(m)}
-            style={{
-              cursor: "pointer",
-              borderRadius: 999,
-              padding: "6px 12px",
-              border: isActive ? "1px solid rgba(255,255,255,0.35)" : "1px solid rgba(255,255,255,0.14)",
-              background: isActive ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.04)",
-              color: "white",
-              fontSize: 12,
-              fontWeight: 600,
-            }}
-          >
-            {modeLabel(m)}
-          </button>
-        );
-      })}
-    </div>
-  );
+function uuid(): string {
+  // Good enough for UI ids without importing dependencies
+  return Math.random().toString(16).slice(2) + "-" + Date.now().toString(16);
 }
 
 export default function CompanionPage() {
-  const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").trim(); // "" means same-origin
+  const searchParams = useSearchParams();
 
-  const [planName, setPlanName] = useState<PlanName>(DEFAULT_PLAN);
-  const [memberId, setMemberId] = useState<string>("");
-  const [memberEmail, setMemberEmail] = useState<string>("");
-  const [companionKey, setCompanionKey] = useState<string>(COMPANION_DISPLAY_NAME);
+  // Session / identity
+  const [sessionId, setSessionId] = useState<string>(() => uuid());
+  const [companionKey, setCompanionKey] = useState<string>("");
 
-  // active mode (default: Friend)
-  const [activeMode, setActiveMode] = useState<Mode>("friend");
+  // Derived from companion_key (or defaults)
+  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
+  const [avatarUrl, setAvatarUrl] = useState<string>(DEFAULT_AVATAR_URL);
+  const [planName, setPlanName] = useState<string>(DEFAULT_PLAN_NAME);
+  const [explicitAllowed, setExplicitAllowed] = useState<boolean>(false);
 
-  const allowedModes = useMemo(() => allowedModesForPlan(planName), [planName]);
+  // Relationship mode: active + pending
+  const [mode, setMode] = useState<RelationshipMode>(DEFAULT_REL_MODE);
+  const [pendingMode, setPendingMode] = useState<RelationshipMode>(DEFAULT_REL_MODE);
 
-  // UI state
-  const [showModePills, setShowModePills] = useState<boolean>(true);
+  // Experience mode
+  const [experienceMode, setExperienceMode] = useState<ExperienceMode>("chat");
+
+  // Chat state
+  const [messages, setMessages] = useState<UiMessage[]>([]);
   const [input, setInput] = useState<string>("");
+  const [sending, setSending] = useState<boolean>(false);
+  const [status, setStatus] = useState<string>("");
 
-  const [messages, setMessages] = useState<ChatMessage[]>(() => [
-    {
-      id: uid("a"),
-      role: "assistant",
-      content: `Hi, ${COMPANION_DISPLAY_NAME} here. What would you like to talk about?`,
-      ts: Date.now(),
-    },
-  ]);
+  // TTS: stable playback uses hidden <video>
+  const ttsVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [ttsBusy, setTtsBusy] = useState<boolean>(false);
 
-  // TTS/STT toggles
-  const [ttsEnabled, setTtsEnabled] = useState<boolean>(true);
-  const [sttEnabled, setSttEnabled] = useState<boolean>(false);
-  const [handsFreeStt, setHandsFreeStt] = useState<boolean>(false);
+  // STT (browser)
+  const recognitionRef = useRef<any>(null);
+  const [listening, setListening] = useState<boolean>(false);
 
-  // recording / stt
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
-  const [isRecording, setIsRecording] = useState<boolean>(false);
+  // Time tracking (local)
+  const [sessionSeconds, setSessionSeconds] = useState<number>(0);
+  const [dailySeconds, setDailySeconds] = useState<number>(0);
 
-  // web speech recognition (hands-free)
-  const speechRecRef = useRef<any>(null);
-  const [speechStatus, setSpeechStatus] = useState<string>("off");
+  const allowedModes = useMemo(() => allowedModesForPlan(planName, explicitAllowed), [planName, explicitAllowed]);
 
-  // audio element for TTS
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-
-  // time tracking
-  const sessionStartedAtMsRef = useRef<number>(Date.now());
-  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
-
-  // session state passed to backend
-  const [sessionState, setSessionState] = useState<SessionState>(() => ({
-    session_id: uid("sess"),
-    plan: DEFAULT_PLAN,
-    companion_key: COMPANION_DISPLAY_NAME,
-    mode: "friend",
-    session_started_at_ms: Date.now(),
-    session_elapsed_seconds: 0,
-    mode_elapsed_seconds: { friend: 0, romantic: 0, intimate: 0, video: 0 },
-    last_client_ts_ms: Date.now(),
-  }));
-
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-
-  const videoModeUrl = (process.env.NEXT_PUBLIC_VIDEO_MODE_URL || "").trim();
-
-  // Auto tick the session timer.
+  // ----------------------------------------------------------------------------
+  // Load companion_key from URL or localStorage, then derive plan/mode/name
+  // ----------------------------------------------------------------------------
   useEffect(() => {
-    const t = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - sessionStartedAtMsRef.current) / 1000));
-    }, 1000);
-    return () => clearInterval(t);
-  }, []);
+    const fromUrl = (searchParams.get("companion_key") || "").trim();
+    const fromLs = typeof window !== "undefined" ? (localStorage.getItem(LS_COMPANION_KEY) || "").trim() : "";
+    const initialKey = fromUrl || fromLs || DEFAULT_COMPANION_KEY;
 
-  // Keep sessionState in sync with timer + mode.
-  useEffect(() => {
-    setSessionState((prev) => {
-      const modeElapsed = { ...(prev.mode_elapsed_seconds || {}) };
-      const currentMode = activeMode;
-      modeElapsed[currentMode] = Math.max(0, (modeElapsed[currentMode] || 0) + 1);
+    setCompanionKey(initialKey);
 
-      return {
-        ...prev,
-        plan: planName,
-        member_id: memberId || prev.member_id,
-        member_email: memberEmail || prev.member_email,
-        companion_key: companionKey || prev.companion_key,
-        mode: activeMode,
-        session_elapsed_seconds: elapsedSeconds,
-        mode_elapsed_seconds: modeElapsed,
-        last_client_ts_ms: Date.now(),
-      };
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [elapsedSeconds]);
-
-  // Scroll chat to bottom when messages change.
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [messages]);
-
-  // Ensure active mode stays allowed when plan changes.
-  useEffect(() => {
-    const { ok, fallback } = ensureAllowedMode(activeMode, planName);
-    if (!ok) setActiveMode(fallback);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planName]);
-
-  // Companion initialization from query params (optional) + postMessage (primary for embeds).
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    // Query params fallback (useful for local dev / direct navigation):
-    const sp = new URLSearchParams(window.location.search);
-    const qpPlan = sp.get("plan");
-    const qpMode = sp.get("mode");
-    const qpCompanionKey = sp.get("companion_key") || sp.get("companionKey");
-
-    if (qpPlan) {
-      const normalizedPlan = String(qpPlan).trim() as PlanName;
-      if (["Free", "Trial", "Starter", "Plus", "Pro"].includes(normalizedPlan)) {
-        setPlanName(normalizedPlan);
-      }
-    }
-    if (qpMode) {
-      const m = normalizeMode(qpMode);
-      if (m) setActiveMode(m);
-    }
-    if (qpCompanionKey) {
-      setCompanionKey(String(qpCompanionKey).trim());
+    if (fromUrl) {
+      try {
+        localStorage.setItem(LS_COMPANION_KEY, fromUrl);
+      } catch {}
     }
 
-    // postMessage handler (Wix, etc.)
-    const onMessage = (event: MessageEvent) => {
-      if (!event?.origin || !isAllowedOrigin(event.origin)) return;
+    const meta = decodeCompanionKey(initialKey);
 
-      const payload = event.data;
-      if (!payload || typeof payload !== "object") return;
+    // Plan default is Trial if missing from key (per requirement)
+    const nextPlan = pickMetaPlan(meta);
+    setPlanName(nextPlan);
 
-      // Normalize payload fields (support camelCase + snake_case)
-      const incomingPlan = (payload.plan || payload.plan_name || payload.planName || DEFAULT_PLAN) as PlanName;
-      const incomingMode = normalizeMode(payload.mode) || "friend";
-      const incomingMemberId = String(payload.memberId || payload.member_id || "");
-      const incomingEmail = String(payload.email || payload.member_email || payload.memberEmail || "");
+    // Mode default is Friend if missing from key (per requirement)
+    const nextMode = pickMetaMode(meta);
 
-      const resolvedCompanionKey = String(
-        payload.companionKey || payload.companion_key || payload.companion || payload.avatar || COMPANION_DISPLAY_NAME
-      );
+    const nextCompanionName = pickMetaCompanionName(meta);
+    setCompanionName(nextCompanionName);
 
-      // Apply
-      if (["Free", "Trial", "Starter", "Plus", "Pro"].includes(incomingPlan)) setPlanName(incomingPlan);
-      if (incomingMemberId) setMemberId(incomingMemberId);
-      if (incomingEmail) setMemberEmail(incomingEmail);
-      if (resolvedCompanionKey) setCompanionKey(resolvedCompanionKey);
+    const nextAvatar = pickMetaAvatarUrl(meta);
+    setAvatarUrl(nextAvatar);
 
-      // Important: if the incoming mode is absent, map to Friend; if it's "Trial", normalizeMode maps to Romantic.
-      setActiveMode(incomingMode);
-    };
+    const nextExplicitAllowed = pickMetaExplicitAllowed(meta);
+    setExplicitAllowed(nextExplicitAllowed);
 
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
-  }, []);
-
-  // iOS / Safari: ensure we have an <audio> element ready.
-  const ensureAudioEl = useCallback(() => {
-    if (!audioRef.current) {
-      audioRef.current = new Audio();
-      audioRef.current.preload = "auto";
+    // If key doesn't specify, fall back to localStorage (optional; does not override explicit requirement defaults)
+    let effectiveMode = nextMode;
+    if (!meta) {
+      const savedMode = (typeof window !== "undefined" ? localStorage.getItem(LS_REL_MODE) : "") || "";
+      effectiveMode = normalizeMode(savedMode);
     }
-    return audioRef.current;
-  }, []);
 
-  // Audio unlock (helps iOS Safari).
-  const unlockAudio = useCallback(async () => {
+    const effectiveAllowed = allowedModesForPlan(nextPlan, nextExplicitAllowed);
+    if (!effectiveAllowed.includes(effectiveMode)) {
+      effectiveMode = effectiveAllowed[0] || DEFAULT_REL_MODE;
+    }
+
+    setMode(effectiveMode);
+    setPendingMode(effectiveMode);
+
+    // Save plan for later pages (optional)
     try {
-      const a = ensureAudioEl();
-      a.src =
-        "data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCA" + "AAAAAAAAAAAAAAAAAAAA"; // tiny stub
-      await a.play();
-      a.pause();
-    } catch {
-      // ignore
-    }
-  }, [ensureAudioEl]);
+      localStorage.setItem(LS_PLAN_NAME, nextPlan);
+      localStorage.setItem(LS_REL_MODE, effectiveMode);
+    } catch {}
+  }, [searchParams]);
 
-  const appendMessage = useCallback((role: ChatMessage["role"], content: string) => {
-    setMessages((prev) => [...prev, { id: uid(role === "user" ? "u" : "a"), role, content, ts: Date.now() }]);
+  // Keep mode legal when plan changes
+  useEffect(() => {
+    if (!allowedModes.includes(mode)) {
+      const fallback = allowedModes[0] || DEFAULT_REL_MODE;
+      setMode(fallback);
+      setPendingMode(fallback);
+      try {
+        localStorage.setItem(LS_REL_MODE, fallback);
+      } catch {}
+    }
+  }, [allowedModes, mode]);
+
+  // ----------------------------------------------------------------------------
+  // Time tracking (session + daily)
+  // ----------------------------------------------------------------------------
+  useEffect(() => {
+    const day = todayKey();
+    const lsKey = `elaralo_daily_seconds_${day}`;
+    try {
+      const stored = parseInt(localStorage.getItem(lsKey) || "0", 10);
+      setDailySeconds(Number.isFinite(stored) ? stored : 0);
+    } catch {
+      setDailySeconds(0);
+    }
+
+    const interval = window.setInterval(() => {
+      setSessionSeconds((s) => s + 1);
+      setDailySeconds((d) => {
+        const nd = d + 1;
+        try {
+          localStorage.setItem(lsKey, String(nd));
+        } catch {}
+        return nd;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(interval);
   }, []);
 
-  const setModeWithPlanGuard = useCallback(
-    (requested: Mode) => {
-      const { ok, fallback } = ensureAllowedMode(requested, planName);
-      if (!ok) {
-        appendMessage(
-          "assistant",
-          `Your current plan (${planLabel(planName)}) does not include ${modeLabel(requested)} mode. Switching to Friend mode.`
-        );
-      }
-      setActiveMode(ok ? requested : fallback);
-    },
-    [appendMessage, planName]
-  );
-
-  // Hands-free STT using Web Speech API (optional).
-  useEffect(() => {
-    if (!handsFreeStt) {
-      // stop if running
-      if (speechRecRef.current) {
-        try {
-          speechRecRef.current.stop();
-        } catch {}
-      }
-      setSpeechStatus("off");
-      return;
-    }
-
-    if (typeof window === "undefined") return;
-
-    const SpeechRecognition: any =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition || null;
-
+  // ----------------------------------------------------------------------------
+  // STT: Browser speech recognition
+  // ----------------------------------------------------------------------------
+  const startListening = () => {
+    const w = window as any;
+    const SpeechRecognition = w.SpeechRecognition || w.webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      setSpeechStatus("unavailable");
+      setStatus("Speech Recognition is not supported in this browser.");
       return;
     }
 
     const rec = new SpeechRecognition();
-    speechRecRef.current = rec;
-
-    rec.continuous = true;
+    rec.continuous = false;
     rec.interimResults = true;
     rec.lang = "en-US";
 
-    let interim = "";
-
-    rec.onstart = () => setSpeechStatus("listening");
-    rec.onerror = () => setSpeechStatus("error");
-    rec.onend = () => {
-      // try to keep alive
-      if (handsFreeStt) {
-        try {
-          rec.start();
-        } catch {}
-      } else {
-        setSpeechStatus("off");
-      }
-    };
-
     rec.onresult = (event: any) => {
-      let finalText = "";
-      interim = "";
-
+      let transcript = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const r = event.results[i];
-        const transcript = String(r[0]?.transcript || "");
-        if (r.isFinal) finalText += transcript;
-        else interim += transcript;
+        transcript += event.results[i][0].transcript;
       }
-
-      if (finalText.trim()) {
-        setInput((prev) => (prev ? prev : "") + finalText.trim() + " ");
-      }
+      setInput((prev) => {
+        // if user already typed, append; otherwise replace
+        const base = prev.trim().length ? prev.trim() + " " : "";
+        return (base + transcript).trimStart();
+      });
     };
 
+    rec.onerror = () => {
+      setListening(false);
+      setStatus("Speech recognition error.");
+    };
+
+    rec.onend = () => setListening(false);
+
+    recognitionRef.current = rec;
+    setListening(true);
+    setStatus("");
+    rec.start();
+  };
+
+  const stopListening = () => {
     try {
-      rec.start();
-    } catch {
-      setSpeechStatus("error");
-    }
+      recognitionRef.current?.stop?.();
+    } catch {}
+    setListening(false);
+  };
 
-    return () => {
+  // ----------------------------------------------------------------------------
+  // TTS helpers
+  // ----------------------------------------------------------------------------
+  const stopTts = () => {
+    // Stop hidden video playback
+    const vid = ttsVideoRef.current;
+    if (vid) {
       try {
-        rec.stop();
+        vid.pause();
+        vid.removeAttribute("src");
+        vid.load();
       } catch {}
-      speechRecRef.current = null;
-    };
-  }, [handsFreeStt]);
+    }
+    // Stop browser speech synthesis
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {}
+    }
+  };
 
-  // Backend STT via MediaRecorder -> /stt/transcribe
-  const startRecording = useCallback(async () => {
-    if (!sttEnabled) return;
-
-    await unlockAudio();
-
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-      appendMessage("assistant", "Microphone capture is not supported in this browser.");
+  const speakWithBrowser = async (text: string) => {
+    if (typeof window === "undefined") return;
+    if (!("speechSynthesis" in window)) {
+      setStatus("Browser TTS is not available.");
       return;
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeTypeCandidates = [
-        "audio/webm;codecs=opus",
-        "audio/webm",
-        "audio/ogg;codecs=opus",
-        "audio/ogg",
-        "audio/mp4",
-      ];
-      const chosenMime = mimeTypeCandidates.find((m) => (window as any).MediaRecorder?.isTypeSupported?.(m)) || "";
-
-      recordedChunksRef.current = [];
-      const rec = new MediaRecorder(stream, chosenMime ? { mimeType: chosenMime } : undefined);
-      mediaRecorderRef.current = rec;
-
-      rec.ondataavailable = (e: BlobEvent) => {
-        if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data);
-      };
-
-      rec.onstop = async () => {
-        setIsRecording(false);
-
-        // stop tracks
-        for (const t of stream.getTracks()) t.stop();
-
-        const blob = new Blob(recordedChunksRef.current, { type: chosenMime || "audio/webm" });
-        recordedChunksRef.current = [];
-
-        // send to backend
-        try {
-          const url = (API_BASE ? `${API_BASE}` : "") + "/stt/transcribe";
-          const form = new FormData();
-          form.append("audio", blob, "audio.webm");
-          form.append("companion_key", companionKey);
-          form.append("member_id", memberId);
-          form.append("plan", planName);
-
-          const res = await fetch(url, { method: "POST", body: form });
-          if (!res.ok) {
-            const t = await res.text();
-            appendMessage("assistant", `STT failed (${res.status}): ${t}`);
-            return;
-          }
-          const data = await res.json();
-          const text = String(data.text || "").trim();
-          if (text) setInput(text);
-        } catch (e: any) {
-          appendMessage("assistant", `STT error: ${String(e?.message || e)}`);
-        }
-      };
-
-      rec.start(250);
-      setIsRecording(true);
-    } catch (e: any) {
-      appendMessage("assistant", `Could not start recording: ${String(e?.message || e)}`);
-    }
-  }, [API_BASE, appendMessage, companionKey, memberId, planName, sttEnabled, unlockAudio]);
-
-  const stopRecording = useCallback(() => {
-    const rec = mediaRecorderRef.current;
-    if (!rec) return;
-    try {
-      rec.stop();
-    } catch {}
-    mediaRecorderRef.current = null;
-  }, []);
-
-  // Video-mode TTS (no ElevenLabs): browser speech synthesis
-  const speakInVideoMode = useCallback(async (text: string) => {
-    if (typeof window === "undefined") return;
-    const synth = window.speechSynthesis;
-    if (!synth) return;
-
-    try {
-      synth.cancel();
+      window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
-      u.lang = "en-US";
       u.rate = 1.0;
       u.pitch = 1.0;
-      synth.speak(u);
+      window.speechSynthesis.speak(u);
     } catch {
-      // ignore
+      setStatus("Browser TTS failed.");
     }
-  }, []);
+  };
 
-  // Audio-mode TTS: ElevenLabs via backend /tts/audio-url
-  const speakWithAudioTts = useCallback(
-    async (text: string) => {
-      if (!text.trim()) return;
-
-      await unlockAudio();
-
-      const url = (API_BASE ? `${API_BASE}` : "") + "/tts/audio-url";
-      const payload = {
-        text,
-        voice_id: DEFAULT_ELEVENLABS_VOICE_ID,
-        companion_key: companionKey,
-        plan: planName,
-        member_id: memberId,
-      };
-
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const t = await res.text();
-        appendMessage("assistant", `TTS failed (${res.status}): ${t}`);
-        return;
-      }
-
-      const data = await res.json();
-      let audioUrl = String(data.audio_url || "").trim();
-      if (!audioUrl) {
-        appendMessage("assistant", "TTS failed: missing audio_url.");
-        return;
-      }
-
-      // If backend returns a relative URL, prefix with API_BASE.
-      if (audioUrl.startsWith("/") && API_BASE) audioUrl = `${API_BASE}${audioUrl}`;
-
-      const a = ensureAudioEl();
-      a.src = audioUrl;
-      a.crossOrigin = "anonymous";
-      a.currentTime = 0;
-      await a.play();
-    },
-    [API_BASE, appendMessage, companionKey, ensureAudioEl, memberId, planName, unlockAudio]
-  );
-
-  const maybeSpeakAssistant = useCallback(
-    async (text: string) => {
-      if (!ttsEnabled) return;
-
-      // No ElevenLabs in Video Mode; use browser TTS.
-      if (activeMode === "video") {
-        await speakInVideoMode(text);
-        return;
-      }
-
-      await speakWithAudioTts(text);
-    },
-    [activeMode, speakInVideoMode, speakWithAudioTts, ttsEnabled]
-  );
-
-  // Chat call -> backend /chat
-  const callChat = useCallback(
-    async (userText: string, mode: Mode): Promise<string> => {
-      const url = (API_BASE ? `${API_BASE}` : "") + "/chat";
-
-      const body = {
-        message: userText,
-        mode,
-        companion_key: companionKey,
-        plan: planName,
-        member_id: memberId,
-        member_email: memberEmail,
-        session_state: sessionState,
-      };
-
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        const t = await res.text();
-        throw new Error(`Chat failed (${res.status}): ${t}`);
-      }
-
-      const data = await res.json();
-      const reply = String(data.reply || "").trim() || "…";
-      const ss = data.session_state || null;
-
-      if (ss && typeof ss === "object") {
-        setSessionState((prev) => ({ ...prev, ...ss }));
-      }
-
-      return reply;
-    },
-    [API_BASE, companionKey, memberEmail, memberId, planName, sessionState]
-  );
-
-  // Save chat summary (optional; no-op backend is fine)
-  const saveChatSummary = useCallback(async () => {
+  const speakWithElevenLabs = async (text: string) => {
+    if (!text.trim()) return;
+    setTtsBusy(true);
+    setStatus("");
     try {
-      const url = (API_BASE ? `${API_BASE}` : "") + "/chat/save-summary";
-      const payload = {
-        companion_key: companionKey,
-        plan: planName,
-        member_id: memberId,
-        session_state: sessionState,
-        messages: messages.slice(-30),
-      };
-      await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    } catch {
-      // ignore
-    }
-  }, [API_BASE, companionKey, memberId, messages, planName, sessionState]);
+      const resp = await fetch(`${API_BASE}/tts/audio-url`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          text,
+          companion_key: companionKey || DEFAULT_COMPANION_KEY,
+        }),
+      });
 
-  const send = useCallback(async () => {
-    const raw = input.trim();
-    if (!raw) return;
-
-    // Mode switch detection embedded in user input
-    const { mode: requestedMode, cleaned } = detectModeSwitchAndClean(raw);
-    const usedText = cleaned || raw;
-
-    let nextMode = activeMode;
-
-    if (requestedMode) {
-      const { ok, fallback } = ensureAllowedMode(requestedMode, planName);
-      nextMode = ok ? requestedMode : fallback;
-      setActiveMode(nextMode);
-
-      if (!ok) {
-        appendMessage(
-          "assistant",
-          `Your current plan (${planLabel(planName)}) does not include ${modeLabel(requestedMode)} mode. Staying in Friend mode.`
-        );
+      if (!resp.ok) {
+        const err = await resp.text();
+        throw new Error(err || `TTS failed (${resp.status})`);
       }
+
+      const data = await resp.json();
+      const audioUrl = data.audio_url as string;
+
+      const vid = ttsVideoRef.current;
+      if (!vid) {
+        throw new Error("Hidden video element not available.");
+      }
+
+      // Important: Audio Mode uses a hidden <video> element for stable playback.
+      vid.pause();
+      vid.src = audioUrl;
+      vid.load();
+
+      // Attempt play; on iOS/Safari this requires a user gesture (Send / Speak button click satisfies)
+      await vid.play();
+    } finally {
+      setTtsBusy(false);
+    }
+  };
+
+  const speak = async (text: string) => {
+    // Video Mode: no ElevenLabs; use browser TTS (vendor-agnostic)
+    if (experienceMode === "video") {
+      await speakWithBrowser(text);
+      return;
     }
 
+    // Chat/Audio: ElevenLabs audio URL
+    await speakWithElevenLabs(text);
+  };
+
+  // ----------------------------------------------------------------------------
+  // Chat send
+  // ----------------------------------------------------------------------------
+  const appendMessage = (role: ChatRole, content: string) => {
+    const msg: UiMessage = { id: uuid(), role, content, ts: Date.now() };
+    setMessages((m) => [...m, msg]);
+    return msg;
+  };
+
+  const clearChat = () => {
+    stopTts();
+    setMessages([]);
     setInput("");
-    appendMessage("user", usedText);
+    setStatus("");
+    setSessionId(uuid());
+  };
+
+  const commitMode = () => {
+    if (!allowedModes.includes(pendingMode)) return;
+
+    setMode(pendingMode);
+    try {
+      localStorage.setItem(LS_REL_MODE, pendingMode);
+    } catch {}
+    setStatus(`Mode set to ${pendingMode === "friend" ? "Friend" : pendingMode === "romantic" ? "Romantic" : "Intimate"}.`);
+  };
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
+
+    setSending(true);
+    setStatus("");
+
+    appendMessage("user", text);
+    setInput("");
+
+    // Build history in the shape backend expects
+    const history = messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .slice(-24)
+      .map((m) => ({ role: m.role, content: m.content }));
 
     try {
-      const reply = await callChat(usedText, nextMode);
-      appendMessage("assistant", reply);
-      await maybeSpeakAssistant(reply);
-      void saveChatSummary();
-    } catch (e: any) {
-      appendMessage("assistant", String(e?.message || e));
-    }
-  }, [activeMode, appendMessage, callChat, input, maybeSpeakAssistant, planName, saveChatSummary]);
+      const resp = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          message: text,
+          history,
+          companion_key: companionKey || DEFAULT_COMPANION_KEY,
+          session_state: {
+            companion_key: companionKey || DEFAULT_COMPANION_KEY,
+            companion_name: companionName,
+            plan_name: planName,
+            mode,
+            explicit_allowed: explicitAllowed,
+          },
+        }),
+      });
 
-  const onKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        void send();
+      if (!resp.ok) {
+        const err = await resp.text();
+        throw new Error(err || `Chat failed (${resp.status})`);
       }
-    },
-    [send]
-  );
 
-  const goToPricing = useCallback(() => {
-    if (typeof window === "undefined") return;
-    window.open("https://www.elaralo.com/pricing-plans/list", "_blank", "noreferrer");
-  }, []);
+      const data = await resp.json();
+      const reply = (data.reply || "").toString();
+      appendMessage("assistant", reply);
 
-  const goToMyElaralo = useCallback(() => {
-    if (typeof window === "undefined") return;
-    window.open("https://www.elaralo.com/myelaralo", "_blank", "noreferrer");
-  }, []);
+      // Auto-speak in Audio and Video modes
+      if (experienceMode === "audio" || experienceMode === "video") {
+        await speak(reply);
+      }
+    } catch (e: any) {
+      setStatus(e?.message || "Chat failed.");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const onKeyDown: React.KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
+    // Enter to send; Shift+Enter for newline
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  };
+
+  // ----------------------------------------------------------------------------
+  // UI helpers
+  // ----------------------------------------------------------------------------
+  const modeLabel = (m: RelationshipMode) => {
+    if (m === "friend") return "Friend";
+    if (m === "romantic") return "Romantic";
+    return "Intimate";
+  };
+
+  const pillStyle = (m: RelationshipMode, active: boolean, pending: boolean) => {
+    const isActive = active;
+    const isPending = pending && !active;
+
+    return {
+      padding: "10px 12px",
+      borderRadius: 999,
+      border: isActive
+        ? "1px solid rgba(122, 162, 247, 0.55)"
+        : isPending
+        ? "1px solid rgba(255,255,255,0.38)"
+        : "1px solid rgba(255,255,255,0.16)",
+      background: isActive
+        ? "rgba(122, 162, 247, 0.18)"
+        : isPending
+        ? "rgba(255,255,255,0.10)"
+        : "rgba(255,255,255,0.06)",
+      color: "rgba(255,255,255,0.92)",
+      cursor: "pointer",
+      fontWeight: 800,
+      fontSize: 12.5,
+      userSelect: "none" as const,
+    };
+  };
+
+  // ----------------------------------------------------------------------------
+  // D‑ID placeholder (kept for future use — intentionally commented out)
+  // ----------------------------------------------------------------------------
+  /*
+  // NOTE: Elaralo Video Mode does NOT use avatar synthesis vendors in current release.
+  // The below is retained for possible future iteration.
+
+  const [didSessionId, setDidSessionId] = useState<string | null>(null);
+  const [didStreamUrl, setDidStreamUrl] = useState<string | null>(null);
+
+  async function startDidAvatarSession() {
+    // 1) Call backend to create D‑ID session
+    // 2) Attach WebRTC stream
+    // 3) Drive speaking by sending audio URLs or phonemes
+  }
+  */
 
   return (
-    <main style={ui.shell}>
-      <div style={ui.container}>
+    <main style={{ minHeight: "100vh", padding: 18, background: "linear-gradient(180deg, #070A12, #05060B)" }}>
+      {/* Hidden video element for stable audio playback (Audio/Chat mode) */}
+      <video
+        ref={ttsVideoRef}
+        playsInline
+        // Keep it truly hidden but still usable
+        style={{ position: "absolute", left: -9999, top: -9999, width: 1, height: 1, opacity: 0 }}
+      />
+
+      <div style={{ maxWidth: 1100, margin: "0 auto" }}>
         {/* Header */}
-        <header style={ui.header}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <header
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 16,
+            padding: 16,
+            borderRadius: 16,
+            background: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.10)",
+            boxShadow: "0 14px 40px rgba(0,0,0,0.35)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
             <img
-              src={DEFAULT_AVATAR_SRC}
-              alt={BRAND}
-              width={44}
-              height={44}
-              style={{ borderRadius: 9999, display: "block" }}
+              src={avatarUrl || DEFAULT_AVATAR_URL}
+              alt="Elaralo"
+              width={56}
+              height={56}
+              style={{
+                borderRadius: 16,
+                border: "1px solid rgba(255,255,255,0.12)",
+                background: "rgba(0,0,0,0.25)",
+              }}
             />
             <div>
-              <div style={{ fontSize: 18, fontWeight: 800 }}>{BRAND}</div>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>Companion: {COMPANION_DISPLAY_NAME}</div>
+              <div style={{ fontSize: 18, fontWeight: 900, letterSpacing: 0.2 }}>
+                {companionName}
+              </div>
+              <div style={{ color: "rgba(255,255,255,0.78)", fontSize: 13, marginTop: 2 }}>
+                Plan: <span style={{ fontWeight: 800 }}>{planName}</span>
+                <span style={{ marginLeft: 10 }}>
+                  Active Mode: <span style={{ fontWeight: 800 }}>{modeLabel(mode)}</span>
+                </span>
+              </div>
+              <div style={{ color: "rgba(255,255,255,0.60)", fontSize: 12, marginTop: 4 }}>
+                Session: {formatSeconds(sessionSeconds)} • Today: {formatSeconds(dailySeconds)}
+              </div>
             </div>
           </div>
 
-          <div style={ui.headerRight}>
-            <div style={ui.planPill}>
-              <div style={{ fontSize: 11, opacity: 0.8 }}>Plan</div>
-              <div style={{ fontSize: 13, fontWeight: 800 }}>{planLabel(planName)}</div>
-            </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {/* Experience mode pills */}
+            {(["chat", "audio", "video"] as ExperienceMode[]).map((m) => {
+              const active = experienceMode === m;
+              const label = m === "chat" ? "Chat" : m === "audio" ? "Audio" : "Video";
+              return (
+                <button
+                  key={m}
+                  onClick={() => {
+                    stopTts();
+                    setStatus("");
+                    setExperienceMode(m);
+                  }}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 999,
+                    border: active ? "1px solid rgba(122, 162, 247, 0.55)" : "1px solid rgba(255,255,255,0.16)",
+                    background: active ? "rgba(122, 162, 247, 0.18)" : "rgba(255,255,255,0.06)",
+                    color: "rgba(255,255,255,0.92)",
+                    cursor: "pointer",
+                    fontWeight: 900,
+                    fontSize: 12.5,
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
 
-            <div style={ui.planPill}>
-              <div style={{ fontSize: 11, opacity: 0.8 }}>Time</div>
-              <div style={{ fontSize: 13, fontWeight: 800 }}>{formatHMS(elapsedSeconds)}</div>
-            </div>
-
-            <button type="button" onClick={goToMyElaralo} style={ui.smallButton}>
-              My Elaralo
-            </button>
-
-            <button type="button" onClick={goToPricing} style={ui.smallButton}>
-              Upgrade
+            <button
+              onClick={clearChat}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 999,
+                border: "1px solid rgba(255,255,255,0.16)",
+                background: "rgba(255,255,255,0.06)",
+                color: "rgba(255,255,255,0.92)",
+                cursor: "pointer",
+                fontWeight: 900,
+                fontSize: 12.5,
+              }}
+            >
+              New Session
             </button>
           </div>
         </header>
 
-        {/* Main layout */}
-        <div style={ui.mainGrid}>
-          {/* Left: Avatar / Video + Mode */}
-          <section style={ui.leftCol}>
-            <div style={ui.card}>
-              <div style={ui.cardTitleRow}>
-                <div style={ui.cardTitle}>Mode</div>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  Active: <b>{modeLabel(activeMode)}</b>
+        {/* Relationship mode selection */}
+        <section
+          style={{
+            marginTop: 14,
+            padding: 16,
+            borderRadius: 16,
+            background: "rgba(255,255,255,0.05)",
+            border: "1px solid rgba(255,255,255,0.10)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+            <div style={{ fontSize: 14, fontWeight: 900 }}>Relationship Mode</div>
+
+            <button
+              onClick={commitMode}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 12,
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid rgba(255,255,255,0.14)",
+                color: "rgba(255,255,255,0.90)",
+                cursor: "pointer",
+                fontWeight: 900,
+              }}
+            >
+              Set Mode
+            </button>
+          </div>
+
+          {/* Pills are always visible under Set Mode (not condensed) */}
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+            {allowedModes.map((m) => (
+              <div
+                key={m}
+                onClick={() => setPendingMode(m)}
+                style={pillStyle(m, mode === m, pendingMode === m)}
+                title={modeLabel(m)}
+              >
+                {modeLabel(m)}
+              </div>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 10, color: "rgba(255,255,255,0.60)", fontSize: 12 }}>
+            Only modes included in the member’s plan are shown. Trial maps to Romantic. No disabled pills are selectable.
+          </div>
+        </section>
+
+        {/* Video Mode */}
+        {experienceMode === "video" && (
+          <section
+            style={{
+              marginTop: 14,
+              padding: 16,
+              borderRadius: 16,
+              background: "rgba(255,255,255,0.05)",
+              border: "1px solid rgba(255,255,255,0.10)",
+            }}
+          >
+            <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 10 }}>Live Video</div>
+            {VIDEO_MODE_URL ? (
+              <iframe
+                src={VIDEO_MODE_URL}
+                style={{
+                  width: "100%",
+                  height: 520,
+                  borderRadius: 16,
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  background: "rgba(0,0,0,0.40)",
+                }}
+                allow="camera; microphone; fullscreen; speaker; display-capture"
+              />
+            ) : (
+              <div style={{ color: "rgba(255,255,255,0.72)", fontSize: 13 }}>
+                Set <code>NEXT_PUBLIC_ELARALO_VIDEO_MODE_URL</code> to an embeddable video-conference or streaming URL.
+                <div style={{ marginTop: 8, color: "rgba(255,255,255,0.55)" }}>
+                  Video Mode does not use avatar synthesis vendors. TTS and STT still run (browser TTS + browser speech recognition).
                 </div>
               </div>
-
-              <div style={{ display: "grid", gap: 10 }}>
-                <button
-                  type="button"
-                  onClick={() => setShowModePills((v) => !v)}
-                  style={ui.primaryButton}
-                >
-                  Set Mode
-                </button>
-
-                {/* Per your request: pills remain un-condensed; only allowed pills are shown; no disabled pills. */}
-                {showModePills && (
-                  <ModePills
-                    allowed={allowedModes}
-                    active={activeMode}
-                    onPick={(m) => setModeWithPlanGuard(m)}
-                  />
-                )}
-              </div>
-            </div>
-
-            <div style={ui.card}>
-              <div style={ui.cardTitleRow}>
-                <div style={ui.cardTitle}>Video</div>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  {activeMode === "video" ? "Video Mode is ON" : "Switch to Video mode to open the conference/stream."}
-                </div>
-              </div>
-
-              {activeMode !== "video" ? (
-                <div style={{ fontSize: 12, opacity: 0.85 }}>
-                  Video Mode is a hosted video conference or streaming video experience. It does not use avatar synthesis
-                  vendors. STT and TTS remain available in all modes.
-                </div>
-              ) : (
-                <div style={{ display: "grid", gap: 10 }}>
-                  {videoModeUrl ? (
-                    <iframe
-                      title="Video Mode"
-                      src={videoModeUrl}
-                      style={{
-                        width: "100%",
-                        height: 360,
-                        border: "1px solid rgba(255,255,255,0.12)",
-                        borderRadius: 12,
-                        background: "#000",
-                      }}
-                      allow="camera; microphone; fullscreen; display-capture"
-                    />
-                  ) : (
-                    <div style={{ fontSize: 12, opacity: 0.85 }}>
-                      Set <code>NEXT_PUBLIC_VIDEO_MODE_URL</code> to embed your video conference or streaming URL.
-                    </div>
-                  )}
-
-                  {videoModeUrl && (
-                    <HoverLink href={videoModeUrl} target="_blank" rel="noreferrer">
-                      Open video in new tab
-                    </HoverLink>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div style={ui.card}>
-              <div style={ui.cardTitleRow}>
-                <div style={ui.cardTitle}>Quick Links</div>
-              </div>
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <Link href="/" style={ui.linkLike}>
-                  Home
-                </Link>
-                <HoverLink href="/docs">Docs</HoverLink>
-                <HoverLink href="/site">Site</HoverLink>
-                <HoverLink href={(API_BASE ? `${API_BASE}` : "") + "/health"} target="_blank" rel="noreferrer">
-                  API Health
-                </HoverLink>
-              </div>
-            </div>
+            )}
           </section>
+        )}
 
-          {/* Right: Chat + Controls */}
-          <section style={ui.rightCol}>
-            <div style={{ ...ui.card, height: "100%", display: "flex", flexDirection: "column" }}>
-              <div style={ui.cardTitleRow}>
-                <div style={ui.cardTitle}>Chat</div>
-                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <label style={ui.toggleLabel}>
-                    <input
-                      type="checkbox"
-                      checked={ttsEnabled}
-                      onChange={(e) => setTtsEnabled(e.target.checked)}
-                    />
-                    <span style={{ marginLeft: 6 }}>TTS</span>
-                  </label>
+        {/* Chat */}
+        <section
+          style={{
+            marginTop: 14,
+            padding: 16,
+            borderRadius: 16,
+            background: "rgba(255,255,255,0.05)",
+            border: "1px solid rgba(255,255,255,0.10)",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+            <div style={{ fontSize: 14, fontWeight: 900 }}>Conversation</div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                onClick={() => stopTts()}
+                disabled={ttsBusy}
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: 12,
+                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  color: "rgba(255,255,255,0.90)",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  fontSize: 12.5,
+                  opacity: ttsBusy ? 0.6 : 1,
+                }}
+              >
+                Stop Audio
+              </button>
 
-                  <label style={ui.toggleLabel}>
-                    <input
-                      type="checkbox"
-                      checked={sttEnabled}
-                      onChange={(e) => setSttEnabled(e.target.checked)}
-                    />
-                    <span style={{ marginLeft: 6 }}>Mic STT</span>
-                  </label>
+              <button
+                onClick={() => {
+                  const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+                  if (lastAssistant) speak(lastAssistant.content);
+                }}
+                disabled={ttsBusy || messages.length === 0}
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: 12,
+                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  color: "rgba(255,255,255,0.90)",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  fontSize: 12.5,
+                  opacity: ttsBusy ? 0.6 : 1,
+                }}
+              >
+                Speak Last
+              </button>
+            </div>
+          </div>
 
-                  <label style={ui.toggleLabel}>
-                    <input
-                      type="checkbox"
-                      checked={handsFreeStt}
-                      onChange={(e) => setHandsFreeStt(e.target.checked)}
-                    />
-                    <span style={{ marginLeft: 6 }}>Hands-free</span>
-                  </label>
-                </div>
+          <div
+            style={{
+              marginTop: 12,
+              borderRadius: 16,
+              border: "1px solid rgba(255,255,255,0.10)",
+              background: "rgba(0,0,0,0.30)",
+              padding: 14,
+              minHeight: 260,
+              maxHeight: 420,
+              overflow: "auto",
+            }}
+          >
+            {messages.length === 0 ? (
+              <div style={{ color: "rgba(255,255,255,0.55)", fontSize: 13 }}>
+                Start a conversation with {companionName}. Audio mode will speak responses automatically.
               </div>
-
-              {handsFreeStt && (
-                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
-                  Hands-free STT status: <b>{speechStatus}</b>
-                </div>
-              )}
-
-              <div ref={scrollRef} style={ui.chatScroll}>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 {messages.map((m) => (
-                  <div key={m.id} style={m.role === "user" ? ui.userMsg : ui.assistantMsg}>
-                    <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 4 }}>
-                      {m.role === "user" ? "You" : COMPANION_DISPLAY_NAME} •{" "}
-                      {new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  <div key={m.id} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
+                    <div
+                      style={{
+                        maxWidth: "82%",
+                        padding: "10px 12px",
+                        borderRadius: 14,
+                        border: "1px solid rgba(255,255,255,0.10)",
+                        background: m.role === "user" ? "rgba(122, 162, 247, 0.16)" : "rgba(255,255,255,0.06)",
+                        color: "rgba(255,255,255,0.92)",
+                        whiteSpace: "pre-wrap",
+                        lineHeight: 1.45,
+                        fontSize: 13.5,
+                      }}
+                    >
+                      <div style={{ fontWeight: 900, fontSize: 11.5, color: "rgba(255,255,255,0.65)", marginBottom: 6 }}>
+                        {m.role === "user" ? "You" : companionName}
+                      </div>
+                      {m.content}
                     </div>
-                    <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.35 }}>{m.content}</div>
                   </div>
                 ))}
               </div>
-
-              <div style={{ display: "grid", gap: 10, marginTop: 10 }}>
-                <textarea
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={onKeyDown}
-                  placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-                  style={ui.textarea}
-                  rows={3}
-                />
-
-                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <button type="button" onClick={() => void send()} style={ui.primaryButton}>
-                    Send
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => void unlockAudio()}
-                    style={ui.secondaryButton}
-                    title="If iOS Safari blocks audio until user interaction, click once."
-                  >
-                    Unlock Audio
-                  </button>
-
-                  <button
-                    type="button"
-                    disabled={!sttEnabled}
-                    onClick={() => {
-                      if (!sttEnabled) return;
-                      if (!isRecording) void startRecording();
-                      else stopRecording();
-                    }}
-                    style={{
-                      ...ui.secondaryButton,
-                      opacity: sttEnabled ? 1 : 0.5,
-                    }}
-                    title={!sttEnabled ? "Enable Mic STT first" : isRecording ? "Stop recording" : "Start recording"}
-                  >
-                    {isRecording ? "Stop Mic" : "Start Mic"}
-                  </button>
-                </div>
-
-                <details style={{ marginTop: 6 }}>
-                  <summary style={{ cursor: "pointer", opacity: 0.85, fontSize: 12 }}>Debug</summary>
-                  <div style={{ fontSize: 12, opacity: 0.85, marginTop: 8, lineHeight: 1.35 }}>
-                    <div>
-                      <b>API_BASE</b>: {API_BASE || "(same-origin)"}
-                    </div>
-                    <div>
-                      <b>member_id</b>: {memberId || "(not set)"}
-                    </div>
-                    <div>
-                      <b>member_email</b>: {memberEmail || "(not set)"}
-                    </div>
-                    <div>
-                      <b>companion_key</b>: {companionKey || "(not set)"}
-                    </div>
-                    <div>
-                      <b>allowed_modes</b>: {allowedModes.join(", ")}
-                    </div>
-                    <div>
-                      <b>session_id</b>: {sessionState.session_id}
-                    </div>
-                  </div>
-                </details>
-              </div>
-            </div>
-          </section>
-        </div>
-
-        <footer style={ui.footer}>
-          <div style={{ opacity: 0.7 }}>
-            Tip: If you’re embedding this page in another site, send a <code>postMessage</code> payload containing
-            <code> plan</code>, <code>member_id</code>, and <code>companion_key</code>.
+            )}
           </div>
-        </footer>
+
+          <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "flex-start" }}>
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={onKeyDown}
+              rows={3}
+              placeholder={experienceMode === "video" ? "Type here… (Video Mode uses browser TTS)" : "Type here…"}
+              style={{
+                flex: 1,
+                resize: "vertical",
+                borderRadius: 14,
+                padding: 12,
+                background: "rgba(0,0,0,0.35)",
+                border: "1px solid rgba(255,255,255,0.12)",
+                color: "rgba(255,255,255,0.92)",
+                outline: "none",
+                fontSize: 13.5,
+                lineHeight: 1.4,
+              }}
+            />
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <button
+                onClick={send}
+                disabled={sending || !input.trim()}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  background: sending ? "rgba(255,255,255,0.06)" : "rgba(122, 162, 247, 0.18)",
+                  border: sending ? "1px solid rgba(255,255,255,0.12)" : "1px solid rgba(122, 162, 247, 0.32)",
+                  color: "rgba(255,255,255,0.92)",
+                  cursor: sending ? "not-allowed" : "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                {sending ? "Sending…" : "Send"}
+              </button>
+
+              <button
+                onClick={listening ? stopListening : startListening}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  background: listening ? "rgba(239, 68, 68, 0.18)" : "rgba(255,255,255,0.06)",
+                  border: listening ? "1px solid rgba(239, 68, 68, 0.35)" : "1px solid rgba(255,255,255,0.12)",
+                  color: "rgba(255,255,255,0.92)",
+                  cursor: "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                {listening ? "Stop Mic" : "Mic"}
+              </button>
+            </div>
+          </div>
+
+          {status && (
+            <div style={{ marginTop: 10, color: "rgba(255,255,255,0.70)", fontSize: 12 }}>
+              {status}
+            </div>
+          )}
+
+          <div style={{ marginTop: 10, color: "rgba(255,255,255,0.55)", fontSize: 12 }}>
+            Backend: <code>{API_BASE}</code>
+          </div>
+        </section>
       </div>
     </main>
   );
 }
-
-const ui: Record<string, React.CSSProperties> = {
-  shell: {
-    minHeight: "100vh",
-    background: "radial-gradient(1200px 600px at 20% 0%, rgba(255,255,255,0.08), transparent 60%), #0b0b0b",
-    padding: 18,
-  },
-  container: { maxWidth: 1200, margin: "0 auto" },
-  header: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: 12,
-    padding: 14,
-    borderRadius: 14,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.04)",
-  },
-  headerRight: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" },
-  planPill: {
-    padding: "8px 10px",
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.04)",
-    minWidth: 86,
-    textAlign: "center",
-  },
-  smallButton: {
-    cursor: "pointer",
-    borderRadius: 10,
-    padding: "10px 12px",
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(255,255,255,0.04)",
-    color: "#fff",
-    fontWeight: 700,
-    fontSize: 12,
-  },
-  mainGrid: {
-    marginTop: 14,
-    display: "grid",
-    gridTemplateColumns: "360px 1fr",
-    gap: 14,
-  },
-  leftCol: { display: "grid", gap: 14 },
-  rightCol: { minHeight: 680 },
-  card: {
-    border: "1px solid rgba(255,255,255,0.12)",
-    borderRadius: 14,
-    background: "rgba(255,255,255,0.04)",
-    padding: 14,
-  },
-  cardTitleRow: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 10 },
-  cardTitle: { fontWeight: 800, fontSize: 13, letterSpacing: 0.3 },
-  primaryButton: {
-    cursor: "pointer",
-    borderRadius: 12,
-    padding: "12px 14px",
-    border: "1px solid rgba(255,255,255,0.18)",
-    background: "rgba(255,255,255,0.10)",
-    color: "#fff",
-    fontWeight: 800,
-    fontSize: 13,
-    textAlign: "center",
-  },
-  secondaryButton: {
-    cursor: "pointer",
-    borderRadius: 12,
-    padding: "12px 14px",
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(255,255,255,0.04)",
-    color: "#fff",
-    fontWeight: 700,
-    fontSize: 13,
-  },
-  toggleLabel: {
-    display: "inline-flex",
-    alignItems: "center",
-    fontSize: 12,
-    opacity: 0.9,
-    userSelect: "none",
-    gap: 6,
-  },
-  chatScroll: {
-    flex: 1,
-    overflowY: "auto",
-    border: "1px solid rgba(255,255,255,0.10)",
-    borderRadius: 12,
-    padding: 12,
-    background: "rgba(0,0,0,0.25)",
-    minHeight: 380,
-  },
-  userMsg: {
-    marginBottom: 10,
-    padding: 12,
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.06)",
-  },
-  assistantMsg: {
-    marginBottom: 10,
-    padding: 12,
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.10)",
-    background: "rgba(255,255,255,0.03)",
-  },
-  textarea: {
-    width: "100%",
-    resize: "vertical",
-    borderRadius: 12,
-    padding: 12,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(0,0,0,0.25)",
-    color: "#fff",
-    outline: "none",
-    fontSize: 13,
-    lineHeight: 1.35,
-  },
-  linkLike: {
-    display: "inline-block",
-    padding: "8px 10px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.04)",
-    textDecoration: "none",
-    fontSize: 12,
-  },
-  footer: { marginTop: 12, padding: 6, fontSize: 12 },
-};

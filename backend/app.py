@@ -1,381 +1,396 @@
+\
+from __future__ import annotations
+
+import base64
 import os
 import time
-import uuid
-from io import BytesIO
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 try:
-    # Optional dependency; only required if you want OpenAI-backed chat + STT.
-    from openai import OpenAI  # type: ignore
+    from openai import OpenAI
 except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore
 
 
-# -----------------------------
-# Configuration
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 
-APP_NAME = "elaralo-api"
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "rJ9XoWu8gbUhVKZnKY8X")
+DEFAULT_ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # safe default; override in App Settings
-OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip()
-
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
-ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
-DEFAULT_ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "rJ9XoWu8gbUhVKZnKY8X").strip()
-
-# Audio cache on disk (shared across gunicorn workers). Azure App Service: /home is writable & persistent.
-TTS_CACHE_DIR = os.getenv("TTS_CACHE_DIR", "/home/elaralo/tts_cache").strip()
-TTS_CACHE_TTL_SECONDS = int(os.getenv("TTS_CACHE_TTL_SECONDS", "3600"))  # 1 hour
-
-# CORS
-# Comma-separated list. Use "*" only if you understand the implications.
-CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
+if CORS_ALLOW_ORIGINS.strip() == "*":
+    _cors_origins = ["*"]
+else:
+    _cors_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # App
-# -----------------------------
+# -----------------------------------------------------------------------------
 
-app = FastAPI(title=APP_NAME)
+app = FastAPI(title="Elaralo API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS if CORS_ORIGINS else ["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
+
+Role = Literal["system", "user", "assistant"]
 
 
-# -----------------------------
-# Domain Logic
-# -----------------------------
-
-PlanName = Literal["Free", "Trial", "Starter", "Plus", "Pro"]
-Mode = Literal["friend", "romantic", "intimate", "video"]
+class ChatMessage(BaseModel):
+    role: Role
+    content: str
 
 
-def normalize_mode(raw: Any) -> Mode:
-    t = str(raw or "").strip().lower()
-    if not t:
-        return "friend"
-    if t == "trial":  # Trial is a plan label; treat as Romantic mode request
-        return "romantic"
-    if t in ("friend", "friendly"):
-        return "friend"
-    if t in ("romantic", "romance"):
-        return "romantic"
-    if t in ("intimate", "explicit", "adult", "18+", "18"):
-        return "intimate"
-    if t in ("video", "call", "conference", "stream"):
-        return "video"
-    return "friend"
+class SessionState(BaseModel):
+    # Companion/session routing
+    companion_key: Optional[str] = None
+
+    # Display/brand
+    companion_name: str = "Elara"
+
+    # Membership gating
+    plan_name: str = "Trial"  # default per product requirement
+    mode: str = "friend"
+
+    # Safety toggle: this should be set earlier in your flow if you support adult content
+    explicit_allowed: bool = False
+
+    # Optional user identity (if included in the companion_key on the frontend)
+    member_id: Optional[str] = None
 
 
-def normalize_plan(raw: Any) -> PlanName:
-    t = str(raw or "").strip()
-    if t in ("Free", "Trial", "Starter", "Plus", "Pro"):
-        return t  # type: ignore
+class ChatRequest(BaseModel):
+    session_id: str = Field(..., description="Client-generated session id (uuid recommended).")
+    message: str = Field(..., description="The user's message.")
+    history: List[ChatMessage] = Field(default_factory=list, description="Prior conversation turns.")
+    companion_key: Optional[str] = Field(default=None, description="Opaque companion key forwarded from frontend.")
+    session_state: Optional[SessionState] = Field(default=None, description="Normalized state derived from companion_key.")
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    mode: str
+    plan_name: str
+    session_id: str
+
+
+class TtsRequest(BaseModel):
+    session_id: str
+    text: str
+    companion_key: Optional[str] = None
+    voice_id: Optional[str] = None
+
+
+class TtsResponse(BaseModel):
+    audio_url: str  # data:audio/mpeg;base64,...
+    voice_id: str
+
+
+# -----------------------------------------------------------------------------
+# Normalization helpers (defense in depth)
+# -----------------------------------------------------------------------------
+
+def _norm(s: Optional[str]) -> str:
+    return (s or "").strip()
+
+
+def normalize_plan_name(plan_name: Optional[str]) -> str:
+    p = _norm(plan_name).lower()
+    if p in {"", "none", "null"}:
+        return "Trial"
+
+    if p in {"trial", "free"}:
+        return "Trial"
+    if p in {"friend", "basic"}:
+        return "Friend"
+    if p in {"romantic", "romance"}:
+        return "Romantic"
+    if p in {"intimate", "adult"}:
+        return "Intimate"
+    if p in {"pro", "premium", "plus"}:
+        return "Pro"
+
+    # Unknown -> Trial (per requirement)
     return "Trial"
 
 
-def allowed_modes_for_plan(plan: PlanName) -> List[Mode]:
-    allowed: List[Mode] = ["friend", "video"]
-    if plan in ("Trial", "Starter", "Plus", "Pro"):
-        allowed.append("romantic")
-    if plan in ("Starter", "Plus", "Pro"):
-        allowed.append("intimate")
-    return allowed
+def normalize_mode(mode: Optional[str]) -> str:
+    m = _norm(mode).lower()
+    if m in {"", "none", "null"}:
+        return "friend"
+    if m in {"friend", "friendly", "companion"}:
+        return "friend"
+    if m in {"romantic", "romance", "flirty"}:
+        return "romantic"
+    if m in {"trial"}:
+        # Legacy mapping: Trial pill -> Romantic pill
+        return "romantic"
+    if m in {"intimate", "adult"}:
+        return "intimate"
+    return "friend"
 
 
-def ensure_allowed_mode(requested: Mode, plan: PlanName) -> Tuple[Mode, bool]:
-    allowed = allowed_modes_for_plan(plan)
-    if requested in allowed:
-        return requested, True
-    return "friend", False
+def allowed_modes_for_plan(plan_name: str, explicit_allowed: bool) -> List[str]:
+    plan = normalize_plan_name(plan_name)
+    modes = ["friend"]
+
+    if plan in {"Trial", "Romantic", "Pro"}:
+        modes.append("romantic")
+
+    # Intimate is only enabled if explicit_allowed is true.
+    # (Consent/age verification should happen before companion access, per requirement.)
+    if plan in {"Intimate", "Pro"} and explicit_allowed:
+        modes.append("intimate")
+
+    # De-dup while preserving order
+    seen = set()
+    out: List[str] = []
+    for x in modes:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+# -----------------------------------------------------------------------------
+# Prompting
+# -----------------------------------------------------------------------------
+
+SYSTEM_PROMPT_BASE = """\
+You are Elara, the Elaralo companion.
+You are warm, attentive, and conversational. You are not a therapist or medical professional.
+You must not claim real-world actions you did not perform. You must not fabricate account status, payments, or identity.
+
+Conversation goals:
+- Keep responses helpful, succinct, and natural.
+- Ask a single, targeted question when you need more context.
+- Maintain continuity with the session history.
+"""
+
+STYLE_FRIEND = """\
+Relationship style: Friend
+- Tone: supportive, respectful, and platonic.
+- Do not be sexually explicit.
+"""
+
+STYLE_ROMANTIC = """\
+Relationship style: Romantic
+- Tone: affectionate, playful, flirty, but keep it non-explicit (PG-13).
+- Avoid explicit sexual content.
+"""
+
+STYLE_INTIMATE = """\
+Relationship style: Intimate
+- Tone: consensual, adult, and sexually explicit only if the user requests it and explicit_allowed is true.
+- If explicit_allowed is false, refuse explicit sexual content and steer to non-explicit conversation.
+"""
+
+def build_system_prompt(state: SessionState) -> str:
+    plan_name = normalize_plan_name(state.plan_name)
+    mode = normalize_mode(state.mode)
+    allowed = allowed_modes_for_plan(plan_name, state.explicit_allowed)
+
+    # If the mode is not allowed, snap to the first allowed mode.
+    if mode not in allowed:
+        mode = allowed[0] if allowed else "friend"
+
+    if mode == "romantic":
+        style = STYLE_ROMANTIC
+    elif mode == "intimate":
+        style = STYLE_INTIMATE
+    else:
+        style = STYLE_FRIEND
+
+    header = f"Companion name: {state.companion_name}\nPlan: {plan_name}\nMode: {mode}\nExplicitAllowed: {state.explicit_allowed}"
+    return "\n".join([header, SYSTEM_PROMPT_BASE, style]).strip()
 
 
-def build_system_prompt(mode: Mode) -> str:
-    # IMPORTANT: No mention of any other companion names.
-    base = (
-        "You are Elara, the Elaralo AI companion. "
-        "You are warm, emotionally attuned, and conversational. "
-        "You do not mention policy or internal rules unless asked. "
-        "You are not a doctor or lawyer; for medical/legal issues, encourage professional help."
+# -----------------------------------------------------------------------------
+# OpenAI client
+# -----------------------------------------------------------------------------
+
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set on the backend.")
+    if OpenAI is None:
+        raise HTTPException(status_code=500, detail="openai package is not installed.")
+    return OpenAI(api_key=api_key)
+
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "service": "elaralo-backend", "ts": int(time.time())}
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest) -> ChatResponse:
+    state = req.session_state or SessionState()
+
+    # Normalize with defense-in-depth fallbacks
+    state.companion_key = req.companion_key or state.companion_key
+    state.plan_name = normalize_plan_name(state.plan_name)
+    state.mode = normalize_mode(state.mode)
+
+    # Enforce plan gating
+    allowed = allowed_modes_for_plan(state.plan_name, state.explicit_allowed)
+    if state.mode not in allowed:
+        state.mode = allowed[0] if allowed else "friend"
+
+    system_prompt = build_system_prompt(state)
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+    # Keep a bounded history to control token usage
+    history = req.history[-24:] if req.history else []
+    for m in history:
+        if m.role in {"user", "assistant"} and m.content:
+            messages.append({"role": m.role, "content": m.content})
+
+    messages.append({"role": "user", "content": req.message})
+
+    try:
+        client = get_openai_client()
+        resp = client.chat.completions.create(
+            model=DEFAULT_OPENAI_MODEL,
+            messages=messages,
+            temperature=0.7,
+        )
+        reply = (resp.choices[0].message.content or "").strip()
+        if not reply:
+            reply = "I’m here. What would you like to talk about next?"
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat failed: {type(e).__name__}: {e}")
+
+    return ChatResponse(
+        reply=reply,
+        mode=state.mode,
+        plan_name=state.plan_name,
+        session_id=req.session_id,
     )
 
-    if mode == "friend":
-        return base + " Style: supportive friend, calm, practical, lightly playful, non-explicit."
-    if mode == "romantic":
-        return base + (
-            " Style: affectionate, romantic, emotionally intimate, but keep language tasteful and non-graphic."
-        )
-    if mode == "intimate":
-        # Keep this non-graphic; access gating is handled outside this page per product design.
-        return base + (
-            " Style: sensual and intimate, but avoid graphic sexual content. Focus on feelings, closeness, and flirtation."
-        )
-    if mode == "video":
-        return base + (
-            " Style: concise, spoken-friendly replies suitable for a video call. Use short paragraphs and clarity."
-        )
-    return base
 
+@app.post("/tts/audio-url", response_model=TtsResponse)
+def tts_audio_url(req: TtsRequest) -> TtsResponse:
+    eleven_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not eleven_key:
+        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY is not set on the backend.")
 
-def get_openai_client() -> Optional[Any]:
-    if not OPENAI_API_KEY or OpenAI is None:
-        return None
-    try:
-        return OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        return None
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing text.")
 
+    voice_id = (req.voice_id or DEFAULT_ELEVENLABS_VOICE_ID).strip()
+    model_id = DEFAULT_ELEVENLABS_MODEL_ID
 
-# In-memory chat sessions; you can replace with Redis/DB later.
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-
-def session_get(session_id: str) -> Dict[str, Any]:
-    s = SESSIONS.get(session_id)
-    if not s:
-        s = {"created_at_ms": now_ms(), "messages": []}
-        SESSIONS[session_id] = s
-    return s
-
-
-def append_history(session_id: str, role: str, content: str) -> None:
-    s = session_get(session_id)
-    msgs: List[Dict[str, str]] = s["messages"]
-    msgs.append({"role": role, "content": content})
-    # keep last N
-    if len(msgs) > 30:
-        del msgs[:-30]
-
-
-def chat_generate_reply(
-    mode: Mode,
-    user_text: str,
-    session_id: str,
-) -> str:
-    client = get_openai_client()
-    if client is None:
-        # Safe fallback (keeps app functional without keys)
-        return (
-            "Backend is running, but OPENAI_API_KEY is not set. "
-            "Set it in Azure App Service → Configuration → Application settings, then restart. "
-            f"You said: {user_text}"
-        )
-
-    # Build message list with short history.
-    s = session_get(session_id)
-    history: List[Dict[str, str]] = s.get("messages", [])
-    sys = {"role": "system", "content": build_system_prompt(mode)}
-    msgs = [sys] + history[-20:] + [{"role": "user", "content": user_text}]
-
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=msgs,
-            temperature=0.8 if mode in ("romantic", "intimate") else 0.6,
-        )
-        out = resp.choices[0].message.content or ""
-        return out.strip() or "…"
-    except Exception as e:
-        return f"Chat error: {str(e)}"
-
-
-def elevenlabs_tts(text: str, voice_id: str) -> bytes:
-    if not ELEVENLABS_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="ELEVENLABS_API_KEY is not set. Add it in Azure App Service → Configuration → Application settings.",
-        )
-
-    vid = voice_id.strip() or DEFAULT_ELEVENLABS_VOICE_ID
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}"
-
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
+        "xi-api-key": eleven_key,
         "accept": "audio/mpeg",
         "content-type": "application/json",
     }
-    payload = {
+
+    body = {
         "text": text,
-        "model_id": ELEVENLABS_MODEL_ID,
+        "model_id": model_id,
         "voice_settings": {
             "stability": 0.45,
             "similarity_boost": 0.8,
-            "style": 0.2,
+            "style": 0.35,
             "use_speaker_boost": True,
         },
     }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code >= 300:
-        raise HTTPException(status_code=500, detail=f"ElevenLabs TTS failed: {r.status_code} {r.text[:500]}")
-    return r.content
-
-
-def write_tts_cache(mp3_bytes: bytes) -> str:
-    token = uuid.uuid4().hex
-    path = os.path.join(TTS_CACHE_DIR, f"{token}.mp3")
-    with open(path, "wb") as f:
-        f.write(mp3_bytes)
-    return token
-
-
-def read_tts_cache(token: str) -> Optional[str]:
-    path = os.path.join(TTS_CACHE_DIR, f"{token}.mp3")
-    if not os.path.exists(path):
-        return None
-    # TTL enforcement
-    age = time.time() - os.path.getmtime(path)
-    if age > TTS_CACHE_TTL_SECONDS:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-        return None
-    return path
-
-
-def openai_transcribe(audio_bytes: bytes, filename: str) -> str:
-    client = get_openai_client()
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set; STT requires it.")
-    bio = BytesIO(audio_bytes)
-    bio.name = filename
     try:
-        # OpenAI python SDK supports file-like objects.
-        tr = client.audio.transcriptions.create(model=OPENAI_TRANSCRIBE_MODEL, file=bio)
-        # SDK returns either a dict-like or an object with `text`.
-        text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None)
-        return (text or "").strip()
+        r = requests.post(url, headers=headers, json=body, timeout=60)
+        if r.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ElevenLabs error: {r.status_code} {r.text[:500]}",
+            )
+        audio_bytes = r.content
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        data_url = f"data:audio/mpeg;base64,{b64}"
+        return TtsResponse(audio_url=data_url, voice_id=voice_id)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"STT error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"TTS failed: {type(e).__name__}: {e}")
 
 
-# -----------------------------
-# Routes
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Optional STT endpoint (kept for parity with the original baseline)
+# -----------------------------------------------------------------------------
+
+class SttRequest(BaseModel):
+    audio_base64: str
+    filename: str = "audio.webm"
+    mimetype: str = "audio/webm"
 
 
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "service": APP_NAME,
-        "time_ms": now_ms(),
-        "openai_configured": bool(OPENAI_API_KEY),
-        "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
-    }
+class SttResponse(BaseModel):
+    text: str
 
 
-@app.post("/tts/audio-url")
-async def tts_audio_url(request: Request) -> Dict[str, Any]:
-    data = await request.json()
-    text = str(data.get("text") or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Missing 'text'.")
-
-    voice_id = str(data.get("voice_id") or DEFAULT_ELEVENLABS_VOICE_ID).strip() or DEFAULT_ELEVENLABS_VOICE_ID
-
-    mp3 = elevenlabs_tts(text=text, voice_id=voice_id)
-    token = write_tts_cache(mp3)
-
-    base = str(request.base_url).rstrip("/")
-    return {"audio_url": f"{base}/tts/audio/{token}.mp3"}
-
-
-@app.get("/tts/audio/{token}.mp3")
-def tts_audio(token: str):
-    path = read_tts_cache(token)
-    if not path:
-        raise HTTPException(status_code=404, detail="Audio not found or expired.")
-    return FileResponse(path, media_type="audio/mpeg", filename=f"{token}.mp3")
-
-
-@app.post("/stt/transcribe")
-async def stt_transcribe(
-    audio: UploadFile = File(...),
-    companion_key: str = Form(""),
-    member_id: str = Form(""),
-    plan: str = Form(""),
-) -> Dict[str, Any]:
-    # companion_key/member_id/plan are accepted for wiring parity; not strictly required here.
-    _ = companion_key, member_id, plan
-
-    audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Empty audio upload.")
-
-    text = openai_transcribe(audio_bytes, audio.filename or "audio.webm")
-    return {"text": text}
-
-
-@app.post("/chat")
-async def chat(request: Request) -> JSONResponse:
-    body = await request.json()
-
-    user_text = str(body.get("message") or "").strip()
-    if not user_text:
-        raise HTTPException(status_code=400, detail="Missing 'message'.")
-
-    session_state = body.get("session_state") or {}
-    session_id = str(session_state.get("session_id") or body.get("session_id") or "").strip() or uuid.uuid4().hex
-
-    plan = normalize_plan(body.get("plan") or session_state.get("plan"))
-    requested_mode = normalize_mode(body.get("mode") or session_state.get("mode"))
-    mode, ok = ensure_allowed_mode(requested_mode, plan)
-
-    # Update session meta
-    sess = session_get(session_id)
-    sess["plan"] = plan
-    sess["member_id"] = str(body.get("member_id") or session_state.get("member_id") or "")
-    sess["member_email"] = str(body.get("member_email") or session_state.get("member_email") or "")
-    sess["companion_key"] = str(body.get("companion_key") or session_state.get("companion_key") or "Elara")
-
-    append_history(session_id, "user", user_text)
-    reply = chat_generate_reply(mode=mode, user_text=user_text, session_id=session_id)
-    append_history(session_id, "assistant", reply)
-
-    # Time tracking: accept client-reported elapsed seconds
-    incoming_elapsed = session_state.get("session_elapsed_seconds")
-    if isinstance(incoming_elapsed, (int, float)):
-        sess["session_elapsed_seconds"] = float(incoming_elapsed)
-
-    out_state: Dict[str, Any] = {
-        "session_id": session_id,
-        "plan": plan,
-        "mode": mode,
-        "mode_allowed": ok,
-        "allowed_modes": allowed_modes_for_plan(plan),
-        "server_time_ms": now_ms(),
-    }
-
-    return JSONResponse({"reply": reply, "session_state": out_state})
-
-
-@app.post("/chat/save-summary")
-async def chat_save_summary(request: Request) -> Dict[str, Any]:
+@app.post("/stt/transcribe", response_model=SttResponse)
+def stt_transcribe(req: SttRequest) -> SttResponse:
     """
-    Optional endpoint: the frontend may call this after sends.
-    This implementation is intentionally lightweight (no persistence) but keeps compatibility.
+    Optional server-side STT (not required if you use browser speech recognition).
+    Kept for parity with the original baseline.
+
+    Expects base64-encoded audio bytes.
     """
-    body = await request.json()
-    # Keep compatible fields for future use:
-    _ = body.get("companion_key"), body.get("plan"), body.get("member_id"), body.get("session_state"), body.get("messages")
-    return {"ok": True}
+    if OpenAI is None:
+        raise HTTPException(status_code=500, detail="openai package is not installed.")
+
+    audio_b64 = (req.audio_base64 or "").strip()
+    if not audio_b64:
+        raise HTTPException(status_code=400, detail="Missing audio_base64.")
+
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 audio.")
+
+    try:
+        client = get_openai_client()
+        # The OpenAI SDK expects a file-like object with a name attribute.
+        import io
+
+        f = io.BytesIO(audio_bytes)
+        f.name = req.filename  # type: ignore[attr-defined]
+
+        tr = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+        )
+        text = getattr(tr, "text", "") or ""
+        return SttResponse(text=text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT failed: {type(e).__name__}: {e}")
