@@ -1,187 +1,237 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-type Role = "user" | "assistant";
-type ExperienceMode = "chat" | "audio" | "video";
-type Mode = "friend" | "romantic" | "intimate";
-type PlanName = "Trial" | "Friend" | "Romantic" | "Intimate" | "Pro";
-
-type Msg = { role: Role; content: string };
-
-type SessionState = {
-  mode: Mode;
-  plan_name: PlanName;
-  companion: string;
-  companion_name?: string;
-  companionName?: string;
-  member_id?: string;
-  memberId?: string;
-
-  // Keep extra passthrough fields for compatibility with existing backends
-  [k: string]: any;
-};
-
-type ChatApiResponse = {
-  reply?: string;
-  text?: string;
-  audio_url?: string;
-  status_mode?: string;
-  session_state?: any;
-};
-
-const DEFAULT_COMPANION_NAME = "Elara";
-const DEFAULT_AVATAR_URL = "/elaralo_logo.png";
-
-// Use Elara as the key, but the voice id value is the one you previously used.
-const ELEVEN_VOICE_IDS: Record<string, string> = {
-  Elara: "rJ9XoWu8gbUhVKZnKY8X",
-};
-
-const MODE_LABELS: Record<Mode, string> = {
-  friend: "Friend",
-  romantic: "Romantic",
-  intimate: "Intimate",
-};
-
-function formatSeconds(totalSeconds: number): string {
-  const s = Math.max(0, Math.floor(totalSeconds));
-  const hh = Math.floor(s / 3600);
-  const mm = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(hh)}:${pad(mm)}:${pad(ss)}`;
+declare global {
+  interface Window {
+    webkitSpeechRecognition?: any;
+    SpeechRecognition?: any;
+  }
 }
 
-function safeJsonParse<T>(raw: string): T | null {
+type ChatRole = "user" | "assistant";
+type RelationshipMode = "Friend" | "Romantic" | "Intimate";
+
+type ChatMessage = {
+  role: ChatRole;
+  content: string;
+};
+
+type CompanionResolved = {
+  companion_key: string | null;
+  name: string;
+  avatar_url: string;
+  plan: string;
+  mode: RelationshipMode;
+  allowed_modes: RelationshipMode[];
+  eleven_voice_id: string;
+  user_name?: string;
+  member_id?: string;
+};
+
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, "") || "http://localhost:8000";
+
+const SWITCH_COMPANION_URL = process.env.NEXT_PUBLIC_SWITCH_COMPANION_URL || "/";
+
+const UPGRADE_URL = process.env.NEXT_PUBLIC_UPGRADE_URL || "/pricing";
+
+const VIDEO_EMBED_URL = process.env.NEXT_PUBLIC_VIDEO_EMBED_URL || "";
+
+const DEFAULT_COMPANION_NAME =
+  process.env.NEXT_PUBLIC_DEFAULT_COMPANION_NAME || "Elara";
+const DEFAULT_AVATAR_URL =
+  process.env.NEXT_PUBLIC_DEFAULT_AVATAR_URL || "/elaralo_logo.png";
+const DEFAULT_PLAN = process.env.NEXT_PUBLIC_DEFAULT_PLAN || "Trial";
+const DEFAULT_ELEVEN_VOICE_ID =
+  process.env.NEXT_PUBLIC_DEFAULT_ELEVEN_VOICE_ID || "rJ9XoWu8gbUhVKZnKY8X";
+
+function safeJsonParse(s: string): any | null {
   try {
-    return JSON.parse(raw) as T;
+    return JSON.parse(s);
   } catch {
     return null;
   }
 }
 
-function normalizePlanName(raw: any): PlanName {
-  const s = String(raw ?? "").trim().toLowerCase();
-  if (!s) return "Trial";
-  if (s.includes("trial") || s.includes("test")) return "Trial";
-  if (s.includes("pro")) return "Pro";
-  if (s.includes("intimate")) return "Intimate";
-  if (s.includes("romantic")) return "Romantic";
-  if (s.includes("friend")) return "Friend";
-  return "Trial";
+function base64UrlToUtf8(b64url: string): string {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+  const binary = atob(b64 + pad);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
-function normalizeMode(raw: any): Mode {
-  const s = String(raw ?? "").trim().toLowerCase();
-  if (!s) return "friend";
-  // Trial “mode” (if it appears) maps to Romantic pill/behavior.
-  if (s.includes("trial")) return "romantic";
-  if (s.includes("intimate")) return "intimate";
-  if (s.includes("romantic")) return "romantic";
-  if (s.includes("friend")) return "friend";
-  return "friend";
+function decodeCompanionKey(companionKey: string): any | null {
+  const key = companionKey.trim();
+  if (!key) return null;
+
+  // JWT (header.payload.signature) style
+  const parts = key.split(".");
+  if (parts.length >= 2) {
+    const payload = parts[1];
+    const json = safeJsonParse(base64UrlToUtf8(payload));
+    if (json) return json;
+  }
+
+  // base64 JSON
+  try {
+    const jsonStr = base64UrlToUtf8(key);
+    const json = safeJsonParse(jsonStr);
+    if (json) return json;
+  } catch {
+    // ignore
+  }
+
+  return null;
 }
 
-function allowedModesForPlan(plan: PlanName): Mode[] {
-  if (plan === "Friend") return ["friend"];
-  if (plan === "Romantic") return ["friend", "romantic"];
-  if (plan === "Trial") return ["friend", "romantic"];
-  if (plan === "Intimate") return ["friend", "romantic", "intimate"];
-  // Pro
-  return ["friend", "romantic", "intimate"];
+function normalizeMode(raw: any): RelationshipMode | null {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s === "friend") return "Friend";
+  if (s === "romantic" || s === "romance") return "Romantic";
+  if (s === "intimate" || s === "explicit") return "Intimate";
+  return null;
 }
 
-function getElevenVoiceIdForCompanionKey(companionKeyOrName: string): string {
-  const key = (companionKeyOrName || "").trim();
-  if (!key) return ELEVEN_VOICE_IDS.Elara;
+function deriveAllowedModes(plan: string, rawAllowed?: any): RelationshipMode[] {
+  if (Array.isArray(rawAllowed)) {
+    const mapped = rawAllowed
+      .map((m) => normalizeMode(m))
+      .filter(Boolean) as RelationshipMode[];
+    const unique = Array.from(new Set(mapped));
+    if (unique.length) return unique;
+  }
 
-  // If the key comes through as something like "Elara-Female-..." take the first token.
-  const firstToken = key.split("-")[0]?.trim() || key;
-  return ELEVEN_VOICE_IDS[firstToken] || ELEVEN_VOICE_IDS.Elara;
+  const p = String(plan || "").toLowerCase();
+  if (p.includes("intimate")) return ["Friend", "Romantic", "Intimate"];
+  if (p.includes("romantic")) return ["Friend", "Romantic"];
+
+  // Trial/test maps to Romantic entitlements (Friend + Romantic)
+  if (p.includes("trial") || p.includes("test")) return ["Friend", "Romantic"];
+
+  if (p.includes("friend")) return ["Friend"];
+
+  // default (safe): Friend only
+  return ["Friend"];
 }
 
-function getApiBase(): string {
-  const env =
-    (process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE || "").trim();
-  const base = (env || "http://127.0.0.1:8000").replace(/\/+$/, "");
-  return base;
+function resolveCompanion(companionKey: string | null): CompanionResolved {
+  const decoded = companionKey ? decodeCompanionKey(companionKey) : null;
+
+  const name =
+    decoded?.companion_name ||
+    decoded?.companionName ||
+    decoded?.name ||
+    DEFAULT_COMPANION_NAME;
+
+  const avatar_url =
+    decoded?.avatar_url ||
+    decoded?.avatarUrl ||
+    decoded?.avatar ||
+    DEFAULT_AVATAR_URL;
+
+  const plan = decoded?.plan || decoded?.plan_name || decoded?.planName || DEFAULT_PLAN;
+
+  const allowed_modes = deriveAllowedModes(plan, decoded?.allowed_modes || decoded?.modes);
+
+  let mode = normalizeMode(decoded?.mode) || "Friend";
+  if (!allowed_modes.includes(mode)) mode = (allowed_modes[0] || "Friend") as RelationshipMode;
+
+  const eleven_voice_id =
+    decoded?.eleven_voice_id ||
+    decoded?.elevenVoiceId ||
+    decoded?.voice_id ||
+    decoded?.voiceId ||
+    DEFAULT_ELEVEN_VOICE_ID;
+
+  const user_name =
+    decoded?.user_name ||
+    decoded?.userName ||
+    decoded?.member_name ||
+    decoded?.memberName ||
+    decoded?.display_name ||
+    decoded?.displayName ||
+    undefined;
+
+  const member_id = decoded?.member_id || decoded?.memberId || decoded?.user_id || decoded?.userId;
+
+  return {
+    companion_key: companionKey,
+    name,
+    avatar_url,
+    plan,
+    allowed_modes,
+    mode,
+    eleven_voice_id,
+    user_name,
+    member_id,
+  };
 }
 
-function trimMessagesForChat(msgs: Msg[], maxMsgs = 60): Msg[] {
-  if (msgs.length <= maxMsgs) return msgs;
-  return msgs.slice(msgs.length - maxMsgs);
+function isSpeechRecognitionAvailable(): boolean {
+  if (typeof window === "undefined") return false;
+  return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
 }
 
-function buildTodayKey(): string {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `elaralo_today_seconds_${yyyy}-${mm}-${dd}`;
+function downloadText(filename: string, contents: string) {
+  const blob = new Blob([contents], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
-function IconButton({
-  title,
-  onClick,
-  active,
-  children,
-}: {
-  title: string;
-  onClick: () => void;
-  active?: boolean;
-  children: React.ReactNode;
-}) {
+function svgIcon(kind: "play" | "mic" | "stop" | "save" | "trash") {
+  // Inline SVGs keep dependencies minimal.
+  if (kind === "play") {
+    return (
+      <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M8 5v14l11-7z" fill="currentColor" />
+      </svg>
+    );
+  }
+  if (kind === "mic") {
+    return (
+      <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+        <path
+          d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11z"
+          fill="currentColor"
+        />
+      </svg>
+    );
+  }
+  if (kind === "stop") {
+    return (
+      <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6 6h12v12H6z" fill="currentColor" />
+      </svg>
+    );
+  }
+  if (kind === "save") {
+    return (
+      <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+        <path
+          d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM6 8V5h9v3H6z"
+          fill="currentColor"
+        />
+      </svg>
+    );
+  }
+  // trash
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={title}
-      aria-label={title}
-      style={{
-        width: 44,
-        height: 44,
-        borderRadius: 10,
-        border: "1px solid #cfcfcf",
-        background: active ? "#eef5ff" : "#fff",
-        cursor: "pointer",
-        display: "grid",
-        placeItems: "center",
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-function Pill({
-  label,
-  active,
-  onClick,
-}: {
-  label: string;
-  active?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      style={{
-        padding: "8px 12px",
-        borderRadius: 999,
-        border: active ? "1px solid #2b6cb0" : "1px solid #cfcfcf",
-        background: active ? "#eef5ff" : "#fff",
-        cursor: "pointer",
-        fontWeight: 700,
-        fontSize: 12.5,
-        lineHeight: 1,
-      }}
-    >
-      {label}
-    </button>
+    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M6 7h12l-1 14H7L6 7zm3-3h6l1 2H8l1-2z"
+        fill="currentColor"
+      />
+    </svg>
   );
 }
 
@@ -189,383 +239,529 @@ export default function CompanionPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  const API_BASE = useMemo(() => getApiBase(), []);
-  const VIDEO_MODE_URL = (process.env.NEXT_PUBLIC_VIDEO_MODE_URL || "").trim();
+  const companionKey = searchParams.get("companion_key");
+  const companion = useMemo(() => resolveCompanion(companionKey), [companionKey]);
 
-  // ---- Companion key parsing (supports JSON or string) ----
-  const companionKeyRaw = (searchParams.get("companion_key") || "").trim();
-  const parsedKey = useMemo(() => safeJsonParse<any>(companionKeyRaw), [companionKeyRaw]);
+  const [relationshipMode, setRelationshipMode] = useState<RelationshipMode>(companion.mode);
+  const [showModePicker, setShowModePicker] = useState<boolean>(false);
 
-  const companionName = useMemo(() => {
-    if (parsedKey) {
-      return (
-        parsedKey.first_name ||
-        parsedKey.name ||
-        parsedKey.companion_name ||
-        parsedKey.companionName ||
-        parsedKey.companion ||
-        DEFAULT_COMPANION_NAME
-      );
-    }
-    if (companionKeyRaw) return companionKeyRaw;
-    return DEFAULT_COMPANION_NAME;
-  }, [parsedKey, companionKeyRaw]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState<string>("");
 
-  const planName: PlanName = useMemo(() => {
-    if (parsedKey) {
-      return normalizePlanName(
-        parsedKey.plan ||
-          parsedKey.plan_name ||
-          parsedKey.planName ||
-          parsedKey.member_plan ||
-          parsedKey.memberPlan
-      );
-    }
-    return "Trial";
-  }, [parsedKey]);
+  const [isSending, setIsSending] = useState<boolean>(false);
 
-  const memberId = useMemo(() => {
-    if (!parsedKey) return "";
-    return String(parsedKey.member_id || parsedKey.memberId || parsedKey.member || "").trim();
-  }, [parsedKey]);
+  const [isVideoMode, setIsVideoMode] = useState<boolean>(false);
 
-  const avatarUrl = useMemo(() => {
-    if (parsedKey && parsedKey.avatar_url) return String(parsedKey.avatar_url);
-    if (parsedKey && parsedKey.avatarUrl) return String(parsedKey.avatarUrl);
-    return DEFAULT_AVATAR_URL;
-  }, [parsedKey]);
+  const [isMicOn, setIsMicOn] = useState<boolean>(false);
+  const micDesiredRef = useRef<boolean>(false);
+  const sttHoldRef = useRef<boolean>(false);
+  const ignoreNextRecordingStopRef = useRef<boolean>(false);
 
-  const initialMode: Mode = useMemo(() => {
-    if (parsedKey) return normalizeMode(parsedKey.mode || parsedKey.relationship_mode);
-    return "friend";
-  }, [parsedKey]);
+  const recognitionRef = useRef<any | null>(null);
+  const [sttStatus, setSttStatus] = useState<"idle" | "listening" | "error">("idle");
 
-  const allowedModes = useMemo(() => allowedModesForPlan(planName), [planName]);
+  const sttFinalRef = useRef<string>("");
+  const sttInterimRef = useRef<string>("");
+  const sttSendTimerRef = useRef<number | null>(null);
 
-  const voiceId = useMemo(() => {
-    const keyForVoice =
-      (parsedKey && (parsedKey.companion_key || parsedKey.companion || parsedKey.name)) ||
-      companionName ||
-      DEFAULT_COMPANION_NAME;
-    return getElevenVoiceIdForCompanionKey(String(keyForVoice));
-  }, [parsedKey, companionName]);
-
-  // ---- Session + timers ----
-  const sessionIdRef = useRef<string>(
-    (globalThis.crypto as any)?.randomUUID?.() ||
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`
-  );
-  const sessionStartMsRef = useRef<number>(Date.now());
-
-  const [sessionSeconds, setSessionSeconds] = useState(0);
-  const [dailySeconds, setDailySeconds] = useState(0);
-
-  useEffect(() => {
-    const todayKey = buildTodayKey();
-    const saved = Number(localStorage.getItem(todayKey) || "0");
-    setDailySeconds(Number.isFinite(saved) ? saved : 0);
-
-    const t = window.setInterval(() => {
-      const now = Date.now();
-      const sess = Math.floor((now - sessionStartMsRef.current) / 1000);
-      setSessionSeconds(sess);
-
-      const base = Number(localStorage.getItem(todayKey) || "0");
-      const next = (Number.isFinite(base) ? base : 0) + 1;
-      localStorage.setItem(todayKey, String(next));
-      setDailySeconds(next);
-    }, 1000);
-
-    return () => window.clearInterval(t);
-  }, []);
-
-  // ---- Core UI state ----
-  const [experienceMode, setExperienceMode] = useState<ExperienceMode>("chat");
-  const [showModePicker, setShowModePicker] = useState(false);
-
-  const [sessionState, setSessionState] = useState<SessionState>(() => ({
-    mode: allowedModes.includes(initialMode) ? initialMode : "friend",
-    plan_name: planName,
-    companion: companionName || DEFAULT_COMPANION_NAME,
-    companion_name: companionName || DEFAULT_COMPANION_NAME,
-    companionName: companionName || DEFAULT_COMPANION_NAME,
-    member_id: memberId || "",
-    memberId: memberId || "",
-    companion_key_raw: companionKeyRaw || "",
-  }));
-
-  useEffect(() => {
-    setSessionState((prev) => ({
-      ...prev,
-      plan_name: planName,
-      companion: companionName || DEFAULT_COMPANION_NAME,
-      companion_name: companionName || DEFAULT_COMPANION_NAME,
-      companionName: companionName || DEFAULT_COMPANION_NAME,
-      member_id: memberId || "",
-      memberId: memberId || "",
-      companion_key_raw: companionKeyRaw || "",
-      mode: allowedModes.includes(prev.mode) ? prev.mode : "friend",
-    }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planName, companionName, memberId, companionKeyRaw, allowedModes.join(",")]);
-
-  const [messages, setMessages] = useState<Msg[]>(() => [
-    { role: "assistant", content: `Hi, ${companionName || DEFAULT_COMPANION_NAME} here. What’s on your mind?` },
-    { role: "assistant", content: `Mode set to: ${MODE_LABELS[allowedModes.includes(initialMode) ? initialMode : "friend"]}` },
-  ]);
-
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [statusLine, setStatusLine] = useState("");
-
-  // ---- TTS playback via hidden video element ----
-  const ttsVideoRef = useRef<HTMLVideoElement | null>(null);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const lastAssistantTextRef = useRef<string>("");
-  const lastAssistantAudioUrlRef = useRef<string>("");
-
-  const stopAudio = useCallback(() => {
-    const v = ttsVideoRef.current;
-    if (v) {
-      try {
-        v.pause();
-        v.removeAttribute("src");
-        v.load();
-      } catch {}
-    }
-    setIsSpeaking(false);
-  }, []);
-
-  const playAudioUrl = useCallback(async (url: string) => {
-    const v = ttsVideoRef.current;
-    if (!v) return;
-    try {
-      setIsSpeaking(false);
-      v.pause();
-      v.src = url;
-      v.currentTime = 0;
-      const p = v.play();
-      if (p) await p;
-      setIsSpeaking(true);
-    } catch (e: any) {
-      setStatusLine("Audio playback was blocked by the browser. Click once anywhere, then try Play again.");
-      setIsSpeaking(false);
-    }
-  }, []);
-
-  const callTtsAudioUrl = useCallback(
-    async (text: string): Promise<string | null> => {
-      const clean = (text || "").trim();
-      if (!clean) return null;
-
-      try {
-        const res = await fetch(`${API_BASE}/tts/audio-url`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            session_id: sessionIdRef.current,
-            voice_id: voiceId,
-            voiceId: voiceId, // compatibility
-            text: clean,
-          }),
-        });
-
-        if (!res.ok) return null;
-        const data = (await res.json()) as any;
-        const url = String(data?.audio_url || data?.audioUrl || "").trim();
-        return url || null;
-      } catch {
-        return null;
-      }
-    },
-    [API_BASE, voiceId]
-  );
-
-  const speakLast = useCallback(async () => {
-    const txt = (lastAssistantTextRef.current || "").trim();
-    if (!txt) return;
-
-    const existingUrl = (lastAssistantAudioUrlRef.current || "").trim();
-    if (existingUrl) {
-      await playAudioUrl(existingUrl);
-      return;
-    }
-
-    const url = await callTtsAudioUrl(txt);
-    if (url) {
-      lastAssistantAudioUrlRef.current = url;
-      await playAudioUrl(url);
-    }
-  }, [callTtsAudioUrl, playAudioUrl]);
-
-  // ---- STT (Web Speech when available; otherwise backend /stt/transcribe as fallback) ----
-  const recognitionRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordedChunksRef = useRef<BlobPart[]>([]);
-  const [listening, setListening] = useState(false);
+  const fallbackRecordingRef = useRef<boolean>(false);
 
-  const stopListening = useCallback(() => {
-    setListening(false);
+  const [isTtsPlaying, setIsTtsPlaying] = useState<boolean>(false);
+  const ttsVideoRef = useRef<HTMLVideoElement | null>(null);
+  const ttsAbortRef = useRef<AbortController | null>(null);
 
-    // Web Speech
-    const rec = recognitionRef.current;
-    if (rec) {
-      try {
-        rec.onresult = null;
-        rec.onerror = null;
-        rec.onend = null;
-        rec.stop();
-      } catch {}
-      recognitionRef.current = null;
-    }
+  const audioUnlockedRef = useRef<boolean>(false);
+  const volumeRef = useRef<number>(1.0);
 
-    // MediaRecorder
-    const mr = mediaRecorderRef.current;
-    if (mr && mr.state !== "inactive") {
-      try {
-        mr.stop();
-      } catch {}
-    }
-    mediaRecorderRef.current = null;
+  const [confirmClearOpen, setConfirmClearOpen] = useState<boolean>(false);
+  const [confirmSaveOpen, setConfirmSaveOpen] = useState<boolean>(false);
+
+  const chatBoxRef = useRef<HTMLDivElement | null>(null);
+
+  const liveStatusText = useMemo(() => {
+    return isVideoMode ? "Live Avatar: live" : "Live Avatar: idle";
+  }, [isVideoMode]);
+
+  // Greeting (first-load)
+  useEffect(() => {
+    setMessages([
+      { role: "assistant", content: `Hi, ${companion.name} here. What's on your mind?` },
+      { role: "assistant", content: `Mode set to: ${relationshipMode}` },
+    ]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const startListening = useCallback(async () => {
-    setStatusLine("");
-    setListening(true);
+  // Keep relationshipMode in sync if companion changes
+  useEffect(() => {
+    setRelationshipMode(companion.mode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companion.mode, companion.name]);
 
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+  // Auto-scroll chat to bottom
+  useEffect(() => {
+    const el = chatBoxRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages]);
 
-    // Prefer Web Speech if present
-    if (SpeechRecognition) {
-      try {
-        const rec = new SpeechRecognition();
-        recognitionRef.current = rec;
+  async function ensureAudioUnlocked() {
+    if (audioUnlockedRef.current) return;
+    audioUnlockedRef.current = true;
 
-        rec.continuous = false;
-        rec.interimResults = false;
-        rec.lang = "en-US";
-
-        rec.onresult = (evt: any) => {
-          const t = evt?.results?.[0]?.[0]?.transcript || "";
-          const text = String(t).trim();
-          if (text) {
-            // In Audio/Video mode, auto-send on voice input.
-            if (experienceMode !== "chat") {
-              setInput("");
-              void send(text);
-            } else {
-              setInput(text);
-            }
-          }
-        };
-
-        rec.onerror = () => {
-          setStatusLine("Microphone recognition error.");
-        };
-
-        rec.onend = () => {
-          setListening(false);
-          recognitionRef.current = null;
-        };
-
-        rec.start();
-        return;
-      } catch {
-        // fall through to MediaRecorder
+    // 1) Resume an AudioContext (iOS/Safari unlock)
+    try {
+      const Ctx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (Ctx) {
+        const ctx = new Ctx();
+        await ctx.resume();
+        // short silent osc
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        gain.gain.value = 0;
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.01);
       }
+    } catch {
+      // ignore
     }
 
-    // Fallback: record a short clip and transcribe with backend
+    // 2) Prime the hidden video element once
+    const el = ttsVideoRef.current;
+    if (!el) return;
+    try {
+      el.muted = true;
+      el.volume = 0;
+      // Tiny silent WAV (base64) to satisfy play() on iOS
+      el.src =
+        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+      await el.play();
+      el.pause();
+      el.currentTime = 0;
+    } catch {
+      // ignore
+    } finally {
+      try {
+        el.muted = false;
+        el.volume = volumeRef.current;
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  function stopAllAudio() {
+    // stop ElevenLabs playback (hidden video)
+    const el = ttsVideoRef.current;
+    try {
+      if (el) {
+        el.pause();
+        el.currentTime = 0;
+        el.removeAttribute("src");
+        el.load();
+      }
+    } catch {
+      // ignore
+    }
+
+    // stop speech synthesis (video mode TTS)
+    try {
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+    } catch {
+      // ignore
+    }
+
+    // abort any in-flight TTS request
+    try {
+      ttsAbortRef.current?.abort();
+    } catch {
+      // ignore
+    } finally {
+      ttsAbortRef.current = null;
+    }
+
+    setIsTtsPlaying(false);
+  }
+
+  function pauseSpeechToText() {
+    // Temporarily pause (used while sending / speaking).
+    sttHoldRef.current = true;
+
+    // Stop SpeechRecognition (if active).
+    try {
+      recognitionRef.current?.stop?.();
+    } catch {
+      // ignore
+    }
+
+    // Stop backend recording (if active), but do NOT transcribe on this stop.
+    if (fallbackRecordingRef.current) {
+      ignoreNextRecordingStopRef.current = true;
+      stopFallbackRecording();
+    }
+
+    setSttStatus("idle");
+  }
+
+  async function resumeSpeechToTextIfDesired() {
+    if (!micDesiredRef.current) return;
+    sttHoldRef.current = false;
+    if (isSpeechRecognitionAvailable()) {
+      startSpeechRecognition();
+    } else {
+      await startFallbackRecording();
+    }
+  }
+
+  function clearSttTimers() {
+    if (sttSendTimerRef.current) {
+      window.clearTimeout(sttSendTimerRef.current);
+      sttSendTimerRef.current = null;
+    }
+  }
+
+  function scheduleAutoSendFromStt() {
+    clearSttTimers();
+    sttSendTimerRef.current = window.setTimeout(async () => {
+      const finalText = (sttFinalRef.current || "").trim();
+      const interimText = (sttInterimRef.current || "").trim();
+      if (!finalText || interimText) return;
+
+      sttFinalRef.current = "";
+      setInput("");
+      await sendMessage(finalText, { spoken: true });
+    }, 650);
+  }
+
+  function startSpeechRecognition() {
+    if (typeof window === "undefined") return;
+    if (!isSpeechRecognitionAvailable()) return;
+
+    // tear down any existing instance
+    try {
+      recognitionRef.current?.stop?.();
+    } catch {
+      // ignore
+    }
+
+    const RecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const rec = new RecognitionCtor();
+
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = "en-US";
+
+    rec.onstart = () => {
+      setSttStatus("listening");
+    };
+
+    rec.onresult = (event: any) => {
+      let interim = "";
+      let final = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        const transcript = res[0]?.transcript ?? "";
+        if (res.isFinal) final += transcript;
+        else interim += transcript;
+      }
+
+      if (final) {
+        sttFinalRef.current = (sttFinalRef.current + " " + final).trim();
+      }
+      sttInterimRef.current = interim.trim();
+
+      const composed = [sttFinalRef.current, sttInterimRef.current].filter(Boolean).join(" ");
+      setInput(composed);
+
+      // if we got a final result and no interim, likely user paused
+      if (final && !sttInterimRef.current) {
+        scheduleAutoSendFromStt();
+      }
+    };
+
+    rec.onerror = (_e: any) => {
+      setSttStatus("error");
+      // attempt restart if mic is still desired
+      if (micDesiredRef.current && !sttHoldRef.current) {
+        window.setTimeout(() => {
+          try {
+            rec.stop();
+          } catch {
+            // ignore
+          }
+          startSpeechRecognition();
+        }, 900);
+      }
+    };
+
+    rec.onend = () => {
+      if (micDesiredRef.current && !sttHoldRef.current) {
+        // restart
+        window.setTimeout(() => startSpeechRecognition(), 200);
+      } else {
+        setSttStatus("idle");
+      }
+    };
+
+    recognitionRef.current = rec;
+    try {
+      rec.start();
+    } catch {
+      setSttStatus("error");
+    }
+  }
+
+  async function startFallbackRecording() {
+    fallbackRecordingRef.current = true;
+    setSttStatus("listening");
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
       recordedChunksRef.current = [];
+      const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
 
-      const mr = new MediaRecorder(stream);
-      mediaRecorderRef.current = mr;
-
-      mr.ondataavailable = (e) => {
+      recorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data);
       };
 
-      mr.onstop = async () => {
+      recorder.onstop = async () => {
         try {
-          setListening(false);
-
-          stream.getTracks().forEach((t) => t.stop());
-
           const blob = new Blob(recordedChunksRef.current, { type: "audio/webm" });
-          if (!blob.size) return;
-
-          const fd = new FormData();
-          fd.append("audio_file", blob, "speech.webm");
-
-          const res = await fetch(`${API_BASE}/stt/transcribe`, {
-            method: "POST",
-            body: fd,
-          });
-
-          if (!res.ok) {
-            setStatusLine("Speech transcription failed.");
-            return;
-          }
-
-          const data = (await res.json()) as any;
-          const text = String(data?.text || "").trim();
-          if (text) {
-            if (experienceMode !== "chat") {
-              setInput("");
-              void send(text);
-            } else {
-              setInput(text);
-            }
-          }
-        } catch {
-          setStatusLine("Speech transcription failed.");
-        } finally {
-          mediaRecorderRef.current = null;
           recordedChunksRef.current = [];
+
+          // If we intentionally stopped recording (e.g., to avoid capturing TTS),
+          // skip transcription for this cycle.
+          if (!ignoreNextRecordingStopRef.current) {
+            await transcribeAndSend(blob);
+          }
+        } finally {
+          ignoreNextRecordingStopRef.current = false;
+          // cleanup stream
+          try {
+            mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+          } catch {
+            // ignore
+          }
+          mediaStreamRef.current = null;
+          mediaRecorderRef.current = null;
+          fallbackRecordingRef.current = false;
+
+          if (micDesiredRef.current && !sttHoldRef.current) {
+            // immediately record again for continuous conversation
+            await startFallbackRecording();
+          } else {
+            setSttStatus("idle");
+          }
         }
       };
 
-      mr.start();
-      // Auto-stop after 7 seconds (short, predictable clip)
-      window.setTimeout(() => {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-          try {
-            mediaRecorderRef.current.stop();
-          } catch {}
-        }
-      }, 7000);
+      recorder.start();
     } catch {
-      setListening(false);
-      setStatusLine("Microphone access is blocked in the browser.");
+      setSttStatus("error");
+      fallbackRecordingRef.current = false;
     }
-  }, [API_BASE, experienceMode]);
+  }
 
-  const toggleListening = useCallback(() => {
-    if (listening) stopListening();
-    else void startListening();
-  }, [listening, startListening, stopListening]);
+  function stopFallbackRecording() {
+    try {
+      mediaRecorderRef.current?.stop();
+    } catch {
+      // ignore
+    }
+  }
 
-  // ---- Chat calls ----
-  const callChat = useCallback(
-    async (nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> => {
-      const payload = {
-        session_id: sessionIdRef.current,
-        wants_explicit: false,
-        voice_id: voiceId,
-        voiceId: voiceId,
-        session_state: {
-          ...stateToSend,
-          // enforce companion identity fields for backend compatibility
-          companion: stateToSend.companion || companionName || DEFAULT_COMPANION_NAME,
-          companionName: stateToSend.companion || companionName || DEFAULT_COMPANION_NAME,
-          companion_name: stateToSend.companion || companionName || DEFAULT_COMPANION_NAME,
-          member_id: (memberId || "").trim(),
-          memberId: (memberId || "").trim(),
+  async function transcribeAndSend(blob: Blob) {
+    // Send audio blob to backend STT, then auto-send the transcript.
+    const form = new FormData();
+    form.append("file", blob, "speech.webm");
+    if (companion.companion_key) form.append("companion_key", companion.companion_key);
+
+    try {
+      const res = await fetch(`${API_BASE}/stt/transcribe`, {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) throw new Error("stt_failed");
+      const data = await res.json();
+      const text = String(data?.text || "").trim();
+      if (!text) return;
+
+      setInput("");
+      await sendMessage(text, { spoken: true });
+    } catch {
+      // Swallow; user can retry
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Microphone recognition error." },
+      ]);
+    }
+  }
+
+  async function toggleMic() {
+    await ensureAudioUnlocked();
+
+    const next = !micDesiredRef.current;
+    micDesiredRef.current = next;
+    setIsMicOn(next);
+
+    if (next) sttHoldRef.current = false;
+
+    if (!next) {
+      // turning off
+      pauseSpeechToText();
+      clearSttTimers();
+      sttFinalRef.current = "";
+      sttInterimRef.current = "";
+      setInput("");
+      return;
+    }
+
+    // turning on
+    if (isSpeechRecognitionAvailable()) {
+      startSpeechRecognition();
+    } else {
+      await startFallbackRecording();
+    }
+  }
+
+  async function speakViaElevenLabs(text: string) {
+    await ensureAudioUnlocked();
+
+    stopAllAudio();
+    setIsTtsPlaying(true);
+
+    const abort = new AbortController();
+    ttsAbortRef.current = abort;
+
+    const payload = {
+      text,
+      voice_id: companion.eleven_voice_id,
+      session_state: {
+        companion_key: companion.companion_key,
+        companion: {
+          name: companion.name,
+            user_name: companion.user_name,
+          plan: companion.plan,
+          mode: relationshipMode,
+          avatar_url: companion.avatar_url,
+          eleven_voice_id: companion.eleven_voice_id,
+          member_id: companion.member_id,
         },
-        messages: trimMessagesForChat(nextMessages).map((m) => ({ role: m.role, content: m.content })),
+      },
+    };
+
+    try {
+      const res = await fetch(`${API_BASE}/tts/audio-url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: abort.signal,
+      });
+      if (!res.ok) throw new Error("tts_failed");
+      const data = await res.json();
+      const audioUrl = String(data?.audio_url || "").trim();
+      if (!audioUrl) throw new Error("tts_no_url");
+
+      const src = audioUrl.startsWith("http") ? audioUrl : `${API_BASE}${audioUrl}`;
+      const el = ttsVideoRef.current;
+      if (!el) throw new Error("tts_no_element");
+
+      el.volume = volumeRef.current;
+      el.src = src;
+
+      await el.play();
+
+      await new Promise<void>((resolve) => {
+        const done = () => resolve();
+        el.onended = done;
+        el.onerror = done;
+      });
+    } finally {
+      setIsTtsPlaying(false);
+      ttsAbortRef.current = null;
+    }
+  }
+
+  async function speakViaSpeechSynthesis(text: string) {
+    await ensureAudioUnlocked();
+
+    stopAllAudio();
+    setIsTtsPlaying(true);
+
+    try {
+      await new Promise<void>((resolve) => {
+        if (typeof window === "undefined" || !window.speechSynthesis) {
+          resolve();
+          return;
+        }
+        const u = new SpeechSynthesisUtterance(text);
+        u.onend = () => resolve();
+        u.onerror = () => resolve();
+        window.speechSynthesis.speak(u);
+      });
+    } finally {
+      setIsTtsPlaying(false);
+    }
+  }
+
+  async function speakAssistant(text: string) {
+    // In Video mode, do not use ElevenLabs. Use browser speechSynthesis.
+    if (isVideoMode) {
+      await speakViaSpeechSynthesis(text);
+      return;
+    }
+
+    // In standard (chat) mode, only speak automatically when mic is active.
+    if (!micDesiredRef.current) return;
+
+    await speakViaElevenLabs(text);
+  }
+
+  async function sendMessage(text: string, opts?: { spoken?: boolean }) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (isSending) return;
+
+    // If user is speaking, pause STT while we send + while we speak the reply.
+    const shouldResumeStt = micDesiredRef.current;
+    if (shouldResumeStt) pauseSpeechToText();
+
+    setIsSending(true);
+    setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+
+    try {
+      const payload = {
+        messages: [
+          ...messages,
+          { role: "user", content: trimmed },
+        ],
+        session_state: {
+          companion_key: companion.companion_key,
+          companion: {
+            name: companion.name,
+            plan: companion.plan,
+            mode: relationshipMode,
+            avatar_url: companion.avatar_url,
+            eleven_voice_id: companion.eleven_voice_id,
+            member_id: companion.member_id,
+          },
+          plan: companion.plan,
+          mode: relationshipMode,
+          client: {
+            spoken: Boolean(opts?.spoken),
+            user_agent: typeof navigator !== "undefined" ? navigator.userAgent : "",
+          },
+        },
       };
 
       const res = await fetch(`${API_BASE}/chat`, {
@@ -574,474 +770,385 @@ export default function CompanionPage() {
         body: JSON.stringify(payload),
       });
 
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`Backend error ${res.status}: ${txt}`);
+      if (!res.ok) throw new Error("chat_failed");
+
+      const data = await res.json();
+      const reply = String(data?.reply || "").trim() || "…";
+
+      setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
+
+      // Speak after we paint the message, and then resume STT if needed.
+      await speakAssistant(reply);
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "Sorry — something went wrong.",
+        },
+      ]);
+    } finally {
+      setIsSending(false);
+      if (shouldResumeStt) {
+        await resumeSpeechToTextIfDesired();
       }
+    }
+  }
 
-      return (await res.json()) as ChatApiResponse;
-    },
-    [API_BASE, voiceId, companionName, memberId]
-  );
+  function handleRelationshipModeClick(mode: RelationshipMode) {
+    setRelationshipMode(mode);
+    setMessages((prev) => [...prev, { role: "assistant", content: `Mode set to: ${mode}` }]);
+    setShowModePicker(false);
+  }
 
-  const callSaveChatSummary = useCallback(
-    async (nextMessages: Msg[], stateToSend: SessionState) => {
+  function handleToggleVideo() {
+    // Video conference / streaming mode.
+    setIsVideoMode((v) => !v);
+
+    // NOTE: D-ID avatar integration is intentionally kept out of this implementation.
+    // If/when you re-enable it, the play button can start/stop the live avatar here.
+  }
+
+  function handleStop() {
+    // Stop TTS + STT + video
+    micDesiredRef.current = false;
+    setIsMicOn(false);
+
+    pauseSpeechToText();
+    clearSttTimers();
+    sttFinalRef.current = "";
+    sttInterimRef.current = "";
+    setInput("");
+
+    stopAllAudio();
+    setIsVideoMode(false);
+  }
+
+  function handleNewSessionClear() {
+    setConfirmClearOpen(false);
+    handleStop();
+    setMessages([
+      { role: "assistant", content: `Hi, ${companion.name} here. What's on your mind?` },
+      { role: "assistant", content: `Mode set to: ${relationshipMode}` },
+    ]);
+  }
+
+  async function handleSaveMessages() {
+    setConfirmSaveOpen(false);
+
+    const payload = {
+      messages,
+      session_state: {
+        companion_key: companion.companion_key,
+        companion: {
+          name: companion.name,
+          plan: companion.plan,
+          mode: relationshipMode,
+          avatar_url: companion.avatar_url,
+          member_id: companion.member_id,
+        },
+      },
+    };
+
+    try {
       const res = await fetch(`${API_BASE}/chat/save-summary`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionIdRef.current,
-          session_state: {
-            ...stateToSend,
-            companion: stateToSend.companion || companionName || DEFAULT_COMPANION_NAME,
-            companionName: stateToSend.companion || companionName || DEFAULT_COMPANION_NAME,
-            companion_name: stateToSend.companion || companionName || DEFAULT_COMPANION_NAME,
-            member_id: (memberId || "").trim(),
-            memberId: (memberId || "").trim(),
-          },
-          messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
-        }),
+        body: JSON.stringify(payload),
       });
 
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`Backend error ${res.status}: ${txt}`);
-      }
-      return (await res.json()) as any;
-    },
-    [API_BASE, companionName, memberId]
-  );
+      if (!res.ok) throw new Error("save_failed");
 
-  const send = useCallback(
-    async (textOverride?: string) => {
-      const text = (textOverride ?? input).trim();
-      if (!text) return;
-      if (busy) return;
+      const data = await res.json();
+      const summary = String(data?.summary || "").trim();
 
-      setBusy(true);
-      setStatusLine("");
+      // Download a local copy for convenience.
+      const filename = `elaralo_session_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+      downloadText(filename, summary || "(no summary returned)");
 
-      const nextMessages: Msg[] = [...messages, { role: "user", content: text }];
-      setMessages(nextMessages);
-
-      if (!textOverride) setInput("");
-
-      try {
-        const resp = await callChat(nextMessages, sessionState);
-
-        const reply = String(resp.reply || resp.text || "").trim();
-        if (resp.session_state) {
-          setSessionState((prev) => ({ ...prev, ...resp.session_state }));
-        }
-
-        if (reply) {
-          setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
-          lastAssistantTextRef.current = reply;
-
-          const audioUrl = String(resp.audio_url || "").trim();
-          if (audioUrl) lastAssistantAudioUrlRef.current = audioUrl;
-
-          // Auto-speak only in audio/video modes.
-          if ((experienceMode === "audio" || experienceMode === "video") && (audioUrl || reply)) {
-            const urlToPlay = audioUrl || (await callTtsAudioUrl(reply));
-            if (urlToPlay) {
-              lastAssistantAudioUrlRef.current = urlToPlay;
-              await playAudioUrl(urlToPlay);
-            }
-          }
-        }
-      } catch (e: any) {
-        setStatusLine(e?.message ? String(e.message) : "Chat failed.");
-      } finally {
-        setBusy(false);
-      }
-    },
-    [input, busy, messages, callChat, sessionState, experienceMode, callTtsAudioUrl, playAudioUrl]
-  );
-
-  // ---- Relationship mode picker ----
-  const visibleModePills: Mode[] = useMemo(() => {
-    // Do not show any disabled pills: only show modes included in plan.
-    return ["friend", "romantic", "intimate"].filter((m) => allowedModes.includes(m as Mode)) as Mode[];
-  }, [allowedModes]);
-
-  const setModeFromPill = useCallback(
-    (m: Mode) => {
-      if (!allowedModes.includes(m)) return; // should never happen because we only show allowed
-      setSessionState((prev) => ({ ...prev, mode: m }));
-      setMessages((prev) => [...prev, { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` }]);
-      setShowModePicker(false);
-    },
-    [allowedModes]
-  );
-
-  // ---- Bottom actions ----
-  const newSession = useCallback(() => {
-    stopAudio();
-    stopListening();
-
-    sessionIdRef.current =
-      (globalThis.crypto as any)?.randomUUID?.() ||
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    sessionStartMsRef.current = Date.now();
-    setSessionSeconds(0);
-
-    setMessages([
-      { role: "assistant", content: `Hi, ${companionName || DEFAULT_COMPANION_NAME} here. What’s on your mind?` },
-      { role: "assistant", content: `Mode set to: ${MODE_LABELS[sessionState.mode]}` },
-    ]);
-    setInput("");
-    setStatusLine("");
-  }, [companionName, sessionState.mode, stopAudio, stopListening]);
-
-  const clearChat = useCallback(() => {
-    stopAudio();
-    stopListening();
-    setMessages([{ role: "assistant", content: `Hi, ${companionName || DEFAULT_COMPANION_NAME} here. What’s on your mind?` }]);
-    setStatusLine("");
-  }, [companionName, stopAudio, stopListening]);
-
-  const saveSummary = useCallback(async () => {
-    setStatusLine("");
-    try {
-      const res = await callSaveChatSummary(messages, sessionState);
-      if (res?.ok) setStatusLine("Summary saved.");
-      else setStatusLine("Summary save failed.");
-    } catch (e: any) {
-      setStatusLine(e?.message ? String(e.message) : "Summary save failed.");
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Session saved." },
+      ]);
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Unable to save this session right now." },
+      ]);
     }
-  }, [callSaveChatSummary, messages, sessionState]);
+  }
 
-  const switchCompanion = useCallback(() => {
-    stopAudio();
-    stopListening();
-    router.push("/myelaralo");
-  }, [router, stopAudio, stopListening]);
+  const showUpgrade = useMemo(() => {
+    const all: RelationshipMode[] = ["Friend", "Romantic", "Intimate"];
+    const allowed = new Set(companion.allowed_modes);
+    return all.some((m) => !allowed.has(m));
+  }, [companion.allowed_modes]);
 
-  // ---- UI ----
-  const activeModeLabel = MODE_LABELS[sessionState.mode] || "Friend";
+  const canUseMode = (m: RelationshipMode) => companion.allowed_modes.includes(m);
 
   return (
-    <div style={{ minHeight: "100vh", background: "#f2f2f2" }}>
-      <div style={{ maxWidth: 1050, margin: "0 auto", padding: "22px 18px" }}>
-        {/* Header */}
-        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
-          <img
-            src={avatarUrl || DEFAULT_AVATAR_URL}
-            alt="Companion avatar"
-            style={{ width: 72, height: 72, borderRadius: "50%", objectFit: "cover", border: "1px solid #d6d6d6" }}
-          />
-
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 30, fontWeight: 800, color: "#111", lineHeight: 1.1 }}>
-              Elaralo
+    <div className="page">
+      <div className="card" style={{ padding: 18 }}>
+        <div className="headerRow">
+          <img className="avatar" src={companion.avatar_url} alt={companion.name} />
+          <div className="headerText">
+            <h1 className="h1">Elaralo</h1>
+            <div className="subline">
+              Companion: <strong>{companion.name}</strong> · Plan: <strong>{companion.plan}</strong>
             </div>
-
-            <div style={{ marginTop: 6, color: "#444", fontSize: 14 }}>
-              Companion: <strong>{companionName || DEFAULT_COMPANION_NAME}</strong> ·{" "}
-              Plan: <strong>{planName}</strong>
+            <div className="subline">
+              Mode: <strong>{relationshipMode}</strong>
             </div>
+          </div>
+        </div>
 
-            <div style={{ marginTop: 2, color: "#555", fontSize: 14 }}>
-              Mode: <strong>{activeModeLabel}</strong>
-            </div>
-
-            <div style={{ marginTop: 6, color: "#666", fontSize: 12.5 }}>
-              Session: {formatSeconds(sessionSeconds)} · Today: {formatSeconds(dailySeconds)}
-            </div>
-
-            {/* Controls row (mirrors the referenced layout pattern) */}
-            <div
-              style={{
-                marginTop: 12,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 12,
-                flexWrap: "wrap",
-              }}
+        <div className="controlsRow">
+          <div className="leftControls">
+            <button
+              className={`iconBtn ${isVideoMode ? "iconBtnActive" : ""}`}
+              onClick={handleToggleVideo}
+              aria-label="Video"
+              title="Video"
             >
-              {/* Left: play/mic/stop + live avatar status */}
-              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                <IconButton title="Play (Speak Last)" onClick={() => void speakLast()} active={isSpeaking}>
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="#111" aria-hidden="true">
-                    <path d="M8 5v14l11-7z" />
-                  </svg>
-                </IconButton>
+              {svgIcon("play")}
+            </button>
 
-                <IconButton title={listening ? "Stop Listening" : "Start Listening"} onClick={toggleListening} active={listening}>
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="#111" aria-hidden="true">
-                    <path d="M12 14a3 3 0 0 0 3-3V7a3 3 0 0 0-6 0v4a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z" />
-                  </svg>
-                </IconButton>
+            <button
+              className={`iconBtn ${isMicOn ? "iconBtnActive" : ""}`}
+              onClick={toggleMic}
+              aria-label="Microphone"
+              title="Microphone"
+            >
+              {svgIcon("mic")}
+            </button>
 
-                <IconButton
-                  title="Stop Audio"
-                  onClick={() => {
-                    stopAudio();
-                    stopListening();
-                  }}
-                >
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="#111" aria-hidden="true">
-                    <path d="M6 6h12v12H6z" />
-                  </svg>
-                </IconButton>
+            <button className="iconBtn" onClick={handleStop} aria-label="Stop" title="Stop">
+              {svgIcon("stop")}
+            </button>
 
-                <div style={{ marginLeft: 6, fontSize: 13, color: "#555" }}>
-                  Live Avatar: <strong>{experienceMode === "video" ? "video" : "idle"}</strong>
-                </div>
+            <div className="liveStatus">
+              <span>Live Avatar: </span>
+              <strong>{isVideoMode ? "live" : "idle"}</strong>
+              {sttStatus === "listening" ? (
+                <span style={{ marginLeft: 10 }}>· Listening</span>
+              ) : null}
+              {isTtsPlaying ? <span style={{ marginLeft: 10 }}>· Speaking</span> : null}
+            </div>
+          </div>
 
-                {/* Experience mode pills (not condensed) */}
-                <div style={{ display: "flex", gap: 8, marginLeft: 10, flexWrap: "wrap" }}>
-                  <Pill label="Chat" active={experienceMode === "chat"} onClick={() => setExperienceMode("chat")} />
-                  <Pill label="Audio" active={experienceMode === "audio"} onClick={() => setExperienceMode("audio")} />
-                  <Pill label="Video" active={experienceMode === "video"} onClick={() => setExperienceMode("video")} />
-                </div>
-              </div>
-
-              {/* Right: Set Mode + Switch Companion */}
-              <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                <button
-                  type="button"
-                  onClick={() => setShowModePicker((v) => !v)}
-                  style={{
-                    padding: "14px 18px",
-                    borderRadius: 14,
-                    border: "1px solid #cfcfcf",
-                    background: "#fff",
-                    fontWeight: 700,
-                    cursor: "pointer",
-                  }}
-                >
-                  Set Mode
-                </button>
-
-                <button
-                  type="button"
-                  onClick={switchCompanion}
-                  style={{
-                    padding: "14px 18px",
-                    borderRadius: 14,
-                    border: "1px solid #cfcfcf",
-                    background: "#fff",
-                    fontWeight: 700,
-                    cursor: "pointer",
-                  }}
-                >
-                  Switch Companion
-                </button>
-              </div>
+          <div className="rightControls">
+            <div className="rightButtons">
+              <button className="btn" onClick={() => setShowModePicker((v) => !v)}>
+                Set Mode
+              </button>
+              <button className="btn" onClick={() => router.push(SWITCH_COMPANION_URL)}>
+                Switch Companion
+              </button>
             </div>
 
-            {/* Relationship mode pills under Set Mode */}
-            {showModePicker && (
-              <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                {visibleModePills.map((m) => (
-                  <Pill
-                    key={m}
-                    label={MODE_LABELS[m]}
-                    active={sessionState.mode === m}
-                    onClick={() => setModeFromPill(m)}
-                  />
-                ))}
+            {showModePicker ? (
+              <div className="pillRow">
+                {canUseMode("Friend") ? (
+                  <button
+                    className={`pill ${relationshipMode === "Friend" ? "pillActive" : ""}`}
+                    onClick={() => handleRelationshipModeClick("Friend")}
+                  >
+                    Friend
+                  </button>
+                ) : null}
 
-                <div style={{ fontSize: 12.5, color: "#666", marginLeft: 6 }}>
-                  Only modes included in the member’s plan are shown. Trial maps to Romantic. No disabled pills are selectable.
-                </div>
+                {canUseMode("Romantic") ? (
+                  <button
+                    className={`pill ${relationshipMode === "Romantic" ? "pillActive" : ""}`}
+                    onClick={() => handleRelationshipModeClick("Romantic")}
+                  >
+                    Romantic
+                  </button>
+                ) : null}
+
+                {canUseMode("Intimate") ? (
+                  <button
+                    className={`pill ${relationshipMode === "Intimate" ? "pillActive" : ""}`}
+                    onClick={() => handleRelationshipModeClick("Intimate")}
+                  >
+                    Intimate
+                  </button>
+                ) : null}
+
+                {showUpgrade ? (
+                  <a className="pill pillLink" href={UPGRADE_URL}>
+                    Upgrade
+                  </a>
+                ) : null}
               </div>
-            )}
+            ) : null}
           </div>
         </div>
 
-        {/* Video mode panel */}
-        {experienceMode === "video" && (
-          <div
-            style={{
-              marginTop: 16,
-              background: "#fff",
-              border: "1px solid #d6d6d6",
-              borderRadius: 14,
-              padding: 12,
-            }}
-          >
-            {VIDEO_MODE_URL ? (
-              <iframe
-                src={VIDEO_MODE_URL}
-                style={{ width: "100%", height: 360, border: 0, borderRadius: 10 }}
-                allow="camera; microphone; autoplay; clipboard-write; display-capture"
-                title="Video mode"
-              />
-            ) : (
-              <div style={{ color: "#444", fontSize: 14 }}>
-                Video mode is enabled, but <code>NEXT_PUBLIC_VIDEO_MODE_URL</code> is not set.
-              </div>
-            )}
+        {/* Video panel (only when play is active) */}
+        {isVideoMode ? (
+          <div style={{ marginTop: 16 }}>
+            <div className="card" style={{ padding: 12 }}>
+              {VIDEO_EMBED_URL ? (
+                <iframe
+                  src={VIDEO_EMBED_URL}
+                  title="Video session"
+                  style={{ width: "100%", height: 320, border: "0", borderRadius: 12 }}
+                  allow="camera; microphone; autoplay; encrypted-media; picture-in-picture"
+                />
+              ) : (
+                <div className="mutedNote">
+                  Video mode is enabled. Set <code>NEXT_PUBLIC_VIDEO_EMBED_URL</code> to embed a
+                  conferencing or streaming URL.
+                </div>
+              )}
+            </div>
           </div>
-        )}
+        ) : null}
 
-        {/* Conversation box */}
-        <div
-          style={{
-            marginTop: 16,
-            background: "#fff",
-            border: "1px solid #d6d6d6",
-            borderRadius: 16,
-            padding: 16,
-            minHeight: 460,
-          }}
-        >
+        <div className="chatBox" ref={chatBoxRef}>
           {messages.map((m, idx) => (
-            <div key={idx} style={{ marginBottom: 10, fontSize: 16, color: "#111" }}>
-              <strong style={{ fontWeight: 800 }}>
-                {m.role === "assistant" ? `${companionName || DEFAULT_COMPANION_NAME}:` : "You:"}
-              </strong>{" "}
-              <span>{m.content}</span>
-            </div>
+            <p className="msg" key={idx}>
+              <span className="speaker">{m.role === "user" ? (companion.user_name || "You") : companion.name}:</span>
+              {m.content}
+            </p>
           ))}
-
-          {statusLine && (
-            <div style={{ marginTop: 10, fontSize: 13.5, color: "#b00020" }}>
-              {statusLine}
-            </div>
-          )}
         </div>
 
-        {/* Input row (icon controls + input + send) */}
-        <div
-          style={{
-            marginTop: 12,
-            display: "flex",
-            gap: 10,
-            alignItems: "center",
-            flexWrap: "wrap",
-          }}
-        >
+        <div className="composeRow">
           <button
-            type="button"
-            onClick={() => void saveSummary()}
-            title="Save Summary"
-            aria-label="Save Summary"
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: 10,
-              border: "1px solid #cfcfcf",
-              background: "#fff",
-              cursor: "pointer",
-              display: "grid",
-              placeItems: "center",
-            }}
+            className="iconBtn"
+            onClick={() => setConfirmSaveOpen(true)}
+            aria-label="Save session"
+            title="Save session"
           >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="#111" aria-hidden="true">
-              <path d="M6 2h9l5 5v15a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm8 1.5V8h4.5L14 3.5zM8 12h8v2H8v-2zm0 4h8v2H8v-2z" />
-            </svg>
+            {svgIcon("save")}
           </button>
 
           <button
-            type="button"
-            onClick={() => {
-              // Keep behavior: New Session is separate from “clear chat”
-              newSession();
-            }}
-            title="New Session"
-            aria-label="New Session"
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: 10,
-              border: "1px solid #cfcfcf",
-              background: "#fff",
-              cursor: "pointer",
-              display: "grid",
-              placeItems: "center",
-            }}
+            className="iconBtn"
+            onClick={() => setConfirmClearOpen(true)}
+            aria-label="New session"
+            title="New session"
           >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="#111" aria-hidden="true">
-              <path d="M12 5V2L8 6l4 4V7c3.31 0 6 2.69 6 6a6 6 0 0 1-6 6 6 6 0 0 1-5.65-4H4.26A8 8 0 0 0 12 21a8 8 0 0 0 0-16z" />
-            </svg>
-          </button>
-
-          <button
-            type="button"
-            onClick={clearChat}
-            title="Clear Messages"
-            aria-label="Clear Messages"
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: 10,
-              border: "1px solid #cfcfcf",
-              background: "#fff",
-              cursor: "pointer",
-              display: "grid",
-              placeItems: "center",
-            }}
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="#111" aria-hidden="true">
-              <path d="M6 7h12l-1 14H7L6 7zm3-3h6l1 2H8l1-2z" />
-            </svg>
+            {svgIcon("trash")}
           </button>
 
           <input
+            className="textInput"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder="Type a message..."
-            style={{
-              flex: 1,
-              minWidth: 260,
-              height: 44,
-              borderRadius: 12,
-              border: "1px solid #cfcfcf",
-              padding: "0 14px",
-              fontSize: 16,
-              outline: "none",
-              background: "#fff",
-            }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
-                void send();
+                void sendMessage(input);
+                setInput("");
               }
             }}
-            disabled={busy}
           />
 
           <button
-            type="button"
-            onClick={() => void send()}
-            disabled={busy}
-            style={{
-              height: 44,
-              padding: "0 18px",
-              borderRadius: 12,
-              border: "1px solid #111",
-              background: "#111",
-              color: "#fff",
-              fontWeight: 800,
-              cursor: busy ? "not-allowed" : "pointer",
+            className="sendBtn"
+            disabled={isSending || !input.trim()}
+            onClick={() => {
+              void sendMessage(input);
+              setInput("");
             }}
           >
-            {busy ? "Sending..." : "Send"}
+            Send
           </button>
         </div>
 
-        {/* Hidden TTS video element (audio playback stability) */}
+        {/* Hidden video element used for stable cross-device audio playback */}
         <video
           ref={ttsVideoRef}
+          style={{ display: "none" }}
           playsInline
-          preload="auto"
-          style={{ width: 0, height: 0, opacity: 0, position: "absolute", left: -9999 }}
-          onEnded={() => setIsSpeaking(false)}
-          onPause={() => setIsSpeaking(false)}
+          // Do not set muted=true; we manage it during unlock only.
         />
+
+        {/* Confirm Clear / New Session */}
+        {confirmClearOpen ? (
+          <div className="modalOverlay" role="dialog" aria-modal="true">
+            <div className="modal">
+              <div className="modalTitle">Start a new session?</div>
+              <p className="modalBody">
+                This will clear the current conversation from the screen.
+              </p>
+              <div className="modalActions">
+                <button className="btn" onClick={() => setConfirmClearOpen(false)}>
+                  Cancel
+                </button>
+                <button className="btn" onClick={handleNewSessionClear}>
+                  New Session
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Confirm Save */}
+        {confirmSaveOpen ? (
+          <div className="modalOverlay" role="dialog" aria-modal="true">
+            <div className="modal">
+              <div className="modalTitle">Save this session?</div>
+              <p className="modalBody">
+                This will generate a summary and download it as a text file.
+              </p>
+              <div className="modalActions">
+                <button className="btn" onClick={() => setConfirmSaveOpen(false)}>
+                  Cancel
+                </button>
+                <button className="btn" onClick={() => void handleSaveMessages()}>
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
     </div>
   );
 }
 
-/**
- * D-ID integration placeholder (kept intentionally for future use)
- *
- * The Elaralo Video mode currently uses video conferencing / streaming (iframe).
- * If you re-enable live avatar rendering later, the D-ID wiring can be restored here.
- */
+
+/* -------------------------------------------------------------------------------------------------
+   D-ID Live Avatar integration (commented out)
+
+   This project intentionally ships with video-conferencing/streaming enabled and avatar synthesis
+   vendors disabled. The block below is preserved as a starting point if you later choose to add a
+   live avatar provider again.
+
+   Notes:
+   - Do not uncomment until you have installed the required SDK package(s) and added your credentials.
+   - Keep this code path behind a feature flag so the standard experience remains provider-agnostic.
+
+   Example skeleton (not active):
+
+   async function startLiveAvatarWithDid() {
+     // 1) Fetch a session token from your backend (recommended) OR directly from your provider if safe.
+     // const tokenRes = await fetch(`${API_BASE}/avatar/token`, { method: "POST" });
+     // const { token } = await tokenRes.json();
+
+     // 2) Initialize SDK (requires: npm i @d-id/client-sdk)
+     // const { createClient } = await import("@d-id/client-sdk");
+     // const client = createClient({ token });
+
+     // 3) Connect to agent / stream, and attach MediaStream to a video element
+     // const agentId = "...";
+     // const room = await client.rooms.join({ agentId });
+     // const stream = room.getStream();
+     // videoEl.srcObject = stream;
+     // await videoEl.play();
+
+     // 4) When you need to speak:
+     // await client.speak({ text, voice: { provider: "elevenlabs", voice_id: companion.eleven_voice_id }});
+   }
+
+   async function stopLiveAvatarWithDid() {
+     // room?.leave();
+     // videoEl.srcObject = null;
+   }
+
+-------------------------------------------------------------------------------------------------- */
