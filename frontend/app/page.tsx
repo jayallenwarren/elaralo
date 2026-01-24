@@ -135,7 +135,7 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
   return DEFAULT_COMPANION_NAME;
 }
 
-const GREET_ONCE_KEY = "AIELARA_GREETED";
+const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -256,7 +256,7 @@ function formatDidError(err: any): string {
   }
 }
 
-const UPGRADE_URL = "https://www.aielara4u.com/pricing-plans/list";
+const UPGRADE_URL = "https://www.elaralo.com/pricing-plans/list";
 
 const MODE_LABELS: Record<Mode, string> = {
   friend: "Friend",
@@ -359,7 +359,7 @@ function isAllowedOrigin(origin: string) {
   try {
     const u = new URL(origin);
     const host = u.hostname.toLowerCase();
-    if (host.endsWith("aielara4u.com")) return true;
+    if (host.endsWith("elaralo.com")) return true;
     if (host.endsWith("wix.com")) return true;
     if (host.endsWith("wixsite.com")) return true;
     return false;
@@ -472,7 +472,7 @@ export default function Page() {
   // Debug overlay (mobile-friendly)
   // Enable with ?debug=1 OR tap the avatar image 5 times quickly.
   // -----------------------
-  const DEBUG_KEY = "AIELARA_DEBUG_OVERLAY";
+  const DEBUG_KEY = "ELARALO_DEBUG_OVERLAY";
   const [debugEnabled, setDebugEnabled] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
@@ -1788,7 +1788,7 @@ const speakAssistantReply = useCallback(
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const key = "AIELARA_SESSION_ID";
+    const key = "ELARALO_SESSION_ID";
     let id = window.sessionStorage.getItem(key);
     if (!id) {
       id = (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1828,7 +1828,7 @@ const speakAssistantReply = useCallback(
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const goToMyElara = useCallback(() => {
-    const url = "https://www.aielara4u.com/myelara";
+    const url = "https://www.elaralo.com/myelara";
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
     // so we leave the embed and avoid “stacked headers”.
@@ -3141,7 +3141,7 @@ const speakGreetingIfNeeded = useCallback(
     }
 
     const name = (companionName || "").trim() || "Companion";
-    const key = `AIELARA_GREET_SPOKEN:${name}`;
+    const key = `ELARALO_GREET_SPOKEN:${name}`;
 
     // Already spoken this session?
     try {
