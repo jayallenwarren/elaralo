@@ -568,7 +568,9 @@ export default function Page() {
         href: window.location.href,
         embedded: isEmbedded,
         ua: navigator.userAgent,
+        apiBase: API_BASE,
       });
+      console.log("[ELARALO] API_BASE =", API_BASE);
     } catch {
       // ignore
     }
