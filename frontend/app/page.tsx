@@ -3723,7 +3723,7 @@ const speakGreetingIfNeeded = useCallback(
         <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
           <img
             src={avatarSrc}
-            alt="ELaRalo"
+            alt="Elaralo"
             style={{ width: "100%", height: "100%" }}
             onError={(e) => {
               (e.currentTarget as HTMLImageElement).src = DEFAULT_AVATAR;
@@ -3731,7 +3731,7 @@ const speakGreetingIfNeeded = useCallback(
           />
         </div>
         <div>
-          <h1 style={{ margin: 0, fontSize: 22 }}>ELaRalo</h1>
+          <h1 style={{ margin: 0, fontSize: 22 }}>Elaralo</h1>
           <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
             <b>{planName ?? "Unknown / Not provided"}</b>
