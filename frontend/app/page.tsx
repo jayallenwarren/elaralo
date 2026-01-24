@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import elaraloLogo from "../public/elaralo-logo.png";
+import elaraHeart from "../public/ai-elara-heart.png";
 
 
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
@@ -135,10 +135,10 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
   return DEFAULT_COMPANION_NAME;
 }
 
-const GREET_ONCE_KEY = "ELARALO_GREETED";
-const DEFAULT_AVATAR = elaraloLogo.src;
+const GREET_ONCE_KEY = "AIELARA_GREETED";
+const DEFAULT_AVATAR = elaraHeart.src;
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "https://elaralo-api-01.azurewebsites.net";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
 type Phase1AvatarMedia = {
   didAgentId: string;
@@ -256,7 +256,7 @@ function formatDidError(err: any): string {
   }
 }
 
-const UPGRADE_URL = "https://www.elaralo.com/pricing-plans/list";
+const UPGRADE_URL = "https://www.aielara4u.com/pricing-plans/list";
 
 const MODE_LABELS: Record<Mode, string> = {
   friend: "Friend",
@@ -359,7 +359,7 @@ function isAllowedOrigin(origin: string) {
   try {
     const u = new URL(origin);
     const host = u.hostname.toLowerCase();
-    if (host.endsWith("elaralo.com")) return true;
+    if (host.endsWith("aielara4u.com")) return true;
     if (host.endsWith("wix.com")) return true;
     if (host.endsWith("wixsite.com")) return true;
     return false;
@@ -472,7 +472,7 @@ export default function Page() {
   // Debug overlay (mobile-friendly)
   // Enable with ?debug=1 OR tap the avatar image 5 times quickly.
   // -----------------------
-  const DEBUG_KEY = "ELARALO_DEBUG_OVERLAY";
+  const DEBUG_KEY = "AIELARA_DEBUG_OVERLAY";
   const [debugEnabled, setDebugEnabled] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
@@ -1788,7 +1788,7 @@ const speakAssistantReply = useCallback(
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const key = "ELARALO_SESSION_ID";
+    const key = "AIELARA_SESSION_ID";
     let id = window.sessionStorage.getItem(key);
     if (!id) {
       id = (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1828,7 +1828,7 @@ const speakAssistantReply = useCallback(
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const goToMyElara = useCallback(() => {
-    const url = "https://www.elaralo.com/myelara";
+    const url = "https://www.aielara4u.com/myelara";
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
     // so we leave the embed and avoid “stacked headers”.
@@ -1981,7 +1981,7 @@ useEffect(() => {
     };
 
     setMessages((prev) => {
-      // If no messages yet, insert greeting only if we haven't greeted this companion in this session.
+      // If no messages yet, insert greeting only if we elara't greeted this companion in this session.
       if (prev.length === 0) {
         return already ? prev : [greetingMsg];
       }
@@ -3141,7 +3141,7 @@ const speakGreetingIfNeeded = useCallback(
     }
 
     const name = (companionName || "").trim() || "Companion";
-    const key = `ELARALO_GREET_SPOKEN:${name}`;
+    const key = `AIELARA_GREET_SPOKEN:${name}`;
 
     // Already spoken this session?
     try {
@@ -3723,7 +3723,7 @@ const speakGreetingIfNeeded = useCallback(
         <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
           <img
             src={avatarSrc}
-            alt="Elaralo"
+            alt="ELaRalo"
             style={{ width: "100%", height: "100%" }}
             onError={(e) => {
               (e.currentTarget as HTMLImageElement).src = DEFAULT_AVATAR;
@@ -3731,7 +3731,7 @@ const speakGreetingIfNeeded = useCallback(
           />
         </div>
         <div>
-          <h1 style={{ margin: 0, fontSize: 22 }}>Elaralo</h1>
+          <h1 style={{ margin: 0, fontSize: 22 }}>ELaRalo</h1>
           <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
             <b>{planName ?? "Unknown / Not provided"}</b>
@@ -4056,7 +4056,7 @@ const speakGreetingIfNeeded = useCallback(
             </div>
             <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
               Saving stores a server-side summary of this conversation for future reference across your devices.
-              By selecting <b>Yes, save</b>, you authorize Elaralo to store chat summary data associated with your
+              By selecting <b>Yes, save</b>, you authorize AI Elara to store chat summary data associated with your
               account for later use.
               <div style={{ marginTop: 8 }}>
                 All audio, video, and mic listening have been stopped. You can resume manually using the controls

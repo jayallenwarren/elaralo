@@ -34,13 +34,13 @@ STATUS_SAFE = "safe"
 STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
-app = FastAPI(title="Elaralo API")
+app = FastAPI(title="AIElara4U API")
 
 # ----------------------------
 # CORS
 # ----------------------------
 # CORS_ALLOW_ORIGINS can be:
-#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
+#   - comma-separated list of exact origins (e.g. https://aielara4u.com,https://www.aielara4u.com)
 #   - entries with wildcards (e.g. https://*.azurestaticapps.net)
 #   - or a single "*" to allow all (NOT recommended for production)
 cors_env = (
@@ -53,46 +53,25 @@ def _split_cors_origins(raw: str) -> list[str]:
     """Split + normalize CORS origins from an env var.
 
     Supports comma and/or whitespace separation.
-    Normalizes to *origins* (scheme://host[:port]) and removes trailing slashes
-    (browser Origin never includes a trailing slash).
+    Removes trailing slashes (browser Origin never includes a trailing slash).
     De-dupes while preserving order.
-
-    Examples (all normalize to the same origin):
-      - https://nice-bay-xxxx.azurestaticapps.net
-      - https://nice-bay-xxxx.azurestaticapps.net/
-      - https://nice-bay-xxxx.azurestaticapps.net/some/path
     """
     if not raw:
         return []
     tokens = re.split(r"[\s,]+", raw.strip())
     out: list[str] = []
     seen: set[str] = set()
-
-    # Origin grammar we accept:
-    #   * a literal origin like https://example.com or http://localhost:3000
-    #   * a wildcard origin like https://*.azurestaticapps.net (handled later)
-    origin_re = re.compile(r"^(https?://[^/]+)(?:/.*)?$")
     for t in tokens:
         if not t:
             continue
-        t = t.strip().strip('"').strip("'")
+        t = t.strip()
         if not t:
             continue
-        if t == "*":
-            # allow-all is handled outside
-            norm = "*"
-        else:
-            # Drop any path/query fragments; keep only scheme://host[:port]
-            m = origin_re.match(t)
-            norm = m.group(1) if m else t
-
-            # Remove trailing slashes defensively
-            if norm.endswith("/"):
-                norm = norm.rstrip("/")
-
-        if norm and norm not in seen:
-            out.append(norm)
-            seen.add(norm)
+        if t != "*" and t.endswith("/"):
+            t = t.rstrip("/")
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
     return out
 
 raw_items = _split_cors_origins(cors_env)
@@ -155,7 +134,7 @@ def root():
     by default. Returning 200 here prevents false "container failed to start" / 502
     notifications when the API itself is healthy but has no root route.
     """
-    return {"ok": True, "service": "Elaralo API"}
+    return {"ok": True, "service": "AIElara4U API"}
 
 
 @app.get("/health")
