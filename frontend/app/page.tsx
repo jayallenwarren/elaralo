@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import elaraHeart from "../public/elara-logo.png";
+import elaraLogo from "../public/elaralo-logo.png";
 
 
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
@@ -136,7 +136,7 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 }
 
 const GREET_ONCE_KEY = "AIELARA_GREETED";
-const DEFAULT_AVATAR = elaraHeart.src;
+const DEFAULT_AVATAR = elaraLogo.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
