@@ -1,3 +1,4 @@
+azure-cognitiveservices-speech
 annotated-types==0.7.0
 anyio==4.12.1
 azure-core==1.38.0
@@ -36,5 +37,4 @@ urllib3==2.6.3
 uvicorn==0.30.6
 watchfiles==1.1.1
 websockets==16.0
-
 azure-storage-blob>=12.19.0,<13
