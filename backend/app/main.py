@@ -8,7 +8,6 @@ import json
 import hashlib
 import base64
 import asyncio
-import io
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,13 +34,13 @@ STATUS_SAFE = "safe"
 STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
-app = FastAPI(title="AIHaven4U API")
+app = FastAPI(title="Elaralo API")
 
 # ----------------------------
 # CORS
 # ----------------------------
 # CORS_ALLOW_ORIGINS can be:
-#   - comma-separated list of exact origins (e.g. https://aihaven4u.com,https://www.aihaven4u.com)
+#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
 #   - entries with wildcards (e.g. https://*.azurestaticapps.net)
 #   - or a single "*" to allow all (NOT recommended for production)
 cors_env = (
@@ -54,25 +53,46 @@ def _split_cors_origins(raw: str) -> list[str]:
     """Split + normalize CORS origins from an env var.
 
     Supports comma and/or whitespace separation.
-    Removes trailing slashes (browser Origin never includes a trailing slash).
+    Normalizes to *origins* (scheme://host[:port]) and removes trailing slashes
+    (browser Origin never includes a trailing slash).
     De-dupes while preserving order.
+
+    Examples (all normalize to the same origin):
+      - https://nice-bay-xxxx.azurestaticapps.net
+      - https://nice-bay-xxxx.azurestaticapps.net/
+      - https://nice-bay-xxxx.azurestaticapps.net/some/path
     """
     if not raw:
         return []
     tokens = re.split(r"[\s,]+", raw.strip())
     out: list[str] = []
     seen: set[str] = set()
+
+    # Origin grammar we accept:
+    #   * a literal origin like https://example.com or http://localhost:3000
+    #   * a wildcard origin like https://*.azurestaticapps.net (handled later)
+    origin_re = re.compile(r"^(https?://[^/]+)(?:/.*)?$")
     for t in tokens:
         if not t:
             continue
-        t = t.strip()
+        t = t.strip().strip('"').strip("'")
         if not t:
             continue
-        if t != "*" and t.endswith("/"):
-            t = t.rstrip("/")
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
+        if t == "*":
+            # allow-all is handled outside
+            norm = "*"
+        else:
+            # Drop any path/query fragments; keep only scheme://host[:port]
+            m = origin_re.match(t)
+            norm = m.group(1) if m else t
+
+            # Remove trailing slashes defensively
+            if norm.endswith("/"):
+                norm = norm.rstrip("/")
+
+        if norm and norm not in seen:
+            out.append(norm)
+            seen.add(norm)
     return out
 
 raw_items = _split_cors_origins(cors_env)
@@ -110,11 +130,6 @@ else:
     if not allow_origins and not allow_origin_regex:
         print("[CORS] WARNING: CORS_ALLOW_ORIGINS is empty. Browser requests from other origins will be blocked.")
 
-
-# Optional runtime diagnostics (enable by setting DEBUG_CORS=1)
-if (os.getenv("DEBUG_CORS") or "").strip().lower() in {"1", "true", "yes", "on"}:
-    print(f"[CORS] allow_origins={allow_origins} allow_origin_regex={allow_origin_regex} allow_credentials={allow_credentials}")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -140,7 +155,7 @@ def root():
     by default. Returning 200 here prevents false "container failed to start" / 502
     notifications when the API itself is healthy but has no root route.
     """
-    return {"ok": True, "service": "AIHaven4U API"}
+    return {"ok": True, "service": "Elaralo API"}
 
 
 @app.get("/health")
@@ -278,7 +293,7 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
         or session_state.get("companionName")
         or session_state.get("companion_name")
     )
-    name = comp.get("first_name") or "Haven"
+    name = comp.get("first_name") or "Elara"
 
     lines = [
         f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
@@ -1306,26 +1321,9 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
 # Frontend should POST the recorded Blob directly:
 #   fetch(`${API_BASE}/stt/transcribe`, { method:"POST", headers:{ "Content-Type": blob.type }, body: blob })
 #
-
 @app.post("/stt/transcribe")
 async def stt_transcribe(request: Request):
-    """
-    Speech-to-text endpoint.
-
-    This endpoint accepts RAW audio bytes in the request body (not multipart/form-data).
-    The frontend should POST the recorded Blob directly, e.g.:
-
-        fetch(`${API_BASE}/stt/transcribe`, {
-          method: "POST",
-          headers: { "Content-Type": blob.type },
-          body: blob
-        })
-
-    CORS: This endpoint is covered by the same CORSMiddleware configuration as /chat.
-    """
-    # Prefer explicit env var, but fall back to settings if your Settings model provides it.
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip() or str(getattr(settings, "OPENAI_API_KEY", "") or "").strip()
-    if not api_key:
+    if not settings.OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
 
     content_type = (request.headers.get("content-type") or "").lower().strip()
@@ -1351,23 +1349,20 @@ async def stt_transcribe(request: Request):
     bio.name = f"stt.{ext}"
 
     try:
-        from openai import OpenAI
-
-        stt_model = (os.getenv("STT_MODEL") or getattr(settings, "STT_MODEL", None) or "whisper-1")
-        client = OpenAI(api_key=api_key)
-
+        # Use the same OpenAI client used elsewhere in this service.
+        # `settings.STT_MODEL` can be set; fallback is whisper-1.
+        stt_model = getattr(settings, "STT_MODEL", None) or "whisper-1"
         resp = client.audio.transcriptions.create(
             model=stt_model,
             file=bio,
         )
-
-        text_out = getattr(resp, "text", None)
-        if text_out is None and isinstance(resp, dict):
-            text_out = resp.get("text")
-
-        return {"text": str(text_out or "").strip()}
+        text = getattr(resp, "text", None)
+        if text is None and isinstance(resp, dict):
+            text = resp.get("text")
+        if not text:
+            text = ""
+        return {"text": str(text).strip()}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"STT transcription failed: {type(e).__name__}: {e}")
-
+        raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
