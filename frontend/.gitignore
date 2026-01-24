@@ -43,3 +43,7 @@ next-env.d.ts
 # Backend runtime / generated data
 backend/data/
 
+# Environment
+.venv/
+
+
