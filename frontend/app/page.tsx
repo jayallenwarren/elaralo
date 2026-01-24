@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import elaraHeart from "../public/ai-elara-heart.png";
+import elaraHeart from "../public/elara-logo.png";
 
 
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
