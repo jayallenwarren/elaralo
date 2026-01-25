@@ -23,8 +23,13 @@ jobs:
       - name: Build And Deploy
         uses: Azure/static-web-apps-deploy@v1
         with:
+          # Azure Static Web Apps uses a *deployment token* (recommended) for CI/CD.
+          # Azure portal -> Static Web App -> Overview -> Manage deployment token
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+
+          # Used for GitHub integrations (for example, PR comments/status).
           repo_token: ${{ secrets.GITHUB_TOKEN }}
+
           action: upload
           app_location: frontend
           output_location: out
