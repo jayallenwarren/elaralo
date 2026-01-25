@@ -34,13 +34,13 @@ STATUS_SAFE = "safe"
 STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
-app = FastAPI(title="AIElara4U API")
+app = FastAPI(title="Elaralo API")
 
 # ----------------------------
 # CORS
 # ----------------------------
 # CORS_ALLOW_ORIGINS can be:
-#   - comma-separated list of exact origins (e.g. https://aielara4u.com,https://www.aielara4u.com)
+#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
 #   - entries with wildcards (e.g. https://*.azurestaticapps.net)
 #   - or a single "*" to allow all (NOT recommended for production)
 cors_env = (
@@ -134,7 +134,7 @@ def root():
     by default. Returning 200 here prevents false "container failed to start" / 502
     notifications when the API itself is healthy but has no root route.
     """
-    return {"ok": True, "service": "AIElara4U API"}
+    return {"ok": True, "service": "Elaralo API"}
 
 
 @app.get("/health")
@@ -1345,4 +1345,4 @@ async def stt_transcribe(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
-    #
+
