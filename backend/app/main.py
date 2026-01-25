@@ -1345,3 +1345,4 @@ async def stt_transcribe(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
+    #
