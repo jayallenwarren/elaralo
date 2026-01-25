@@ -1,7 +1,0 @@
-sku_id,name,channel,minutes,price_usd,currency,description
-tts_15m_499,TTS Minutes — 15,tts,15,4.99,USD,Prepaid 15 minutes for Text-to-Speech audio (expires in 12 months)
-tts_30m_999,TTS Minutes — 30,tts,30,9.99,USD,Prepaid 30 minutes for Text-to-Speech audio (expires in 12 months)
-tts_60m_1499,TTS Minutes — 60,tts,60,14.99,USD,Prepaid 60 minutes for Text-to-Speech audio (expires in 12 months)
-text_15m_099,Text Minutes — 15,text,15,0.99,USD,Prepaid 15 minutes for text chat (expires in 12 months)
-text_30m_299,Text Minutes — 30,text,30,2.99,USD,Prepaid 30 minutes for text chat (expires in 12 months)
-text_60m_599,Text Minutes — 60,text,60,5.99,USD,Prepaid 60 minutes for text chat (expires in 12 months)
