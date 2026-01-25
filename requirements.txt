@@ -1,2 +1,0 @@
--r backend/requirements.txt
-azure-storage-blob>=12.0.0
