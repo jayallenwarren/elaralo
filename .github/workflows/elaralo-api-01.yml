@@ -1,12 +1,14 @@
-# Run
-name: Deploy FastAPI to Azure Web App
+name: Deploy FastAPI to Azure Web App - elaralo-api-01
 
 on:
   push:
     branches:
       - main
     paths:
-      - backend/**
+      - "backend/**"
+      - ".github/workflows/elaralo-api-01.yml"
+
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -16,8 +18,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Option A (App Service Publish Profile): authenticate directly in azure/webapps-deploy
-      # using an App Service publish profile stored as a GitHub secret.
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
