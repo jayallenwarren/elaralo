@@ -1,3 +1,4 @@
+# Run
 name: Deploy FastAPI to Azure Web App
 
 on:
