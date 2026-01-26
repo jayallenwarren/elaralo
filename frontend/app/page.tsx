@@ -221,6 +221,26 @@ const DEFAULT_AVATAR = elaraLogo.src;
 const DEFAULT_COMPANY_NAME = "Elaralo";
 const REBRANDING_QUERY_PARAM = "rebranding";
 
+function getAppBasePathFromAsset(assetPath: string): string {
+  const p = String(assetPath || "");
+  const idx = p.indexOf("/_next/");
+  // If Next.js is configured with a basePath, imported assets will include it (e.g., "/foo/_next/...").
+  // We want to prefix rebrand logos with the same basePath so they resolve correctly in all deployments.
+  if (idx > 0) return p.slice(0, idx);
+  return "";
+}
+
+function joinUrlPrefix(prefix: string, path: string): string {
+  const pre = String(prefix || "").trim();
+  const p = String(path || "");
+  if (!pre) return p;
+  if (pre.endsWith("/") && p.startsWith("/")) return pre.slice(0, -1) + p;
+  if (!pre.endsWith("/") && !p.startsWith("/")) return pre + "/" + p;
+  return pre + p;
+}
+
+const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
+
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
 type Phase1AvatarMedia = {
@@ -451,16 +471,24 @@ function pickFirstLoadableImage(urls: string[]): Promise<string> {
     const tryNext = () => {
       if (i >= urls.length) return resolve(DEFAULT_AVATAR);
 
-      const url = urls[i++];
+      const url = String(urls[i++] || "").trim();
       if (!url) return tryNext();
       if (url === DEFAULT_AVATAR) return resolve(DEFAULT_AVATAR);
 
       const img = new Image();
-      img.onload = () => resolve(url);
+
+      img.onload = () => {
+        // Some hosting stacks rewrite missing assets to HTML (200) which can still trigger load.
+        // Ensure the browser actually decoded an image.
+        if ((img.naturalWidth || 0) > 0 && (img.naturalHeight || 0) > 0) return resolve(url);
+        return tryNext();
+      };
       img.onerror = () => tryNext();
 
-      // For static assets this is safe; if the asset exists it will load, otherwise we fall back.
-      img.src = url;
+      // Cache-busting probe so newly-added logos are discovered immediately after deployment.
+      const bust = `__probe=${Date.now()}_${Math.random().toString(16).slice(2)}`;
+      const probeUrl = url.includes("?") ? `${url}&${bust}` : `${url}?${bust}`;
+      img.src = probeUrl;
     };
 
     tryNext();
@@ -939,42 +967,51 @@ export default function Page() {
 
     // No rebranding: revert to the default Elaralo logo.
     if (!raw) {
-      // If we are currently showing a "company logo" (default or previous rebrand),
-      // keep it in sync. Do NOT override an existing companion image.
       setCompanyLogoSrc(DEFAULT_AVATAR);
+
+      // Keep the header image in sync if we are currently showing a company logo.
+      // Do NOT override a companion headshot.
       setAvatarSrc((prev) => {
-        const p = (prev || "").trim();
+        const p = String(prev || "").trim();
         if (!p) return DEFAULT_AVATAR;
-        if (p === companyLogoSrc || p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
+        if (p.startsWith(`${HEADSHOT_DIR}/`)) return prev;
+        if (p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
+
+        // If we were previously showing a rebrand logo, revert to default.
+        if (p.includes("-logo.")) return DEFAULT_AVATAR;
+
         return prev;
       });
+
       return;
     }
 
-    const lower = raw.toLowerCase();
-    const compact = lower.replace(/[^a-z0-9]+/g, "");
+    // Normalize the rebranding name into a filename base:
+    // - strip extension
+    // - strip trailing "-logo"
+    // - lowercase
+    // - remove non-alphanumerics so "Dulce Moon" and "DulceMoon" => "dulcemoon"
+    const normalizedBase = raw
+      .replace(/\.(png|jpg|jpeg|webp)$/i, "")
+      .replace(/-logo$/i, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "");
 
-    // Try a few safe variants so "Dulce Moon" and "DulceMoon" both map to dulcemoon-logo.*
-    // We also include a "camel-dup" variant to tolerate accidental double-letter filenames like "dulcemmoon-logo.png".
-    const camelDup = raw.replace(/([a-z0-9])([A-Z])/g, "$1$2$2").toLowerCase();
-    const baseKeys = Array.from(
-      new Set(
-        [compact, lower.replace(/\s+/g, ""), lower, camelDup]
-          .map((s) => s.replace(/[^a-z0-9]+/g, ""))
-          .filter(Boolean)
-      )
-    );
+    const base = normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
 
     const candidates: string[] = [];
-    for (const k of baseKeys) {
-      candidates.push(`/${k}-logo.png`);
-      candidates.push(`/${k}-logo.jpg`);
-      candidates.push(`/${k}-logo.jpeg`);
-      candidates.push(`/${k}-logo.webp`);
+    if (base) {
+      // IMPORTANT: Logo assets live in frontend/public, which resolves to the site root at runtime.
+      // Use the same basePath prefix as Next's imported assets so this works in all deployments.
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.png`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpg`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpeg`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.webp`));
     }
+
+    // Fallback: default Elaralo logo (imported asset)
     candidates.push(DEFAULT_AVATAR);
 
-    // Validate by loading the image (prevents false positives when missing assets are rewritten to index.html).
     let cancelled = false;
 
     pickFirstLoadableImage(candidates).then((picked) => {
@@ -982,12 +1019,17 @@ export default function Page() {
 
       setCompanyLogoSrc(picked);
 
-      // If the current header image is a company logo (default or previous rebrand),
-      // update it. Do NOT override a companion image.
+      // If the current image is a company logo (default or previous rebrand), update it.
+      // Do NOT override a companion headshot.
       setAvatarSrc((prev) => {
-        const p = (prev || "").trim();
+        const p = String(prev || "").trim();
         if (!p) return picked;
-        if (p === companyLogoSrc || p === DEFAULT_AVATAR) return picked;
+        if (p.startsWith(`${HEADSHOT_DIR}/`)) return prev;
+        if (p === DEFAULT_AVATAR) return picked;
+
+        // If we were showing some other "-logo.*" asset, treat it as a company logo and swap it.
+        if (p.includes("-logo.")) return picked;
+
         return prev;
       });
     });
