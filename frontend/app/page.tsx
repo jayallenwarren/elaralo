@@ -218,6 +218,8 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
+const DEFAULT_COMPANY_NAME = "Elaralo";
+const REBRANDING_QUERY_PARAM = "rebranding";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
@@ -886,8 +888,81 @@ export default function Page() {
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
+  // Optional white-label rebranding (company name + default logo only; does NOT touch companion logic)
+  const [rebrandingName, setRebrandingName] = useState<string>("");
+  const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
+  const companyName = ((rebrandingName || "").trim() || DEFAULT_COMPANY_NAME);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
+
+  // Read `?rebranding=...` for direct testing (outside Wix).
+  // In production, Wix should pass { rebranding: "BrandName" } via postMessage.
+  useEffect(() => {
+    try {
+      const u = new URL(window.location.href);
+      const q = u.searchParams.get(REBRANDING_QUERY_PARAM);
+      if (q && q.trim()) setRebrandingName(q.trim());
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Resolve the default company logo when rebranding is active.
+  // This only affects the header circle image when no companion image is available.
+  useEffect(() => {
+    const raw = (rebrandingName || "").trim();
+
+    // No rebranding: revert to the default Elaralo logo.
+    if (!raw) {
+      // If we are currently showing a "company logo" (default or previous rebrand),
+      // keep it in sync. Do NOT override an existing companion image.
+      setCompanyLogoSrc(DEFAULT_AVATAR);
+      setAvatarSrc((prev) => {
+        const p = (prev || "").trim();
+        if (!p) return DEFAULT_AVATAR;
+        if (p === companyLogoSrc || p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
+        return prev;
+      });
+      return;
+    }
+
+    const lower = raw.toLowerCase();
+    const compact = lower.replace(/[^a-z0-9]+/g, "");
+
+    // Try a few safe variants so "Dulce Moon" and "DulceMoon" both map to dulcemoon-logo.*
+    // We also include a "camel-dup" variant to tolerate accidental double-letter filenames like "dulcemmoon-logo.png".
+    const camelDup = raw.replace(/([a-z0-9])([A-Z])/g, "$1$2$2").toLowerCase();
+    const baseKeys = Array.from(
+      new Set(
+        [compact, lower.replace(/\s+/g, ""), lower, camelDup]
+          .map((s) => s.replace(/[^a-z0-9]+/g, ""))
+          .filter(Boolean)
+      )
+    );
+
+    const candidates: string[] = [];
+    for (const k of baseKeys) {
+      candidates.push(`/${k}-logo.png`);
+      candidates.push(`/${k}-logo.jpg`);
+      candidates.push(`/${k}-logo.jpeg`);
+      candidates.push(`/${k}-logo.webp`);
+    }
+    candidates.push(DEFAULT_AVATAR);
+
+    // NOTE: We intentionally reuse the existing HEAD-probe helper that the companion image system uses.
+    pickFirstExisting(candidates).then((picked) => {
+      setCompanyLogoSrc(picked);
+
+      // If the current header image is a company logo (default or previous rebrand),
+      // update it. Do NOT override a companion image.
+      setAvatarSrc((prev) => {
+        const p = (prev || "").trim();
+        if (!p) return picked;
+        if (p === companyLogoSrc || p === DEFAULT_AVATAR) return picked;
+        return prev;
+      });
+    });
+  }, [rebrandingName]);
 
 
 // ----------------------------
@@ -2151,9 +2226,18 @@ useEffect(() => {
       if (!isAllowedOrigin(event.origin)) return;
 
       const data = event.data;
-      if (!data || data.type !== "WEEKLY_PLAN") return;
+      if (!data || data.type !== "MEMBER_PLAN") return;
 
       const incomingPlan = normalizePlanName((data as any).planName);
+
+      // Optional white-label brand handoff from Wix (company name + default logo only).
+      // This MUST NOT affect companion selection or persona logic.
+      if ("rebranding" in (data as any)) {
+        const incomingRebranding =
+          typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
+        setRebrandingName(incomingRebranding);
+      }
+
 
 
       const incomingMemberId =
@@ -2218,26 +2302,6 @@ useEffect(() => {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  // Standalone/default behavior:
-  // If we do NOT have a memberId, the visitor is on Free Trial and should have Romantic-level access.
-  // When running outside Wix (or if the handoff never arrives), we must still enable Romantic and default the mode.
-  useEffect(() => {
-    if ((memberId || "").trim()) return;
-
-    // If romantic is already enabled (e.g., Wix sent Trial), do nothing.
-    if (allowedModes.includes("romantic")) return;
-
-    const nextAllowed = allowedModesForPlan("Trial");
-    setAllowedModes(nextAllowed);
-
-    // Trial should start in Romantic mode (user can still switch back to Friend).
-    setSessionState((prev) => {
-      if (prev.mode !== "friend") return prev;
-      return { ...prev, mode: "romantic", pending_consent: null };
-    });
-  }, [memberId, allowedModes]);
-
-
   async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
@@ -2255,20 +2319,12 @@ const companionForBackend =
   (companionName || DEFAULT_COMPANION_NAME).trim() ||
   DEFAULT_COMPANION_NAME;
 
-// Ensure the backend always receives a plan value for minute-budgets.
-// - If no memberId: Free Trial => planName "Trial"
-// - If memberId exists but plan is missing: send empty string so backend can show "Unknown / Not Provided"
-const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
-
 const stateToSendWithCompanion: SessionState = {
   ...stateToSend,
   companion: companionForBackend,
   // Backward/forward compatibility with any backend expecting different field names
   companionName: companionForBackend,
   companion_name: companionForBackend,
-  planName: effectivePlanForBackend,
-  plan_name: effectivePlanForBackend,
-  plan: effectivePlanForBackend,
   // Member identity (from Wix)
   memberId: (memberId || "").trim(),
   member_id: (memberId || "").trim(),
@@ -3890,16 +3946,16 @@ const speakGreetingIfNeeded = useCallback(
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
           <img
-            src={avatarSrc}
-            alt="Elaralo"
+            src={avatarSrc || companyLogoSrc}
+            alt={companyName}
             style={{ width: "100%", height: "100%" }}
             onError={(e) => {
-              (e.currentTarget as HTMLImageElement).src = DEFAULT_AVATAR;
+              (e.currentTarget as HTMLImageElement).src = companyLogoSrc;
             }}
           />
         </div>
         <div>
-          <h1 style={{ margin: 0, fontSize: 22 }}>Elaralo</h1>
+          <h1 style={{ margin: 0, fontSize: 22 }}>{companyName}</h1>
           <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
             <b>{displayPlanLabel(planName, memberId)}</b>
