@@ -91,10 +91,91 @@ type PlanName =
   | "Friend"
   | "Romantic"
   | "Intimate (18+)"
+  | "Pay as You Go"
   | "Test - Friend"
   | "Test - Romantic"
   | "Test - Intimate (18+)"
+  | "Test - Pay as You Go"
   | null;
+
+
+// --- Plan and companion helpers (no UI changes beyond required labels) ---
+function normalizePlanName(raw: any): PlanName {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  const key = s.toLowerCase();
+
+  switch (key) {
+    case "trial":
+      return "Trial";
+    case "friend":
+      return "Friend";
+    case "romantic":
+      return "Romantic";
+    case "intimate (18+)":
+      return "Intimate (18+)";
+    case "pay as you go":
+      return "Pay as You Go";
+    case "test - friend":
+      return "Test - Friend";
+    case "test - romantic":
+      return "Test - Romantic";
+    case "test - intimate (18+)":
+      return "Test - Intimate (18+)";
+    case "test - pay as you go":
+      return "Test - Pay as You Go";
+    default:
+      return null;
+  }
+}
+
+function displayPlanLabel(planName: PlanName, memberId: string): string {
+  const hasMemberId = Boolean((memberId || "").trim());
+
+  // Requirement: If we do not have a memberId, the visitor is on Trial, shown as "Free Trial".
+  if (!hasMemberId) return "Free Trial";
+
+  // Requirement: Unknown / Not Provided only when the plan information for a member is not provided.
+  if (!planName) return "Unknown / Not Provided";
+
+  return planName;
+}
+
+type CompanionKeySplit = {
+  baseKey: string;
+  flags: Record<string, string>;
+};
+
+/**
+ * Companion keys can include optional metadata after a pipe.
+ * Example:
+ *   "Elara-Female-Caucasian-GenZ|live=stream"
+ *
+ * The baseKey is used for parsing/display and file lookups.
+ * Flags are used for live behavior (D-ID vs streaming/web conference).
+ */
+function splitCompanionKey(raw: string): CompanionKeySplit {
+  const s = String(raw ?? "").trim();
+  if (!s) return { baseKey: "", flags: {} };
+
+  const parts = s.split("|").map((p) => p.trim()).filter(Boolean);
+  const baseKey = parts[0] || "";
+  const flags: Record<string, string> = {};
+
+  for (let i = 1; i < parts.length; i++) {
+    const piece = parts[i] || "";
+    const eq = piece.indexOf("=");
+    if (eq === -1) {
+      flags[piece.toLowerCase()] = "1";
+      continue;
+    }
+    const k = piece.slice(0, eq).trim().toLowerCase();
+    const v = piece.slice(eq + 1).trim();
+    if (k) flags[k] = v;
+  }
+
+  return { baseKey, flags };
+}
 
 type CompanionMeta = {
   first: string;
@@ -256,7 +337,8 @@ function formatDidError(err: any): string {
   }
 }
 
-const UPGRADE_URL = "https://www.elaralo.com/pricing-plans/list";
+const UPGRADE_URL = process.env.NEXT_PUBLIC_UPGRADE_URL || "https://www.elaralo.com/pricing-plans/list";
+const STREAM_URL = process.env.NEXT_PUBLIC_STREAM_URL || "";
 
 const MODE_LABELS: Record<Mode, string> = {
   friend: "Friend",
@@ -273,14 +355,22 @@ const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Trial",
   "Romantic",
   "Intimate (18+)",
+  "Pay as You Go",
   "Test - Romantic",
   "Test - Intimate (18+)",
+  "Test - Pay as You Go",
 ];
+
 
 function allowedModesForPlan(planName: PlanName): Mode[] {
   const modes: Mode[] = ["friend"];
   if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (planName === "Intimate (18+)" || planName === "Test - Intimate (18+)")
+  if (
+    planName === "Intimate (18+)" ||
+    planName === "Test - Intimate (18+)" ||
+    planName === "Pay as You Go" ||
+    planName === "Test - Pay as You Go"
+  )
     modes.push("intimate");
   return modes;
 }
@@ -797,6 +887,7 @@ export default function Page() {
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   const [companionKey, setCompanionKey] = useState<string>("");
+  const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
 
 // ----------------------------
@@ -822,6 +913,23 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
 const [avatarError, setAvatarError] = useState<string | null>(null);
 
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
+
+const liveProvider = useMemo(() => {
+  const raw = String(companionKeyRaw || companionKey || "").trim();
+  const { flags } = splitCompanionKey(raw);
+  const v = String(flags["live"] || "").toLowerCase();
+  if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
+  return "did";
+}, [companionKeyRaw, companionKey]);
+
+const streamUrl = useMemo(() => {
+  const raw = String(companionKeyRaw || "").trim();
+  const { flags } = splitCompanionKey(raw);
+  return String(flags["streamurl"] || "").trim() || STREAM_URL;
+}, [companionKeyRaw]);
+
+const liveEnabled = liveProvider === "stream" || Boolean(phase1AvatarMedia);
+
 
   // UI layout
   const conversationHeight = 520;
@@ -1024,11 +1132,31 @@ const startLiveAvatar = useCallback(async () => {
   setAvatarError(null);
   ensureIphoneAudioContextUnlocked();
 
-  if (!phase1AvatarMedia) {
+if (liveProvider === "stream") {
+  if (!streamUrl) {
     setAvatarStatus("error");
-    setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
+    setAvatarError("Streaming is not configured for this companion.");
     return;
   }
+
+  setAvatarError(null);
+  setAvatarStatus("connected");
+
+  // Streaming / web conference sessions are hosted externally (real-person companions).
+  // Open in a new tab/window to avoid iframe restrictions.
+  try {
+    window.open(streamUrl, "_blank", "noopener,noreferrer");
+  } catch {
+    window.location.href = streamUrl;
+  }
+  return;
+}
+
+if (!phase1AvatarMedia) {
+  setAvatarStatus("error");
+  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
+  return;
+}
 
   if (
     avatarStatus === "connecting" ||
@@ -1178,7 +1306,7 @@ const startLiveAvatar = useCallback(async () => {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
+}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -2025,8 +2153,7 @@ useEffect(() => {
       const data = event.data;
       if (!data || data.type !== "WEEKLY_PLAN") return;
 
-      const incomingPlan = (data.planName ?? null) as PlanName;
-      setPlanName(incomingPlan);
+      const incomingPlan = normalizePlanName((data as any).planName);
 
 
       const incomingMemberId =
@@ -2037,12 +2164,17 @@ useEffect(() => {
             : "";
       setMemberId(incomingMemberId);
 
+      const effectivePlan: PlanName = incomingMemberId ? incomingPlan : "Trial";
+      setPlanName(effectivePlan);
+
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
       const resolvedCompanionKey = incomingCompanion || "";
+      const { baseKey } = splitCompanionKey(resolvedCompanionKey);
 
       if (resolvedCompanionKey) {
-        const parsed = parseCompanionMeta(resolvedCompanionKey);
+        setCompanionKeyRaw(resolvedCompanionKey);
+        const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
 
@@ -2054,6 +2186,7 @@ useEffect(() => {
           companion_name: parsed.key,
         }));
       } else {
+        setCompanionKeyRaw("");
         setCompanionKey("");
         setCompanionName(DEFAULT_COMPANION_NAME);
 
@@ -2065,10 +2198,10 @@ useEffect(() => {
         }));
       }
 
-      const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
+      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME);
       pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
-      const nextAllowed = allowedModesForPlan(incomingPlan);
+      const nextAllowed = allowedModesForPlan(effectivePlan);
       setAllowedModes(nextAllowed);
 
       // If current mode is not allowed, force friend
@@ -2145,11 +2278,16 @@ const stateToSendWithCompanion: SessionState = {
       (companionName || DEFAULT_COMPANION_NAME).trim() ||
       DEFAULT_COMPANION_NAME;
 
+    const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
+
     const stateToSendWithCompanion: SessionState = {
       ...stateToSend,
       companion: companionForBackend,
       companionName: companionForBackend,
       companion_name: companionForBackend,
+      planName: effectivePlanForBackend,
+      plan_name: effectivePlanForBackend,
+      plan: effectivePlanForBackend,
       memberId: (memberId || "").trim(),
       member_id: (memberId || "").trim(),
     };
@@ -3736,7 +3874,7 @@ const speakGreetingIfNeeded = useCallback(
           <h1 style={{ margin: 0, fontSize: 22 }}>Elaralo</h1>
           <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-            <b>{planName ?? "Unknown / Not provided"}</b>
+            <b>{displayPlanLabel(planName, memberId)}</b>
           </div>
           <div style={{ fontSize: 12, color: "#666" }}>
             Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
@@ -3749,7 +3887,7 @@ const speakGreetingIfNeeded = useCallback(
         </div>
       </header>
 
-{phase1AvatarMedia ? (
+{liveEnabled ? (
   <section
     style={{
       display: "flex",
@@ -3777,12 +3915,12 @@ const speakGreetingIfNeeded = useCallback(
                 stopSpeechToText();
               }
 
-              if (!sttEnabledRef.current) {
+              if (liveProvider !== "stream" && !sttEnabledRef.current) {
                 await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
               }
 
               // If mic permission was denied, don't start Live Avatar.
-              if (!sttEnabledRef.current) return;
+              if (liveProvider !== "stream" && !sttEnabledRef.current) return;
 
               await startLiveAvatar();
             })();

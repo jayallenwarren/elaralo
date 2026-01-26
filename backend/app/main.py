@@ -11,6 +11,8 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from filelock import FileLock  # type: ignore
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -148,6 +150,45 @@ def health():
     """
     return {"ok": True}
 
+@app.post("/usage/credit")
+async def usage_credit(request: Request):
+    """Credit purchased minutes to a member.
+
+    Intended for payment provider webhooks or admin tooling.
+
+    Security:
+      - Requires header "X-Admin-Token" matching env var USAGE_ADMIN_TOKEN.
+
+    Body (JSON):
+      {
+        "member_id": "abc123",
+        "minutes": 60
+      }
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    token = (request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token") or "").strip()
+    if not USAGE_ADMIN_TOKEN or token != USAGE_ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    member_id = str(raw.get("member_id") or raw.get("memberId") or "").strip()
+    minutes = raw.get("minutes") or raw.get("add_minutes") or raw.get("purchased_minutes") or 0
+
+    try:
+        minutes_i = int(minutes)
+    except Exception:
+        minutes_i = 0
+
+    if not member_id or minutes_i <= 0:
+        raise HTTPException(status_code=400, detail="member_id and minutes (> 0) are required")
+
+    identity_key = f"member::{member_id}"
+    result = await run_in_threadpool(_usage_credit_minutes_sync, identity_key, minutes_i)
+    return result
+
 
 @app.get("/ready")
 def ready():
@@ -168,6 +209,264 @@ def _dbg(enabled: bool, *args: Any) -> None:
 
 def _now_ts() -> int:
     return int(time.time())
+
+
+# ----------------------------
+# Usage / Minutes limits (Trial + plan quotas)
+# ----------------------------
+# This feature enforces time budgets for:
+# - Visitors without a memberId (Free Trial) using client IP address as identity
+# - Members with a memberId (subscription plan minutes + optional purchased minutes)
+#
+# Storage strategy:
+# - A single JSON file on the App Service Linux shared filesystem (/home) so that it survives restarts.
+# - A file lock to coordinate writes across gunicorn workers.
+#
+# NOTE: This is intentionally simple and fail-open (it will not crash the API).
+#       If the usage file is unavailable, the system will allow access rather than block.
+_USAGE_STORE_PATH = (os.getenv("USAGE_STORE_PATH", "/home/elaralo_usage.json") or "").strip() or "/home/elaralo_usage.json"
+_USAGE_LOCK_PATH = _USAGE_STORE_PATH + ".lock"
+_USAGE_LOCK = FileLock(_USAGE_LOCK_PATH)
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name, "")
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(str(v).strip())
+    except Exception:
+        return int(default)
+
+# Minutes for visitors without a memberId
+TRIAL_MINUTES = _env_int("TRIAL_MINUTES", 15)
+
+# Included minutes per subscription plan (set these in App Service Configuration)
+INCLUDED_MINUTES_FRIEND = _env_int("INCLUDED_MINUTES_FRIEND", 0)
+INCLUDED_MINUTES_ROMANTIC = _env_int("INCLUDED_MINUTES_ROMANTIC", 0)
+INCLUDED_MINUTES_INTIMATE = _env_int("INCLUDED_MINUTES_INTIMATE", 0)
+INCLUDED_MINUTES_PAYG = _env_int("INCLUDED_MINUTES_PAYG", 0)
+
+# Billing/usage tuning (optional)
+USAGE_CYCLE_DAYS = _env_int("USAGE_CYCLE_DAYS", 30)  # member usage resets every N days (subscription cycle)
+USAGE_IDLE_GRACE_SECONDS = _env_int("USAGE_IDLE_GRACE_SECONDS", 600)  # gaps bigger than this are not charged
+USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST", 120)  # cap per chat call
+
+# Pay links (shown to the user when minutes are exhausted)
+UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
+PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
+PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 60)
+PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
+
+# Admin token for server-side minute credits (payment webhook can call this)
+USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
+
+def _extract_plan_name(session_state: Dict[str, Any]) -> str:
+    plan = (
+        session_state.get("planName")
+        or session_state.get("plan_name")
+        or session_state.get("plan")
+        or ""
+    )
+    return str(plan).strip() if plan is not None else ""
+
+def _normalize_plan_name_for_limits(plan_name: str) -> str:
+    p = (plan_name or "").strip()
+    if not p:
+        return ""
+    # Normalize "Test - X" plans to X for quota purposes
+    if p.lower().startswith("test - "):
+        p = p[7:].strip()
+    return p
+
+def _included_minutes_for_plan(plan_name: str) -> int:
+    p = _normalize_plan_name_for_limits(plan_name).lower()
+
+    if p == "friend":
+        return INCLUDED_MINUTES_FRIEND
+    if p == "romantic":
+        return INCLUDED_MINUTES_ROMANTIC
+    if p == "intimate (18+)":
+        return INCLUDED_MINUTES_INTIMATE
+    if p == "pay as you go":
+        return INCLUDED_MINUTES_PAYG
+    # Unknown / not provided -> 0 included minutes
+    return 0
+
+def _get_client_ip(request: Request) -> str:
+    # Azure front-ends commonly set x-forwarded-for with a comma-separated chain.
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    rip = (request.headers.get("x-real-ip") or "").strip()
+    if rip:
+        return rip
+    cip = (request.headers.get("x-client-ip") or "").strip()
+    if cip:
+        return cip
+    try:
+        return str(getattr(request.client, "host", "") or "").strip()
+    except Exception:
+        return ""
+
+def _load_usage_store() -> Dict[str, Any]:
+    try:
+        if not os.path.isfile(_USAGE_STORE_PATH):
+            return {}
+        with open(_USAGE_STORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_usage_store(store: Dict[str, Any]) -> None:
+    try:
+        folder = os.path.dirname(_USAGE_STORE_PATH) or "."
+        os.makedirs(folder, exist_ok=True)
+        tmp = _USAGE_STORE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store, f)
+        os.replace(tmp, _USAGE_STORE_PATH)
+    except Exception:
+        # Fail-open: do not crash the API
+        return
+
+def _usage_paywall_message(is_trial: bool, plan_name: str, minutes_allowed: int) -> str:
+    # Keep this short and plain so it can be spoken via TTS.
+    lines: List[str] = []
+
+    if is_trial:
+        lines.append(f"Your Free Trial time has ended ({minutes_allowed} minutes).")
+    else:
+        nice_plan = (plan_name or "").strip()
+        if not nice_plan:
+            lines.append("Your membership plan is Unknown / Not Provided, so minutes cannot be allocated.")
+        else:
+            lines.append(f"You have no minutes remaining for your plan ({nice_plan}).")
+
+    if PAYG_PAY_URL:
+        price_part = f" ({PAYG_PRICE_TEXT})" if PAYG_PRICE_TEXT else ""
+        lines.append(f"Add {PAYG_INCREMENT_MINUTES} minutes{price_part}: {PAYG_PAY_URL}")
+
+    if UPGRADE_URL:
+        lines.append(f"Upgrade your membership: {UPGRADE_URL}")
+
+    lines.append("Once you have more minutes, come back here and continue our conversation.")
+    return " ".join([ln.strip() for ln in lines if ln.strip()])
+
+def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str) -> Tuple[bool, Dict[str, Any]]:
+    """Charge usage time and determine whether the identity still has minutes.
+
+    Returns:
+      (ok, info)
+        ok: True if allowed to continue, False if minutes exhausted.
+        info: includes minutes_used / minutes_allowed / minutes_remaining for optional UI/debug.
+    """
+    now = time.time()
+    try:
+        with _USAGE_LOCK:
+            store = _load_usage_store()
+            rec = store.get(identity_key)
+            if not isinstance(rec, dict):
+                rec = {}
+
+            # Initialize record
+            used_seconds = float(rec.get("used_seconds") or 0.0)
+            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+            last_seen = rec.get("last_seen")
+            cycle_start = float(rec.get("cycle_start") or now)
+
+            # Member cycle reset (trial does not reset)
+            if not is_trial and USAGE_CYCLE_DAYS and USAGE_CYCLE_DAYS > 0:
+                cycle_len = float(USAGE_CYCLE_DAYS) * 86400.0
+                if (now - cycle_start) >= cycle_len:
+                    used_seconds = 0.0
+                    cycle_start = now
+
+            # Charge time since last chat call (capped)
+            delta = 0.0
+            if last_seen is not None:
+                try:
+                    delta = float(now - float(last_seen))
+                except Exception:
+                    delta = 0.0
+
+            if delta < 0:
+                delta = 0.0
+
+            # Don't charge long idle gaps (prevents "went AFK" from burning minutes)
+            if USAGE_IDLE_GRACE_SECONDS and delta > float(USAGE_IDLE_GRACE_SECONDS):
+                delta = 0.0
+
+            # Cap per-request billable time
+            max_bill = float(USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST) if USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST > 0 else 0.0
+            if max_bill and delta > max_bill:
+                delta = max_bill
+
+            used_seconds += delta
+
+            # Compute allowed seconds
+            minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
+            allowed_seconds = (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0)
+
+            # Persist record
+            rec_out = {
+                "used_seconds": used_seconds,
+                "purchased_seconds": purchased_seconds,
+                "last_seen": now,
+                "cycle_start": cycle_start,
+                "plan_name": plan_name,
+                "is_trial": bool(is_trial),
+            }
+            store[identity_key] = rec_out
+            _save_usage_store(store)
+
+        remaining_seconds = max(0.0, allowed_seconds - used_seconds)
+        ok = remaining_seconds > 0.0
+
+        return ok, {
+            "minutes_used": int(used_seconds // 60),
+            "minutes_allowed": int(minutes_allowed),
+            "minutes_remaining": int(remaining_seconds // 60),
+            "identity_key": identity_key,
+        }
+    except Exception:
+        # Fail-open
+        return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": identity_key}
+
+def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any]:
+    """Add purchased minutes to an identity record (used by payment webhooks/admin tooling)."""
+    now = time.time()
+    try:
+        minutes_i = int(minutes)
+        if minutes_i <= 0:
+            return {"ok": False, "error": "minutes must be > 0", "identity_key": identity_key}
+
+        with _USAGE_LOCK:
+            store = _load_usage_store()
+            rec = store.get(identity_key)
+            if not isinstance(rec, dict):
+                rec = {}
+
+            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+            purchased_seconds += float(minutes_i) * 60.0
+
+            rec["purchased_seconds"] = purchased_seconds
+            rec.setdefault("used_seconds", float(rec.get("used_seconds") or 0.0))
+            rec.setdefault("cycle_start", float(rec.get("cycle_start") or now))
+            rec.setdefault("last_seen", float(rec.get("last_seen") or now))
+            rec["plan_name"] = rec.get("plan_name") or "Pay as You Go"
+
+            store[identity_key] = rec
+            _save_usage_store(store)
+
+        return {
+            "ok": True,
+            "identity_key": identity_key,
+            "minutes_added": minutes_i,
+            "purchased_minutes_total": int(purchased_seconds // 60),
+        }
+    except Exception:
+        return {"ok": False, "identity_key": identity_key}
 
 
 def _normalize_mode(raw: str) -> str:
@@ -255,7 +554,11 @@ def _looks_intimate(text: str) -> bool:
 
 def _parse_companion_meta(raw: Any) -> Dict[str, str]:
     if isinstance(raw, str):
-        parts = [p.strip() for p in raw.split("-") if p.strip()]
+        # Companion keys may include additional metadata after a pipe, e.g.:
+        #   "Elara-Female-Caucasian-GenZ|live=stream"
+        # For persona generation we only want the base identity.
+        base = raw.split("|", 1)[0].strip()
+        parts = [p.strip() for p in base.split("-") if p.strip()]
         if len(parts) >= 4:
             return {
                 "first_name": parts[0],
@@ -264,6 +567,7 @@ def _parse_companion_meta(raw: Any) -> Dict[str, str]:
                 "generation": "-".join(parts[3:]),
             }
     return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
+
 
 
 def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
@@ -791,7 +1095,51 @@ async def chat(request: Request):
 
     raw = await request.json()
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
-    voice_id = _extract_voice_id(raw)    # Best-effort retrieval of a previously saved chat summary.
+    
+    voice_id = _extract_voice_id(raw)
+
+    # ----------------------------
+    # Usage / minutes enforcement
+    # ----------------------------
+    # Rule: If we do NOT have a memberId, the visitor is on Free Trial (IP-based identity).
+    # Every plan (including subscriptions) has a minute budget. When exhausted, we return a pay/upgrade message.
+    member_id = _extract_member_id(session_state)
+    plan_name = _extract_plan_name(session_state)
+    is_trial = not bool(member_id)
+    identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+
+    usage_ok, usage_info = await run_in_threadpool(
+        _usage_charge_and_check_sync,
+        identity_key,
+        is_trial=is_trial,
+        plan_name=plan_name,
+    )
+
+    if not usage_ok:
+        minutes_allowed = int(
+            usage_info.get("minutes_allowed")
+            or (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name))
+            or 0
+        )
+        session_state_out = dict(session_state)
+        session_state_out.update(
+            {
+                "minutes_exhausted": True,
+                "minutes_used": int(usage_info.get("minutes_used") or 0),
+                "minutes_allowed": int(minutes_allowed),
+                "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
+            }
+        )
+        reply = _usage_paywall_message(is_trial=is_trial, plan_name=plan_name, minutes_allowed=minutes_allowed)
+        return {
+            "session_id": session_id,
+            "mode": STATUS_SAFE,
+            "reply": reply,
+            "session_state": session_state_out,
+            "audio_url": None,
+        }
+
+    # Best-effort retrieval of a previously saved chat summary.
     # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
     saved_summary: str | None = None
     memory_key: str | None = None
@@ -1075,6 +1423,8 @@ def _normalize_companion_key(raw: Any) -> str:
     """
     s = "" if raw is None else str(raw)
     s = re.sub(r"\s+", " ", s.strip())
+    # Strip any pipe-appended metadata to keep keys stable across live providers
+    s = s.split("|", 1)[0].strip()
     return s.lower()
 
 
