@@ -2218,6 +2218,26 @@ useEffect(() => {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
+  // Standalone/default behavior:
+  // If we do NOT have a memberId, the visitor is on Free Trial and should have Romantic-level access.
+  // When running outside Wix (or if the handoff never arrives), we must still enable Romantic and default the mode.
+  useEffect(() => {
+    if ((memberId || "").trim()) return;
+
+    // If romantic is already enabled (e.g., Wix sent Trial), do nothing.
+    if (allowedModes.includes("romantic")) return;
+
+    const nextAllowed = allowedModesForPlan("Trial");
+    setAllowedModes(nextAllowed);
+
+    // Trial should start in Romantic mode (user can still switch back to Friend).
+    setSessionState((prev) => {
+      if (prev.mode !== "friend") return prev;
+      return { ...prev, mode: "romantic", pending_consent: null };
+    });
+  }, [memberId, allowedModes]);
+
+
   async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
@@ -2235,12 +2255,20 @@ const companionForBackend =
   (companionName || DEFAULT_COMPANION_NAME).trim() ||
   DEFAULT_COMPANION_NAME;
 
+// Ensure the backend always receives a plan value for minute-budgets.
+// - If no memberId: Free Trial => planName "Trial"
+// - If memberId exists but plan is missing: send empty string so backend can show "Unknown / Not Provided"
+const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
+
 const stateToSendWithCompanion: SessionState = {
   ...stateToSend,
   companion: companionForBackend,
   // Backward/forward compatibility with any backend expecting different field names
   companionName: companionForBackend,
   companion_name: companionForBackend,
+  planName: effectivePlanForBackend,
+  plan_name: effectivePlanForBackend,
+  plan: effectivePlanForBackend,
   // Member identity (from Wix)
   memberId: (memberId || "").trim(),
   member_id: (memberId || "").trim(),
