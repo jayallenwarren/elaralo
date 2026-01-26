@@ -440,7 +440,7 @@ async function pickFirstExisting(urls: string[]) {
     }
   }
   return DEFAULT_AVATAR;
-
+}
 
 // Like pickFirstExisting (HEAD probe), but validates by actually loading the image in the browser.
 // This avoids false positives on platforms that rewrite missing assets to index.html (HTTP 200).
@@ -465,7 +465,6 @@ function pickFirstLoadableImage(urls: string[]): Promise<string> {
 
     tryNext();
   });
-}
 }
 
 function greetingFor(name: string) {
