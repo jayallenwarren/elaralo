@@ -440,6 +440,32 @@ async function pickFirstExisting(urls: string[]) {
     }
   }
   return DEFAULT_AVATAR;
+
+
+// Like pickFirstExisting (HEAD probe), but validates by actually loading the image in the browser.
+// This avoids false positives on platforms that rewrite missing assets to index.html (HTTP 200).
+function pickFirstLoadableImage(urls: string[]): Promise<string> {
+  return new Promise((resolve) => {
+    let i = 0;
+
+    const tryNext = () => {
+      if (i >= urls.length) return resolve(DEFAULT_AVATAR);
+
+      const url = urls[i++];
+      if (!url) return tryNext();
+      if (url === DEFAULT_AVATAR) return resolve(DEFAULT_AVATAR);
+
+      const img = new Image();
+      img.onload = () => resolve(url);
+      img.onerror = () => tryNext();
+
+      // For static assets this is safe; if the asset exists it will load, otherwise we fall back.
+      img.src = url;
+    };
+
+    tryNext();
+  });
+}
 }
 
 function greetingFor(name: string) {
@@ -949,8 +975,12 @@ export default function Page() {
     }
     candidates.push(DEFAULT_AVATAR);
 
-    // NOTE: We intentionally reuse the existing HEAD-probe helper that the companion image system uses.
-    pickFirstExisting(candidates).then((picked) => {
+    // Validate by loading the image (prevents false positives when missing assets are rewritten to index.html).
+    let cancelled = false;
+
+    pickFirstLoadableImage(candidates).then((picked) => {
+      if (cancelled) return;
+
       setCompanyLogoSrc(picked);
 
       // If the current header image is a company logo (default or previous rebrand),
@@ -962,6 +992,10 @@ export default function Page() {
         return prev;
       });
     });
+
+    return () => {
+      cancelled = true;
+    };
   }, [rebrandingName]);
 
 
@@ -3946,11 +3980,15 @@ const speakGreetingIfNeeded = useCallback(
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
           <img
-            src={avatarSrc || companyLogoSrc}
+            // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
+            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
             alt={companyName}
             style={{ width: "100%", height: "100%" }}
             onError={(e) => {
-              (e.currentTarget as HTMLImageElement).src = companyLogoSrc;
+              // IMPORTANT: Persist the fallback in state to prevent flicker on subsequent renders.
+              const fallback = (companyLogoSrc || DEFAULT_AVATAR);
+              (e.currentTarget as HTMLImageElement).src = fallback;
+              setAvatarSrc(fallback);
             }}
           />
         </div>
