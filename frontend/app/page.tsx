@@ -2227,7 +2227,7 @@ const speakAssistantReply = useCallback(
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
   const [sessionState, setSessionState] = useState<SessionState>({
-    mode: "friend",
+    mode: "romantic",
     model: "gpt-4o",
     adult_verified: false,
     romance_consented: false,
@@ -2243,7 +2243,7 @@ const speakAssistantReply = useCallback(
   const [showModePicker, setShowModePicker] = useState(false);
   const [setModeFlash, setSetModeFlash] = useState(false);
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
-  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
+  const [allowedModes, setAllowedModes] = useState<Mode[]>(allowedModesForPlan("Trial"));
 
   const goToMyElara = useCallback(() => {
     const url = "https://www.elaralo.com/myelara";
