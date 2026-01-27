@@ -561,7 +561,6 @@ function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: stri
   return candidates;
 }
 
-}
 
 async function pickFirstExisting(urls: string[]) {
   for (const url of urls) {
