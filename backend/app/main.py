@@ -255,7 +255,14 @@ USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PE
 UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
 PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
 PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 60)
+
+# Base Pay-As-You-Go price (e.g., "$4.99"). If PAYG_PRICE_TEXT is not set, we derive it as:
+#   "<PAYG_PRICE> per <PAYG_INCREMENT_MINUTES> minutes"
+PAYG_PRICE = (os.getenv("PAYG_PRICE", "") or "").strip()
 PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
+if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
+    PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
+
 
 # Admin token for server-side minute credits (payment webhook can call this)
 USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
@@ -268,6 +275,103 @@ def _extract_plan_name(session_state: Dict[str, Any]) -> str:
         or ""
     )
     return str(plan).strip() if plan is not None else ""
+
+
+def _extract_rebranding_key(session_state: Dict[str, Any]) -> str:
+    """Extract the Wix-provided RebrandingKey (preferred) or legacy rebranding string."""
+    rk = (
+        session_state.get("rebrandingKey")
+        or session_state.get("rebranding_key")
+        or session_state.get("RebrandingKey")
+        or session_state.get("rebranding")  # legacy: brand name only
+        or ""
+    )
+    return str(rk).strip() if rk is not None else ""
+
+def _strip_rebranding_key_label(part: str) -> str:
+    """Accept either raw values or labeled values like 'PayGoMinutes: 60'."""
+    s = (part or "").strip()
+    m = re.match(r"^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$", s)
+    return m.group(1).strip() if m else s
+
+def _parse_rebranding_key(raw: str) -> Dict[str, str]:
+    """Parse a '|' separated RebrandingKey.
+
+    Expected order:
+      Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+    """
+    v = (raw or "").strip()
+    if not v:
+        return {}
+
+    # Legacy support: no delimiter -> only brand name
+    if "|" not in v:
+        return {
+            "rebranding": _strip_rebranding_key_label(v),
+            "upgrade_link": "",
+            "pay_go_link": "",
+            "pay_go_price": "",
+            "pay_go_minutes": "",
+            "plan": "",
+            "elaralo_plan_map": "",
+            "free_minutes": "",
+            "cycle_days": "",
+        }
+
+    parts = [_strip_rebranding_key_label(p) for p in v.split("|")]
+    parts += [""] * (9 - len(parts))
+
+    (
+        rebranding,
+        upgrade_link,
+        pay_go_link,
+        pay_go_price,
+        pay_go_minutes,
+        plan,
+        elaralo_plan_map,
+        free_minutes,
+        cycle_days,
+    ) = parts[:9]
+
+    return {
+        "rebranding": str(rebranding or "").strip(),
+        "upgrade_link": str(upgrade_link or "").strip(),
+        "pay_go_link": str(pay_go_link or "").strip(),
+        "pay_go_price": str(pay_go_price or "").strip(),
+        "pay_go_minutes": str(pay_go_minutes or "").strip(),
+        "plan": str(plan or "").strip(),
+        "elaralo_plan_map": str(elaralo_plan_map or "").strip(),
+        "free_minutes": str(free_minutes or "").strip(),
+        "cycle_days": str(cycle_days or "").strip(),
+    }
+
+def _safe_int(val: Any) -> Optional[int]:
+    """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
+    try:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+        m = re.search(r"-?\d+", s)
+        if not m:
+            return None
+        return int(m.group(0))
+    except Exception:
+        return None
+
+def _session_get_str(session_state: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        try:
+            v = session_state.get(k)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
 
 def _normalize_plan_name_for_limits(plan_name: str) -> str:
     p = (plan_name or "").strip()
@@ -330,9 +434,33 @@ def _save_usage_store(store: Dict[str, Any]) -> None:
         # Fail-open: do not crash the API
         return
 
-def _usage_paywall_message(is_trial: bool, plan_name: str, minutes_allowed: int) -> str:
+def _usage_paywall_message(
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed: int,
+    *,
+    upgrade_url: str = "",
+    payg_pay_url: str = "",
+    payg_increment_minutes: Optional[int] = None,
+    payg_price_text: str = "",
+) -> str:
+    """Generate the user-facing message when minutes are exhausted.
+
+    Supports per-request overrides (RebrandingKey) for:
+      - upgrade_url
+      - payg_pay_url
+      - payg_increment_minutes
+      - payg_price_text
+    """
     # Keep this short and plain so it can be spoken via TTS.
     lines: List[str] = []
+
+    resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
+    resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
+    resolved_payg_minutes = (
+        int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
+    )
+    resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
 
     if is_trial:
         lines.append(f"Your Free Trial time has ended ({minutes_allowed} minutes).")
@@ -343,17 +471,16 @@ def _usage_paywall_message(is_trial: bool, plan_name: str, minutes_allowed: int)
         else:
             lines.append(f"You have no minutes remaining for your plan ({nice_plan}).")
 
-    if PAYG_PAY_URL:
-        price_part = f" ({PAYG_PRICE_TEXT})" if PAYG_PRICE_TEXT else ""
-        lines.append(f"Add {PAYG_INCREMENT_MINUTES} minutes{price_part}: {PAYG_PAY_URL}")
+    if resolved_payg_pay_url and resolved_payg_minutes > 0:
+        price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
+        lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
 
-    if UPGRADE_URL:
-        lines.append(f"Upgrade your membership: {UPGRADE_URL}")
+    if resolved_upgrade_url:
+        lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
 
     lines.append("Once you have more minutes, come back here and continue our conversation.")
     return " ".join([ln.strip() for ln in lines if ln.strip()])
-
-def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str) -> Tuple[bool, Dict[str, Any]]:
+def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str, minutes_allowed_override: Optional[int] = None, cycle_days_override: Optional[int] = None) -> Tuple[bool, Dict[str, Any]]:
     """Charge usage time and determine whether the identity still has minutes.
 
     Returns:
@@ -376,8 +503,9 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
             cycle_start = float(rec.get("cycle_start") or now)
 
             # Member cycle reset (trial does not reset)
-            if not is_trial and USAGE_CYCLE_DAYS and USAGE_CYCLE_DAYS > 0:
-                cycle_len = float(USAGE_CYCLE_DAYS) * 86400.0
+            cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
+            if not is_trial and cycle_days and cycle_days > 0:
+                cycle_len = float(cycle_days) * 86400.0
                 if (now - cycle_start) >= cycle_len:
                     used_seconds = 0.0
                     cycle_start = now
@@ -405,7 +533,13 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
             used_seconds += delta
 
             # Compute allowed seconds
-            minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
+            if minutes_allowed_override is not None:
+                try:
+                    minutes_allowed = max(0, int(minutes_allowed_override))
+                except Exception:
+                    minutes_allowed = 0
+            else:
+                minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
             allowed_seconds = (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0)
 
             # Persist record
@@ -1104,21 +1238,77 @@ async def chat(request: Request):
     # Rule: If we do NOT have a memberId, the visitor is on Free Trial (IP-based identity).
     # Every plan (including subscriptions) has a minute budget. When exhausted, we return a pay/upgrade message.
     member_id = _extract_member_id(session_state)
-    plan_name = _extract_plan_name(session_state)
+    plan_name_raw = _extract_plan_name(session_state)
+
+    # RebrandingKey (Wix) overrides (upgrade/pay links + quota settings) when present.
+    # Wix provides: Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+    rebranding_key_raw = _extract_rebranding_key(session_state)
+    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+
+    # Prefer explicit fields (if provided) and fall back to the parsed RebrandingKey.
+    upgrade_link_override = _session_get_str(session_state, "upgrade_link", "upgradeLink") or rebranding_parsed.get("upgrade_link", "")
+    pay_go_link_override = _session_get_str(session_state, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
+    pay_go_price = _session_get_str(session_state, "pay_go_price", "payGoPrice") or rebranding_parsed.get("pay_go_price", "")
+    pay_go_minutes_raw = _session_get_str(session_state, "pay_go_minutes", "payGoMinutes") or rebranding_parsed.get("pay_go_minutes", "")
+    plan_external = (
+        _session_get_str(session_state, "rebranding_plan", "rebrandingPlan", "planExternal", "plan_external")
+        or rebranding_parsed.get("plan", "")
+    )
+    plan_map = _session_get_str(session_state, "elaralo_plan_map", "elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map", "")
+    free_minutes_raw = _session_get_str(session_state, "free_minutes", "freeMinutes") or rebranding_parsed.get("free_minutes", "")
+    cycle_days_raw = _session_get_str(session_state, "cycle_days", "cycleDays") or rebranding_parsed.get("cycle_days", "")
+
+    pay_go_minutes = _safe_int(pay_go_minutes_raw)
+    free_minutes = _safe_int(free_minutes_raw)
+    cycle_days = _safe_int(cycle_days_raw)
+
     is_trial = not bool(member_id)
     identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+
+    # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
+    minutes_allowed_override: Optional[int] = None
+    if free_minutes is not None:
+        minutes_allowed_override = free_minutes
+    elif plan_map:
+        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
+
+    cycle_days_override: Optional[int] = None
+    if cycle_days is not None:
+        cycle_days_override = cycle_days
+
+    # Plan name used for quota purposes (fallback) should use the mapped plan if provided.
+    plan_name_for_limits = plan_map or plan_name_raw
+
+    # Plan label shown to the user should use the external plan name (if provided).
+    plan_label_for_messages = plan_external or plan_name_raw
+
+    # For rebranding, construct PAYG_PRICE_TEXT as:
+    #   PayGoPrice + " per " + PayGoMinutes + " minutes"
+    is_rebranding = bool(rebranding_key_raw or plan_external or plan_map or upgrade_link_override or pay_go_link_override or pay_go_price)
+
+    payg_price_text_override = ""
+    if is_rebranding:
+        minutes_part = ""
+        if pay_go_minutes is not None:
+            minutes_part = str(pay_go_minutes)
+        else:
+            minutes_part = str(pay_go_minutes_raw or "").strip()
+        if pay_go_price and minutes_part:
+            payg_price_text_override = f"{pay_go_price} per {minutes_part} minutes"
 
     usage_ok, usage_info = await run_in_threadpool(
         _usage_charge_and_check_sync,
         identity_key,
         is_trial=is_trial,
-        plan_name=plan_name,
+        plan_name=plan_name_for_limits,
+        minutes_allowed_override=minutes_allowed_override,
+        cycle_days_override=cycle_days_override,
     )
 
     if not usage_ok:
         minutes_allowed = int(
             usage_info.get("minutes_allowed")
-            or (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name))
+            or (minutes_allowed_override if minutes_allowed_override is not None else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits)))
             or 0
         )
         session_state_out = dict(session_state)
@@ -1130,7 +1320,15 @@ async def chat(request: Request):
                 "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
             }
         )
-        reply = _usage_paywall_message(is_trial=is_trial, plan_name=plan_name, minutes_allowed=minutes_allowed)
+        reply = _usage_paywall_message(
+            is_trial=is_trial,
+            plan_name=plan_label_for_messages,
+            minutes_allowed=minutes_allowed,
+            upgrade_url=upgrade_link_override,
+            payg_pay_url=pay_go_link_override,
+            payg_increment_minutes=pay_go_minutes,
+            payg_price_text=payg_price_text_override,
+        )
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
@@ -1139,7 +1337,7 @@ async def chat(request: Request):
             "audio_url": None,
         }
 
-    # Best-effort retrieval of a previously saved chat summary.
+# Best-effort retrieval of a previously saved chat summary.
     # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
     saved_summary: str | None = None
     memory_key: str | None = None
