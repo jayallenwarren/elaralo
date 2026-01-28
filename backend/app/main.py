@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import threading
 import re
 import uuid
 import json
@@ -255,14 +256,7 @@ USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PE
 UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
 PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
 PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 60)
-
-# Base Pay-As-You-Go price (e.g., "$4.99"). If PAYG_PRICE_TEXT is not set, we derive it as:
-#   "<PAYG_PRICE> per <PAYG_INCREMENT_MINUTES> minutes"
-PAYG_PRICE = (os.getenv("PAYG_PRICE", "") or "").strip()
 PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
-if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
-    PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
-
 
 # Admin token for server-side minute credits (payment webhook can call this)
 USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
@@ -275,516 +269,6 @@ def _extract_plan_name(session_state: Dict[str, Any]) -> str:
         or ""
     )
     return str(plan).strip() if plan is not None else ""
-
-
-def _extract_rebranding_key(session_state: Dict[str, Any]) -> str:
-    """Extract the Wix-provided RebrandingKey (preferred) or legacy rebranding string."""
-    rk = (
-        session_state.get("rebrandingKey")
-        or session_state.get("rebranding_key")
-        or session_state.get("RebrandingKey")
-        or session_state.get("rebranding")  # legacy: brand name only
-        or ""
-    )
-    return str(rk).strip() if rk is not None else ""
-
-def _strip_rebranding_key_label(part: str) -> str:
-    """Accept either raw values or labeled values like 'PayGoMinutes: 60'."""
-    s = (part or "").strip()
-    m = re.match(r"^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$", s)
-    return m.group(1).strip() if m else s
-
-def _parse_rebranding_key(raw: str) -> Dict[str, str]:
-    """Parse a '|' separated RebrandingKey.
-
-    Expected order:
-      Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
-    """
-    v = (raw or "").strip()
-    if not v:
-        return {}
-
-    # Legacy support: no delimiter -> only brand name
-    if "|" not in v:
-        return {
-            "rebranding": _strip_rebranding_key_label(v),
-            "upgrade_link": "",
-            "pay_go_link": "",
-            "pay_go_price": "",
-            "pay_go_minutes": "",
-            "plan": "",
-            "elaralo_plan_map": "",
-            "free_minutes": "",
-            "cycle_days": "",
-        }
-
-    parts = [_strip_rebranding_key_label(p) for p in v.split("|")]
-    parts += [""] * (9 - len(parts))
-
-    (
-        rebranding,
-        upgrade_link,
-        pay_go_link,
-        pay_go_price,
-        pay_go_minutes,
-        plan,
-        elaralo_plan_map,
-        free_minutes,
-        cycle_days,
-    ) = parts[:9]
-
-    return {
-        "rebranding": str(rebranding or "").strip(),
-        "upgrade_link": str(upgrade_link or "").strip(),
-        "pay_go_link": str(pay_go_link or "").strip(),
-        "pay_go_price": str(pay_go_price or "").strip(),
-        "pay_go_minutes": str(pay_go_minutes or "").strip(),
-        "plan": str(plan or "").strip(),
-        "elaralo_plan_map": str(elaralo_plan_map or "").strip(),
-        "free_minutes": str(free_minutes or "").strip(),
-        "cycle_days": str(cycle_days or "").strip(),
-    }
-
-
-# ---------------------------------------------------------------------------
-# RebrandingKey validation
-# ---------------------------------------------------------------------------
-# IMPORTANT: RebrandingKey format/field validation is performed upstream in Wix (Velo).
-# The API intentionally accepts the RebrandingKey as-is to avoid breaking Wix flows.
-#
-# If you remove Wix-side validation in the future, you can enable the server-side
-# validator below by uncommenting it AND the call site in /chat.
-#
-# def _validate_rebranding_key_server_side(raw: str) -> Tuple[bool, str]:
-#     """Server-side validator for RebrandingKey.
-#
-#     Expected order:
-#       Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
-#     """
-#     v = (raw or "").strip()
-#     if not v:
-#         return True, ""
-#
-#     # Guardrail: prevent extremely large payloads
-#     if len(v) > 2048:
-#         return False, "too long"
-#
-#     # Legacy support: no delimiter => brand name only
-#     if "|" not in v:
-#         return True, ""
-#
-#     parts = v.split("|")
-#     if len(parts) != 9:
-#         return False, f"expected 9 parts, got {len(parts)}"
-#
-#     rebranding = parts[0].strip()
-#     if not rebranding:
-#         return False, "missing Rebranding"
-#
-#     # Validate URLs (when present)
-#     def _is_http_url(s: str) -> bool:
-#         s = (s or "").strip()
-#         if not s:
-#             return True
-#         return bool(re.match(r"^https?://", s, re.IGNORECASE))
-#
-#     if not _is_http_url(parts[1]):
-#         return False, "UpgradeLink must be http(s) URL"
-#     if not _is_http_url(parts[2]):
-#         return False, "PayGoLink must be http(s) URL"
-#
-#     # Validate integers (when present)
-#     for name, val in [
-#         ("PayGoMinutes", parts[4]),
-#         ("FreeMinutes", parts[7]),
-#         ("CycleDays", parts[8]),
-#     ]:
-#         s = (val or "").strip()
-#         if not s:
-#             continue
-#         if not re.fullmatch(r"-?\d+", s):
-#             return False, f"{name} must be an integer"
-#
-#     # Basic price sanity (allow "$5.99", "5.99", "USD 5.99")
-#     price = (parts[3] or "").strip()
-#     if price and len(price) > 32:
-#         return False, "PayGoPrice too long"
-#
-#     # Basic length checks (defense-in-depth)
-#     for i, p in enumerate(parts):
-#         if len((p or "").strip()) > 512:
-#             return False, f"part {i} too long"
-#
-#     return True, ""
-
-
-
-
-# ---------------------------------------------------------------------------
-# Voice/Video companion capability mappings (SQLite -> in-memory)
-# ---------------------------------------------------------------------------
-# This database is generated from the Excel mapping sheet ("Voice and Video Mappings - Elaralo.xlsx")
-# and shipped alongside the API so the frontend can query companion capabilities at runtime:
-#   - which companions are Audio-only vs Video+Audio
-#   - which Live provider to use (D-ID vs Stream)
-#   - ElevenLabs voice IDs (TTS voice selection)
-#   - D-ID Agent IDs / Client Keys (for the D-ID browser SDK)
-#
-# Design choice:
-#   - We load the full table into memory at startup (fast lookups, no per-request DB IO).
-#   - The DB is treated as read-only config; updates are made by regenerating the SQLite file
-#     and redeploying (or by mounting a new file and restarting).
-#
-# Default lookup key is (brand, avatar), case-insensitive.
-
-import sqlite3
-from urllib.parse import urlparse, parse_qs
-
-_COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
-_COMPANION_MAPPINGS_LOADED_AT: float | None = None
-_COMPANION_MAPPINGS_SOURCE: str = ""
-
-
-def _norm_key(s: str) -> str:
-    return (s or "").strip().lower()
-
-
-def _candidate_mapping_db_paths() -> List[str]:
-    base_dir = os.path.dirname(__file__)
-    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-    candidates = [
-        env_path,
-        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
-        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
-    ]
-    # keep unique, preserve order
-    out: List[str] = []
-    seen: set[str] = set()
-    for p in candidates:
-        p = (p or "").strip()
-        if not p:
-            continue
-        if p not in seen:
-            out.append(p)
-            seen.add(p)
-    return out
-
-
-def _load_companion_mappings_sync() -> None:
-    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE
-
-    db_path = ""
-    for p in _candidate_mapping_db_paths():
-        if os.path.exists(p):
-            db_path = p
-            break
-
-    if not db_path:
-        print("[mappings] WARNING: voice/video mappings DB not found. Video/audio capabilities will fall back to frontend defaults.")
-        _COMPANION_MAPPINGS = {}
-        _COMPANION_MAPPINGS_LOADED_AT = time.time()
-        _COMPANION_MAPPINGS_SOURCE = ""
-        return
-
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-              brand,
-              avatar,
-              eleven_voice_name,
-              communication,
-              eleven_voice_id,
-              live,
-              did_embed_code,
-              did_agent_link,
-              did_agent_id,
-              did_client_key
-            FROM companion_mappings
-            """
-        )
-        rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    d: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for r in rows:
-        brand = str(r["brand"] or "").strip()
-        avatar = str(r["avatar"] or "").strip()
-        if not brand or not avatar:
-            continue
-        key = (_norm_key(brand), _norm_key(avatar))
-        d[key] = {
-            "brand": brand,
-            "avatar": avatar,
-            "eleven_voice_name": (r["eleven_voice_name"] or "") if r["eleven_voice_name"] is not None else "",
-            "communication": (r["communication"] or "") if r["communication"] is not None else "",
-            "eleven_voice_id": (r["eleven_voice_id"] or "") if r["eleven_voice_id"] is not None else "",
-            "live": (r["live"] or "") if r["live"] is not None else "",
-            "did_embed_code": (r["did_embed_code"] or "") if r["did_embed_code"] is not None else "",
-            "did_agent_link": (r["did_agent_link"] or "") if r["did_agent_link"] is not None else "",
-            "did_agent_id": (r["did_agent_id"] or "") if r["did_agent_id"] is not None else "",
-            "did_client_key": (r["did_client_key"] or "") if r["did_client_key"] is not None else "",
-        }
-
-    _COMPANION_MAPPINGS = d
-    _COMPANION_MAPPINGS_LOADED_AT = time.time()
-    _COMPANION_MAPPINGS_SOURCE = db_path
-    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path}")
-
-
-def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
-    b = _norm_key(brand) or "elaralo"
-    a = _norm_key(avatar)
-    if not a:
-        return None
-
-    m = _COMPANION_MAPPINGS.get((b, a))
-    if m:
-        return m
-
-    # fallback brand → Elaralo
-    if b != "elaralo":
-        m = _COMPANION_MAPPINGS.get(("elaralo", a))
-        if m:
-            return m
-
-    # final fallback: if someone sends a composite key like "Ashley-Female-...".
-    first = a.split("-")[0].strip() if "-" in a else a
-    if first and first != a:
-        m = _COMPANION_MAPPINGS.get((b, first))
-        if m:
-            return m
-        if b != "elaralo":
-            m = _COMPANION_MAPPINGS.get(("elaralo", first))
-            if m:
-                return m
-
-    return None
-
-
-@app.on_event("startup")
-async def _startup_load_companion_mappings() -> None:
-    # Load once at startup; do not block on errors.
-    try:
-        await run_in_threadpool(_load_companion_mappings_sync)
-    except Exception as e:
-        print(f"[mappings] ERROR loading companion mappings: {e!r}")
-
-
-@app.get("/mappings/companion")
-async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
-    """Lookup a companion mapping row by (brand, avatar).
-
-    Query params:
-      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
-      - avatar: Avatar first name (e.g., "Jennifer")
-
-    Response:
-      {
-        found: bool,
-        brand: str,
-        avatar: str,
-        communication: "Audio"|"Video"|"" ,
-        live: "D-ID"|"Stream"|"" ,
-        elevenVoiceId: str,
-        elevenVoiceName: str,
-        didAgentId: str,
-        didClientKey: str,
-        didAgentLink: str,
-        didEmbedCode: str,
-        loadedAt: <unix seconds> | null,
-        source: <db path> | ""
-      }
-    """
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
-
-    m = _lookup_companion_mapping(b, a)
-    if not m:
-        return {
-            "found": False,
-            "brand": b,
-            "avatar": a,
-            "communication": "",
-            "live": "",
-            "elevenVoiceId": "",
-            "elevenVoiceName": "",
-            "didAgentId": "",
-            "didClientKey": "",
-            "didAgentLink": "",
-            "didEmbedCode": "",
-            "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-            "source": _COMPANION_MAPPINGS_SOURCE,
-        }
-
-    return {
-        "found": True,
-        "brand": str(m.get("brand") or ""),
-        "avatar": str(m.get("avatar") or ""),
-        "communication": str(m.get("communication") or ""),
-        "live": str(m.get("live") or ""),
-        "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
-        "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
-        "didAgentId": str(m.get("did_agent_id") or ""),
-        "didClientKey": str(m.get("did_client_key") or ""),
-        "didAgentLink": str(m.get("did_agent_link") or ""),
-        "didEmbedCode": str(m.get("did_embed_code") or ""),
-        "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-        "source": _COMPANION_MAPPINGS_SOURCE,
-    }
-
-
-# ---------------------------------------------------------------------------
-# BeeStreamed: Start WebRTC streams (Live=Stream companions)
-# ---------------------------------------------------------------------------
-# IMPORTANT:
-# - BeeStreamed tokens MUST NOT be exposed to the browser. The frontend calls this endpoint,
-#   and the API performs BeeStreamed authentication server-side.
-# - Authentication format per BeeStreamed docs:
-#     Authorization: Basic base64_encode({token_id}:{secret_key})
-# - Start WebRTC stream endpoint:
-#     POST https://api.beestreamed.com/events/[EVENT REF]/startwebrtcstream
-#
-# Docs: https://docs.beestreamed.com/introduction (API Overview / Authentication)
-
-
-def _extract_beestreamed_event_ref_from_url(stream_url: str) -> str:
-    """Best-effort extraction of BeeStreamed event_ref from a viewer URL.
-
-    This is intentionally flexible because BeeStreamed viewer URLs can be customized.
-    We attempt, in order:
-      1) query string parameters: event_ref / eventRef
-      2) last path segment that looks like an alphanumeric ref (6-32 chars)
-    """
-    u = (stream_url or "").strip()
-    if not u:
-        return ""
-
-    try:
-        parsed = urlparse(u)
-    except Exception:
-        return ""
-
-    try:
-        qs = parse_qs(parsed.query or "")
-        for k in ("event_ref", "eventRef", "event", "ref"):
-            v = qs.get(k)
-            if v and isinstance(v, list) and v[0]:
-                cand = str(v[0]).strip()
-                if re.fullmatch(r"[A-Za-z0-9]{6,32}", cand):
-                    return cand
-    except Exception:
-        pass
-
-    # Path fallback
-    try:
-        segments = [s for s in (parsed.path or "").split("/") if s]
-        for seg in reversed(segments):
-            seg = seg.strip()
-            if re.fullmatch(r"[A-Za-z0-9]{6,32}", seg):
-                return seg
-    except Exception:
-        pass
-
-    return ""
-
-
-@app.post("/stream/beestreamed/start")
-async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
-    """Start a BeeStreamed WebRTC stream for the configured event.
-
-    Body (JSON):
-      {
-        "stream_url": "https://..."     (optional; used to derive event_ref)
-        "event_ref": "abcd12345678"    (optional; overrides URL parsing)
-      }
-
-    Env vars (server-side only):
-      STREAM_TOKEN_ID
-      STREAM_SECRET_KEY
-    """
-    try:
-        raw = await request.json()
-    except Exception:
-        raw = {}
-
-    stream_url = str(raw.get("stream_url") or raw.get("streamUrl") or "").strip()
-    event_ref = str(raw.get("event_ref") or raw.get("eventRef") or "").strip()
-
-    if not event_ref:
-        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
-
-    # Optional server-side fallback (useful when the viewer URL does not contain the event_ref).
-    if not event_ref:
-        event_ref = (os.getenv("STREAM_EVENT_REF", "") or "").strip()
-
-    if not event_ref:
-        raise HTTPException(
-            status_code=400,
-            detail="BeeStreamed event_ref is required (provide event_ref, STREAM_EVENT_REF, or a stream_url containing it).",
-        )
-
-    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
-    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
-
-    if not token_id or not secret_key:
-        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
-
-    # BeeStreamed auth header: Basic base64(token_id:secret_key)
-    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
-    headers = {"Authorization": f"Basic {basic}"}
-
-    api_url = f"https://api.beestreamed.com/events/{event_ref}/startwebrtcstream"
-
-    import requests  # type: ignore
-
-    try:
-        r = requests.post(api_url, headers=headers, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed request failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed error {r.status_code}: {msg[:500]}")
-
-    try:
-        data = r.json()
-    except Exception:
-        data = {"message": (r.text or "").strip(), "status": r.status_code}
-
-    return {"ok": True, "event_ref": event_ref, "beestreamed": data}
-
-def _safe_int(val: Any) -> Optional[int]:
-    """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
-    try:
-        if val is None:
-            return None
-        s = str(val).strip()
-        if not s:
-            return None
-        m = re.search(r"-?\d+", s)
-        if not m:
-            return None
-        return int(m.group(0))
-    except Exception:
-        return None
-
-def _session_get_str(session_state: Dict[str, Any], *keys: str) -> str:
-    for k in keys:
-        try:
-            v = session_state.get(k)
-        except Exception:
-            v = None
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s:
-            return s
-    return ""
 
 def _normalize_plan_name_for_limits(plan_name: str) -> str:
     p = (plan_name or "").strip()
@@ -847,33 +331,9 @@ def _save_usage_store(store: Dict[str, Any]) -> None:
         # Fail-open: do not crash the API
         return
 
-def _usage_paywall_message(
-    is_trial: bool,
-    plan_name: str,
-    minutes_allowed: int,
-    *,
-    upgrade_url: str = "",
-    payg_pay_url: str = "",
-    payg_increment_minutes: Optional[int] = None,
-    payg_price_text: str = "",
-) -> str:
-    """Generate the user-facing message when minutes are exhausted.
-
-    Supports per-request overrides (RebrandingKey) for:
-      - upgrade_url
-      - payg_pay_url
-      - payg_increment_minutes
-      - payg_price_text
-    """
+def _usage_paywall_message(is_trial: bool, plan_name: str, minutes_allowed: int) -> str:
     # Keep this short and plain so it can be spoken via TTS.
     lines: List[str] = []
-
-    resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
-    resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
-    resolved_payg_minutes = (
-        int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
-    )
-    resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
 
     if is_trial:
         lines.append(f"Your Free Trial time has ended ({minutes_allowed} minutes).")
@@ -884,16 +344,17 @@ def _usage_paywall_message(
         else:
             lines.append(f"You have no minutes remaining for your plan ({nice_plan}).")
 
-    if resolved_payg_pay_url and resolved_payg_minutes > 0:
-        price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
-        lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
+    if PAYG_PAY_URL:
+        price_part = f" ({PAYG_PRICE_TEXT})" if PAYG_PRICE_TEXT else ""
+        lines.append(f"Add {PAYG_INCREMENT_MINUTES} minutes{price_part}: {PAYG_PAY_URL}")
 
-    if resolved_upgrade_url:
-        lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
+    if UPGRADE_URL:
+        lines.append(f"Upgrade your membership: {UPGRADE_URL}")
 
     lines.append("Once you have more minutes, come back here and continue our conversation.")
     return " ".join([ln.strip() for ln in lines if ln.strip()])
-def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str, minutes_allowed_override: Optional[int] = None, cycle_days_override: Optional[int] = None) -> Tuple[bool, Dict[str, Any]]:
+
+def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str) -> Tuple[bool, Dict[str, Any]]:
     """Charge usage time and determine whether the identity still has minutes.
 
     Returns:
@@ -916,9 +377,8 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
             cycle_start = float(rec.get("cycle_start") or now)
 
             # Member cycle reset (trial does not reset)
-            cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
-            if not is_trial and cycle_days and cycle_days > 0:
-                cycle_len = float(cycle_days) * 86400.0
+            if not is_trial and USAGE_CYCLE_DAYS and USAGE_CYCLE_DAYS > 0:
+                cycle_len = float(USAGE_CYCLE_DAYS) * 86400.0
                 if (now - cycle_start) >= cycle_len:
                     used_seconds = 0.0
                     cycle_start = now
@@ -946,13 +406,7 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
             used_seconds += delta
 
             # Compute allowed seconds
-            if minutes_allowed_override is not None:
-                try:
-                    minutes_allowed = max(0, int(minutes_allowed_override))
-                except Exception:
-                    minutes_allowed = 0
-            else:
-                minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
+            minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
             allowed_seconds = (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0)
 
             # Persist record
@@ -1651,85 +1105,21 @@ async def chat(request: Request):
     # Rule: If we do NOT have a memberId, the visitor is on Free Trial (IP-based identity).
     # Every plan (including subscriptions) has a minute budget. When exhausted, we return a pay/upgrade message.
     member_id = _extract_member_id(session_state)
-    plan_name_raw = _extract_plan_name(session_state)
-
-    # RebrandingKey (Wix) overrides (upgrade/pay links + quota settings) when present.
-    # Wix provides: Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
-    rebranding_key_raw = _extract_rebranding_key(session_state)
-
-    # NOTE: RebrandingKey validation is performed in Wix (Velo) before sending to this API.
-    # Server-side validation is intentionally disabled to avoid breaking existing Wix flows.
-    # If Wix-side validation is removed, you can enable the validator by uncommenting below:
-    # ok, err = _validate_rebranding_key_server_side(rebranding_key_raw)
-    # if not ok:
-    #     _dbg(debug, f"[RebrandingKey] rejected: {err}")
-    #     rebranding_key_raw = ""
-    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
-
-    # Prefer explicit fields (if provided) and fall back to the parsed RebrandingKey.
-    upgrade_link_override = _session_get_str(session_state, "upgrade_link", "upgradeLink") or rebranding_parsed.get("upgrade_link", "")
-    pay_go_link_override = _session_get_str(session_state, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
-    pay_go_price = _session_get_str(session_state, "pay_go_price", "payGoPrice") or rebranding_parsed.get("pay_go_price", "")
-    pay_go_minutes_raw = _session_get_str(session_state, "pay_go_minutes", "payGoMinutes") or rebranding_parsed.get("pay_go_minutes", "")
-    plan_external = (
-        _session_get_str(session_state, "rebranding_plan", "rebrandingPlan", "planExternal", "plan_external")
-        or rebranding_parsed.get("plan", "")
-    )
-    plan_map = _session_get_str(session_state, "elaralo_plan_map", "elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map", "")
-    free_minutes_raw = _session_get_str(session_state, "free_minutes", "freeMinutes") or rebranding_parsed.get("free_minutes", "")
-    cycle_days_raw = _session_get_str(session_state, "cycle_days", "cycleDays") or rebranding_parsed.get("cycle_days", "")
-
-    pay_go_minutes = _safe_int(pay_go_minutes_raw)
-    free_minutes = _safe_int(free_minutes_raw)
-    cycle_days = _safe_int(cycle_days_raw)
-
+    plan_name = _extract_plan_name(session_state)
     is_trial = not bool(member_id)
     identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
-
-    # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
-    minutes_allowed_override: Optional[int] = None
-    if free_minutes is not None:
-        minutes_allowed_override = free_minutes
-    elif plan_map:
-        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
-
-    cycle_days_override: Optional[int] = None
-    if cycle_days is not None:
-        cycle_days_override = cycle_days
-
-    # Plan name used for quota purposes (fallback) should use the mapped plan if provided.
-    plan_name_for_limits = plan_map or plan_name_raw
-
-    # Plan label shown to the user should use the external plan name (if provided).
-    plan_label_for_messages = plan_external or plan_name_raw
-
-    # For rebranding, construct PAYG_PRICE_TEXT as:
-    #   PayGoPrice + " per " + PayGoMinutes + " minutes"
-    is_rebranding = bool(rebranding_key_raw or plan_external or plan_map or upgrade_link_override or pay_go_link_override or pay_go_price)
-
-    payg_price_text_override = ""
-    if is_rebranding:
-        minutes_part = ""
-        if pay_go_minutes is not None:
-            minutes_part = str(pay_go_minutes)
-        else:
-            minutes_part = str(pay_go_minutes_raw or "").strip()
-        if pay_go_price and minutes_part:
-            payg_price_text_override = f"{pay_go_price} per {minutes_part} minutes"
 
     usage_ok, usage_info = await run_in_threadpool(
         _usage_charge_and_check_sync,
         identity_key,
         is_trial=is_trial,
-        plan_name=plan_name_for_limits,
-        minutes_allowed_override=minutes_allowed_override,
-        cycle_days_override=cycle_days_override,
+        plan_name=plan_name,
     )
 
     if not usage_ok:
         minutes_allowed = int(
             usage_info.get("minutes_allowed")
-            or (minutes_allowed_override if minutes_allowed_override is not None else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits)))
+            or (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name))
             or 0
         )
         session_state_out = dict(session_state)
@@ -1741,15 +1131,7 @@ async def chat(request: Request):
                 "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
             }
         )
-        reply = _usage_paywall_message(
-            is_trial=is_trial,
-            plan_name=plan_label_for_messages,
-            minutes_allowed=minutes_allowed,
-            upgrade_url=upgrade_link_override,
-            payg_pay_url=pay_go_link_override,
-            payg_increment_minutes=pay_go_minutes,
-            payg_price_text=payg_price_text_override,
-        )
+        reply = _usage_paywall_message(is_trial=is_trial, plan_name=plan_name, minutes_allowed=minutes_allowed)
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
@@ -1758,7 +1140,7 @@ async def chat(request: Request):
             "audio_url": None,
         }
 
-# Best-effort retrieval of a previously saved chat summary.
+    # Best-effort retrieval of a previously saved chat summary.
     # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
     saved_summary: str | None = None
     memory_key: str | None = None
@@ -2082,6 +1464,104 @@ def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
     return f"session::{session_id}"
 
 
+
+# -----------------------------------------------------------------------------
+# Option B: Separate journaling endpoint (does NOT stop audio/video/mic)
+# -----------------------------------------------------------------------------
+#
+# Rationale:
+# - The existing manual Save Summary flow intentionally stops audio/video/mic for user confirmation.
+# - We do NOT want to auto-trigger that flow because it impacts UX.
+# - Instead, the frontend can fire-and-forget copies of user + assistant turns to this endpoint.
+# - A separate, later process (Azure Function / cron / admin endpoint) can generate summaries
+#   from the journal without touching the live chat / TTS / STT pathways.
+#
+# NOTE: This endpoint is purposely isolated from the /chat logic to avoid any regressions
+# in the established TTS/STT pipeline.
+
+_CHAT_JOURNAL_ENABLED = os.getenv("CHAT_JOURNAL_ENABLED", "1").strip() not in ("0", "false", "False", "")
+
+# Default journal directory:
+# - If CHAT_SUMMARY_FILE is set to a persistent /home path, we journal next to it.
+# - Else, fall back to backend/app/data/journal (inside repo) for local dev.
+_CHAT_JOURNAL_DIR = os.getenv("CHAT_JOURNAL_DIR", "").strip()
+if not _CHAT_JOURNAL_DIR:
+    try:
+        _summary_dir = os.path.dirname(os.path.abspath(_CHAT_SUMMARY_FILE)) if _CHAT_SUMMARY_FILE else ""
+    except Exception:
+        _summary_dir = ""
+    if _summary_dir:
+        _CHAT_JOURNAL_DIR = os.path.join(_summary_dir, "journal")
+    else:
+        _CHAT_JOURNAL_DIR = os.path.join(os.path.dirname(__file__), "data", "journal")
+
+_CHAT_JOURNAL_LOCK = threading.RLock()
+
+def _journal_filename_for_key(key: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", key).strip("_") or "unknown"
+    return os.path.join(_CHAT_JOURNAL_DIR, f"{safe}.jsonl")
+
+def _append_journal_record(key: str, record: Dict[str, Any]) -> None:
+    if not _CHAT_JOURNAL_ENABLED:
+        return
+    try:
+        os.makedirs(_CHAT_JOURNAL_DIR, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False)
+        path = _journal_filename_for_key(key)
+        with _CHAT_JOURNAL_LOCK:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        # Never allow journaling failures to impact the app
+        return
+
+@app.post("/journal/append")
+async def journal_append(request: Request) -> Dict[str, Any]:
+    if not _CHAT_JOURNAL_ENABLED:
+        return {"ok": True, "enabled": False}
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    session_id = str(payload.get("session_id") or "").strip()
+    role = str(payload.get("role") or "").strip().lower()
+    content = payload.get("content")
+    ts = payload.get("ts") or payload.get("timestamp") or None
+
+    session_state = payload.get("session_state") or payload.get("sessionState") or {}
+    if not isinstance(session_state, dict):
+        session_state = {}
+
+    if not session_id or role not in ("user", "assistant") or not isinstance(content, str):
+        raise HTTPException(status_code=422, detail="Invalid payload")
+
+    # Reuse the same keying strategy as summaries:
+    # - memberId::companion when memberId exists
+    # - session::session_id otherwise
+    key = _summary_store_key(session_state, session_id)
+
+    record = {
+        "key": key,
+        "session_id": session_id,
+        "role": role,
+        "content": content,
+        "ts": ts or int(time.time() * 1000),
+        "brand": str(session_state.get("rebranding") or "").strip(),
+        "companion": str(
+            session_state.get("companion")
+            or session_state.get("companionName")
+            or session_state.get("companion_name")
+            or ""
+        ).strip(),
+        "member_id": _extract_member_id(session_state) or "",
+    }
+
+    _append_journal_record(key, record)
+    return {"ok": True, "enabled": True}
+
+
 def _persist_summary_store() -> None:
     """Best-effort atomic persistence to a shared file.
 
@@ -2315,160 +1795,3 @@ async def stt_transcribe(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
 
-
-
-# =============================================================================
-# Option B — Separate Journaling Endpoint (does NOT touch /chat or TTS/STT)
-# =============================================================================
-#
-# Goal:
-#   Capture *copies* of incoming/outgoing messages to an append-only journal store.
-#   Summaries (manual or automated) can later be generated from this journal without
-#   invoking the existing /chat/save-summary flow that the frontend currently treats
-#   as a "stop everything" action.
-#
-# IMPORTANT:
-#   - This code path is separate from /chat, /tts/*, /stt/*.
-#   - It is only executed if the frontend calls /journal/append.
-#   - No TTS/STT logic is modified by this feature.
-#
-# Storage:
-#   - Default: local persistent /home on Azure App Service.
-#   - Set CHAT_JOURNAL_DIR to override.
-#
-# Payload contract (frontend → backend):
-#   POST /journal/append
-#   {
-#     "session_id": "....",
-#     "session_state": { ... },     # same object you send to /chat
-#     "events": [
-#       { "role": "user"|"assistant", "content": "...", "ts": 1730000000.123 }
-#     ]
-#   }
-#
-# Response:
-#   { ok: true|false, key: "...", count: N, error?: "..." }
-# =============================================================================
-
-_CHAT_JOURNAL_DIR = (os.getenv("CHAT_JOURNAL_DIR", "") or "/home/chat_journals").strip()
-
-
-def _journal_safe_filename(key: str) -> str:
-    # memberId::companionKey (contains ':' and other chars) → filesystem-safe slug
-    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", (key or "").strip())
-    if not safe:
-        safe = "unknown"
-    return safe + ".jsonl"
-
-
-def _journal_path_for_key(key: str) -> str:
-    try:
-        os.makedirs(_CHAT_JOURNAL_DIR, exist_ok=True)
-    except Exception:
-        # Fail-open: journaling should never break the API
-        pass
-    return os.path.join(_CHAT_JOURNAL_DIR, _journal_safe_filename(key))
-
-
-def _append_journal_events_sync(path: str, events: List[Dict[str, Any]]) -> None:
-    # Append JSONL with a per-file lock for multi-worker safety.
-    lock = FileLock(path + ".lock")
-    with lock:
-        with open(path, "a", encoding="utf-8") as f:
-            for e in events:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
-
-
-@app.post("/journal/append", response_model=None)
-async def journal_append(request: Request):
-    try:
-        raw = await request.json()
-    except Exception as e:
-        return {"ok": False, "error": f"invalid_json: {type(e).__name__}: {e}"}
-
-    session_id = str(raw.get("session_id") or "").strip()
-    session_state = raw.get("session_state") or {}
-    events_in = raw.get("events") or []
-
-    if not isinstance(session_state, dict):
-        session_state = {}
-    if not isinstance(events_in, list):
-        events_in = []
-
-    # Compute the same stable keying scheme used by summaries.
-    # (memberId + normalized companion; falls back to session::<session_id>)
-    if not session_id:
-        # journaling must still have a stable file name; fall back to an ephemeral id
-        session_id = "session-" + uuid.uuid4().hex
-
-    key = _summary_store_key(session_state, session_id)
-
-    # Normalize/cap events (journaling must be cheap + safe)
-    now_ts = time.time()
-    max_events = int(os.getenv("CHAT_JOURNAL_MAX_EVENTS", "20") or "20")
-    max_chars = int(os.getenv("CHAT_JOURNAL_MAX_CHARS", "8000") or "8000")
-    max_chars_per_event = int(os.getenv("CHAT_JOURNAL_MAX_CHARS_PER_EVENT", "2000") or "2000")
-
-    norm: List[Dict[str, Any]] = []
-    for e in events_in[:max_events]:
-        if not isinstance(e, dict):
-            continue
-        role = str(e.get("role") or "").strip().lower()
-        if role not in {"user", "assistant"}:
-            continue
-        content = str(e.get("content") or "")
-        content = content.strip()
-        if not content:
-            continue
-        if len(content) > max_chars_per_event:
-            content = content[:max_chars_per_event] + "…"
-        ts = e.get("ts")
-        try:
-            ts_f = float(ts) if ts is not None else now_ts
-        except Exception:
-            ts_f = now_ts
-
-        norm.append(
-            {
-                "ts": ts_f,
-                "role": role,
-                "content": content,
-                "session_id": session_id,
-                "key": key,
-            }
-        )
-
-    # Global cap
-    total_chars = 0
-    capped: List[Dict[str, Any]] = []
-    for e in norm:
-        total_chars += len(e.get("content") or "")
-        if total_chars > max_chars:
-            break
-        capped.append(e)
-
-    if not capped:
-        return {"ok": True, "key": key, "count": 0}
-
-    path = _journal_path_for_key(key)
-    try:
-        await run_in_threadpool(_append_journal_events_sync, path, capped)
-        return {"ok": True, "key": key, "count": len(capped)}
-    except Exception as e:
-        # Fail-open: journaling errors shouldn't break UX.
-        return {"ok": False, "key": key, "count": 0, "error": f"{type(e).__name__}: {e}"}
-
-
-# -----------------------------------------------------------------------------
-# (Optional / future) Server-side summarization from journal
-# -----------------------------------------------------------------------------
-# If, later, you decide to remove Wix-side validation or want backend-driven
-# automatic summaries, you can build it on top of the journal file(s) above.
-#
-# We are intentionally NOT enabling this now, because it introduces extra model
-# calls and could create new performance variables. Keep it as a controlled,
-# explicit feature rollout.
-#
-# @app.post("/journal/summarize", response_model=None)
-# async def journal_summarize(request: Request):
-#     ...
