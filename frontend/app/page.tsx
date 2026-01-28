@@ -2157,7 +2157,11 @@ const speakAssistantReply = useCallback(
     lastSavedAtMs: 0,
     lastSavedKey: null,
   });
-  const autoSaveSummaryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // IMPORTANT (TypeScript): In Next.js builds that include both DOM + Node typings,
+  // `setTimeout` can be typed as returning NodeJS.Timeout, while `window.setTimeout`
+  // returns a number. Since this is a client component and we call `window.setTimeout`,
+  // store the timer id as a number to avoid TS errors in CI.
+  const autoSaveSummaryTimerRef = useRef<number | null>(null);
   const autoSaveSummaryInFlightRef = useRef<boolean>(false);
   const autoSaveSummaryLastErrorRef = useRef<string | null>(null);
 
