@@ -190,6 +190,157 @@ async def usage_credit(request: Request):
     return result
 
 
+@app.post("/usage/status")
+async def usage_status(request: Request):
+    """Return remaining minutes for the caller (read-only).
+
+    This endpoint is intentionally separate from /chat so the frontend can answer
+    "how many minutes do I have left?" without touching the OpenAI pipeline.
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    session_id = str(raw.get("session_id") or raw.get("sessionId") or "").strip()
+
+    session_state = raw.get("session_state") or raw.get("sessionState") or {}
+    if not isinstance(session_state, dict):
+        session_state = {}
+
+    member_id = _extract_member_id(session_state)
+    plan_name_raw = _extract_plan_name(session_state)
+
+    # RebrandingKey / overrides (same logic as /chat)
+    rebranding_key_raw = _extract_rebranding_key(session_state)
+    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+
+    upgrade_link_override = _session_get_str(session_state, "upgrade_link", "upgradeLink") or rebranding_parsed.get("upgrade_link", "")
+    pay_go_link_override = _session_get_str(session_state, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
+    pay_go_price = _session_get_str(session_state, "pay_go_price", "payGoPrice") or rebranding_parsed.get("pay_go_price", "")
+    pay_go_minutes_raw = _session_get_str(session_state, "pay_go_minutes", "payGoMinutes") or rebranding_parsed.get("pay_go_minutes", "")
+    plan_external = (
+        _session_get_str(session_state, "rebranding_plan", "rebrandingPlan", "planExternal", "plan_external")
+        or rebranding_parsed.get("plan", "")
+    )
+    plan_map = _session_get_str(session_state, "elaralo_plan_map", "elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map", "")
+    free_minutes_raw = _session_get_str(session_state, "free_minutes", "freeMinutes") or rebranding_parsed.get("free_minutes", "")
+    cycle_days_raw = _session_get_str(session_state, "cycle_days", "cycleDays") or rebranding_parsed.get("cycle_days", "")
+
+    pay_go_minutes = _safe_int(pay_go_minutes_raw)
+    free_minutes = _safe_int(free_minutes_raw)
+    cycle_days = _safe_int(cycle_days_raw)
+
+    is_trial = not bool(member_id)
+    identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+
+    # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
+    minutes_allowed_override: Optional[int] = None
+    if free_minutes is not None:
+        minutes_allowed_override = free_minutes
+    elif plan_map:
+        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
+
+    cycle_days_override: Optional[int] = None
+    if cycle_days is not None:
+        cycle_days_override = cycle_days
+
+    # Plan name used for quota purposes (fallback) should use the mapped plan if provided.
+    plan_name_for_limits = plan_map or plan_name_raw
+
+    # Plan label shown to the user should use the external plan name (if provided).
+    plan_label_for_messages = plan_external or plan_name_raw
+
+    # For rebranding, construct PAYG_PRICE_TEXT as:
+    #   PayGoPrice + " per " + PayGoMinutes + " minutes"
+    is_rebranding = bool(rebranding_key_raw or plan_external or plan_map or upgrade_link_override or pay_go_link_override or pay_go_price)
+
+    payg_price_text_override = ""
+    if is_rebranding:
+        minutes_part = ""
+        if pay_go_minutes is not None:
+            minutes_part = str(pay_go_minutes)
+        else:
+            minutes_part = str(pay_go_minutes_raw or "").strip()
+        if pay_go_price and minutes_part:
+            payg_price_text_override = f"{pay_go_price} per {minutes_part} minutes"
+
+    status = await run_in_threadpool(
+        _usage_peek_status_sync,
+        identity_key,
+        is_trial=is_trial,
+        plan_name=plan_name_for_limits,
+        minutes_allowed_override=minutes_allowed_override,
+        cycle_days_override=cycle_days_override,
+    )
+
+    minutes_remaining = int(status.get("minutes_remaining") or 0)
+    minutes_allowed = int(status.get("minutes_allowed") or 0)
+    minutes_used = int(status.get("minutes_used") or 0)
+
+    resolved_upgrade_url = (upgrade_link_override or "").strip() or UPGRADE_URL
+    resolved_payg_pay_url = (pay_go_link_override or "").strip() or PAYG_PAY_URL
+    resolved_payg_minutes = int(pay_go_minutes) if pay_go_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
+    resolved_payg_price_text = (payg_price_text_override or "").strip() or PAYG_PRICE_TEXT
+
+    nice_plan_label = "Free Trial" if is_trial else (plan_label_for_messages or "your plan")
+
+    # Build a short, TTS-friendly answer.
+    lines: List[str] = []
+    lines.append(f"You have {minutes_remaining} minutes remaining on your {nice_plan_label}.")
+    if minutes_allowed > 0:
+        lines.append(f"You've used {minutes_used} of {minutes_allowed} included minutes.")
+
+    cycle_days_effective = int(status.get("cycle_days") or 0)
+    cycle_resets_in_days = status.get("cycle_resets_in_days")
+    if (not is_trial) and cycle_days_effective and isinstance(cycle_resets_in_days, int):
+        lines.append(
+            f"Your minutes reset every {cycle_days_effective} days. Next reset in about {cycle_resets_in_days} days."
+        )
+
+    # If exhausted, include the same paywall guidance you already use in /chat.
+    if minutes_remaining <= 0:
+        lines.append(
+            _usage_paywall_message(
+                is_trial=is_trial,
+                plan_name=plan_label_for_messages,
+                minutes_allowed=minutes_allowed,
+                upgrade_url=upgrade_link_override,
+                payg_pay_url=pay_go_link_override,
+                payg_increment_minutes=pay_go_minutes,
+                payg_price_text=payg_price_text_override,
+            )
+        )
+    else:
+        # Optional: quick way to add more time
+        if resolved_payg_pay_url:
+            if resolved_payg_minutes and resolved_payg_price_text:
+                lines.append(f"Add {resolved_payg_minutes} minutes ({resolved_payg_price_text}): {resolved_payg_pay_url}")
+            else:
+                lines.append(f"Add minutes: {resolved_payg_pay_url}")
+
+        if resolved_upgrade_url:
+            lines.append(f"Upgrade: {resolved_upgrade_url}")
+
+    reply = "\n".join([ln for ln in lines if str(ln or "").strip()])
+
+    return {
+        "ok": bool(status.get("ok")),
+        "reply": reply,
+        "is_trial": bool(is_trial),
+        "plan_name": plan_label_for_messages or ("Trial" if is_trial else ""),
+        "minutes_used": minutes_used,
+        "minutes_allowed": minutes_allowed,
+        "minutes_remaining": minutes_remaining,
+        "cycle_days": cycle_days_effective,
+        "cycle_resets_in_days": status.get("cycle_resets_in_days"),
+        "upgrade_url": resolved_upgrade_url,
+        "payg_pay_url": resolved_payg_pay_url,
+        "payg_increment_minutes": int(resolved_payg_minutes or 0),
+        "payg_price_text": resolved_payg_price_text,
+    }
+
+
 @app.get("/ready")
 def ready():
     """
@@ -980,6 +1131,117 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
         # Fail-open
         return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": identity_key}
 
+
+def _usage_peek_status_sync(
+    identity_key: str,
+    *,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int] = None,
+    cycle_days_override: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return usage status WITHOUT persisting.
+
+    IMPORTANT:
+      - Does NOT update last_seen
+      - Does NOT write used_seconds back to the store
+      - Computes a *projected* remaining time as-if a chat call happened "now"
+        (so the number matches what /chat would enforce), but it is read-only.
+    """
+    now = time.time()
+    try:
+        with _USAGE_LOCK:
+            store = _load_usage_store()
+            rec = store.get(identity_key)
+            if not isinstance(rec, dict):
+                rec = {}
+
+            used_seconds = float(rec.get("used_seconds") or 0.0)
+            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+            last_seen = rec.get("last_seen")
+            cycle_start = float(rec.get("cycle_start") or now)
+
+            # Member cycle reset (trial does not reset)
+            cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
+            cycle_reset_applied = False
+            if not is_trial and cycle_days and cycle_days > 0:
+                cycle_len = float(cycle_days) * 86400.0
+                if (now - cycle_start) >= cycle_len:
+                    used_seconds = 0.0
+                    cycle_start = now
+                    cycle_reset_applied = True
+
+            # Compute the same billable delta that /chat would apply,
+            # but do NOT persist it.
+            delta = 0.0
+            if last_seen is not None:
+                try:
+                    delta = float(now - float(last_seen))
+                except Exception:
+                    delta = 0.0
+
+            if delta < 0:
+                delta = 0.0
+
+            # Don't charge long idle gaps (prevents "went AFK" from burning minutes)
+            if USAGE_IDLE_GRACE_SECONDS and delta > float(USAGE_IDLE_GRACE_SECONDS):
+                delta = 0.0
+
+            # Cap per-request billable time
+            max_bill = (
+                float(USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST)
+                if USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST > 0
+                else 0.0
+            )
+            if max_bill and delta > max_bill:
+                delta = max_bill
+
+            projected_used_seconds = used_seconds + delta
+
+        # Compute allowed seconds
+        if minutes_allowed_override is not None:
+            try:
+                minutes_allowed = max(0, int(minutes_allowed_override))
+            except Exception:
+                minutes_allowed = 0
+        else:
+            minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
+        allowed_seconds = (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0)
+
+        remaining_seconds = max(0.0, allowed_seconds - projected_used_seconds)
+        ok = remaining_seconds > 0.0
+
+        cycle_resets_in_days: Optional[int] = None
+        if not is_trial and cycle_days and cycle_days > 0:
+            cycle_end = float(cycle_start) + (float(cycle_days) * 86400.0)
+            cycle_resets_in_days = int(max(0.0, cycle_end - now) // 86400)
+
+        return {
+            "ok": ok,
+            "minutes_used": int(projected_used_seconds // 60),
+            "minutes_allowed": int(minutes_allowed),
+            "minutes_remaining": int(remaining_seconds // 60),
+            "purchased_minutes": int(float(purchased_seconds or 0.0) // 60),
+            "identity_key": identity_key,
+            "cycle_days": int(cycle_days or 0),
+            "cycle_resets_in_days": cycle_resets_in_days,
+            "cycle_reset_applied": bool(cycle_reset_applied),
+        }
+    except Exception:
+        # Fail-open
+        return {
+            "ok": True,
+            "minutes_used": 0,
+            "minutes_allowed": 0,
+            "minutes_remaining": 0,
+            "purchased_minutes": 0,
+            "identity_key": identity_key,
+            "cycle_days": int(cycle_days_override or 0),
+            "cycle_resets_in_days": None,
+            "cycle_reset_applied": False,
+        }
+
+
 def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any]:
     """Add purchased minutes to an identity record (used by payment webhooks/admin tooling)."""
     now = time.time()
@@ -1171,7 +1433,7 @@ def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
 
     client = OpenAI(api_key=api_key)
     resp = client.chat.completions.create(
-        model=(os.getenv("SAVE_SUMMARY_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4o")),
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
         temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
     )
@@ -1190,7 +1452,7 @@ def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
     timeout_s = float(os.getenv("SAVE_SUMMARY_OPENAI_TIMEOUT_S", "25") or "25")
     client = OpenAI(api_key=api_key, timeout=timeout_s)
     resp = client.chat.completions.create(
-        model=(os.getenv("SAVE_SUMMARY_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4o")),
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
         temperature=float(os.getenv("SAVE_SUMMARY_TEMPERATURE", "0.2") or "0.2"),
         max_tokens=int(os.getenv("SAVE_SUMMARY_MAX_TOKENS", "350") or "350"),
@@ -1801,28 +2063,13 @@ async def chat(request: Request):
                 state_out = dict(state_out)
                 state_out["tts_error"] = f"{type(e).__name__}: {e}"
 
-        resp = {
+        return {
             "session_id": session_id,
             "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
             "reply": reply,
             "session_state": state_out,
             "audio_url": audio_url,       # NEW (optional)
         }
-
-        # Auto-save summary (server-side) is deliberately non-blocking and MUST NOT affect TTS/STT.
-        # It runs in the background after a reply is produced and never changes frontend state.
-        try:
-            _maybe_schedule_autosave_summary(
-                session_id=session_id,
-                messages=messages,
-                assistant_reply=reply,
-                session_state=state_out,
-                status_mode=status_mode,
-            )
-        except Exception:
-            pass
-
-        return resp
 
     # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
@@ -2123,50 +2370,29 @@ def _persist_summary_store() -> None:
 _load_summary_store()
 
 
-# ----------------------------
-# AUTO-SAVE CHAT SUMMARY (server-side)
-# ----------------------------
-# Manual Save (frontend) intentionally pauses hands-free STT while the confirmation modal is open.
-# Auto-save runs ONLY on the backend and MUST NOT affect TTS/STT or video/audio UI state.
-#
-# Enable auto-save via environment:
-#   AUTO_SAVE_SUMMARY=1
-#
-# Optional:
-#   AUTO_SAVE_SUMMARY_BRANDS=elaralo,dulcemoon   (comma-separated; overrides AUTO_SAVE_SUMMARY if set)
-#   AUTO_SAVE_SUMMARY_MIN_SECONDS=120           (throttle per (member/session + companion) key)
-#   SAVE_SUMMARY_MODEL=gpt-4o-mini              (optional; defaults to OPENAI_MODEL)
+@app.post("/chat/save-summary", response_model=None)
+async def save_chat_summary(request: Request):
+    """Saves a server-side summary of the chat history.
 
-_AUTO_SAVE_INFLIGHT: set[str] = set()
-_AUTO_SAVE_LOCK = __import__("threading").RLock()
+    Reliability goals:
+      - Never leave the browser with an ambiguous network failure when possible.
+      - Cap inputs to avoid oversized payloads/timeouts.
+      - Return a structured JSON response even when summarization fails.
 
+    Request JSON:
+      { session_id, messages, session_state }
 
-def _autosave_is_enabled(session_state: Dict[str, Any]) -> bool:
-    brands = (os.getenv("AUTO_SAVE_SUMMARY_BRANDS") or "").strip()
-    if brands:
-        allowed = {_norm_key(b) for b in brands.split(",") if str(b).strip()}
-        brand = (
-            session_state.get("rebranding")
-            or session_state.get("brand")
-            or session_state.get("company")
-            or session_state.get("companyName")
-            or ""
-        )
-        return _norm_key(str(brand)) in allowed
+    Response JSON:
+      { ok: true|false, summary?: "...", error_code?: "...", error?: "...", saved_at?: <ts>, key?: "..." }
+    """
+    debug = bool(getattr(settings, "DEBUG", False))
 
-    v = (os.getenv("AUTO_SAVE_SUMMARY") or "0").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    try:
+        raw = await request.json()
+    except Exception as e:
+        return {"ok": False, "error_code": "invalid_json", "error": f"{type(e).__name__}: {e}"}
 
-
-async def _save_chat_summary_internal(
-    *,
-    session_id: str,
-    messages: List[Dict[str, Any]],
-    session_state: Dict[str, Any],
-    debug: bool = False,
-    reason: str = "manual",
-) -> Dict[str, Any]:
-    """Internal implementation used by both manual Save and server-side auto-save."""
+    session_id, messages, session_state, _wants_explicit = _normalize_payload(raw)
 
     # Normalize + cap the conversation for summarization to reduce cost and avoid request failures.
     max_msgs = int(os.getenv("SAVE_SUMMARY_MAX_MESSAGES", "80") or "80")
@@ -2174,16 +2400,13 @@ async def _save_chat_summary_internal(
     per_msg_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS_PER_MESSAGE", "2000") or "2000")
 
     convo_items: List[Dict[str, str]] = []
-    for m in (messages or []):
+    for m in messages:
         role = m.get("role")
         if role in ("user", "assistant"):
             content = str(m.get("content") or "")
             if per_msg_chars > 0 and len(content) > per_msg_chars:
                 content = content[:per_msg_chars] + " …"
             convo_items.append({"role": role, "content": content})
-
-    if not convo_items:
-        return {"ok": False, "error_code": "no_messages", "error": "No user/assistant messages to summarize."}
 
     if max_msgs > 0 and len(convo_items) > max_msgs:
         convo_items = convo_items[-max_msgs:]
@@ -2195,6 +2418,7 @@ async def _save_chat_summary_internal(
         c = m["content"]
         if total >= max_chars:
             break
+        # keep at least some of this message
         remaining = max_chars - total
         if remaining <= 0:
             break
@@ -2213,6 +2437,7 @@ async def _save_chat_summary_internal(
 
     convo: List[Dict[str, str]] = [{"role": "system", "content": sys}] + convo_items
 
+    # Time-bound the summarization request to prevent upstream timeouts.
     timeout_s = float(os.getenv("SAVE_SUMMARY_TIMEOUT_S", "30") or "30")
     try:
         summary = await asyncio.wait_for(run_in_threadpool(_call_gpt4o_summary, convo), timeout=timeout_s)
@@ -2222,6 +2447,7 @@ async def _save_chat_summary_internal(
         _dbg(debug, "Summary generation failed:", repr(e))
         return {"ok": False, "error_code": "summary_failed", "error": f"{type(e).__name__}: {e}"}
 
+    # Refresh from disk before write to avoid clobbering another worker's recent update.
     _refresh_summary_store_if_needed()
 
     key = _summary_store_key(session_state, session_id)
@@ -2231,109 +2457,11 @@ async def _save_chat_summary_internal(
         "member_id": session_state.get("memberId") or session_state.get("member_id"),
         "companion": session_state.get("companion") or session_state.get("companionName") or session_state.get("companion_name"),
         "summary": summary,
-        "reason": reason,
     }
     _CHAT_SUMMARY_STORE[key] = record
     _persist_summary_store()
 
     return {"ok": True, "summary": summary, "saved_at": record["saved_at"], "key": key}
-
-
-def _maybe_schedule_autosave_summary(
-    *,
-    session_id: str,
-    messages: List[Dict[str, Any]],
-    assistant_reply: str,
-    session_state: Dict[str, Any],
-    status_mode: str,
-) -> None:
-    """Fire-and-forget auto-save that never blocks /chat and never touches frontend UX."""
-
-    # Only auto-save for successful chat turns. (Manual Save remains available for all cases.)
-    if status_mode == STATUS_BLOCKED:
-        return
-
-    if not _autosave_is_enabled(session_state):
-        return
-
-    # Skip if we don't have a stable key (unknown companion, etc.)
-    key = _summary_store_key(session_state, session_id)
-    if key.endswith("::unknown"):
-        return
-
-    # Throttle saves per key to avoid load/cost spikes.
-    min_s = float(os.getenv("AUTO_SAVE_SUMMARY_MIN_SECONDS", "120") or "120")
-    try:
-        _refresh_summary_store_if_needed()
-        rec = _CHAT_SUMMARY_STORE.get(key) or {}
-        last = int(rec.get("saved_at") or 0)
-        if last and (_now_ts() - last) < min_s:
-            return
-    except Exception:
-        # If anything about the store is odd, fail open (attempt save) rather than interrupt chat.
-        pass
-
-    with _AUTO_SAVE_LOCK:
-        if key in _AUTO_SAVE_INFLIGHT:
-            return
-        _AUTO_SAVE_INFLIGHT.add(key)
-
-    async def _runner() -> None:
-        try:
-            # Include the assistant reply so the saved summary reflects the latest turn.
-            msgs_for_summary = list(messages or [])
-            if isinstance(assistant_reply, str) and assistant_reply.strip():
-                msgs_for_summary = msgs_for_summary + [{"role": "assistant", "content": assistant_reply}]
-
-            await _save_chat_summary_internal(
-                session_id=session_id,
-                messages=msgs_for_summary,
-                session_state=session_state,
-                debug=False,
-                reason="auto",
-            )
-        except Exception:
-            # Never let auto-save errors affect chat UX.
-            return
-        finally:
-            with _AUTO_SAVE_LOCK:
-                _AUTO_SAVE_INFLIGHT.discard(key)
-
-    try:
-        asyncio.create_task(_runner())
-    except RuntimeError:
-        # No running loop: don't crash; just skip.
-        with _AUTO_SAVE_LOCK:
-            _AUTO_SAVE_INFLIGHT.discard(key)
-        return
-
-
-@app.post("/chat/save-summary", response_model=None)
-async def save_chat_summary(request: Request):
-    """
-    Create (or refresh) a compact summary of the current conversation and persist it server-side.
-
-    IMPORTANT:
-    - The *frontend* manual Save flow pauses hands-free STT while the user confirms.
-    - The *backend* summary generation (this endpoint and auto-save) never touches TTS/STT state.
-    """
-
-    debug = (os.getenv("DEBUG_SAVE_SUMMARY") or "").strip().lower() in ("1", "true", "yes", "on")
-
-    try:
-        raw = await request.json()
-    except Exception:
-        return {"ok": False, "error_code": "invalid_json", "error": "Invalid JSON body."}
-
-    session_id, messages, session_state, _wants_explicit = _normalize_payload(raw)
-
-    return await _save_chat_summary_internal(
-        session_id=session_id,
-        messages=messages,
-        session_state=session_state,
-        debug=debug,
-        reason="manual",
-    )
 
 
 # ----------------------------
@@ -2449,3 +2577,160 @@ async def stt_transcribe(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
 
+
+
+# =============================================================================
+# Option B — Separate Journaling Endpoint (does NOT touch /chat or TTS/STT)
+# =============================================================================
+#
+# Goal:
+#   Capture *copies* of incoming/outgoing messages to an append-only journal store.
+#   Summaries (manual or automated) can later be generated from this journal without
+#   invoking the existing /chat/save-summary flow that the frontend currently treats
+#   as a "stop everything" action.
+#
+# IMPORTANT:
+#   - This code path is separate from /chat, /tts/*, /stt/*.
+#   - It is only executed if the frontend calls /journal/append.
+#   - No TTS/STT logic is modified by this feature.
+#
+# Storage:
+#   - Default: local persistent /home on Azure App Service.
+#   - Set CHAT_JOURNAL_DIR to override.
+#
+# Payload contract (frontend → backend):
+#   POST /journal/append
+#   {
+#     "session_id": "....",
+#     "session_state": { ... },     # same object you send to /chat
+#     "events": [
+#       { "role": "user"|"assistant", "content": "...", "ts": 1730000000.123 }
+#     ]
+#   }
+#
+# Response:
+#   { ok: true|false, key: "...", count: N, error?: "..." }
+# =============================================================================
+
+_CHAT_JOURNAL_DIR = (os.getenv("CHAT_JOURNAL_DIR", "") or "/home/chat_journals").strip()
+
+
+def _journal_safe_filename(key: str) -> str:
+    # memberId::companionKey (contains ':' and other chars) → filesystem-safe slug
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", (key or "").strip())
+    if not safe:
+        safe = "unknown"
+    return safe + ".jsonl"
+
+
+def _journal_path_for_key(key: str) -> str:
+    try:
+        os.makedirs(_CHAT_JOURNAL_DIR, exist_ok=True)
+    except Exception:
+        # Fail-open: journaling should never break the API
+        pass
+    return os.path.join(_CHAT_JOURNAL_DIR, _journal_safe_filename(key))
+
+
+def _append_journal_events_sync(path: str, events: List[Dict[str, Any]]) -> None:
+    # Append JSONL with a per-file lock for multi-worker safety.
+    lock = FileLock(path + ".lock")
+    with lock:
+        with open(path, "a", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+@app.post("/journal/append", response_model=None)
+async def journal_append(request: Request):
+    try:
+        raw = await request.json()
+    except Exception as e:
+        return {"ok": False, "error": f"invalid_json: {type(e).__name__}: {e}"}
+
+    session_id = str(raw.get("session_id") or "").strip()
+    session_state = raw.get("session_state") or {}
+    events_in = raw.get("events") or []
+
+    if not isinstance(session_state, dict):
+        session_state = {}
+    if not isinstance(events_in, list):
+        events_in = []
+
+    # Compute the same stable keying scheme used by summaries.
+    # (memberId + normalized companion; falls back to session::<session_id>)
+    if not session_id:
+        # journaling must still have a stable file name; fall back to an ephemeral id
+        session_id = "session-" + uuid.uuid4().hex
+
+    key = _summary_store_key(session_state, session_id)
+
+    # Normalize/cap events (journaling must be cheap + safe)
+    now_ts = time.time()
+    max_events = int(os.getenv("CHAT_JOURNAL_MAX_EVENTS", "20") or "20")
+    max_chars = int(os.getenv("CHAT_JOURNAL_MAX_CHARS", "8000") or "8000")
+    max_chars_per_event = int(os.getenv("CHAT_JOURNAL_MAX_CHARS_PER_EVENT", "2000") or "2000")
+
+    norm: List[Dict[str, Any]] = []
+    for e in events_in[:max_events]:
+        if not isinstance(e, dict):
+            continue
+        role = str(e.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(e.get("content") or "")
+        content = content.strip()
+        if not content:
+            continue
+        if len(content) > max_chars_per_event:
+            content = content[:max_chars_per_event] + "…"
+        ts = e.get("ts")
+        try:
+            ts_f = float(ts) if ts is not None else now_ts
+        except Exception:
+            ts_f = now_ts
+
+        norm.append(
+            {
+                "ts": ts_f,
+                "role": role,
+                "content": content,
+                "session_id": session_id,
+                "key": key,
+            }
+        )
+
+    # Global cap
+    total_chars = 0
+    capped: List[Dict[str, Any]] = []
+    for e in norm:
+        total_chars += len(e.get("content") or "")
+        if total_chars > max_chars:
+            break
+        capped.append(e)
+
+    if not capped:
+        return {"ok": True, "key": key, "count": 0}
+
+    path = _journal_path_for_key(key)
+    try:
+        await run_in_threadpool(_append_journal_events_sync, path, capped)
+        return {"ok": True, "key": key, "count": len(capped)}
+    except Exception as e:
+        # Fail-open: journaling errors shouldn't break UX.
+        return {"ok": False, "key": key, "count": 0, "error": f"{type(e).__name__}: {e}"}
+
+
+# -----------------------------------------------------------------------------
+# (Optional / future) Server-side summarization from journal
+# -----------------------------------------------------------------------------
+# If, later, you decide to remove Wix-side validation or want backend-driven
+# automatic summaries, you can build it on top of the journal file(s) above.
+#
+# We are intentionally NOT enabling this now, because it introduces extra model
+# calls and could create new performance variables. Keep it as a controlled,
+# explicit feature rollout.
+#
+# @app.post("/journal/summarize", response_model=None)
+# async def journal_summarize(request: Request):
+#     ...
