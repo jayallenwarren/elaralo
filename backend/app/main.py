@@ -1088,6 +1088,63 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     return None
 
 
+
+# ----------------------------
+# Usage: "minutes remaining" intent
+# ----------------------------
+def _is_minutes_remaining_question(text: str) -> bool:
+    """Return True when the user is asking about remaining plan/trial minutes/time."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # normalize whitespace
+    t = re.sub(r"\s+", " ", t)
+
+    # Extremely short query variants (often from voice/STT) like: "time remaining"
+    t_simple = re.sub(r"[^a-z0-9\s]", "", t)
+    if t_simple in {"time remaining", "remaining time"}:
+        return True
+
+    # Fast path: common direct phrases
+    direct_phrases = [
+        "minutes remaining",
+        "minutes left",
+        "remaining minutes",
+        "available minutes",
+        "minute balance",
+        "minutes balance",
+        "usage remaining",
+        "minutes used",
+        "time used",
+        "usage used",
+        "minutes spent",
+        "time spent",
+    ]
+    if any(p in t for p in direct_phrases):
+        return True
+
+    # Question-style variants
+    if "how many" in t and "minute" in t and any(k in t for k in ["left", "remaining", "available", "do i have", "can i", "can we"]):
+        return True
+    if "how many" in t and "minute" in t and any(k in t for k in ["used", "spent"]):
+        return True
+    if "how much" in t and "time" in t and any(k in t for k in ["used", "spent"]):
+        return True
+    if "how much" in t and any(w in t for w in ["time", "minutes", "minute"]) and any(k in t for k in ["left", "remaining", "available", "do i have"]):
+        return True
+    if "how long" in t and any(k in t for k in ["can i", "can we", "do i"]) and any(w in t for w in ["talk", "speak", "chat", "call"]):
+        return True
+
+    # Generic: contains minutes/time + remaining/left/balance and mentions plan/trial or chatting
+    has_amount_word = bool(re.search(r"\b(minutes?|time)\b", t))
+    has_remaining_word = bool(re.search(r"\b(remaining|left|available|balance)\b", t))
+    has_context_word = any(w in t for w in ["plan", "trial", "subscription", "speak", "talk", "chat", "with you", "on my", "upgrade", "pay as you go", "paygo"])
+    if has_amount_word and has_remaining_word and has_context_word:
+        return True
+
+    return False
+
 def _looks_intimate(text: str) -> bool:
     t = (text or "").lower()
     return any(
@@ -1736,7 +1793,7 @@ async def chat(request: Request):
         session_state_out.update(
             {
                 "minutes_exhausted": True,
-                "minutes_used": int(usage_info.get("minutes_used") or 0),
+                "minutes_used": mins_used,
                 "minutes_allowed": int(minutes_allowed),
                 "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
             }
@@ -1813,6 +1870,37 @@ async def chat(request: Request):
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
     user_text = ((last_user.get("content") if last_user else "") or "").strip()
     normalized_text = user_text.lower().strip()
+
+    # "Minutes remaining" intent: answer deterministically from the quota tracker (no OpenAI call).
+    # This is safe to run even when the UI is waiting on intimate consent (it is NOT a consent yes/no).
+    if _is_minutes_remaining_question(user_text):
+        mins_remaining = int(usage_info.get("minutes_remaining") or 0)
+        mins_used = int(usage_info.get("minutes_used") or 0)
+
+        # Prefer showing "Free Trial" wording for non-members, even if the plan label is "Trial".
+        if is_trial:
+            plan_label = "your Free Trial"
+        else:
+            nice_plan = (plan_label_for_messages or plan_name_for_limits or "plan").strip()
+            plan_label = f"your {nice_plan} plan"
+
+        plural_rem = "" if mins_remaining == 1 else "s"
+        plural_used = "" if mins_used == 1 else "s"
+        reply = (
+            f"You have {mins_remaining} minute{plural_rem} remaining on {plan_label}. "
+            f"You've used {mins_used} minute{plural_used} so far in this usage cycle."
+        )
+
+        state_out = dict(session_state)
+        state_out.update(
+            {
+                "minutes_used": int(usage_info.get("minutes_used") or 0),
+                "minutes_allowed": int(usage_info.get("minutes_allowed") or 0),
+                "minutes_remaining": mins_remaining,
+            }
+        )
+        return await _respond(reply, STATUS_SAFE, state_out)
+
 
     # allow text-based mode switching
     detected_switch = _detect_mode_switch_from_text(user_text)
@@ -2315,160 +2403,3 @@ async def stt_transcribe(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
 
-
-
-# =============================================================================
-# Option B — Separate Journaling Endpoint (does NOT touch /chat or TTS/STT)
-# =============================================================================
-#
-# Goal:
-#   Capture *copies* of incoming/outgoing messages to an append-only journal store.
-#   Summaries (manual or automated) can later be generated from this journal without
-#   invoking the existing /chat/save-summary flow that the frontend currently treats
-#   as a "stop everything" action.
-#
-# IMPORTANT:
-#   - This code path is separate from /chat, /tts/*, /stt/*.
-#   - It is only executed if the frontend calls /journal/append.
-#   - No TTS/STT logic is modified by this feature.
-#
-# Storage:
-#   - Default: local persistent /home on Azure App Service.
-#   - Set CHAT_JOURNAL_DIR to override.
-#
-# Payload contract (frontend → backend):
-#   POST /journal/append
-#   {
-#     "session_id": "....",
-#     "session_state": { ... },     # same object you send to /chat
-#     "events": [
-#       { "role": "user"|"assistant", "content": "...", "ts": 1730000000.123 }
-#     ]
-#   }
-#
-# Response:
-#   { ok: true|false, key: "...", count: N, error?: "..." }
-# =============================================================================
-
-_CHAT_JOURNAL_DIR = (os.getenv("CHAT_JOURNAL_DIR", "") or "/home/chat_journals").strip()
-
-
-def _journal_safe_filename(key: str) -> str:
-    # memberId::companionKey (contains ':' and other chars) → filesystem-safe slug
-    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", (key or "").strip())
-    if not safe:
-        safe = "unknown"
-    return safe + ".jsonl"
-
-
-def _journal_path_for_key(key: str) -> str:
-    try:
-        os.makedirs(_CHAT_JOURNAL_DIR, exist_ok=True)
-    except Exception:
-        # Fail-open: journaling should never break the API
-        pass
-    return os.path.join(_CHAT_JOURNAL_DIR, _journal_safe_filename(key))
-
-
-def _append_journal_events_sync(path: str, events: List[Dict[str, Any]]) -> None:
-    # Append JSONL with a per-file lock for multi-worker safety.
-    lock = FileLock(path + ".lock")
-    with lock:
-        with open(path, "a", encoding="utf-8") as f:
-            for e in events:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
-
-
-@app.post("/journal/append", response_model=None)
-async def journal_append(request: Request):
-    try:
-        raw = await request.json()
-    except Exception as e:
-        return {"ok": False, "error": f"invalid_json: {type(e).__name__}: {e}"}
-
-    session_id = str(raw.get("session_id") or "").strip()
-    session_state = raw.get("session_state") or {}
-    events_in = raw.get("events") or []
-
-    if not isinstance(session_state, dict):
-        session_state = {}
-    if not isinstance(events_in, list):
-        events_in = []
-
-    # Compute the same stable keying scheme used by summaries.
-    # (memberId + normalized companion; falls back to session::<session_id>)
-    if not session_id:
-        # journaling must still have a stable file name; fall back to an ephemeral id
-        session_id = "session-" + uuid.uuid4().hex
-
-    key = _summary_store_key(session_state, session_id)
-
-    # Normalize/cap events (journaling must be cheap + safe)
-    now_ts = time.time()
-    max_events = int(os.getenv("CHAT_JOURNAL_MAX_EVENTS", "20") or "20")
-    max_chars = int(os.getenv("CHAT_JOURNAL_MAX_CHARS", "8000") or "8000")
-    max_chars_per_event = int(os.getenv("CHAT_JOURNAL_MAX_CHARS_PER_EVENT", "2000") or "2000")
-
-    norm: List[Dict[str, Any]] = []
-    for e in events_in[:max_events]:
-        if not isinstance(e, dict):
-            continue
-        role = str(e.get("role") or "").strip().lower()
-        if role not in {"user", "assistant"}:
-            continue
-        content = str(e.get("content") or "")
-        content = content.strip()
-        if not content:
-            continue
-        if len(content) > max_chars_per_event:
-            content = content[:max_chars_per_event] + "…"
-        ts = e.get("ts")
-        try:
-            ts_f = float(ts) if ts is not None else now_ts
-        except Exception:
-            ts_f = now_ts
-
-        norm.append(
-            {
-                "ts": ts_f,
-                "role": role,
-                "content": content,
-                "session_id": session_id,
-                "key": key,
-            }
-        )
-
-    # Global cap
-    total_chars = 0
-    capped: List[Dict[str, Any]] = []
-    for e in norm:
-        total_chars += len(e.get("content") or "")
-        if total_chars > max_chars:
-            break
-        capped.append(e)
-
-    if not capped:
-        return {"ok": True, "key": key, "count": 0}
-
-    path = _journal_path_for_key(key)
-    try:
-        await run_in_threadpool(_append_journal_events_sync, path, capped)
-        return {"ok": True, "key": key, "count": len(capped)}
-    except Exception as e:
-        # Fail-open: journaling errors shouldn't break UX.
-        return {"ok": False, "key": key, "count": 0, "error": f"{type(e).__name__}: {e}"}
-
-
-# -----------------------------------------------------------------------------
-# (Optional / future) Server-side summarization from journal
-# -----------------------------------------------------------------------------
-# If, later, you decide to remove Wix-side validation or want backend-driven
-# automatic summaries, you can build it on top of the journal file(s) above.
-#
-# We are intentionally NOT enabling this now, because it introduces extra model
-# calls and could create new performance variables. Keep it as a controlled,
-# explicit feature rollout.
-#
-# @app.post("/journal/summarize", response_model=None)
-# async def journal_summarize(request: Request):
-#     ...
