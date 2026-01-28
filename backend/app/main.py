@@ -263,6 +263,12 @@ PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
 if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
     PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
 
+# When the backend returns an "instant" deterministic reply (e.g., minutes-balance queries),
+# some clients (notably iOS Safari in embedded contexts) can still be transitioning from
+# microphone capture to playback, causing the next TTS audio to route at a much lower volume.
+# We enforce a small minimum response latency for these fast paths to keep audio routing consistent.
+FAST_REPLY_MIN_LATENCY_MS = _env_int("FAST_REPLY_MIN_LATENCY_MS", 900)
+
 
 # Admin token for server-side minute credits (payment webhook can call this)
 USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
@@ -1748,6 +1754,26 @@ async def chat(request: Request):
     """
     debug = bool(getattr(settings, "DEBUG", False))
 
+    # Track request start so we can optionally enforce a minimum latency for fast-path responses.
+    request_started = time.monotonic()
+
+    async def _ensure_fast_reply_min_latency() -> None:
+        """Ensure fast-path /chat responses take at least FAST_REPLY_MIN_LATENCY_MS.
+
+        This prevents some embedded/iOS clients from playing the next TTS response at a very low volume
+        when the server responds "too quickly" after microphone capture.
+        """
+        try:
+            min_ms = int(FAST_REPLY_MIN_LATENCY_MS or 0)
+        except Exception:
+            return
+        if min_ms <= 0:
+            return
+        elapsed_ms = (time.monotonic() - request_started) * 1000.0
+        if elapsed_ms < float(min_ms):
+            await asyncio.sleep((float(min_ms) - elapsed_ms) / 1000.0)
+
+
     raw = await request.json()
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
     
@@ -1865,6 +1891,7 @@ async def chat(request: Request):
             payg_increment_minutes=pay_go_minutes,
             payg_price_text=payg_price_text_override,
         )
+        await _ensure_fast_reply_min_latency()
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
@@ -1957,6 +1984,7 @@ async def chat(request: Request):
             payg_increment_minutes=pay_go_minutes,
             payg_price_text=payg_price_text_override,
         )
+        await _ensure_fast_reply_min_latency()
         return await _respond(reply, STATUS_SAFE, session_state_out)
 
     # last user message
