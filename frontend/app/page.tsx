@@ -1582,7 +1582,11 @@ const playLocalTtsUrl = useCallback(
 
       // iOS Safari can route <audio> to the receiver (or mute it) after mic/STT.
       // Using a hidden <video> element often matches Live Avatar output routing (speaker).
-      const preferVideo = isIOS && !!videoEl;
+      //
+      // IMPORTANT (Elaralo stability rule): Always route audio-only TTS through the hidden VIDEO
+      // element. Alternate <audio> playback paths have proven unstable across devices.
+      const forceHiddenVideo = true;
+      const preferVideo = !!videoEl && (isIOS || forceHiddenVideo);
 
       const stopWebSpeechIfNeeded = async () => {
         if (!(isIOS && sttRecRef.current)) return;
@@ -1810,9 +1814,9 @@ const playLocalTtsUrl = useCallback(
         return true;
       };
 
-      // iOS: prefer the hidden VIDEO element for TTS playback.
-      // We intentionally do NOT fall back to <audio> on iOS because it has historically
-      // destabilized STT after the first playback in embedded Safari/WebViews.
+      // Elaralo policy: prefer the hidden VIDEO element for all audio-only TTS playback.
+      // We intentionally do NOT fall back to <audio> because alternate paths have been unstable
+      // across devices (and historically caused STT regressions after playback in some browsers).
       if (preferVideo && videoEl) {
         const ok = await playOn(videoEl, true);
         if (ok) return;
@@ -1823,7 +1827,8 @@ const playLocalTtsUrl = useCallback(
         return;
       }
 
-      if (audioEl) {
+      // Only allow <audio> fallback if hidden-video TTS has been explicitly disabled.
+      if (!forceHiddenVideo && audioEl) {
         const ok = await playOn(audioEl, false);
         if (ok) return;
       }
