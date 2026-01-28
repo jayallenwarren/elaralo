@@ -418,6 +418,346 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
 #     return True, ""
 
 
+
+
+# ---------------------------------------------------------------------------
+# Voice/Video companion capability mappings (SQLite -> in-memory)
+# ---------------------------------------------------------------------------
+# This database is generated from the Excel mapping sheet ("Voice and Video Mappings - Elaralo.xlsx")
+# and shipped alongside the API so the frontend can query companion capabilities at runtime:
+#   - which companions are Audio-only vs Video+Audio
+#   - which Live provider to use (D-ID vs Stream)
+#   - ElevenLabs voice IDs (TTS voice selection)
+#   - D-ID Agent IDs / Client Keys (for the D-ID browser SDK)
+#
+# Design choice:
+#   - We load the full table into memory at startup (fast lookups, no per-request DB IO).
+#   - The DB is treated as read-only config; updates are made by regenerating the SQLite file
+#     and redeploying (or by mounting a new file and restarting).
+#
+# Default lookup key is (brand, avatar), case-insensitive.
+
+import sqlite3
+from urllib.parse import urlparse, parse_qs
+
+_COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_COMPANION_MAPPINGS_LOADED_AT: float | None = None
+_COMPANION_MAPPINGS_SOURCE: str = ""
+
+
+def _norm_key(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _candidate_mapping_db_paths() -> List[str]:
+    base_dir = os.path.dirname(__file__)
+    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    candidates = [
+        env_path,
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+    ]
+    # keep unique, preserve order
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in candidates:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+def _load_companion_mappings_sync() -> None:
+    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE
+
+    db_path = ""
+    for p in _candidate_mapping_db_paths():
+        if os.path.exists(p):
+            db_path = p
+            break
+
+    if not db_path:
+        print("[mappings] WARNING: voice/video mappings DB not found. Video/audio capabilities will fall back to frontend defaults.")
+        _COMPANION_MAPPINGS = {}
+        _COMPANION_MAPPINGS_LOADED_AT = time.time()
+        _COMPANION_MAPPINGS_SOURCE = ""
+        return
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              brand,
+              avatar,
+              eleven_voice_name,
+              communication,
+              eleven_voice_id,
+              live,
+              did_embed_code,
+              did_agent_link,
+              did_agent_id,
+              did_client_key
+            FROM companion_mappings
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    d: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        brand = str(r["brand"] or "").strip()
+        avatar = str(r["avatar"] or "").strip()
+        if not brand or not avatar:
+            continue
+        key = (_norm_key(brand), _norm_key(avatar))
+        d[key] = {
+            "brand": brand,
+            "avatar": avatar,
+            "eleven_voice_name": (r["eleven_voice_name"] or "") if r["eleven_voice_name"] is not None else "",
+            "communication": (r["communication"] or "") if r["communication"] is not None else "",
+            "eleven_voice_id": (r["eleven_voice_id"] or "") if r["eleven_voice_id"] is not None else "",
+            "live": (r["live"] or "") if r["live"] is not None else "",
+            "did_embed_code": (r["did_embed_code"] or "") if r["did_embed_code"] is not None else "",
+            "did_agent_link": (r["did_agent_link"] or "") if r["did_agent_link"] is not None else "",
+            "did_agent_id": (r["did_agent_id"] or "") if r["did_agent_id"] is not None else "",
+            "did_client_key": (r["did_client_key"] or "") if r["did_client_key"] is not None else "",
+        }
+
+    _COMPANION_MAPPINGS = d
+    _COMPANION_MAPPINGS_LOADED_AT = time.time()
+    _COMPANION_MAPPINGS_SOURCE = db_path
+    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path}")
+
+
+def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
+    b = _norm_key(brand) or "elaralo"
+    a = _norm_key(avatar)
+    if not a:
+        return None
+
+    m = _COMPANION_MAPPINGS.get((b, a))
+    if m:
+        return m
+
+    # fallback brand → Elaralo
+    if b != "elaralo":
+        m = _COMPANION_MAPPINGS.get(("elaralo", a))
+        if m:
+            return m
+
+    # final fallback: if someone sends a composite key like "Ashley-Female-...".
+    first = a.split("-")[0].strip() if "-" in a else a
+    if first and first != a:
+        m = _COMPANION_MAPPINGS.get((b, first))
+        if m:
+            return m
+        if b != "elaralo":
+            m = _COMPANION_MAPPINGS.get(("elaralo", first))
+            if m:
+                return m
+
+    return None
+
+
+@app.on_event("startup")
+async def _startup_load_companion_mappings() -> None:
+    # Load once at startup; do not block on errors.
+    try:
+        await run_in_threadpool(_load_companion_mappings_sync)
+    except Exception as e:
+        print(f"[mappings] ERROR loading companion mappings: {e!r}")
+
+
+@app.get("/mappings/companion")
+async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
+    """Lookup a companion mapping row by (brand, avatar).
+
+    Query params:
+      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
+      - avatar: Avatar first name (e.g., "Jennifer")
+
+    Response:
+      {
+        found: bool,
+        brand: str,
+        avatar: str,
+        communication: "Audio"|"Video"|"" ,
+        live: "D-ID"|"Stream"|"" ,
+        elevenVoiceId: str,
+        elevenVoiceName: str,
+        didAgentId: str,
+        didClientKey: str,
+        didAgentLink: str,
+        didEmbedCode: str,
+        loadedAt: <unix seconds> | null,
+        source: <db path> | ""
+      }
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+
+    m = _lookup_companion_mapping(b, a)
+    if not m:
+        return {
+            "found": False,
+            "brand": b,
+            "avatar": a,
+            "communication": "",
+            "live": "",
+            "elevenVoiceId": "",
+            "elevenVoiceName": "",
+            "didAgentId": "",
+            "didClientKey": "",
+            "didAgentLink": "",
+            "didEmbedCode": "",
+            "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+            "source": _COMPANION_MAPPINGS_SOURCE,
+        }
+
+    return {
+        "found": True,
+        "brand": str(m.get("brand") or ""),
+        "avatar": str(m.get("avatar") or ""),
+        "communication": str(m.get("communication") or ""),
+        "live": str(m.get("live") or ""),
+        "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
+        "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
+        "didAgentId": str(m.get("did_agent_id") or ""),
+        "didClientKey": str(m.get("did_client_key") or ""),
+        "didAgentLink": str(m.get("did_agent_link") or ""),
+        "didEmbedCode": str(m.get("did_embed_code") or ""),
+        "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+        "source": _COMPANION_MAPPINGS_SOURCE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# BeeStreamed: Start WebRTC streams (Live=Stream companions)
+# ---------------------------------------------------------------------------
+# IMPORTANT:
+# - BeeStreamed tokens MUST NOT be exposed to the browser. The frontend calls this endpoint,
+#   and the API performs BeeStreamed authentication server-side.
+# - Authentication format per BeeStreamed docs:
+#     Authorization: Basic base64_encode({token_id}:{secret_key})
+# - Start WebRTC stream endpoint:
+#     POST https://api.beestreamed.com/events/[EVENT REF]/startwebrtcstream
+#
+# Docs: https://docs.beestreamed.com/introduction (API Overview / Authentication)
+
+
+def _extract_beestreamed_event_ref_from_url(stream_url: str) -> str:
+    """Best-effort extraction of BeeStreamed event_ref from a viewer URL.
+
+    This is intentionally flexible because BeeStreamed viewer URLs can be customized.
+    We attempt, in order:
+      1) query string parameters: event_ref / eventRef
+      2) last path segment that looks like an alphanumeric ref (6-32 chars)
+    """
+    u = (stream_url or "").strip()
+    if not u:
+        return ""
+
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return ""
+
+    try:
+        qs = parse_qs(parsed.query or "")
+        for k in ("event_ref", "eventRef", "event", "ref"):
+            v = qs.get(k)
+            if v and isinstance(v, list) and v[0]:
+                cand = str(v[0]).strip()
+                if re.fullmatch(r"[A-Za-z0-9]{6,32}", cand):
+                    return cand
+    except Exception:
+        pass
+
+    # Path fallback
+    try:
+        segments = [s for s in (parsed.path or "").split("/") if s]
+        for seg in reversed(segments):
+            seg = seg.strip()
+            if re.fullmatch(r"[A-Za-z0-9]{6,32}", seg):
+                return seg
+    except Exception:
+        pass
+
+    return ""
+
+
+@app.post("/stream/beestreamed/start")
+async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
+    """Start a BeeStreamed WebRTC stream for the configured event.
+
+    Body (JSON):
+      {
+        "stream_url": "https://..."     (optional; used to derive event_ref)
+        "event_ref": "abcd12345678"    (optional; overrides URL parsing)
+      }
+
+    Env vars (server-side only):
+      STREAM_TOKEN_ID
+      STREAM_SECRET_KEY
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    stream_url = str(raw.get("stream_url") or raw.get("streamUrl") or "").strip()
+    event_ref = str(raw.get("event_ref") or raw.get("eventRef") or "").strip()
+
+    if not event_ref:
+        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
+
+    # Optional server-side fallback (useful when the viewer URL does not contain the event_ref).
+    if not event_ref:
+        event_ref = (os.getenv("STREAM_EVENT_REF", "") or "").strip()
+
+    if not event_ref:
+        raise HTTPException(
+            status_code=400,
+            detail="BeeStreamed event_ref is required (provide event_ref, STREAM_EVENT_REF, or a stream_url containing it).",
+        )
+
+    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
+    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
+
+    if not token_id or not secret_key:
+        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
+
+    # BeeStreamed auth header: Basic base64(token_id:secret_key)
+    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
+    headers = {"Authorization": f"Basic {basic}"}
+
+    api_url = f"https://api.beestreamed.com/events/{event_ref}/startwebrtcstream"
+
+    import requests  # type: ignore
+
+    try:
+        r = requests.post(api_url, headers=headers, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed request failed: {e!r}")
+
+    if r.status_code >= 400:
+        msg = (r.text or "").strip()
+        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed error {r.status_code}: {msg[:500]}")
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {"message": (r.text or "").strip(), "status": r.status_code}
+
+    return {"ok": True, "event_ref": event_ref, "beestreamed": data}
+
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
     try:

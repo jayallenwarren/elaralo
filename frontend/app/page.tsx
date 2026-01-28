@@ -343,6 +343,23 @@ type Phase1AvatarMedia = {
   elevenVoiceId: string;
 };
 
+type CompanionMappingRow = {
+  found: boolean;
+  brand?: string;
+  avatar?: string;
+  communication?: string; // "Audio" | "Video"
+  live?: string; // "D-ID" | "Stream"
+  elevenVoiceId?: string;
+  elevenVoiceName?: string;
+  didAgentId?: string;
+  didClientKey?: string;
+  didAgentLink?: string;
+  didEmbedCode?: string;
+  loadedAt?: number | null;
+  source?: string;
+};
+
+
 const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
   "Jennifer": {
     "didAgentId": "v2_agt_n7itFF6f",
@@ -1076,6 +1093,16 @@ export default function Page() {
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
+  // Database-driven companion capabilities (brand + avatar -> communication/live/voice/D-ID fields).
+  // If a mapping row exists, it becomes the source of truth for:
+  //   - Whether the Video button is shown (Communication = Video)
+  //   - Which live provider to use (Live = D-ID or Stream)
+  //   - The ElevenLabs voice ID for audio-only TTS
+  const mappingBrand = (rebrandingName || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
+  const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
+  const [companionMappingError, setCompanionMappingError] = useState<string | null>(null);
+
+
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
   // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
@@ -1178,6 +1205,45 @@ export default function Page() {
   }, [rebrandingName, rebrandingSlug]);
 
 
+  // Load brand+avatar capability mapping from the API (SQLite-backed).
+  // Fail-open: if no row exists (or API fails), the app falls back to existing defaults.
+  useEffect(() => {
+    let cancelled = false;
+
+    const brand = (mappingBrand || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
+    const avatar = (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+
+    if (!API_BASE) {
+      setCompanionMapping(null);
+      setCompanionMappingError("API base URL is not configured.");
+      return;
+    }
+
+    (async () => {
+      setCompanionMappingError(null);
+      try {
+        const url = `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(avatar)}`;
+        const res = await fetch(url, { method: "GET" });
+        if (!res.ok) {
+          const msg = await res.text().catch(() => "");
+          throw new Error(`Mapping lookup failed: ${res.status} ${msg}`.trim());
+        }
+        const data = (await res.json()) as CompanionMappingRow;
+        if (cancelled) return;
+        setCompanionMapping(data && data.found ? data : null);
+      } catch (e: any) {
+        if (cancelled) return;
+        setCompanionMapping(null);
+        setCompanionMappingError(e?.message ? String(e.message) : "Failed to load companion mapping.");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mappingBrand, companionName]);
+
+
 // ----------------------------
 // Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
 // ----------------------------
@@ -1200,15 +1266,38 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
 
-const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
+const phase1AvatarMediaFallback = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
-const liveProvider = useMemo(() => {
+// Database-driven override: if the mapping row says Live = D-ID, use its Agent ID / Client Key / Voice ID.
+// This keeps the existing hard-coded mapping as a safe fallback when no DB row exists.
+const phase1AvatarMedia: Phase1AvatarMedia | null = useMemo(() => {
+  const live = String(companionMapping?.live || "").trim().toLowerCase();
+
+  if ((live === "d-id" || live === "did") && companionMapping?.didAgentId && companionMapping?.didClientKey) {
+    return {
+      didAgentId: String(companionMapping.didAgentId).trim(),
+      didClientKey: String(companionMapping.didClientKey).trim(),
+      elevenVoiceId:
+        String(companionMapping.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(companionName),
+    };
+  }
+
+  return phase1AvatarMediaFallback;
+}, [companionMapping, phase1AvatarMediaFallback, companionName]);
+
+const liveProvider: LiveProvider = useMemo(() => {
+  // Prefer database mapping when present.
+  const liveFromDb = String(companionMapping?.live || "").trim().toLowerCase();
+  if (liveFromDb === "stream") return "stream";
+  if (liveFromDb === "d-id" || liveFromDb === "did") return "did";
+
+  // Fallback: allow companionKey flags like "|live=stream" for legacy/testing.
   const raw = String(companionKeyRaw || companionKey || "").trim();
   const { flags } = splitCompanionKey(raw);
   const v = String(flags["live"] || "").toLowerCase();
   if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
   return "did";
-}, [companionKeyRaw, companionKey]);
+}, [companionMapping, companionKeyRaw, companionKey]);
 
 const streamUrl = useMemo(() => {
   const raw = String(companionKeyRaw || "").trim();
@@ -1216,7 +1305,19 @@ const streamUrl = useMemo(() => {
   return String(flags["streamurl"] || "").trim() || STREAM_URL;
 }, [companionKeyRaw]);
 
-const liveEnabled = liveProvider === "stream" || Boolean(phase1AvatarMedia);
+const communicationFromDb = String(companionMapping?.communication || "").trim().toLowerCase();
+const mappingWantsVideo = communicationFromDb === "video";
+const mappingWantsAudioOnly = communicationFromDb === "audio";
+
+// Video button visibility:
+// - If mapping says Communication=Video → show Video + Audio (Video requires provider configuration).
+// - If mapping says Communication=Audio → hide Video, keep Audio.
+// - If no mapping row → fall back to existing Phase 1 logic.
+const liveEnabled = mappingWantsVideo
+  ? (liveProvider === "stream" ? Boolean(streamUrl) : Boolean(phase1AvatarMedia))
+  : mappingWantsAudioOnly
+    ? false
+    : (liveProvider === "stream" || Boolean(phase1AvatarMedia));
 
 
   // UI layout
@@ -1428,6 +1529,26 @@ if (liveProvider === "stream") {
   }
 
   setAvatarError(null);
+  setAvatarStatus("connecting");
+
+  // Live=Stream companions are hosted on BeeStreamed.
+  // We MUST start the WebRTC stream server-side (tokens never exposed in browser).
+  try {
+    const res = await fetch(`${API_BASE}/stream/beestreamed/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stream_url: streamUrl }),
+    });
+    if (!res.ok) {
+      const msg = await res.text().catch(() => "");
+      throw new Error(`BeeStreamed start failed: ${res.status} ${msg}`.trim());
+    }
+  } catch (e: any) {
+    setAvatarStatus("error");
+    setAvatarError(e?.message ? String(e.message) : "Failed to start streaming session.");
+    return;
+  }
+
   setAvatarStatus("connected");
 
   // Streaming / web conference sessions are hosted externally (real-person companions).
@@ -1439,6 +1560,7 @@ if (liveProvider === "stream") {
   }
   return;
 }
+
 
 if (!phase1AvatarMedia) {
   setAvatarStatus("error");
@@ -2860,7 +2982,8 @@ const stateToSendWithCompanion: SessionState = {
 
       const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
 
-      const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
+      const voiceId =
+        String(companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey);
 
       const canLiveAvatarSpeak =
         avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
@@ -3634,7 +3757,8 @@ const speakGreetingIfNeeded = useCallback(
     // (Live avatar uses its own configured voice via the DID agent.)
     const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
 
-      const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
+      const voiceId =
+        String(companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey);
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
     const prevIgnore = sttIgnoreUntilRef.current;
