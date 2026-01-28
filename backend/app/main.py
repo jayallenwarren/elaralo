@@ -345,6 +345,79 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
         "cycle_days": str(cycle_days or "").strip(),
     }
 
+
+# ---------------------------------------------------------------------------
+# RebrandingKey validation
+# ---------------------------------------------------------------------------
+# IMPORTANT: RebrandingKey format/field validation is performed upstream in Wix (Velo).
+# The API intentionally accepts the RebrandingKey as-is to avoid breaking Wix flows.
+#
+# If you remove Wix-side validation in the future, you can enable the server-side
+# validator below by uncommenting it AND the call site in /chat.
+#
+# def _validate_rebranding_key_server_side(raw: str) -> Tuple[bool, str]:
+#     """Server-side validator for RebrandingKey.
+#
+#     Expected order:
+#       Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+#     """
+#     v = (raw or "").strip()
+#     if not v:
+#         return True, ""
+#
+#     # Guardrail: prevent extremely large payloads
+#     if len(v) > 2048:
+#         return False, "too long"
+#
+#     # Legacy support: no delimiter => brand name only
+#     if "|" not in v:
+#         return True, ""
+#
+#     parts = v.split("|")
+#     if len(parts) != 9:
+#         return False, f"expected 9 parts, got {len(parts)}"
+#
+#     rebranding = parts[0].strip()
+#     if not rebranding:
+#         return False, "missing Rebranding"
+#
+#     # Validate URLs (when present)
+#     def _is_http_url(s: str) -> bool:
+#         s = (s or "").strip()
+#         if not s:
+#             return True
+#         return bool(re.match(r"^https?://", s, re.IGNORECASE))
+#
+#     if not _is_http_url(parts[1]):
+#         return False, "UpgradeLink must be http(s) URL"
+#     if not _is_http_url(parts[2]):
+#         return False, "PayGoLink must be http(s) URL"
+#
+#     # Validate integers (when present)
+#     for name, val in [
+#         ("PayGoMinutes", parts[4]),
+#         ("FreeMinutes", parts[7]),
+#         ("CycleDays", parts[8]),
+#     ]:
+#         s = (val or "").strip()
+#         if not s:
+#             continue
+#         if not re.fullmatch(r"-?\d+", s):
+#             return False, f"{name} must be an integer"
+#
+#     # Basic price sanity (allow "$5.99", "5.99", "USD 5.99")
+#     price = (parts[3] or "").strip()
+#     if price and len(price) > 32:
+#         return False, "PayGoPrice too long"
+#
+#     # Basic length checks (defense-in-depth)
+#     for i, p in enumerate(parts):
+#         if len((p or "").strip()) > 512:
+#             return False, f"part {i} too long"
+#
+#     return True, ""
+
+
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
     try:
@@ -1243,6 +1316,14 @@ async def chat(request: Request):
     # RebrandingKey (Wix) overrides (upgrade/pay links + quota settings) when present.
     # Wix provides: Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
     rebranding_key_raw = _extract_rebranding_key(session_state)
+
+    # NOTE: RebrandingKey validation is performed in Wix (Velo) before sending to this API.
+    # Server-side validation is intentionally disabled to avoid breaking existing Wix flows.
+    # If Wix-side validation is removed, you can enable the validator by uncommenting below:
+    # ok, err = _validate_rebranding_key_server_side(rebranding_key_raw)
+    # if not ok:
+    #     _dbg(debug, f"[RebrandingKey] rejected: {err}")
+    #     rebranding_key_raw = ""
     rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
 
     # Prefer explicit fields (if provided) and fall back to the parsed RebrandingKey.
