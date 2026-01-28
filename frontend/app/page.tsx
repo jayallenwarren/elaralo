@@ -66,6 +66,31 @@ const SaveIcon = ({ size = 18 }: { size?: number }) => (
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
+// ----------------------------
+// Background chat-summary journaling (Option B)
+// ----------------------------
+// Turn count = number of user messages (each user message is a "turn").
+type JournalEntry = Msg & { ts: number };
+type SummaryJournal = {
+  entries: JournalEntry[];
+  // How many items from `messages` have been mirrored into `entries`.
+  lastProcessedLen: number;
+  // Current number of user turns (user messages).
+  turnCount: number;
+  // The last user turn count that has been persisted via /chat/save-summary.
+  lastSavedTurnCount: number;
+  // Epoch ms when the last autosave succeeded.
+  lastSavedAtMs: number;
+  // Optional key returned by the backend.
+  lastSavedKey: string | null;
+};
+
+function countUserTurns(msgs: Array<{ role: Role }>): number {
+  let n = 0;
+  for (const m of msgs) if (m?.role === "user") n += 1;
+  return n;
+}
+
 type Mode = "friend" | "romantic" | "intimate";
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
@@ -84,6 +109,30 @@ type ChatApiResponse = {
   reply: string;
   mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
   session_state?: Partial<SessionState>;
+};
+
+type UsageStatusResponse = {
+  ok: boolean;
+  reply: string;
+
+  // Mirrors the backend quota counters (minutes, not seconds)
+  minutes_used: number;
+  minutes_allowed: number;
+  minutes_remaining: number;
+
+  // Helpful context
+  is_trial?: boolean;
+  plan_name?: string;
+
+  // Optional purchase/upgrade hints
+  upgrade_url?: string;
+  payg_pay_url?: string;
+  payg_increment_minutes?: number;
+  payg_price_text?: string;
+
+  // Cycle metadata (memberships only)
+  cycle_days?: number;
+  cycle_resets_in_days?: number | null;
 };
 
 type PlanName =
@@ -242,6 +291,12 @@ function joinUrlPrefix(prefix: string, path: string): string {
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+
+// Autosave summary (debounced) settings.
+// These only affect background /chat/save-summary calls. Manual Save button behavior is unchanged.
+const AUTO_SAVE_SUMMARY_DEBOUNCE_MS = 12_000;
+const AUTO_SAVE_SUMMARY_MIN_INTERVAL_MS = 15_000;
+const AUTO_SAVE_SUMMARY_MIN_NEW_TURNS = 1;
 
 type Phase1AvatarMedia = {
   didAgentId: string;
@@ -583,6 +638,42 @@ function normalizeMode(raw: any): Mode | null {
 
   return null;
 }
+
+
+function isUsageMinutesInquiry(text: string): boolean {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return false;
+
+  // We want to catch "minutes remaining on my plan" style questions,
+  // while avoiding false positives like "give me five minutes".
+  const hasMinutes = /\bminute(s)?\b/.test(t);
+  const hasTime = /\btime\b/.test(t);
+
+  const aboutRemaining =
+    /\b(remaining|left|available|balance|credit|quota|usage|allowance)\b/.test(t) ||
+    /\bhow (many|much)\b/.test(t) ||
+    /\bdo i have\b/.test(t);
+
+  const aboutPlanOrTalking =
+    /\b(plan|trial|membership|subscription)\b/.test(t) ||
+    /\b(speak|talk|chat|conversation)\b/.test(t) ||
+    /\bwith you\b/.test(t);
+
+  // "How many minutes do I have left?"
+  if ((hasMinutes || hasTime) && aboutRemaining && aboutPlanOrTalking) return true;
+
+  // Common short forms
+  if (/\b(minutes? (left|remaining)|time (left|remaining))\b/.test(t)) return true;
+
+  // "Check my minutes" / "Show my remaining time"
+  if (/\b(check|show|tell|what('?s| is))\b/.test(t) && /\b(minutes?|time)\b/.test(t) && aboutRemaining) return true;
+
+  // "How long can we talk?" (no explicit minutes word)
+  if (/\bhow (long|much longer)\b/.test(t) && /\b(talk|speak|chat|conversation)\b/.test(t) && aboutPlanOrTalking) return true;
+
+  return false;
+}
+
 
 
 export default function Page() {
@@ -2107,6 +2198,204 @@ const speakAssistantReply = useCallback(
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
+  // -----------------------
+  // Background summary journaling (Option B)
+  //
+  // Goal:
+  //  - Maintain a "journal" of inbound/outbound messages in a ref
+  //  - Debounce /chat/save-summary calls so they happen silently in the background
+  //
+  // Constraints:
+  //  - MUST NOT touch any STT/TTS start/stop code paths.
+  //  - Manual Save button UX remains unchanged.
+  // -----------------------
+  const summaryJournalRef = useRef<SummaryJournal>({
+    entries: [],
+    lastProcessedLen: 0,
+    turnCount: 0,
+    lastSavedTurnCount: 0,
+    lastSavedAtMs: 0,
+    lastSavedKey: null,
+  });
+  // IMPORTANT (TypeScript): In Next.js builds that include both DOM + Node typings,
+  // `setTimeout` can be typed as returning NodeJS.Timeout, while `window.setTimeout`
+  // returns a number. Since this is a client component and we call `window.setTimeout`,
+  // store the timer id as a number to avoid TS errors in CI.
+  const autoSaveSummaryTimerRef = useRef<number | null>(null);
+  const autoSaveSummaryInFlightRef = useRef<boolean>(false);
+  const autoSaveSummaryLastErrorRef = useRef<string | null>(null);
+
+  // Always-current pointer to the save-summary function (avoids stale closures in timers).
+  const callSaveChatSummaryRef = useRef<null | ((nextMessages: Msg[], stateToSend: SessionState) => Promise<any>)>(null);
+
+  // Mirror a few pieces of state into refs so the autosave runner can stay ref-driven.
+  const sessionStateForAutosaveRef = useRef<SessionState>(sessionState);
+  const loadingForAutosaveRef = useRef<boolean>(loading);
+  const showSaveConfirmForAutosaveRef = useRef<boolean>(showSaveSummaryConfirm);
+  const showClearConfirmForAutosaveRef = useRef<boolean>(showClearMessagesConfirm);
+  const savingSummaryForAutosaveRef = useRef<boolean>(savingSummary);
+
+  useEffect(() => {
+    sessionStateForAutosaveRef.current = sessionState;
+  }, [sessionState]);
+  useEffect(() => {
+    loadingForAutosaveRef.current = loading;
+  }, [loading]);
+  useEffect(() => {
+    showSaveConfirmForAutosaveRef.current = showSaveSummaryConfirm;
+  }, [showSaveSummaryConfirm]);
+  useEffect(() => {
+    showClearConfirmForAutosaveRef.current = showClearMessagesConfirm;
+  }, [showClearMessagesConfirm]);
+  useEffect(() => {
+    savingSummaryForAutosaveRef.current = savingSummary;
+  }, [savingSummary]);
+
+  async function runAutoSaveSummary(reason: string) {
+    if (!API_BASE) return;
+
+    // Never overlap autosaves.
+    if (autoSaveSummaryInFlightRef.current) return;
+
+    // Don't fight with the manual Save flow.
+    if (savingSummaryForAutosaveRef.current) return;
+    if (showSaveConfirmForAutosaveRef.current) return;
+
+    // Don't autosave while a clear-confirm modal is up (avoid surprise network work).
+    if (showClearConfirmForAutosaveRef.current) return;
+
+    // Wait until the assistant reply has landed and we're not mid-request.
+    if (loadingForAutosaveRef.current) return;
+
+    const journal = summaryJournalRef.current;
+    const snapshot: Msg[] = journal.entries.map((e) => ({ role: e.role, content: e.content }));
+    if (snapshot.length < 2) return;
+
+    // Autosave only when the most recent message is from the assistant.
+    if (snapshot[snapshot.length - 1]?.role !== "assistant") return;
+
+    const turnCount = countUserTurns(snapshot);
+    journal.turnCount = turnCount;
+
+    // Only save when we have at least N new user turns since the last successful save.
+    if (turnCount - journal.lastSavedTurnCount < AUTO_SAVE_SUMMARY_MIN_NEW_TURNS) return;
+
+    const now = Date.now();
+    if (journal.lastSavedAtMs && now - journal.lastSavedAtMs < AUTO_SAVE_SUMMARY_MIN_INTERVAL_MS) return;
+
+    const saver = callSaveChatSummaryRef.current;
+    if (!saver) return;
+
+    autoSaveSummaryInFlightRef.current = true;
+    try {
+      const res = await saver(snapshot, sessionStateForAutosaveRef.current);
+      journal.lastSavedTurnCount = turnCount;
+      journal.lastSavedAtMs = Date.now();
+      if (res && typeof res.key === "string") journal.lastSavedKey = res.key;
+      autoSaveSummaryLastErrorRef.current = null;
+
+      if (debugEnabledRef.current) {
+        console.log("[ELARALO] autosave summary ok", {
+          reason,
+          turnCount,
+          key: res?.key,
+          saved_at: res?.saved_at,
+        });
+      }
+    } catch (e: any) {
+      const msg = e?.message ? String(e.message) : String(e);
+      autoSaveSummaryLastErrorRef.current = msg;
+      if (debugEnabledRef.current) {
+        console.warn("[ELARALO] autosave summary failed", { reason, error: msg });
+      }
+    } finally {
+      autoSaveSummaryInFlightRef.current = false;
+    }
+  }
+
+  const scheduleAutoSaveSummary = useCallback((reason: string) => {
+    if (typeof window === "undefined") return;
+    if (!API_BASE) return;
+
+    if (autoSaveSummaryTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryTimerRef.current);
+    }
+
+    autoSaveSummaryTimerRef.current = window.setTimeout(() => {
+      void runAutoSaveSummary(reason);
+    }, AUTO_SAVE_SUMMARY_DEBOUNCE_MS);
+  }, []);
+
+  // Keep the journal in sync with the rendered chat (mirror new messages only).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const journal = summaryJournalRef.current;
+
+    // Full reset on clear.
+    if (messages.length === 0) {
+      journal.entries = [];
+      journal.lastProcessedLen = 0;
+      journal.turnCount = 0;
+      journal.lastSavedTurnCount = 0;
+      journal.lastSavedAtMs = 0;
+      journal.lastSavedKey = null;
+      autoSaveSummaryLastErrorRef.current = null;
+
+      if (autoSaveSummaryTimerRef.current) {
+        window.clearTimeout(autoSaveSummaryTimerRef.current);
+        autoSaveSummaryTimerRef.current = null;
+      }
+      return;
+    }
+
+    // If messages were shortened/replaced, rebuild the journal from scratch.
+    if (messages.length < journal.lastProcessedLen) {
+      const ts = Date.now();
+      journal.entries = messages.map((m) => ({ role: m.role, content: m.content, ts }));
+      journal.lastProcessedLen = messages.length;
+      journal.turnCount = countUserTurns(messages);
+      scheduleAutoSaveSummary("journal_rebuild");
+      return;
+    }
+
+    // No change.
+    if (messages.length === journal.lastProcessedLen) return;
+
+    // Mirror only the new tail.
+    const added = messages.slice(journal.lastProcessedLen);
+    const ts = Date.now();
+    for (const m of added) {
+      journal.entries.push({ role: m.role, content: m.content, ts });
+    }
+    journal.lastProcessedLen = messages.length;
+    journal.turnCount = countUserTurns(messages);
+
+    // Debounced background autosave. The runner will no-op until conditions are safe.
+    scheduleAutoSaveSummary("messages_changed");
+  }, [messages, scheduleAutoSaveSummary]);
+
+  // If the user opens a confirmation modal, cancel any pending autosave timer.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!showSaveSummaryConfirm && !showClearMessagesConfirm) return;
+    if (autoSaveSummaryTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryTimerRef.current);
+      autoSaveSummaryTimerRef.current = null;
+    }
+  }, [showSaveSummaryConfirm, showClearMessagesConfirm]);
+
+  // Cleanup timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (typeof window === "undefined") return;
+      if (autoSaveSummaryTimerRef.current) {
+        window.clearTimeout(autoSaveSummaryTimerRef.current);
+        autoSaveSummaryTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const goToMyElara = useCallback(() => {
     const url = "https://www.elaralo.com/myelara";
 
@@ -2424,7 +2713,49 @@ const stateToSendWithCompanion: SessionState = {
     return (await res.json()) as ChatApiResponse;
   }
 
-  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
+
+  async function callUsageStatus(stateToSend: SessionState): Promise<UsageStatusResponse> {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+
+    const session_id =
+      sessionIdRef.current ||
+      (crypto as any).randomUUID?.() ||
+      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    // Ensure backend receives the selected companion so it can apply the correct persona
+    // (and return the correct plan label / rebranding info if applicable).
+    const companionForBackend =
+      (companionKey || "").trim() ||
+      (companionName || DEFAULT_COMPANION_NAME).trim() ||
+      DEFAULT_COMPANION_NAME;
+
+    const stateToSendWithCompanion: SessionState = {
+      ...stateToSend,
+      companion: companionForBackend,
+      // Backward/forward compatibility with any backend expecting different field names
+      companionName: companionForBackend,
+      companion_name: companionForBackend,
+      // Member identity (from Wix)
+      memberId: (memberId || "").trim(),
+      member_id: (memberId || "").trim(),
+    };
+
+    const res = await fetch(`${API_BASE}/usage/status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id,
+        session_state: stateToSendWithCompanion,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Backend error ${res.status}: ${errText}`);
+    }
+
+    return (await res.json()) as UsageStatusResponse;
+  }  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const session_id =
@@ -2468,6 +2799,10 @@ const stateToSendWithCompanion: SessionState = {
 
     return (await res.json()) as any;
   }
+
+  // Keep an always-current function pointer for debounced background autosave timers.
+  // (Avoids stale closures without touching any STT/TTS code paths.)
+  callSaveChatSummaryRef.current = callSaveChatSummary;
 
   // This is the mode that drives the UI highlight:
   // - If backend is asking for intimate consent, keep intimate pill highlighted
@@ -2553,6 +2888,129 @@ const stateToSendWithCompanion: SessionState = {
     const userMsg: Msg = { role: "user", content: outgoingText };
     const nextMessages: Msg[] = [...messages, userMsg];
 
+
+    // Handle "minutes remaining" questions locally (no OpenAI round-trip).
+    // This keeps the response fast and avoids touching the /chat pipeline.
+    if (isUsageMinutesInquiry(outgoingText)) {
+      // If speech-to-text is active, pause it and resume after speaking finishes.
+      const resumeSttAfter = sttEnabledRef.current;
+      let resumeScheduled = false;
+      if (resumeSttAfter) {
+        pauseSpeechToText();
+
+        // Defensive: clear any in-progress transcript to avoid accidental duplicate sends.
+        sttFinalRef.current = "";
+        sttInterimRef.current = "";
+      }
+
+      setMessages(nextMessages);
+      setInput("");
+      setLoading(true);
+
+      try {
+        const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
+        const data = await callUsageStatus(sendState);
+
+        // If the user hit "Clear Messages" while we were waiting on the response,
+        // ignore this result and do not append it to a cleared chat.
+        if (epochAtStart !== clearEpochRef.current) return;
+
+        // Mirror quota counters into session state (useful for UI/debug).
+        setSessionState((prev) => ({
+          ...(prev as any),
+          minutes_used: typeof data.minutes_used === "number" ? data.minutes_used : (prev as any).minutes_used,
+          minutes_allowed:
+            typeof data.minutes_allowed === "number" ? data.minutes_allowed : (prev as any).minutes_allowed,
+          minutes_remaining:
+            typeof data.minutes_remaining === "number" ? data.minutes_remaining : (prev as any).minutes_remaining,
+          minutes_exhausted: !data.ok,
+        }));
+
+        const replyText = String(data.reply || "");
+        let assistantCommitted = false;
+        const commitAssistantMessage = () => {
+          if (assistantCommitted) return;
+          assistantCommitted = true;
+          setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
+        };
+
+        // Guard against STT feedback: ignore any recognition results until after speech finishes.
+        const estimateSpeechMs = (text: string) => {
+          const words = text.trim().split(/\s+/).filter(Boolean).length;
+          const wpm = 160;
+          const baseMs = (words / wpm) * 60_000;
+          const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
+          return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
+        };
+        const estimatedSpeechMs = estimateSpeechMs(replyText);
+
+        const hooks: SpeakAssistantHooks = {
+          onWillSpeak: () => {
+            // We'll treat "speaking" the same whether it's Live Avatar or local audio-only.
+            if (!assistantCommitted) {
+              commitAssistantMessage();
+              assistantCommitted = true;
+            }
+
+            // Block STT from capturing the assistant speech.
+            if (sttEnabledRef.current) {
+              const now = Date.now();
+              const ignoreMs = estimatedSpeechMs + 1200;
+              sttIgnoreUntilRef.current = Math.max(sttIgnoreUntilRef.current || 0, now + ignoreMs);
+            }
+          },
+          onDidNotSpeak: () => {
+            // If we can't speak, still show the assistant message immediately.
+            if (!assistantCommitted) {
+              commitAssistantMessage();
+              assistantCommitted = true;
+            }
+          },
+        };
+
+        const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
+        const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
+
+        const canLiveAvatarSpeak =
+          avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
+
+        // Audio-only TTS is only played in hands-free STT mode (mic button enabled),
+        // when Live Avatar is NOT speaking.
+        const shouldUseLocalTts = !canLiveAvatarSpeak && sttEnabledRef.current;
+
+        const speakPromise = (canLiveAvatarSpeak
+          ? speakAssistantReply(replyText, hooks)
+          : shouldUseLocalTts
+            ? speakLocalTtsReply(replyText, voiceId, hooks)
+            : (hooks.onDidNotSpeak(), Promise.resolve())
+        ).catch(() => {
+          // If something goes wrong, just fall back to showing text.
+          hooks.onDidNotSpeak();
+        });
+
+        // If STT is enabled, resume listening only after speech finishes.
+        if (resumeSttAfter) {
+          resumeScheduled = true;
+          speakPromise.finally(() => {
+            if (sttEnabledRef.current) resumeSpeechToText();
+          });
+        }
+      } catch (err: any) {
+        if (epochAtStart !== clearEpochRef.current) return;
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
+        ]);
+      } finally {
+        setLoading(false);
+        if (resumeSttAfter && !resumeScheduled) {
+          // No speech was triggered (e.g., request failed). Resume immediately.
+          if (sttEnabledRef.current) resumeSpeechToText();
+        }
+      }
+
+      return;
+    }
     // If speech-to-text "hands-free" mode is enabled, pause recognition while we send
     // and while the avatar speaks. We'll auto-resume after speaking finishes.
     const resumeSttAfter = sttEnabledRef.current;

@@ -190,6 +190,157 @@ async def usage_credit(request: Request):
     return result
 
 
+@app.post("/usage/status")
+async def usage_status(request: Request):
+    """Return remaining minutes for the caller (read-only).
+
+    This endpoint is intentionally separate from /chat so the frontend can answer
+    "how many minutes do I have left?" without touching the OpenAI pipeline.
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    session_id = str(raw.get("session_id") or raw.get("sessionId") or "").strip()
+
+    session_state = raw.get("session_state") or raw.get("sessionState") or {}
+    if not isinstance(session_state, dict):
+        session_state = {}
+
+    member_id = _extract_member_id(session_state)
+    plan_name_raw = _extract_plan_name(session_state)
+
+    # RebrandingKey / overrides (same logic as /chat)
+    rebranding_key_raw = _extract_rebranding_key(session_state)
+    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+
+    upgrade_link_override = _session_get_str(session_state, "upgrade_link", "upgradeLink") or rebranding_parsed.get("upgrade_link", "")
+    pay_go_link_override = _session_get_str(session_state, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
+    pay_go_price = _session_get_str(session_state, "pay_go_price", "payGoPrice") or rebranding_parsed.get("pay_go_price", "")
+    pay_go_minutes_raw = _session_get_str(session_state, "pay_go_minutes", "payGoMinutes") or rebranding_parsed.get("pay_go_minutes", "")
+    plan_external = (
+        _session_get_str(session_state, "rebranding_plan", "rebrandingPlan", "planExternal", "plan_external")
+        or rebranding_parsed.get("plan", "")
+    )
+    plan_map = _session_get_str(session_state, "elaralo_plan_map", "elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map", "")
+    free_minutes_raw = _session_get_str(session_state, "free_minutes", "freeMinutes") or rebranding_parsed.get("free_minutes", "")
+    cycle_days_raw = _session_get_str(session_state, "cycle_days", "cycleDays") or rebranding_parsed.get("cycle_days", "")
+
+    pay_go_minutes = _safe_int(pay_go_minutes_raw)
+    free_minutes = _safe_int(free_minutes_raw)
+    cycle_days = _safe_int(cycle_days_raw)
+
+    is_trial = not bool(member_id)
+    identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+
+    # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
+    minutes_allowed_override: Optional[int] = None
+    if free_minutes is not None:
+        minutes_allowed_override = free_minutes
+    elif plan_map:
+        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
+
+    cycle_days_override: Optional[int] = None
+    if cycle_days is not None:
+        cycle_days_override = cycle_days
+
+    # Plan name used for quota purposes (fallback) should use the mapped plan if provided.
+    plan_name_for_limits = plan_map or plan_name_raw
+
+    # Plan label shown to the user should use the external plan name (if provided).
+    plan_label_for_messages = plan_external or plan_name_raw
+
+    # For rebranding, construct PAYG_PRICE_TEXT as:
+    #   PayGoPrice + " per " + PayGoMinutes + " minutes"
+    is_rebranding = bool(rebranding_key_raw or plan_external or plan_map or upgrade_link_override or pay_go_link_override or pay_go_price)
+
+    payg_price_text_override = ""
+    if is_rebranding:
+        minutes_part = ""
+        if pay_go_minutes is not None:
+            minutes_part = str(pay_go_minutes)
+        else:
+            minutes_part = str(pay_go_minutes_raw or "").strip()
+        if pay_go_price and minutes_part:
+            payg_price_text_override = f"{pay_go_price} per {minutes_part} minutes"
+
+    status = await run_in_threadpool(
+        _usage_peek_status_sync,
+        identity_key,
+        is_trial=is_trial,
+        plan_name=plan_name_for_limits,
+        minutes_allowed_override=minutes_allowed_override,
+        cycle_days_override=cycle_days_override,
+    )
+
+    minutes_remaining = int(status.get("minutes_remaining") or 0)
+    minutes_allowed = int(status.get("minutes_allowed") or 0)
+    minutes_used = int(status.get("minutes_used") or 0)
+
+    resolved_upgrade_url = (upgrade_link_override or "").strip() or UPGRADE_URL
+    resolved_payg_pay_url = (pay_go_link_override or "").strip() or PAYG_PAY_URL
+    resolved_payg_minutes = int(pay_go_minutes) if pay_go_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
+    resolved_payg_price_text = (payg_price_text_override or "").strip() or PAYG_PRICE_TEXT
+
+    nice_plan_label = "Free Trial" if is_trial else (plan_label_for_messages or "your plan")
+
+    # Build a short, TTS-friendly answer.
+    lines: List[str] = []
+    lines.append(f"You have {minutes_remaining} minutes remaining on your {nice_plan_label}.")
+    if minutes_allowed > 0:
+        lines.append(f"You've used {minutes_used} of {minutes_allowed} included minutes.")
+
+    cycle_days_effective = int(status.get("cycle_days") or 0)
+    cycle_resets_in_days = status.get("cycle_resets_in_days")
+    if (not is_trial) and cycle_days_effective and isinstance(cycle_resets_in_days, int):
+        lines.append(
+            f"Your minutes reset every {cycle_days_effective} days. Next reset in about {cycle_resets_in_days} days."
+        )
+
+    # If exhausted, include the same paywall guidance you already use in /chat.
+    if minutes_remaining <= 0:
+        lines.append(
+            _usage_paywall_message(
+                is_trial=is_trial,
+                plan_name=plan_label_for_messages,
+                minutes_allowed=minutes_allowed,
+                upgrade_url=upgrade_link_override,
+                payg_pay_url=pay_go_link_override,
+                payg_increment_minutes=pay_go_minutes,
+                payg_price_text=payg_price_text_override,
+            )
+        )
+    else:
+        # Optional: quick way to add more time
+        if resolved_payg_pay_url:
+            if resolved_payg_minutes and resolved_payg_price_text:
+                lines.append(f"Add {resolved_payg_minutes} minutes ({resolved_payg_price_text}): {resolved_payg_pay_url}")
+            else:
+                lines.append(f"Add minutes: {resolved_payg_pay_url}")
+
+        if resolved_upgrade_url:
+            lines.append(f"Upgrade: {resolved_upgrade_url}")
+
+    reply = "\n".join([ln for ln in lines if str(ln or "").strip()])
+
+    return {
+        "ok": bool(status.get("ok")),
+        "reply": reply,
+        "is_trial": bool(is_trial),
+        "plan_name": plan_label_for_messages or ("Trial" if is_trial else ""),
+        "minutes_used": minutes_used,
+        "minutes_allowed": minutes_allowed,
+        "minutes_remaining": minutes_remaining,
+        "cycle_days": cycle_days_effective,
+        "cycle_resets_in_days": status.get("cycle_resets_in_days"),
+        "upgrade_url": resolved_upgrade_url,
+        "payg_pay_url": resolved_payg_pay_url,
+        "payg_increment_minutes": int(resolved_payg_minutes or 0),
+        "payg_price_text": resolved_payg_price_text,
+    }
+
+
 @app.get("/ready")
 def ready():
     """
@@ -262,12 +413,6 @@ PAYG_PRICE = (os.getenv("PAYG_PRICE", "") or "").strip()
 PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
 if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
     PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
-
-# When the backend returns an "instant" deterministic reply (e.g., minutes-balance queries),
-# some clients (notably iOS Safari in embedded contexts) can still be transitioning from
-# microphone capture to playback, causing the next TTS audio to route at a much lower volume.
-# We enforce a small minimum response latency for these fast paths to keep audio routing consistent.
-FAST_REPLY_MIN_LATENCY_MS = _env_int("FAST_REPLY_MIN_LATENCY_MS", 900)
 
 
 # Admin token for server-side minute credits (payment webhook can call this)
@@ -899,69 +1044,6 @@ def _usage_paywall_message(
 
     lines.append("Once you have more minutes, come back here and continue our conversation.")
     return " ".join([ln.strip() for ln in lines if ln.strip()])
-def _usage_status_message(
-    *,
-    is_trial: bool,
-    plan_name: str,
-    minutes_used: int,
-    minutes_allowed: int,
-    minutes_remaining: int,
-    cycle_days: int,
-    upgrade_url: str = "",
-    payg_pay_url: str = "",
-    payg_increment_minutes: Optional[int] = None,
-    payg_price_text: str = "",
-) -> str:
-    """Generate a short, deterministic answer about remaining minutes.
-
-    This is used when the user asks questions like:
-      - "How many minutes do I have left?"
-      - "How many more minutes can we talk?"
-      - "How much time do I have remaining on my plan?"
-
-    The response is intentionally plain so it can be spoken via TTS.
-    """
-    lines: List[str] = []
-
-    m_used = max(0, int(minutes_used or 0))
-    m_allowed = max(0, int(minutes_allowed or 0))
-    m_rem = max(0, int(minutes_remaining or 0))
-
-    if is_trial:
-        lines.append(f"You have {m_rem} minutes remaining in your Free Trial.")
-    else:
-        nice_plan = (plan_name or "").strip()
-        if nice_plan:
-            lines.append(f"You have {m_rem} minutes remaining on your plan ({nice_plan}).")
-        else:
-            lines.append(f"You have {m_rem} minutes remaining on your plan.")
-
-    # Include a small breakdown for clarity.
-    if m_allowed > 0 or m_used > 0:
-        lines.append(f"Used: {m_used} of {m_allowed} minutes.")
-
-    if (not is_trial) and int(cycle_days or 0) > 0:
-        lines.append(f"Your usage cycle resets every {int(cycle_days)} days.")
-
-    # If exhausted, include the same upgrade/pay links used by the paywall.
-    if m_rem <= 0:
-        resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
-        resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
-        resolved_payg_minutes = (
-            int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
-        )
-        resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
-
-        if resolved_payg_pay_url and resolved_payg_minutes > 0:
-            price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
-            lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
-
-        if resolved_upgrade_url:
-            lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
-
-    return " ".join([ln.strip() for ln in lines if ln.strip()])
-
-
 def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str, minutes_allowed_override: Optional[int] = None, cycle_days_override: Optional[int] = None) -> Tuple[bool, Dict[str, Any]]:
     """Charge usage time and determine whether the identity still has minutes.
 
@@ -1048,6 +1130,117 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
     except Exception:
         # Fail-open
         return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": identity_key}
+
+
+def _usage_peek_status_sync(
+    identity_key: str,
+    *,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int] = None,
+    cycle_days_override: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return usage status WITHOUT persisting.
+
+    IMPORTANT:
+      - Does NOT update last_seen
+      - Does NOT write used_seconds back to the store
+      - Computes a *projected* remaining time as-if a chat call happened "now"
+        (so the number matches what /chat would enforce), but it is read-only.
+    """
+    now = time.time()
+    try:
+        with _USAGE_LOCK:
+            store = _load_usage_store()
+            rec = store.get(identity_key)
+            if not isinstance(rec, dict):
+                rec = {}
+
+            used_seconds = float(rec.get("used_seconds") or 0.0)
+            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+            last_seen = rec.get("last_seen")
+            cycle_start = float(rec.get("cycle_start") or now)
+
+            # Member cycle reset (trial does not reset)
+            cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
+            cycle_reset_applied = False
+            if not is_trial and cycle_days and cycle_days > 0:
+                cycle_len = float(cycle_days) * 86400.0
+                if (now - cycle_start) >= cycle_len:
+                    used_seconds = 0.0
+                    cycle_start = now
+                    cycle_reset_applied = True
+
+            # Compute the same billable delta that /chat would apply,
+            # but do NOT persist it.
+            delta = 0.0
+            if last_seen is not None:
+                try:
+                    delta = float(now - float(last_seen))
+                except Exception:
+                    delta = 0.0
+
+            if delta < 0:
+                delta = 0.0
+
+            # Don't charge long idle gaps (prevents "went AFK" from burning minutes)
+            if USAGE_IDLE_GRACE_SECONDS and delta > float(USAGE_IDLE_GRACE_SECONDS):
+                delta = 0.0
+
+            # Cap per-request billable time
+            max_bill = (
+                float(USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST)
+                if USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST > 0
+                else 0.0
+            )
+            if max_bill and delta > max_bill:
+                delta = max_bill
+
+            projected_used_seconds = used_seconds + delta
+
+        # Compute allowed seconds
+        if minutes_allowed_override is not None:
+            try:
+                minutes_allowed = max(0, int(minutes_allowed_override))
+            except Exception:
+                minutes_allowed = 0
+        else:
+            minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
+        allowed_seconds = (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0)
+
+        remaining_seconds = max(0.0, allowed_seconds - projected_used_seconds)
+        ok = remaining_seconds > 0.0
+
+        cycle_resets_in_days: Optional[int] = None
+        if not is_trial and cycle_days and cycle_days > 0:
+            cycle_end = float(cycle_start) + (float(cycle_days) * 86400.0)
+            cycle_resets_in_days = int(max(0.0, cycle_end - now) // 86400)
+
+        return {
+            "ok": ok,
+            "minutes_used": int(projected_used_seconds // 60),
+            "minutes_allowed": int(minutes_allowed),
+            "minutes_remaining": int(remaining_seconds // 60),
+            "purchased_minutes": int(float(purchased_seconds or 0.0) // 60),
+            "identity_key": identity_key,
+            "cycle_days": int(cycle_days or 0),
+            "cycle_resets_in_days": cycle_resets_in_days,
+            "cycle_reset_applied": bool(cycle_reset_applied),
+        }
+    except Exception:
+        # Fail-open
+        return {
+            "ok": True,
+            "minutes_used": 0,
+            "minutes_allowed": 0,
+            "minutes_remaining": 0,
+            "purchased_minutes": 0,
+            "identity_key": identity_key,
+            "cycle_days": int(cycle_days_override or 0),
+            "cycle_resets_in_days": None,
+            "cycle_reset_applied": False,
+        }
+
 
 def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any]:
     """Add purchased minutes to an identity record (used by payment webhooks/admin tooling)."""
@@ -1155,51 +1348,6 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
         return "intimate"
 
     return None
-def _is_minutes_balance_question(text: str) -> bool:
-    """Detect user questions about remaining/available plan minutes.
-
-    Examples we want to catch:
-      - "How many more minutes do I have on my plan?"
-      - "How many minutes are left?"
-      - "Minutes remaining?"
-      - "How long can I talk to you?"
-      - "What's my minutes balance / usage?"
-
-    We keep this intentionally conservative to avoid false triggers.
-    """
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-
-    # Avoid a common unrelated question.
-    if re.search(r"\bwhat time is it\b", t):
-        return False
-
-    # Strong patterns (explicit "how many/much" + minutes/time + left/remaining)
-    if re.search(r"\bhow\s+(many|much)\b.*\b(minutes?|time)\b.*\b(left|remaining|available)\b", t):
-        return True
-
-    # "minutes remaining", "time left", etc with plan/usage keywords
-    if re.search(r"\b(minutes?|time)\b.*\b(left|remaining|available)\b", t) and re.search(
-        r"\b(plan|trial|subscription|membership|usage|balance|quota|included)\b", t
-    ):
-        return True
-
-    # Short forms: "minutes left?", "minutes available?"
-    if re.search(r"\bminutes?\b", t) and re.search(r"\b(left|remaining|available|balance|used)\b", t):
-        return True
-
-    # "How long can I talk/speak/chat?"
-    if re.search(r"\bhow\s+long\b.*\b(can|may)\s+i\b.*\b(talk|speak|chat)\b", t):
-        return True
-
-    # "check my usage" / "show my minutes"
-    if re.search(r"\b(check|show)\b.*\b(usage|minutes?|balance)\b", t):
-        return True
-
-    return False
-
-
 
 
 def _looks_intimate(text: str) -> bool:
@@ -1754,26 +1902,6 @@ async def chat(request: Request):
     """
     debug = bool(getattr(settings, "DEBUG", False))
 
-    # Track request start so we can optionally enforce a minimum latency for fast-path responses.
-    request_started = time.monotonic()
-
-    async def _ensure_fast_reply_min_latency() -> None:
-        """Ensure fast-path /chat responses take at least FAST_REPLY_MIN_LATENCY_MS.
-
-        This prevents some embedded/iOS clients from playing the next TTS response at a very low volume
-        when the server responds "too quickly" after microphone capture.
-        """
-        try:
-            min_ms = int(FAST_REPLY_MIN_LATENCY_MS or 0)
-        except Exception:
-            return
-        if min_ms <= 0:
-            return
-        elapsed_ms = (time.monotonic() - request_started) * 1000.0
-        if elapsed_ms < float(min_ms):
-            await asyncio.sleep((float(min_ms) - elapsed_ms) / 1000.0)
-
-
     raw = await request.json()
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
     
@@ -1860,14 +1988,7 @@ async def chat(request: Request):
         cycle_days_override=cycle_days_override,
     )
 
-
-    # Special-case: allow "minutes remaining" questions to return a status message
-    # even when minutes are exhausted (no OpenAI call).
-    probe_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-    probe_text = ((probe_last_user.get("content") if probe_last_user else "") or "").strip()
-    is_minutes_balance_query = _is_minutes_balance_question(probe_text)
-
-    if not usage_ok and not is_minutes_balance_query:
+    if not usage_ok:
         minutes_allowed = int(
             usage_info.get("minutes_allowed")
             or (minutes_allowed_override if minutes_allowed_override is not None else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits)))
@@ -1891,7 +2012,6 @@ async def chat(request: Request):
             payg_increment_minutes=pay_go_minutes,
             payg_price_text=payg_price_text_override,
         )
-        await _ensure_fast_reply_min_latency()
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
@@ -1950,42 +2070,6 @@ async def chat(request: Request):
             "session_state": state_out,
             "audio_url": audio_url,       # NEW (optional)
         }
-
-    # If the user is asking about their remaining minutes, answer deterministically
-    # (no OpenAI call). This also works when minutes are exhausted.
-    if is_minutes_balance_query:
-        minutes_used = int(usage_info.get("minutes_used") or 0)
-        minutes_allowed = int(usage_info.get("minutes_allowed") or 0)
-        minutes_remaining = int(usage_info.get("minutes_remaining") or 0)
-
-        effective_cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
-
-        session_state_out = dict(session_state)
-        session_state_out.update(
-            {
-                "minutes_exhausted": minutes_remaining <= 0,
-                "minutes_used": minutes_used,
-                "minutes_allowed": minutes_allowed,
-                "minutes_remaining": minutes_remaining,
-            }
-        )
-        # Ensure mode is always present for the frontend.
-        session_state_out["mode"] = session_state_out.get("mode") or "friend"
-
-        reply = _usage_status_message(
-            is_trial=is_trial,
-            plan_name=plan_label_for_messages,
-            minutes_used=minutes_used,
-            minutes_allowed=minutes_allowed,
-            minutes_remaining=minutes_remaining,
-            cycle_days=effective_cycle_days,
-            upgrade_url=upgrade_link_override,
-            payg_pay_url=pay_go_link_override,
-            payg_increment_minutes=pay_go_minutes,
-            payg_price_text=payg_price_text_override,
-        )
-        await _ensure_fast_reply_min_latency()
-        return await _respond(reply, STATUS_SAFE, session_state_out)
 
     # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
