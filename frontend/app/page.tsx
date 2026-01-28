@@ -129,15 +129,11 @@ function normalizePlanName(raw: any): PlanName {
   }
 }
 
-function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverride?: string): string {
+function displayPlanLabel(planName: PlanName, memberId: string): string {
   const hasMemberId = Boolean((memberId || "").trim());
 
   // Requirement: If we do not have a memberId, the visitor is on Trial, shown as "Free Trial".
   if (!hasMemberId) return "Free Trial";
-
-  // If a white-label site supplies its own plan name, prefer showing that (UI label only).
-  const override = String(planLabelOverride || "").trim();
-  if (override) return override;
 
   // Requirement: Unknown / Not Provided only when the plan information for a member is not provided.
   if (!planName) return "Unknown / Not Provided";
@@ -223,97 +219,7 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
 const DEFAULT_COMPANY_NAME = "Elaralo";
-
-// Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
-const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
-
-// Back-compat: older embeds/tests may still pass ?rebranding=BrandName
-const LEGACY_REBRANDING_QUERY_PARAM = "rebranding";
-
-// Public asset root for white-label rebrands
-const REBRANDING_PUBLIC_DIR = "/rebranding";
-
-type RebrandingKeyParts = {
-  rebranding: string;
-  upgradeLink: string;
-  payGoLink: string;
-  payGoPrice: string;
-  payGoMinutes: string;
-  plan: string;
-  elaraloPlanMap: string;
-  freeMinutes: string;
-  cycleDays: string;
-};
-
-function stripRebrandingKeyLabel(part: string): string {
-  const s = String(part || "").trim();
-  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon")
-  const m = s.match(/^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$/);
-  return m ? String(m[1] || "").trim() : s;
-}
-
-function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
-  const v = String(raw || "").trim();
-  if (!v) return null;
-
-  // Legacy support: if there is no "|" delimiter, treat this as just the brand name.
-  if (!v.includes("|")) {
-    const brand = stripRebrandingKeyLabel(v);
-    return {
-      rebranding: brand,
-      upgradeLink: "",
-      payGoLink: "",
-      payGoPrice: "",
-      payGoMinutes: "",
-      plan: "",
-      elaraloPlanMap: "",
-      freeMinutes: "",
-      cycleDays: "",
-    };
-  }
-
-  const parts = v.split("|").map((p) => stripRebrandingKeyLabel(p));
-
-  const [
-    rebranding = "",
-    upgradeLink = "",
-    payGoLink = "",
-    payGoPrice = "",
-    payGoMinutes = "",
-    plan = "",
-    elaraloPlanMap = "",
-    freeMinutes = "",
-    cycleDays = "",
-  ] = parts;
-
-  return {
-    rebranding: String(rebranding || "").trim(),
-    upgradeLink: String(upgradeLink || "").trim(),
-    payGoLink: String(payGoLink || "").trim(),
-    payGoPrice: String(payGoPrice || "").trim(),
-    payGoMinutes: String(payGoMinutes || "").trim(),
-    plan: String(plan || "").trim(),
-    elaraloPlanMap: String(elaraloPlanMap || "").trim(),
-    freeMinutes: String(freeMinutes || "").trim(),
-    cycleDays: String(cycleDays || "").trim(),
-  };
-}
-
-function normalizeRebrandingSlug(rawBrand: string): string {
-  const raw = String(rawBrand || "").trim();
-  if (!raw) return "";
-
-  // Match the prior logo normalization rules so:
-  // - "Dulce Moon" and "DulceMoon" both -> "dulcemoon"
-  // - also works if someone includes an extension or "-logo" suffix
-  const normalizedBase = raw
-    .replace(/\.(png|jpg|jpeg|webp)$/i, "")
-    .replace(/-logo$/i, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
-
-  return normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
+const REBRANDING_QUERY_PARAM = "rebranding";
 
 function getAppBasePathFromAsset(assetPath: string): string {
   const p = String(assetPath || "");
@@ -528,39 +434,20 @@ function parseCompanionMeta(raw: string): CompanionMeta {
   };
 }
 
-function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: string) {
+function buildAvatarCandidates(companionKeyOrName: string) {
   const raw = (companionKeyOrName || "").trim();
   const normalized = normalizeKeyForFile(stripExt(raw));
-  const enc = normalized ? encodeURIComponent(normalized) : "";
+  const base = normalized ? `${HEADSHOT_DIR}/${encodeURIComponent(normalized)}` : "";
 
   const candidates: string[] = [];
-
-  if (enc) {
-    // Rebrand-specific headshots (preferred when RebrandingKey is present):
-    //   /rebranding/<brand>/companion/headshot/<CompanionName>.{jpeg|jpg|png}
-    const slug = String(rebrandingSlug || "").trim();
-    if (slug) {
-      const rebrandBase = joinUrlPrefix(
-        APP_BASE_PATH,
-        `${REBRANDING_PUBLIC_DIR}/${encodeURIComponent(slug)}${HEADSHOT_DIR}/${enc}`
-      );
-      candidates.push(`${rebrandBase}.jpeg`);
-      candidates.push(`${rebrandBase}.jpg`);
-      candidates.push(`${rebrandBase}.png`);
-    }
-
-    // Default (non-rebranded) headshots:
-    //   /companion/headshot/<CompanionName>.{jpeg|jpg|png}
-    const base = joinUrlPrefix(APP_BASE_PATH, `${HEADSHOT_DIR}/${enc}`);
+  if (base) {
     candidates.push(`${base}.jpeg`);
     candidates.push(`${base}.jpg`);
     candidates.push(`${base}.png`);
   }
-
   candidates.push(DEFAULT_AVATAR);
   return candidates;
 }
-
 
 async function pickFirstExisting(urls: string[]) {
   for (const url of urls) {
@@ -1054,38 +941,20 @@ export default function Page() {
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
-
-  // Optional white-label rebranding:
-  // - Wix provides a single RebrandingKey string with "|" separated fields.
-  // - If RebrandingKey has a value, we use it to drive branding assets + upgrade/pay links.
-  // - This MUST NOT change companion persona logic.
-  const [rebrandingKey, setRebrandingKey] = useState<string>("");
-  const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
-
-  const rebrandingName = String(rebrandingInfo?.rebranding || "").trim();
-  const rebrandingSlug = useMemo(() => normalizeRebrandingSlug(rebrandingName), [rebrandingName]);
-
-  // Upgrade URL (defaults to env; overridden by RebrandingKey when present)
-  const upgradeUrl = useMemo(() => {
-    const u = String(rebrandingInfo?.upgradeLink || "").trim();
-    return u || UPGRADE_URL;
-  }, [rebrandingInfo]);
-
+  // Optional white-label rebranding (company name + default logo only; does NOT touch companion logic)
+  const [rebrandingName, setRebrandingName] = useState<string>("");
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
+  const companyName = ((rebrandingName || "").trim() || DEFAULT_COMPANY_NAME);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
-  // Read `?rebrandingKey=...` for direct testing (outside Wix).
-  // Back-compat: also accept `?rebranding=BrandName`.
-  // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
+  // Read `?rebranding=...` for direct testing (outside Wix).
+  // In production, Wix should pass { rebranding: "BrandName" } via postMessage.
   useEffect(() => {
     try {
       const u = new URL(window.location.href);
-      const qKey = u.searchParams.get(REBRANDING_KEY_QUERY_PARAM);
-      const qLegacy = u.searchParams.get(LEGACY_REBRANDING_QUERY_PARAM);
-      const q = String(qKey || "").trim() || String(qLegacy || "").trim();
-      if (q) setRebrandingKey(q);
+      const q = u.searchParams.get(REBRANDING_QUERY_PARAM);
+      if (q && q.trim()) setRebrandingName(q.trim());
     } catch {
       // ignore
     }
@@ -1094,11 +963,10 @@ export default function Page() {
   // Resolve the default company logo when rebranding is active.
   // This only affects the header circle image when no companion image is available.
   useEffect(() => {
-    const rawBrand = (rebrandingName || "").trim();
-    const slug = (rebrandingSlug || "").trim();
+    const raw = (rebrandingName || "").trim();
 
     // No rebranding: revert to the default Elaralo logo.
-    if (!rawBrand) {
+    if (!raw) {
       setCompanyLogoSrc(DEFAULT_AVATAR);
 
       // Keep the header image in sync if we are currently showing a company logo.
@@ -1106,12 +974,7 @@ export default function Page() {
       setAvatarSrc((prev) => {
         const p = String(prev || "").trim();
         if (!p) return DEFAULT_AVATAR;
-
-        // Covers both:
-        // - "/companion/headshot/..."
-        // - "/rebranding/<brand>/companion/headshot/..."
-        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
-
+        if (p.startsWith(`${HEADSHOT_DIR}/`)) return prev;
         if (p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
 
         // If we were previously showing a rebrand logo, revert to default.
@@ -1123,21 +986,23 @@ export default function Page() {
       return;
     }
 
-    const base = slug || normalizeRebrandingSlug(rawBrand);
+    // Normalize the rebranding name into a filename base:
+    // - strip extension
+    // - strip trailing "-logo"
+    // - lowercase
+    // - remove non-alphanumerics so "Dulce Moon" and "DulceMoon" => "dulcemoon"
+    const normalizedBase = raw
+      .replace(/\.(png|jpg|jpeg|webp)$/i, "")
+      .replace(/-logo$/i, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "");
+
+    const base = normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
 
     const candidates: string[] = [];
     if (base) {
-      // IMPORTANT:
-      // - Logo assets live under frontend/public.
-      // - For rebrands, the logo is now located under:
-      //     /rebranding/<brand>/<brand>-logo.(png|jpg|jpeg|webp)
-      // - We keep a legacy fallback for older deployments where the logo lived at site root.
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.png`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpeg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.webp`));
-
-      // Legacy fallback: root-level logo
+      // IMPORTANT: Logo assets live in frontend/public, which resolves to the site root at runtime.
+      // Use the same basePath prefix as Next's imported assets so this works in all deployments.
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.png`));
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpg`));
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpeg`));
@@ -1159,10 +1024,7 @@ export default function Page() {
       setAvatarSrc((prev) => {
         const p = String(prev || "").trim();
         if (!p) return picked;
-
-        // Covers both default + rebrand headshots.
-        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
-
+        if (p.startsWith(`${HEADSHOT_DIR}/`)) return prev;
         if (p === DEFAULT_AVATAR) return picked;
 
         // If we were showing some other "-logo.*" asset, treat it as a company logo and swap it.
@@ -1175,7 +1037,7 @@ export default function Page() {
     return () => {
       cancelled = true;
     };
-  }, [rebrandingName, rebrandingSlug]);
+  }, [rebrandingName]);
 
 
 // ----------------------------
@@ -2227,7 +2089,7 @@ const speakAssistantReply = useCallback(
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
   const [sessionState, setSessionState] = useState<SessionState>({
-    mode: "romantic",
+    mode: "friend",
     model: "gpt-4o",
     adult_verified: false,
     romance_consented: false,
@@ -2243,7 +2105,7 @@ const speakAssistantReply = useCallback(
   const [showModePicker, setShowModePicker] = useState(false);
   const [setModeFlash, setSetModeFlash] = useState(false);
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
-  const [allowedModes, setAllowedModes] = useState<Mode[]>(allowedModesForPlan("Trial"));
+  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const goToMyElara = useCallback(() => {
     const url = "https://www.elaralo.com/myelara";
@@ -2272,7 +2134,7 @@ const speakAssistantReply = useCallback(
   }, []);
 
   const goToUpgrade = useCallback(() => {
-    const url = upgradeUrl;
+    const url = UPGRADE_URL;
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
     // so we leave the embed and avoid “stacked headers”.
@@ -2295,7 +2157,7 @@ const speakAssistantReply = useCallback(
 
     // Fallback: navigate the current frame.
     window.location.href = url;
-  }, [upgradeUrl]);
+  }, []);
 
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
@@ -2428,7 +2290,7 @@ useEffect(() => {
     const modeLabel = MODE_LABELS[requestedMode];
     const msg =
       `The requested mode (${modeLabel}) isn't available on your current plan. ` +
-      `Please upgrade here: ${upgradeUrl} or click the upgrade button below the text input box`;
+      `Please upgrade here: ${UPGRADE_URL} or click the upgrade button below the text input box`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
@@ -2443,29 +2305,15 @@ useEffect(() => {
 
       const incomingPlan = normalizePlanName((data as any).planName);
 
-      // Preferred white-label handoff from Wix: a single "|" separated RebrandingKey.
-      // Back-compat: older Wix sites may still send `rebranding` (brand name only).
-      const hasRebrandingKeyField =
-        "rebrandingKey" in (data as any) || "RebrandingKey" in (data as any) || "rebranding" in (data as any);
-
-      const incomingRebrandingKey =
-        typeof (data as any).rebrandingKey === "string"
-          ? String((data as any).rebrandingKey).trim()
-          : typeof (data as any).RebrandingKey === "string"
-            ? String((data as any).RebrandingKey).trim()
-            : typeof (data as any).rebranding === "string"
-              ? String((data as any).rebranding).trim()
-              : "";
-
-      // Persist the raw key so the rest of the app (logo/headshots/upgrade link) can use it.
-      // If the field exists but is empty, this also clears prior rebranding.
-      if (hasRebrandingKeyField) {
-        setRebrandingKey(incomingRebrandingKey);
+      // Optional white-label brand handoff from Wix (company name + default logo only).
+      // This MUST NOT affect companion selection or persona logic.
+      if ("rebranding" in (data as any)) {
+        const incomingRebranding =
+          typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
+        setRebrandingName(incomingRebranding);
       }
 
-      const parsedRebrandingKey = parseRebrandingKey(incomingRebrandingKey);
-      const planMapFromKey = normalizePlanName(parsedRebrandingKey?.elaraloPlanMap);
-      const incomingRebrandingSlug = normalizeRebrandingSlug(parsedRebrandingKey?.rebranding || "");
+
 
       const incomingMemberId =
         typeof (data as any).memberId === "string"
@@ -2475,9 +2323,7 @@ useEffect(() => {
             : "";
       setMemberId(incomingMemberId);
 
-      // For members, prefer the plan mapping from RebrandingKey (ElaraloPlanMap).
-      // If not present, fall back to Wix's planName (legacy).
-      const effectivePlan: PlanName = incomingMemberId ? (planMapFromKey || incomingPlan) : "Trial";
+      const effectivePlan: PlanName = incomingMemberId ? incomingPlan : "Trial";
       setPlanName(effectivePlan);
 
       const incomingCompanion =
@@ -2511,7 +2357,7 @@ useEffect(() => {
         }));
       }
 
-      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, incomingRebrandingSlug);
+      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME);
       pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       const nextAllowed = allowedModesForPlan(effectivePlan);
@@ -2603,28 +2449,6 @@ const stateToSendWithCompanion: SessionState = {
       plan: effectivePlanForBackend,
       memberId: (memberId || "").trim(),
       member_id: (memberId || "").trim(),
-      // Optional white-label handoff (RebrandingKey). The backend uses this to override upgrade/pay links and billing settings.
-      rebrandingKey: String(rebrandingKey || "").trim(),
-      rebranding_key: String(rebrandingKey || "").trim(),
-
-      // Parsed fields (sent redundantly for readability/debugging; backend can also parse rebrandingKey directly).
-      rebranding: String(rebrandingInfo?.rebranding || "").trim(),
-      upgradeLink: String(rebrandingInfo?.upgradeLink || "").trim(),
-      upgrade_link: String(rebrandingInfo?.upgradeLink || "").trim(),
-      payGoLink: String(rebrandingInfo?.payGoLink || "").trim(),
-      pay_go_link: String(rebrandingInfo?.payGoLink || "").trim(),
-      payGoPrice: String(rebrandingInfo?.payGoPrice || "").trim(),
-      pay_go_price: String(rebrandingInfo?.payGoPrice || "").trim(),
-      payGoMinutes: String(rebrandingInfo?.payGoMinutes || "").trim(),
-      pay_go_minutes: String(rebrandingInfo?.payGoMinutes || "").trim(),
-      rebrandingPlan: String(rebrandingInfo?.plan || "").trim(),
-      rebranding_plan: String(rebrandingInfo?.plan || "").trim(),
-      elaraloPlanMap: String(rebrandingInfo?.elaraloPlanMap || "").trim(),
-      elaralo_plan_map: String(rebrandingInfo?.elaraloPlanMap || "").trim(),
-      freeMinutes: String(rebrandingInfo?.freeMinutes || "").trim(),
-      free_minutes: String(rebrandingInfo?.freeMinutes || "").trim(),
-      cycleDays: String(rebrandingInfo?.cycleDays || "").trim(),
-      cycle_days: String(rebrandingInfo?.cycleDays || "").trim(),
     };
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
@@ -4213,7 +4037,7 @@ const speakGreetingIfNeeded = useCallback(
           <h1 style={{ margin: 0, fontSize: 22 }}>{companyName}</h1>
           <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-            <b>{displayPlanLabel(planName, memberId, rebrandingInfo?.plan)}</b>
+            <b>{displayPlanLabel(planName, memberId)}</b>
           </div>
           <div style={{ fontSize: 12, color: "#666" }}>
             Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
