@@ -8,7 +8,6 @@ import json
 import hashlib
 import base64
 import asyncio
-import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -122,306 +121,6 @@ app.add_middleware(
 )
 
 # ----------------------------
-
-
-# ---------------------------------------------------------------------------
-# Companion Catalog (DB-driven voice/video/live provider mappings)
-# ---------------------------------------------------------------------------
-# Source of truth: companion_catalog.sqlite (imported from "Voice and Video Mappings - Elaralo.xlsx").
-# We load it into memory at startup so lookups are constant time and don't hit disk per request.
-#
-# NOTE: This catalog is used only for UI/config decisions (voice IDs, video availability, D-ID agent config,
-# BeeStreamed live provider), and does NOT change any TTS/STT implementation details.
-
-CATALOG_DB_PATH = os.getenv(
-    "COMPANION_CATALOG_DB_PATH",
-    os.path.join(os.path.dirname(__file__), "voice_video_mappings.sqlite3"),
-)
-
-_COMPANION_CATALOG: Dict[Tuple[str, str], Dict[str, Any]] = {}
-_BRAND_TO_COMPANIONS: Dict[str, List[Dict[str, Any]]] = {}
-
-
-def _norm_catalog_key(s: str) -> str:
-    """Normalize a brand/avatar key for stable lookup (case/space/punctuation insensitive)."""
-    return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
-
-
-def _as_optional_str(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s or None
-
-
-def _load_companion_catalog_from_sqlite(db_path: str) -> None:
-    global _COMPANION_CATALOG, _BRAND_TO_COMPANIONS
-
-    if not db_path or not os.path.exists(db_path):
-        print(f"[catalog] DB not found at: {db_path} (skipping)")
-        _COMPANION_CATALOG = {}
-        _BRAND_TO_COMPANIONS = {}
-        return
-
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM companion_mappings").fetchall()
-    except Exception as e:
-        print(f"[catalog] Failed to read DB {db_path}: {e}")
-        _COMPANION_CATALOG = {}
-        _BRAND_TO_COMPANIONS = {}
-        return
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    catalog: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    by_brand: Dict[str, List[Dict[str, Any]]] = {}
-
-    for r in rows:
-        brand = str(r["brand"] or "").strip()
-
-        # Column names come from the Excel-driven sqlite:
-        #   - NEW: companion_mappings.companion, companion_mappings.channel_cap, companion_mappings.live
-        #   - OLD: avatar/communication/live_provider (kept for backward compatibility)
-        cols = set(getattr(r, "keys", lambda: [])())
-
-        avatar = str((r["companion"] if "companion" in cols else r["avatar"]) or "").strip()
-
-        channel_raw = str((r["channel_cap"] if "channel_cap" in cols else r["communication"]) or "").strip().lower()
-        communication = "video" if channel_raw == "video" else "audio"
-
-        live_raw = str((r["live"] if "live" in cols else r["live_provider"]) or "").strip().lower()
-        live: Optional[str] = None
-        if live_raw:
-            if live_raw in ("d-id", "did", "d_id"):
-                live = "did"
-            elif live_raw in ("stream", "beestreamed", "bee"):
-                live = "stream"
-            else:
-                # Unknown provider value; keep as-is so we can debug quickly.
-                live = live_raw
-
-        item: Dict[str, Any] = {
-            "brand": brand,
-            "avatar": avatar,
-            "communication": communication,
-            "elevenVoiceId": _as_optional_str(r["eleven_voice_id"]),
-            "live": live,
-            # D-ID fields (used only when live == "did")
-            "didAgentId": _as_optional_str(r["did_agent_id"]),
-            "didClientKey": _as_optional_str(r["did_client_key"]),
-            # Optional debug fields (kept for future use)
-            "didAgentLink": _as_optional_str(r["did_agent_link"]),
-        }
-
-key = (_norm_catalog_key(brand), _norm_catalog_key(avatar))
-        catalog[key] = item
-
-        bkey = _norm_catalog_key(brand)
-        by_brand.setdefault(bkey, []).append(item)
-
-    # Stable ordering for UI callers
-    for bkey, items in by_brand.items():
-        items.sort(key=lambda x: str(x.get("avatar") or ""))
-
-    _COMPANION_CATALOG = catalog
-    _BRAND_TO_COMPANIONS = by_brand
-
-    print(f"[catalog] Loaded {len(_COMPANION_CATALOG)} companion mappings from {db_path}")
-
-
-@app.on_event("startup")
-async def _startup_load_catalog() -> None:
-    _load_companion_catalog_from_sqlite(CATALOG_DB_PATH)
-
-
-@app.get("/catalog/companion")
-async def get_catalog_companion(brand: str, avatar: str) -> Dict[str, Any]:
-    """Return the catalog config for a given (brand, avatar)."""
-    key = (_norm_catalog_key(brand), _norm_catalog_key(avatar))
-    item = _COMPANION_CATALOG.get(key)
-    if not item:
-        raise HTTPException(status_code=404, detail="Companion not found in catalog")
-    return item
-
-
-@app.get("/catalog/brand")
-async def get_catalog_brand(brand: str) -> Dict[str, Any]:
-    """Return all companions configured for a given brand."""
-    bkey = _norm_catalog_key(brand)
-    return {
-        "brand": brand,
-        "companions": _BRAND_TO_COMPANIONS.get(bkey, []),
-        "count": len(_BRAND_TO_COMPANIONS.get(bkey, [])),
-    }
-
-
-
-# ---------------------------------------------------------------------------
-# BeeStreamed (Live=Stream) integration
-# ---------------------------------------------------------------------------
-# Docs: https://docs.beestreamed.com/introduction
-#
-# Auth: Basic base64(token_id:secret_key) via Authorization header.
-# The Token ID + Secret Key are expected as environment variables:
-#   STREAM_TOKEN_ID
-#   STREAM_SECRET_KEY
-#
-# When a Stream companion's Video button is clicked, the frontend calls /stream/start.
-# We (1) create or reuse a BeeStreamed event, (2) start its WebRTC stream, then
-# return a viewer URL like: https://beestreamed.com/event?id=<EVENT_REF>
-
-BEESTREAMED_API_BASE = os.getenv("BEESTREAMED_API_BASE", "https://api.beestreamed.com").rstrip("/")
-_STREAM_EVENT_CACHE: Dict[Tuple[str, str], str] = {}
-
-
-def _beestreamed_headers() -> Dict[str, str]:
-    token_id = (os.getenv("STREAM_TOKEN_ID") or "").strip()
-    secret_key = (os.getenv("STREAM_SECRET_KEY") or "").strip()
-
-    if not token_id or not secret_key:
-        raise RuntimeError("STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured in the environment")
-
-    token = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
-    return {
-        "Authorization": f"Basic {token}",
-        "Accept": "application/json",
-    }
-
-
-def _beestreamed_request_sync(
-    method: str,
-    path: str,
-    *,
-    params: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
-) -> Any:
-    import requests
-
-    url = f"{BEESTREAMED_API_BASE}{path}"
-    headers = _beestreamed_headers()
-
-    resp = requests.request(
-        method=method,
-        url=url,
-        headers=headers,
-        params=params,
-        json=json_body,
-        timeout=20,
-    )
-
-    if resp.status_code >= 400:
-        # Bubble up a concise error while still keeping enough context for debugging.
-        body_preview = (resp.text or "")[:500]
-        raise RuntimeError(f"BeeStreamed {method} {path} failed: HTTP {resp.status_code} - {body_preview}")
-
-    if not (resp.text or "").strip():
-        return {}
-
-    try:
-        return resp.json()
-    except Exception:
-        return {"raw": resp.text}
-
-
-def _extract_events_list(payload: Any) -> List[Dict[str, Any]]:
-    """BeeStreamed list responses may be either a list or an object containing a list."""
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-
-    if isinstance(payload, dict):
-        for k in ("events", "data", "items", "results"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-
-    return []
-
-
-@app.post("/stream/start")
-async def beestreamed_start_stream(req: Request) -> Dict[str, Any]:
-    body = await req.json()
-    brand = str(body.get("brand") or "").strip()
-    avatar = str(body.get("avatar") or "").strip()
-
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    # If we have a catalog entry, enforce that this companion is configured for Stream.
-    key = (_norm_catalog_key(brand), _norm_catalog_key(avatar))
-    item = _COMPANION_CATALOG.get(key)
-    if item and str(item.get("live") or "") != "stream":
-        raise HTTPException(status_code=400, detail="This companion is not configured for Stream")
-
-    event_title = f"{brand} - {avatar}"
-    cache_key = (_norm_catalog_key(brand), _norm_catalog_key(avatar))
-
-    event_ref = _STREAM_EVENT_CACHE.get(cache_key)
-
-    # 1) Find or create the event (cached in-memory per worker)
-    if not event_ref:
-        try:
-            payload = await run_in_threadpool(
-                _beestreamed_request_sync,
-                "GET",
-                "/events",
-                params={
-                    "search": event_title,
-                    "maxResults": 25,
-                },
-            )
-            events = _extract_events_list(payload)
-        except Exception:
-            events = []
-
-        # Prefer an exact title match; otherwise fall back to the first returned event.
-        for ev in events:
-            title = str(ev.get("event_title") or ev.get("title") or "").strip()
-            ref = str(ev.get("event_ref") or ev.get("ref") or "").strip()
-            if ref and title.lower() == event_title.lower():
-                event_ref = ref
-                break
-
-        if not event_ref and events:
-            ref = str(events[0].get("event_ref") or events[0].get("ref") or "").strip()
-            if ref:
-                event_ref = ref
-
-        if not event_ref:
-            created = await run_in_threadpool(_beestreamed_request_sync, "POST", "/events")
-            event_ref = str(created.get("event_ref") or created.get("eventRef") or "").strip()
-
-            if not event_ref:
-                raise HTTPException(status_code=502, detail="BeeStreamed did not return an event_ref")
-
-            # Set a recognizable title (best-effort).
-            try:
-                await run_in_threadpool(
-                    _beestreamed_request_sync,
-                    "PATCH",
-                    f"/events/{event_ref}",
-                    params={"title": event_title},
-                )
-            except Exception as e:
-                print(f"[beestreamed] Warning: failed to set event title: {e}")
-
-        _STREAM_EVENT_CACHE[cache_key] = event_ref
-
-    # 2) Start (or re-start) the WebRTC stream
-    try:
-        await run_in_threadpool(_beestreamed_request_sync, "POST", f"/events/{event_ref}/startwebrtcstream")
-    except Exception as e:
-        # Still return a viewer URL; the event page can surface the underlying issue.
-        print(f"[beestreamed] Warning: failed to start WebRTC stream: {e}")
-
-    # 3) Viewer URL (documented in BeeStreamed signup email template)
-    viewer_url = f"https://beestreamed.com/event?id={event_ref}"
-    return {"eventRef": event_ref, "viewerUrl": viewer_url}
-
 # Routes
 # ----------------------------
 if consent_router is not None:
@@ -718,6 +417,346 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
 #
 #     return True, ""
 
+
+
+
+# ---------------------------------------------------------------------------
+# Voice/Video companion capability mappings (SQLite -> in-memory)
+# ---------------------------------------------------------------------------
+# This database is generated from the Excel mapping sheet ("Voice and Video Mappings - Elaralo.xlsx")
+# and shipped alongside the API so the frontend can query companion capabilities at runtime:
+#   - which companions are Audio-only vs Video+Audio
+#   - which Live provider to use (D-ID vs Stream)
+#   - ElevenLabs voice IDs (TTS voice selection)
+#   - D-ID Agent IDs / Client Keys (for the D-ID browser SDK)
+#
+# Design choice:
+#   - We load the full table into memory at startup (fast lookups, no per-request DB IO).
+#   - The DB is treated as read-only config; updates are made by regenerating the SQLite file
+#     and redeploying (or by mounting a new file and restarting).
+#
+# Default lookup key is (brand, avatar), case-insensitive.
+
+import sqlite3
+from urllib.parse import urlparse, parse_qs
+
+_COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_COMPANION_MAPPINGS_LOADED_AT: float | None = None
+_COMPANION_MAPPINGS_SOURCE: str = ""
+
+
+def _norm_key(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _candidate_mapping_db_paths() -> List[str]:
+    base_dir = os.path.dirname(__file__)
+    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    candidates = [
+        env_path,
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+    ]
+    # keep unique, preserve order
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in candidates:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+def _load_companion_mappings_sync() -> None:
+    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE
+
+    db_path = ""
+    for p in _candidate_mapping_db_paths():
+        if os.path.exists(p):
+            db_path = p
+            break
+
+    if not db_path:
+        print("[mappings] WARNING: voice/video mappings DB not found. Video/audio capabilities will fall back to frontend defaults.")
+        _COMPANION_MAPPINGS = {}
+        _COMPANION_MAPPINGS_LOADED_AT = time.time()
+        _COMPANION_MAPPINGS_SOURCE = ""
+        return
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              brand,
+              avatar,
+              eleven_voice_name,
+              communication,
+              eleven_voice_id,
+              live,
+              did_embed_code,
+              did_agent_link,
+              did_agent_id,
+              did_client_key
+            FROM companion_mappings
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    d: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        brand = str(r["brand"] or "").strip()
+        avatar = str(r["avatar"] or "").strip()
+        if not brand or not avatar:
+            continue
+        key = (_norm_key(brand), _norm_key(avatar))
+        d[key] = {
+            "brand": brand,
+            "avatar": avatar,
+            "eleven_voice_name": (r["eleven_voice_name"] or "") if r["eleven_voice_name"] is not None else "",
+            "communication": (r["communication"] or "") if r["communication"] is not None else "",
+            "eleven_voice_id": (r["eleven_voice_id"] or "") if r["eleven_voice_id"] is not None else "",
+            "live": (r["live"] or "") if r["live"] is not None else "",
+            "did_embed_code": (r["did_embed_code"] or "") if r["did_embed_code"] is not None else "",
+            "did_agent_link": (r["did_agent_link"] or "") if r["did_agent_link"] is not None else "",
+            "did_agent_id": (r["did_agent_id"] or "") if r["did_agent_id"] is not None else "",
+            "did_client_key": (r["did_client_key"] or "") if r["did_client_key"] is not None else "",
+        }
+
+    _COMPANION_MAPPINGS = d
+    _COMPANION_MAPPINGS_LOADED_AT = time.time()
+    _COMPANION_MAPPINGS_SOURCE = db_path
+    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path}")
+
+
+def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
+    b = _norm_key(brand) or "elaralo"
+    a = _norm_key(avatar)
+    if not a:
+        return None
+
+    m = _COMPANION_MAPPINGS.get((b, a))
+    if m:
+        return m
+
+    # fallback brand → Elaralo
+    if b != "elaralo":
+        m = _COMPANION_MAPPINGS.get(("elaralo", a))
+        if m:
+            return m
+
+    # final fallback: if someone sends a composite key like "Ashley-Female-...".
+    first = a.split("-")[0].strip() if "-" in a else a
+    if first and first != a:
+        m = _COMPANION_MAPPINGS.get((b, first))
+        if m:
+            return m
+        if b != "elaralo":
+            m = _COMPANION_MAPPINGS.get(("elaralo", first))
+            if m:
+                return m
+
+    return None
+
+
+@app.on_event("startup")
+async def _startup_load_companion_mappings() -> None:
+    # Load once at startup; do not block on errors.
+    try:
+        await run_in_threadpool(_load_companion_mappings_sync)
+    except Exception as e:
+        print(f"[mappings] ERROR loading companion mappings: {e!r}")
+
+
+@app.get("/mappings/companion")
+async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
+    """Lookup a companion mapping row by (brand, avatar).
+
+    Query params:
+      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
+      - avatar: Avatar first name (e.g., "Jennifer")
+
+    Response:
+      {
+        found: bool,
+        brand: str,
+        avatar: str,
+        communication: "Audio"|"Video"|"" ,
+        live: "D-ID"|"Stream"|"" ,
+        elevenVoiceId: str,
+        elevenVoiceName: str,
+        didAgentId: str,
+        didClientKey: str,
+        didAgentLink: str,
+        didEmbedCode: str,
+        loadedAt: <unix seconds> | null,
+        source: <db path> | ""
+      }
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+
+    m = _lookup_companion_mapping(b, a)
+    if not m:
+        return {
+            "found": False,
+            "brand": b,
+            "avatar": a,
+            "communication": "",
+            "live": "",
+            "elevenVoiceId": "",
+            "elevenVoiceName": "",
+            "didAgentId": "",
+            "didClientKey": "",
+            "didAgentLink": "",
+            "didEmbedCode": "",
+            "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+            "source": _COMPANION_MAPPINGS_SOURCE,
+        }
+
+    return {
+        "found": True,
+        "brand": str(m.get("brand") or ""),
+        "avatar": str(m.get("avatar") or ""),
+        "communication": str(m.get("communication") or ""),
+        "live": str(m.get("live") or ""),
+        "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
+        "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
+        "didAgentId": str(m.get("did_agent_id") or ""),
+        "didClientKey": str(m.get("did_client_key") or ""),
+        "didAgentLink": str(m.get("did_agent_link") or ""),
+        "didEmbedCode": str(m.get("did_embed_code") or ""),
+        "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+        "source": _COMPANION_MAPPINGS_SOURCE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# BeeStreamed: Start WebRTC streams (Live=Stream companions)
+# ---------------------------------------------------------------------------
+# IMPORTANT:
+# - BeeStreamed tokens MUST NOT be exposed to the browser. The frontend calls this endpoint,
+#   and the API performs BeeStreamed authentication server-side.
+# - Authentication format per BeeStreamed docs:
+#     Authorization: Basic base64_encode({token_id}:{secret_key})
+# - Start WebRTC stream endpoint:
+#     POST https://api.beestreamed.com/events/[EVENT REF]/startwebrtcstream
+#
+# Docs: https://docs.beestreamed.com/introduction (API Overview / Authentication)
+
+
+def _extract_beestreamed_event_ref_from_url(stream_url: str) -> str:
+    """Best-effort extraction of BeeStreamed event_ref from a viewer URL.
+
+    This is intentionally flexible because BeeStreamed viewer URLs can be customized.
+    We attempt, in order:
+      1) query string parameters: event_ref / eventRef
+      2) last path segment that looks like an alphanumeric ref (6-32 chars)
+    """
+    u = (stream_url or "").strip()
+    if not u:
+        return ""
+
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return ""
+
+    try:
+        qs = parse_qs(parsed.query or "")
+        for k in ("event_ref", "eventRef", "event", "ref"):
+            v = qs.get(k)
+            if v and isinstance(v, list) and v[0]:
+                cand = str(v[0]).strip()
+                if re.fullmatch(r"[A-Za-z0-9]{6,32}", cand):
+                    return cand
+    except Exception:
+        pass
+
+    # Path fallback
+    try:
+        segments = [s for s in (parsed.path or "").split("/") if s]
+        for seg in reversed(segments):
+            seg = seg.strip()
+            if re.fullmatch(r"[A-Za-z0-9]{6,32}", seg):
+                return seg
+    except Exception:
+        pass
+
+    return ""
+
+
+@app.post("/stream/beestreamed/start")
+async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
+    """Start a BeeStreamed WebRTC stream for the configured event.
+
+    Body (JSON):
+      {
+        "stream_url": "https://..."     (optional; used to derive event_ref)
+        "event_ref": "abcd12345678"    (optional; overrides URL parsing)
+      }
+
+    Env vars (server-side only):
+      STREAM_TOKEN_ID
+      STREAM_SECRET_KEY
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    stream_url = str(raw.get("stream_url") or raw.get("streamUrl") or "").strip()
+    event_ref = str(raw.get("event_ref") or raw.get("eventRef") or "").strip()
+
+    if not event_ref:
+        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
+
+    # Optional server-side fallback (useful when the viewer URL does not contain the event_ref).
+    if not event_ref:
+        event_ref = (os.getenv("STREAM_EVENT_REF", "") or "").strip()
+
+    if not event_ref:
+        raise HTTPException(
+            status_code=400,
+            detail="BeeStreamed event_ref is required (provide event_ref, STREAM_EVENT_REF, or a stream_url containing it).",
+        )
+
+    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
+    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
+
+    if not token_id or not secret_key:
+        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
+
+    # BeeStreamed auth header: Basic base64(token_id:secret_key)
+    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
+    headers = {"Authorization": f"Basic {basic}"}
+
+    api_url = f"https://api.beestreamed.com/events/{event_ref}/startwebrtcstream"
+
+    import requests  # type: ignore
+
+    try:
+        r = requests.post(api_url, headers=headers, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed request failed: {e!r}")
+
+    if r.status_code >= 400:
+        msg = (r.text or "").strip()
+        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed error {r.status_code}: {msg[:500]}")
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {"message": (r.text or "").strip(), "status": r.status_code}
+
+    return {"ok": True, "event_ref": event_ref, "beestreamed": data}
 
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
@@ -1132,7 +1171,7 @@ def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
 
     client = OpenAI(api_key=api_key)
     resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        model=(os.getenv("SAVE_SUMMARY_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4o")),
         messages=messages,
         temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
     )
@@ -1151,7 +1190,7 @@ def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
     timeout_s = float(os.getenv("SAVE_SUMMARY_OPENAI_TIMEOUT_S", "25") or "25")
     client = OpenAI(api_key=api_key, timeout=timeout_s)
     resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        model=(os.getenv("SAVE_SUMMARY_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4o")),
         messages=messages,
         temperature=float(os.getenv("SAVE_SUMMARY_TEMPERATURE", "0.2") or "0.2"),
         max_tokens=int(os.getenv("SAVE_SUMMARY_MAX_TOKENS", "350") or "350"),
@@ -1762,13 +1801,28 @@ async def chat(request: Request):
                 state_out = dict(state_out)
                 state_out["tts_error"] = f"{type(e).__name__}: {e}"
 
-        return {
+        resp = {
             "session_id": session_id,
             "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
             "reply": reply,
             "session_state": state_out,
             "audio_url": audio_url,       # NEW (optional)
         }
+
+        # Auto-save summary (server-side) is deliberately non-blocking and MUST NOT affect TTS/STT.
+        # It runs in the background after a reply is produced and never changes frontend state.
+        try:
+            _maybe_schedule_autosave_summary(
+                session_id=session_id,
+                messages=messages,
+                assistant_reply=reply,
+                session_state=state_out,
+                status_mode=status_mode,
+            )
+        except Exception:
+            pass
+
+        return resp
 
     # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
@@ -2069,29 +2123,50 @@ def _persist_summary_store() -> None:
 _load_summary_store()
 
 
-@app.post("/chat/save-summary", response_model=None)
-async def save_chat_summary(request: Request):
-    """Saves a server-side summary of the chat history.
+# ----------------------------
+# AUTO-SAVE CHAT SUMMARY (server-side)
+# ----------------------------
+# Manual Save (frontend) intentionally pauses hands-free STT while the confirmation modal is open.
+# Auto-save runs ONLY on the backend and MUST NOT affect TTS/STT or video/audio UI state.
+#
+# Enable auto-save via environment:
+#   AUTO_SAVE_SUMMARY=1
+#
+# Optional:
+#   AUTO_SAVE_SUMMARY_BRANDS=elaralo,dulcemoon   (comma-separated; overrides AUTO_SAVE_SUMMARY if set)
+#   AUTO_SAVE_SUMMARY_MIN_SECONDS=120           (throttle per (member/session + companion) key)
+#   SAVE_SUMMARY_MODEL=gpt-4o-mini              (optional; defaults to OPENAI_MODEL)
 
-    Reliability goals:
-      - Never leave the browser with an ambiguous network failure when possible.
-      - Cap inputs to avoid oversized payloads/timeouts.
-      - Return a structured JSON response even when summarization fails.
+_AUTO_SAVE_INFLIGHT: set[str] = set()
+_AUTO_SAVE_LOCK = __import__("threading").RLock()
 
-    Request JSON:
-      { session_id, messages, session_state }
 
-    Response JSON:
-      { ok: true|false, summary?: "...", error_code?: "...", error?: "...", saved_at?: <ts>, key?: "..." }
-    """
-    debug = bool(getattr(settings, "DEBUG", False))
+def _autosave_is_enabled(session_state: Dict[str, Any]) -> bool:
+    brands = (os.getenv("AUTO_SAVE_SUMMARY_BRANDS") or "").strip()
+    if brands:
+        allowed = {_norm_key(b) for b in brands.split(",") if str(b).strip()}
+        brand = (
+            session_state.get("rebranding")
+            or session_state.get("brand")
+            or session_state.get("company")
+            or session_state.get("companyName")
+            or ""
+        )
+        return _norm_key(str(brand)) in allowed
 
-    try:
-        raw = await request.json()
-    except Exception as e:
-        return {"ok": False, "error_code": "invalid_json", "error": f"{type(e).__name__}: {e}"}
+    v = (os.getenv("AUTO_SAVE_SUMMARY") or "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
-    session_id, messages, session_state, _wants_explicit = _normalize_payload(raw)
+
+async def _save_chat_summary_internal(
+    *,
+    session_id: str,
+    messages: List[Dict[str, Any]],
+    session_state: Dict[str, Any],
+    debug: bool = False,
+    reason: str = "manual",
+) -> Dict[str, Any]:
+    """Internal implementation used by both manual Save and server-side auto-save."""
 
     # Normalize + cap the conversation for summarization to reduce cost and avoid request failures.
     max_msgs = int(os.getenv("SAVE_SUMMARY_MAX_MESSAGES", "80") or "80")
@@ -2099,13 +2174,16 @@ async def save_chat_summary(request: Request):
     per_msg_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS_PER_MESSAGE", "2000") or "2000")
 
     convo_items: List[Dict[str, str]] = []
-    for m in messages:
+    for m in (messages or []):
         role = m.get("role")
         if role in ("user", "assistant"):
             content = str(m.get("content") or "")
             if per_msg_chars > 0 and len(content) > per_msg_chars:
                 content = content[:per_msg_chars] + " …"
             convo_items.append({"role": role, "content": content})
+
+    if not convo_items:
+        return {"ok": False, "error_code": "no_messages", "error": "No user/assistant messages to summarize."}
 
     if max_msgs > 0 and len(convo_items) > max_msgs:
         convo_items = convo_items[-max_msgs:]
@@ -2117,7 +2195,6 @@ async def save_chat_summary(request: Request):
         c = m["content"]
         if total >= max_chars:
             break
-        # keep at least some of this message
         remaining = max_chars - total
         if remaining <= 0:
             break
@@ -2136,7 +2213,6 @@ async def save_chat_summary(request: Request):
 
     convo: List[Dict[str, str]] = [{"role": "system", "content": sys}] + convo_items
 
-    # Time-bound the summarization request to prevent upstream timeouts.
     timeout_s = float(os.getenv("SAVE_SUMMARY_TIMEOUT_S", "30") or "30")
     try:
         summary = await asyncio.wait_for(run_in_threadpool(_call_gpt4o_summary, convo), timeout=timeout_s)
@@ -2146,7 +2222,6 @@ async def save_chat_summary(request: Request):
         _dbg(debug, "Summary generation failed:", repr(e))
         return {"ok": False, "error_code": "summary_failed", "error": f"{type(e).__name__}: {e}"}
 
-    # Refresh from disk before write to avoid clobbering another worker's recent update.
     _refresh_summary_store_if_needed()
 
     key = _summary_store_key(session_state, session_id)
@@ -2156,11 +2231,109 @@ async def save_chat_summary(request: Request):
         "member_id": session_state.get("memberId") or session_state.get("member_id"),
         "companion": session_state.get("companion") or session_state.get("companionName") or session_state.get("companion_name"),
         "summary": summary,
+        "reason": reason,
     }
     _CHAT_SUMMARY_STORE[key] = record
     _persist_summary_store()
 
     return {"ok": True, "summary": summary, "saved_at": record["saved_at"], "key": key}
+
+
+def _maybe_schedule_autosave_summary(
+    *,
+    session_id: str,
+    messages: List[Dict[str, Any]],
+    assistant_reply: str,
+    session_state: Dict[str, Any],
+    status_mode: str,
+) -> None:
+    """Fire-and-forget auto-save that never blocks /chat and never touches frontend UX."""
+
+    # Only auto-save for successful chat turns. (Manual Save remains available for all cases.)
+    if status_mode == STATUS_BLOCKED:
+        return
+
+    if not _autosave_is_enabled(session_state):
+        return
+
+    # Skip if we don't have a stable key (unknown companion, etc.)
+    key = _summary_store_key(session_state, session_id)
+    if key.endswith("::unknown"):
+        return
+
+    # Throttle saves per key to avoid load/cost spikes.
+    min_s = float(os.getenv("AUTO_SAVE_SUMMARY_MIN_SECONDS", "120") or "120")
+    try:
+        _refresh_summary_store_if_needed()
+        rec = _CHAT_SUMMARY_STORE.get(key) or {}
+        last = int(rec.get("saved_at") or 0)
+        if last and (_now_ts() - last) < min_s:
+            return
+    except Exception:
+        # If anything about the store is odd, fail open (attempt save) rather than interrupt chat.
+        pass
+
+    with _AUTO_SAVE_LOCK:
+        if key in _AUTO_SAVE_INFLIGHT:
+            return
+        _AUTO_SAVE_INFLIGHT.add(key)
+
+    async def _runner() -> None:
+        try:
+            # Include the assistant reply so the saved summary reflects the latest turn.
+            msgs_for_summary = list(messages or [])
+            if isinstance(assistant_reply, str) and assistant_reply.strip():
+                msgs_for_summary = msgs_for_summary + [{"role": "assistant", "content": assistant_reply}]
+
+            await _save_chat_summary_internal(
+                session_id=session_id,
+                messages=msgs_for_summary,
+                session_state=session_state,
+                debug=False,
+                reason="auto",
+            )
+        except Exception:
+            # Never let auto-save errors affect chat UX.
+            return
+        finally:
+            with _AUTO_SAVE_LOCK:
+                _AUTO_SAVE_INFLIGHT.discard(key)
+
+    try:
+        asyncio.create_task(_runner())
+    except RuntimeError:
+        # No running loop: don't crash; just skip.
+        with _AUTO_SAVE_LOCK:
+            _AUTO_SAVE_INFLIGHT.discard(key)
+        return
+
+
+@app.post("/chat/save-summary", response_model=None)
+async def save_chat_summary(request: Request):
+    """
+    Create (or refresh) a compact summary of the current conversation and persist it server-side.
+
+    IMPORTANT:
+    - The *frontend* manual Save flow pauses hands-free STT while the user confirms.
+    - The *backend* summary generation (this endpoint and auto-save) never touches TTS/STT state.
+    """
+
+    debug = (os.getenv("DEBUG_SAVE_SUMMARY") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    try:
+        raw = await request.json()
+    except Exception:
+        return {"ok": False, "error_code": "invalid_json", "error": "Invalid JSON body."}
+
+    session_id, messages, session_state, _wants_explicit = _normalize_payload(raw)
+
+    return await _save_chat_summary_internal(
+        session_id=session_id,
+        messages=messages,
+        session_state=session_state,
+        debug=debug,
+        reason="manual",
+    )
 
 
 # ----------------------------
