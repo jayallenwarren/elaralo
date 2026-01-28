@@ -66,31 +66,6 @@ const SaveIcon = ({ size = 18 }: { size?: number }) => (
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
-// ----------------------------
-// Background chat-summary journaling (Option B)
-// ----------------------------
-// Turn count = number of user messages (each user message is a "turn").
-type JournalEntry = Msg & { ts: number };
-type SummaryJournal = {
-  entries: JournalEntry[];
-  // How many items from `messages` have been mirrored into `entries`.
-  lastProcessedLen: number;
-  // Current number of user turns (user messages).
-  turnCount: number;
-  // The last user turn count that has been persisted via /chat/save-summary.
-  lastSavedTurnCount: number;
-  // Epoch ms when the last autosave succeeded.
-  lastSavedAtMs: number;
-  // Optional key returned by the backend.
-  lastSavedKey: string | null;
-};
-
-function countUserTurns(msgs: Array<{ role: Role }>): number {
-  let n = 0;
-  for (const m of msgs) if (m?.role === "user") n += 1;
-  return n;
-}
-
 type Mode = "friend" | "romantic" | "intimate";
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
@@ -109,30 +84,6 @@ type ChatApiResponse = {
   reply: string;
   mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
   session_state?: Partial<SessionState>;
-};
-
-type UsageStatusResponse = {
-  ok: boolean;
-  reply: string;
-
-  // Mirrors the backend quota counters (minutes, not seconds)
-  minutes_used: number;
-  minutes_allowed: number;
-  minutes_remaining: number;
-
-  // Helpful context
-  is_trial?: boolean;
-  plan_name?: string;
-
-  // Optional purchase/upgrade hints
-  upgrade_url?: string;
-  payg_pay_url?: string;
-  payg_increment_minutes?: number;
-  payg_price_text?: string;
-
-  // Cycle metadata (memberships only)
-  cycle_days?: number;
-  cycle_resets_in_days?: number | null;
 };
 
 type PlanName =
@@ -178,11 +129,15 @@ function normalizePlanName(raw: any): PlanName {
   }
 }
 
-function displayPlanLabel(planName: PlanName, memberId: string): string {
+function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverride?: string): string {
   const hasMemberId = Boolean((memberId || "").trim());
 
   // Requirement: If we do not have a memberId, the visitor is on Trial, shown as "Free Trial".
   if (!hasMemberId) return "Free Trial";
+
+  // If a white-label site supplies its own plan name, prefer showing that (UI label only).
+  const override = String(planLabelOverride || "").trim();
+  if (override) return override;
 
   // Requirement: Unknown / Not Provided only when the plan information for a member is not provided.
   if (!planName) return "Unknown / Not Provided";
@@ -268,7 +223,97 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
 const DEFAULT_COMPANY_NAME = "Elaralo";
-const REBRANDING_QUERY_PARAM = "rebranding";
+
+// Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
+const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
+
+// Back-compat: older embeds/tests may still pass ?rebranding=BrandName
+const LEGACY_REBRANDING_QUERY_PARAM = "rebranding";
+
+// Public asset root for white-label rebrands
+const REBRANDING_PUBLIC_DIR = "/rebranding";
+
+type RebrandingKeyParts = {
+  rebranding: string;
+  upgradeLink: string;
+  payGoLink: string;
+  payGoPrice: string;
+  payGoMinutes: string;
+  plan: string;
+  elaraloPlanMap: string;
+  freeMinutes: string;
+  cycleDays: string;
+};
+
+function stripRebrandingKeyLabel(part: string): string {
+  const s = String(part || "").trim();
+  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon")
+  const m = s.match(/^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$/);
+  return m ? String(m[1] || "").trim() : s;
+}
+
+function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
+  const v = String(raw || "").trim();
+  if (!v) return null;
+
+  // Legacy support: if there is no "|" delimiter, treat this as just the brand name.
+  if (!v.includes("|")) {
+    const brand = stripRebrandingKeyLabel(v);
+    return {
+      rebranding: brand,
+      upgradeLink: "",
+      payGoLink: "",
+      payGoPrice: "",
+      payGoMinutes: "",
+      plan: "",
+      elaraloPlanMap: "",
+      freeMinutes: "",
+      cycleDays: "",
+    };
+  }
+
+  const parts = v.split("|").map((p) => stripRebrandingKeyLabel(p));
+
+  const [
+    rebranding = "",
+    upgradeLink = "",
+    payGoLink = "",
+    payGoPrice = "",
+    payGoMinutes = "",
+    plan = "",
+    elaraloPlanMap = "",
+    freeMinutes = "",
+    cycleDays = "",
+  ] = parts;
+
+  return {
+    rebranding: String(rebranding || "").trim(),
+    upgradeLink: String(upgradeLink || "").trim(),
+    payGoLink: String(payGoLink || "").trim(),
+    payGoPrice: String(payGoPrice || "").trim(),
+    payGoMinutes: String(payGoMinutes || "").trim(),
+    plan: String(plan || "").trim(),
+    elaraloPlanMap: String(elaraloPlanMap || "").trim(),
+    freeMinutes: String(freeMinutes || "").trim(),
+    cycleDays: String(cycleDays || "").trim(),
+  };
+}
+
+function normalizeRebrandingSlug(rawBrand: string): string {
+  const raw = String(rawBrand || "").trim();
+  if (!raw) return "";
+
+  // Match the prior logo normalization rules so:
+  // - "Dulce Moon" and "DulceMoon" both -> "dulcemoon"
+  // - also works if someone includes an extension or "-logo" suffix
+  const normalizedBase = raw
+    .replace(/\.(png|jpg|jpeg|webp)$/i, "")
+    .replace(/-logo$/i, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+
+  return normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
 
 function getAppBasePathFromAsset(assetPath: string): string {
   const p = String(assetPath || "");
@@ -291,12 +336,6 @@ function joinUrlPrefix(prefix: string, path: string): string {
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-
-// Autosave summary (debounced) settings.
-// These only affect background /chat/save-summary calls. Manual Save button behavior is unchanged.
-const AUTO_SAVE_SUMMARY_DEBOUNCE_MS = 12_000;
-const AUTO_SAVE_SUMMARY_MIN_INTERVAL_MS = 15_000;
-const AUTO_SAVE_SUMMARY_MIN_NEW_TURNS = 1;
 
 type Phase1AvatarMedia = {
   didAgentId: string;
@@ -489,20 +528,39 @@ function parseCompanionMeta(raw: string): CompanionMeta {
   };
 }
 
-function buildAvatarCandidates(companionKeyOrName: string) {
+function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: string) {
   const raw = (companionKeyOrName || "").trim();
   const normalized = normalizeKeyForFile(stripExt(raw));
-  const base = normalized ? `${HEADSHOT_DIR}/${encodeURIComponent(normalized)}` : "";
+  const enc = normalized ? encodeURIComponent(normalized) : "";
 
   const candidates: string[] = [];
-  if (base) {
+
+  if (enc) {
+    // Rebrand-specific headshots (preferred when RebrandingKey is present):
+    //   /rebranding/<brand>/companion/headshot/<CompanionName>.{jpeg|jpg|png}
+    const slug = String(rebrandingSlug || "").trim();
+    if (slug) {
+      const rebrandBase = joinUrlPrefix(
+        APP_BASE_PATH,
+        `${REBRANDING_PUBLIC_DIR}/${encodeURIComponent(slug)}${HEADSHOT_DIR}/${enc}`
+      );
+      candidates.push(`${rebrandBase}.jpeg`);
+      candidates.push(`${rebrandBase}.jpg`);
+      candidates.push(`${rebrandBase}.png`);
+    }
+
+    // Default (non-rebranded) headshots:
+    //   /companion/headshot/<CompanionName>.{jpeg|jpg|png}
+    const base = joinUrlPrefix(APP_BASE_PATH, `${HEADSHOT_DIR}/${enc}`);
     candidates.push(`${base}.jpeg`);
     candidates.push(`${base}.jpg`);
     candidates.push(`${base}.png`);
   }
+
   candidates.push(DEFAULT_AVATAR);
   return candidates;
 }
+
 
 async function pickFirstExisting(urls: string[]) {
   for (const url of urls) {
@@ -638,42 +696,6 @@ function normalizeMode(raw: any): Mode | null {
 
   return null;
 }
-
-
-function isUsageMinutesInquiry(text: string): boolean {
-  const t = String(text || "").trim().toLowerCase();
-  if (!t) return false;
-
-  // We want to catch "minutes remaining on my plan" style questions,
-  // while avoiding false positives like "give me five minutes".
-  const hasMinutes = /\bminute(s)?\b/.test(t);
-  const hasTime = /\btime\b/.test(t);
-
-  const aboutRemaining =
-    /\b(remaining|left|available|balance|credit|quota|usage|allowance)\b/.test(t) ||
-    /\bhow (many|much)\b/.test(t) ||
-    /\bdo i have\b/.test(t);
-
-  const aboutPlanOrTalking =
-    /\b(plan|trial|membership|subscription)\b/.test(t) ||
-    /\b(speak|talk|chat|conversation)\b/.test(t) ||
-    /\bwith you\b/.test(t);
-
-  // "How many minutes do I have left?"
-  if ((hasMinutes || hasTime) && aboutRemaining && aboutPlanOrTalking) return true;
-
-  // Common short forms
-  if (/\b(minutes? (left|remaining)|time (left|remaining))\b/.test(t)) return true;
-
-  // "Check my minutes" / "Show my remaining time"
-  if (/\b(check|show|tell|what('?s| is))\b/.test(t) && /\b(minutes?|time)\b/.test(t) && aboutRemaining) return true;
-
-  // "How long can we talk?" (no explicit minutes word)
-  if (/\bhow (long|much longer)\b/.test(t) && /\b(talk|speak|chat|conversation)\b/.test(t) && aboutPlanOrTalking) return true;
-
-  return false;
-}
-
 
 
 export default function Page() {
@@ -1032,20 +1054,38 @@ export default function Page() {
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
-  // Optional white-label rebranding (company name + default logo only; does NOT touch companion logic)
-  const [rebrandingName, setRebrandingName] = useState<string>("");
+
+  // Optional white-label rebranding:
+  // - Wix provides a single RebrandingKey string with "|" separated fields.
+  // - If RebrandingKey has a value, we use it to drive branding assets + upgrade/pay links.
+  // - This MUST NOT change companion persona logic.
+  const [rebrandingKey, setRebrandingKey] = useState<string>("");
+  const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
+
+  const rebrandingName = String(rebrandingInfo?.rebranding || "").trim();
+  const rebrandingSlug = useMemo(() => normalizeRebrandingSlug(rebrandingName), [rebrandingName]);
+
+  // Upgrade URL (defaults to env; overridden by RebrandingKey when present)
+  const upgradeUrl = useMemo(() => {
+    const u = String(rebrandingInfo?.upgradeLink || "").trim();
+    return u || UPGRADE_URL;
+  }, [rebrandingInfo]);
+
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = ((rebrandingName || "").trim() || DEFAULT_COMPANY_NAME);
+  const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
-  // Read `?rebranding=...` for direct testing (outside Wix).
-  // In production, Wix should pass { rebranding: "BrandName" } via postMessage.
+  // Read `?rebrandingKey=...` for direct testing (outside Wix).
+  // Back-compat: also accept `?rebranding=BrandName`.
+  // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
   useEffect(() => {
     try {
       const u = new URL(window.location.href);
-      const q = u.searchParams.get(REBRANDING_QUERY_PARAM);
-      if (q && q.trim()) setRebrandingName(q.trim());
+      const qKey = u.searchParams.get(REBRANDING_KEY_QUERY_PARAM);
+      const qLegacy = u.searchParams.get(LEGACY_REBRANDING_QUERY_PARAM);
+      const q = String(qKey || "").trim() || String(qLegacy || "").trim();
+      if (q) setRebrandingKey(q);
     } catch {
       // ignore
     }
@@ -1054,10 +1094,11 @@ export default function Page() {
   // Resolve the default company logo when rebranding is active.
   // This only affects the header circle image when no companion image is available.
   useEffect(() => {
-    const raw = (rebrandingName || "").trim();
+    const rawBrand = (rebrandingName || "").trim();
+    const slug = (rebrandingSlug || "").trim();
 
     // No rebranding: revert to the default Elaralo logo.
-    if (!raw) {
+    if (!rawBrand) {
       setCompanyLogoSrc(DEFAULT_AVATAR);
 
       // Keep the header image in sync if we are currently showing a company logo.
@@ -1065,7 +1106,12 @@ export default function Page() {
       setAvatarSrc((prev) => {
         const p = String(prev || "").trim();
         if (!p) return DEFAULT_AVATAR;
-        if (p.startsWith(`${HEADSHOT_DIR}/`)) return prev;
+
+        // Covers both:
+        // - "/companion/headshot/..."
+        // - "/rebranding/<brand>/companion/headshot/..."
+        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
+
         if (p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
 
         // If we were previously showing a rebrand logo, revert to default.
@@ -1077,23 +1123,21 @@ export default function Page() {
       return;
     }
 
-    // Normalize the rebranding name into a filename base:
-    // - strip extension
-    // - strip trailing "-logo"
-    // - lowercase
-    // - remove non-alphanumerics so "Dulce Moon" and "DulceMoon" => "dulcemoon"
-    const normalizedBase = raw
-      .replace(/\.(png|jpg|jpeg|webp)$/i, "")
-      .replace(/-logo$/i, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "");
-
-    const base = normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const base = slug || normalizeRebrandingSlug(rawBrand);
 
     const candidates: string[] = [];
     if (base) {
-      // IMPORTANT: Logo assets live in frontend/public, which resolves to the site root at runtime.
-      // Use the same basePath prefix as Next's imported assets so this works in all deployments.
+      // IMPORTANT:
+      // - Logo assets live under frontend/public.
+      // - For rebrands, the logo is now located under:
+      //     /rebranding/<brand>/<brand>-logo.(png|jpg|jpeg|webp)
+      // - We keep a legacy fallback for older deployments where the logo lived at site root.
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.png`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpg`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpeg`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.webp`));
+
+      // Legacy fallback: root-level logo
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.png`));
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpg`));
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpeg`));
@@ -1115,7 +1159,10 @@ export default function Page() {
       setAvatarSrc((prev) => {
         const p = String(prev || "").trim();
         if (!p) return picked;
-        if (p.startsWith(`${HEADSHOT_DIR}/`)) return prev;
+
+        // Covers both default + rebrand headshots.
+        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
+
         if (p === DEFAULT_AVATAR) return picked;
 
         // If we were showing some other "-logo.*" asset, treat it as a company logo and swap it.
@@ -1128,7 +1175,7 @@ export default function Page() {
     return () => {
       cancelled = true;
     };
-  }, [rebrandingName]);
+  }, [rebrandingName, rebrandingSlug]);
 
 
 // ----------------------------
@@ -2180,7 +2227,7 @@ const speakAssistantReply = useCallback(
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
   const [sessionState, setSessionState] = useState<SessionState>({
-    mode: "friend",
+    mode: "romantic",
     model: "gpt-4o",
     adult_verified: false,
     romance_consented: false,
@@ -2196,205 +2243,7 @@ const speakAssistantReply = useCallback(
   const [showModePicker, setShowModePicker] = useState(false);
   const [setModeFlash, setSetModeFlash] = useState(false);
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
-  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
-
-  // -----------------------
-  // Background summary journaling (Option B)
-  //
-  // Goal:
-  //  - Maintain a "journal" of inbound/outbound messages in a ref
-  //  - Debounce /chat/save-summary calls so they happen silently in the background
-  //
-  // Constraints:
-  //  - MUST NOT touch any STT/TTS start/stop code paths.
-  //  - Manual Save button UX remains unchanged.
-  // -----------------------
-  const summaryJournalRef = useRef<SummaryJournal>({
-    entries: [],
-    lastProcessedLen: 0,
-    turnCount: 0,
-    lastSavedTurnCount: 0,
-    lastSavedAtMs: 0,
-    lastSavedKey: null,
-  });
-  // IMPORTANT (TypeScript): In Next.js builds that include both DOM + Node typings,
-  // `setTimeout` can be typed as returning NodeJS.Timeout, while `window.setTimeout`
-  // returns a number. Since this is a client component and we call `window.setTimeout`,
-  // store the timer id as a number to avoid TS errors in CI.
-  const autoSaveSummaryTimerRef = useRef<number | null>(null);
-  const autoSaveSummaryInFlightRef = useRef<boolean>(false);
-  const autoSaveSummaryLastErrorRef = useRef<string | null>(null);
-
-  // Always-current pointer to the save-summary function (avoids stale closures in timers).
-  const callSaveChatSummaryRef = useRef<null | ((nextMessages: Msg[], stateToSend: SessionState) => Promise<any>)>(null);
-
-  // Mirror a few pieces of state into refs so the autosave runner can stay ref-driven.
-  const sessionStateForAutosaveRef = useRef<SessionState>(sessionState);
-  const loadingForAutosaveRef = useRef<boolean>(loading);
-  const showSaveConfirmForAutosaveRef = useRef<boolean>(showSaveSummaryConfirm);
-  const showClearConfirmForAutosaveRef = useRef<boolean>(showClearMessagesConfirm);
-  const savingSummaryForAutosaveRef = useRef<boolean>(savingSummary);
-
-  useEffect(() => {
-    sessionStateForAutosaveRef.current = sessionState;
-  }, [sessionState]);
-  useEffect(() => {
-    loadingForAutosaveRef.current = loading;
-  }, [loading]);
-  useEffect(() => {
-    showSaveConfirmForAutosaveRef.current = showSaveSummaryConfirm;
-  }, [showSaveSummaryConfirm]);
-  useEffect(() => {
-    showClearConfirmForAutosaveRef.current = showClearMessagesConfirm;
-  }, [showClearMessagesConfirm]);
-  useEffect(() => {
-    savingSummaryForAutosaveRef.current = savingSummary;
-  }, [savingSummary]);
-
-  async function runAutoSaveSummary(reason: string) {
-    if (!API_BASE) return;
-
-    // Never overlap autosaves.
-    if (autoSaveSummaryInFlightRef.current) return;
-
-    // Don't fight with the manual Save flow.
-    if (savingSummaryForAutosaveRef.current) return;
-    if (showSaveConfirmForAutosaveRef.current) return;
-
-    // Don't autosave while a clear-confirm modal is up (avoid surprise network work).
-    if (showClearConfirmForAutosaveRef.current) return;
-
-    // Wait until the assistant reply has landed and we're not mid-request.
-    if (loadingForAutosaveRef.current) return;
-
-    const journal = summaryJournalRef.current;
-    const snapshot: Msg[] = journal.entries.map((e) => ({ role: e.role, content: e.content }));
-    if (snapshot.length < 2) return;
-
-    // Autosave only when the most recent message is from the assistant.
-    if (snapshot[snapshot.length - 1]?.role !== "assistant") return;
-
-    const turnCount = countUserTurns(snapshot);
-    journal.turnCount = turnCount;
-
-    // Only save when we have at least N new user turns since the last successful save.
-    if (turnCount - journal.lastSavedTurnCount < AUTO_SAVE_SUMMARY_MIN_NEW_TURNS) return;
-
-    const now = Date.now();
-    if (journal.lastSavedAtMs && now - journal.lastSavedAtMs < AUTO_SAVE_SUMMARY_MIN_INTERVAL_MS) return;
-
-    const saver = callSaveChatSummaryRef.current;
-    if (!saver) return;
-
-    autoSaveSummaryInFlightRef.current = true;
-    try {
-      const res = await saver(snapshot, sessionStateForAutosaveRef.current);
-      journal.lastSavedTurnCount = turnCount;
-      journal.lastSavedAtMs = Date.now();
-      if (res && typeof res.key === "string") journal.lastSavedKey = res.key;
-      autoSaveSummaryLastErrorRef.current = null;
-
-      if (debugEnabledRef.current) {
-        console.log("[ELARALO] autosave summary ok", {
-          reason,
-          turnCount,
-          key: res?.key,
-          saved_at: res?.saved_at,
-        });
-      }
-    } catch (e: any) {
-      const msg = e?.message ? String(e.message) : String(e);
-      autoSaveSummaryLastErrorRef.current = msg;
-      if (debugEnabledRef.current) {
-        console.warn("[ELARALO] autosave summary failed", { reason, error: msg });
-      }
-    } finally {
-      autoSaveSummaryInFlightRef.current = false;
-    }
-  }
-
-  const scheduleAutoSaveSummary = useCallback((reason: string) => {
-    if (typeof window === "undefined") return;
-    if (!API_BASE) return;
-
-    if (autoSaveSummaryTimerRef.current) {
-      window.clearTimeout(autoSaveSummaryTimerRef.current);
-    }
-
-    autoSaveSummaryTimerRef.current = window.setTimeout(() => {
-      void runAutoSaveSummary(reason);
-    }, AUTO_SAVE_SUMMARY_DEBOUNCE_MS);
-  }, []);
-
-  // Keep the journal in sync with the rendered chat (mirror new messages only).
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const journal = summaryJournalRef.current;
-
-    // Full reset on clear.
-    if (messages.length === 0) {
-      journal.entries = [];
-      journal.lastProcessedLen = 0;
-      journal.turnCount = 0;
-      journal.lastSavedTurnCount = 0;
-      journal.lastSavedAtMs = 0;
-      journal.lastSavedKey = null;
-      autoSaveSummaryLastErrorRef.current = null;
-
-      if (autoSaveSummaryTimerRef.current) {
-        window.clearTimeout(autoSaveSummaryTimerRef.current);
-        autoSaveSummaryTimerRef.current = null;
-      }
-      return;
-    }
-
-    // If messages were shortened/replaced, rebuild the journal from scratch.
-    if (messages.length < journal.lastProcessedLen) {
-      const ts = Date.now();
-      journal.entries = messages.map((m) => ({ role: m.role, content: m.content, ts }));
-      journal.lastProcessedLen = messages.length;
-      journal.turnCount = countUserTurns(messages);
-      scheduleAutoSaveSummary("journal_rebuild");
-      return;
-    }
-
-    // No change.
-    if (messages.length === journal.lastProcessedLen) return;
-
-    // Mirror only the new tail.
-    const added = messages.slice(journal.lastProcessedLen);
-    const ts = Date.now();
-    for (const m of added) {
-      journal.entries.push({ role: m.role, content: m.content, ts });
-    }
-    journal.lastProcessedLen = messages.length;
-    journal.turnCount = countUserTurns(messages);
-
-    // Debounced background autosave. The runner will no-op until conditions are safe.
-    scheduleAutoSaveSummary("messages_changed");
-  }, [messages, scheduleAutoSaveSummary]);
-
-  // If the user opens a confirmation modal, cancel any pending autosave timer.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (!showSaveSummaryConfirm && !showClearMessagesConfirm) return;
-    if (autoSaveSummaryTimerRef.current) {
-      window.clearTimeout(autoSaveSummaryTimerRef.current);
-      autoSaveSummaryTimerRef.current = null;
-    }
-  }, [showSaveSummaryConfirm, showClearMessagesConfirm]);
-
-  // Cleanup timer on unmount.
-  useEffect(() => {
-    return () => {
-      if (typeof window === "undefined") return;
-      if (autoSaveSummaryTimerRef.current) {
-        window.clearTimeout(autoSaveSummaryTimerRef.current);
-        autoSaveSummaryTimerRef.current = null;
-      }
-    };
-  }, []);
+  const [allowedModes, setAllowedModes] = useState<Mode[]>(allowedModesForPlan("Trial"));
 
   const goToMyElara = useCallback(() => {
     const url = "https://www.elaralo.com/myelara";
@@ -2423,7 +2272,7 @@ const speakAssistantReply = useCallback(
   }, []);
 
   const goToUpgrade = useCallback(() => {
-    const url = UPGRADE_URL;
+    const url = upgradeUrl;
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
     // so we leave the embed and avoid “stacked headers”.
@@ -2446,7 +2295,7 @@ const speakAssistantReply = useCallback(
 
     // Fallback: navigate the current frame.
     window.location.href = url;
-  }, []);
+  }, [upgradeUrl]);
 
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
@@ -2579,7 +2428,7 @@ useEffect(() => {
     const modeLabel = MODE_LABELS[requestedMode];
     const msg =
       `The requested mode (${modeLabel}) isn't available on your current plan. ` +
-      `Please upgrade here: ${UPGRADE_URL} or click the upgrade button below the text input box`;
+      `Please upgrade here: ${upgradeUrl} or click the upgrade button below the text input box`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
@@ -2594,15 +2443,29 @@ useEffect(() => {
 
       const incomingPlan = normalizePlanName((data as any).planName);
 
-      // Optional white-label brand handoff from Wix (company name + default logo only).
-      // This MUST NOT affect companion selection or persona logic.
-      if ("rebranding" in (data as any)) {
-        const incomingRebranding =
-          typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
-        setRebrandingName(incomingRebranding);
+      // Preferred white-label handoff from Wix: a single "|" separated RebrandingKey.
+      // Back-compat: older Wix sites may still send `rebranding` (brand name only).
+      const hasRebrandingKeyField =
+        "rebrandingKey" in (data as any) || "RebrandingKey" in (data as any) || "rebranding" in (data as any);
+
+      const incomingRebrandingKey =
+        typeof (data as any).rebrandingKey === "string"
+          ? String((data as any).rebrandingKey).trim()
+          : typeof (data as any).RebrandingKey === "string"
+            ? String((data as any).RebrandingKey).trim()
+            : typeof (data as any).rebranding === "string"
+              ? String((data as any).rebranding).trim()
+              : "";
+
+      // Persist the raw key so the rest of the app (logo/headshots/upgrade link) can use it.
+      // If the field exists but is empty, this also clears prior rebranding.
+      if (hasRebrandingKeyField) {
+        setRebrandingKey(incomingRebrandingKey);
       }
 
-
+      const parsedRebrandingKey = parseRebrandingKey(incomingRebrandingKey);
+      const planMapFromKey = normalizePlanName(parsedRebrandingKey?.elaraloPlanMap);
+      const incomingRebrandingSlug = normalizeRebrandingSlug(parsedRebrandingKey?.rebranding || "");
 
       const incomingMemberId =
         typeof (data as any).memberId === "string"
@@ -2612,7 +2475,9 @@ useEffect(() => {
             : "";
       setMemberId(incomingMemberId);
 
-      const effectivePlan: PlanName = incomingMemberId ? incomingPlan : "Trial";
+      // For members, prefer the plan mapping from RebrandingKey (ElaraloPlanMap).
+      // If not present, fall back to Wix's planName (legacy).
+      const effectivePlan: PlanName = incomingMemberId ? (planMapFromKey || incomingPlan) : "Trial";
       setPlanName(effectivePlan);
 
       const incomingCompanion =
@@ -2646,7 +2511,7 @@ useEffect(() => {
         }));
       }
 
-      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME);
+      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, incomingRebrandingSlug);
       pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       const nextAllowed = allowedModesForPlan(effectivePlan);
@@ -2713,49 +2578,7 @@ const stateToSendWithCompanion: SessionState = {
     return (await res.json()) as ChatApiResponse;
   }
 
-
-  async function callUsageStatus(stateToSend: SessionState): Promise<UsageStatusResponse> {
-    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
-
-    const session_id =
-      sessionIdRef.current ||
-      (crypto as any).randomUUID?.() ||
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-    // Ensure backend receives the selected companion so it can apply the correct persona
-    // (and return the correct plan label / rebranding info if applicable).
-    const companionForBackend =
-      (companionKey || "").trim() ||
-      (companionName || DEFAULT_COMPANION_NAME).trim() ||
-      DEFAULT_COMPANION_NAME;
-
-    const stateToSendWithCompanion: SessionState = {
-      ...stateToSend,
-      companion: companionForBackend,
-      // Backward/forward compatibility with any backend expecting different field names
-      companionName: companionForBackend,
-      companion_name: companionForBackend,
-      // Member identity (from Wix)
-      memberId: (memberId || "").trim(),
-      member_id: (memberId || "").trim(),
-    };
-
-    const res = await fetch(`${API_BASE}/usage/status`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id,
-        session_state: stateToSendWithCompanion,
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Backend error ${res.status}: ${errText}`);
-    }
-
-    return (await res.json()) as UsageStatusResponse;
-  }  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
+  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const session_id =
@@ -2780,6 +2603,28 @@ const stateToSendWithCompanion: SessionState = {
       plan: effectivePlanForBackend,
       memberId: (memberId || "").trim(),
       member_id: (memberId || "").trim(),
+      // Optional white-label handoff (RebrandingKey). The backend uses this to override upgrade/pay links and billing settings.
+      rebrandingKey: String(rebrandingKey || "").trim(),
+      rebranding_key: String(rebrandingKey || "").trim(),
+
+      // Parsed fields (sent redundantly for readability/debugging; backend can also parse rebrandingKey directly).
+      rebranding: String(rebrandingInfo?.rebranding || "").trim(),
+      upgradeLink: String(rebrandingInfo?.upgradeLink || "").trim(),
+      upgrade_link: String(rebrandingInfo?.upgradeLink || "").trim(),
+      payGoLink: String(rebrandingInfo?.payGoLink || "").trim(),
+      pay_go_link: String(rebrandingInfo?.payGoLink || "").trim(),
+      payGoPrice: String(rebrandingInfo?.payGoPrice || "").trim(),
+      pay_go_price: String(rebrandingInfo?.payGoPrice || "").trim(),
+      payGoMinutes: String(rebrandingInfo?.payGoMinutes || "").trim(),
+      pay_go_minutes: String(rebrandingInfo?.payGoMinutes || "").trim(),
+      rebrandingPlan: String(rebrandingInfo?.plan || "").trim(),
+      rebranding_plan: String(rebrandingInfo?.plan || "").trim(),
+      elaraloPlanMap: String(rebrandingInfo?.elaraloPlanMap || "").trim(),
+      elaralo_plan_map: String(rebrandingInfo?.elaraloPlanMap || "").trim(),
+      freeMinutes: String(rebrandingInfo?.freeMinutes || "").trim(),
+      free_minutes: String(rebrandingInfo?.freeMinutes || "").trim(),
+      cycleDays: String(rebrandingInfo?.cycleDays || "").trim(),
+      cycle_days: String(rebrandingInfo?.cycleDays || "").trim(),
     };
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
@@ -2799,10 +2644,6 @@ const stateToSendWithCompanion: SessionState = {
 
     return (await res.json()) as any;
   }
-
-  // Keep an always-current function pointer for debounced background autosave timers.
-  // (Avoids stale closures without touching any STT/TTS code paths.)
-  callSaveChatSummaryRef.current = callSaveChatSummary;
 
   // This is the mode that drives the UI highlight:
   // - If backend is asking for intimate consent, keep intimate pill highlighted
@@ -2888,129 +2729,6 @@ const stateToSendWithCompanion: SessionState = {
     const userMsg: Msg = { role: "user", content: outgoingText };
     const nextMessages: Msg[] = [...messages, userMsg];
 
-
-    // Handle "minutes remaining" questions locally (no OpenAI round-trip).
-    // This keeps the response fast and avoids touching the /chat pipeline.
-    if (isUsageMinutesInquiry(outgoingText)) {
-      // If speech-to-text is active, pause it and resume after speaking finishes.
-      const resumeSttAfter = sttEnabledRef.current;
-      let resumeScheduled = false;
-      if (resumeSttAfter) {
-        pauseSpeechToText();
-
-        // Defensive: clear any in-progress transcript to avoid accidental duplicate sends.
-        sttFinalRef.current = "";
-        sttInterimRef.current = "";
-      }
-
-      setMessages(nextMessages);
-      setInput("");
-      setLoading(true);
-
-      try {
-        const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
-        const data = await callUsageStatus(sendState);
-
-        // If the user hit "Clear Messages" while we were waiting on the response,
-        // ignore this result and do not append it to a cleared chat.
-        if (epochAtStart !== clearEpochRef.current) return;
-
-        // Mirror quota counters into session state (useful for UI/debug).
-        setSessionState((prev) => ({
-          ...(prev as any),
-          minutes_used: typeof data.minutes_used === "number" ? data.minutes_used : (prev as any).minutes_used,
-          minutes_allowed:
-            typeof data.minutes_allowed === "number" ? data.minutes_allowed : (prev as any).minutes_allowed,
-          minutes_remaining:
-            typeof data.minutes_remaining === "number" ? data.minutes_remaining : (prev as any).minutes_remaining,
-          minutes_exhausted: !data.ok,
-        }));
-
-        const replyText = String(data.reply || "");
-        let assistantCommitted = false;
-        const commitAssistantMessage = () => {
-          if (assistantCommitted) return;
-          assistantCommitted = true;
-          setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
-        };
-
-        // Guard against STT feedback: ignore any recognition results until after speech finishes.
-        const estimateSpeechMs = (text: string) => {
-          const words = text.trim().split(/\s+/).filter(Boolean).length;
-          const wpm = 160;
-          const baseMs = (words / wpm) * 60_000;
-          const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
-          return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
-        };
-        const estimatedSpeechMs = estimateSpeechMs(replyText);
-
-        const hooks: SpeakAssistantHooks = {
-          onWillSpeak: () => {
-            // We'll treat "speaking" the same whether it's Live Avatar or local audio-only.
-            if (!assistantCommitted) {
-              commitAssistantMessage();
-              assistantCommitted = true;
-            }
-
-            // Block STT from capturing the assistant speech.
-            if (sttEnabledRef.current) {
-              const now = Date.now();
-              const ignoreMs = estimatedSpeechMs + 1200;
-              sttIgnoreUntilRef.current = Math.max(sttIgnoreUntilRef.current || 0, now + ignoreMs);
-            }
-          },
-          onDidNotSpeak: () => {
-            // If we can't speak, still show the assistant message immediately.
-            if (!assistantCommitted) {
-              commitAssistantMessage();
-              assistantCommitted = true;
-            }
-          },
-        };
-
-        const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
-        const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
-
-        const canLiveAvatarSpeak =
-          avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
-
-        // Audio-only TTS is only played in hands-free STT mode (mic button enabled),
-        // when Live Avatar is NOT speaking.
-        const shouldUseLocalTts = !canLiveAvatarSpeak && sttEnabledRef.current;
-
-        const speakPromise = (canLiveAvatarSpeak
-          ? speakAssistantReply(replyText, hooks)
-          : shouldUseLocalTts
-            ? speakLocalTtsReply(replyText, voiceId, hooks)
-            : (hooks.onDidNotSpeak(), Promise.resolve())
-        ).catch(() => {
-          // If something goes wrong, just fall back to showing text.
-          hooks.onDidNotSpeak();
-        });
-
-        // If STT is enabled, resume listening only after speech finishes.
-        if (resumeSttAfter) {
-          resumeScheduled = true;
-          speakPromise.finally(() => {
-            if (sttEnabledRef.current) resumeSpeechToText();
-          });
-        }
-      } catch (err: any) {
-        if (epochAtStart !== clearEpochRef.current) return;
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
-        ]);
-      } finally {
-        setLoading(false);
-        if (resumeSttAfter && !resumeScheduled) {
-          // No speech was triggered (e.g., request failed). Resume immediately.
-          if (sttEnabledRef.current) resumeSpeechToText();
-        }
-      }
-
-      return;
-    }
     // If speech-to-text "hands-free" mode is enabled, pause recognition while we send
     // and while the avatar speaks. We'll auto-resume after speaking finishes.
     const resumeSttAfter = sttEnabledRef.current;
@@ -4495,7 +4213,7 @@ const speakGreetingIfNeeded = useCallback(
           <h1 style={{ margin: 0, fontSize: 22 }}>{companyName}</h1>
           <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-            <b>{displayPlanLabel(planName, memberId)}</b>
+            <b>{displayPlanLabel(planName, memberId, rebrandingInfo?.plan)}</b>
           </div>
           <div style={{ fontSize: 12, color: "#666" }}>
             Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
