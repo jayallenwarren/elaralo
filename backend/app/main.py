@@ -2315,3 +2315,160 @@ async def stt_transcribe(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
 
+
+
+# =============================================================================
+# Option B — Separate Journaling Endpoint (does NOT touch /chat or TTS/STT)
+# =============================================================================
+#
+# Goal:
+#   Capture *copies* of incoming/outgoing messages to an append-only journal store.
+#   Summaries (manual or automated) can later be generated from this journal without
+#   invoking the existing /chat/save-summary flow that the frontend currently treats
+#   as a "stop everything" action.
+#
+# IMPORTANT:
+#   - This code path is separate from /chat, /tts/*, /stt/*.
+#   - It is only executed if the frontend calls /journal/append.
+#   - No TTS/STT logic is modified by this feature.
+#
+# Storage:
+#   - Default: local persistent /home on Azure App Service.
+#   - Set CHAT_JOURNAL_DIR to override.
+#
+# Payload contract (frontend → backend):
+#   POST /journal/append
+#   {
+#     "session_id": "....",
+#     "session_state": { ... },     # same object you send to /chat
+#     "events": [
+#       { "role": "user"|"assistant", "content": "...", "ts": 1730000000.123 }
+#     ]
+#   }
+#
+# Response:
+#   { ok: true|false, key: "...", count: N, error?: "..." }
+# =============================================================================
+
+_CHAT_JOURNAL_DIR = (os.getenv("CHAT_JOURNAL_DIR", "") or "/home/chat_journals").strip()
+
+
+def _journal_safe_filename(key: str) -> str:
+    # memberId::companionKey (contains ':' and other chars) → filesystem-safe slug
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", (key or "").strip())
+    if not safe:
+        safe = "unknown"
+    return safe + ".jsonl"
+
+
+def _journal_path_for_key(key: str) -> str:
+    try:
+        os.makedirs(_CHAT_JOURNAL_DIR, exist_ok=True)
+    except Exception:
+        # Fail-open: journaling should never break the API
+        pass
+    return os.path.join(_CHAT_JOURNAL_DIR, _journal_safe_filename(key))
+
+
+def _append_journal_events_sync(path: str, events: List[Dict[str, Any]]) -> None:
+    # Append JSONL with a per-file lock for multi-worker safety.
+    lock = FileLock(path + ".lock")
+    with lock:
+        with open(path, "a", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+@app.post("/journal/append", response_model=None)
+async def journal_append(request: Request):
+    try:
+        raw = await request.json()
+    except Exception as e:
+        return {"ok": False, "error": f"invalid_json: {type(e).__name__}: {e}"}
+
+    session_id = str(raw.get("session_id") or "").strip()
+    session_state = raw.get("session_state") or {}
+    events_in = raw.get("events") or []
+
+    if not isinstance(session_state, dict):
+        session_state = {}
+    if not isinstance(events_in, list):
+        events_in = []
+
+    # Compute the same stable keying scheme used by summaries.
+    # (memberId + normalized companion; falls back to session::<session_id>)
+    if not session_id:
+        # journaling must still have a stable file name; fall back to an ephemeral id
+        session_id = "session-" + uuid.uuid4().hex
+
+    key = _summary_store_key(session_state, session_id)
+
+    # Normalize/cap events (journaling must be cheap + safe)
+    now_ts = time.time()
+    max_events = int(os.getenv("CHAT_JOURNAL_MAX_EVENTS", "20") or "20")
+    max_chars = int(os.getenv("CHAT_JOURNAL_MAX_CHARS", "8000") or "8000")
+    max_chars_per_event = int(os.getenv("CHAT_JOURNAL_MAX_CHARS_PER_EVENT", "2000") or "2000")
+
+    norm: List[Dict[str, Any]] = []
+    for e in events_in[:max_events]:
+        if not isinstance(e, dict):
+            continue
+        role = str(e.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(e.get("content") or "")
+        content = content.strip()
+        if not content:
+            continue
+        if len(content) > max_chars_per_event:
+            content = content[:max_chars_per_event] + "…"
+        ts = e.get("ts")
+        try:
+            ts_f = float(ts) if ts is not None else now_ts
+        except Exception:
+            ts_f = now_ts
+
+        norm.append(
+            {
+                "ts": ts_f,
+                "role": role,
+                "content": content,
+                "session_id": session_id,
+                "key": key,
+            }
+        )
+
+    # Global cap
+    total_chars = 0
+    capped: List[Dict[str, Any]] = []
+    for e in norm:
+        total_chars += len(e.get("content") or "")
+        if total_chars > max_chars:
+            break
+        capped.append(e)
+
+    if not capped:
+        return {"ok": True, "key": key, "count": 0}
+
+    path = _journal_path_for_key(key)
+    try:
+        await run_in_threadpool(_append_journal_events_sync, path, capped)
+        return {"ok": True, "key": key, "count": len(capped)}
+    except Exception as e:
+        # Fail-open: journaling errors shouldn't break UX.
+        return {"ok": False, "key": key, "count": 0, "error": f"{type(e).__name__}: {e}"}
+
+
+# -----------------------------------------------------------------------------
+# (Optional / future) Server-side summarization from journal
+# -----------------------------------------------------------------------------
+# If, later, you decide to remove Wix-side validation or want backend-driven
+# automatic summaries, you can build it on top of the journal file(s) above.
+#
+# We are intentionally NOT enabling this now, because it introduces extra model
+# calls and could create new performance variables. Keep it as a controlled,
+# explicit feature rollout.
+#
+# @app.post("/journal/summarize", response_model=None)
+# async def journal_summarize(request: Request):
+#     ...
