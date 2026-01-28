@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import os
 import time
-import threading
 import re
 import uuid
 import json
 import hashlib
 import base64
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -122,6 +122,306 @@ app.add_middleware(
 )
 
 # ----------------------------
+
+
+# ---------------------------------------------------------------------------
+# Companion Catalog (DB-driven voice/video/live provider mappings)
+# ---------------------------------------------------------------------------
+# Source of truth: companion_catalog.sqlite (imported from "Voice and Video Mappings - Elaralo.xlsx").
+# We load it into memory at startup so lookups are constant time and don't hit disk per request.
+#
+# NOTE: This catalog is used only for UI/config decisions (voice IDs, video availability, D-ID agent config,
+# BeeStreamed live provider), and does NOT change any TTS/STT implementation details.
+
+CATALOG_DB_PATH = os.getenv(
+    "COMPANION_CATALOG_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "voice_video_mappings.sqlite3"),
+)
+
+_COMPANION_CATALOG: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_BRAND_TO_COMPANIONS: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _norm_catalog_key(s: str) -> str:
+    """Normalize a brand/avatar key for stable lookup (case/space/punctuation insensitive)."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
+
+
+def _as_optional_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _load_companion_catalog_from_sqlite(db_path: str) -> None:
+    global _COMPANION_CATALOG, _BRAND_TO_COMPANIONS
+
+    if not db_path or not os.path.exists(db_path):
+        print(f"[catalog] DB not found at: {db_path} (skipping)")
+        _COMPANION_CATALOG = {}
+        _BRAND_TO_COMPANIONS = {}
+        return
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM companion_mappings").fetchall()
+    except Exception as e:
+        print(f"[catalog] Failed to read DB {db_path}: {e}")
+        _COMPANION_CATALOG = {}
+        _BRAND_TO_COMPANIONS = {}
+        return
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    catalog: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    by_brand: Dict[str, List[Dict[str, Any]]] = {}
+
+    for r in rows:
+        brand = str(r["brand"] or "").strip()
+
+        # Column names come from the Excel-driven sqlite:
+        #   - NEW: companion_mappings.companion, companion_mappings.channel_cap, companion_mappings.live
+        #   - OLD: avatar/communication/live_provider (kept for backward compatibility)
+        cols = set(getattr(r, "keys", lambda: [])())
+
+        avatar = str((r["companion"] if "companion" in cols else r["avatar"]) or "").strip()
+
+        channel_raw = str((r["channel_cap"] if "channel_cap" in cols else r["communication"]) or "").strip().lower()
+        communication = "video" if channel_raw == "video" else "audio"
+
+        live_raw = str((r["live"] if "live" in cols else r["live_provider"]) or "").strip().lower()
+        live: Optional[str] = None
+        if live_raw:
+            if live_raw in ("d-id", "did", "d_id"):
+                live = "did"
+            elif live_raw in ("stream", "beestreamed", "bee"):
+                live = "stream"
+            else:
+                # Unknown provider value; keep as-is so we can debug quickly.
+                live = live_raw
+
+        item: Dict[str, Any] = {
+            "brand": brand,
+            "avatar": avatar,
+            "communication": communication,
+            "elevenVoiceId": _as_optional_str(r["eleven_voice_id"]),
+            "live": live,
+            # D-ID fields (used only when live == "did")
+            "didAgentId": _as_optional_str(r["did_agent_id"]),
+            "didClientKey": _as_optional_str(r["did_client_key"]),
+            # Optional debug fields (kept for future use)
+            "didAgentLink": _as_optional_str(r["did_agent_link"]),
+        }
+
+key = (_norm_catalog_key(brand), _norm_catalog_key(avatar))
+        catalog[key] = item
+
+        bkey = _norm_catalog_key(brand)
+        by_brand.setdefault(bkey, []).append(item)
+
+    # Stable ordering for UI callers
+    for bkey, items in by_brand.items():
+        items.sort(key=lambda x: str(x.get("avatar") or ""))
+
+    _COMPANION_CATALOG = catalog
+    _BRAND_TO_COMPANIONS = by_brand
+
+    print(f"[catalog] Loaded {len(_COMPANION_CATALOG)} companion mappings from {db_path}")
+
+
+@app.on_event("startup")
+async def _startup_load_catalog() -> None:
+    _load_companion_catalog_from_sqlite(CATALOG_DB_PATH)
+
+
+@app.get("/catalog/companion")
+async def get_catalog_companion(brand: str, avatar: str) -> Dict[str, Any]:
+    """Return the catalog config for a given (brand, avatar)."""
+    key = (_norm_catalog_key(brand), _norm_catalog_key(avatar))
+    item = _COMPANION_CATALOG.get(key)
+    if not item:
+        raise HTTPException(status_code=404, detail="Companion not found in catalog")
+    return item
+
+
+@app.get("/catalog/brand")
+async def get_catalog_brand(brand: str) -> Dict[str, Any]:
+    """Return all companions configured for a given brand."""
+    bkey = _norm_catalog_key(brand)
+    return {
+        "brand": brand,
+        "companions": _BRAND_TO_COMPANIONS.get(bkey, []),
+        "count": len(_BRAND_TO_COMPANIONS.get(bkey, [])),
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# BeeStreamed (Live=Stream) integration
+# ---------------------------------------------------------------------------
+# Docs: https://docs.beestreamed.com/introduction
+#
+# Auth: Basic base64(token_id:secret_key) via Authorization header.
+# The Token ID + Secret Key are expected as environment variables:
+#   STREAM_TOKEN_ID
+#   STREAM_SECRET_KEY
+#
+# When a Stream companion's Video button is clicked, the frontend calls /stream/start.
+# We (1) create or reuse a BeeStreamed event, (2) start its WebRTC stream, then
+# return a viewer URL like: https://beestreamed.com/event?id=<EVENT_REF>
+
+BEESTREAMED_API_BASE = os.getenv("BEESTREAMED_API_BASE", "https://api.beestreamed.com").rstrip("/")
+_STREAM_EVENT_CACHE: Dict[Tuple[str, str], str] = {}
+
+
+def _beestreamed_headers() -> Dict[str, str]:
+    token_id = (os.getenv("STREAM_TOKEN_ID") or "").strip()
+    secret_key = (os.getenv("STREAM_SECRET_KEY") or "").strip()
+
+    if not token_id or not secret_key:
+        raise RuntimeError("STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured in the environment")
+
+    token = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
+    return {
+        "Authorization": f"Basic {token}",
+        "Accept": "application/json",
+    }
+
+
+def _beestreamed_request_sync(
+    method: str,
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+) -> Any:
+    import requests
+
+    url = f"{BEESTREAMED_API_BASE}{path}"
+    headers = _beestreamed_headers()
+
+    resp = requests.request(
+        method=method,
+        url=url,
+        headers=headers,
+        params=params,
+        json=json_body,
+        timeout=20,
+    )
+
+    if resp.status_code >= 400:
+        # Bubble up a concise error while still keeping enough context for debugging.
+        body_preview = (resp.text or "")[:500]
+        raise RuntimeError(f"BeeStreamed {method} {path} failed: HTTP {resp.status_code} - {body_preview}")
+
+    if not (resp.text or "").strip():
+        return {}
+
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": resp.text}
+
+
+def _extract_events_list(payload: Any) -> List[Dict[str, Any]]:
+    """BeeStreamed list responses may be either a list or an object containing a list."""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+
+    if isinstance(payload, dict):
+        for k in ("events", "data", "items", "results"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+
+    return []
+
+
+@app.post("/stream/start")
+async def beestreamed_start_stream(req: Request) -> Dict[str, Any]:
+    body = await req.json()
+    brand = str(body.get("brand") or "").strip()
+    avatar = str(body.get("avatar") or "").strip()
+
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    # If we have a catalog entry, enforce that this companion is configured for Stream.
+    key = (_norm_catalog_key(brand), _norm_catalog_key(avatar))
+    item = _COMPANION_CATALOG.get(key)
+    if item and str(item.get("live") or "") != "stream":
+        raise HTTPException(status_code=400, detail="This companion is not configured for Stream")
+
+    event_title = f"{brand} - {avatar}"
+    cache_key = (_norm_catalog_key(brand), _norm_catalog_key(avatar))
+
+    event_ref = _STREAM_EVENT_CACHE.get(cache_key)
+
+    # 1) Find or create the event (cached in-memory per worker)
+    if not event_ref:
+        try:
+            payload = await run_in_threadpool(
+                _beestreamed_request_sync,
+                "GET",
+                "/events",
+                params={
+                    "search": event_title,
+                    "maxResults": 25,
+                },
+            )
+            events = _extract_events_list(payload)
+        except Exception:
+            events = []
+
+        # Prefer an exact title match; otherwise fall back to the first returned event.
+        for ev in events:
+            title = str(ev.get("event_title") or ev.get("title") or "").strip()
+            ref = str(ev.get("event_ref") or ev.get("ref") or "").strip()
+            if ref and title.lower() == event_title.lower():
+                event_ref = ref
+                break
+
+        if not event_ref and events:
+            ref = str(events[0].get("event_ref") or events[0].get("ref") or "").strip()
+            if ref:
+                event_ref = ref
+
+        if not event_ref:
+            created = await run_in_threadpool(_beestreamed_request_sync, "POST", "/events")
+            event_ref = str(created.get("event_ref") or created.get("eventRef") or "").strip()
+
+            if not event_ref:
+                raise HTTPException(status_code=502, detail="BeeStreamed did not return an event_ref")
+
+            # Set a recognizable title (best-effort).
+            try:
+                await run_in_threadpool(
+                    _beestreamed_request_sync,
+                    "PATCH",
+                    f"/events/{event_ref}",
+                    params={"title": event_title},
+                )
+            except Exception as e:
+                print(f"[beestreamed] Warning: failed to set event title: {e}")
+
+        _STREAM_EVENT_CACHE[cache_key] = event_ref
+
+    # 2) Start (or re-start) the WebRTC stream
+    try:
+        await run_in_threadpool(_beestreamed_request_sync, "POST", f"/events/{event_ref}/startwebrtcstream")
+    except Exception as e:
+        # Still return a viewer URL; the event page can surface the underlying issue.
+        print(f"[beestreamed] Warning: failed to start WebRTC stream: {e}")
+
+    # 3) Viewer URL (documented in BeeStreamed signup email template)
+    viewer_url = f"https://beestreamed.com/event?id={event_ref}"
+    return {"eventRef": event_ref, "viewerUrl": viewer_url}
+
 # Routes
 # ----------------------------
 if consent_router is not None:
@@ -256,7 +556,14 @@ USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PE
 UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
 PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
 PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 60)
+
+# Base Pay-As-You-Go price (e.g., "$4.99"). If PAYG_PRICE_TEXT is not set, we derive it as:
+#   "<PAYG_PRICE> per <PAYG_INCREMENT_MINUTES> minutes"
+PAYG_PRICE = (os.getenv("PAYG_PRICE", "") or "").strip()
 PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
+if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
+    PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
+
 
 # Admin token for server-side minute credits (payment webhook can call this)
 USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
@@ -269,6 +576,176 @@ def _extract_plan_name(session_state: Dict[str, Any]) -> str:
         or ""
     )
     return str(plan).strip() if plan is not None else ""
+
+
+def _extract_rebranding_key(session_state: Dict[str, Any]) -> str:
+    """Extract the Wix-provided RebrandingKey (preferred) or legacy rebranding string."""
+    rk = (
+        session_state.get("rebrandingKey")
+        or session_state.get("rebranding_key")
+        or session_state.get("RebrandingKey")
+        or session_state.get("rebranding")  # legacy: brand name only
+        or ""
+    )
+    return str(rk).strip() if rk is not None else ""
+
+def _strip_rebranding_key_label(part: str) -> str:
+    """Accept either raw values or labeled values like 'PayGoMinutes: 60'."""
+    s = (part or "").strip()
+    m = re.match(r"^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$", s)
+    return m.group(1).strip() if m else s
+
+def _parse_rebranding_key(raw: str) -> Dict[str, str]:
+    """Parse a '|' separated RebrandingKey.
+
+    Expected order:
+      Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+    """
+    v = (raw or "").strip()
+    if not v:
+        return {}
+
+    # Legacy support: no delimiter -> only brand name
+    if "|" not in v:
+        return {
+            "rebranding": _strip_rebranding_key_label(v),
+            "upgrade_link": "",
+            "pay_go_link": "",
+            "pay_go_price": "",
+            "pay_go_minutes": "",
+            "plan": "",
+            "elaralo_plan_map": "",
+            "free_minutes": "",
+            "cycle_days": "",
+        }
+
+    parts = [_strip_rebranding_key_label(p) for p in v.split("|")]
+    parts += [""] * (9 - len(parts))
+
+    (
+        rebranding,
+        upgrade_link,
+        pay_go_link,
+        pay_go_price,
+        pay_go_minutes,
+        plan,
+        elaralo_plan_map,
+        free_minutes,
+        cycle_days,
+    ) = parts[:9]
+
+    return {
+        "rebranding": str(rebranding or "").strip(),
+        "upgrade_link": str(upgrade_link or "").strip(),
+        "pay_go_link": str(pay_go_link or "").strip(),
+        "pay_go_price": str(pay_go_price or "").strip(),
+        "pay_go_minutes": str(pay_go_minutes or "").strip(),
+        "plan": str(plan or "").strip(),
+        "elaralo_plan_map": str(elaralo_plan_map or "").strip(),
+        "free_minutes": str(free_minutes or "").strip(),
+        "cycle_days": str(cycle_days or "").strip(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# RebrandingKey validation
+# ---------------------------------------------------------------------------
+# IMPORTANT: RebrandingKey format/field validation is performed upstream in Wix (Velo).
+# The API intentionally accepts the RebrandingKey as-is to avoid breaking Wix flows.
+#
+# If you remove Wix-side validation in the future, you can enable the server-side
+# validator below by uncommenting it AND the call site in /chat.
+#
+# def _validate_rebranding_key_server_side(raw: str) -> Tuple[bool, str]:
+#     """Server-side validator for RebrandingKey.
+#
+#     Expected order:
+#       Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+#     """
+#     v = (raw or "").strip()
+#     if not v:
+#         return True, ""
+#
+#     # Guardrail: prevent extremely large payloads
+#     if len(v) > 2048:
+#         return False, "too long"
+#
+#     # Legacy support: no delimiter => brand name only
+#     if "|" not in v:
+#         return True, ""
+#
+#     parts = v.split("|")
+#     if len(parts) != 9:
+#         return False, f"expected 9 parts, got {len(parts)}"
+#
+#     rebranding = parts[0].strip()
+#     if not rebranding:
+#         return False, "missing Rebranding"
+#
+#     # Validate URLs (when present)
+#     def _is_http_url(s: str) -> bool:
+#         s = (s or "").strip()
+#         if not s:
+#             return True
+#         return bool(re.match(r"^https?://", s, re.IGNORECASE))
+#
+#     if not _is_http_url(parts[1]):
+#         return False, "UpgradeLink must be http(s) URL"
+#     if not _is_http_url(parts[2]):
+#         return False, "PayGoLink must be http(s) URL"
+#
+#     # Validate integers (when present)
+#     for name, val in [
+#         ("PayGoMinutes", parts[4]),
+#         ("FreeMinutes", parts[7]),
+#         ("CycleDays", parts[8]),
+#     ]:
+#         s = (val or "").strip()
+#         if not s:
+#             continue
+#         if not re.fullmatch(r"-?\d+", s):
+#             return False, f"{name} must be an integer"
+#
+#     # Basic price sanity (allow "$5.99", "5.99", "USD 5.99")
+#     price = (parts[3] or "").strip()
+#     if price and len(price) > 32:
+#         return False, "PayGoPrice too long"
+#
+#     # Basic length checks (defense-in-depth)
+#     for i, p in enumerate(parts):
+#         if len((p or "").strip()) > 512:
+#             return False, f"part {i} too long"
+#
+#     return True, ""
+
+
+def _safe_int(val: Any) -> Optional[int]:
+    """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
+    try:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+        m = re.search(r"-?\d+", s)
+        if not m:
+            return None
+        return int(m.group(0))
+    except Exception:
+        return None
+
+def _session_get_str(session_state: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        try:
+            v = session_state.get(k)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
 
 def _normalize_plan_name_for_limits(plan_name: str) -> str:
     p = (plan_name or "").strip()
@@ -331,9 +808,33 @@ def _save_usage_store(store: Dict[str, Any]) -> None:
         # Fail-open: do not crash the API
         return
 
-def _usage_paywall_message(is_trial: bool, plan_name: str, minutes_allowed: int) -> str:
+def _usage_paywall_message(
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed: int,
+    *,
+    upgrade_url: str = "",
+    payg_pay_url: str = "",
+    payg_increment_minutes: Optional[int] = None,
+    payg_price_text: str = "",
+) -> str:
+    """Generate the user-facing message when minutes are exhausted.
+
+    Supports per-request overrides (RebrandingKey) for:
+      - upgrade_url
+      - payg_pay_url
+      - payg_increment_minutes
+      - payg_price_text
+    """
     # Keep this short and plain so it can be spoken via TTS.
     lines: List[str] = []
+
+    resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
+    resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
+    resolved_payg_minutes = (
+        int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
+    )
+    resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
 
     if is_trial:
         lines.append(f"Your Free Trial time has ended ({minutes_allowed} minutes).")
@@ -344,17 +845,16 @@ def _usage_paywall_message(is_trial: bool, plan_name: str, minutes_allowed: int)
         else:
             lines.append(f"You have no minutes remaining for your plan ({nice_plan}).")
 
-    if PAYG_PAY_URL:
-        price_part = f" ({PAYG_PRICE_TEXT})" if PAYG_PRICE_TEXT else ""
-        lines.append(f"Add {PAYG_INCREMENT_MINUTES} minutes{price_part}: {PAYG_PAY_URL}")
+    if resolved_payg_pay_url and resolved_payg_minutes > 0:
+        price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
+        lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
 
-    if UPGRADE_URL:
-        lines.append(f"Upgrade your membership: {UPGRADE_URL}")
+    if resolved_upgrade_url:
+        lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
 
     lines.append("Once you have more minutes, come back here and continue our conversation.")
     return " ".join([ln.strip() for ln in lines if ln.strip()])
-
-def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str) -> Tuple[bool, Dict[str, Any]]:
+def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str, minutes_allowed_override: Optional[int] = None, cycle_days_override: Optional[int] = None) -> Tuple[bool, Dict[str, Any]]:
     """Charge usage time and determine whether the identity still has minutes.
 
     Returns:
@@ -377,8 +877,9 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
             cycle_start = float(rec.get("cycle_start") or now)
 
             # Member cycle reset (trial does not reset)
-            if not is_trial and USAGE_CYCLE_DAYS and USAGE_CYCLE_DAYS > 0:
-                cycle_len = float(USAGE_CYCLE_DAYS) * 86400.0
+            cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
+            if not is_trial and cycle_days and cycle_days > 0:
+                cycle_len = float(cycle_days) * 86400.0
                 if (now - cycle_start) >= cycle_len:
                     used_seconds = 0.0
                     cycle_start = now
@@ -406,7 +907,13 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
             used_seconds += delta
 
             # Compute allowed seconds
-            minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
+            if minutes_allowed_override is not None:
+                try:
+                    minutes_allowed = max(0, int(minutes_allowed_override))
+                except Exception:
+                    minutes_allowed = 0
+            else:
+                minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
             allowed_seconds = (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0)
 
             # Persist record
@@ -1105,21 +1612,85 @@ async def chat(request: Request):
     # Rule: If we do NOT have a memberId, the visitor is on Free Trial (IP-based identity).
     # Every plan (including subscriptions) has a minute budget. When exhausted, we return a pay/upgrade message.
     member_id = _extract_member_id(session_state)
-    plan_name = _extract_plan_name(session_state)
+    plan_name_raw = _extract_plan_name(session_state)
+
+    # RebrandingKey (Wix) overrides (upgrade/pay links + quota settings) when present.
+    # Wix provides: Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+    rebranding_key_raw = _extract_rebranding_key(session_state)
+
+    # NOTE: RebrandingKey validation is performed in Wix (Velo) before sending to this API.
+    # Server-side validation is intentionally disabled to avoid breaking existing Wix flows.
+    # If Wix-side validation is removed, you can enable the validator by uncommenting below:
+    # ok, err = _validate_rebranding_key_server_side(rebranding_key_raw)
+    # if not ok:
+    #     _dbg(debug, f"[RebrandingKey] rejected: {err}")
+    #     rebranding_key_raw = ""
+    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+
+    # Prefer explicit fields (if provided) and fall back to the parsed RebrandingKey.
+    upgrade_link_override = _session_get_str(session_state, "upgrade_link", "upgradeLink") or rebranding_parsed.get("upgrade_link", "")
+    pay_go_link_override = _session_get_str(session_state, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
+    pay_go_price = _session_get_str(session_state, "pay_go_price", "payGoPrice") or rebranding_parsed.get("pay_go_price", "")
+    pay_go_minutes_raw = _session_get_str(session_state, "pay_go_minutes", "payGoMinutes") or rebranding_parsed.get("pay_go_minutes", "")
+    plan_external = (
+        _session_get_str(session_state, "rebranding_plan", "rebrandingPlan", "planExternal", "plan_external")
+        or rebranding_parsed.get("plan", "")
+    )
+    plan_map = _session_get_str(session_state, "elaralo_plan_map", "elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map", "")
+    free_minutes_raw = _session_get_str(session_state, "free_minutes", "freeMinutes") or rebranding_parsed.get("free_minutes", "")
+    cycle_days_raw = _session_get_str(session_state, "cycle_days", "cycleDays") or rebranding_parsed.get("cycle_days", "")
+
+    pay_go_minutes = _safe_int(pay_go_minutes_raw)
+    free_minutes = _safe_int(free_minutes_raw)
+    cycle_days = _safe_int(cycle_days_raw)
+
     is_trial = not bool(member_id)
     identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+
+    # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
+    minutes_allowed_override: Optional[int] = None
+    if free_minutes is not None:
+        minutes_allowed_override = free_minutes
+    elif plan_map:
+        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
+
+    cycle_days_override: Optional[int] = None
+    if cycle_days is not None:
+        cycle_days_override = cycle_days
+
+    # Plan name used for quota purposes (fallback) should use the mapped plan if provided.
+    plan_name_for_limits = plan_map or plan_name_raw
+
+    # Plan label shown to the user should use the external plan name (if provided).
+    plan_label_for_messages = plan_external or plan_name_raw
+
+    # For rebranding, construct PAYG_PRICE_TEXT as:
+    #   PayGoPrice + " per " + PayGoMinutes + " minutes"
+    is_rebranding = bool(rebranding_key_raw or plan_external or plan_map or upgrade_link_override or pay_go_link_override or pay_go_price)
+
+    payg_price_text_override = ""
+    if is_rebranding:
+        minutes_part = ""
+        if pay_go_minutes is not None:
+            minutes_part = str(pay_go_minutes)
+        else:
+            minutes_part = str(pay_go_minutes_raw or "").strip()
+        if pay_go_price and minutes_part:
+            payg_price_text_override = f"{pay_go_price} per {minutes_part} minutes"
 
     usage_ok, usage_info = await run_in_threadpool(
         _usage_charge_and_check_sync,
         identity_key,
         is_trial=is_trial,
-        plan_name=plan_name,
+        plan_name=plan_name_for_limits,
+        minutes_allowed_override=minutes_allowed_override,
+        cycle_days_override=cycle_days_override,
     )
 
     if not usage_ok:
         minutes_allowed = int(
             usage_info.get("minutes_allowed")
-            or (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name))
+            or (minutes_allowed_override if minutes_allowed_override is not None else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits)))
             or 0
         )
         session_state_out = dict(session_state)
@@ -1131,7 +1702,15 @@ async def chat(request: Request):
                 "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
             }
         )
-        reply = _usage_paywall_message(is_trial=is_trial, plan_name=plan_name, minutes_allowed=minutes_allowed)
+        reply = _usage_paywall_message(
+            is_trial=is_trial,
+            plan_name=plan_label_for_messages,
+            minutes_allowed=minutes_allowed,
+            upgrade_url=upgrade_link_override,
+            payg_pay_url=pay_go_link_override,
+            payg_increment_minutes=pay_go_minutes,
+            payg_price_text=payg_price_text_override,
+        )
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
@@ -1140,7 +1719,7 @@ async def chat(request: Request):
             "audio_url": None,
         }
 
-    # Best-effort retrieval of a previously saved chat summary.
+# Best-effort retrieval of a previously saved chat summary.
     # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
     saved_summary: str | None = None
     memory_key: str | None = None
@@ -1462,104 +2041,6 @@ def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
     if member_id:
         return f"{member_id}::{companion_key or 'unknown'}"
     return f"session::{session_id}"
-
-
-
-# -----------------------------------------------------------------------------
-# Option B: Separate journaling endpoint (does NOT stop audio/video/mic)
-# -----------------------------------------------------------------------------
-#
-# Rationale:
-# - The existing manual Save Summary flow intentionally stops audio/video/mic for user confirmation.
-# - We do NOT want to auto-trigger that flow because it impacts UX.
-# - Instead, the frontend can fire-and-forget copies of user + assistant turns to this endpoint.
-# - A separate, later process (Azure Function / cron / admin endpoint) can generate summaries
-#   from the journal without touching the live chat / TTS / STT pathways.
-#
-# NOTE: This endpoint is purposely isolated from the /chat logic to avoid any regressions
-# in the established TTS/STT pipeline.
-
-_CHAT_JOURNAL_ENABLED = os.getenv("CHAT_JOURNAL_ENABLED", "1").strip() not in ("0", "false", "False", "")
-
-# Default journal directory:
-# - If CHAT_SUMMARY_FILE is set to a persistent /home path, we journal next to it.
-# - Else, fall back to backend/app/data/journal (inside repo) for local dev.
-_CHAT_JOURNAL_DIR = os.getenv("CHAT_JOURNAL_DIR", "").strip()
-if not _CHAT_JOURNAL_DIR:
-    try:
-        _summary_dir = os.path.dirname(os.path.abspath(_CHAT_SUMMARY_FILE)) if _CHAT_SUMMARY_FILE else ""
-    except Exception:
-        _summary_dir = ""
-    if _summary_dir:
-        _CHAT_JOURNAL_DIR = os.path.join(_summary_dir, "journal")
-    else:
-        _CHAT_JOURNAL_DIR = os.path.join(os.path.dirname(__file__), "data", "journal")
-
-_CHAT_JOURNAL_LOCK = threading.RLock()
-
-def _journal_filename_for_key(key: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", key).strip("_") or "unknown"
-    return os.path.join(_CHAT_JOURNAL_DIR, f"{safe}.jsonl")
-
-def _append_journal_record(key: str, record: Dict[str, Any]) -> None:
-    if not _CHAT_JOURNAL_ENABLED:
-        return
-    try:
-        os.makedirs(_CHAT_JOURNAL_DIR, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False)
-        path = _journal_filename_for_key(key)
-        with _CHAT_JOURNAL_LOCK:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-    except Exception:
-        # Never allow journaling failures to impact the app
-        return
-
-@app.post("/journal/append")
-async def journal_append(request: Request) -> Dict[str, Any]:
-    if not _CHAT_JOURNAL_ENABLED:
-        return {"ok": True, "enabled": False}
-
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-
-    session_id = str(payload.get("session_id") or "").strip()
-    role = str(payload.get("role") or "").strip().lower()
-    content = payload.get("content")
-    ts = payload.get("ts") or payload.get("timestamp") or None
-
-    session_state = payload.get("session_state") or payload.get("sessionState") or {}
-    if not isinstance(session_state, dict):
-        session_state = {}
-
-    if not session_id or role not in ("user", "assistant") or not isinstance(content, str):
-        raise HTTPException(status_code=422, detail="Invalid payload")
-
-    # Reuse the same keying strategy as summaries:
-    # - memberId::companion when memberId exists
-    # - session::session_id otherwise
-    key = _summary_store_key(session_state, session_id)
-
-    record = {
-        "key": key,
-        "session_id": session_id,
-        "role": role,
-        "content": content,
-        "ts": ts or int(time.time() * 1000),
-        "brand": str(session_state.get("rebranding") or "").strip(),
-        "companion": str(
-            session_state.get("companion")
-            or session_state.get("companionName")
-            or session_state.get("companion_name")
-            or ""
-        ).strip(),
-        "member_id": _extract_member_id(session_state) or "",
-    }
-
-    _append_journal_record(key, record)
-    return {"ok": True, "enabled": True}
 
 
 def _persist_summary_store() -> None:
