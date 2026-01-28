@@ -66,31 +66,6 @@ const SaveIcon = ({ size = 18 }: { size?: number }) => (
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
-// ----------------------------
-// Background chat-summary journaling (Option B)
-// ----------------------------
-// Turn count = number of user messages (each user message is a "turn").
-type JournalEntry = Msg & { ts: number };
-type SummaryJournal = {
-  entries: JournalEntry[];
-  // How many items from `messages` have been mirrored into `entries`.
-  lastProcessedLen: number;
-  // Current number of user turns (user messages).
-  turnCount: number;
-  // The last user turn count that has been persisted via /chat/save-summary.
-  lastSavedTurnCount: number;
-  // Epoch ms when the last autosave succeeded.
-  lastSavedAtMs: number;
-  // Optional key returned by the backend.
-  lastSavedKey: string | null;
-};
-
-function countUserTurns(msgs: Array<{ role: Role }>): number {
-  let n = 0;
-  for (const m of msgs) if (m?.role === "user") n += 1;
-  return n;
-}
-
 type Mode = "friend" | "romantic" | "intimate";
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
@@ -267,12 +242,6 @@ function joinUrlPrefix(prefix: string, path: string): string {
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-
-// Autosave summary (debounced) settings.
-// These only affect background /chat/save-summary calls. Manual Save button behavior is unchanged.
-const AUTO_SAVE_SUMMARY_DEBOUNCE_MS = 12_000;
-const AUTO_SAVE_SUMMARY_MIN_INTERVAL_MS = 15_000;
-const AUTO_SAVE_SUMMARY_MIN_NEW_TURNS = 1;
 
 type Phase1AvatarMedia = {
   didAgentId: string;
@@ -2138,204 +2107,6 @@ const speakAssistantReply = useCallback(
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
-  // -----------------------
-  // Background summary journaling (Option B)
-  //
-  // Goal:
-  //  - Maintain a "journal" of inbound/outbound messages in a ref
-  //  - Debounce /chat/save-summary calls so they happen silently in the background
-  //
-  // Constraints:
-  //  - MUST NOT touch any STT/TTS start/stop code paths.
-  //  - Manual Save button UX remains unchanged.
-  // -----------------------
-  const summaryJournalRef = useRef<SummaryJournal>({
-    entries: [],
-    lastProcessedLen: 0,
-    turnCount: 0,
-    lastSavedTurnCount: 0,
-    lastSavedAtMs: 0,
-    lastSavedKey: null,
-  });
-  // IMPORTANT (TypeScript): In Next.js builds that include both DOM + Node typings,
-  // `setTimeout` can be typed as returning NodeJS.Timeout, while `window.setTimeout`
-  // returns a number. Since this is a client component and we call `window.setTimeout`,
-  // store the timer id as a number to avoid TS errors in CI.
-  const autoSaveSummaryTimerRef = useRef<number | null>(null);
-  const autoSaveSummaryInFlightRef = useRef<boolean>(false);
-  const autoSaveSummaryLastErrorRef = useRef<string | null>(null);
-
-  // Always-current pointer to the save-summary function (avoids stale closures in timers).
-  const callSaveChatSummaryRef = useRef<null | ((nextMessages: Msg[], stateToSend: SessionState) => Promise<any>)>(null);
-
-  // Mirror a few pieces of state into refs so the autosave runner can stay ref-driven.
-  const sessionStateForAutosaveRef = useRef<SessionState>(sessionState);
-  const loadingForAutosaveRef = useRef<boolean>(loading);
-  const showSaveConfirmForAutosaveRef = useRef<boolean>(showSaveSummaryConfirm);
-  const showClearConfirmForAutosaveRef = useRef<boolean>(showClearMessagesConfirm);
-  const savingSummaryForAutosaveRef = useRef<boolean>(savingSummary);
-
-  useEffect(() => {
-    sessionStateForAutosaveRef.current = sessionState;
-  }, [sessionState]);
-  useEffect(() => {
-    loadingForAutosaveRef.current = loading;
-  }, [loading]);
-  useEffect(() => {
-    showSaveConfirmForAutosaveRef.current = showSaveSummaryConfirm;
-  }, [showSaveSummaryConfirm]);
-  useEffect(() => {
-    showClearConfirmForAutosaveRef.current = showClearMessagesConfirm;
-  }, [showClearMessagesConfirm]);
-  useEffect(() => {
-    savingSummaryForAutosaveRef.current = savingSummary;
-  }, [savingSummary]);
-
-  async function runAutoSaveSummary(reason: string) {
-    if (!API_BASE) return;
-
-    // Never overlap autosaves.
-    if (autoSaveSummaryInFlightRef.current) return;
-
-    // Don't fight with the manual Save flow.
-    if (savingSummaryForAutosaveRef.current) return;
-    if (showSaveConfirmForAutosaveRef.current) return;
-
-    // Don't autosave while a clear-confirm modal is up (avoid surprise network work).
-    if (showClearConfirmForAutosaveRef.current) return;
-
-    // Wait until the assistant reply has landed and we're not mid-request.
-    if (loadingForAutosaveRef.current) return;
-
-    const journal = summaryJournalRef.current;
-    const snapshot: Msg[] = journal.entries.map((e) => ({ role: e.role, content: e.content }));
-    if (snapshot.length < 2) return;
-
-    // Autosave only when the most recent message is from the assistant.
-    if (snapshot[snapshot.length - 1]?.role !== "assistant") return;
-
-    const turnCount = countUserTurns(snapshot);
-    journal.turnCount = turnCount;
-
-    // Only save when we have at least N new user turns since the last successful save.
-    if (turnCount - journal.lastSavedTurnCount < AUTO_SAVE_SUMMARY_MIN_NEW_TURNS) return;
-
-    const now = Date.now();
-    if (journal.lastSavedAtMs && now - journal.lastSavedAtMs < AUTO_SAVE_SUMMARY_MIN_INTERVAL_MS) return;
-
-    const saver = callSaveChatSummaryRef.current;
-    if (!saver) return;
-
-    autoSaveSummaryInFlightRef.current = true;
-    try {
-      const res = await saver(snapshot, sessionStateForAutosaveRef.current);
-      journal.lastSavedTurnCount = turnCount;
-      journal.lastSavedAtMs = Date.now();
-      if (res && typeof res.key === "string") journal.lastSavedKey = res.key;
-      autoSaveSummaryLastErrorRef.current = null;
-
-      if (debugEnabledRef.current) {
-        console.log("[ELARALO] autosave summary ok", {
-          reason,
-          turnCount,
-          key: res?.key,
-          saved_at: res?.saved_at,
-        });
-      }
-    } catch (e: any) {
-      const msg = e?.message ? String(e.message) : String(e);
-      autoSaveSummaryLastErrorRef.current = msg;
-      if (debugEnabledRef.current) {
-        console.warn("[ELARALO] autosave summary failed", { reason, error: msg });
-      }
-    } finally {
-      autoSaveSummaryInFlightRef.current = false;
-    }
-  }
-
-  const scheduleAutoSaveSummary = useCallback((reason: string) => {
-    if (typeof window === "undefined") return;
-    if (!API_BASE) return;
-
-    if (autoSaveSummaryTimerRef.current) {
-      window.clearTimeout(autoSaveSummaryTimerRef.current);
-    }
-
-    autoSaveSummaryTimerRef.current = window.setTimeout(() => {
-      void runAutoSaveSummary(reason);
-    }, AUTO_SAVE_SUMMARY_DEBOUNCE_MS);
-  }, []);
-
-  // Keep the journal in sync with the rendered chat (mirror new messages only).
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const journal = summaryJournalRef.current;
-
-    // Full reset on clear.
-    if (messages.length === 0) {
-      journal.entries = [];
-      journal.lastProcessedLen = 0;
-      journal.turnCount = 0;
-      journal.lastSavedTurnCount = 0;
-      journal.lastSavedAtMs = 0;
-      journal.lastSavedKey = null;
-      autoSaveSummaryLastErrorRef.current = null;
-
-      if (autoSaveSummaryTimerRef.current) {
-        window.clearTimeout(autoSaveSummaryTimerRef.current);
-        autoSaveSummaryTimerRef.current = null;
-      }
-      return;
-    }
-
-    // If messages were shortened/replaced, rebuild the journal from scratch.
-    if (messages.length < journal.lastProcessedLen) {
-      const ts = Date.now();
-      journal.entries = messages.map((m) => ({ role: m.role, content: m.content, ts }));
-      journal.lastProcessedLen = messages.length;
-      journal.turnCount = countUserTurns(messages);
-      scheduleAutoSaveSummary("journal_rebuild");
-      return;
-    }
-
-    // No change.
-    if (messages.length === journal.lastProcessedLen) return;
-
-    // Mirror only the new tail.
-    const added = messages.slice(journal.lastProcessedLen);
-    const ts = Date.now();
-    for (const m of added) {
-      journal.entries.push({ role: m.role, content: m.content, ts });
-    }
-    journal.lastProcessedLen = messages.length;
-    journal.turnCount = countUserTurns(messages);
-
-    // Debounced background autosave. The runner will no-op until conditions are safe.
-    scheduleAutoSaveSummary("messages_changed");
-  }, [messages, scheduleAutoSaveSummary]);
-
-  // If the user opens a confirmation modal, cancel any pending autosave timer.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (!showSaveSummaryConfirm && !showClearMessagesConfirm) return;
-    if (autoSaveSummaryTimerRef.current) {
-      window.clearTimeout(autoSaveSummaryTimerRef.current);
-      autoSaveSummaryTimerRef.current = null;
-    }
-  }, [showSaveSummaryConfirm, showClearMessagesConfirm]);
-
-  // Cleanup timer on unmount.
-  useEffect(() => {
-    return () => {
-      if (typeof window === "undefined") return;
-      if (autoSaveSummaryTimerRef.current) {
-        window.clearTimeout(autoSaveSummaryTimerRef.current);
-        autoSaveSummaryTimerRef.current = null;
-      }
-    };
-  }, []);
-
   const goToMyElara = useCallback(() => {
     const url = "https://www.elaralo.com/myelara";
 
@@ -2697,10 +2468,6 @@ const stateToSendWithCompanion: SessionState = {
 
     return (await res.json()) as any;
   }
-
-  // Keep an always-current function pointer for debounced background autosave timers.
-  // (Avoids stale closures without touching any STT/TTS code paths.)
-  callSaveChatSummaryRef.current = callSaveChatSummary;
 
   // This is the mode that drives the UI highlight:
   // - If backend is asking for intimate consent, keep intimate pill highlighted
