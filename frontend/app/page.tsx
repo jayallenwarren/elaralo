@@ -1322,11 +1322,6 @@ const liveProvider: LiveProvider = useMemo(() => {
 
   return "did";
 }, [companionMapping, companionKeyRaw, companionKey]);
-  const { flags } = splitCompanionKey(raw);
-  const v = String(flags["live"] || "").toLowerCase();
-  if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
-  return "did";
-}, [companionKeyRaw, companionKey]);
 
 const streamUrl = useMemo(() => {
   const raw = String(companionKeyRaw || "").trim();
