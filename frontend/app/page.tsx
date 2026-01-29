@@ -216,16 +216,25 @@ function normalizePlanName(raw: any): PlanName {
 function stripTrialControlsFromRebrandingKey(key: string): string {
   const p = parseRebrandingKey(key);
   if (!p) return key;
+
+  // IMPORTANT:
+  // Historically some backend paths read the *plan* segment (6th field) from the rebrandingKey to decide
+  // included minutes. For white-label sites, the 6th field may be the white-label plan label (e.g. "Test - Exclusive")
+  // and the Elaralo entitlement plan is carried in `elaraloPlanMap` (e.g. "Intimate (18+)").
+  //
+  // To ensure quota/minutes are computed from the mapped Elaralo plan, we copy `elaraloPlanMap` into the plan slot
+  // when it's present.
+  const entitlementPlan = (p.elaraloPlanMap || "").trim() || (p.plan || "").trim();
   // Keep format stable (9 segments).
   // Blank-out FreeMinutes + CycleDays so the backend can fall back to plan defaults
   // when the user is entitled (i.e., has an active plan).
   return [
-    p.brand,
+    p.rebranding,
     p.upgradeUrl,
     p.paygUrl,
     p.paygPrice,
     p.paygMinutes,
-    p.plan,
+    entitlementPlan,
     p.elaraloPlanMap,
     "",
     "",
@@ -2916,7 +2925,7 @@ const companionForBackend =
 
 
 const rawBrand =
-  (rebranding || "").trim() || parseRebrandingKey(rebrandingKey || "")?.brand || "core";
+  (rebranding || "").trim() || parseRebrandingKey(rebrandingKey || "")?.rebranding || "core";
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -2991,7 +3000,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
 
     
 const rawBrand =
-  (rebranding || "").trim() || parseRebrandingKey(rebrandingKey || "")?.brand || "core";
+  (rebranding || "").trim() || parseRebrandingKey(rebrandingKey || "")?.rebranding || "core";
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
