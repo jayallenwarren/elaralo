@@ -515,6 +515,48 @@ function normalizeKeyForFile(raw: string) {
   return (raw || "").trim().replace(/\s+/g, "-");
 }
 
+// Some Wix implementations append a member UUID to the companion key for uniqueness.
+// Example: "dulce-female-black-millennials-ebf0bfb2-11b4-4638-ad3c-4909c6f810e6"
+// For static asset lookup (headshots), we should strip that UUID suffix.
+function stripTrailingUuid(raw: string): string {
+  const s = String(raw || "").trim();
+  return s.replace(
+    /-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    "",
+  );
+}
+
+function titleCaseToken(token: string): string {
+  const lower = String(token || "").toLowerCase();
+  // Common generation tokens found in your asset naming convention.
+  if (lower === "genz") return "GenZ";
+  if (lower === "genx") return "GenX";
+  if (lower === "geny") return "GenY";
+  if (lower === "genalpha") return "GenAlpha";
+  if (!lower) return "";
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+function toTitleCaseHyphenated(s: string): string {
+  return String(s || "")
+    .split("-")
+    .map((t) => titleCaseToken(t))
+    .join("-");
+}
+
+function uniqueStrings(items: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const v of items) {
+    const s = String(v || "").trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
 function parseCompanionMeta(raw: string): CompanionMeta {
   const cleaned = stripExt(raw || "");
   const parts = cleaned
@@ -545,32 +587,57 @@ function parseCompanionMeta(raw: string): CompanionMeta {
 }
 
 function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: string) {
-  const raw = (companionKeyOrName || "").trim();
-  const normalized = normalizeKeyForFile(stripExt(raw));
-  const enc = normalized ? encodeURIComponent(normalized) : "";
+  const raw = stripExt(String(companionKeyOrName || "").trim());
+  if (!raw) return [DEFAULT_AVATAR];
+
+  // Build multiple name variants so headshot lookup remains robust even when:
+  // - companion keys are lower-cased by Wix
+  // - a member UUID suffix is appended
+  const baseInputs = Array.from(
+    new Set([raw, stripTrailingUuidSuffix(raw)].map((v) => String(v || "").trim()).filter(Boolean))
+  );
+
+  const encVariants: string[] = [];
+  const seenEnc = new Set<string>();
+
+  for (const baseInput of baseInputs) {
+    const normalized = normalizeKeyForFile(baseInput);
+    const lower = normalized.toLowerCase();
+    const title = toTitleCaseHyphenated(lower);
+
+    for (const v of [normalized, title, lower]) {
+      const trimmed = String(v || "").trim();
+      if (!trimmed) continue;
+      const enc = encodeURIComponent(trimmed);
+      if (!seenEnc.has(enc)) {
+        seenEnc.add(enc);
+        encVariants.push(enc);
+      }
+    }
+  }
+
+  const slug = String(rebrandingSlug || "").trim();
+  const slugEnc = slug ? encodeURIComponent(slug) : "";
 
   const candidates: string[] = [];
-
-  if (enc) {
+  // Some repos store images with uppercase extensions on Windows (e.g. ".JPG"),
+  // and the exported static output can be case-sensitive.
+  const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
+  for (const enc of encVariants) {
     // Rebrand-specific headshots (preferred when RebrandingKey is present):
     //   /rebranding/<brand>/companion/headshot/<CompanionName>.{jpeg|jpg|png}
-    const slug = String(rebrandingSlug || "").trim();
-    if (slug) {
+    if (slugEnc) {
       const rebrandBase = joinUrlPrefix(
         APP_BASE_PATH,
-        `${REBRANDING_PUBLIC_DIR}/${encodeURIComponent(slug)}${HEADSHOT_DIR}/${enc}`
+        `${REBRANDING_PUBLIC_DIR}/${slugEnc}${HEADSHOT_DIR}/${enc}`
       );
-      candidates.push(`${rebrandBase}.jpeg`);
-      candidates.push(`${rebrandBase}.jpg`);
-      candidates.push(`${rebrandBase}.png`);
+      for (const ext of exts) candidates.push(`${rebrandBase}.${ext}`);
     }
 
     // Default (non-rebranded) headshots:
     //   /companion/headshot/<CompanionName>.{jpeg|jpg|png}
     const base = joinUrlPrefix(APP_BASE_PATH, `${HEADSHOT_DIR}/${enc}`);
-    candidates.push(`${base}.jpeg`);
-    candidates.push(`${base}.jpg`);
-    candidates.push(`${base}.png`);
+    for (const ext of exts) candidates.push(`${base}.${ext}`);
   }
 
   candidates.push(DEFAULT_AVATAR);
