@@ -1191,6 +1191,53 @@ export default function Page() {
   // IMPORTANT: This must never alter STT/TTS start/stop code paths.
   const [rebrandingKey, setRebrandingKey] = useState<string>("");
   const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
+
+  const renderMsgContent = useCallback(
+    (m: Msg): React.ReactNode => {
+      // For user messages we keep plain text.
+      if (m.role !== "assistant") return m.content;
+
+      // For assistant messages, we render PayGo/Upgrade URLs as friendly links.
+      const stripScheme = (u: string) => (u || "").replace(/^https?:/i, "");
+
+      const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
+      const upgradeKey = rebrandingInfo?.upgradeLink ? stripScheme(rebrandingInfo.upgradeLink).toLowerCase() : "";
+
+      const urlGlobal = /(https?:\/\/[^\s]+|\/\/[^\s]+)/g;
+      const parts = (m.content || "").split(urlGlobal);
+
+      return parts.map((part, idx) => {
+        if (!part) return null;
+
+        const isUrl = /^https?:\/\//i.test(part) || part.startsWith("//");
+        if (!isUrl) return <span key={idx}>{part}</span>;
+
+        // Peel trailing punctuation so it doesn't get included in the href.
+        const match = part.match(/^(.*?)([\)\]\.,;:!?]+)?$/);
+        const urlRaw = match?.[1] ?? part;
+        const punct = match?.[2] ?? "";
+
+        const comparable = stripScheme(urlRaw).toLowerCase();
+
+        let label = urlRaw;
+        if (paygKey && comparable === paygKey) label = "Pay as you Go";
+        else if (upgradeKey && comparable === upgradeKey) label = "Upgrade";
+
+        const href = urlRaw.startsWith("//") ? `https:${urlRaw}` : urlRaw;
+
+        return (
+          <React.Fragment key={idx}>
+            <a href={href} target="_blank" rel="noopener noreferrer" className="underline">
+              {label}
+            </a>
+            {punct}
+          </React.Fragment>
+        );
+      });
+    },
+    [rebrandingInfo]
+  );
+
   const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), [rebrandingInfo]);
   const rebrandingSlug = useMemo(() => normalizeRebrandingSlug(rebrandingName), [rebrandingName]);
 
@@ -2703,7 +2750,8 @@ useEffect(() => {
       // When RebrandingKey is present, use ElaraloPlanMap for capability gating
       // (Wix planName may be the rebrand site's plan names like "Supreme").
       const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
-      const effectivePlan: PlanName = incomingMemberId ? (mappedPlanFromKey || incomingPlan) : "Trial";
+      const hasEntitledPlan = Boolean((mappedPlanFromKey || incomingPlan).trim());
+      const effectivePlan: PlanName = hasEntitledPlan ? (mappedPlanFromKey || incomingPlan) : "Trial";
       setPlanName(effectivePlan);
 
       // Display the rebranding site's plan label when provided (e.g., "Supreme"),
@@ -2787,6 +2835,14 @@ const stateToSendWithCompanion: SessionState = {
   // Member identity (from Wix)
   memberId: (memberId || "").trim(),
   member_id: (memberId || "").trim(),
+
+  // Plan for entitlements (use mapped Elaralo plan when rebrandingKey provides one)
+  planName: (planName || "").trim(),
+  plan_name: (planName || "").trim(),
+
+  // Optional display label (white-label plan name). Backend can use this for messaging only.
+  planLabelOverride: (planLabelOverride || "").trim(),
+  plan_label_override: (planLabelOverride || "").trim(),
 
   // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
   rebrandingKey: (rebrandingKey || "").trim(),
@@ -3560,10 +3616,9 @@ const pauseSpeechToText = useCallback(() => {
     // NOTE: Web Speech API does not reliably prompt on iOS if start() is called
     // outside the user's click. We still use getUserMedia to ensure permission exists.
     if (!navigator.mediaDevices?.getUserMedia) return true;
-    // Some embedded contexts (notably Wix Editor) can reject getUserMedia via Permissions-Policy
-    // even when the browser Web Speech API works.
-    // If we're NOT using backend STT capture, let SpeechRecognition own the permission prompt.
-    if (!useBackendStt) return true;
+    // iOS Safari (especially when embedded) can reject getUserMedia even when SpeechRecognition still works.
+    // If we're not using backend STT, let SpeechRecognition trigger the permission prompt instead.
+    if (isIOS && !useBackendStt) return true;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -3574,7 +3629,7 @@ const pauseSpeechToText = useCallback(() => {
       setMicGranted(true);
       return true;
     } catch (e: any) {
-      console.warn("Mic permission denied/unavailable:", (e as any)?.name, (e as any)?.message, e);
+      console.warn("Mic permission denied/unavailable:", e);
       setSttError(getEmbedHint());
 
       const name = e?.name || "";
@@ -4639,7 +4694,7 @@ const speakGreetingIfNeeded = useCallback(
                   color: m.role === "assistant" ? "#111" : "#333",
                 }}
               >
-                <b>{m.role === "assistant" ? companionName : "You"}:</b> {m.content}
+                <b>{m.role === "assistant" ? companionName : "You"}:</b> {renderMsgContent(m)}
               </div>
             ))}
             {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
