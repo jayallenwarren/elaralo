@@ -2743,9 +2743,8 @@ useEffect(() => {
       }
 
       const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, rebrandSlugFromMessage);
-      pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
-
-      const nextAllowed = allowedModesForPlan(effectivePlan);
+      pickFirstLoadableImage(avatarCandidates).then((picked) => setAvatarSrc(picked));
+const nextAllowed = allowedModesForPlan(effectivePlan);
       setAllowedModes(nextAllowed);
 
       // If current mode is not allowed, force friend
