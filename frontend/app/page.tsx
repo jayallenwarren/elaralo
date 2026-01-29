@@ -594,7 +594,7 @@ function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: stri
   // - companion keys are lower-cased by Wix
   // - a member UUID suffix is appended
   const baseInputs = Array.from(
-    new Set([raw, stripTrailingUuidSuffix(raw)].map((v) => String(v || "").trim()).filter(Boolean))
+    new Set([raw, stripTrailingUuid(raw)].map((v) => String(v || "").trim()).filter(Boolean))
   );
 
   const encVariants: string[] = [];
@@ -625,18 +625,26 @@ function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: stri
   const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
   for (const enc of encVariants) {
     // Rebrand-specific headshots (preferred when RebrandingKey is present):
-    //   /rebranding/<brand>/companion/headshot/<CompanionName>.{jpeg|jpg|png}
+    //   /rebranding/<brand>/companion/headshot/<CompanionName>[.<ext>]
     if (slugEnc) {
       const rebrandBase = joinUrlPrefix(
         APP_BASE_PATH,
         `${REBRANDING_PUBLIC_DIR}/${slugEnc}${HEADSHOT_DIR}/${enc}`
       );
+
+      // Allow extension-less filenames too (Windows may hide extensions, or assets may be committed without one).
+      candidates.push(rebrandBase);
+
       for (const ext of exts) candidates.push(`${rebrandBase}.${ext}`);
     }
 
     // Default (non-rebranded) headshots:
-    //   /companion/headshot/<CompanionName>.{jpeg|jpg|png}
+    //   /companion/headshot/<CompanionName>[.<ext>]
     const base = joinUrlPrefix(APP_BASE_PATH, `${HEADSHOT_DIR}/${enc}`);
+
+    // Allow extension-less filenames too.
+    candidates.push(base);
+
     for (const ext of exts) candidates.push(`${base}.${ext}`);
   }
 
