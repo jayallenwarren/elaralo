@@ -2214,8 +2214,8 @@ const speakAssistantReply = useCallback(
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
-  const goToMyElara = useCallback(() => {
-    const url = "https://www.elaralo.com/myelara";
+  const goToMyElaralo = useCallback(() => {
+    const url = "https://www.elaralo.com/myelaralo";
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
     // so we leave the embed and avoid “stacked headers”.
@@ -4081,7 +4081,7 @@ const speakGreetingIfNeeded = useCallback(
             onClick={() => {
               setSwitchCompanionFlash(true);
               window.setTimeout(() => {
-                goToMyElara();
+                goToMyElaralo();
                 setSwitchCompanionFlash(false);
               }, 120);
             }}
