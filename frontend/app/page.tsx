@@ -113,6 +113,75 @@ type PlanName =
   | "Test - Pay as You Go"
   | null;
 
+// -----------------------------------------------------------------------------
+// Visitor identity (anon) helpers
+// - We store a per-brand anon id in localStorage so visitors without a Wix memberId
+//   can still be consistently identified for freeMinutes usage tracking.
+// - IMPORTANT: localStorage is scoped to the iframe origin (azurestaticapps.net),
+//   so we namespace by brand to avoid cross-site collisions across white-label embeds.
+// -----------------------------------------------------------------------------
+const ANON_ID_PREFIX = "anon:";
+const ANON_ID_STORAGE_KEY_PREFIX = "ELARALO_ANON_ID::";
+
+function safeBrandKey(raw: string): string {
+  const s = (raw || "").trim().toLowerCase();
+  if (!s) return "core";
+  const cleaned = s.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned || "core";
+}
+
+function getAnonIdStorageKey(brand: string): string {
+  return `${ANON_ID_STORAGE_KEY_PREFIX}${safeBrandKey(brand)}`;
+}
+
+function generateAnonId(): string {
+  try {
+    // @ts-ignore
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      // @ts-ignore
+      return crypto.randomUUID();
+    }
+  } catch {}
+  // Fallback: 32-hex chars
+  const rand32 = () =>
+    Math.floor(Math.random() * 0xffffffff)
+      .toString(16)
+      .padStart(8, "0");
+  return `${rand32()}${rand32()}${rand32()}${rand32()}`;
+}
+
+function getOrCreateAnonMemberId(brand: string): string {
+  if (typeof window === "undefined") return "";
+  const storageKey = getAnonIdStorageKey(brand);
+
+  // Primary: localStorage (sticky across sessions)
+  try {
+    const existing = window.localStorage.getItem(storageKey);
+    if (existing && existing.trim()) return `${ANON_ID_PREFIX}${existing.trim()}`;
+    const id = generateAnonId();
+    window.localStorage.setItem(storageKey, id);
+    return `${ANON_ID_PREFIX}${id}`;
+  } catch {
+    // Some browsers/settings can block localStorage in a third-party iframe context.
+    // Secondary: sessionStorage (sticky for the tab session).
+    try {
+      const ssKey = `ELARALO_SESSION_ANON_ID::${safeBrandKey(brand)}`;
+      const existing = window.sessionStorage.getItem(ssKey);
+      if (existing && existing.trim()) return `${ANON_ID_PREFIX}${existing.trim()}`;
+      const id = generateAnonId();
+      window.sessionStorage.setItem(ssKey, id);
+      return `${ANON_ID_PREFIX}${id}`;
+    } catch {
+      return "";
+    }
+  }
+}
+
+function isAnonMemberId(memberId: string): boolean {
+  return (memberId || "").trim().toLowerCase().startsWith(ANON_ID_PREFIX);
+}
+
+
 
 // --- Plan and companion helpers (no UI changes beyond required labels) ---
 function normalizePlanName(raw: any): PlanName {
@@ -142,6 +211,25 @@ function normalizePlanName(raw: any): PlanName {
     default:
       return null;
   }
+}
+
+function stripTrialControlsFromRebrandingKey(key: string): string {
+  const p = parseRebrandingKey(key);
+  if (!p) return key;
+  // Keep format stable (9 segments).
+  // Blank-out FreeMinutes + CycleDays so the backend can fall back to plan defaults
+  // when the user is entitled (i.e., has an active plan).
+  return [
+    p.brand,
+    p.upgradeUrl,
+    p.paygUrl,
+    p.paygPrice,
+    p.paygMinutes,
+    p.plan,
+    p.elaraloPlanMap,
+    "",
+    "",
+  ].join("|");
 }
 
 function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverride?: string): string {
@@ -2826,15 +2914,30 @@ const companionForBackend =
   (companionName || DEFAULT_COMPANION_NAME).trim() ||
   DEFAULT_COMPANION_NAME;
 
-const stateToSendWithCompanion: SessionState = {
+
+const rawBrand =
+  (rebranding || "").trim() || parseRebrandingKey(rebrandingKey || "")?.brand || "core";
+const brandKey = safeBrandKey(rawBrand);
+
+// For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
+const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
+
+// If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
+// from the rebranding key so backend quota comes from the mapped Elaralo plan.
+const hasEntitledPlan = !!((memberId || "").trim() && !!loggedIn && !!planName && planName !== "Trial");
+const rebrandingKeyForBackend = hasEntitledPlan
+  ? stripTrialControlsFromRebrandingKey(rebrandingKey || "")
+  : (rebrandingKey || "");
+
+    const stateToSendWithCompanion: SessionState = {
   ...stateToSend,
   companion: companionForBackend,
   // Backward/forward compatibility with any backend expecting different field names
   companionName: companionForBackend,
   companion_name: companionForBackend,
   // Member identity (from Wix)
-  memberId: (memberId || "").trim(),
-  member_id: (memberId || "").trim(),
+  memberId: (memberIdForBackend || "").trim(),
+  member_id: (memberIdForBackend || "").trim(),
 
   // Plan for entitlements (use mapped Elaralo plan when rebrandingKey provides one)
   planName: (planName || "").trim(),
@@ -2845,11 +2948,11 @@ const stateToSendWithCompanion: SessionState = {
   plan_label_override: (planLabelOverride || "").trim(),
 
   // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
-  rebrandingKey: (rebrandingKey || "").trim(),
-  rebranding_key: (rebrandingKey || "").trim(),
-  RebrandingKey: (rebrandingKey || "").trim(),
+  rebrandingKey: (rebrandingKeyForBackend || "").trim(),
+  rebranding_key: (rebrandingKeyForBackend || "").trim(),
+  RebrandingKey: (rebrandingKeyForBackend || "").trim(),
   // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
-  rebranding: (rebrandingKey || "").trim(),
+  rebranding: (rebranding || "").trim(),
 };
 
     const res = await fetch(`${API_BASE}/chat`, {
@@ -2886,7 +2989,22 @@ const stateToSendWithCompanion: SessionState = {
 
     const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
 
-    const stateToSendWithCompanion: SessionState = {
+    
+const rawBrand =
+  (rebranding || "").trim() || parseRebrandingKey(rebrandingKey || "")?.brand || "core";
+const brandKey = safeBrandKey(rawBrand);
+
+// For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
+const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
+
+// If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
+// from the rebranding key so backend quota comes from the mapped Elaralo plan.
+const hasEntitledPlan = !!((memberId || "").trim() && !!loggedIn && !!planName && planName !== "Trial");
+const rebrandingKeyForBackend = hasEntitledPlan
+  ? stripTrialControlsFromRebrandingKey(rebrandingKey || "")
+  : (rebrandingKey || "");
+
+  const stateToSendWithCompanion: SessionState = {
       ...stateToSend,
       companion: companionForBackend,
       companionName: companionForBackend,
@@ -2894,15 +3012,15 @@ const stateToSendWithCompanion: SessionState = {
       planName: effectivePlanForBackend,
       plan_name: effectivePlanForBackend,
       plan: effectivePlanForBackend,
-      memberId: (memberId || "").trim(),
-      member_id: (memberId || "").trim(),
+      memberId: (memberIdForBackend || "").trim(),
+      member_id: (memberIdForBackend || "").trim(),
 
   // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
-  rebrandingKey: (rebrandingKey || "").trim(),
-  rebranding_key: (rebrandingKey || "").trim(),
-  RebrandingKey: (rebrandingKey || "").trim(),
+  rebrandingKey: (rebrandingKeyForBackend || "").trim(),
+  rebranding_key: (rebrandingKeyForBackend || "").trim(),
+  RebrandingKey: (rebrandingKeyForBackend || "").trim(),
   // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
-  rebranding: (rebrandingKey || "").trim(),
+  rebranding: (rebranding || "").trim(),
 };
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
