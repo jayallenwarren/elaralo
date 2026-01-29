@@ -67,6 +67,21 @@ type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
 type Mode = "friend" | "romantic" | "intimate";
+
+type LiveProvider = "did" | "stream";
+type ChannelCap = "audio" | "video" | "";
+
+type CompanionMappingRow = {
+  found?: boolean;
+  brand?: string;
+  avatar?: string;
+  communication?: string; // "Audio" | "Video"
+  live?: string; // "D-ID" | "Stream"
+  didClientKey?: string;
+  didAgentId?: string;
+  elevenVoiceId?: string;
+};
+
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
 type SessionState = {
@@ -129,11 +144,16 @@ function normalizePlanName(raw: any): PlanName {
   }
 }
 
-function displayPlanLabel(planName: PlanName, memberId: string): string {
+function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverride?: string): string {
   const hasMemberId = Boolean((memberId || "").trim());
 
   // Requirement: If we do not have a memberId, the visitor is on Trial, shown as "Free Trial".
   if (!hasMemberId) return "Free Trial";
+
+  // White-label: show the rebranding site's plan label when provided (e.g., "Supreme"),
+  // while still using ElaraloPlanMap for capability gating.
+  const override = String(planLabelOverride || "").trim();
+  if (override) return override;
 
   // Requirement: Unknown / Not Provided only when the plan information for a member is not provided.
   if (!planName) return "Unknown / Not Provided";
@@ -219,8 +239,97 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
 const DEFAULT_COMPANY_NAME = "Elaralo";
-const REBRANDING_QUERY_PARAM = "rebranding"; // legacy
+// Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
 const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
+
+// Back-compat: older embeds/tests may still pass ?rebranding=BrandName
+const LEGACY_REBRANDING_QUERY_PARAM = "rebranding";
+
+// Public asset root for white-label rebrands
+const REBRANDING_PUBLIC_DIR = "/rebranding";
+
+type RebrandingKeyParts = {
+  rebranding: string;
+  upgradeLink: string;
+  payGoLink: string;
+  payGoPrice: string;
+  payGoMinutes: string;
+  plan: string;
+  elaraloPlanMap: string;
+  freeMinutes: string;
+  cycleDays: string;
+};
+
+function stripRebrandingKeyLabel(part: string): string {
+  const s = String(part || "").trim();
+  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon")
+  const m = s.match(/^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$/);
+  return m ? String(m[1] || "").trim() : s;
+}
+
+function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
+  const v = String(raw || "").trim();
+  if (!v) return null;
+
+  // Legacy support: if there is no "|" delimiter, treat this as just the brand name.
+  if (!v.includes("|")) {
+    const brand = stripRebrandingKeyLabel(v);
+    return {
+      rebranding: brand,
+      upgradeLink: "",
+      payGoLink: "",
+      payGoPrice: "",
+      payGoMinutes: "",
+      plan: "",
+      elaraloPlanMap: "",
+      freeMinutes: "",
+      cycleDays: "",
+    };
+  }
+
+  const parts = v.split("|").map((p) => stripRebrandingKeyLabel(p));
+
+  const [
+    rebranding = "",
+    upgradeLink = "",
+    payGoLink = "",
+    payGoPrice = "",
+    payGoMinutes = "",
+    plan = "",
+    elaraloPlanMap = "",
+    freeMinutes = "",
+    cycleDays = "",
+  ] = parts;
+
+  return {
+    rebranding: String(rebranding || "").trim(),
+    upgradeLink: String(upgradeLink || "").trim(),
+    payGoLink: String(payGoLink || "").trim(),
+    payGoPrice: String(payGoPrice || "").trim(),
+    payGoMinutes: String(payGoMinutes || "").trim(),
+    plan: String(plan || "").trim(),
+    elaraloPlanMap: String(elaraloPlanMap || "").trim(),
+    freeMinutes: String(freeMinutes || "").trim(),
+    cycleDays: String(cycleDays || "").trim(),
+  };
+}
+
+function normalizeRebrandingSlug(rawBrand: string): string {
+  const raw = String(rawBrand || "").trim();
+  if (!raw) return "";
+
+  // Match the prior logo normalization rules so:
+  // - "Dulce Moon" and "DulceMoon" both -> "dulcemoon"
+  // - also works if someone includes an extension or "-logo" suffix
+  const normalizedBase = raw
+    .replace(/\.(png|jpg|jpeg|webp)$/i, "")
+    .replace(/-logo$/i, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+
+  return normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 
 function getAppBasePathFromAsset(assetPath: string): string {
   const p = String(assetPath || "");
@@ -240,41 +349,6 @@ function joinUrlPrefix(prefix: string, path: string): string {
   return pre + p;
 }
 
-type RebrandingKeyParsed = {
-  rebranding: string;
-  upgradeLink: string;
-  payGoLink: string;
-  payGoPrice: string;
-  payGoMinutes: string;
-  plan: string;
-  elaraloPlanMap: string;
-  freeMinutes: string;
-  cycleDays: string;
-};
-
-function parseRebrandingKey(raw: any): RebrandingKeyParsed | null {
-  const s = String(raw ?? "").trim();
-  if (!s) return null;
-
-  // Wix provides a pipe-delimited key:
-  // Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
-  const parts = s.split("|").map((p) => String(p ?? "").trim());
-
-  // Allow partial keys (defense-in-depth). Missing parts become empty strings.
-  return {
-    rebranding: parts[0] || "",
-    upgradeLink: parts[1] || "",
-    payGoLink: parts[2] || "",
-    payGoPrice: parts[3] || "",
-    payGoMinutes: parts[4] || "",
-    plan: parts[5] || "",
-    elaraloPlanMap: parts[6] || "",
-    freeMinutes: parts[7] || "",
-    cycleDays: parts[8] || "",
-  };
-}
-
-
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -284,23 +358,6 @@ type Phase1AvatarMedia = {
   didClientKey: string;
   elevenVoiceId: string;
 };
-
-type CompanionMappingRow = {
-  found: boolean;
-  brand: string;
-  avatar: string;
-  communication: string; // "Audio" | "Video" | ""
-  live: string; // "D-ID" | "Stream" | ""
-  elevenVoiceId: string;
-  elevenVoiceName: string;
-  didAgentId: string;
-  didClientKey: string;
-  didAgentLink: string;
-  didEmbedCode: string;
-  loadedAt: number | null;
-  source: string;
-};
-
 
 const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
   "Jennifer": {
@@ -487,17 +544,35 @@ function parseCompanionMeta(raw: string): CompanionMeta {
   };
 }
 
-function buildAvatarCandidates(companionKeyOrName: string) {
+function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: string) {
   const raw = (companionKeyOrName || "").trim();
   const normalized = normalizeKeyForFile(stripExt(raw));
-  const base = normalized ? `${HEADSHOT_DIR}/${encodeURIComponent(normalized)}` : "";
+  const enc = normalized ? encodeURIComponent(normalized) : "";
 
   const candidates: string[] = [];
-  if (base) {
+
+  if (enc) {
+    // Rebrand-specific headshots (preferred when RebrandingKey is present):
+    //   /rebranding/<brand>/companion/headshot/<CompanionName>.{jpeg|jpg|png}
+    const slug = String(rebrandingSlug || "").trim();
+    if (slug) {
+      const rebrandBase = joinUrlPrefix(
+        APP_BASE_PATH,
+        `${REBRANDING_PUBLIC_DIR}/${encodeURIComponent(slug)}${HEADSHOT_DIR}/${enc}`
+      );
+      candidates.push(`${rebrandBase}.jpeg`);
+      candidates.push(`${rebrandBase}.jpg`);
+      candidates.push(`${rebrandBase}.png`);
+    }
+
+    // Default (non-rebranded) headshots:
+    //   /companion/headshot/<CompanionName>.{jpeg|jpg|png}
+    const base = joinUrlPrefix(APP_BASE_PATH, `${HEADSHOT_DIR}/${enc}`);
     candidates.push(`${base}.jpeg`);
     candidates.push(`${base}.jpg`);
     candidates.push(`${base}.png`);
   }
+
   candidates.push(DEFAULT_AVATAR);
   return candidates;
 }
@@ -556,10 +631,53 @@ function greetingFor(name: string) {
 function isAllowedOrigin(origin: string) {
   try {
     const u = new URL(origin);
-    const host = u.hostname.toLowerCase();
+    const hostRaw = u.hostname.toLowerCase();
+    const host = hostRaw.startsWith("www.") ? hostRaw.slice(4) : hostRaw;
+
+    // First-party + Wix domains (Editor/Studio/Preview).
     if (host.endsWith("elaralo.com")) return true;
     if (host.endsWith("wix.com")) return true;
     if (host.endsWith("wixsite.com")) return true;
+
+    // White-label custom domains:
+    // In an iframe, Wix will postMessage from the parent page origin (e.g. https://www.dulcemoon.net).
+    // Allow the *embedding page* origin by matching document.referrer (and tolerating www vs non-www).
+    try {
+      const ref = typeof document !== "undefined" ? document.referrer : "";
+      if (ref) {
+        const refHostRaw = new URL(ref).hostname.toLowerCase();
+        const refHost = refHostRaw.startsWith("www.") ? refHostRaw.slice(4) : refHostRaw;
+
+        if (host === refHost) return true;
+        if (host.endsWith("." + refHost)) return true; // subdomain match
+        if (refHost.endsWith("." + host)) return true; // inverse (defensive)
+      }
+    } catch {
+      // ignore referrer parse issues
+    }
+
+    // Chrome-only fallback (helps in some embedded contexts)
+    try {
+      const ancestorOrigins = (typeof window !== "undefined" ? (window.location as any).ancestorOrigins : null) as
+        | { length: number; [idx: number]: string }
+        | null;
+      if (ancestorOrigins && typeof ancestorOrigins.length === "number") {
+        for (let i = 0; i < ancestorOrigins.length; i++) {
+          try {
+            const aHostRaw = new URL(ancestorOrigins[i]).hostname.toLowerCase();
+            const aHost = aHostRaw.startsWith("www.") ? aHostRaw.slice(4) : aHostRaw;
+            if (host === aHost) return true;
+            if (host.endsWith("." + aHost)) return true;
+            if (aHost.endsWith("." + host)) return true;
+          } catch {
+            // ignore per-origin parse issues
+          }
+        }
+      }
+    } catch {
+      // ignore ancestorOrigins issues
+    }
+
     return false;
   } catch {
     return false;
@@ -994,34 +1112,78 @@ export default function Page() {
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
-  // Optional white-label rebranding (company name + default logo only; does NOT touch companion logic)
-  const [rebrandingName, setRebrandingName] = useState<string>("");
+  // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
+  // IMPORTANT: This must never alter STT/TTS start/stop code paths.
+  const [rebrandingKey, setRebrandingKey] = useState<string>("");
+  const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
+  const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), [rebrandingInfo]);
+  const rebrandingSlug = useMemo(() => normalizeRebrandingSlug(rebrandingName), [rebrandingName]);
+
+  // For rebrands, show the rebranding site's plan label when Wix provides it (e.g., "Supreme").
+  const [planLabelOverride, setPlanLabelOverride] = useState<string>("");
+
+  // Upgrade URL (defaults to env; overridden by RebrandingKey when present)
+  const upgradeUrl = useMemo(() => {
+    const u = String(rebrandingInfo?.upgradeLink || "").trim();
+    return u || UPGRADE_URL;
+  }, [rebrandingInfo]);
+
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = ((rebrandingName || "").trim() || DEFAULT_COMPANY_NAME);
+  const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
-  // Companion capabilities (Audio vs Video, Live provider, D-ID + ElevenLabs IDs) from the SQLite mappings DB (served by the API).
+  // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
   const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
 
-  // Direct testing (outside Wix):
-  // - Preferred: ?rebrandingKey=<pipe-delimited key>
-  // - Legacy:    ?rebranding=<BrandName>
-  //
-  // In production, Wix passes rebrandingKey via postMessage.
   useEffect(() => {
-    try {
-      const u = new URL(window.location.href);
+    let cancelled = false;
 
-      const rk = u.searchParams.get(REBRANDING_KEY_QUERY_PARAM);
-      const parsed = parseRebrandingKey(rk);
-      if (parsed?.rebranding && parsed.rebranding.trim()) {
-        setRebrandingName(parsed.rebranding.trim());
+    async function load() {
+      const brand = String(companyName || "").trim();
+      const avatar = String(companionName || "").trim();
+      if (!brand || !avatar) {
+        setCompanionMapping(null);
         return;
       }
 
-      const q = u.searchParams.get(REBRANDING_QUERY_PARAM);
-      if (q && q.trim()) setRebrandingName(q.trim());
+      if (!API_BASE) {
+        setCompanionMapping(null);
+        return;
+      }
+
+      try {
+        const url = `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(
+          avatar
+        )}`;
+        const res = await fetch(url, { method: "GET" });
+        const json = (await res.json()) as CompanionMappingRow;
+        if (cancelled) return;
+
+        if (res.ok && (json as any)?.found) setCompanionMapping(json);
+        else setCompanionMapping(null);
+      } catch {
+        if (!cancelled) setCompanionMapping(null);
+      }
+    }
+
+    void load();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [companyName, companionName]);
+
+  // Read `?rebrandingKey=...` for direct testing (outside Wix).
+  // Back-compat: also accept `?rebranding=BrandName`.
+  // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
+  useEffect(() => {
+    try {
+      const u = new URL(window.location.href);
+      const qKey = u.searchParams.get(REBRANDING_KEY_QUERY_PARAM);
+      const qLegacy = u.searchParams.get(LEGACY_REBRANDING_QUERY_PARAM);
+      const q = String(qKey || "").trim() || String(qLegacy || "").trim();
+      if (q) setRebrandingKey(q);
     } catch {
       // ignore
     }
@@ -1030,10 +1192,11 @@ export default function Page() {
   // Resolve the default company logo when rebranding is active.
   // This only affects the header circle image when no companion image is available.
   useEffect(() => {
-    const raw = (rebrandingName || "").trim();
+    const rawBrand = (rebrandingName || "").trim();
+    const slug = (rebrandingSlug || "").trim();
 
     // No rebranding: revert to the default Elaralo logo.
-    if (!raw) {
+    if (!rawBrand) {
       setCompanyLogoSrc(DEFAULT_AVATAR);
 
       // Keep the header image in sync if we are currently showing a company logo.
@@ -1041,7 +1204,12 @@ export default function Page() {
       setAvatarSrc((prev) => {
         const p = String(prev || "").trim();
         if (!p) return DEFAULT_AVATAR;
-        if (p.startsWith(`${HEADSHOT_DIR}/`)) return prev;
+
+        // Covers both:
+        // - "/companion/headshot/..."
+        // - "/rebranding/<brand>/companion/headshot/..."
+        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
+
         if (p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
 
         // If we were previously showing a rebrand logo, revert to default.
@@ -1053,23 +1221,21 @@ export default function Page() {
       return;
     }
 
-    // Normalize the rebranding name into a filename base:
-    // - strip extension
-    // - strip trailing "-logo"
-    // - lowercase
-    // - remove non-alphanumerics so "Dulce Moon" and "DulceMoon" => "dulcemoon"
-    const normalizedBase = raw
-      .replace(/\.(png|jpg|jpeg|webp)$/i, "")
-      .replace(/-logo$/i, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "");
-
-    const base = normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const base = slug || normalizeRebrandingSlug(rawBrand);
 
     const candidates: string[] = [];
     if (base) {
-      // IMPORTANT: Logo assets live in frontend/public, which resolves to the site root at runtime.
-      // Use the same basePath prefix as Next's imported assets so this works in all deployments.
+      // IMPORTANT:
+      // - Logo assets live under frontend/public.
+      // - For rebrands, the logo is now located under:
+      //     /rebranding/<brand>/<brand>-logo.(png|jpg|jpeg|webp)
+      // - We keep a legacy fallback for older deployments where the logo lived at site root.
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.png`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpg`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpeg`));
+      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.webp`));
+
+      // Legacy fallback: root-level logo
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.png`));
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpg`));
       candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpeg`));
@@ -1091,7 +1257,10 @@ export default function Page() {
       setAvatarSrc((prev) => {
         const p = String(prev || "").trim();
         if (!p) return picked;
-        if (p.startsWith(`${HEADSHOT_DIR}/`)) return prev;
+
+        // Covers both default + rebrand headshots.
+        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
+
         if (p === DEFAULT_AVATAR) return picked;
 
         // If we were showing some other "-logo.*" asset, treat it as a company logo and swap it.
@@ -1104,7 +1273,8 @@ export default function Page() {
     return () => {
       cancelled = true;
     };
-  }, [rebrandingName]);
+  }, [rebrandingName, rebrandingSlug]);
+
 
 
 // ----------------------------
@@ -1129,58 +1299,50 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
 
-const phase1AvatarMedia = useMemo(() => {
-  // Phase 1 hardcoded mapping has priority (keeps known-stable companions unchanged).
-  const hard = getPhase1AvatarMedia(companionName);
-  if (hard) return hard;
+const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
-  // If the DB mapping provides D-ID credentials, enable Live Avatar for this companion.
-  const didAgentId = String((companionMapping as any)?.didAgentId || "").trim();
-  const didClientKey = String((companionMapping as any)?.didClientKey || "").trim();
+const channelCap: ChannelCap = useMemo(() => {
+  const commFromDb = String(companionMapping?.communication || "").trim().toLowerCase();
+  if (commFromDb === "video") return "video";
+  if (commFromDb === "audio") return "audio";
+  return "";
+}, [companionMapping]);
 
-  if (!didAgentId || !didClientKey) return null;
-
-  // Voice ID: prefer DB, fallback to the existing stable voice map (or empty).
-  const elevenVoiceId =
-    String((companionMapping as any)?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(companionName);
-
-  if (!elevenVoiceId) return null;
-
-  return { didAgentId, didClientKey, elevenVoiceId };
-}, [companionName, companionMapping]);
-
-const liveProvider = useMemo(() => {
+const liveProvider: LiveProvider = useMemo(() => {
   // Prefer database mapping when present.
-  const liveFromDb = String((companionMapping as any)?.live || "").trim().toLowerCase();
+  const liveFromDb = String(companionMapping?.live || "").trim().toLowerCase();
   if (liveFromDb === "stream") return "stream";
   if (liveFromDb === "d-id" || liveFromDb === "did" || liveFromDb === "d_id") return "did";
 
-  // Legacy fallback: flags embedded in the companion key (deprecated; kept for backward compatibility).
+  // Backward compatibility: allow companionKey flags (older Wix payloads / test URLs)
   const raw = String(companionKeyRaw || companionKey || "").trim();
+  const { flags } = splitCompanionKey(raw);
+  const v = String(flags["live"] || "").trim().toLowerCase();
+  if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
+
+  return "did";
+}, [companionMapping, companionKeyRaw, companionKey]);
   const { flags } = splitCompanionKey(raw);
   const v = String(flags["live"] || "").toLowerCase();
   if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
   return "did";
-}, [companionMapping, companionKeyRaw, companionKey]);
+}, [companionKeyRaw, companionKey]);
 
 const streamUrl = useMemo(() => {
-  // DB currently does not carry a per-companion stream URL. Use env, with a legacy flag override.
   const raw = String(companionKeyRaw || "").trim();
   const { flags } = splitCompanionKey(raw);
   return String(flags["streamurl"] || "").trim() || STREAM_URL;
 }, [companionKeyRaw]);
 
-const communicationCap = useMemo(() => {
-  const commFromDb = String((companionMapping as any)?.communication || "").trim().toLowerCase();
-  if (commFromDb === "video") return "video";
-  if (commFromDb === "audio") return "audio";
+const liveEnabled = useMemo(() => {
+  // Primary: DB mapping tells us whether this companion supports video.
+  if (channelCap === "video") return true;
+  if (channelCap === "audio") return false;
 
-  // Fallback: if a Live Avatar is possible, treat as video-capable.
-  return (liveProvider === "stream" || Boolean(phase1AvatarMedia)) ? "video" : "audio";
-}, [companionMapping, liveProvider, phase1AvatarMedia]);
+  // Fallback to the prior behavior when mapping is missing.
+  return liveProvider === "stream" || Boolean(phase1AvatarMedia);
+}, [channelCap, liveProvider, phase1AvatarMedia]);
 
-const liveEnabled =
-  communicationCap === "video" && (liveProvider === "stream" || Boolean(phase1AvatarMedia));
 
 
   // UI layout
@@ -2241,7 +2403,7 @@ const speakAssistantReply = useCallback(
   }, []);
 
   const goToUpgrade = useCallback(() => {
-    const url = UPGRADE_URL;
+    const url = upgradeUrl;
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
     // so we leave the embed and avoid “stacked headers”.
@@ -2264,7 +2426,7 @@ const speakAssistantReply = useCallback(
 
     // Fallback: navigate the current frame.
     window.location.href = url;
-  }, []);
+  }, [upgradeUrl]);
 
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
@@ -2397,7 +2559,7 @@ useEffect(() => {
     const modeLabel = MODE_LABELS[requestedMode];
     const msg =
       `The requested mode (${modeLabel}) isn't available on your current plan. ` +
-      `Please upgrade here: ${UPGRADE_URL} or click the upgrade button below the text input box`;
+      `Please upgrade here: ${upgradeUrl} or click the upgrade button below the text input box`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
@@ -2405,28 +2567,58 @@ useEffect(() => {
   // Receive plan + companion from Wix postMessage
   useEffect(() => {
     function onMessage(event: MessageEvent) {
-      if (!isAllowedOrigin(event.origin)) return;
+  if (!isAllowedOrigin(event.origin)) return;
 
-      const data = event.data;
-      if (!data || data.type !== "MEMBER_PLAN") return;
+  // Wix HTML components sometimes deliver the payload as a JSON string.
+  // Accept both object and string forms.
+  let data: any = (event as any).data;
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      return;
+    }
+  }
 
+  if (!data || typeof data !== "object" || (data as any).type !== "MEMBER_PLAN") return;
       const incomingPlan = normalizePlanName((data as any).planName);
 
-      // Optional white-label brand handoff from Wix (company name + default logo only).
-      // This MUST NOT affect companion selection or persona logic.
+      // Optional white-label brand handoff from Wix.
+      // - Elaralo site should send: { rebrandingKey: "" }
+      // - Rebranding sites should send the full RebrandingKey (pipe-delimited).
       //
-      // Preferred: rebrandingKey (pipe-delimited). Elaralo sends an empty string.
-      // Legacy:    rebranding (plain string)
-      if ("rebrandingKey" in (data as any)) {
-        const rawKey =
-          typeof (data as any).rebrandingKey === "string" ? String((data as any).rebrandingKey).trim() : "";
-        const parsed = parseRebrandingKey(rawKey);
-        setRebrandingName((parsed?.rebranding || "").trim());
+      // IMPORTANT: This must never alter STT/TTS start/stop code paths.
+      let rawRebrandingKey = "";
+
+      if (
+        "rebrandingKey" in (data as any) ||
+        "rebranding_key" in (data as any) ||
+        "RebrandingKey" in (data as any) ||
+        "rebrandingkey" in (data as any)
+      ) {
+        rawRebrandingKey =
+          typeof (data as any).rebrandingKey === "string"
+            ? String((data as any).rebrandingKey)
+            : typeof (data as any).rebranding_key === "string"
+              ? String((data as any).rebranding_key)
+              : typeof (data as any).rebrandingkey === "string"
+                ? String((data as any).rebrandingkey)
+                : typeof (data as any).RebrandingKey === "string"
+                  ? String((data as any).RebrandingKey)
+                  : "";
+        rawRebrandingKey = rawRebrandingKey.trim();
+
+        // Allow empty string to explicitly clear any previous rebranding state.
+        setRebrandingKey(rawRebrandingKey);
       } else if ("rebranding" in (data as any)) {
-        const incomingRebranding =
-          typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
-        setRebrandingName(incomingRebranding);
+        // Legacy support: some older Wix pages may still send { rebranding: "BrandName" }.
+        rawRebrandingKey = typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
+        if (rawRebrandingKey) setRebrandingKey(rawRebrandingKey);
       }
+
+      const rkParts = parseRebrandingKey(rawRebrandingKey);
+      const rebrandSlugFromMessage = normalizeRebrandingSlug(rkParts?.rebranding || "");
+
 
 
 
@@ -2438,8 +2630,16 @@ useEffect(() => {
             : "";
       setMemberId(incomingMemberId);
 
-      const effectivePlan: PlanName = incomingMemberId ? incomingPlan : "Trial";
+      // When RebrandingKey is present, use ElaraloPlanMap for capability gating
+      // (Wix planName may be the rebrand site's plan names like "Supreme").
+      const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
+      const effectivePlan: PlanName = incomingMemberId ? (mappedPlanFromKey || incomingPlan) : "Trial";
       setPlanName(effectivePlan);
+
+      // Display the rebranding site's plan label when provided (e.g., "Supreme"),
+      // but only for logged-in members (Free Trial ignores plan labels by design).
+      const planLabel = incomingMemberId ? String(rkParts?.plan || "").trim() : "";
+      setPlanLabelOverride(planLabel);
 
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
@@ -2472,7 +2672,7 @@ useEffect(() => {
         }));
       }
 
-      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME);
+      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, rebrandSlugFromMessage);
       pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       const nextAllowed = allowedModesForPlan(effectivePlan);
@@ -2491,36 +2691,6 @@ useEffect(() => {
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, []);
-
-
-  // Load companion mapping (brand + avatar) from the API (backed by the SQLite DB loaded in memory on startup).
-  // This replaces any legacy "live=..." flags that were previously appended in Wix.
-  useEffect(() => {
-    if (!API_BASE) return;
-
-    const avatar = (companionName || "").trim() || DEFAULT_COMPANION_NAME;
-    const brand = (companyName || "").trim(); // blank is OK; backend defaults to Elaralo
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const url =
-          `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(avatar)}`;
-        const res = await fetch(url, { method: "GET", cache: "no-store" });
-        if (!res.ok) throw new Error(`mappings/companion ${res.status}`);
-        const data = (await res.json()) as CompanionMappingRow;
-        if (!cancelled) setCompanionMapping(data);
-      } catch (e) {
-        // Fail open: keep UI defaults / Phase 1 hardcoded mapping.
-        if (!cancelled) setCompanionMapping(null);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [companionName, companyName]);
-
 
   async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
@@ -2548,6 +2718,13 @@ const stateToSendWithCompanion: SessionState = {
   // Member identity (from Wix)
   memberId: (memberId || "").trim(),
   member_id: (memberId || "").trim(),
+
+  // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
+  rebrandingKey: (rebrandingKey || "").trim(),
+  rebranding_key: (rebrandingKey || "").trim(),
+  RebrandingKey: (rebrandingKey || "").trim(),
+  // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
+  rebranding: (rebrandingKey || "").trim(),
 };
 
     const res = await fetch(`${API_BASE}/chat`, {
@@ -2594,7 +2771,14 @@ const stateToSendWithCompanion: SessionState = {
       plan: effectivePlanForBackend,
       memberId: (memberId || "").trim(),
       member_id: (memberId || "").trim(),
-    };
+
+  // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
+  rebrandingKey: (rebrandingKey || "").trim(),
+  rebranding_key: (rebrandingKey || "").trim(),
+  RebrandingKey: (rebrandingKey || "").trim(),
+  // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
+  rebranding: (rebrandingKey || "").trim(),
+};
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
       method: "POST",
@@ -4182,7 +4366,7 @@ const speakGreetingIfNeeded = useCallback(
           <h1 style={{ margin: 0, fontSize: 22 }}>{companyName}</h1>
           <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-            <b>{displayPlanLabel(planName, memberId)}</b>
+            <b>{displayPlanLabel(planName, memberId, planLabelOverride)}</b>
           </div>
           <div style={{ fontSize: 12, color: "#666" }}>
             Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
