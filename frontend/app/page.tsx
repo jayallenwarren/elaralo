@@ -3560,9 +3560,10 @@ const pauseSpeechToText = useCallback(() => {
     // NOTE: Web Speech API does not reliably prompt on iOS if start() is called
     // outside the user's click. We still use getUserMedia to ensure permission exists.
     if (!navigator.mediaDevices?.getUserMedia) return true;
-    // iOS Safari (especially when embedded) can reject getUserMedia even when SpeechRecognition still works.
-    // If we're not using backend STT, let SpeechRecognition trigger the permission prompt instead.
-    if (isIOS && !useBackendStt) return true;
+    // Some embedded contexts (notably Wix Editor) can reject getUserMedia via Permissions-Policy
+    // even when the browser Web Speech API works.
+    // If we're NOT using backend STT capture, let SpeechRecognition own the permission prompt.
+    if (!useBackendStt) return true;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -3573,7 +3574,7 @@ const pauseSpeechToText = useCallback(() => {
       setMicGranted(true);
       return true;
     } catch (e: any) {
-      console.warn("Mic permission denied/unavailable:", e);
+      console.warn("Mic permission denied/unavailable:", (e as any)?.name, (e as any)?.message, e);
       setSttError(getEmbedHint());
 
       const name = e?.name || "";
