@@ -219,7 +219,8 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
 const DEFAULT_COMPANY_NAME = "Elaralo";
-const REBRANDING_QUERY_PARAM = "rebranding";
+const REBRANDING_QUERY_PARAM = "rebranding"; // legacy
+const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
 
 function getAppBasePathFromAsset(assetPath: string): string {
   const p = String(assetPath || "");
@@ -239,6 +240,41 @@ function joinUrlPrefix(prefix: string, path: string): string {
   return pre + p;
 }
 
+type RebrandingKeyParsed = {
+  rebranding: string;
+  upgradeLink: string;
+  payGoLink: string;
+  payGoPrice: string;
+  payGoMinutes: string;
+  plan: string;
+  elaraloPlanMap: string;
+  freeMinutes: string;
+  cycleDays: string;
+};
+
+function parseRebrandingKey(raw: any): RebrandingKeyParsed | null {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+
+  // Wix provides a pipe-delimited key:
+  // Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+  const parts = s.split("|").map((p) => String(p ?? "").trim());
+
+  // Allow partial keys (defense-in-depth). Missing parts become empty strings.
+  return {
+    rebranding: parts[0] || "",
+    upgradeLink: parts[1] || "",
+    payGoLink: parts[2] || "",
+    payGoPrice: parts[3] || "",
+    payGoMinutes: parts[4] || "",
+    plan: parts[5] || "",
+    elaraloPlanMap: parts[6] || "",
+    freeMinutes: parts[7] || "",
+    cycleDays: parts[8] || "",
+  };
+}
+
+
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -248,6 +284,23 @@ type Phase1AvatarMedia = {
   didClientKey: string;
   elevenVoiceId: string;
 };
+
+type CompanionMappingRow = {
+  found: boolean;
+  brand: string;
+  avatar: string;
+  communication: string; // "Audio" | "Video" | ""
+  live: string; // "D-ID" | "Stream" | ""
+  elevenVoiceId: string;
+  elevenVoiceName: string;
+  didAgentId: string;
+  didClientKey: string;
+  didAgentLink: string;
+  didEmbedCode: string;
+  loadedAt: number | null;
+  source: string;
+};
+
 
 const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
   "Jennifer": {
@@ -948,11 +1001,25 @@ export default function Page() {
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
-  // Read `?rebranding=...` for direct testing (outside Wix).
-  // In production, Wix should pass { rebranding: "BrandName" } via postMessage.
+  // Companion capabilities (Audio vs Video, Live provider, D-ID + ElevenLabs IDs) from the SQLite mappings DB (served by the API).
+  const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
+
+  // Direct testing (outside Wix):
+  // - Preferred: ?rebrandingKey=<pipe-delimited key>
+  // - Legacy:    ?rebranding=<BrandName>
+  //
+  // In production, Wix passes rebrandingKey via postMessage.
   useEffect(() => {
     try {
       const u = new URL(window.location.href);
+
+      const rk = u.searchParams.get(REBRANDING_KEY_QUERY_PARAM);
+      const parsed = parseRebrandingKey(rk);
+      if (parsed?.rebranding && parsed.rebranding.trim()) {
+        setRebrandingName(parsed.rebranding.trim());
+        return;
+      }
+
       const q = u.searchParams.get(REBRANDING_QUERY_PARAM);
       if (q && q.trim()) setRebrandingName(q.trim());
     } catch {
@@ -1062,23 +1129,58 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
 
-const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
+const phase1AvatarMedia = useMemo(() => {
+  // Phase 1 hardcoded mapping has priority (keeps known-stable companions unchanged).
+  const hard = getPhase1AvatarMedia(companionName);
+  if (hard) return hard;
+
+  // If the DB mapping provides D-ID credentials, enable Live Avatar for this companion.
+  const didAgentId = String((companionMapping as any)?.didAgentId || "").trim();
+  const didClientKey = String((companionMapping as any)?.didClientKey || "").trim();
+
+  if (!didAgentId || !didClientKey) return null;
+
+  // Voice ID: prefer DB, fallback to the existing stable voice map (or empty).
+  const elevenVoiceId =
+    String((companionMapping as any)?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(companionName);
+
+  if (!elevenVoiceId) return null;
+
+  return { didAgentId, didClientKey, elevenVoiceId };
+}, [companionName, companionMapping]);
 
 const liveProvider = useMemo(() => {
+  // Prefer database mapping when present.
+  const liveFromDb = String((companionMapping as any)?.live || "").trim().toLowerCase();
+  if (liveFromDb === "stream") return "stream";
+  if (liveFromDb === "d-id" || liveFromDb === "did" || liveFromDb === "d_id") return "did";
+
+  // Legacy fallback: flags embedded in the companion key (deprecated; kept for backward compatibility).
   const raw = String(companionKeyRaw || companionKey || "").trim();
   const { flags } = splitCompanionKey(raw);
   const v = String(flags["live"] || "").toLowerCase();
   if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
   return "did";
-}, [companionKeyRaw, companionKey]);
+}, [companionMapping, companionKeyRaw, companionKey]);
 
 const streamUrl = useMemo(() => {
+  // DB currently does not carry a per-companion stream URL. Use env, with a legacy flag override.
   const raw = String(companionKeyRaw || "").trim();
   const { flags } = splitCompanionKey(raw);
   return String(flags["streamurl"] || "").trim() || STREAM_URL;
 }, [companionKeyRaw]);
 
-const liveEnabled = liveProvider === "stream" || Boolean(phase1AvatarMedia);
+const communicationCap = useMemo(() => {
+  const commFromDb = String((companionMapping as any)?.communication || "").trim().toLowerCase();
+  if (commFromDb === "video") return "video";
+  if (commFromDb === "audio") return "audio";
+
+  // Fallback: if a Live Avatar is possible, treat as video-capable.
+  return (liveProvider === "stream" || Boolean(phase1AvatarMedia)) ? "video" : "audio";
+}, [companionMapping, liveProvider, phase1AvatarMedia]);
+
+const liveEnabled =
+  communicationCap === "video" && (liveProvider === "stream" || Boolean(phase1AvatarMedia));
 
 
   // UI layout
@@ -2312,7 +2414,15 @@ useEffect(() => {
 
       // Optional white-label brand handoff from Wix (company name + default logo only).
       // This MUST NOT affect companion selection or persona logic.
-      if ("rebranding" in (data as any)) {
+      //
+      // Preferred: rebrandingKey (pipe-delimited). Elaralo sends an empty string.
+      // Legacy:    rebranding (plain string)
+      if ("rebrandingKey" in (data as any)) {
+        const rawKey =
+          typeof (data as any).rebrandingKey === "string" ? String((data as any).rebrandingKey).trim() : "";
+        const parsed = parseRebrandingKey(rawKey);
+        setRebrandingName((parsed?.rebranding || "").trim());
+      } else if ("rebranding" in (data as any)) {
         const incomingRebranding =
           typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
         setRebrandingName(incomingRebranding);
@@ -2381,6 +2491,36 @@ useEffect(() => {
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, []);
+
+
+  // Load companion mapping (brand + avatar) from the API (backed by the SQLite DB loaded in memory on startup).
+  // This replaces any legacy "live=..." flags that were previously appended in Wix.
+  useEffect(() => {
+    if (!API_BASE) return;
+
+    const avatar = (companionName || "").trim() || DEFAULT_COMPANION_NAME;
+    const brand = (companyName || "").trim(); // blank is OK; backend defaults to Elaralo
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const url =
+          `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(avatar)}`;
+        const res = await fetch(url, { method: "GET", cache: "no-store" });
+        if (!res.ok) throw new Error(`mappings/companion ${res.status}`);
+        const data = (await res.json()) as CompanionMappingRow;
+        if (!cancelled) setCompanionMapping(data);
+      } catch (e) {
+        // Fail open: keep UI defaults / Phase 1 hardcoded mapping.
+        if (!cancelled) setCompanionMapping(null);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [companionName, companyName]);
+
 
   async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
