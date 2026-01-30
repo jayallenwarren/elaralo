@@ -2924,8 +2924,7 @@ const companionForBackend =
   DEFAULT_COMPANION_NAME;
 
 
-const rawBrand =
-  (rebranding || "").trim() || parseRebrandingKey(rebrandingKey || "")?.rebranding || "core";
+const rawBrand = parseRebrandingKey(rebrandingKey || "")?.rebranding || "core";
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -2999,8 +2998,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
     const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
 
     
-const rawBrand =
-  (rebranding || "").trim() || parseRebrandingKey(rebrandingKey || "")?.rebranding || "core";
+const rawBrand = parseRebrandingKey(rebrandingKey || "")?.rebranding || "core";
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
