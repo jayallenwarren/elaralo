@@ -230,10 +230,10 @@ function stripTrialControlsFromRebrandingKey(key: string): string {
   // when the user is entitled (i.e., has an active plan).
   return [
     p.rebranding,
-    p.upgradeLink,
-    p.payGoLink,
-    p.payGoPrice,
-    p.payGoMinutes,
+    p.upgradeUrl,
+    p.paygUrl,
+    p.paygPrice,
+    p.paygMinutes,
     entitlementPlan,
     p.elaraloPlanMap,
     "",
@@ -2582,6 +2582,7 @@ const speakAssistantReply = useCallback(
 
   const [planName, setPlanName] = useState<PlanName>(null);
   const [memberId, setMemberId] = useState<string>("");
+  const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
   // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
   const [handoffReady, setHandoffReady] = useState<boolean>(false);
@@ -2795,6 +2796,15 @@ useEffect(() => {
   }
 
   if (!data || typeof data !== "object" || (data as any).type !== "MEMBER_PLAN") return;
+
+      // loggedIn must come from Wix; do NOT infer from memberId.
+      const incomingLoggedIn = (data as any).loggedIn;
+      if (typeof incomingLoggedIn === "boolean") {
+        setLoggedIn(incomingLoggedIn);
+      } else {
+        setLoggedIn(false);
+      }
+
       const incomingPlan = normalizePlanName((data as any).planName);
 
       // Optional white-label brand handoff from Wix.
@@ -2924,7 +2934,10 @@ const companionForBackend =
   DEFAULT_COMPANION_NAME;
 
 
-const rawBrand = parseRebrandingKey(rebrandingKey || "")?.rebranding || "core";
+// NOTE:
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || "core").trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -2932,7 +2945,9 @@ const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(br
 
 // If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
 // from the rebranding key so backend quota comes from the mapped Elaralo plan.
-const hasEntitledPlan = !!((memberId || "").trim() && !!loggedIn && !!planName && planName !== "Trial");
+
+// `loggedIn` is only available when the Wix parent posts it.
+const hasEntitledPlan = !!((memberId || "").trim() && loggedIn === true && !!planName && planName !== "Trial");
 const rebrandingKeyForBackend = hasEntitledPlan
   ? stripTrialControlsFromRebrandingKey(rebrandingKey || "")
   : (rebrandingKey || "");
@@ -2998,7 +3013,10 @@ const rebrandingKeyForBackend = hasEntitledPlan
     const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
 
     
-const rawBrand = parseRebrandingKey(rebrandingKey || "")?.rebranding || "core";
+// NOTE:
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || "core").trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
