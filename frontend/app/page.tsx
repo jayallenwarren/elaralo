@@ -294,6 +294,15 @@ function splitCompanionKey(raw: string): CompanionKeySplit {
   return { baseKey, flags };
 }
 
+function modeFromElaraloPlanMap(raw: unknown): Mode | null {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (s.includes("intimate")) return "intimate";
+  if (s.includes("romantic")) return "romantic";
+  if (s.includes("friend")) return "friend";
+  return null;
+}
+
 type CompanionMeta = {
   first: string;
   gender: string;
@@ -2906,13 +2915,29 @@ useEffect(() => {
 
       const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, rebrandSlugFromMessage);
       pickFirstLoadableImage(avatarCandidates).then((picked) => setAvatarSrc(picked));
-const nextAllowed = allowedModesForPlan(effectivePlan);
+
+      // Brand-default starting mode:
+      // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
+      // - Fallback: entitled plans default to Intimate, Trial/visitors default to Romantic.
+      const desiredStartMode: Mode =
+        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) || (hasEntitledPlan ? "intimate" : "romantic");
+
+      const nextAllowed = allowedModesForPlan(effectivePlan);
       setAllowedModes(nextAllowed);
 
-      // If current mode is not allowed, force friend
       setSessionState((prev) => {
-        if (nextAllowed.includes(prev.mode)) return prev;
-        return { ...prev, mode: "friend", pending_consent: null };
+        let nextMode: Mode = prev.mode;
+
+        // If the previous mode is the default placeholder (Friend) or no longer allowed,
+        // snap to the brand-default start mode (if allowed).
+        if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
+          nextMode = desiredStartMode;
+        } else if (!nextAllowed.includes(nextMode)) {
+          nextMode = "friend";
+        }
+
+        if (nextMode === prev.mode) return prev;
+        return { ...prev, mode: nextMode, pending_consent: null };
       });
 
       // Mark handoff ready so the first audio-only TTS can deterministically use the selected companion voice.
