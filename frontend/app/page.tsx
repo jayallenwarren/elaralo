@@ -1287,6 +1287,13 @@ export default function Page() {
   // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
   // IMPORTANT: This must never alter STT/TTS start/stop code paths.
   const [rebrandingKey, setRebrandingKey] = useState<string>("");
+
+  // Derive legacy single-field rebranding string from the pipe-delimited RebrandingKey.
+  // Default: "" (treated as core / non-rebranded).
+  const rebranding = useMemo(() => {
+    const p = parseRebrandingKey(rebrandingKey || "");
+    return String(p?.rebranding || "").trim();
+  }, [rebrandingKey]);
   const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
 
   const renderMsgContent = useCallback(
