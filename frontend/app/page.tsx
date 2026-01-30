@@ -1534,6 +1534,11 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
 
+  // BeeStreamed (Human companion) embed state
+  const [streamEmbedUrl, setStreamEmbedUrl] = useState<string>("");
+  const [streamEventRef, setStreamEventRef] = useState<string>("");
+
+
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
@@ -1577,7 +1582,7 @@ const liveEnabled = useMemo(() => {
 
   // UI layout
   const conversationHeight = 520;
-  const showAvatarFrame = Boolean(phase1AvatarMedia) && avatarStatus !== "idle";
+  const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (Boolean(phase1AvatarMedia) && avatarStatus !== "idle");
 
 const cleanupIphoneLiveAvatarAudio = useCallback(() => {
   if (!didIphoneBoostActiveRef.current && !didIphoneAudioCtxRef.current) return;
@@ -1700,6 +1705,28 @@ const stopLiveAvatar = useCallback(async () => {
   // Always clean up iPhone audio boost routing first
   cleanupIphoneLiveAvatarAudio();
 
+  // BeeStreamed (Human companion) — stop the stream and clear the embed.
+  if (streamEmbedUrl || streamEventRef) {
+    try {
+      const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
+      await fetch(`${API_BASE}/stream/beestreamed/stop_embed`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          brand: companyName,
+          avatar: companionName,
+          embedDomain,
+          eventRef: streamEventRef || undefined,
+        }),
+      });
+    } catch (e) {
+      console.warn("BeeStreamed stop_embed failed:", e);
+    } finally {
+      setStreamEmbedUrl("");
+      setStreamEventRef("");
+    }
+  }
+
   try {
     const mgr = didAgentMgrRef.current;
     didAgentMgrRef.current = null;
@@ -1744,7 +1771,7 @@ const stopLiveAvatar = useCallback(async () => {
     setAvatarStatus("idle");
     setAvatarError(null);
   }
-}, [cleanupIphoneLiveAvatarAudio]);
+}, [cleanupIphoneLiveAvatarAudio, streamEmbedUrl, streamEventRef, companyName, companionName]);
 
 const reconnectLiveAvatar = useCallback(async () => {
   const mgr = didAgentMgrRef.current;
@@ -1777,21 +1804,57 @@ const startLiveAvatar = useCallback(async () => {
   ensureIphoneAudioContextUnlocked();
 
 if (liveProvider === "stream") {
-  if (!streamUrl) {
-    setAvatarStatus("error");
-    setAvatarError("Streaming is not configured for this companion.");
-    return;
-  }
-
+  // BeeStreamed (Human companion) — start/ensure the event on the API, then embed inside the page.
   setAvatarError(null);
-  setAvatarStatus("connected");
+  setAvatarStatus("connecting");
 
-  // Streaming / web conference sessions are hosted externally (real-person companions).
-  // Open in a new tab/window to avoid iframe restrictions.
   try {
-    window.open(streamUrl, "_blank", "noopener,noreferrer");
-  } catch {
-    window.location.href = streamUrl;
+    const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
+
+    // Ask the app server to:
+    //  - resolve/create an event_ref for this (brand, avatar)
+    //  - start the WebRTC stream for that event
+    //  - return an embed URL
+    const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        brand: companyName,
+        avatar: companionName,
+        embedDomain,
+      }),
+    });
+
+    const data: any = await res.json().catch(() => ({}));
+    if (!res.ok || !data?.ok) {
+      throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
+    }
+
+    const eventRef = String(data?.eventRef || "").trim();
+    const embedUrl =
+      String(data?.embedUrl || "").trim() ||
+      (eventRef ? `https://beestreamed.com/event?id=${encodeURIComponent(eventRef)}` : "");
+
+    if (!embedUrl) throw new Error("BeeStreamed did not return an embedUrl/eventRef.");
+
+    setStreamEventRef(eventRef);
+    setStreamEmbedUrl(embedUrl);
+    setAvatarStatus("connected");
+  } catch (err: any) {
+    console.error("BeeStreamed start_embed failed:", err);
+    setAvatarStatus("error");
+    setAvatarError(
+      `Streaming failed to start. ${err?.message ? String(err.message) : String(err)}`,
+    );
+
+    // Fallback: if a direct streamUrl exists, open it externally.
+    if (streamUrl) {
+      try {
+        window.open(streamUrl, "_blank", "noopener,noreferrer");
+      } catch (_e) {
+        window.location.href = streamUrl;
+      }
+    }
   }
   return;
 }
@@ -1950,7 +2013,7 @@ if (!phase1AvatarMedia) {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
+}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -4805,13 +4868,23 @@ const speakGreetingIfNeeded = useCallback(
                 position: "relative",
               }}
             >
-              <video
-                ref={avatarVideoRef}
-                style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                playsInline
-                autoPlay
-                muted={false}
-              />
+                            {liveProvider === "stream" && streamEmbedUrl ? (
+                <iframe
+                  src={streamEmbedUrl}
+                  title="Live Stream"
+                  style={{ width: "100%", height: "100%", border: 0 }}
+                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
+                  allowFullScreen
+                />
+              ) : (
+                <video
+                  ref={avatarVideoRef}
+                  style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                  playsInline
+                  autoPlay
+                  muted={false}
+                />
+              )}
               {avatarStatus !== "connected" ? (
                 <div
                   style={{
