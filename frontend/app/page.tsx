@@ -230,10 +230,10 @@ function stripTrialControlsFromRebrandingKey(key: string): string {
   // when the user is entitled (i.e., has an active plan).
   return [
     p.rebranding,
-    p.upgradeUrl,
-    p.paygUrl,
-    p.paygPrice,
-    p.paygMinutes,
+    p.upgradeLink,
+    p.payGoLink,
+    p.payGoPrice,
+    p.payGoMinutes,
     entitlementPlan,
     p.elaraloPlanMap,
     "",
