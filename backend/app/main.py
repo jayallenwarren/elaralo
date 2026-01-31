@@ -496,6 +496,212 @@ def _ensure_runtime_mappings_db_copy_sync() -> Optional[str]:
         return None
 
 
+
+def _repo_mappings_db_path_sync() -> Optional[str]:
+    """Return the deployed (read-only) mappings DB path if it exists."""
+    base_dir = os.path.dirname(__file__)
+    candidates = [
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _is_placeholder_event_ref(v: Any) -> bool:
+    s = (str(v).strip() if v is not None else "")
+    if not s:
+        return True
+    s_low = s.lower()
+    return s_low in {"event_ref_here", "placeholder", "none", "null", "undefined"}
+
+
+def _sync_repo_mappings_into_runtime_sync(runtime_db_path: str) -> None:
+    """
+    Merge the deployed (repo) mapping DB into the runtime (/home) DB.
+
+    Why: the runtime DB is a copy that persists across restarts. If you update the repo DB
+    (e.g. enabling Live='Stream' for Dulce or adding new companions), those changes would not
+    be seen by the running app unless we merge them into the persisted runtime copy.
+
+    Rules:
+    - Inserts missing companions from repo -> runtime.
+    - Updates static config fields (e.g. Live, DID/ElevenLabs fields, host_member_id, etc.)
+      for existing companions.
+    - Preserves runtime Event_Ref once it has a real value (non-empty and not placeholder),
+      so a host-created event_ref is not overwritten on reboot.
+    """
+    try:
+        if not runtime_db_path:
+            return
+
+        repo_db_path = _repo_mappings_db_path_sync()
+        if not repo_db_path:
+            return
+
+        # If we're not actually using a runtime copy (e.g., VOICE_VIDEO_DB_PATH points to repo),
+        # then there's nothing to sync.
+        if os.path.abspath(repo_db_path) == os.path.abspath(runtime_db_path):
+            return
+
+        if not os.path.exists(runtime_db_path):
+            return
+
+        rconn = sqlite3.connect(runtime_db_path)
+        rconn.row_factory = sqlite3.Row
+        pconn = sqlite3.connect(repo_db_path)
+        pconn.row_factory = sqlite3.Row
+
+        try:
+            # Ensure table exists in runtime. If it doesn't, attempt to recreate from repo.
+            rt = rconn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='companion_mappings'"
+            ).fetchone()
+            if not rt:
+                schema_row = pconn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='companion_mappings'"
+                ).fetchone()
+                if schema_row and schema_row["sql"]:
+                    rconn.execute(schema_row["sql"])
+                    repo_rows = pconn.execute("SELECT * FROM companion_mappings").fetchall()
+                    if repo_rows:
+                        cols = [c for c in repo_rows[0].keys() if c and c.lower() != "id"]
+                        if cols:
+                            placeholders = ",".join(["?"] * len(cols))
+                            rconn.executemany(
+                                f"INSERT INTO companion_mappings ({','.join(cols)}) VALUES ({placeholders})",
+                                [[row[c] for c in cols] for row in repo_rows],
+                            )
+                    rconn.commit()
+                return
+
+            # Runtime column map (case-insensitive -> case-preserving)
+            runtime_cols = [
+                row["name"] if isinstance(row, sqlite3.Row) else row[1]
+                for row in rconn.execute("PRAGMA table_info(companion_mappings)").fetchall()
+            ]
+            runtime_cols_lc = {c.lower(): c for c in runtime_cols}
+
+            brand_col = runtime_cols_lc.get("brand")
+            comp_col = runtime_cols_lc.get("companion") or runtime_cols_lc.get("avatar")
+            event_ref_col = runtime_cols_lc.get("event_ref")
+
+            if not brand_col or not comp_col:
+                # Unexpected schema; can't safely sync
+                return
+
+            repo_rows = pconn.execute("SELECT * FROM companion_mappings").fetchall()
+            if not repo_rows:
+                return
+
+            for row in repo_rows:
+                rowd = dict(row)
+
+                brand_val = rowd.get("Brand") or rowd.get("brand")
+                comp_val = (
+                    rowd.get("Companion")
+                    or rowd.get("companion")
+                    or rowd.get("Avatar")
+                    or rowd.get("avatar")
+                )
+
+                if brand_val is None or comp_val is None:
+                    continue
+
+                brand_s = str(brand_val).strip()
+                comp_s = str(comp_val).strip()
+                if not brand_s or not comp_s:
+                    continue
+
+                exists = rconn.execute(
+                    f"SELECT 1 FROM companion_mappings WHERE lower({brand_col})=lower(?) AND lower({comp_col})=lower(?) LIMIT 1",
+                    (brand_s, comp_s),
+                ).fetchone()
+
+                if not exists:
+                    # Insert missing companion row (avoid copying autoincrement 'id')
+                    insert_cols = []
+                    insert_vals = []
+                    for k, v in rowd.items():
+                        if k is None:
+                            continue
+                        lk = str(k).lower()
+                        if lk == "id":
+                            continue
+                        if lk in runtime_cols_lc:
+                            insert_cols.append(runtime_cols_lc[lk])
+                            insert_vals.append(v)
+
+                    if insert_cols:
+                        placeholders = ",".join(["?"] * len(insert_cols))
+                        rconn.execute(
+                            f"INSERT INTO companion_mappings ({','.join(insert_cols)}) VALUES ({placeholders})",
+                            insert_vals,
+                        )
+                    continue
+
+                # Update static config fields for existing row (preserve Event_Ref if already real)
+                current_event_ref = None
+                if event_ref_col:
+                    cur = rconn.execute(
+                        f"SELECT {event_ref_col} FROM companion_mappings WHERE lower({brand_col})=lower(?) AND lower({comp_col})=lower(?) LIMIT 1",
+                        (brand_s, comp_s),
+                    ).fetchone()
+                    if cur is not None:
+                        current_event_ref = cur[0]
+
+                set_parts = []
+                vals = []
+
+                for k, v in rowd.items():
+                    if k is None:
+                        continue
+                    lk = str(k).lower()
+                    if lk == "id":
+                        continue
+                    if lk not in runtime_cols_lc:
+                        continue
+                    col = runtime_cols_lc[lk]
+                    if event_ref_col and col == event_ref_col:
+                        continue
+                    set_parts.append(f"{col} = ?")
+                    vals.append(v)
+
+                if event_ref_col:
+                    repo_event_ref = (
+                        rowd.get(event_ref_col)
+                        or rowd.get("Event_Ref")
+                        or rowd.get("event_ref")
+                    )
+                    if _is_placeholder_event_ref(current_event_ref) and not _is_placeholder_event_ref(
+                        repo_event_ref
+                    ):
+                        set_parts.append(f"{event_ref_col} = ?")
+                        vals.append(str(repo_event_ref).strip())
+
+                if set_parts:
+                    vals.extend([brand_s, comp_s])
+                    rconn.execute(
+                        f"UPDATE companion_mappings SET {', '.join(set_parts)} WHERE lower({brand_col})=lower(?) AND lower({comp_col})=lower(?)",
+                        vals,
+                    )
+
+            rconn.commit()
+        finally:
+            try:
+                rconn.close()
+            except Exception:
+                pass
+            try:
+                pconn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Failed to sync repo mappings into runtime mappings DB.")
+
+
 def _mappings_db_write_path_sync() -> Optional[str]:
     """Return the DB path that is safe for writes (prefer /home copy)."""
     runtime_path = _ensure_runtime_mappings_db_copy_sync()
@@ -626,11 +832,19 @@ def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any
     return None
 
 
+def _startup_sync_and_load_mappings_sync() -> None:
+    # Ensure runtime DB exists, then merge any new/updated companion rows from the repo DB,
+    # then (re)load the in-memory mapping cache used by /mappings/companion.
+    runtime_db_path = _mappings_db_write_path_sync()
+    _sync_repo_mappings_into_runtime_sync(runtime_db_path)
+    _load_companion_mappings_sync()
+
+
 @app.on_event("startup")
 async def _startup_load_companion_mappings() -> None:
     # Load once at startup; do not block on errors.
     try:
-        await run_in_threadpool(_load_companion_mappings_sync)
+        await run_in_threadpool(_startup_sync_and_load_mappings_sync)
     except Exception as e:
         print(f"[mappings] ERROR loading companion mappings: {e!r}")
 
