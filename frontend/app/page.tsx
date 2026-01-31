@@ -1303,10 +1303,6 @@ export default function Page() {
     const p = parseRebrandingKey(rebrandingKey || "");
     return String(p?.rebranding || "").trim();
   }, [rebrandingKey]);
-
-  // Hide "Switch Companion" for white-label embeds (non-empty rebrandingKey).
-  const hasRebrandingKey = !!String(rebrandingKey ?? "").trim();
-
   const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
 
   const renderMsgContent = useCallback(
@@ -1607,7 +1603,6 @@ const liveEnabled = useMemo(() => {
   // UI layout
   const conversationHeight = 520;
   const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (Boolean(phase1AvatarMedia) && avatarStatus !== "idle");
-  const disableSaveClearWhileStreaming = liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart;
 
 const cleanupIphoneLiveAvatarAudio = useCallback(() => {
   if (!didIphoneBoostActiveRef.current && !didIphoneAudioCtxRef.current) return;
@@ -4404,21 +4399,7 @@ const speakGreetingIfNeeded = useCallback(
     else await startSpeechToText();
   }, [liveAvatarActive, startSpeechToText, stopSpeechToText]);
 
-  
-  // Stream host session (BeeStreamed):
-  // - When the current user is the host (streamCanStart === true) and the stream embed is running,
-  //   we disable hands-free STT/TTS to avoid microphone contention / echo with the live stream.
-  const streamHostSessionActive = useMemo(() => {
-    if (liveProvider !== "stream") return false;
-    if (!streamCanStart) return false;
-    return (
-      avatarStatus === "connecting" ||
-      avatarStatus === "connected" ||
-      avatarStatus === "reconnecting"
-    );
-  }, [liveProvider, streamCanStart, avatarStatus]);
-
-const stopHandsFreeSTT = useCallback(() => {
+  const stopHandsFreeSTT = useCallback(() => {
     // Cancel any in-flight local TTS work and advance epoch so late callbacks are ignored.
     localTtsEpochRef.current += 1;
     try {
@@ -4433,23 +4414,11 @@ const stopHandsFreeSTT = useCallback(() => {
     // Force a fresh iOS audio-route prime next time the mic/audio starts (prevents low/silent volume after stop/cancel).
     localTtsUnlockedRef.current = false;
 
-    // If Live Avatar is running, stop it too (mic is required in D-ID Live Avatar mode).
-    // For BeeStreamed ("stream"), Stop should NOT kill the stream iframe — host/video stop is the Video toggle.
-    if (liveAvatarActive && liveProvider !== "stream") {
+    // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
+    if (liveAvatarActive) {
       void stopLiveAvatar();
     }
-  }, [liveAvatarActive, liveProvider, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
-
-
-  // Option 1 (shared mic stream handling):
-  // When the host starts a live BeeStreamed session, forcibly stop hands-free STT/TTS so the browser mic
-  // is dedicated to the live stream and we avoid echo/feedback.
-  useEffect(() => {
-    if (!streamHostSessionActive) return;
-    try {
-      stopHandsFreeSTT();
-    } catch {}
-  }, [streamHostSessionActive, stopHandsFreeSTT]);
+  }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
   // Stop button handler (explicit user gesture): stop all comms AND immediately
   // re-prime the iOS/Safari audio route so that when the user manually resumes
@@ -4617,8 +4586,8 @@ const stopHandsFreeSTT = useCallback(() => {
       <button
         type="button"
         onClick={toggleSpeechToText}
-        disabled={streamHostSessionActive || (!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
-        title={streamHostSessionActive ? "STT/TTS disabled while hosting live stream" : "Audio"}
+        disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
+        title="Audio"
         style={{
           width: 44,
           minWidth: 44,
@@ -4626,8 +4595,7 @@ const stopHandsFreeSTT = useCallback(() => {
           border: "1px solid #111",
           background: sttEnabled ? "#b00020" : "#fff",
           color: sttEnabled ? "#fff" : "#111",
-          cursor: (streamHostSessionActive || disableSaveClearWhileStreaming) ? "not-allowed" : "pointer",
-          opacity: (streamHostSessionActive || disableSaveClearWhileStreaming) ? 0.5 : 1,
+          cursor: "pointer",
           fontWeight: 700,
         }}
       >
@@ -4688,8 +4656,7 @@ const stopHandsFreeSTT = useCallback(() => {
               border: "1px solid #111",
               background: setModeFlash ? "#111" : "#fff",
               color: setModeFlash ? "#fff" : "#111",
-              cursor: disableSaveClearWhileStreaming ? "not-allowed" : "pointer",
-                opacity: disableSaveClearWhileStreaming ? 0.5 : 1,
+              cursor: "pointer",
               fontWeight: 400,
               whiteSpace: "nowrap",
               display: "inline-flex",
@@ -4700,32 +4667,30 @@ const stopHandsFreeSTT = useCallback(() => {
           </button>
 
 
-          {!hasRebrandingKey && (
-            <button
-              type="button"
-              onClick={() => {
-                setSwitchCompanionFlash(true);
-                window.setTimeout(() => {
-                  goToMyElaralo();
-                  setSwitchCompanionFlash(false);
-                }, 120);
-              }}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: switchCompanionFlash ? "#111" : "#fff",
-                color: switchCompanionFlash ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 400,
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-              }}
-            >
-              Switch Companion
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => {
+              setSwitchCompanionFlash(true);
+              window.setTimeout(() => {
+                goToMyElaralo();
+                setSwitchCompanionFlash(false);
+              }, 120);
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: switchCompanionFlash ? "#111" : "#fff",
+              color: switchCompanionFlash ? "#fff" : "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Switch Companion
+          </button>
         </div>
       ) : (
         <>
@@ -5034,8 +4999,7 @@ const stopHandsFreeSTT = useCallback(() => {
             <button
               type="button"
               onClick={requestSaveChatSummary}
-              disabled={disableSaveClearWhileStreaming}
-              title={disableSaveClearWhileStreaming ? "Only the companion can Save while streaming" : "Save"}
+              title="Save"
               aria-label="Save"
               style={{
                 width: 44,
@@ -5043,8 +5007,7 @@ const stopHandsFreeSTT = useCallback(() => {
                 borderRadius: 10,
                 border: "1px solid #bbb",
                 background: "#fff",
-                cursor: disableSaveClearWhileStreaming ? "not-allowed" : "pointer",
-                opacity: disableSaveClearWhileStreaming ? 0.5 : 1,
+                cursor: "pointer",
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
@@ -5056,8 +5019,7 @@ const stopHandsFreeSTT = useCallback(() => {
             <button
               type="button"
               onClick={requestClearMessages}
-              disabled={disableSaveClearWhileStreaming}
-              title={disableSaveClearWhileStreaming ? "Only the companion can Clear while streaming" : "Clear"}
+              title="Clear"
               aria-label="Delete"
               style={{
                 width: 44,
@@ -5065,8 +5027,7 @@ const stopHandsFreeSTT = useCallback(() => {
                 borderRadius: 10,
                 border: "1px solid #bbb",
                 background: "#fff",
-                cursor: disableSaveClearWhileStreaming ? "not-allowed" : "pointer",
-                opacity: disableSaveClearWhileStreaming ? 0.5 : 1,
+                cursor: "pointer",
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
