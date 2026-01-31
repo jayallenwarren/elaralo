@@ -1303,10 +1303,6 @@ export default function Page() {
     const p = parseRebrandingKey(rebrandingKey || "");
     return String(p?.rebranding || "").trim();
   }, [rebrandingKey]);
-
-  // Hide "Switch Companion" for white-label embeds (non-empty rebrandingKey).
-  const hasRebrandingKey = !!String(rebrandingKey ?? "").trim();
-
   const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
 
   const renderMsgContent = useCallback(
@@ -4700,32 +4696,30 @@ const stopHandsFreeSTT = useCallback(() => {
           </button>
 
 
-          {!hasRebrandingKey && (
-            <button
-              type="button"
-              onClick={() => {
-                setSwitchCompanionFlash(true);
-                window.setTimeout(() => {
-                  goToMyElaralo();
-                  setSwitchCompanionFlash(false);
-                }, 120);
-              }}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: switchCompanionFlash ? "#111" : "#fff",
-                color: switchCompanionFlash ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 400,
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-              }}
-            >
-              Switch Companion
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => {
+              setSwitchCompanionFlash(true);
+              window.setTimeout(() => {
+                goToMyElaralo();
+                setSwitchCompanionFlash(false);
+              }, 120);
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: switchCompanionFlash ? "#111" : "#fff",
+              color: switchCompanionFlash ? "#fff" : "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Switch Companion
+          </button>
         </div>
       ) : (
         <>
