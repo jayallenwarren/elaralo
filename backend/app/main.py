@@ -700,6 +700,13 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
     b = (brand or "").strip()
     a = (avatar or "").strip()
 
+    # Defensive: if startup hook didn't run, ensure mappings are loaded now.
+    if _COMPANION_MAPPINGS_LOADED_AT is None:
+        try:
+            await run_in_threadpool(_load_companion_mappings_sync)
+        except Exception as ex:
+            print(f"[mappings] lazy-load failed: {ex}")
+
     m = _lookup_companion_mapping(b, a)
     if not m:
         return {
@@ -997,6 +1004,13 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
     """
     b = _clean_str(brand)
     a = _clean_str(avatar)
+
+    # Defensive: if mappings were never loaded, load synchronously here (best effort).
+    if _COMPANION_MAPPINGS_LOADED_AT is None:
+        try:
+            _load_companion_mappings_sync()
+        except Exception as ex:
+            print(f"[mappings] sync-load failed (persist): {ex}")
     e = _clean_str(event_ref)
     if not b or not a or not e:
         return False
@@ -1027,8 +1041,24 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
                 print("[mappings] event_ref column missing; cannot persist")
                 return False
 
+            # Resolve actual column names for brand & avatar (supports legacy schemas).
+            colmap = {c.lower(): c for c in cols}
+            brand_col = None
+            for cand in ["brand", "Brand", "company", "rebranding"]:
+                if cand.lower() in colmap:
+                    brand_col = colmap[cand.lower()]
+                    break
+            avatar_col = None
+            for cand in ["avatar", "companion", "Companion", "firstname", "first_name", "firstName", "first name"]:
+                if cand.lower() in colmap:
+                    avatar_col = colmap[cand.lower()]
+                    break
+            if not brand_col or not avatar_col:
+                print(f"[mappings] cannot persist event_ref; missing brand/avatar columns. cols={cols}")
+                return False
+
             cur.execute(
-                "UPDATE companion_mappings SET event_ref=? WHERE Brand=? AND Companion=?",
+                f"UPDATE companion_mappings SET event_ref=? WHERE LOWER({brand_col})=LOWER(?) AND LOWER({avatar_col})=LOWER(?)",
                 (e, b, a),
             )
             conn.commit()
@@ -1060,6 +1090,13 @@ class BeeStreamedStopEmbedRequest(BaseModel):
 async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     brand = (req.brand or "").strip()
     avatar = (req.avatar or "").strip()
+
+    # Defensive: ensure mappings cache is loaded (some deploys skip startup hooks).
+    if _COMPANION_MAPPINGS_LOADED_AT is None:
+        try:
+            await run_in_threadpool(_load_companion_mappings_sync)
+        except Exception as ex:
+            print(f"[mappings] lazy-load failed: {ex}")
     if not brand or not avatar:
         raise HTTPException(status_code=400, detail="brand and avatar are required")
 
@@ -1130,6 +1167,13 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
 async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
     brand = (req.brand or "").strip()
     avatar = (req.avatar or "").strip()
+
+    # Defensive: ensure mappings cache is loaded (some deploys skip startup hooks).
+    if _COMPANION_MAPPINGS_LOADED_AT is None:
+        try:
+            await run_in_threadpool(_load_companion_mappings_sync)
+        except Exception as ex:
+            print(f"[mappings] lazy-load failed: {ex}")
     if not brand or not avatar:
         raise HTTPException(status_code=400, detail="brand and avatar are required")
 
