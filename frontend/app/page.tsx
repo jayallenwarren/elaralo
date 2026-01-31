@@ -1554,8 +1554,10 @@ const channelCap: ChannelCap = useMemo(() => {
 const liveProvider: LiveProvider = useMemo(() => {
   // Prefer database mapping when present.
   const liveFromDb = String(companionMapping?.live || "").trim().toLowerCase();
-  if (liveFromDb === "stream") return "stream";
-  if (liveFromDb === "d-id" || liveFromDb === "did" || liveFromDb === "d_id") return "did";
+	  // Be tolerant of values like "Stream", "Streamed", "BeeStreamed", or custom labels that include
+	  // these keywords (e.g., "Stream (BeeStreamed)").
+	  if (liveFromDb.includes("stream")) return "stream";
+	  if (liveFromDb.includes("d-id") || liveFromDb.includes("did") || liveFromDb.includes("d_id")) return "did";
 
   // Backward compatibility: allow companionKey flags (older Wix payloads / test URLs)
   const raw = String(companionKeyRaw || companionKey || "").trim();
@@ -1573,13 +1575,28 @@ const streamUrl = useMemo(() => {
 }, [companionKeyRaw]);
 
 const liveEnabled = useMemo(() => {
-  // Primary: DB mapping tells us whether this companion supports video.
+  // NOTE: The product requirement for showing the "video" control is driven by the
+  // SQLite "Live" column (values like "D-ID" or "Stream").
+  //
+  // Some rows also have a "communication" column (audio/video). In prior iterations we
+  // treated communication=audio as "no video" and hid the control — but that breaks the
+  // intended behavior for human companions (Live=Stream) and D-ID avatars (Live=D-ID)
+  // that may still be marked communication=audio.
+  //
+  // Therefore: if the mapping explicitly declares Live=Stream or Live=D-ID, we always
+  // enable the control regardless of communication.
+  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
+  const mappingSaysVideo =
+    liveRaw.includes("stream") || liveRaw.includes("d-id") || liveRaw.includes("did");
+  if (mappingSaysVideo) return true;
+
+  // If we *only* have a channel cap (and no Live mapping), honor it.
   if (channelCap === "video") return true;
   if (channelCap === "audio") return false;
 
-  // Fallback to the prior behavior when mapping is missing.
+  // Final fallback: keep prior behavior when mapping is missing.
   return liveProvider === "stream" || Boolean(phase1AvatarMedia);
-}, [channelCap, liveProvider, phase1AvatarMedia]);
+}, [companionMapping, channelCap, liveProvider, phase1AvatarMedia]);
 
 
 
