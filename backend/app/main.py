@@ -15,6 +15,7 @@ from filelock import FileLock  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
