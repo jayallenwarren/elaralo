@@ -1528,7 +1528,7 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
 
 
   const [avatarStatus, setAvatarStatus] = useState<
-    "idle" | "connecting" | "connected" | "reconnecting" | "error"
+    "idle" | "connecting" | "connected" | "reconnecting" | "waiting" | "error"
   >(
   "idle"
 );
@@ -1537,6 +1537,9 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   // BeeStreamed (Human companion) embed state
   const [streamEmbedUrl, setStreamEmbedUrl] = useState<string>("");
   const [streamEventRef, setStreamEventRef] = useState<string>("");
+  const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
+  const [streamNotice, setStreamNotice] = useState<string>("");
+
 
 
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
@@ -1708,22 +1711,29 @@ const stopLiveAvatar = useCallback(async () => {
   // BeeStreamed (Human companion) — stop the stream and clear the embed.
   if (streamEmbedUrl || streamEventRef) {
     try {
-      const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
-      await fetch(`${API_BASE}/stream/beestreamed/stop_embed`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brand: companyName,
-          avatar: companionName,
-          embedDomain,
-          eventRef: streamEventRef || undefined,
-        }),
-      });
+      // Only the host can stop the underlying live stream.
+      // Non-host viewers can still close the embed locally without affecting the session.
+      if (streamCanStart) {
+        const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
+        await fetch(`${API_BASE}/stream/beestreamed/stop_embed`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            brand: companyName,
+            avatar: companionName,
+            embedDomain,
+            memberId: memberId || "",
+            eventRef: streamEventRef || undefined,
+          }),
+        });
+      }
     } catch (e) {
       console.warn("BeeStreamed stop_embed failed:", e);
     } finally {
       setStreamEmbedUrl("");
       setStreamEventRef("");
+      setStreamCanStart(false);
+      setStreamNotice("");
     }
   }
 
@@ -1822,6 +1832,7 @@ if (liveProvider === "stream") {
         brand: companyName,
         avatar: companionName,
         embedDomain,
+        memberId: memberId || "",
       }),
     });
 
@@ -1839,7 +1850,23 @@ if (liveProvider === "stream") {
 
     setStreamEventRef(eventRef);
     setStreamEmbedUrl(embedUrl);
-    setAvatarStatus("connected");
+
+    const canStart = !!res?.canStart;
+    setStreamCanStart(canStart);
+
+    if (!canStart) {
+      setStreamNotice(
+        `Waiting for ${companionName || "the host"} to start the live session…`
+      );
+      setAvatarStatus("waiting");
+    } else if (res?.status === "start_failed") {
+      setStreamNotice("");
+      setAvatarStatus("error");
+      setAvatarError("Streaming failed to start. Please try again.");
+    } else {
+      setStreamNotice("");
+      setAvatarStatus("connected");
+    }
   } catch (err: any) {
     console.error("BeeStreamed start_embed failed:", err);
     setAvatarStatus("error");
@@ -4904,6 +4931,8 @@ const speakGreetingIfNeeded = useCallback(
                     ? "Connecting…"
                     : avatarStatus === "reconnecting"
                     ? "Reconnecting…"
+                    : avatarStatus === "waiting"
+                    ? streamNotice || "Waiting for the host to start…"
                     : avatarStatus === "error"
                     ? "Avatar error"
                     : null}
