@@ -440,7 +440,6 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
 # Default lookup key is (brand, avatar), case-insensitive.
 
 import sqlite3
-import shutil
 from urllib.parse import urlparse, parse_qs
 
 _COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -452,80 +451,25 @@ def _norm_key(s: str) -> str:
     return (s or "").strip().lower()
 
 
-# -----------------------------
-# Persistent SQLite DB copy (App Service durable writes)
-# -----------------------------
-#
-# Azure App Service persists the /home filesystem across restarts/deployments,
-# while the repo contents under the app folder are effectively read-only "release artifacts".
-#
-# We ship the canonical SQLite DB alongside main.py (repo DB), but we NEVER want to write to it.
-# Instead, we copy it to /home on first run and do all runtime writes against the /home copy.
-#
-# You can override the runtime DB path by setting VOICE_VIDEO_DB_PATH to a writable location (recommended: /home/...).
-
-_DEFAULT_RUNTIME_DB_PATH = "/home/voice_video_mappings.sqlite3"
-
-
-def _ensure_runtime_mappings_db_copy_sync() -> Optional[str]:
-    """Copy repo DB -> /home on first run; return writable runtime DB path (or None)."""
-    try:
-        # Explicit override (if present). This should point to a writable path.
-        env_path = _clean_str(os.getenv("VOICE_VIDEO_DB_PATH"))
-        if env_path:
-            return env_path
-
-        runtime_path = _DEFAULT_RUNTIME_DB_PATH
-        if os.path.exists(runtime_path):
-            return runtime_path
-
-        src_path = os.path.join(base_dir, "voice_video_mappings.sqlite3")
-        if not os.path.exists(src_path):
-            return None
-
-        os.makedirs(os.path.dirname(runtime_path) or "/home", exist_ok=True)
-
-        # Guard copy with a file lock because gunicorn runs multiple workers.
-        with FileLock(runtime_path + ".lock", timeout=30):
-            if not os.path.exists(runtime_path):
-                shutil.copy2(src_path, runtime_path)
-
-        return runtime_path
-    except Exception as e:
-        print(f"[mappings] runtime DB copy failed: {e}")
-        return None
-
-
-def _mappings_db_write_path_sync() -> Optional[str]:
-    """Return the DB path that is safe for writes (prefer /home copy)."""
-    runtime_path = _ensure_runtime_mappings_db_copy_sync()
-    if runtime_path and os.path.exists(runtime_path):
-        return runtime_path
-
-    # Fallback to whichever DB we loaded (not ideal, but prevents hard failure in dev).
-    if _COMPANION_MAPPINGS_SOURCE and os.path.exists(_COMPANION_MAPPINGS_SOURCE):
-        return _COMPANION_MAPPINGS_SOURCE
-
-    return None
-
-
 def _candidate_mapping_db_paths() -> List[str]:
-    # Read-only repo DB is last in this list; prefer /home copy for durability.
-    env_path = _clean_str(os.getenv("VOICE_VIDEO_DB_PATH"))
-    candidates: List[str] = []
-
-    if env_path:
-        candidates.append(env_path)
-
-    runtime_path = _ensure_runtime_mappings_db_copy_sync()
-    if runtime_path and runtime_path not in candidates:
-        candidates.append(runtime_path)
-
-    # Repo/shipped DB fallbacks (read-only in App Service; OK for local dev).
-    candidates.append(os.path.join(base_dir, "voice_video_mappings.sqlite3"))
-    candidates.append(os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"))
-
-    return candidates
+    base_dir = os.path.dirname(__file__)
+    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    candidates = [
+        env_path,
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+    ]
+    # keep unique, preserve order
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in candidates:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
 
 
 def _load_companion_mappings_sync() -> None:
@@ -851,27 +795,6 @@ def _beestreamed_auth_headers() -> Dict[str, str]:
     basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
     return {"Authorization": f"Basic {basic}", "Content-Type": "application/json"}
 
-def _beestreamed_patch_event_date_unix_sync(event_ref: str, unix_ts: int) -> None:
-    """(A) Patch BeeStreamed event_date_unix to 'now' so the embed countdown starts immediately."""
-    try:
-        event_ref = _clean_str(event_ref)
-        if not event_ref:
-            return
-        api_base = _beestreamed_api_base()
-        headers = _beestreamed_auth_headers()
-        payload = {"event_date_unix": int(unix_ts)}
-        import requests  # local import
-
-        url = f"{api_base}/events/{event_ref}"
-        resp = requests.patch(url, headers=headers, json=payload, timeout=20)
-        if resp.status_code >= 400:
-            # Best-effort: do not raise, just log.
-            print(f"[beestreamed] patch event_date_unix failed status={resp.status_code} body={resp.text[:300]}")
-        else:
-            print(f"[beestreamed] patched event_date_unix={int(unix_ts)} for event_ref={event_ref}")
-    except Exception as e:
-        print(f"[beestreamed] patch event_date_unix error: {e}")
-
 def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
     import requests  # type: ignore
 
@@ -893,7 +816,7 @@ def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
     except Exception:
         data = {}
 
-    event_ref = (data.get("event_ref") or data.get("eventRef") or data.get("event_client_ref") or data.get("eventClientRef") or data.get("id") or "").strip()
+    event_ref = (data.get("event_ref") or data.get("eventRef") or data.get("id") or "").strip()
     if not event_ref:
         raise HTTPException(status_code=502, detail="BeeStreamed create event did not return an event_ref")
 
@@ -953,18 +876,14 @@ def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str,
     return host
 
 def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> bool:
-    """Persist event_ref to companion_mappings SQLite DB (best effort).
-
-    - Updates in-memory mapping immediately.
-    - Writes to the durable DB copy in /home when available.
-    """
-    b = _clean_str(brand)
-    a = _clean_str(avatar)
-    e = _clean_str(event_ref)
+    """Try to persist event_ref into the companion_mappings SQLite DB (if writable). Always updates in-memory mapping."""
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    e = (event_ref or "").strip()
     if not b or not a or not e:
         return False
 
-    # Update in-memory mapping.
+    # Always update in-memory mapping so this process is consistent.
     try:
         key = (b.lower(), a.lower())
         if key in _COMPANION_MAPPINGS:
@@ -972,40 +891,46 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
     except Exception:
         pass
 
-    db_path = _mappings_db_write_path_sync()
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
     if not db_path or not os.path.exists(db_path):
         return False
 
-    conn = None
     try:
-        # SQLite is file-level locked for writes; guard with FileLock across gunicorn workers.
-        with FileLock(db_path + ".lock", timeout=10):
-            conn = sqlite3.connect(db_path)
-            cur = conn.cursor()
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(companion_mappings)")
+        cols = [str(r[1] or "").strip() for r in cur.fetchall()]
+        cols_l = [c.lower() for c in cols]
 
-            # Ensure column exists
-            cur.execute("PRAGMA table_info(companion_mappings)")
-            cols = [r[1] for r in cur.fetchall()]
-            if "event_ref" not in cols:
-                print("[mappings] event_ref column missing; cannot persist")
+        # Ensure event_ref column exists
+        if "event_ref" not in cols_l:
+            try:
+                cur.execute("ALTER TABLE companion_mappings ADD COLUMN event_ref TEXT")
+                conn.commit()
+                cols_l.append("event_ref")
+            except Exception:
+                # read-only DB or unsupported ALTER; give up persistence but keep in-memory update
                 return False
 
-            cur.execute(
-                "UPDATE companion_mappings SET event_ref=? WHERE Brand=? AND Companion=?",
-                (e, b, a),
-            )
-            conn.commit()
+        # Determine key columns
+        brand_col = "brand" if "brand" in cols_l else ("brand_id" if "brand_id" in cols_l else "")
+        avatar_col = "avatar" if "avatar" in cols_l else ("companion" if "companion" in cols_l else "")
+        if not brand_col or not avatar_col:
+            return False
 
+        cur.execute(
+            f"UPDATE companion_mappings SET event_ref = ? WHERE lower({brand_col}) = lower(?) AND lower({avatar_col}) = lower(?)",
+            (e, b, a),
+        )
+        conn.commit()
         return True
-    except Exception as ex:
-        print(f"[mappings] persist event_ref failed: {ex}")
+    except Exception:
         return False
     finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
@@ -1075,8 +1000,6 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
         }
 
     # Host: start the stream (idempotent on BeeStreamed side).
-    # (A) Patch event_date_unix on every host start (so the embed countdown starts NOW)
-    _beestreamed_patch_event_date_unix_sync(event_ref, int(time.time()))
     _beestreamed_start_webrtc_sync(event_ref)
 
     return {
