@@ -1851,7 +1851,7 @@ if (liveProvider === "stream") {
     setStreamEventRef(eventRef);
     setStreamEmbedUrl(embedUrl);
 
-    const canStart = !!res?.canStart;
+    const canStart = !!data?.canStart;
     setStreamCanStart(canStart);
 
     if (!canStart) {
@@ -1859,7 +1859,7 @@ if (liveProvider === "stream") {
         `Waiting for ${companionName || "the host"} to start the live session…`
       );
       setAvatarStatus("waiting");
-    } else if (res?.status === "start_failed") {
+    } else if (String(data?.status || "").trim() === "start_failed") {
       setStreamNotice("");
       setAvatarStatus("error");
       setAvatarError("Streaming failed to start. Please try again.");
