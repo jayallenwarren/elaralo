@@ -1540,29 +1540,6 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
 
-  // Lightweight viewer auto-refresh: if you're not the host, keep polling until the host creates/starts the event.
-  // This avoids requiring manual page refresh for viewers waiting on the host.
-  useEffect(() => {
-    // Only poll while we are explicitly waiting and we don't yet have an embed URL.
-    if (avatarStatus !== "waiting") return;
-    if (streamEmbedUrl) return;
-
-    let cancelled = false;
-    const intervalMs = 3000;
-
-    const poll = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            brand: companyName,
-            avatar: companionName,
-            memberId: memberId || "",
-            embedDomain: window?.location?.hostname || "",
-          }),
-        });
-
         if (!res.ok) return;
         const data = await res.json();
         if (cancelled) return;
@@ -2778,6 +2755,30 @@ const speakAssistantReply = useCallback(
 
   const [planName, setPlanName] = useState<PlanName>(null);
   const [memberId, setMemberId] = useState<string>("");
+
+
+  // Lightweight viewer auto-refresh: if you're not the host, keep polling until the host creates/starts the event.
+  // This avoids requiring manual page refresh for viewers waiting on the host.
+  useEffect(() => {
+    // Only poll while we are explicitly waiting and we don't yet have an embed URL.
+    if (avatarStatus !== "waiting") return;
+    if (streamEmbedUrl) return;
+
+    let cancelled = false;
+    const intervalMs = 3000;
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            brand: companyName,
+            avatar: companionName,
+            memberId: memberId || "",
+            embedDomain: window?.location?.hostname || "",
+          }),
+        });
   const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
   // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
