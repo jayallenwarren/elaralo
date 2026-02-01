@@ -2767,57 +2767,55 @@ const speakAssistantReply = useCallback(
     let cancelled = false;
     const intervalMs = 3000;
 
-    const poll = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            brand: companyName,
-            avatar: companionName,
-            memberId: memberId || "",
-            embedDomain: typeof window !== "undefined" ? window.location.hostname : "",
-          }),
+    const poll = () => {
+      fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          brand: companyName,
+          avatar: companionName,
+          memberId: memberId || "",
+          embedDomain: typeof window !== "undefined" ? window.location.hostname : "",
+        }),
+      })
+        .then((res) => {
+          if (!res.ok) return null;
+          return res.json();
+        })
+        .then((data) => {
+          if (!data || cancelled) return;
+
+          const eventRef = String((data as any)?.eventRef || "").trim();
+          let embedUrl = String((data as any)?.embedUrl || "").trim();
+          if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
+
+          if (embedUrl) {
+            setStreamEventRef(eventRef);
+            setStreamEmbedUrl(embedUrl);
+
+            // Viewers can never "start", so we keep canStart false.
+            setStreamCanStart(false);
+
+            if ((data as any)?.message) setStreamNotice(String((data as any).message));
+          } else if ((data as any)?.message) {
+            setStreamNotice(String((data as any).message));
+          }
+        })
+        .catch(() => {
+          // Ignore transient failures; keep polling.
         });
-
-        if (!res.ok) return;
-
-        const data = await res.json();
-        if (cancelled) return;
-
-        const eventRef = String(data?.eventRef || "").trim();
-        let embedUrl = String(data?.embedUrl || "").trim();
-        if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
-
-        // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
-        if (embedUrl) {
-          setStreamEventRef(eventRef);
-          setStreamEmbedUrl(embedUrl);
-
-          // Viewers can never "start", so we keep canStart false.
-          setStreamCanStart(false);
-
-          if (data?.message) setStreamNotice(String(data.message));
-        } else if (data?.message) {
-          setStreamNotice(String(data.message));
-        }
-      } catch (e) {
-        // Ignore transient failures; keep polling.
-      }
     };
 
-    // Kick once immediately, then interval.
-    void poll();
-    const t = window.setInterval(() => {
-      void poll();
-    }, intervalMs);
+    poll();
+    const t = window.setInterval(poll, intervalMs);
 
     return () => {
       cancelled = true;
       window.clearInterval(t);
     };
   }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
-  const [loggedIn, setLoggedIn] = useState<boolean>(false);
+
+const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
   // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
   const [handoffReady, setHandoffReady] = useState<boolean>(false);
