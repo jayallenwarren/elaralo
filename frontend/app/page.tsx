@@ -5007,42 +5007,30 @@ const speakGreetingIfNeeded = useCallback(
             height: conversationHeight,
             position: "relative",
             display: "flex",
-            flexDirection
-{streamCanStart && liveProvider === "stream" && showBroadcaster && (
-  <div
-    style={{
-      position: "absolute",
-      inset: 0,
-      zIndex: 30,
-      background: "#fff",
-      border: "1px solid #ddd",
-      borderRadius: 12,
-      overflow: "hidden",
-      boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
-    }}
-  >
-    {streamBroadcastUrl ? (
-      <iframe
-        title="BeeStreamed Broadcaster"
-        src={streamBroadcastUrl}
-        style={{ width: "100%", height: "100%", border: "none" }}
-        allow="camera; microphone; autoplay; encrypted-media; fullscreen"
-        allowFullScreen
-      />
-    ) : (
-      <div style={{ padding: 14, fontSize: 14, lineHeight: 1.4 }}>
-        <div style={{ fontWeight: 700, marginBottom: 6 }}>Broadcaster UI</div>
-        <div style={{ color: "#444" }}>
-          Stream event is not initialized yet. Click the video button to initialize the stream event (event_ref),
-          then open the Broadcaster UI again.
-        </div>
-      </div>
-    )}
-  </div>
-)}
-: "column",
+            flexDirection: "column",
           }}
         >
+          {streamCanStart && liveProvider === "stream" && showBroadcaster && streamBroadcastUrl && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                zIndex: 50,
+                background: "rgba(255,255,255,0.96)",
+                borderRadius: 16,
+                overflow: "hidden",
+              }}
+            >
+              <iframe
+                title="BeeStreamed Broadcaster"
+                src={streamBroadcastUrl}
+                style={{ width: "100%", height: "100%", border: "none" }}
+                allow="camera; microphone; autoplay; clipboard-read; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+                allowFullScreen
+              />
+            </div>
+          )}
+
           <div
             ref={messagesBoxRef}
             style={{
