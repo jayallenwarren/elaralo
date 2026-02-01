@@ -2776,9 +2776,47 @@ const speakAssistantReply = useCallback(
             brand: companyName,
             avatar: companionName,
             memberId: memberId || "",
-            embedDomain: window?.location?.hostname || "",
+            embedDomain: typeof window !== "undefined" ? window.location.hostname : "",
           }),
         });
+
+        if (!res.ok) return;
+
+        const data = await res.json();
+        if (cancelled) return;
+
+        const eventRef = String(data?.eventRef || "").trim();
+        let embedUrl = String(data?.embedUrl || "").trim();
+        if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
+
+        // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
+        if (embedUrl) {
+          setStreamEventRef(eventRef);
+          setStreamEmbedUrl(embedUrl);
+
+          // Viewers can never "start", so we keep canStart false.
+          setStreamCanStart(false);
+
+          if (data?.message) setStreamNotice(String(data.message));
+        } else if (data?.message) {
+          setStreamNotice(String(data.message));
+        }
+      } catch (e) {
+        // Ignore transient failures; keep polling.
+      }
+    };
+
+    // Kick once immediately, then interval.
+    void poll();
+    const t = window.setInterval(() => {
+      void poll();
+    }, intervalMs);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
   const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
   // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
