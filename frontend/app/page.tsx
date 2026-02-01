@@ -1897,14 +1897,7 @@ setStreamEventRef(eventRef);
       `Streaming failed to start. ${err?.message ? String(err.message) : String(err)}`,
     );
 
-    // Fallback: if a direct streamUrl exists, open it externally.
-    if (streamUrl) {
-      try {
-        window.open(streamUrl, "_blank", "noopener,noreferrer");
-      } catch (_e) {
-        window.location.href = streamUrl;
-      }
-    }
+    // BeeStreamed: do not open external popups; stay in-page.
   }
   return;
 }

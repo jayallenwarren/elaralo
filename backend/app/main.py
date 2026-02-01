@@ -1123,9 +1123,11 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     is_host = bool(host_id and member_id and member_id == host_id)
 
     event_ref = str(mapping.get("event_ref") or "").strip()
+    created_in_this_call = False
 
     # Only the host is allowed to create the event_ref automatically.
     if not event_ref and is_host:
+        created_in_this_call = True
         event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
         _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
 
@@ -1155,8 +1157,34 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
         }
 
     # Host: ensure the event is scheduled for 'now' and then start the WebRTC stream.
-    _beestreamed_schedule_now_sync(event_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
-    _beestreamed_start_webrtc_sync(event_ref)
+    # If BeeStreamed returns a 404 for an existing/stale event_ref, we transparently generate a fresh one,
+    # persist it, and retry once.
+    def _start_event(_ref: str) -> None:
+        _beestreamed_schedule_now_sync(
+            _ref,
+            title=f"{resolved_avatar} Live",
+            embed_domain=(req.embedDomain or "").strip(),
+        )
+        _beestreamed_start_webrtc_sync(_ref)
+
+    try:
+        _start_event(event_ref)
+    except HTTPException as e:
+        if int(getattr(e, "status_code", 0) or 0) == 404:
+            if created_in_this_call:
+                # Sometimes BeeStreamed is eventually-consistent right after creation; retry once.
+                import time as _time
+
+                _time.sleep(1.0)
+                _start_event(event_ref)
+            else:
+                # Stale/invalid event_ref in DB: regenerate, persist, and retry once.
+                event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
+                _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+                embed_url = f"/stream/beestreamed/embed/{event_ref}"
+                _start_event(event_ref)
+        else:
+            raise
 
     return {
         "ok": True,
@@ -1219,13 +1247,32 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
 
     # Host path: reuse existing event_ref if present, else create and persist.
     event_ref = str(mapping.get("event_ref") or "").strip()
+    created_in_this_call = False
     if not event_ref:
+        created_in_this_call = True
         event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
         _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
 
     if bool(req.startStream):
-        _beestreamed_schedule_now_sync(event_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
-        _beestreamed_start_webrtc_sync(event_ref)
+        def _start_event(_ref: str) -> None:
+            _beestreamed_schedule_now_sync(_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
+            _beestreamed_start_webrtc_sync(_ref)
+
+        try:
+            _start_event(event_ref)
+        except HTTPException as e:
+            if int(getattr(e, "status_code", 0) or 0) == 404:
+                if created_in_this_call:
+                    import time as _time
+
+                    _time.sleep(1.0)
+                    _start_event(event_ref)
+                else:
+                    event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
+                    _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+                    _start_event(event_ref)
+            else:
+                raise
 
     return {
         "ok": True,
