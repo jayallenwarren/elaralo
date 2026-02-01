@@ -2774,6 +2774,26 @@ const speakAssistantReply = useCallback(
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
+  // BeeStreamed broadcaster (host-only) overlay
+  // - "host" is determined by comparing the current Wix memberId to the BeeStreamed host_member_id
+  //   stored in voice_video_mappings.sqlite3 (exposed via /stream/beestreamed/status).
+  const [beestreamedHostMemberId, setBeestreamedHostMemberId] = useState<string>("");
+  const isBeeStreamedHost = useMemo(() => {
+    const mid = String(memberId || "").trim();
+    const hid = String(beestreamedHostMemberId || "").trim();
+    return Boolean(mid && hid && mid === hid);
+  }, [memberId, beestreamedHostMemberId]);
+
+  const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
+  const [broadcasterOverlayUrl, setBroadcasterOverlayUrl] = useState<string>("");
+  const [broadcastPreparing, setBroadcastPreparing] = useState<boolean>(false);
+  const [broadcastError, setBroadcastError] = useState<string>("");
+
+  const showBroadcastButton = useMemo(() => {
+    return liveProvider === "stream" && isBeeStreamedHost;
+  }, [liveProvider, isBeeStreamedHost]);
+
+
   const goToMyElaralo = useCallback(() => {
     const url = "https://www.elaralo.com/myelaralo";
 
@@ -2825,6 +2845,127 @@ const speakAssistantReply = useCallback(
     // Fallback: navigate the current frame.
     window.location.href = url;
   }, [upgradeUrl]);
+
+
+  // ---------------------------------------------------------------------------
+  // BeeStreamed broadcaster overlay (Host-only)
+  // - Fetch the host_member_id for the current companion (no side effects; does NOT start the event).
+  // - The "Broadcast" button (rendered only for the host) calls /stream/beestreamed/start_broadcast which
+  //   prepares the event and returns a broadcaster iframe URL.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (liveProvider !== "stream") {
+      setBeestreamedHostMemberId("");
+      return;
+    }
+    if (!companyName || !companionName) {
+      setBeestreamedHostMemberId("");
+      return;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const url = `${API_BASE}/stream/beestreamed/status?brand=${encodeURIComponent(
+          companyName,
+        )}&avatar=${encodeURIComponent(companionName)}`;
+
+        const res = await fetch(url);
+        const data: any = await res.json().catch(() => ({}));
+        if (cancelled) return;
+
+        if (!res.ok || !data?.ok) {
+          setBeestreamedHostMemberId("");
+          return;
+        }
+
+        setBeestreamedHostMemberId(String(data?.hostMemberId || "").trim());
+      } catch (e) {
+        if (!cancelled) setBeestreamedHostMemberId("");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [API_BASE, companyName, companionName, liveProvider]);
+
+  // Reset broadcaster UI when switching companion / provider.
+  useEffect(() => {
+    setShowBroadcasterOverlay(false);
+    setBroadcasterOverlayUrl("");
+    setBroadcastPreparing(false);
+    setBroadcastError("");
+  }, [companyName, companionName, liveProvider]);
+
+  // If host-eligibility changes (e.g., user logs out), force-hide the overlay.
+  useEffect(() => {
+    if (!showBroadcastButton) setShowBroadcasterOverlay(false);
+  }, [showBroadcastButton]);
+
+  const toggleBroadcastOverlay = useCallback(async () => {
+    if (!showBroadcastButton) return;
+
+    // Toggle off
+    if (showBroadcasterOverlay) {
+      setShowBroadcasterOverlay(false);
+      return;
+    }
+
+    // Toggle on
+    setShowBroadcasterOverlay(true);
+    setBroadcastError("");
+
+    // If we already have a resolved URL, do not re-request.
+    if (broadcasterOverlayUrl) return;
+
+    setBroadcastPreparing(true);
+
+    try {
+      const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
+
+      const res = await fetch(`${API_BASE}/stream/beestreamed/start_broadcast`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          brand: companyName,
+          avatar: companionName,
+          embedDomain,
+          memberId: memberId || "",
+        }),
+      });
+
+      const data: any = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.ok) {
+        throw new Error(String(data?.detail || data?.error || data?.message || `HTTP ${res.status}`));
+      }
+      if (!data?.isHost) {
+        throw new Error("Broadcast is only available for the host account.");
+      }
+
+      let url = String(data?.broadcasterUrl || "").trim();
+      if (!url) throw new Error("BeeStreamed did not return a broadcasterUrl.");
+      if (url.startsWith("/")) url = `${API_BASE}${url}`;
+
+      setBroadcasterOverlayUrl(url);
+    } catch (err: any) {
+      console.error("BeeStreamed start_broadcast failed:", err);
+      setBroadcastError(err?.message ? String(err.message) : String(err));
+      // NOTE: Keep the overlay open so the host can see the error and can hide it via the Broadcast button.
+    } finally {
+      setBroadcastPreparing(false);
+    }
+  }, [
+    API_BASE,
+    broadcasterOverlayUrl,
+    companyName,
+    companionName,
+    memberId,
+    showBroadcastButton,
+    showBroadcasterOverlay,
+  ]);
+
 
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
@@ -4731,6 +4872,35 @@ const speakGreetingIfNeeded = useCallback(
           </button>
 
 
+          {showBroadcastButton ? (
+            <button
+              type="button"
+              onClick={() => {
+                void toggleBroadcastOverlay();
+              }}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid #111",
+                background: showBroadcasterOverlay ? "#111" : "#fff",
+                color: showBroadcasterOverlay ? "#fff" : "#111",
+                cursor: "pointer",
+                fontWeight: 400,
+                whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+                opacity: broadcastPreparing ? 0.75 : 1,
+              }}
+              disabled={broadcastPreparing}
+              aria-pressed={showBroadcasterOverlay}
+              title="Show/Hide Broadcast UI"
+            >
+              {broadcastPreparing ? "Broadcast…" : "Broadcast"}
+            </button>
+          ) : null}
+
+
+
           {(!rebrandingKey || String(rebrandingKey).trim() === "") && (
             <button
               type="button"
@@ -4802,6 +4972,30 @@ const speakGreetingIfNeeded = useCallback(
               }}
             >
               Upgrade
+            </button>
+          ) : null}
+
+          {showBroadcastButton ? (
+            <button
+              key="broadcast"
+              onClick={() => {
+                void toggleBroadcastOverlay();
+              }}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 999,
+                border: "1px solid #ddd",
+                background: showBroadcasterOverlay ? "#111" : "#fff",
+                color: showBroadcasterOverlay ? "#fff" : "#111",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+                opacity: broadcastPreparing ? 0.75 : 1,
+              }}
+              disabled={broadcastPreparing}
+              aria-pressed={showBroadcasterOverlay}
+              title="Show/Hide Broadcast UI"
+            >
+              {broadcastPreparing ? "Broadcast…" : "Broadcast"}
             </button>
           ) : null}
         </>
@@ -5035,6 +5229,7 @@ const speakGreetingIfNeeded = useCallback(
             height: conversationHeight,
             display: "flex",
             flexDirection: "column",
+            position: "relative",
           }}
         >
           <div
@@ -5148,6 +5343,54 @@ const speakGreetingIfNeeded = useCallback(
 	          {sttError ? (
 	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
 	          ) : null}
+
+          {/* BeeStreamed UI Broadcaster overlay (Host-only) */}
+          {showBroadcastButton && showBroadcasterOverlay ? (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                zIndex: 50,
+                borderRadius: 12,
+                overflow: "hidden",
+                background: "#fff",
+                border: "1px solid #e5e5e5",
+              }}
+            >
+              {broadcasterOverlayUrl ? (
+                <iframe
+                  src={broadcasterOverlayUrl}
+                  title="BeeStreamed Broadcaster"
+                  style={{ width: "100%", height: "100%", border: 0, background: "#fff" }}
+                  // Keep navigation inside the frame; BeeStreamed UI needs scripts + camera/mic.
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
+                  referrerPolicy="no-referrer-when-downgrade"
+                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
+                  allowFullScreen
+                />
+              ) : (
+                <div
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: 16,
+                    textAlign: "center",
+                    color: broadcastError ? "#b00020" : "#111",
+                    background: "#fff",
+                  }}
+                >
+                  {broadcastPreparing
+                    ? "Preparing broadcast…"
+                    : broadcastError
+                    ? `Broadcast unavailable: ${broadcastError}`
+                    : "Preparing broadcast…"}
+                </div>
+              )}
+            </div>
+          ) : null}
         </div>
       </section>
 

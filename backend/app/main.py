@@ -820,6 +820,47 @@ def _beestreamed_public_event_url(event_ref: str) -> str:
     base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
     return f"{base}?id={event_ref}"
 
+
+def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
+    """Return the BeeStreamed *broadcaster / producer* UI URL for an event.
+
+    This project embeds the broadcaster UI inside an iframe. BeeStreamed's exact producer URL can vary by account
+    configuration. To keep this integration drop-in and environment-configurable, we resolve the URL in this order:
+
+      1) BEESTREAMED_BROADCASTER_URL_TEMPLATE (preferred)
+           Example:
+             https://manage.beestreamed.com/producer?event_ref={event_ref}
+           Must include "{event_ref}" placeholder.
+
+      2) BEESTREAMED_BROADCASTER_BASE (+ optional BEESTREAMED_BROADCASTER_QUERY_KEY)
+           Example:
+             BEESTREAMED_BROADCASTER_BASE=https://manage.beestreamed.com/producer
+             BEESTREAMED_BROADCASTER_QUERY_KEY=event_ref   (default: "id")
+           Result:
+             https://manage.beestreamed.com/producer?event_ref=<event_ref>
+
+      3) Fallback to the public event page with a "producer" hint parameter.
+         (If BeeStreamed ignores this parameter, set the template/base env vars above.)
+    """
+    ref = (event_ref or "").strip()
+    if not ref:
+        return ""
+
+    tmpl = (os.getenv("BEESTREAMED_BROADCASTER_URL_TEMPLATE", "") or "").strip()
+    if tmpl and "{event_ref}" in tmpl:
+        return tmpl.replace("{event_ref}", ref)
+
+    base = (os.getenv("BEESTREAMED_BROADCASTER_BASE", "") or "").strip().rstrip("/")
+    if base:
+        key = (os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "") or "id").strip() or "id"
+        join = "&" if "?" in base else "?"
+        return f"{base}{join}{key}={ref}"
+
+    # Best-effort fallback (works only if BeeStreamed supports a producer mode via query param).
+    viewer_base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
+    return f"{viewer_base}?id={ref}&producer=1"
+
+
 @app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
 async def beestreamed_embed_page(event_ref: str):
     """Render a BeeStreamed event inside a sandboxed iframe.
@@ -873,6 +914,62 @@ async def beestreamed_embed_page(event_ref: str):
 </html>"""
 
     # No caching: viewer state is time-sensitive.
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
+
+
+
+@app.get("/stream/beestreamed/broadcaster/{event_ref}", response_class=HTMLResponse)
+async def beestreamed_broadcaster_page(event_ref: str):
+    """Render the BeeStreamed *broadcaster / producer* UI inside a sandboxed iframe."""
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="event_ref is required")
+
+    producer_url = _beestreamed_broadcaster_ui_url(event_ref)
+    if not producer_url:
+        raise HTTPException(
+            status_code=500,
+            detail="Broadcaster URL could not be resolved. Configure BEESTREAMED_BROADCASTER_URL_TEMPLATE or BEESTREAMED_BROADCASTER_BASE.",
+        )
+
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Broadcast</title>
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }}
+      .frame {{
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }}
+    </style>
+  </head>
+  <body>
+    <iframe
+      class="frame"
+      src="{producer_url}"
+      title="Broadcast"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
+      referrerpolicy="no-referrer-when-downgrade"
+      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
+      allowfullscreen
+    ></iframe>
+  </body>
+</html>"""
+
+    # No caching: broadcast UI is stateful.
     return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
 
 
@@ -1200,6 +1297,33 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
 
 
 
+
+@app.post("/stream/beestreamed/start_broadcast")
+async def beestreamed_start_broadcast(req: BeeStreamedStartEmbedRequest):
+    """Host helper: prepare a BeeStreamed event and return a broadcaster iframe URL.
+
+    - Uses the same host-gating logic as /stream/beestreamed/start_embed.
+    - Ensures the event exists (host-only), schedules it for "now", and starts the WebRTC stream.
+    - Returns a same-origin wrapper URL (/stream/beestreamed/broadcaster/{event_ref}) suitable for iframing.
+
+    Frontend intent:
+      - The host can click "Broadcast" and immediately see the BeeStreamed broadcaster UI already pointed at the
+        correct event; they only need to press "Start" in the BeeStreamed UI.
+    """
+    data = await beestreamed_start_embed(req)
+
+    try:
+        is_host = bool(data.get("isHost"))
+        event_ref = str(data.get("eventRef") or "").strip()
+    except Exception:
+        is_host = False
+        event_ref = ""
+
+    data["broadcasterUrl"] = f"/stream/beestreamed/broadcaster/{event_ref}" if (is_host and event_ref) else ""
+    return data
+
+
+
 @app.post("/stream/beestreamed/create_event")
 async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
     """Create (and optionally start) a BeeStreamed event for a configured companion.
@@ -1299,11 +1423,12 @@ async def beestreamed_status(brand: str, avatar: str):
         raise HTTPException(status_code=404, detail="Companion mapping not found")
 
     event_ref = str(mapping.get("event_ref") or "").strip()
+    host_id = _resolve_host_member_id(brand, avatar, mapping)
     return {
         "ok": True,
         "eventRef": event_ref,
         "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
-        "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
+        "hostMemberId": host_id,
         "companionType": str(mapping.get("companion_type") or "").strip(),
         "live": str(mapping.get("live") or "").strip(),
     }
