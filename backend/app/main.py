@@ -960,7 +960,9 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     resolved_avatar = str(mapping.get("avatar") or avatar).strip()
 
     live = str(mapping.get("live") or "").strip().lower()
-    if live != "stream":
+
+    # Be tolerant of values like "Stream", "BeeStreamed", or labels that include these keywords.
+    if "stream" not in live:
         raise HTTPException(status_code=400, detail="This companion is not configured for stream")
 
     member_id = (req.memberId or "").strip()
