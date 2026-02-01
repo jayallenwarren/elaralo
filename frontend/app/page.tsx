@@ -141,7 +141,7 @@ function generateAnonId(): string {
       // @ts-ignore
       return crypto.randomUUID();
     }
-  } catch (e) {}
+  } catch {}
   // Fallback: 32-hex chars
   const rand32 = () =>
     Math.floor(Math.random() * 0xffffffff)
@@ -161,7 +161,7 @@ function getOrCreateAnonMemberId(brand: string): string {
     const id = generateAnonId();
     window.localStorage.setItem(storageKey, id);
     return `${ANON_ID_PREFIX}${id}`;
-  } catch (e) {
+  } catch {
     // Some browsers/settings can block localStorage in a third-party iframe context.
     // Secondary: sessionStorage (sticky for the tab session).
     try {
@@ -171,7 +171,7 @@ function getOrCreateAnonMemberId(brand: string): string {
       const id = generateAnonId();
       window.sessionStorage.setItem(ssKey, id);
       return `${ANON_ID_PREFIX}${id}`;
-    } catch (e) {
+    } catch {
       return "";
     }
   }
@@ -570,7 +570,7 @@ function formatDidError(err: any): string {
 
   try {
     return JSON.stringify(err);
-  } catch (e) {
+  } catch {
     return String(err);
   }
 }
@@ -764,7 +764,7 @@ async function pickFirstExisting(urls: string[]) {
     try {
       const res = await fetch(url, { method: "HEAD", cache: "no-store" });
       if (res.ok) return url;
-    } catch (e) {
+    } catch {
       // ignore
     }
   }
@@ -833,7 +833,7 @@ function isAllowedOrigin(origin: string) {
         if (host.endsWith("." + refHost)) return true; // subdomain match
         if (refHost.endsWith("." + host)) return true; // inverse (defensive)
       }
-    } catch (e) {
+    } catch {
       // ignore referrer parse issues
     }
 
@@ -850,17 +850,17 @@ function isAllowedOrigin(origin: string) {
             if (host === aHost) return true;
             if (host.endsWith("." + aHost)) return true;
             if (aHost.endsWith("." + host)) return true;
-          } catch (e) {
+          } catch {
             // ignore per-origin parse issues
           }
         }
       }
-    } catch (e) {
+    } catch {
       // ignore ancestorOrigins issues
     }
 
     return false;
-  } catch (e) {
+  } catch {
     return false;
   }
 }
@@ -956,7 +956,7 @@ export default function Page() {
     if (typeof window === "undefined") return false;
     try {
       return window.self !== window.top;
-    } catch (e) {
+    } catch {
       // Cross-origin access to window.top can throw; assume embedded.
       return true;
     }
@@ -990,7 +990,7 @@ export default function Page() {
         setDebugEnabled(true);
         setDebugOpen(qs.get("debugOpen") === "1");
       }
-    } catch (e) {
+    } catch {
       // ignore
     }
   }, []);
@@ -1001,7 +1001,7 @@ export default function Page() {
     try {
       if (debugEnabled) window.localStorage.setItem(DEBUG_KEY, "1");
       else window.localStorage.removeItem(DEBUG_KEY);
-    } catch (e) {
+    } catch {
       // ignore
     }
   }, [debugEnabled]);
@@ -1015,7 +1015,7 @@ export default function Page() {
           if (typeof a === "string") return a;
           try {
             return JSON.stringify(a);
-          } catch (e) {
+          } catch {
             return String(a);
           }
         })
@@ -1025,7 +1025,7 @@ export default function Page() {
         const next = [...prev, line];
         return next.length > 250 ? next.slice(next.length - 250) : next;
       });
-    } catch (e) {
+    } catch {
       // ignore
     }
   }, []);
@@ -1068,7 +1068,7 @@ export default function Page() {
         apiBase: API_BASE,
       });
       console.log("[ELARALO] API_BASE =", API_BASE);
-    } catch (e) {
+    } catch {
       // ignore
     }
 
@@ -1151,7 +1151,7 @@ export default function Page() {
         ctx.resume().catch(() => {});
       }
       return ctx;
-    } catch (e) {
+    } catch {
       return null;
     }
   }, []);
@@ -1182,10 +1182,10 @@ export default function Page() {
       osc.stop(stopAt);
 
       window.setTimeout(() => {
-        try { osc.disconnect(); } catch (e) {}
-        try { g.disconnect(); } catch (e) {}
+        try { osc.disconnect(); } catch {}
+        try { g.disconnect(); } catch {}
       }, 180);
-    } catch (e) {
+    } catch {
       // ignore
     }
   }, [ensureTtsAudioContext]);
@@ -1210,7 +1210,7 @@ export default function Page() {
       // if the media response is not CORS-enabled. To guarantee audibility, we do NOT route
       // local (audio-only) TTS through WebAudio GainNodes. (We still keep the hidden VIDEO element.)
       if (kind === "audio" || kind === "video") {
-        try { media.muted = false; media.volume = 1; } catch (e) {}
+        try { media.muted = false; media.volume = 1; } catch {}
         return;
       }
 
@@ -1221,7 +1221,7 @@ export default function Page() {
         // If the underlying media element instance changed (common when Live Avatar is stopped/started),
         // we must recreate the MediaElementSourceNode. Source nodes are permanently bound to a single element.
         if (avatarVideoBoundElRef.current !== media) {
-          try { avatarVideoMediaSrcRef.current?.disconnect(); } catch (e) {}
+          try { avatarVideoMediaSrcRef.current?.disconnect(); } catch {}
           avatarVideoMediaSrcRef.current = null;
           avatarVideoBoundElRef.current = media;
           avatarVideoChainConnectedRef.current = false;
@@ -1252,10 +1252,10 @@ export default function Page() {
           if (connectedRef.current) return;
           try {
             src!.connect(gain!);
-          } catch (e) {}
+          } catch {}
           try {
             gain!.connect(ctx.destination);
-          } catch (e) {}
+          } catch {}
           connectedRef.current = true;
         };
         // kind is narrowed to "avatar" here (audio/video returned early above).
@@ -1267,13 +1267,13 @@ export default function Page() {
         try {
           media.muted = false;
           media.volume = 1;
-        } catch (e) {}
+        } catch {}
       } catch (e) {
         // If this fails (e.g., cross-origin media restrictions), we still keep media.volume at 1.
         try {
           media.muted = false;
           media.volume = 1;
-        } catch (e) {}
+        } catch {}
       }
     },
     [ensureTtsAudioContext, isIphone]
@@ -1284,7 +1284,7 @@ export default function Page() {
       // Local (audio-only) TTS elements intentionally NOT routed through WebAudio.
       // Live avatar video element (non-iPhone)
       applyTtsGainRouting(avatarVideoRef.current, "avatar");
-    } catch (e) {
+    } catch {
       // ignore
     }
   }, [applyTtsGainRouting]);
@@ -1397,7 +1397,7 @@ export default function Page() {
 
         if (res.ok && (json as any)?.found) setCompanionMapping(json);
         else setCompanionMapping(null);
-      } catch (e) {
+      } catch {
         if (!cancelled) setCompanionMapping(null);
       }
     }
@@ -1419,7 +1419,7 @@ export default function Page() {
       const qLegacy = u.searchParams.get(LEGACY_REBRANDING_QUERY_PARAM);
       const q = String(qKey || "").trim() || String(qLegacy || "").trim();
       if (q) setRebrandingKey(q);
-    } catch (e) {
+    } catch {
       // ignore
     }
   }, []);
@@ -1540,6 +1540,8 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
 
+
+
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
@@ -1609,10 +1611,10 @@ const cleanupIphoneLiveAvatarAudio = useCallback(() => {
 
   try {
     didIphoneAudioSrcRef.current?.disconnect();
-  } catch (e) {}
+  } catch {}
   try {
     didIphoneAudioGainRef.current?.disconnect();
-  } catch (e) {}
+  } catch {}
 
   didIphoneAudioSrcRef.current = null;
   didIphoneAudioGainRef.current = null;
@@ -1620,7 +1622,7 @@ const cleanupIphoneLiveAvatarAudio = useCallback(() => {
   try {
     // Closing releases resources; we recreate on demand.
     didIphoneAudioCtxRef.current?.close?.();
-  } catch (e) {}
+  } catch {}
   didIphoneAudioCtxRef.current = null;
 
   // Restore video element audio defaults (in case we muted it for iPhone boost)
@@ -1629,7 +1631,7 @@ const cleanupIphoneLiveAvatarAudio = useCallback(() => {
     try {
       vid.muted = false;
       vid.volume = 1;
-    } catch (e) {}
+    } catch {}
   }
 }, []);
 
@@ -1650,7 +1652,7 @@ const ensureIphoneAudioContextUnlocked = useCallback(() => {
     if (ctx?.state === "suspended" && ctx.resume) {
       ctx.resume().catch(() => {});
     }
-  } catch (e) {
+  } catch {
     // ignore
   }
 }, [isIphone]);
@@ -1681,10 +1683,10 @@ const applyIphoneLiveAvatarAudioBoost = useCallback(
       // Clear any previous routing
       try {
         didIphoneAudioSrcRef.current?.disconnect();
-      } catch (e) {}
+      } catch {}
       try {
         didIphoneAudioGainRef.current?.disconnect();
-      } catch (e) {}
+      } catch {}
 
       // Route MediaStream audio -> Gain -> destination
       const source = ctx.createMediaStreamSource(stream);
@@ -1707,7 +1709,7 @@ const applyIphoneLiveAvatarAudioBoost = useCallback(
         try {
           vid.muted = true;
           vid.volume = 0;
-        } catch (e) {}
+        } catch {}
       }
     } catch (e) {
       console.warn("iPhone Live Avatar audio boost failed:", e);
@@ -1768,7 +1770,7 @@ const stopLiveAvatar = useCallback(async () => {
       if (remembered && typeof remembered.getTracks === "function") {
         remembered.getTracks().forEach((t: any) => t?.stop?.());
       }
-    } catch (e) {
+    } catch {
       // ignore
     }
 
@@ -1786,11 +1788,11 @@ const stopLiveAvatar = useCallback(async () => {
         vid.removeAttribute("src");
         (vid as any).src = "";
         vid.load?.();
-      } catch (e) {
+      } catch {
         // ignore
       }
     }
-  } catch (e) {
+  } catch {
     // ignore
   } finally {
     setAvatarStatus("idle");
@@ -1857,29 +1859,21 @@ if (liveProvider === "stream") {
     }
 
     const eventRef = String(data?.eventRef || "").trim();
+    const embedUrl =
+      String(data?.embedUrl || "").trim() ||
+      (eventRef ? `https://beestreamed.com/event?id=${encodeURIComponent(eventRef)}` : "");
 
-// IMPORTANT: Always use our internal wrapper so the experience stays within the iframe.
-// The API may return a relative path like "/stream/beestreamed/embed/{eventRef}".
-let embedUrl = String(data?.embedUrl || "").trim();
-if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
+    if (!embedUrl) throw new Error("BeeStreamed did not return an embedUrl/eventRef.");
 
-// If the host hasn't created the event yet, non-host users may legitimately have no embedUrl/eventRef.
-const canStart = !!data?.canStart;
-if (!embedUrl && eventRef) {
-  // Fallback to wrapper path (never direct beestreamed.com) if API returned eventRef only.
-  embedUrl = `${API_BASE}/stream/beestreamed/embed/${encodeURIComponent(eventRef)}`;
-}
-if (!embedUrl && canStart) {
-  throw new Error("BeeStreamed did not return an embedUrl/eventRef.");
-}
-setStreamEventRef(eventRef);
+    setStreamEventRef(eventRef);
     setStreamEmbedUrl(embedUrl);
 
+    const canStart = !!data?.canStart;
     setStreamCanStart(canStart);
 
     if (!canStart) {
       setStreamNotice(
-        `Waiting on ${companionName || "the host"} to start event`
+        `Waiting for ${companionName || "the host"} to start the live session…`
       );
       setAvatarStatus("waiting");
     } else if (String(data?.status || "").trim() === "start_failed") {
@@ -1897,7 +1891,14 @@ setStreamEventRef(eventRef);
       `Streaming failed to start. ${err?.message ? String(err.message) : String(err)}`,
     );
 
-    // BeeStreamed: do not open external popups; stay in-page.
+    // Fallback: if a direct streamUrl exists, open it externally.
+    if (streamUrl) {
+      try {
+        window.open(streamUrl, "_blank", "noopener,noreferrer");
+      } catch (_e) {
+        window.location.href = streamUrl;
+      }
+    }
   }
   return;
 }
@@ -1923,7 +1924,7 @@ if (!phase1AvatarMedia) {
       if (didAgentMgrRef.current) {
         await didAgentMgrRef.current.disconnect();
       }
-    } catch (e) {}
+    } catch {}
     didAgentMgrRef.current = null;
 
     try {
@@ -1931,7 +1932,7 @@ if (!phase1AvatarMedia) {
       if (existingStream && typeof existingStream.getTracks === "function") {
         existingStream.getTracks().forEach((t: any) => t?.stop?.());
       }
-    } catch (e) {}
+    } catch {}
     didSrcObjectRef.current = null;
     if (avatarVideoRef.current) {
       try {
@@ -1941,7 +1942,7 @@ if (!phase1AvatarMedia) {
         vid.removeAttribute("src");
         (vid as any).src = "";
         vid.load?.();
-      } catch (e) {
+      } catch {
         // ignore
       }
     }
@@ -1974,7 +1975,7 @@ if (!phase1AvatarMedia) {
               vid.removeAttribute("src");
               (vid as any).src = "";
               vid.load?.();
-            } catch (e) {
+            } catch {
               // ignore
             }
             vid.loop = false;
@@ -1986,7 +1987,7 @@ if (!phase1AvatarMedia) {
             // Non-iPhone: also route the <video> element through a gain node to ensure robust volume.
             try {
               applyTtsGainRouting(vid, "avatar");
-            } catch (e) {}
+            } catch {}
           }
           return value;
         },
@@ -2009,7 +2010,7 @@ if (!phase1AvatarMedia) {
                 if (vid.src !== idleUrl) vid.src = idleUrl;
                 vid.loop = true;
                 vid.play().catch(() => {});
-              } catch (e) {
+              } catch {
                 // ignore
               }
             }
@@ -2029,7 +2030,7 @@ if (!phase1AvatarMedia) {
               vid.loop = false;
               vid.srcObject = stream;
               vid.play().catch(() => {});
-            } catch (e) {
+            } catch {
               // ignore
             }
           }
@@ -2131,7 +2132,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
         try {
           (m as any).playsInline = true;
           (m as any).setAttribute?.("playsinline", "");
-        } catch (e) {}
+        } catch {}
 
         const p = m.play();
         Promise.resolve(p)
@@ -2139,10 +2140,10 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
             markUnlocked();
             try {
               m.pause();
-            } catch (e) {}
+            } catch {}
             try {
               (m as any).currentTime = 0;
-            } catch (e) {}
+            } catch {}
           })
           .catch((e) => {
             console.warn("Failed to prime local TTS", {
@@ -2170,7 +2171,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
     // Ensure boosted routing is in place after priming.
     try {
       boostAllTtsVolumes();
-    } catch (e) {}
+    } catch {}
 
     // If neither succeeds, localTtsUnlockedRef remains false and we'll retry on the next user gesture.
   }, []);
@@ -2205,20 +2206,20 @@ const playLocalTtsUrl = useCallback(
             (rec as any).onend = (...args: any[]) => {
               try {
                 prevOnEnd?.(...args);
-              } catch (e) {}
+              } catch {}
               finish();
             };
 
             try {
               rec.stop();
-            } catch (e) {
+            } catch {
               finish();
             }
 
             // Safety if onend never arrives
             setTimeout(finish, 220);
           });
-        } catch (e) {
+        } catch {
           // ignore
         }
       };
@@ -2236,10 +2237,10 @@ const playLocalTtsUrl = useCallback(
         try {
           m.pause();
           m.currentTime = 0;
-        } catch (e) {}
+        } catch {}
 
         try {
-        } catch (e) {}
+        } catch {}
 
         if (useVideo) {
           try {
@@ -2247,32 +2248,32 @@ const playLocalTtsUrl = useCallback(
             v.playsInline = true;
             v.setAttribute("playsinline", "true");
             v.setAttribute("webkit-playsinline", "true");
-          } catch (e) {}
+          } catch {}
         }
 
         try {
           m.muted = false;
           m.volume = 1;
-        } catch (e) {}
+        } catch {}
 
         // Local (audio-only) TTS stays on the hidden VIDEO element, but we do not
         // route it through WebAudio (can cause silence with non-CORS media).
-        try { m.muted = false; m.volume = 1; } catch (e) {}
+        try { m.muted = false; m.volume = 1; } catch {}
 
         try {
           (m as any).preload = "auto";
-        } catch (e) {}
+        } catch {}
 
         try {
           m.src = finalUrl;
           try {
             (m as any).load?.();
-          } catch (e) {}
-        } catch (e) {}
+          } catch {}
+        } catch {}
 
         try {
           hooks?.onWillSpeak?.();
-        } catch (e) {}
+        } catch {}
 
         try {
           await m.play();
@@ -2289,7 +2290,7 @@ const playLocalTtsUrl = useCallback(
                 m.removeEventListener("playing", onPlaying);
                 m.removeEventListener("timeupdate", onTimeUpdate);
                 m.removeEventListener("error", onErr);
-              } catch (e) {}
+              } catch {}
               resolve(ok);
             }
 
@@ -2307,7 +2308,7 @@ const playLocalTtsUrl = useCallback(
               m.addEventListener("playing", onPlaying, { once: true });
               m.addEventListener("timeupdate", onTimeUpdate);
               m.addEventListener("error", onErr, { once: true });
-            } catch (e) {
+            } catch {
               // If we can't attach events, just accept.
               finish(true);
               return;
@@ -2322,7 +2323,7 @@ const playLocalTtsUrl = useCallback(
             try {
               m.pause();
               m.currentTime = 0;
-            } catch (e) {}
+            } catch {}
             return false;
           }
         } catch (e) {
@@ -2365,14 +2366,14 @@ const playLocalTtsUrl = useCallback(
             try {
               m.pause();
               m.currentTime = 0;
-            } catch (e) {}
+            } catch {}
 
             // iOS Safari sometimes gets "stuck" if we leave the src attached.
             if (isIOS) {
               try {
                 m.removeAttribute("src");
                 (m as any).load?.();
-              } catch (e) {}
+              } catch {}
             }
 
             resolve();
@@ -2423,7 +2424,7 @@ const playLocalTtsUrl = useCallback(
 
         try {
           hooks?.onDidNotSpeak?.();
-        } catch (e) {}
+        } catch {}
         return;
       }
 
@@ -2435,7 +2436,7 @@ const playLocalTtsUrl = useCallback(
 
       try {
         hooks?.onDidNotSpeak?.();
-      } catch (e) {}
+      } catch {}
     },
     [isIOS, applyTtsGainRouting],
   );
@@ -2445,7 +2446,7 @@ const playLocalTtsUrl = useCallback(
   const stopLocalTtsPlayback = useCallback(() => {
     try {
       localTtsStopFnRef.current?.();
-    } catch (e) {
+    } catch {
       // ignore
     }
     localTtsStopFnRef.current = null;
@@ -2455,11 +2456,11 @@ const playLocalTtsUrl = useCallback(
       try {
         a.pause();
         a.currentTime = 0;
-      } catch (e) {}
+      } catch {}
       try {
         a.removeAttribute("src");
         (a as any).load?.();
-      } catch (e) {}
+      } catch {}
     }
 
     const v = localTtsVideoRef.current;
@@ -2467,11 +2468,11 @@ const playLocalTtsUrl = useCallback(
       try {
         v.pause();
         v.currentTime = 0;
-      } catch (e) {}
+      } catch {}
       try {
         v.removeAttribute("src");
         (v as any).load?.();
-      } catch (e) {}
+      } catch {}
     }
   }, []);
 
@@ -2487,7 +2488,7 @@ const playLocalTtsUrl = useCallback(
       const epoch = localTtsEpochRef.current;
       try {
         localTtsAbortRef.current?.abort();
-      } catch (e) {}
+      } catch {}
       const controller = new AbortController();
       localTtsAbortRef.current = controller;
 
@@ -2524,7 +2525,7 @@ const speakAssistantReply = useCallback(
     const callDidNotSpeak = () => {
       try {
         hooks?.onDidNotSpeak?.();
-      } catch (e) {
+      } catch {
         // ignore
       }
     };
@@ -2535,7 +2536,7 @@ const speakAssistantReply = useCallback(
       willSpeakCalled = true;
       try {
         hooks?.onWillSpeak?.();
-      } catch (e) {
+      } catch {
         // ignore
       }
     };
@@ -2584,7 +2585,7 @@ const speakAssistantReply = useCallback(
         a.preload = "metadata";
         // Some CDNs require this for cross-origin metadata access (best-effort).
         try {
-        } catch (e) {
+        } catch {
           // ignore
         }
 
@@ -2595,13 +2596,13 @@ const speakAssistantReply = useCallback(
           try {
             a.onloadedmetadata = null as any;
             a.onerror = null as any;
-          } catch (e) {
+          } catch {
             // ignore
           }
           // release resource
           try {
             a.src = "";
-          } catch (e) {
+          } catch {
             // ignore
           }
           resolve(ms);
@@ -2704,67 +2705,6 @@ const speakAssistantReply = useCallback(
 
   const [planName, setPlanName] = useState<PlanName>(null);
   const [memberId, setMemberId] = useState<string>("");
-
-  // Lightweight viewer auto-refresh: if you are not the host, keep polling until the host creates/starts the event.
-  // This avoids requiring manual page refresh for viewers waiting on the host.
-  useEffect(() => {
-    // Only poll while we are explicitly waiting and we don't yet have an embed URL.
-    if (avatarStatus !== "waiting") return;
-    if (streamEmbedUrl) return;
-
-    let cancelled = false;
-    const intervalMs = 3000;
-
-    const poll = () => {
-      const embedDomain = (typeof window !== "undefined" && window.location) ? window.location.hostname : "";
-
-      fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brand: companyName,
-          avatar: companionName,
-          memberId: memberId || "",
-          embedDomain,
-        }),
-      })
-        .then((res) => (res && res.ok ? res.json() : null))
-        .then((data: any) => {
-          if (!data || cancelled) return;
-
-          const eventRef = String(data?.eventRef || "").trim();
-          let embedUrl = String(data?.embedUrl || "").trim();
-          if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
-
-          // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
-          if (embedUrl) {
-            setStreamEventRef(eventRef);
-            setStreamEmbedUrl(embedUrl);
-
-            // Viewers can never "start", so we keep waiting state (and message) until the stream is live.
-            // This is purely to allow the iframe to appear without requiring a hard refresh.
-            setStreamCanStart(false);
-
-            if (data?.message) setStreamNotice(String(data.message));
-          } else if (data?.message) {
-            setStreamNotice(String(data.message));
-          }
-        })
-        .catch((_e) => {
-          // Ignore transient failures; keep polling.
-        });
-    };
-
-    // Kick once immediately, then interval.
-    poll();
-    const t = window.setInterval(poll, intervalMs);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(t);
-    };
-  }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
-
   const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
   // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
@@ -2784,7 +2724,7 @@ const speakAssistantReply = useCallback(
         window.top.location.href = url;
         return;
       }
-    } catch (e) {
+    } catch {
       // Cross-origin access to window.top can throw.
     }
 
@@ -2792,7 +2732,7 @@ const speakAssistantReply = useCallback(
     try {
       window.open(url, "_top");
       return;
-    } catch (e) {
+    } catch {
       // ignore
     }
 
@@ -2810,7 +2750,7 @@ const speakAssistantReply = useCallback(
         window.top.location.href = url;
         return;
       }
-    } catch (e) {
+    } catch {
       // Cross-origin access to window.top can throw.
     }
 
@@ -2818,7 +2758,7 @@ const speakAssistantReply = useCallback(
     try {
       window.open(url, "_top");
       return;
-    } catch (e) {
+    } catch {
       // ignore
     }
 
@@ -2899,7 +2839,7 @@ const speakAssistantReply = useCallback(
       " (If this page is embedded, ensure the embed/iframe allows microphone access.)";
     try {
       return window.self !== window.top ? hint : "";
-    } catch (e) {
+    } catch {
       return hint;
     }
   }, []);
@@ -2973,7 +2913,7 @@ useEffect(() => {
   if (typeof data === "string") {
     try {
       data = JSON.parse(data);
-    } catch (e) {
+    } catch {
       return;
     }
   }
@@ -3558,18 +3498,18 @@ const rebrandingKeyForBackend = hasEntitledPlan
       rec.onend = null;
       rec.onerror = null;
       rec.onresult = null;
-    } catch (e) {
+    } catch {
       // ignore
     }
 
     try {
       rec.abort?.();
-    } catch (e) {
+    } catch {
       // ignore
     }
     try {
       rec.stop?.();
-    } catch (e) {
+    } catch {
       // ignore
     }
 
@@ -3598,7 +3538,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
       if (backendSttRecorderRef.current && backendSttRecorderRef.current.state !== "inactive") {
         backendSttRecorderRef.current.stop();
       }
-    } catch (e) {}
+    } catch {}
     backendSttRecorderRef.current = null;
 
     if (backendSttHardStopTimerRef.current) {
@@ -3615,7 +3555,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
       backendSttStreamRef.current.getTracks().forEach((t) => {
         try {
           t.stop();
-        } catch (e) {}
+        } catch {}
       });
       backendSttStreamRef.current = null;
     }
@@ -3623,7 +3563,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
     if (backendSttAudioCtxRef.current) {
       try {
         backendSttAudioCtxRef.current.close();
-      } catch (e) {}
+      } catch {}
       backendSttAudioCtxRef.current = null;
     }
 
@@ -3634,7 +3574,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
   const abortBackendStt = useCallback(() => {
     try {
       backendSttAbortRef.current?.abort();
-    } catch (e) {}
+    } catch {}
     backendSttAbortRef.current = null;
 
     cleanupBackendSttResources();
@@ -3666,7 +3606,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
         let detail = "";
         try {
           detail = await resp.text();
-        } catch (e) {}
+        } catch {}
         throw new Error(`STT backend error ${resp.status}: ${detail || resp.statusText}`);
       }
 
@@ -3741,12 +3681,12 @@ const rebrandingKeyForBackend = hasEntitledPlan
             break;
           }
         }
-      } catch (e) {}
+      } catch {}
 
       let recorder: MediaRecorder;
       try {
         recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      } catch (e) {
+      } catch {
         throw new Error("This browser cannot record audio for STT. Please use Live Avatar mode on this device.");
       }
       backendSttRecorderRef.current = recorder;
@@ -3771,7 +3711,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
         backendSttAudioCtxRef.current = ctx;
         try {
           await ctx.resume();
-        } catch (e) {}
+        } catch {}
 
         const src = ctx.createMediaStreamSource(stream);
         const analyser = ctx.createAnalyser();
@@ -3790,7 +3730,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
           if (!sttEnabledRef.current || sttPausedRef.current) {
             try {
               if (recorder.state !== "inactive") recorder.stop();
-            } catch (e) {}
+            } catch {}
             return;
           }
 
@@ -3814,14 +3754,14 @@ const rebrandingKeyForBackend = hasEntitledPlan
           if (elapsed >= maxRecordMs) {
             try {
               if (recorder.state !== "inactive") recorder.stop();
-            } catch (e) {}
+            } catch {}
             return;
           }
 
           if (backendSttHasSpokenRef.current && elapsed > minRecordMs && silentFor >= silenceMs) {
             try {
               if (recorder.state !== "inactive") recorder.stop();
-            } catch (e) {}
+            } catch {}
             return;
           }
 
@@ -3829,19 +3769,19 @@ const rebrandingKeyForBackend = hasEntitledPlan
         };
 
         backendSttRafRef.current = requestAnimationFrame(tick);
-      } catch (e) {
+      } catch {
         // If VAD setup fails, we still record; hard-stop timer will end it.
       }
 
       backendSttHardStopTimerRef.current = window.setTimeout(() => {
         try {
           if (recorder.state !== "inactive") recorder.stop();
-        } catch (e) {}
+        } catch {}
       }, 16000);
 
       try {
         recorder.start(250);
-      } catch (e) {
+      } catch {
         throw new Error("Failed to start recording.");
       }
 
@@ -3921,7 +3861,7 @@ const pauseSpeechToText = useCallback(() => {
     const rec = sttRecRef.current;
     try {
       rec?.stop?.();
-    } catch (e) {
+    } catch {
       // ignore
     }
 
@@ -3981,7 +3921,7 @@ const pauseSpeechToText = useCallback(() => {
         setBackendSttAvailable(false);
         try {
           sttRecRef.current?.abort?.();
-        } catch (e) {
+        } catch {
           // ignore
         }
         sttRecRef.current = null;
@@ -4006,19 +3946,19 @@ const pauseSpeechToText = useCallback(() => {
     // iOS + embedded contexts are more stable with continuous=false and manual restarts.
     try {
       rec.continuous = !isIOS;
-    } catch (e) {
+    } catch {
       // ignore
     }
 
     try {
       rec.interimResults = true;
-    } catch (e) {
+    } catch {
       // ignore
     }
 
     try {
       rec.lang = "en-US";
-    } catch (e) {
+    } catch {
       // ignore
     }
 
@@ -4051,7 +3991,7 @@ const pauseSpeechToText = useCallback(() => {
 
         try {
           rec.start();
-        } catch (e) {
+        } catch {
           // ignore
         }
       }, baseDelay + ignoreDelay);
@@ -4076,7 +4016,7 @@ const pauseSpeechToText = useCallback(() => {
         setSttError("Microphone permission was blocked." + getEmbedHint());
         try {
           rec.stop?.();
-        } catch (e) {
+        } catch {
           // ignore
         }
         return;
@@ -4108,7 +4048,7 @@ const pauseSpeechToText = useCallback(() => {
           );
           try {
             rec.stop?.();
-          } catch (e) {
+          } catch {
             // ignore
           }
           return;
@@ -4129,7 +4069,7 @@ const pauseSpeechToText = useCallback(() => {
 
           try {
             r2.start();
-          } catch (e) {
+          } catch {
             // ignore
           }
         }, isIOS ? 1200 : 650);
@@ -4210,7 +4150,7 @@ const pauseSpeechToText = useCallback(() => {
       try {
         rec.start();
         setSttRunning(true);
-      } catch (e) {
+      } catch {
         // ignore; will restart on onend if needed
       }
     }, delayMs);
@@ -4241,7 +4181,7 @@ const speakGreetingIfNeeded = useCallback(
     // Already spoken this session?
     try {
       if (sessionStorage.getItem(key) === "1") return;
-    } catch (e) {}
+    } catch {}
 
     // Prevent duplicates/races (e.g., Live Avatar connects right after mic-start).
     if (greetInFlightRef.current) return;
@@ -4263,7 +4203,7 @@ const speakGreetingIfNeeded = useCallback(
     try {
       try {
         await pauseSpeechToText();
-      } catch (e) {}
+      } catch {}
 
       const hooks: SpeakAssistantHooks = {
         onWillSpeak: () => {},
@@ -4281,19 +4221,19 @@ const speakGreetingIfNeeded = useCallback(
       // Mark spoken ONLY after successful playback.
       try {
         sessionStorage.setItem(key, "1");
-      } catch (e) {}
+      } catch {}
     } catch (e) {
       // Allow retry later if something failed.
       try {
         sessionStorage.removeItem(key);
-      } catch (e) {}
+      } catch {}
       console.warn("Greeting playback failed:", e);
     } finally {
       sttIgnoreUntilRef.current = prevIgnore;
       greetInFlightRef.current = false;
       try {
         await resumeSpeechToText();
-      } catch (e) {}
+      } catch {}
     }
   },
   [companionName, handoffReady, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
@@ -4367,7 +4307,7 @@ const speakGreetingIfNeeded = useCallback(
     // iOS Safari can enter a low-volume route after stop/start transitions.
     // Apply the same "loud path" recovery we use for Clear/Save before kicking off STT.
     // IMPORTANT: do not await here; iOS SpeechRecognition must start directly from the user gesture.
-    try { boostAllTtsVolumes(); } catch (e) {}
+    try { boostAllTtsVolumes(); } catch {}
     void nudgeAudioSession();
     primeLocalTtsAudio(true);
     void ensureIphoneAudioContextUnlocked();
@@ -4464,7 +4404,7 @@ const speakGreetingIfNeeded = useCallback(
     localTtsEpochRef.current += 1;
     try {
       localTtsAbortRef.current?.abort();
-    } catch (e) {}
+    } catch {}
     localTtsAbortRef.current = null;
     // Stop listening immediately
     stopSpeechToText();
@@ -4486,13 +4426,13 @@ const speakGreetingIfNeeded = useCallback(
   const handleStopClick = useCallback(() => {
     try {
       stopHandsFreeSTT();
-    } catch (e) {}
+    } catch {}
 
     // Re-assert boosted audio routing and nudge audio session on the same user gesture.
-    try { boostAllTtsVolumes(); } catch (e) {}
-    try { void nudgeAudioSession(); } catch (e) {}
-    try { primeLocalTtsAudio(true); } catch (e) {}
-    try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
+    try { boostAllTtsVolumes(); } catch {}
+    try { void nudgeAudioSession(); } catch {}
+    try { primeLocalTtsAudio(true); } catch {}
+    try { void ensureIphoneAudioContextUnlocked(); } catch {}
   }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
 
   // Clear Messages (with confirmation)
@@ -4504,26 +4444,26 @@ const speakGreetingIfNeeded = useCallback(
 
     try {
       stopHandsFreeSTT();
-    } catch (e) {
+    } catch {
       // ignore
     }
 
     // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
     try {
       boostAllTtsVolumes();
-    } catch (e) {}
+    } catch {}
     try {
       void nudgeAudioSession();
-    } catch (e) {}
+    } catch {}
 
     // Strong iOS recovery: prime the hidden VIDEO element on this user gesture so audio-only TTS
     // is not left in a silent/receiver route after the confirmation modal.
     try {
       primeLocalTtsAudio(true);
-    } catch (e) {}
+    } catch {}
     try {
       void ensureIphoneAudioContextUnlocked();
-    } catch (e) {}
+    } catch {}
 
 
     setShowClearMessagesConfirm(true);
@@ -4539,23 +4479,23 @@ const speakGreetingIfNeeded = useCallback(
 
     try {
       stopHandsFreeSTT();
-    } catch (e) {}
+    } catch {}
 
     // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
     try {
       boostAllTtsVolumes();
-    } catch (e) {}
+    } catch {}
     try {
       void nudgeAudioSession();
-    } catch (e) {}
+    } catch {}
 
     // Prime the hidden VIDEO element on this user gesture so audio-only TTS remains healthy.
     try {
       primeLocalTtsAudio(true);
-    } catch (e) {}
+    } catch {}
     try {
       void ensureIphoneAudioContextUnlocked();
-    } catch (e) {}
+    } catch {}
 
     setShowSaveSummaryConfirm(true);
   }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
@@ -4569,17 +4509,17 @@ const speakGreetingIfNeeded = useCallback(
     // that *future* manual resumption of TTS is not routed to a silent/receiver path.
 
     // Re-assert boosted routing first.
-    try { boostAllTtsVolumes(); } catch (e) {}
+    try { boostAllTtsVolumes(); } catch {}
 
     // iOS route recovery: nudge the audio session back to normal playback.
-    try { await nudgeAudioSession(); } catch (e) {}
+    try { await nudgeAudioSession(); } catch {}
 
     // Prime the hidden VIDEO element (required by your constraint) so the next audio-only
     // TTS playback is unlocked and uses the correct output route.
-    try { primeLocalTtsAudio(true); } catch (e) {}
+    try { primeLocalTtsAudio(true); } catch {}
 
     // If Live Avatar is used on iPhone, ensure its audio context is also unlocked.
-    try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
+    try { void ensureIphoneAudioContextUnlocked(); } catch {}
 
     // Ensure element mute/volume flags are sane (gain routing provides the loudness).
     try {
@@ -4591,7 +4531,7 @@ const speakGreetingIfNeeded = useCallback(
         // @ts-ignore
         v.playsInline = true;
       }
-    } catch (e) {}
+    } catch {}
 
     try {
       const a = localTtsAudioRef.current;
@@ -4599,7 +4539,7 @@ const speakGreetingIfNeeded = useCallback(
         a.muted = false;
         a.volume = 1;
       }
-    } catch (e) {}
+    } catch {}
 
     try {
       const av = avatarVideoRef.current;
@@ -4607,7 +4547,7 @@ const speakGreetingIfNeeded = useCallback(
         av.muted = false;
         av.volume = 1;
       }
-    } catch (e) {}
+    } catch {}
   }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes, nudgeAudioSession]);
 
 
@@ -4627,16 +4567,16 @@ const speakGreetingIfNeeded = useCallback(
             rec.onend = null;
             rec.onresult = null;
             rec.onerror = null;
-          } catch (e) {}
+          } catch {}
           try {
             rec.abort?.();
-          } catch (e) {
+          } catch {
             try {
               rec.stop?.();
-            } catch (e) {}
+            } catch {}
           }
         }
-      } catch (e) {}
+      } catch {}
     };
   }, []);
 
@@ -4645,21 +4585,17 @@ const speakGreetingIfNeeded = useCallback(
     <>
       <button
         type="button"
-        onClick={() => {
-          if (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) return;
-          void toggleSpeechToText();
-        }}
-        disabled={(liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) || (!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
+        onClick={toggleSpeechToText}
+        disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
         title="Audio"
         style={{
           width: 44,
           minWidth: 44,
           borderRadius: 10,
           border: "1px solid #111",
-          background: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
+          background: sttEnabled ? "#b00020" : "#fff",
           color: sttEnabled ? "#fff" : "#111",
-          cursor: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-          opacity: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
+          cursor: "pointer",
           fontWeight: 700,
         }}
       >
@@ -4731,32 +4667,30 @@ const speakGreetingIfNeeded = useCallback(
           </button>
 
 
-          {(!rebrandingKey || String(rebrandingKey).trim() === "") && (
-            <button
-              type="button"
-              onClick={() => {
-                setSwitchCompanionFlash(true);
-                window.setTimeout(() => {
-                  goToMyElaralo();
-                  setSwitchCompanionFlash(false);
-                }, 120);
-              }}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: switchCompanionFlash ? "#111" : "#fff",
-                color: switchCompanionFlash ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 400,
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-              }}
-            >
-              Switch Companion
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => {
+              setSwitchCompanionFlash(true);
+              window.setTimeout(() => {
+                goToMyElaralo();
+                setSwitchCompanionFlash(false);
+              }, 120);
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: switchCompanionFlash ? "#111" : "#fff",
+              color: switchCompanionFlash ? "#fff" : "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Switch Companion
+          </button>
         </div>
       ) : (
         <>
@@ -4983,9 +4917,6 @@ const speakGreetingIfNeeded = useCallback(
                   src={streamEmbedUrl}
                   title="Live Stream"
                   style={{ width: "100%", height: "100%", border: 0 }}
-                  // Keep all navigation inside the frame (block popout/new-window behavior)
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
-                  referrerPolicy="no-referrer-when-downgrade"
                   allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
                   allowFullScreen
                 />
@@ -5075,15 +5006,13 @@ const speakGreetingIfNeeded = useCallback(
                 height: 44,
                 borderRadius: 10,
                 border: "1px solid #bbb",
-                background: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : "#fff",
-                cursor: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-                opacity: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
+                background: "#fff",
+                cursor: "pointer",
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
               }}
-              disabled={liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}
-              >
+            >
               <SaveIcon size={18} />
             </button>
 
@@ -5097,15 +5026,13 @@ const speakGreetingIfNeeded = useCallback(
                 height: 44,
                 borderRadius: 10,
                 border: "1px solid #bbb",
-                background: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : "#fff",
-                cursor: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-                opacity: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
+                background: "#fff",
+                cursor: "pointer",
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
               }}
-              disabled={liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}
-              >
+            >
               <TrashIcon size={18} />
             </button>
 
@@ -5195,7 +5122,7 @@ const speakGreetingIfNeeded = useCallback(
                   if (savingSummary) return;
                   setShowSaveSummaryConfirm(false);
                   // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
-                  try { boostAllTtsVolumes(); } catch (e) {}
+                  try { boostAllTtsVolumes(); } catch {}
                   void restoreVolumesAfterClearCancel();
                 }}
                 style={{
@@ -5263,7 +5190,7 @@ const speakGreetingIfNeeded = useCallback(
                     setSavingSummary(false);
                     setShowSaveSummaryConfirm(false);
                     // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
-                    try { boostAllTtsVolumes(); } catch (e) {}
+                    try { boostAllTtsVolumes(); } catch {}
                     void restoreVolumesAfterClearCancel();
                   }
                 }}
@@ -5319,7 +5246,7 @@ const speakGreetingIfNeeded = useCallback(
                 onClick={() => {
                     setShowClearMessagesConfirm(false);
                     // User gesture: restore boosted routing so subsequent TTS isn't quiet.
-                    try { boostAllTtsVolumes(); } catch (e) {}
+                    try { boostAllTtsVolumes(); } catch {}
                     // Restore audio routing/volume immediately.
                     void restoreVolumesAfterClearCancel();
                   }}
@@ -5338,10 +5265,10 @@ const speakGreetingIfNeeded = useCallback(
                 onClick={() => {
                   setMessages([]);
                   setInput("");
-                  try { if (inputElRef.current) inputElRef.current.value = ""; } catch (e) {}
+                  try { if (inputElRef.current) inputElRef.current.value = ""; } catch {}
                   setShowClearMessagesConfirm(false);
                   // User gesture: restore boosted routing so subsequent TTS isn't quiet.
-                  try { boostAllTtsVolumes(); } catch (e) {}
+                  try { boostAllTtsVolumes(); } catch {}
                   // Re-prime audio outputs after a hard stop so Audio TTS doesn't come back quiet (iOS/Safari).
                   void restoreVolumesAfterClearCancel();
                 }}
@@ -5479,7 +5406,7 @@ const speakGreetingIfNeeded = useCallback(
                     // eslint-disable-next-line no-alert
                     alert(text);
                   }
-                } catch (e) {}
+                } catch {}
               }}
               style={{
                 marginLeft: "auto",
