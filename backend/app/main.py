@@ -1082,7 +1082,7 @@ class BeeStreamedCreateEventRequest(BaseModel):
     startStream: bool = True
 
 
-    This is the lowest-level primitive when you *don't* already have an event_ref.
+    # This is the lowest-level primitive when you *don't* already have an event_ref.
     Credentials are taken from env:
       - STREAM_TOKEN_ID
       - STREAM_SECRET_KEY
