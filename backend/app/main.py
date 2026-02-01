@@ -1,3154 +1,4612 @@
-from __future__ import annotations
+"use client";
 
-import os
-import time
-import re
-import uuid
-import json
-import hashlib
-import base64
-import asyncio
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
-
-from pydantic import BaseModel
-
-from filelock import FileLock  # type: ignore
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-# Threadpool helper (prevents blocking the event loop on requests/azure upload)
-from starlette.concurrency import run_in_threadpool  # type: ignore
-
-from .settings import settings
-from .models import ChatResponse  # kept for compatibility with existing codebase
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import elaraLogo from "../public/elaralo-logo.png";
 
 
-# ----------------------------
-# Optional consent router
-# ----------------------------
-try:
-    from .consent_routes import router as consent_router  # type: ignore
-except Exception:
-    consent_router = None
+const PlayIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    <path d="M8 5v14l11-7z" fill="currentColor" />
+  </svg>
+);
+
+const PauseIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    <path d="M6 5h4v14H6zM14 5h4v14h-4z" fill="currentColor" />
+  </svg>
+);
 
 
-STATUS_SAFE = "safe"
-STATUS_BLOCKED = "explicit_blocked"
-STATUS_ALLOWED = "explicit_allowed"
 
-app = FastAPI(title="Elaralo API")
+const TrashIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    <path
+      d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v10h-2V9zm4 0h2v10h-2V9zM6 9h2v10H6V9z"
+      fill="currentColor"
+    />
+  </svg>
+);
 
-# ----------------------------
-# CORS
-# ----------------------------
-# CORS_ALLOW_ORIGINS can be:
-#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
-#   - entries with wildcards (e.g. https://*.azurestaticapps.net)
-#   - or a single "*" to allow all (NOT recommended for production)
-cors_env = (
-    os.getenv("CORS_ALLOW_ORIGINS", "")
-    or getattr(settings, "CORS_ALLOW_ORIGINS", None)
-    or ""
-).strip()
+const SaveIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    <path
+      d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h11v5H7v2h10V4.41L19 6.41V19z"
+      fill="currentColor"
+    />
+  </svg>
+);
+type Role = "user" | "assistant";
+type Msg = { role: Role; content: string };
 
-def _split_cors_origins(raw: str) -> list[str]:
-    """Split + normalize CORS origins from an env var.
+type Mode = "friend" | "romantic" | "intimate";
 
-    Supports comma and/or whitespace separation.
-    Removes trailing slashes (browser Origin never includes a trailing slash).
-    De-dupes while preserving order.
-    """
-    if not raw:
-        return []
-    tokens = re.split(r"[\s,]+", raw.strip())
-    out: list[str] = []
-    seen: set[str] = set()
-    for t in tokens:
-        if not t:
-            continue
-        t = t.strip()
-        if not t:
-            continue
-        if t != "*" and t.endswith("/"):
-            t = t.rstrip("/")
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
-    return out
+type LiveProvider = "did" | "stream";
+type ChannelCap = "audio" | "video" | "";
 
-raw_items = _split_cors_origins(cors_env)
-allow_all = (len(raw_items) == 1 and raw_items[0] == "*")
+type CompanionMappingRow = {
+  found?: boolean;
+  brand?: string;
+  avatar?: string;
+  communication?: string; // "Audio" | "Video"
+  live?: string; // "D-ID" | "Stream"
+  didClientKey?: string;
+  didAgentId?: string;
+  elevenVoiceId?: string;
+};
 
-allow_origins: list[str] = []
-allow_origin_regex: str | None = None
-allow_credentials = True
+type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
-if allow_all:
-    # Allow-all is only enabled when explicitly configured via "*".
-    allow_origins = ["*"]
-    allow_credentials = False  # cannot be True with wildcard
-else:
-    # Support optional wildcards (e.g., "https://*.azurestaticapps.net").
-    literal: list[str] = []
-    wildcard: list[str] = []
-    for o in raw_items:
-        if "*" in o:
-            wildcard.append(o)
-        else:
-            literal.append(o)
+type SessionState = {
+  mode: Mode;
+  adult_verified: boolean;
+  romance_consented: boolean;
+  explicit_consented: boolean;
+  pending_consent: "intimate" | null;
+  model: string;
+  // optional extras tolerated
+  [k: string]: any;
+};
 
-    allow_origins = literal
+type ChatApiResponse = {
+  reply: string;
+  mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
+  session_state?: Partial<SessionState>;
+};
 
-    if wildcard:
-        # Convert wildcard origins to a regex.
-        parts: list[str] = []
-        for w in wildcard:
-            parts.append("^" + re.escape(w).replace("\\*", ".*") + "$")
-        allow_origin_regex = "|".join(parts)
+type PlanName =
+  | "Trial"
+  | "Friend"
+  | "Romantic"
+  | "Intimate (18+)"
+  | "Pay as You Go"
+  | "Test - Friend"
+  | "Test - Romantic"
+  | "Test - Intimate (18+)"
+  | "Test - Pay as You Go"
+  | null;
 
-    # Security-first default: if CORS_ALLOW_ORIGINS is empty, we do NOT allow browser cross-origin calls.
-    # (Server-to-server calls without an Origin header still work.)
-    if not allow_origins and not allow_origin_regex:
-        print("[CORS] WARNING: CORS_ALLOW_ORIGINS is empty. Browser requests from other origins will be blocked.")
+// -----------------------------------------------------------------------------
+// Visitor identity (anon) helpers
+// - We store a per-brand anon id in localStorage so visitors without a Wix memberId
+//   can still be consistently identified for freeMinutes usage tracking.
+// - IMPORTANT: localStorage is scoped to the iframe origin (azurestaticapps.net),
+//   so we namespace by brand to avoid cross-site collisions across white-label embeds.
+// -----------------------------------------------------------------------------
+const ANON_ID_PREFIX = "anon:";
+const ANON_ID_STORAGE_KEY_PREFIX = "ELARALO_ANON_ID::";
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_origin_regex=allow_origin_regex,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+function safeBrandKey(raw: string): string {
+  const s = (raw || "").trim().toLowerCase();
+  if (!s) return "core";
+  const cleaned = s.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned || "core";
+}
 
-# ----------------------------
-# Routes
-# ----------------------------
-if consent_router is not None:
-    app.include_router(consent_router)
+function getAnonIdStorageKey(brand: string): string {
+  return `${ANON_ID_STORAGE_KEY_PREFIX}${safeBrandKey(brand)}`;
+}
+
+function generateAnonId(): string {
+  try {
+    // @ts-ignore
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      // @ts-ignore
+      return crypto.randomUUID();
+    }
+  } catch (e) {
+        }
+  // Fallback: 32-hex chars
+  const rand32 = () =>
+    Math.floor(Math.random() * 0xffffffff)
+      .toString(16)
+      .padStart(8, "0");
+  return `${rand32()}${rand32()}${rand32()}${rand32()}`;
+}
+
+function getOrCreateAnonMemberId(brand: string): string {
+  if (typeof window === "undefined") return "";
+  const storageKey = getAnonIdStorageKey(brand);
+
+  // Primary: localStorage (sticky across sessions)
+  try {
+    const existing = window.localStorage.getItem(storageKey);
+    if (existing && existing.trim()) return `${ANON_ID_PREFIX}${existing.trim()}`;
+    const id = generateAnonId();
+    window.localStorage.setItem(storageKey, id);
+    return `${ANON_ID_PREFIX}${id}`;
+  } catch (e) {
+        // Some browsers/settings can block localStorage in a third-party iframe context.
+    // Secondary: sessionStorage (sticky for the tab session).
+    try {
+      const ssKey = `ELARALO_SESSION_ANON_ID::${safeBrandKey(brand)}`;
+      const existing = window.sessionStorage.getItem(ssKey);
+      if (existing && existing.trim()) return `${ANON_ID_PREFIX}${existing.trim()}`;
+      const id = generateAnonId();
+      window.sessionStorage.setItem(ssKey, id);
+      return `${ANON_ID_PREFIX}${id}`;
+    } catch (e) {
+        return "";
+    }
+  }
+}
+
+function isAnonMemberId(memberId: string): boolean {
+  return (memberId || "").trim().toLowerCase().startsWith(ANON_ID_PREFIX);
+}
 
 
-@app.get("/")
-def root():
-    """
-    Minimal root endpoint.
 
-    Azure App Service (Linux) health probes and some monitoring tools will call "/"
-    by default. Returning 200 here prevents false "container failed to start" / 502
-    notifications when the API itself is healthy but has no root route.
-    """
-    return {"ok": True, "service": "Elaralo API"}
+// --- Plan and companion helpers (no UI changes beyond required labels) ---
+function normalizePlanName(raw: any): PlanName {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  const key = s.toLowerCase();
+
+  switch (key) {
+    case "trial":
+      return "Trial";
+    case "friend":
+      return "Friend";
+    case "romantic":
+      return "Romantic";
+    case "intimate (18+)":
+      return "Intimate (18+)";
+    case "pay as you go":
+      return "Pay as You Go";
+    case "test - friend":
+      return "Test - Friend";
+    case "test - romantic":
+      return "Test - Romantic";
+    case "test - intimate (18+)":
+      return "Test - Intimate (18+)";
+    case "test - pay as you go":
+      return "Test - Pay as You Go";
+    default:
+      return null;
+  }
+}
+
+function stripTrialControlsFromRebrandingKey(key: string): string {
+  const p = parseRebrandingKey(key);
+  if (!p) return key;
+
+  // IMPORTANT:
+  // Historically some backend paths read the *plan* segment (6th field) from the rebrandingKey to decide
+  // included minutes. For white-label sites, the 6th field may be the white-label plan label (e.g. "Test - Exclusive")
+  // and the Elaralo entitlement plan is carried in `elaraloPlanMap` (e.g. "Intimate (18+)").
+  //
+  // To ensure quota/minutes are computed from the mapped Elaralo plan, we copy `elaraloPlanMap` into the plan slot
+  // when it's present.
+  const entitlementPlan = (p.elaraloPlanMap || "").trim() || (p.plan || "").trim();
+  // Keep format stable (9 segments).
+  // Blank-out FreeMinutes + CycleDays so the backend can fall back to plan defaults
+  // when the user is entitled (i.e., has an active plan).
+  return [
+    p.rebranding,
+    p.upgradeLink,
+    p.payGoLink,
+    p.payGoPrice,
+    p.payGoMinutes,
+    entitlementPlan,
+    p.elaraloPlanMap,
+    "",
+    "",
+  ].join("|");
+}
+
+function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverride?: string): string {
+  const hasMemberId = Boolean((memberId || "").trim());
+
+  // Requirement: If we do not have a memberId, the visitor is on Trial, shown as "Free Trial".
+  if (!hasMemberId) return "Free Trial";
+
+  // White-label: show the rebranding site's plan label when provided (e.g., "Supreme"),
+  // while still using ElaraloPlanMap for capability gating.
+  const override = String(planLabelOverride || "").trim();
+  if (override) return override;
+
+  // Requirement: Unknown / Not Provided only when the plan information for a member is not provided.
+  if (!planName) return "Unknown / Not Provided";
+
+  return planName;
+}
+
+type CompanionKeySplit = {
+  baseKey: string;
+  flags: Record<string, string>;
+};
+
+/**
+ * Companion keys can include optional metadata after a pipe.
+ * Example:
+ *   "Elara-Female-Caucasian-GenZ|live=stream"
+ *
+ * The baseKey is used for parsing/display and file lookups.
+ * Flags are used for live behavior (D-ID vs streaming/web conference).
+ */
+function splitCompanionKey(raw: string): CompanionKeySplit {
+  const s = String(raw ?? "").trim();
+  if (!s) return { baseKey: "", flags: {} };
+
+  const parts = s.split("|").map((p) => p.trim()).filter(Boolean);
+  const baseKey = parts[0] || "";
+  const flags: Record<string, string> = {};
+
+  for (let i = 1; i < parts.length; i++) {
+    const piece = parts[i] || "";
+    const eq = piece.indexOf("=");
+    if (eq === -1) {
+      flags[piece.toLowerCase()] = "1";
+      continue;
+    }
+    const k = piece.slice(0, eq).trim().toLowerCase();
+    const v = piece.slice(eq + 1).trim();
+    if (k) flags[k] = v;
+  }
+
+  return { baseKey, flags };
+}
+
+function modeFromElaraloPlanMap(raw: unknown): Mode | null {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (s.includes("intimate")) return "intimate";
+  if (s.includes("romantic")) return "romantic";
+  if (s.includes("friend")) return "friend";
+  return null;
+}
+
+type CompanionMeta = {
+  first: string;
+  gender: string;
+  ethnicity: string;
+  generation: string;
+  key: string;
+};
+
+const DEFAULT_COMPANION_NAME = "Elara";
+
+// Step C (Latency): limit how much chat history we send to /chat.
+// 20 turns ~= 40 messages (user+assistant). System prompt (if present) is always preserved.
+const MAX_MESSAGES_TO_SEND = 40;
+
+function trimMessagesForChat<T extends { role: string; content: any }>(messages: T[]): T[] {
+  if (!Array.isArray(messages) || messages.length <= MAX_MESSAGES_TO_SEND) return messages;
+
+  const first = messages[0];
+  const hasSystem = first && first.role === "system";
+
+  const body = hasSystem ? messages.slice(1) : messages.slice();
+
+  const trimmedBody = body.slice(Math.max(0, body.length - MAX_MESSAGES_TO_SEND));
+
+  return hasSystem ? ([first, ...trimmedBody] as T[]) : (trimmedBody as T[]);
+}
+
+const HEADSHOT_DIR = "/companion/headshot";
+
+// Resolve companion key/name for backend requests and TTS voice selection.
+// This must be browser-safe and never rely on DOM parsing.
+function resolveCompanionForBackend(opts: { companionKey?: string; companionName?: string }): string {
+  const ck = (opts.companionKey || '').trim();
+  if (ck) return ck;
+  const cn = (opts.companionName || '').trim();
+  if (cn) return cn;
+  return DEFAULT_COMPANION_NAME;
+}
+
+const GREET_ONCE_KEY = "ELARALO_GREETED";
+const DEFAULT_AVATAR = elaraLogo.src;
+const DEFAULT_COMPANY_NAME = "Elaralo";
+// Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
+const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
+
+// Back-compat: older embeds/tests may still pass ?rebranding=BrandName
+const LEGACY_REBRANDING_QUERY_PARAM = "rebranding";
+
+// Public asset root for white-label rebrands
+const REBRANDING_PUBLIC_DIR = "/rebranding";
+
+type RebrandingKeyParts = {
+  rebranding: string;
+  upgradeLink: string;
+  payGoLink: string;
+  payGoPrice: string;
+  payGoMinutes: string;
+  plan: string;
+  elaraloPlanMap: string;
+  freeMinutes: string;
+  cycleDays: string;
+};
+
+function stripRebrandingKeyLabel(part: string): string {
+  const s = String(part || "").trim();
+  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon")
+  const m = s.match(/^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$/);
+  return m ? String(m[1] || "").trim() : s;
+}
+
+function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
+  const v = String(raw || "").trim();
+  if (!v) return null;
+
+  // Legacy support: if there is no "|" delimiter, treat this as just the brand name.
+  if (!v.includes("|")) {
+    const brand = stripRebrandingKeyLabel(v);
+    return {
+      rebranding: brand,
+      upgradeLink: "",
+      payGoLink: "",
+      payGoPrice: "",
+      payGoMinutes: "",
+      plan: "",
+      elaraloPlanMap: "",
+      freeMinutes: "",
+      cycleDays: "",
+    };
+  }
+
+  const parts = v.split("|").map((p) => stripRebrandingKeyLabel(p));
+
+  const [
+    rebranding = "",
+    upgradeLink = "",
+    payGoLink = "",
+    payGoPrice = "",
+    payGoMinutes = "",
+    plan = "",
+    elaraloPlanMap = "",
+    freeMinutes = "",
+    cycleDays = "",
+  ] = parts;
+
+  return {
+    rebranding: String(rebranding || "").trim(),
+    upgradeLink: String(upgradeLink || "").trim(),
+    payGoLink: String(payGoLink || "").trim(),
+    payGoPrice: String(payGoPrice || "").trim(),
+    payGoMinutes: String(payGoMinutes || "").trim(),
+    plan: String(plan || "").trim(),
+    elaraloPlanMap: String(elaraloPlanMap || "").trim(),
+    freeMinutes: String(freeMinutes || "").trim(),
+    cycleDays: String(cycleDays || "").trim(),
+  };
+}
+
+function normalizeRebrandingSlug(rawBrand: string): string {
+  const raw = String(rawBrand || "").trim();
+  if (!raw) return "";
+
+  // Match the prior logo normalization rules so:
+  // - "Dulce Moon" and "DulceMoon" both -> "dulcemoon"
+  // - also works if someone includes an extension or "-logo" suffix
+  const normalizedBase = raw
+    .replace(/\.(png|jpg|jpeg|webp)$/i, "")
+    .replace(/-logo$/i, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+
+  return normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
 
 
-@app.get("/health")
-@app.get("/healthz")
-def health():
-    """
-    Liveness probe.
+function getAppBasePathFromAsset(assetPath: string): string {
+  const p = String(assetPath || "");
+  const idx = p.indexOf("/_next/");
+  // If Next.js is configured with a basePath, imported assets will include it (e.g., "/foo/_next/...").
+  // We want to prefix rebrand logos with the same basePath so they resolve correctly in all deployments.
+  if (idx > 0) return p.slice(0, idx);
+  return "";
+}
 
-    Keep this fast and dependency-free (no downstream calls) so platform health checks
-    remain reliable during partial outages.
-    """
-    return {"ok": True}
+function joinUrlPrefix(prefix: string, path: string): string {
+  const pre = String(prefix || "").trim();
+  const p = String(path || "");
+  if (!pre) return p;
+  if (pre.endsWith("/") && p.startsWith("/")) return pre.slice(0, -1) + p;
+  if (!pre.endsWith("/") && !p.startsWith("/")) return pre + "/" + p;
+  return pre + p;
+}
 
-@app.post("/usage/credit")
-async def usage_credit(request: Request):
-    """Credit purchased minutes to a member.
+const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
-    Intended for payment provider webhooks or admin tooling.
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
-    Security:
-      - Requires header "X-Admin-Token" matching env var USAGE_ADMIN_TOKEN.
+type Phase1AvatarMedia = {
+  didAgentId: string;
+  didClientKey: string;
+  elevenVoiceId: string;
+};
 
-    Body (JSON):
-      {
-        "member_id": "abc123",
-        "minutes": 60
+const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
+  "Jennifer": {
+    "didAgentId": "v2_agt_n7itFF6f",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "19STyYD15bswVz51nqLf"
+  },
+  "Jason": {
+    "didAgentId": "v2_agt_WpC1hOBQ",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "j0jBf06B5YHDbCWVmlmr"
+  },
+  "Tonya": {
+    "didAgentId": "v2_agt_2lL6f5YY",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "Hybl6rg76ZOcgqZqN5WN"
+  }
+} as any;
+
+const ELEVEN_VOICE_ID_BY_AVATAR: Record<string, string> = {
+  "Jennifer": "19STyYD15bswVz51nqLf",
+  "Jason": "j0jBf06B5YHDbCWVmlmr",
+  "Tonya": "Hybl6rg76ZOcgqZqN5WN",
+  "Darnell": "gYr8yTP0q4RkX1HnzQfX",
+  "Michelle": "ui11Rd52NKH2DbWlcbvw",
+  "Daniel": "tcO8jJ1XXzdQ4pzViV9c",
+  "Veronica": "GDzHdQOi6jjf8zaXhCYD",
+  "Ricardo": "l1zE9xgNpUTaQCZzpNJa",
+  "Linda": "flHkNRp1BlvT73UL6gyz",
+  "Robert": "uA0L9FxeLpzlG615Ueay",
+  "Patricia": "zwbQ2XUiIlOKD6b3JWXd",
+  "Clarence": "CXAc4DNZL6wonQQNlNgZ",
+  "Mei": "bQQWtYx9EodAqMdkrNAc",
+  "Minh": "cALE2CwoMM2QxiEdDEhv",
+  "Maria": "WLjZnm4PkNmYtNCyiCq8",
+  "Jose": "IP2syKL31S2JthzSSfZH",
+  "Ashley": "GbDIo39THauInuigCmPM",
+  "Ryan": "qIT7IrVUa21IEiKE1lug",
+  "Latoya": "BZgkqPqms7Kj9ulSkVzn",
+  "Jamal": "3w1kUvxu1LioQcLgp1KY",
+  "Tiffany": "XeomjLZoU5rr4yNIg16w",
+  "Kevin": "69Na567Zr0bPvmBYuGdc",
+  "Adriana": "FGLJyeekUzxl8M3CTG9M",
+  "Miguel": "dlGxemPxFMTY7iXagmOj",
+  "Elara": "rJ9XoWu8gbUhVKZnKY8X",
+};
+
+function getElevenVoiceIdForAvatar(avatarName: string | null | undefined): string {
+  const raw = (avatarName || "").trim();
+  if (raw && ELEVEN_VOICE_ID_BY_AVATAR[raw]) return ELEVEN_VOICE_ID_BY_AVATAR[raw];
+
+  // Many companions arrive from Wix as a descriptive key like:
+  //   "Ashley-Female-Caucasian-Millennials"
+  // while our ElevenLabs map is keyed by the first name ("Ashley").
+  // Normalize to reduce accidental fallback to Elara for the greeting.
+  const firstToken = raw.split("-")[0]?.trim() || "";
+  if (firstToken && ELEVEN_VOICE_ID_BY_AVATAR[firstToken]) return ELEVEN_VOICE_ID_BY_AVATAR[firstToken];
+
+  // Case-insensitive match as a final attempt.
+  const ciKey = Object.keys(ELEVEN_VOICE_ID_BY_AVATAR).find(
+    (k) => k.toLowerCase() === raw.toLowerCase() || (firstToken && k.toLowerCase() === firstToken.toLowerCase())
+  );
+  if (ciKey) return ELEVEN_VOICE_ID_BY_AVATAR[ciKey];
+
+  // Fallback to Elara so audio-only TTS always has a voice.
+  return ELEVEN_VOICE_ID_BY_AVATAR["Elara"] || "";
+}
+function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
+  if (!avatarName) return null;
+
+  const direct = PHASE1_AVATAR_MEDIA[avatarName];
+  if (direct) return direct;
+
+  const key = Object.keys(PHASE1_AVATAR_MEDIA).find(
+    (k) => k.toLowerCase() === avatarName.toLowerCase()
+  );
+  return key ? PHASE1_AVATAR_MEDIA[key] : null;
+}
+
+function isDidSessionError(err: any): boolean {
+  const kind = typeof err?.kind === "string" ? err.kind : "";
+  const description = typeof err?.description === "string" ? err.description : "";
+  const message = typeof err?.message === "string" ? err.message : "";
+
+  // The SDK sometimes uses { kind, description } and sometimes uses message strings.
+  return (
+    kind === "SessionError" ||
+    description.toLowerCase().includes("session_id") ||
+    message.toLowerCase().includes("session_id")
+  );
+}
+
+function formatDidError(err: any): string {
+  if (!err) return "Unknown error";
+  if (typeof err === "string") return err;
+  if (typeof err?.message === "string") return err.message;
+
+  const kind = typeof err?.kind === "string" ? err.kind : undefined;
+  const description = typeof err?.description === "string" ? err.description : undefined;
+
+  if (kind || description) {
+    return JSON.stringify({ kind, description });
+  }
+
+  try {
+    return JSON.stringify(err);
+  } catch (e) {
+        return String(err);
+  }
+}
+
+const UPGRADE_URL = process.env.NEXT_PUBLIC_UPGRADE_URL || "https://www.elaralo.com/pricing-plans/list";
+const STREAM_URL = process.env.NEXT_PUBLIC_STREAM_URL || "";
+
+const MODE_LABELS: Record<Mode, string> = {
+  friend: "Friend",
+  romantic: "Romantic",
+  intimate: "Intimate (18+)",
+};
+
+// Plan → mode availability mapping (UI pills)
+// Requirements:
+// - Friend or Test - Friend Plan: Friend only
+// - Romantic or Test - Romantic Plan: Friend + Romantic
+// - Intimate (18+) or Test - Intimate (18+) Plan: Friend + Romantic + Intimate (18+)
+const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
+  "Trial",
+  "Romantic",
+  "Intimate (18+)",
+  "Pay as You Go",
+  "Test - Romantic",
+  "Test - Intimate (18+)",
+  "Test - Pay as You Go",
+];
+
+
+function allowedModesForPlan(planName: PlanName): Mode[] {
+  const modes: Mode[] = ["friend"];
+  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
+  if (
+    planName === "Intimate (18+)" ||
+    planName === "Test - Intimate (18+)" ||
+    planName === "Pay as You Go" ||
+    planName === "Test - Pay as You Go"
+  )
+    modes.push("intimate");
+  return modes;
+}
+
+function stripExt(s: string) {
+  return (s || "").replace(/\.(png|jpg|jpeg|webp)$/i, "");
+}
+
+function normalizeKeyForFile(raw: string) {
+  return (raw || "").trim().replace(/\s+/g, "-");
+}
+
+// Some Wix implementations append a member UUID to the companion key for uniqueness.
+// Example: "dulce-female-black-millennials-ebf0bfb2-11b4-4638-ad3c-4909c6f810e6"
+// For static asset lookup (headshots), we should strip that UUID suffix.
+function stripTrailingUuid(raw: string): string {
+  const s = String(raw || "").trim();
+  return s.replace(
+    /-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    "",
+  );
+}
+
+function titleCaseToken(token: string): string {
+  const lower = String(token || "").toLowerCase();
+  // Common generation tokens found in your asset naming convention.
+  if (lower === "genz") return "GenZ";
+  if (lower === "genx") return "GenX";
+  if (lower === "geny") return "GenY";
+  if (lower === "genalpha") return "GenAlpha";
+  if (!lower) return "";
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+function toTitleCaseHyphenated(s: string): string {
+  return String(s || "")
+    .split("-")
+    .map((t) => titleCaseToken(t))
+    .join("-");
+}
+
+function uniqueStrings(items: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const v of items) {
+    const s = String(v || "").trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function parseCompanionMeta(raw: string): CompanionMeta {
+  const cleaned = stripExt(raw || "");
+  const parts = cleaned
+    .split("-")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (parts.length < 4) {
+    return {
+      first: cleaned || DEFAULT_COMPANION_NAME,
+      gender: "",
+      ethnicity: "",
+      generation: "",
+      key: cleaned || DEFAULT_COMPANION_NAME,
+    };
+  }
+
+  const [first, gender, ethnicity, ...rest] = parts;
+  const generation = rest.join("-");
+
+  return {
+    first: first || DEFAULT_COMPANION_NAME,
+    gender: gender || "",
+    ethnicity: ethnicity || "",
+    generation: generation || "",
+    key: cleaned,
+  };
+}
+
+function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: string) {
+  const raw = stripExt(String(companionKeyOrName || "").trim());
+  if (!raw) return [DEFAULT_AVATAR];
+
+  // Build multiple name variants so headshot lookup remains robust even when:
+  // - companion keys are lower-cased by Wix
+  // - a member UUID suffix is appended
+  const baseInputs = Array.from(
+    new Set([raw, stripTrailingUuid(raw)].map((v) => String(v || "").trim()).filter(Boolean))
+  );
+
+  const encVariants: string[] = [];
+  const seenEnc = new Set<string>();
+
+  for (const baseInput of baseInputs) {
+    const normalized = normalizeKeyForFile(baseInput);
+    const lower = normalized.toLowerCase();
+    const title = toTitleCaseHyphenated(lower);
+
+    for (const v of [normalized, title, lower]) {
+      const trimmed = String(v || "").trim();
+      if (!trimmed) continue;
+      const enc = encodeURIComponent(trimmed);
+      if (!seenEnc.has(enc)) {
+        seenEnc.add(enc);
+        encVariants.push(enc);
       }
-    """
-    try:
-        raw = await request.json()
-    except Exception:
-        raw = {}
+    }
+  }
 
-    token = (request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token") or "").strip()
-    if not USAGE_ADMIN_TOKEN or token != USAGE_ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
+  const slug = String(rebrandingSlug || "").trim();
+  const slugEnc = slug ? encodeURIComponent(slug) : "";
 
-    member_id = str(raw.get("member_id") or raw.get("memberId") or "").strip()
-    minutes = raw.get("minutes") or raw.get("add_minutes") or raw.get("purchased_minutes") or 0
+  const candidates: string[] = [];
+  // Some repos store images with uppercase extensions on Windows (e.g. ".JPG"),
+  // and the exported static output can be case-sensitive.
+  const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
+  for (const enc of encVariants) {
+    // Rebrand-specific headshots (preferred when RebrandingKey is present):
+    //   /rebranding/<brand>/companion/headshot/<CompanionName>[.<ext>]
+    if (slugEnc) {
+      const rebrandBase = joinUrlPrefix(
+        APP_BASE_PATH,
+        `${REBRANDING_PUBLIC_DIR}/${slugEnc}${HEADSHOT_DIR}/${enc}`
+      );
 
-    try:
-        minutes_i = int(minutes)
-    except Exception:
-        minutes_i = 0
+      // Allow extension-less filenames too (Windows may hide extensions, or assets may be committed without one).
+      candidates.push(rebrandBase);
 
-    if not member_id or minutes_i <= 0:
-        raise HTTPException(status_code=400, detail="member_id and minutes (> 0) are required")
-
-    identity_key = f"member::{member_id}"
-    result = await run_in_threadpool(_usage_credit_minutes_sync, identity_key, minutes_i)
-    return result
-
-
-@app.get("/ready")
-def ready():
-    """
-    Readiness probe.
-
-    If you want a stricter readiness check (e.g., verify required env vars),
-    add lightweight checks here. For now it mirrors liveness.
-    """
-    return {"ok": True}
-# ----------------------------
-# Helpers
-# ----------------------------
-def _dbg(enabled: bool, *args: Any) -> None:
-    if enabled:
-        print(*args)
-
-
-def _now_ts() -> int:
-    return int(time.time())
-
-
-# ----------------------------
-# Usage / Minutes limits (Trial + plan quotas)
-# ----------------------------
-# This feature enforces time budgets for:
-# - Visitors without a memberId (Free Trial) using client IP address as identity
-# - Members with a memberId (subscription plan minutes + optional purchased minutes)
-#
-# Storage strategy:
-# - A single JSON file on the App Service Linux shared filesystem (/home) so that it survives restarts.
-# - A file lock to coordinate writes across gunicorn workers.
-#
-# NOTE: This is intentionally simple and fail-open (it will not crash the API).
-#       If the usage file is unavailable, the system will allow access rather than block.
-_USAGE_STORE_PATH = (os.getenv("USAGE_STORE_PATH", "/home/elaralo_usage.json") or "").strip() or "/home/elaralo_usage.json"
-_USAGE_LOCK_PATH = _USAGE_STORE_PATH + ".lock"
-_USAGE_LOCK = FileLock(_USAGE_LOCK_PATH)
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.getenv(name, "")
-        if v is None or str(v).strip() == "":
-            return int(default)
-        return int(str(v).strip())
-    except Exception:
-        return int(default)
-
-# Minutes for visitors without a memberId
-TRIAL_MINUTES = _env_int("TRIAL_MINUTES", 15)
-
-# Included minutes per subscription plan (set these in App Service Configuration)
-INCLUDED_MINUTES_FRIEND = _env_int("INCLUDED_MINUTES_FRIEND", 0)
-INCLUDED_MINUTES_ROMANTIC = _env_int("INCLUDED_MINUTES_ROMANTIC", 0)
-INCLUDED_MINUTES_INTIMATE = _env_int("INCLUDED_MINUTES_INTIMATE", 0)
-INCLUDED_MINUTES_PAYG = _env_int("INCLUDED_MINUTES_PAYG", 0)
-
-# Billing/usage tuning (optional)
-USAGE_CYCLE_DAYS = _env_int("USAGE_CYCLE_DAYS", 30)  # member usage resets every N days (subscription cycle)
-USAGE_IDLE_GRACE_SECONDS = _env_int("USAGE_IDLE_GRACE_SECONDS", 600)  # gaps bigger than this are not charged
-USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST", 120)  # cap per chat call
-
-# Pay links (shown to the user when minutes are exhausted)
-UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
-PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
-PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 60)
-
-# Base Pay-As-You-Go price (e.g., "$4.99"). If PAYG_PRICE_TEXT is not set, we derive it as:
-#   "<PAYG_PRICE> per <PAYG_INCREMENT_MINUTES> minutes"
-PAYG_PRICE = (os.getenv("PAYG_PRICE", "") or "").strip()
-PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
-if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
-    PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
-
-
-# Admin token for server-side minute credits (payment webhook can call this)
-USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
-
-def _extract_plan_name(session_state: Dict[str, Any]) -> str:
-    plan = (
-        session_state.get("planName")
-        or session_state.get("plan_name")
-        or session_state.get("plan")
-        or ""
-    )
-    return str(plan).strip() if plan is not None else ""
-
-
-def _extract_rebranding_key(session_state: Dict[str, Any]) -> str:
-    """Extract the Wix-provided RebrandingKey (preferred) or legacy rebranding string."""
-    rk = (
-        session_state.get("rebrandingKey")
-        or session_state.get("rebranding_key")
-        or session_state.get("RebrandingKey")
-        or session_state.get("rebranding")  # legacy: brand name only
-        or ""
-    )
-    return str(rk).strip() if rk is not None else ""
-
-def _strip_rebranding_key_label(part: str) -> str:
-    """Accept either raw values or labeled values like 'PayGoMinutes: 60'."""
-    s = (part or "").strip()
-    m = re.match(r"^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$", s)
-    return m.group(1).strip() if m else s
-
-def _parse_rebranding_key(raw: str) -> Dict[str, str]:
-    """Parse a '|' separated RebrandingKey.
-
-    Expected order:
-      Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
-    """
-    v = (raw or "").strip()
-    if not v:
-        return {}
-
-    # Legacy support: no delimiter -> only brand name
-    if "|" not in v:
-        return {
-            "rebranding": _strip_rebranding_key_label(v),
-            "upgrade_link": "",
-            "pay_go_link": "",
-            "pay_go_price": "",
-            "pay_go_minutes": "",
-            "plan": "",
-            "elaralo_plan_map": "",
-            "free_minutes": "",
-            "cycle_days": "",
-        }
-
-    parts = [_strip_rebranding_key_label(p) for p in v.split("|")]
-    parts += [""] * (9 - len(parts))
-
-    (
-        rebranding,
-        upgrade_link,
-        pay_go_link,
-        pay_go_price,
-        pay_go_minutes,
-        plan,
-        elaralo_plan_map,
-        free_minutes,
-        cycle_days,
-    ) = parts[:9]
-
-    return {
-        "rebranding": str(rebranding or "").strip(),
-        "upgrade_link": str(upgrade_link or "").strip(),
-        "pay_go_link": str(pay_go_link or "").strip(),
-        "pay_go_price": str(pay_go_price or "").strip(),
-        "pay_go_minutes": str(pay_go_minutes or "").strip(),
-        "plan": str(plan or "").strip(),
-        "elaralo_plan_map": str(elaralo_plan_map or "").strip(),
-        "free_minutes": str(free_minutes or "").strip(),
-        "cycle_days": str(cycle_days or "").strip(),
+      for (const ext of exts) candidates.push(`${rebrandBase}.${ext}`);
     }
 
+    // Default (non-rebranded) headshots:
+    //   /companion/headshot/<CompanionName>[.<ext>]
+    const base = joinUrlPrefix(APP_BASE_PATH, `${HEADSHOT_DIR}/${enc}`);
 
-# ---------------------------------------------------------------------------
-# RebrandingKey validation
-# ---------------------------------------------------------------------------
-# IMPORTANT: RebrandingKey format/field validation is performed upstream in Wix (Velo).
-# The API intentionally accepts the RebrandingKey as-is to avoid breaking Wix flows.
-#
-# If you remove Wix-side validation in the future, you can enable the server-side
-# validator below by uncommenting it AND the call site in /chat.
-#
-# def _validate_rebranding_key_server_side(raw: str) -> Tuple[bool, str]:
-#     """Server-side validator for RebrandingKey.
-#
-#     Expected order:
-#       Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
-#     """
-#     v = (raw or "").strip()
-#     if not v:
-#         return True, ""
-#
-#     # Guardrail: prevent extremely large payloads
-#     if len(v) > 2048:
-#         return False, "too long"
-#
-#     # Legacy support: no delimiter => brand name only
-#     if "|" not in v:
-#         return True, ""
-#
-#     parts = v.split("|")
-#     if len(parts) != 9:
-#         return False, f"expected 9 parts, got {len(parts)}"
-#
-#     rebranding = parts[0].strip()
-#     if not rebranding:
-#         return False, "missing Rebranding"
-#
-#     # Validate URLs (when present)
-#     def _is_http_url(s: str) -> bool:
-#         s = (s or "").strip()
-#         if not s:
-#             return True
-#         return bool(re.match(r"^https?://", s, re.IGNORECASE))
-#
-#     if not _is_http_url(parts[1]):
-#         return False, "UpgradeLink must be http(s) URL"
-#     if not _is_http_url(parts[2]):
-#         return False, "PayGoLink must be http(s) URL"
-#
-#     # Validate integers (when present)
-#     for name, val in [
-#         ("PayGoMinutes", parts[4]),
-#         ("FreeMinutes", parts[7]),
-#         ("CycleDays", parts[8]),
-#     ]:
-#         s = (val or "").strip()
-#         if not s:
-#             continue
-#         if not re.fullmatch(r"-?\d+", s):
-#             return False, f"{name} must be an integer"
-#
-#     # Basic price sanity (allow "$5.99", "5.99", "USD 5.99")
-#     price = (parts[3] or "").strip()
-#     if price and len(price) > 32:
-#         return False, "PayGoPrice too long"
-#
-#     # Basic length checks (defense-in-depth)
-#     for i, p in enumerate(parts):
-#         if len((p or "").strip()) > 512:
-#             return False, f"part {i} too long"
-#
-#     return True, ""
+    // Allow extension-less filenames too.
+    candidates.push(base);
 
+    for (const ext of exts) candidates.push(`${base}.${ext}`);
+  }
 
+  candidates.push(DEFAULT_AVATAR);
+  return candidates;
+}
 
+async function pickFirstExisting(urls: string[]) {
+  for (const url of urls) {
+    if (url === DEFAULT_AVATAR) return url;
+    try {
+      const res = await fetch(url, { method: "HEAD", cache: "no-store" });
+      if (res.ok) return url;
+    } catch (e) {
+        // ignore
+    }
+  }
+  return DEFAULT_AVATAR;
+}
 
-# ---------------------------------------------------------------------------
-# Voice/Video companion capability mappings (SQLite -> in-memory)
-# ---------------------------------------------------------------------------
-# This database is generated from the Excel mapping sheet ("Voice and Video Mappings - Elaralo.xlsx")
-# and shipped alongside the API so the frontend can query companion capabilities at runtime:
-#   - which companions are Audio-only vs Video+Audio
-#   - which Live provider to use (D-ID vs Stream)
-#   - ElevenLabs voice IDs (TTS voice selection)
-#   - D-ID Agent IDs / Client Keys (for the D-ID browser SDK)
-#
-# Design choice:
-#   - We load the full table into memory at startup (fast lookups, no per-request DB IO).
-#   - The DB is treated as read-only config; updates are made by regenerating the SQLite file
-#     and redeploying (or by mounting a new file and restarting).
-#
-# Default lookup key is (brand, avatar), case-insensitive.
+// Like pickFirstExisting (HEAD probe), but validates by actually loading the image in the browser.
+// This avoids false positives on platforms that rewrite missing assets to index.html (HTTP 200).
+function pickFirstLoadableImage(urls: string[]): Promise<string> {
+  return new Promise((resolve) => {
+    let i = 0;
 
-import sqlite3
-from urllib.parse import urlparse, parse_qs
+    const tryNext = () => {
+      if (i >= urls.length) return resolve(DEFAULT_AVATAR);
 
-_COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
-_COMPANION_MAPPINGS_LOADED_AT: float | None = None
-_COMPANION_MAPPINGS_SOURCE: str = ""
+      const url = String(urls[i++] || "").trim();
+      if (!url) return tryNext();
+      if (url === DEFAULT_AVATAR) return resolve(DEFAULT_AVATAR);
 
+      const img = new Image();
 
-def _norm_key(s: str) -> str:
-    return (s or "").strip().lower()
+      img.onload = () => {
+        // Some hosting stacks rewrite missing assets to HTML (200) which can still trigger load.
+        // Ensure the browser actually decoded an image.
+        if ((img.naturalWidth || 0) > 0 && (img.naturalHeight || 0) > 0) return resolve(url);
+        return tryNext();
+      };
+      img.onerror = () => tryNext();
 
+      // Cache-busting probe so newly-added logos are discovered immediately after deployment.
+      const bust = `__probe=${Date.now()}_${Math.random().toString(16).slice(2)}`;
+      const probeUrl = url.includes("?") ? `${url}&${bust}` : `${url}?${bust}`;
+      img.src = probeUrl;
+    };
 
-def _candidate_mapping_db_paths() -> List[str]:
-    base_dir = os.path.dirname(__file__)
-    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-    candidates = [
-        env_path,
-        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
-        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
-    ]
-    # keep unique, preserve order
-    out: List[str] = []
-    seen: set[str] = set()
-    for p in candidates:
-        p = (p or "").strip()
-        if not p:
-            continue
-        if p not in seen:
-            out.append(p)
-            seen.add(p)
-    return out
+    tryNext();
+  });
+}
 
+function greetingFor(name: string) {
+  const n = (name || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+  return `Hi, ${n} here. 😊 What's on your mind?`;
+}
 
-def _load_companion_mappings_sync() -> None:
-    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE
+function isAllowedOrigin(origin: string) {
+  try {
+    const u = new URL(origin);
+    const hostRaw = u.hostname.toLowerCase();
+    const host = hostRaw.startsWith("www.") ? hostRaw.slice(4) : hostRaw;
 
-    db_path = ""
-    for p in _candidate_mapping_db_paths():
-        if os.path.exists(p):
-            db_path = p
-            break
+    // First-party + Wix domains (Editor/Studio/Preview).
+    if (host.endsWith("elaralo.com")) return true;
+    if (host.endsWith("wix.com")) return true;
+    if (host.endsWith("wixsite.com")) return true;
 
-    if not db_path:
-        print("[mappings] WARNING: voice/video mappings DB not found. Video/audio capabilities will fall back to frontend defaults.")
-        _COMPANION_MAPPINGS = {}
-        _COMPANION_MAPPINGS_LOADED_AT = time.time()
-        _COMPANION_MAPPINGS_SOURCE = ""
-        return
+    // White-label custom domains:
+    // In an iframe, Wix will postMessage from the parent page origin (e.g. https://www.dulcemoon.net).
+    // Allow the *embedding page* origin by matching document.referrer (and tolerating www vs non-www).
+    try {
+      const ref = typeof document !== "undefined" ? document.referrer : "";
+      if (ref) {
+        const refHostRaw = new URL(ref).hostname.toLowerCase();
+        const refHost = refHostRaw.startsWith("www.") ? refHostRaw.slice(4) : refHostRaw;
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM companion_mappings")
-        rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    d: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for r in rows:
-        # sqlite3.Row keys preserve the column names from the DB. Different environments may
-        # have different capitalization (e.g., Live vs live) or legacy names (e.g., Companion).
-        keys_lc = {str(k).lower(): k for k in r.keys()}
-
-        def get_col(*candidates: str, default: Any = "") -> Any:
-            for cand in candidates:
-                k = keys_lc.get(str(cand).lower())
-                if k is not None:
-                    return r[k]
-            return default
-
-        brand = str(get_col("brand", "rebranding", "company", "brand_id", "Brand", default="") or "").strip()
-        avatar = str(get_col("avatar", "companion", "Companion", "first_name", "firstname", default="") or "").strip()
-        if not brand or not avatar:
-            continue
-
-        key = (_norm_key(brand), _norm_key(avatar))
-
-        d[key] = {
-            "brand": brand,
-            "avatar": avatar,
-            "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
-            "communication": str(get_col("communication", "Communication", default="") or ""),
-            "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
-            "live": str(get_col("live", "Live", default="") or ""),
-            "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
-            "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
-            "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
-            "did_embed_code": str(get_col("did_embed_code", "DID_EMBED_CODE", default="") or ""),
-            "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
-            "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
-            "did_client_key": str(get_col("did_client_key", "DID_CLIENT_KEY", default="") or ""),
-            # Preserve common extra fields when present (helps debugging / future UIs).
-            "companion_id": str(get_col("companion_id", "Companion_ID", "CompanionId", default="") or ""),
-        }
-
-    _COMPANION_MAPPINGS = d
-    _COMPANION_MAPPINGS_LOADED_AT = time.time()
-    _COMPANION_MAPPINGS_SOURCE = db_path
-    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path}")
-
-
-def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
-    b = _norm_key(brand) or "elaralo"
-    a = _norm_key(avatar)
-    if not a:
-        return None
-
-    m = _COMPANION_MAPPINGS.get((b, a))
-    if m:
-        return m
-
-    # fallback brand → Elaralo
-    if b != "elaralo":
-        m = _COMPANION_MAPPINGS.get(("elaralo", a))
-        if m:
-            return m
-
-    # final fallback: if someone sends a composite key like "Ashley-Female-...".
-    first = a.split("-")[0].strip() if "-" in a else a
-    if first and first != a:
-        m = _COMPANION_MAPPINGS.get((b, first))
-        if m:
-            return m
-        if b != "elaralo":
-            m = _COMPANION_MAPPINGS.get(("elaralo", first))
-            if m:
-                return m
-
-    return None
-
-
-@app.on_event("startup")
-async def _startup_load_companion_mappings() -> None:
-    # Load once at startup; do not block on errors.
-    try:
-        await run_in_threadpool(_load_companion_mappings_sync)
-    except Exception as e:
-        print(f"[mappings] ERROR loading companion mappings: {e!r}")
-
-
-@app.get("/mappings/companion")
-async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
-    """Lookup a companion mapping row by (brand, avatar).
-
-    Query params:
-      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
-      - avatar: Avatar first name (e.g., "Jennifer")
-
-    Response:
-      {
-        found: bool,
-        brand: str,
-        avatar: str,
-        communication: "Audio"|"Video"|"" ,
-        live: "D-ID"|"Stream"|"" ,
-        elevenVoiceId: str,
-        elevenVoiceName: str,
-        didAgentId: str,
-        didClientKey: str,
-        didAgentLink: str,
-        didEmbedCode: str,
-        loadedAt: <unix seconds> | null,
-        source: <db path> | ""
+        if (host === refHost) return true;
+        if (host.endsWith("." + refHost)) return true; // subdomain match
+        if (refHost.endsWith("." + host)) return true; // inverse (defensive)
       }
-    """
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
-
-    m = _lookup_companion_mapping(b, a)
-    if not m:
-        return {
-            "found": False,
-            "brand": b,
-            "avatar": a,
-            "communication": "",
-            "live": "",
-            "elevenVoiceId": "",
-            "elevenVoiceName": "",
-            "didAgentId": "",
-            "didClientKey": "",
-            "didAgentLink": "",
-            "didEmbedCode": "",
-            "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-            "source": _COMPANION_MAPPINGS_SOURCE,
-        }
-
-    return {
-        "found": True,
-        "brand": str(m.get("brand") or ""),
-        "avatar": str(m.get("avatar") or ""),
-        "communication": str(m.get("communication") or ""),
-        "live": str(m.get("live") or ""),
-        "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
-        "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
-        "didAgentId": str(m.get("did_agent_id") or ""),
-        "didClientKey": str(m.get("did_client_key") or ""),
-        "didAgentLink": str(m.get("did_agent_link") or ""),
-        "didEmbedCode": str(m.get("did_embed_code") or ""),
-        "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-        "source": _COMPANION_MAPPINGS_SOURCE,
+    } catch (e) {
+        // ignore referrer parse issues
     }
 
+    // Chrome-only fallback (helps in some embedded contexts)
+    try {
+      const ancestorOrigins = (typeof window !== "undefined" ? (window.location as any).ancestorOrigins : null) as
+        | { length: number; [idx: number]: string }
+        | null;
+      if (ancestorOrigins && typeof ancestorOrigins.length === "number") {
+        for (let i = 0; i < ancestorOrigins.length; i++) {
+          try {
+            const aHostRaw = new URL(ancestorOrigins[i]).hostname.toLowerCase();
+            const aHost = aHostRaw.startsWith("www.") ? aHostRaw.slice(4) : aHostRaw;
+            if (host === aHost) return true;
+            if (host.endsWith("." + aHost)) return true;
+            if (aHost.endsWith("." + host)) return true;
+          } catch (e) {
+        // ignore per-origin parse issues
+          }
+        }
+      }
+    } catch (e) {
+        // ignore ancestorOrigins issues
+    }
 
-# ---------------------------------------------------------------------------
-# BeeStreamed: Start WebRTC streams (Live=Stream companions)
-# ---------------------------------------------------------------------------
-# IMPORTANT:
-# - BeeStreamed tokens MUST NOT be exposed to the browser. The frontend calls this endpoint,
-#   and the API performs BeeStreamed authentication server-side.
-# - Authentication format per BeeStreamed docs:
-#     Authorization: Basic base64_encode({token_id}:{secret_key})
-# - Start WebRTC stream endpoint:
-#     POST https://api.beestreamed.com/events/[EVENT REF]/startwebrtcstream
-#
-# Docs: https://docs.beestreamed.com/introduction (API Overview / Authentication)
+    return false;
+  } catch (e) {
+        return false;
+  }
+}
+
+/**
+ * Detects a mode switch request in *user text* and returns:
+ * - mode: desired mode
+ * - cleaned: text with explicit [mode:*] removed (so it won't pollute the chat)
+ *
+ * Supports:
+ * - [mode:romantic], mode:romantic
+ * - "switch to romantic", "romantic mode", "set mode to romantic", etc.
+ */
+function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: string } {
+  const raw = text || "";
+  const t = raw.toLowerCase();
+
+  // explicit tokens
+  // NOTE: allow "romance" token from older builds as a synonym for "romantic"
+  const tokenRe =
+    /\[mode:(friend|romantic|romance|intimate|explicit)\]|mode:(friend|romantic|romance|intimate|explicit)/gi;
+
+  let tokenMode: Mode | null = null;
+  let cleaned = raw.replace(tokenRe, (m) => {
+    const mm = m.toLowerCase();
+    if (mm.includes("friend")) tokenMode = "friend";
+    else if (mm.includes("romantic") || mm.includes("romance")) tokenMode = "romantic";
+    else if (mm.includes("intimate") || mm.includes("explicit")) tokenMode = "intimate";
+    return "";
+  });
+
+  cleaned = cleaned.trim();
+
+  if (tokenMode) return { mode: tokenMode, cleaned };
+
+  // soft phrasing (covers friend->romantic and intimate->romantic)
+  const soft = t.trim();
+
+  const wantsFriend =
+    /\b(switch|set|turn|go|back)\b.*\bfriend\b/.test(soft) || /\bfriend mode\b/.test(soft);
+
+  const wantsRomantic =
+    // "romantic mode" / "romance mode"
+    /\b(romantic|romance) mode\b/.test(soft) ||
+    // switch/set/back/go/turn ... romantic
+    /\b(switch|set|turn|go|back)\b.*\b(romantic|romance)\b/.test(soft) ||
+    // natural phrasing users actually type
+    /\b(let['’]?s|lets)\b.*\b(romantic|romance)\b/.test(soft) ||
+    /\b(be|being|try|trying|have|having)\b.*\b(romantic|romance)\b/.test(soft) ||
+    /\bromantic conversation\b/.test(soft) ||
+    /\bromance again\b/.test(soft) ||
+    /\btry romance again\b/.test(soft);
+
+  const wantsIntimate =
+    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
+    /\b(intimate|explicit) mode\b/.test(soft);
+
+  if (wantsFriend) return { mode: "friend", cleaned: raw };
+  if (wantsRomantic) return { mode: "romantic", cleaned: raw };
+  if (wantsIntimate) return { mode: "intimate", cleaned: raw };
+
+  return { mode: null, cleaned: raw.trim() };
+}
+
+function normalizeMode(raw: any): Mode | null {
+  const t = String(raw ?? "").trim().toLowerCase();
+  if (!t) return null;
+
+  if (t === "friend") return "friend";
+  if (t === "romantic" || t === "romance") return "romantic";
+  if (t === "intimate" || t === "explicit" || t === "adult" || t === "18+" || t === "18") return "intimate";
+
+  return null;
+}
 
 
-def _extract_beestreamed_event_ref_from_url(stream_url: str) -> str:
-    """Best-effort extraction of BeeStreamed event_ref from a viewer URL.
+export default function Page() {
+  // iOS detection (includes iPadOS 13+ which reports itself as "Macintosh")
+  const isIOS = useMemo(() => {
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent || "";
+    const iOS = /iPad|iPhone|iPod/i.test(ua);
+    const iPadOS13 = /Macintosh/i.test(ua) && typeof document !== "undefined" && "ontouchend" in document;
+    return iOS || iPadOS13;
+  }, []);
 
-    This is intentionally flexible because BeeStreamed viewer URLs can be customized.
-    We attempt, in order:
-      1) query string parameters: event_ref / eventRef
-      2) last path segment that looks like an alphanumeric ref (6-32 chars)
-    """
-    u = (stream_url or "").strip()
-    if not u:
-        return ""
+  const isIphone = useMemo(() => {
+    if (typeof navigator === "undefined") return false;
+    return /iPhone|iPod/i.test(navigator.userAgent || "");
+  }, []);
 
-    try:
-        parsed = urlparse(u)
-    except Exception:
-        return ""
-
-    try:
-        qs = parse_qs(parsed.query or "")
-        for k in ("event_ref", "eventRef", "event", "ref"):
-            v = qs.get(k)
-            if v and isinstance(v, list) and v[0]:
-                cand = str(v[0]).strip()
-                if re.fullmatch(r"[A-Za-z0-9]{6,32}", cand):
-                    return cand
-    except Exception:
-        pass
-
-    # Path fallback
-    try:
-        segments = [s for s in (parsed.path or "").split("/") if s]
-        for seg in reversed(segments):
-            seg = seg.strip()
-            if re.fullmatch(r"[A-Za-z0-9]{6,32}", seg):
-                return seg
-    except Exception:
-        pass
-
-    return ""
+  const isEmbedded = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.self !== window.top;
+    } catch (e) {
+        // Cross-origin access to window.top can throw; assume embedded.
+      return true;
+    }
+  }, []);
 
 
-@app.post("/stream/beestreamed/start")
-async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
-    """Start a BeeStreamed WebRTC stream for the configured event.
+  const sessionIdRef = useRef<string | null>(null);
 
-    Body (JSON):
-      {
-        "stream_url": "https://..."     (optional; used to derive event_ref)
-        "event_ref": "abcd12345678"    (optional; overrides URL parsing)
+  // -----------------------
+  // Debug overlay (mobile-friendly)
+  // Enable with ?debug=1 OR tap the avatar image 5 times quickly.
+  // -----------------------
+  const DEBUG_KEY = "ELARALO_DEBUG_OVERLAY";
+  const [debugEnabled, setDebugEnabled] = useState(false);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
+  const debugEnabledRef = useRef(false);
+  const debugTapCountRef = useRef(0);
+  const debugTapTimerRef = useRef<number | null>(null);
+
+  // Stop the current live session (video + STT/TTS). Used by Stop button and when switching companions.
+  // NOTE: Keep this as a function declaration (not const/useCallback) to avoid build-order/dependency issues.
+  async function stopLiveAvatar(): Promise<void> {
+    // Stop STT/TTS first (matches Stop button behavior).
+    try { stopHandsFreeSTT(); } catch (e) {}
+    try { stopSpeechToText(); } catch (e) {}
+
+    // BeeStreamed: stop the host stream server-side; viewers only disconnect locally.
+    if (liveProvider === "stream") {
+      if (streamCanStart) {
+        try {
+          await fetch(`${API_BASE}/stream/beestreamed/stop_embed`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              brand: companyName,
+              avatar: companionName,
+              memberId: memberId || "",
+              eventRef: streamEventRef || "",
+            }),
+          });
+        } catch (e) {
+          // Best-effort: still tear down local UI state even if stop fails.
+        }
       }
 
-    Env vars (server-side only):
-      STREAM_TOKEN_ID
-      STREAM_SECRET_KEY
-    """
-    try:
-        raw = await request.json()
-    except Exception:
-        raw = {}
-
-    stream_url = str(raw.get("stream_url") or raw.get("streamUrl") or "").strip()
-    event_ref = str(raw.get("event_ref") or raw.get("eventRef") or "").strip()
-
-    if not event_ref:
-        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
-
-    # Optional server-side fallback (useful when the viewer URL does not contain the event_ref).
-    if not event_ref:
-        event_ref = (os.getenv("STREAM_EVENT_REF", "") or "").strip()
-
-    if not event_ref:
-        raise HTTPException(
-            status_code=400,
-            detail="BeeStreamed event_ref is required (provide event_ref, STREAM_EVENT_REF, or a stream_url containing it).",
-        )
-
-    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
-    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
-
-    if not token_id or not secret_key:
-        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
-
-    # BeeStreamed auth header: Basic base64(token_id:secret_key)
-    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
-    headers = {"Authorization": f"Basic {basic}"}
-
-    api_url = f"https://api.beestreamed.com/events/{event_ref}/startwebrtcstream"
-
-    import requests  # type: ignore
-
-    try:
-        r = requests.post(api_url, headers=headers, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed request failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed error {r.status_code}: {msg[:500]}")
-
-    try:
-        data = r.json()
-    except Exception:
-        data = {"message": (r.text or "").strip(), "status": r.status_code}
-
-    return {"ok": True, "event_ref": event_ref, "beestreamed": data}
-
-# ---------------------------------------------------------------------------
-# BeeStreamed embed + host gating (white-label friendly)
-#
-# Goals:
-# - Each "Human / Stream" companion has a stable event_ref (preferably stored in the SQLite mapping DB).
-# - Only the Human Companion (host) can start/stop the WebRTC stream.
-# - Everyone else can open the embed and will see a "waiting for host" experience until the host starts.
-#
-# Notes:
-# - host_member_id can be stored per companion in the mapping DB as `host_member_id`.
-# - If `host_member_id` is missing for DulceMoon/Dulce, we fall back to a known host id (single human companion).
-# - If `event_ref` is missing, ONLY the host will create it (via BeeStreamed API) and we will best-effort persist it.
-# ---------------------------------------------------------------------------
-
-DULCE_HOST_MEMBER_ID_FALLBACK = "1dc3fe06-c351-4678-8fe4-6a4b1350c556"
-
-def _beestreamed_api_base() -> str:
-    return (os.getenv("BEESTREAMED_API_BASE", "") or "https://api.beestreamed.com").strip().rstrip("/")
-
-def _beestreamed_public_event_url(event_ref: str) -> str:
-    # BeeStreamed public event page (works as an embeddable viewer page in an iframe).
-    base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
-    return f"{base}?id={event_ref}"
-
-@app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
-async def beestreamed_embed_page(event_ref: str):
-    """Render a BeeStreamed event inside a sandboxed iframe.
-
-    Why this exists:
-      - The BeeStreamed viewer UI can include actions that open a pop-out / new window.
-      - By wrapping the viewer in a sandboxed iframe WITHOUT `allow-popups`, those actions
-        are prevented and the experience stays within the iframe container.
-    """
-    event_ref = (event_ref or "").strip()
-    if not event_ref:
-        raise HTTPException(status_code=400, detail="event_ref is required")
-
-    viewer_url = _beestreamed_public_event_url(event_ref)
-
-    html = f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Live Stream</title>
-    <style>
-      html, body {{
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        background: #000;
-        overflow: hidden;
-      }}
-      .frame {{
-        position: fixed;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        border: 0;
-      }}
-    </style>
-  </head>
-  <body>
-    <iframe
-      class="frame"
-      src="{viewer_url}"
-      title="Live Stream"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
-      referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
-      allowfullscreen
-    ></iframe>
-  </body>
-</html>"""
-
-    # No caching: viewer state is time-sensitive.
-    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
-
-
-def _beestreamed_auth_headers() -> Dict[str, str]:
-    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
-    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
-    if not token_id or not secret_key:
-        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
-
-    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {basic}", "Content-Type": "application/json"}
-
-def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
-    import requests  # type: ignore
-
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-
-    # Create an event
-    try:
-        r = requests.post(f"{api_base}/events", headers=headers, json={}, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed create event failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed create event error {r.status_code}: {msg[:500]}")
-
-    try:
-        data = r.json()
-    except Exception:
-        data = {}
-
-    event_ref = (data.get("event_ref") or data.get("eventRef") or data.get("id") or "").strip()
-    if not event_ref:
-        raise HTTPException(status_code=502, detail="BeeStreamed create event did not return an event_ref")
-
-    # Best-effort: set embed domain on the event so the iframe host is allowed.
-    # If this fails, we continue — the embed may still work depending on BeeStreamed account settings.
-    embed_domain = (embed_domain or "").strip()
-    if embed_domain:
-        try:
-            requests.patch(
-                f"{api_base}/events/{event_ref}",
-                headers=headers,
-                json={"event_embed_domain": embed_domain},
-                timeout=20,
-            )
-        except Exception:
-            pass
-
-    return event_ref
-
-
-def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_domain: str = "") -> None:
-    """Best-effort: set the event date to 'now' so the event is effectively scheduled immediately.
-
-    BeeStreamed docs: PATCH /events/[EVENT REF] supports `date` (formatted) and `title`.
-    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS". citeturn3view1turn3view0
-    """
-    import requests  # type: ignore
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-
-    ref = (event_ref or "").strip()
-    if not ref:
-        return
-
-    payload = {}
-    # Use UTC to avoid timezone ambiguity across API hosts.
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    payload["date"] = now_str
-
-    if (title or "").strip():
-        payload["title"] = (title or "").strip()
-
-    # Some BeeStreamed accounts may accept embed domain as a field; we keep this best-effort.
-    # If not supported, BeeStreamed will ignore or reject; we swallow failures.
-    if (embed_domain or "").strip():
-        payload["event_embed_domain"] = (embed_domain or "").strip()
-
-    try:
-        requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload, timeout=20)
-    except Exception:
-        pass
-
-def _beestreamed_start_webrtc_sync(event_ref: str) -> None:
-    import requests  # type: ignore
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-
-    try:
-        r = requests.post(f"{api_base}/events/{event_ref}/startwebrtcstream", headers=headers, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed start failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed start error {r.status_code}: {msg[:500]}")
-
-def _beestreamed_stop_webrtc_sync(event_ref: str) -> None:
-    import requests  # type: ignore
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-
-    try:
-        r = requests.post(f"{api_base}/events/{event_ref}/stopwebrtcstream", headers=headers, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed stop failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed stop error {r.status_code}: {msg[:500]}")
-
-def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str, Any]]) -> str:
-    host = ""
-    if mapping:
-        host = str(mapping.get("host_member_id") or "").strip()
-
-    # Fallback for current single-host deployment (DulceMoon/Dulce).
-    if not host:
-        if (brand or "").strip().lower() == "dulcemoon" and (avatar or "").strip().lower().startswith("dulce"):
-            host = DULCE_HOST_MEMBER_ID_FALLBACK
-    return host
-
-def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> bool:
-    """Try to persist event_ref into the companion_mappings SQLite DB (if writable). Always updates in-memory mapping."""
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
-    e = (event_ref or "").strip()
-    if not b or not a or not e:
-        return False
-
-    # Always update in-memory mapping so this process is consistent.
-    try:
-        key = (b.lower(), a.lower())
-        if key in _COMPANION_MAPPINGS:
-            _COMPANION_MAPPINGS[key]["event_ref"] = e
-    except Exception:
-        pass
-
-    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
-    if not db_path or not os.path.exists(db_path):
-        return False
-
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(companion_mappings)")
-        cols = [str(r[1] or "").strip() for r in cur.fetchall()]
-        cols_l = [c.lower() for c in cols]
-
-        # Ensure event_ref column exists
-        if "event_ref" not in cols_l:
-            try:
-                cur.execute("ALTER TABLE companion_mappings ADD COLUMN event_ref TEXT")
-                conn.commit()
-                cols_l.append("event_ref")
-            except Exception:
-                # read-only DB or unsupported ALTER; give up persistence but keep in-memory update
-                return False
-
-        # Determine key columns
-        brand_col = "brand" if "brand" in cols_l else ("brand_id" if "brand_id" in cols_l else "")
-        avatar_col = "avatar" if "avatar" in cols_l else ("companion" if "companion" in cols_l else "")
-        if not brand_col or not avatar_col:
-            return False
-
-        cur.execute(
-            f"UPDATE companion_mappings SET event_ref = ? WHERE lower({brand_col}) = lower(?) AND lower({avatar_col}) = lower(?)",
-            (e, b, a),
-        )
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-class BeeStreamedStartEmbedRequest(BaseModel):
-    brand: str
-    avatar: str
-    embedDomain: Optional[str] = None
-    memberId: Optional[str] = None
-
-class BeeStreamedStopEmbedRequest(BaseModel):
-    brand: str
-    avatar: str
-    memberId: Optional[str] = None
-    eventRef: Optional[str] = None
-
-class BeeStreamedCreateEventRequest(BaseModel):
-    """Create a BeeStreamed event for a specific (brand, avatar) mapping.
-
-    Only the user whose memberId matches the mapping's host_member_id may create/start the event.
-    Credentials are taken from env on the API host:
-      - STREAM_TOKEN_ID
-      - STREAM_SECRET_KEY
-    """
-    brand: str
-    avatar: str
-    memberId: str
-    embedDomain: Optional[str] = None
-    startStream: bool = True
-
-
-    This is the lowest-level primitive when you *don't* already have an event_ref.
-    Credentials are taken from env:
-      - STREAM_TOKEN_ID
-      - STREAM_SECRET_KEY
-    """
-    embedDomain: Optional[str] = None
-    startStream: bool = True
-
-class BeeStreamedEmbedUrlRequest(BaseModel):
-    """Resolve a BeeStreamed embed URL that stays inside our iframe wrapper.
-
-    Accepts either:
-      - eventRef / event_ref, OR
-      - streamUrl / stream_url (we'll try to parse the event ref out of it)
-    """
-    eventRef: Optional[str] = None
-    streamUrl: Optional[str] = None
-
-
-@app.post("/stream/beestreamed/start_embed")
-async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    # Use the resolved mapping keys for persistence (first-name fallback etc).
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
-
-    live = str(mapping.get("live") or "").strip().lower()
-
-    # Be tolerant of values like "Stream", "BeeStreamed", or labels that include these keywords.
-    if "stream" not in live:
-        raise HTTPException(status_code=400, detail="This companion is not configured for stream")
-
-    comp_type = str(mapping.get("companion_type") or "").strip()
-    if comp_type and comp_type.lower() != "human":
-        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
-
-    member_id = (req.memberId or "").strip()
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and member_id == host_id)
-
-    event_ref = str(mapping.get("event_ref") or "").strip()
-
-    # Only the host is allowed to create the event_ref automatically.
-    if not event_ref and is_host:
-        event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
-
-    # If we still have no event_ref, non-host users should wait.
-    if not event_ref:
-        return {
-            "ok": True,
-            "status": "waiting_for_host",
-            "canStart": False,
-            "isHost": False,
-            "eventRef": "",
-            "embedUrl": "",
-            "message": f"Waiting on {resolved_avatar} to start event",
+      // Local disconnect (host + viewer)
+      setStreamEmbedUrl("");
+      setStreamEventRef("");
+      setStreamCanStart(false);
+      setStreamNotice("");
+    }
+
+    // Reset avatar UI status
+    setAvatarStatus("idle");
+  }
+
+useEffect(() => {
+  // Stop when switching companions
+  void stopLiveAvatar();
+}, [companionKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?: AbortSignal): Promise<string | null> => {
+  try {
+    const res = await fetch(`${API_BASE}/tts/audio-url`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify({
+        session_id: sessionIdRef.current || "anon",
+        voice_id: voiceId,
+        text,
+      }),
+    });
+
+    if (!res.ok) {
+      const msg = await res.text().catch(() => "");
+      console.warn("TTS/audio-url failed:", res.status, msg);
+      return null;
+    }
+
+    const data = (await res.json()) as { audio_url?: string };
+    return data.audio_url || null;
+  } catch (e) {
+    console.warn("TTS/audio-url error:", e);
+    return null;
+  }
+}, []);
+
+  type SpeakAssistantHooks = {
+    // Called right before we ask D-ID to speak.
+    // Used to delay the assistant text until the avatar begins speaking.
+    onWillSpeak?: () => void;
+    // Called when we cannot / did not speak via D-ID.
+    onDidNotSpeak?: () => void;
+  };
+
+  // ---------- Local (audio-only) TTS playback ----------
+  // Used when Live Avatar is NOT active/available, but the user is in hands-free STT mode.
+  // iOS Safari requires a user gesture to "unlock" programmatic audio playback, so we prime
+  // this hidden <audio> element on the first mic click.
+  const PRIME_SILENT_MP3 =
+    "data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU5LjI3LjEwMAAAAAAAAAAAAAAA//tAwAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAJAAAEXgBBQUFBQUFBQUFBQVlZWVlZWVlZWVlZcXFxcXFxcXFxcXGIiIiIiIiIiIiIiKCgoKCgoKCgoKCguLi4uLi4uLi4uLjQ0NDQ0NDQ0NDQ0Ojo6Ojo6Ojo6Ojo//////////////8AAAAATGF2YzU5LjM3AAAAAAAAAAAAAAAAJAPMAAAAAAAABF6gwS6ZAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVf/7EMQpg8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVV//sQxFMDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVX/+xDEfIPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMSmA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxM+DwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/+xDE1gPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMTWA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxNYDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+
+  const primeLocalTtsAudio = useCallback((force: boolean = false) => {
+    // iOS/Safari autoplay rules: unlocking media MUST happen synchronously in a user gesture
+    // (e.g., mic button tap). We "prime" a hidden media element with a tiny silent MP3.
+    if (!force && localTtsUnlockedRef.current) return;
+    if (force) localTtsUnlockedRef.current = false;
+
+    let unlocked = false;
+    const markUnlocked = () => {
+      if (unlocked) return;
+      unlocked = true;
+      localTtsUnlockedRef.current = true;
+      console.log("Local TTS unlocked");
+    };
+
+    const prime = (m: HTMLMediaElement | null, label: string) => {
+      if (!m) return;
+      try {
+        // Load a tiny silent MP3 and attempt play/pause.
+        m.src = PRIME_SILENT_MP3;
+        m.muted = false;
+        m.volume = 1;
+
+        // playsinline helps on iOS; safe to set on audio too.
+        try {
+          (m as any).playsInline = true;
+          (m as any).setAttribute?.("playsinline", "");
+        } catch (e) {
         }
 
-    embed_url = f"/stream/beestreamed/embed/{event_ref}"
+        const p = m.play();
+        Promise.resolve(p)
+          .then(() => {
+            markUnlocked();
+            try {
+              m.pause();
+            } catch (e) {
+        }
+            try {
+              (m as any).currentTime = 0;
+            } catch (e) {
+        }
+          })
+          .catch((e) => {
+            console.warn("Failed to prime local TTS", {
+            mediaTag: m.tagName,
+              err: String(e),
+              name: (e as any)?.name,
+              message: (e as any)?.message,
+            });
+          });
+      } catch (e) {
+        console.warn("Failed to prime local TTS", {
+            mediaTag: m.tagName,
+          err: String(e),
+          name: (e as any)?.name,
+          message: (e as any)?.message,
+        });
+      }
+    };
 
-    if not is_host:
-        return {
-            "ok": True,
-            "status": "waiting_for_host",
-            "canStart": False,
-            "isHost": False,
-            "eventRef": event_ref,
-            "embedUrl": embed_url,
-            "message": f"Waiting on {resolved_avatar} to start event",
+    // Prime BOTH. iOS prefers the hidden VIDEO element (routes like Live Avatar),
+    // but we also prime the AUDIO element as fallback.
+    prime(localTtsVideoRef.current, "video");
+    prime(localTtsAudioRef.current, "audio");
+
+    // Ensure boosted routing is in place after priming.
+    try {
+      boostAllTtsVolumes();
+    } catch (e) {
         }
 
-    # Host: ensure the event is scheduled for 'now' and then start the WebRTC stream.
-    _beestreamed_schedule_now_sync(event_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
-    _beestreamed_start_webrtc_sync(event_ref)
+    // If neither succeeds, localTtsUnlockedRef remains false and we'll retry on the next user gesture.
+  }, []);
 
-    return {
-        "ok": True,
-        "status": "started",
-        "canStart": True,
-        "isHost": True,
-        "eventRef": event_ref,
-        "embedUrl": embed_url,
-        "message": "",
-    }
+const playLocalTtsUrl = useCallback(
+    async (url: string, hooks?: SpeakAssistantHooks) => {
+      const audioEl = localTtsAudioRef.current;
+      const videoEl = localTtsVideoRef.current;
 
+      // iOS Safari can route <audio> to the receiver (or mute it) after mic/STT.
+      // Using a hidden <video> element often matches Live Avatar output routing (speaker).
+      //
+      // IMPORTANT (Elaralo stability rule): Always route audio-only TTS through the hidden VIDEO
+      // element. Alternate <audio> playback paths have proven unstable across devices.
+      const forceHiddenVideo = true;
+      const preferVideo = !!videoEl && (isIOS || forceHiddenVideo);
 
+      const stopWebSpeechIfNeeded = async () => {
+        if (!(isIOS && sttRecRef.current)) return;
 
+        const rec = sttRecRef.current;
+        try {
+          await new Promise<void>((resolve) => {
+            let done = false;
+            const finish = () => {
+              if (done) return;
+              done = true;
+              resolve();
+            };
 
-
-@app.post("/stream/beestreamed/create_event")
-async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
-    """Create (and optionally start) a BeeStreamed event for a configured companion.
-
-    Authorization rule:
-      - Only the host (memberId == host_member_id in voice_video_mappings.sqlite3) may create/start.
-      - Everyone else gets a "waiting" response.
-    """
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    member_id = (req.memberId or "").strip()
-
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
-
-    live = str(mapping.get("live") or "").strip().lower()
-    if "stream" not in live:
-        raise HTTPException(status_code=400, detail="This companion is not configured for stream")
-
-    comp_type = str(mapping.get("companion_type") or "").strip()
-    if comp_type and comp_type.lower() != "human":
-        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
-
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and member_id == host_id)
-
-    if not is_host:
-        existing_ref = str(mapping.get("event_ref") or "").strip()
-        return {
-            "ok": True,
-            "status": "waiting_for_host",
-            "canStart": False,
-            "isHost": False,
-            "eventRef": existing_ref,
-            "embedUrl": f"/stream/beestreamed/embed/{existing_ref}" if existing_ref else "",
-            "message": f"Waiting on {resolved_avatar} to start event",
+            const prevOnEnd = (rec as any).onend;
+            (rec as any).onend = (...args: any[]) => {
+              try {
+                prevOnEnd?.(...args);
+              } catch (e) {
         }
+              finish();
+            };
 
-    # Host path: reuse existing event_ref if present, else create and persist.
-    event_ref = str(mapping.get("event_ref") or "").strip()
-    if not event_ref:
-        event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
-
-    if bool(req.startStream):
-        _beestreamed_schedule_now_sync(event_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
-        _beestreamed_start_webrtc_sync(event_ref)
-
-    return {
-        "ok": True,
-        "status": "started",
-        "canStart": True,
-        "isHost": True,
-        "eventRef": event_ref,
-        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
-        "message": "",
-    }
-
-",
-    }
-
-
-@app.get("/stream/beestreamed/status")
-async def beestreamed_status(brand: str, avatar: str):
-    """Return current BeeStreamed mapping state for a companion (does not start anything)."""
-    brand = (brand or "").strip()
-    avatar = (avatar or "").strip()
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    event_ref = str(mapping.get("event_ref") or "").strip()
-    return {
-        "ok": True,
-        "eventRef": event_ref,
-        "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
-        "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
-        "companionType": str(mapping.get("companion_type") or "").strip(),
-        "live": str(mapping.get("live") or "").strip(),
-    }
-@app.post("/stream/beestreamed/embed_url")
-async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
-    """Return an embeddable URL that *cannot* pop out of the iframe.
-
-    This is useful when the frontend already has an eventRef (or a BeeStreamed viewer URL)
-    and only needs the safe wrapper URL for the iframe container.
-    """
-    event_ref = (req.eventRef or "").strip()
-    stream_url = (req.streamUrl or "").strip()
-
-    if not event_ref and stream_url:
-        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
-
-    if not event_ref:
-        raise HTTPException(status_code=400, detail="eventRef (or a streamUrl containing it) is required")
-
-    return {
-        "ok": True,
-        "eventRef": event_ref,
-        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
-    }
-@app.post("/stream/beestreamed/stop_embed")
-async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
-
-    member_id = (req.memberId or "").strip()
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and member_id == host_id)
-
-    if not is_host:
-        return {"ok": True, "status": "not_host"}
-
-    event_ref = (req.eventRef or "").strip() or str(mapping.get("event_ref") or "").strip()
-    if not event_ref:
-        return {"ok": True, "status": "no_event"}
-
-    _beestreamed_stop_webrtc_sync(event_ref)
-    return {"ok": True, "status": "stopped", "eventRef": event_ref}
-
-
-def _safe_int(val: Any) -> Optional[int]:
-    """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
-    try:
-        if val is None:
-            return None
-        s = str(val).strip()
-        if not s:
-            return None
-        m = re.search(r"-?\d+", s)
-        if not m:
-            return None
-        return int(m.group(0))
-    except Exception:
-        return None
-
-def _session_get_str(session_state: Dict[str, Any], *keys: str) -> str:
-    for k in keys:
-        try:
-            v = session_state.get(k)
-        except Exception:
-            v = None
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s:
-            return s
-    return ""
-
-def _normalize_plan_name_for_limits(plan_name: str) -> str:
-    p = (plan_name or "").strip()
-    if not p:
-        return ""
-    # Normalize "Test - X" plans to X for quota purposes
-    if p.lower().startswith("test - "):
-        p = p[7:].strip()
-    return p
-
-def _included_minutes_for_plan(plan_name: str) -> int:
-    p = _normalize_plan_name_for_limits(plan_name).lower()
-
-    if p == "friend":
-        return INCLUDED_MINUTES_FRIEND
-    if p == "romantic":
-        return INCLUDED_MINUTES_ROMANTIC
-    if p == "intimate (18+)":
-        return INCLUDED_MINUTES_INTIMATE
-    if p == "pay as you go":
-        return INCLUDED_MINUTES_PAYG
-    # Unknown / not provided -> 0 included minutes
-    return 0
-
-def _get_client_ip(request: Request) -> str:
-    # Azure front-ends commonly set x-forwarded-for with a comma-separated chain.
-    xff = (request.headers.get("x-forwarded-for") or "").strip()
-    if xff:
-        return xff.split(",")[0].strip()
-    rip = (request.headers.get("x-real-ip") or "").strip()
-    if rip:
-        return rip
-    cip = (request.headers.get("x-client-ip") or "").strip()
-    if cip:
-        return cip
-    try:
-        return str(getattr(request.client, "host", "") or "").strip()
-    except Exception:
-        return ""
-
-def _load_usage_store() -> Dict[str, Any]:
-    try:
-        if not os.path.isfile(_USAGE_STORE_PATH):
-            return {}
-        with open(_USAGE_STORE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-def _save_usage_store(store: Dict[str, Any]) -> None:
-    try:
-        folder = os.path.dirname(_USAGE_STORE_PATH) or "."
-        os.makedirs(folder, exist_ok=True)
-        tmp = _USAGE_STORE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(store, f)
-        os.replace(tmp, _USAGE_STORE_PATH)
-    except Exception:
-        # Fail-open: do not crash the API
-        return
-
-def _usage_paywall_message(
-    is_trial: bool,
-    plan_name: str,
-    minutes_allowed: int,
-    *,
-    upgrade_url: str = "",
-    payg_pay_url: str = "",
-    payg_increment_minutes: Optional[int] = None,
-    payg_price_text: str = "",
-) -> str:
-    """Generate the user-facing message when minutes are exhausted.
-
-    Supports per-request overrides (RebrandingKey) for:
-      - upgrade_url
-      - payg_pay_url
-      - payg_increment_minutes
-      - payg_price_text
-    """
-    # Keep this short and plain so it can be spoken via TTS.
-    lines: List[str] = []
-
-    resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
-    resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
-    resolved_payg_minutes = (
-        int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
-    )
-    resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
-
-    if is_trial:
-        lines.append(f"Your Free Trial time has ended ({minutes_allowed} minutes).")
-    else:
-        nice_plan = (plan_name or "").strip()
-        if not nice_plan:
-            lines.append("Your membership plan is Unknown / Not Provided, so minutes cannot be allocated.")
-        else:
-            lines.append(f"You have no minutes remaining for your plan ({nice_plan}).")
-
-    if resolved_payg_pay_url and resolved_payg_minutes > 0:
-        price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
-        lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
-
-    if resolved_upgrade_url:
-        lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
-
-    lines.append("Once you have more minutes, come back here and continue our conversation.")
-    return " ".join([ln.strip() for ln in lines if ln.strip()])
-def _usage_status_message(
-    *,
-    is_trial: bool,
-    plan_name: str,
-    minutes_used: int,
-    minutes_allowed: int,
-    minutes_remaining: int,
-    cycle_days: int,
-    upgrade_url: str = "",
-    payg_pay_url: str = "",
-    payg_increment_minutes: Optional[int] = None,
-    payg_price_text: str = "",
-) -> str:
-    """Generate a short, deterministic answer about remaining minutes.
-
-    This is used when the user asks questions like:
-      - "How many minutes do I have left?"
-      - "How many more minutes can we talk?"
-      - "How much time do I have remaining on my plan?"
-
-    The response is intentionally plain so it can be spoken via TTS.
-    """
-    lines: List[str] = []
-
-    m_used = max(0, int(minutes_used or 0))
-    m_allowed = max(0, int(minutes_allowed or 0))
-    m_rem = max(0, int(minutes_remaining or 0))
-
-    if is_trial:
-        lines.append(f"You have {m_rem} minutes remaining in your Free Trial.")
-    else:
-        nice_plan = (plan_name or "").strip()
-        if nice_plan:
-            lines.append(f"You have {m_rem} minutes remaining on your plan ({nice_plan}).")
-        else:
-            lines.append(f"You have {m_rem} minutes remaining on your plan.")
-
-    # Include a small breakdown for clarity.
-    if m_allowed > 0 or m_used > 0:
-        lines.append(f"Used: {m_used} of {m_allowed} minutes.")
-
-    if (not is_trial) and int(cycle_days or 0) > 0:
-        lines.append(f"Your usage cycle resets every {int(cycle_days)} days.")
-
-    # If exhausted, include the same upgrade/pay links used by the paywall.
-    if m_rem <= 0:
-        resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
-        resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
-        resolved_payg_minutes = (
-            int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
-        )
-        resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
-
-        if resolved_payg_pay_url and resolved_payg_minutes > 0:
-            price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
-            lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
-
-        if resolved_upgrade_url:
-            lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
-
-    return " ".join([ln.strip() for ln in lines if ln.strip()])
-
-
-def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str, minutes_allowed_override: Optional[int] = None, cycle_days_override: Optional[int] = None) -> Tuple[bool, Dict[str, Any]]:
-    """Charge usage time and determine whether the identity still has minutes.
-
-    Returns:
-      (ok, info)
-        ok: True if allowed to continue, False if minutes exhausted.
-        info: includes minutes_used / minutes_allowed / minutes_remaining for optional UI/debug.
-    """
-    now = time.time()
-    try:
-        with _USAGE_LOCK:
-            store = _load_usage_store()
-            rec = store.get(identity_key)
-            if not isinstance(rec, dict):
-                rec = {}
-
-            # Initialize record
-            used_seconds = float(rec.get("used_seconds") or 0.0)
-            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
-            last_seen = rec.get("last_seen")
-            cycle_start = float(rec.get("cycle_start") or now)
-
-            # Member cycle reset (trial does not reset)
-            cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
-            if not is_trial and cycle_days and cycle_days > 0:
-                cycle_len = float(cycle_days) * 86400.0
-                if (now - cycle_start) >= cycle_len:
-                    used_seconds = 0.0
-                    cycle_start = now
-
-            # Charge time since last chat call (capped)
-            delta = 0.0
-            if last_seen is not None:
-                try:
-                    delta = float(now - float(last_seen))
-                except Exception:
-                    delta = 0.0
-
-            if delta < 0:
-                delta = 0.0
-
-            # Don't charge long idle gaps (prevents "went AFK" from burning minutes)
-            if USAGE_IDLE_GRACE_SECONDS and delta > float(USAGE_IDLE_GRACE_SECONDS):
-                delta = 0.0
-
-            # Cap per-request billable time
-            max_bill = float(USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST) if USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST > 0 else 0.0
-            if max_bill and delta > max_bill:
-                delta = max_bill
-
-            used_seconds += delta
-
-            # Compute allowed seconds
-            if minutes_allowed_override is not None:
-                try:
-                    minutes_allowed = max(0, int(minutes_allowed_override))
-                except Exception:
-                    minutes_allowed = 0
-            else:
-                minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
-            allowed_seconds = (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0)
-
-            # Persist record
-            rec_out = {
-                "used_seconds": used_seconds,
-                "purchased_seconds": purchased_seconds,
-                "last_seen": now,
-                "cycle_start": cycle_start,
-                "plan_name": plan_name,
-                "is_trial": bool(is_trial),
+            try {
+              rec.stop();
+            } catch (e) {
+        finish();
             }
-            store[identity_key] = rec_out
-            _save_usage_store(store)
 
-        remaining_seconds = max(0.0, allowed_seconds - used_seconds)
-        ok = remaining_seconds > 0.0
-
-        return ok, {
-            "minutes_used": int(used_seconds // 60),
-            "minutes_allowed": int(minutes_allowed),
-            "minutes_remaining": int(remaining_seconds // 60),
-            "identity_key": identity_key,
+            // Safety if onend never arrives
+            setTimeout(finish, 220);
+          });
+        } catch (e) {
+        // ignore
         }
-    except Exception:
-        # Fail-open
-        return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": identity_key}
+      };
 
-def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any]:
-    """Add purchased minutes to an identity record (used by payment webhooks/admin tooling)."""
-    now = time.time()
-    try:
-        minutes_i = int(minutes)
-        if minutes_i <= 0:
-            return {"ok": False, "error": "minutes must be > 0", "identity_key": identity_key}
+      const playOn = async (m: HTMLMediaElement, useVideo: boolean): Promise<boolean> => {
+        await stopWebSpeechIfNeeded();
 
-        with _USAGE_LOCK:
-            store = _load_usage_store()
-            rec = store.get(identity_key)
-            if not isinstance(rec, dict):
-                rec = {}
+        // Give Safari a beat to swap audio-session away from capture.
+        if (isIOS) await new Promise((r) => setTimeout(r, 180));
 
-            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
-            purchased_seconds += float(minutes_i) * 60.0
+        // Cache-bust on iOS (some devices can aggressively cache the same URL path).
+        const finalUrl = isIOS ? `${url}${url.includes("?") ? "&" : "?"}cb=${Date.now()}` : url;
 
-            rec["purchased_seconds"] = purchased_seconds
-            rec.setdefault("used_seconds", float(rec.get("used_seconds") or 0.0))
-            rec.setdefault("cycle_start", float(rec.get("cycle_start") or now))
-            rec.setdefault("last_seen", float(rec.get("last_seen") or now))
-            rec["plan_name"] = rec.get("plan_name") or "Pay as You Go"
-
-            store[identity_key] = rec
-            _save_usage_store(store)
-
-        return {
-            "ok": True,
-            "identity_key": identity_key,
-            "minutes_added": minutes_i,
-            "purchased_minutes_total": int(purchased_seconds // 60),
+        // Prepare element
+        try {
+          m.pause();
+          m.currentTime = 0;
+        } catch (e) {
         }
-    except Exception:
-        return {"ok": False, "identity_key": identity_key}
 
+        try {
+        } catch (e) {
+        }
 
-def _normalize_mode(raw: str) -> str:
-    t = (raw or "").strip().lower()
-    # allow some synonyms from older frontend builds
-    if t in {"explicit", "intimate", "18+", "adult"}:
-        return "intimate"
-    if t in {"romance", "romantic"}:
-        return "romantic"
-    return "friend"
+        if (useVideo) {
+          try {
+            const v = m as HTMLVideoElement;
+            v.playsInline = true;
+            v.setAttribute("playsinline", "true");
+            v.setAttribute("webkit-playsinline", "true");
+          } catch (e) {
+        }
+        }
 
+        try {
+          m.muted = false;
+          m.volume = 1;
+        } catch (e) {
+        }
 
-def _detect_mode_switch_from_text(text: str) -> Optional[str]:
-    t = (text or "").lower().strip()
+        // Local (audio-only) TTS stays on the hidden VIDEO element, but we do not
+        // route it through WebAudio (can cause silence with non-CORS media).
+        try { m.muted = false; m.volume = 1; } catch (e) {
+        }
 
-    # explicit hints: allow [mode:romantic] etc
-    if "mode:friend" in t or "[mode:friend]" in t:
-        return "friend"
-    if "mode:romantic" in t or "[mode:romantic]" in t:
-        return "romantic"
-    if (
-        "mode:intimate" in t
-        or "[mode:intimate]" in t
-        or "mode:explicit" in t
-        or "[mode:explicit]" in t
-    ):
-        return "intimate"
+        try {
+          (m as any).preload = "auto";
+        } catch (e) {
+        }
 
-    # soft detection (more natural language coverage)
-    # friend
-    if any(p in t for p in [
-        "switch to friend",
-        "go to friend",
-        "back to friend",
-        "friend mode",
-        "set friend",
-        "set mode to friend",
-        "turn on friend",
-    ]):
-        return "friend"
+        try {
+          m.src = finalUrl;
+          try {
+            (m as any).load?.();
+          } catch (e) {
+        }
+        } catch (e) {
+        }
 
-    # romantic
-    if any(p in t for p in [
-        "switch to romantic",
-        "go to romantic",
-        "back to romantic",
-        "romantic mode",
-        "set romantic",
-        "set mode to romantic",
-        "turn on romantic",
-        "let's be romantic",
-    ]):
-        return "romantic"
+        try {
+          hooks?.onWillSpeak?.();
+        } catch (e) {
+        }
 
-    # intimate/explicit
-    if any(p in t for p in [
-        "switch to intimate",
-        "go to intimate",
-        "back to intimate",
-        "intimate mode",
-        "set intimate",
-        "set mode to intimate",
-        "turn on intimate",
-        "switch to explicit",
-        "explicit mode",
-        "set explicit",
-        "set mode to explicit",
-        "turn on explicit",
-    ]):
-        return "intimate"
+        try {
+          await m.play();
+          localTtsUnlockedRef.current = true;
+          // iOS Safari can sometimes resolve play() but keep media effectively paused/silent.
+          // Confirm playback actually started before we proceed.
+          const started = await new Promise<boolean>((resolve) => {
+            let settled = false;
 
-    return None
-def _is_minutes_balance_question(text: str) -> bool:
-    """Detect user questions about remaining/available plan minutes.
-
-    Examples we want to catch:
-      - "How many more minutes do I have on my plan?"
-      - "How many minutes are left?"
-      - "Minutes remaining?"
-      - "How long can I talk to you?"
-      - "What's my minutes balance / usage?"
-
-    We keep this intentionally conservative to avoid false triggers.
-    """
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-
-    # Avoid a common unrelated question.
-    if re.search(r"\bwhat time is it\b", t):
-        return False
-
-    # Strong patterns (explicit "how many/much" + minutes/time + left/remaining)
-    if re.search(r"\bhow\s+(many|much)\b.*\b(minutes?|time)\b.*\b(left|remaining|available)\b", t):
-        return True
-
-    # "minutes remaining", "time left", etc with plan/usage keywords
-    if re.search(r"\b(minutes?|time)\b.*\b(left|remaining|available)\b", t) and re.search(
-        r"\b(plan|trial|subscription|membership|usage|balance|quota|included)\b", t
-    ):
-        return True
-
-    # Short forms: "minutes left?", "minutes available?"
-    if re.search(r"\bminutes?\b", t) and re.search(r"\b(left|remaining|available|balance|used)\b", t):
-        return True
-
-    # "How long can I talk/speak/chat?"
-    if re.search(r"\bhow\s+long\b.*\b(can|may)\s+i\b.*\b(talk|speak|chat)\b", t):
-        return True
-
-    # "check my usage" / "show my minutes"
-    if re.search(r"\b(check|show)\b.*\b(usage|minutes?|balance)\b", t):
-        return True
-
-    return False
-
-
-
-
-def _looks_intimate(text: str) -> bool:
-    t = (text or "").lower()
-    return any(
-        k in t
-        for k in [
-            "explicit", "intimate", "nsfw", "sex", "nude", "porn",
-            "fuck", "cock", "pussy", "blowjob", "anal", "orgasm",
-        ]
-    )
-
-
-def _parse_companion_meta(raw: Any) -> Dict[str, str]:
-    if isinstance(raw, str):
-        # Companion keys may include additional metadata after a pipe, e.g.:
-        #   "Elara-Female-Caucasian-GenZ|live=stream"
-        # For persona generation we only want the base identity.
-        base = raw.split("|", 1)[0].strip()
-        parts = [p.strip() for p in base.split("-") if p.strip()]
-        if len(parts) >= 4:
-            return {
-                "first_name": parts[0],
-                "gender": parts[1],
-                "ethnicity": parts[2],
-                "generation": "-".join(parts[3:]),
+            function finish(ok: boolean) {
+              if (settled) return;
+              settled = true;
+              try {
+                m.removeEventListener("playing", onPlaying);
+                m.removeEventListener("timeupdate", onTimeUpdate);
+                m.removeEventListener("error", onErr);
+              } catch (e) {
+        }
+              resolve(ok);
             }
-    return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
 
+            function onPlaying() {
+              finish(true);
+            }
+            function onTimeUpdate() {
+              if (m.currentTime > 0) finish(true);
+            }
+            function onErr() {
+              finish(false);
+            }
 
+            try {
+              m.addEventListener("playing", onPlaying, { once: true });
+              m.addEventListener("timeupdate", onTimeUpdate);
+              m.addEventListener("error", onErr, { once: true });
+            } catch (e) {
+        // If we can't attach events, just accept.
+              finish(true);
+              return;
+            }
 
-def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
-    comp = _parse_companion_meta(
-        session_state.get("companion")
-        or session_state.get("companionName")
-        or session_state.get("companion_name")
-    )
-    name = comp.get("first_name") or "Elara"
+            setTimeout(() => {
+              finish(m.currentTime > 0 || !m.paused);
+            }, 600);
+          });
 
-    lines = [
-        f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
-        "You speak naturally and conversationally.",
-        "You prioritize consent, safety, and emotional connection.",
-    ]
+          if (!started) {
+            try {
+              m.pause();
+              m.currentTime = 0;
+            } catch (e) {
+        }
+            return false;
+          }
+        } catch (e) {
+          console.warn("Local TTS playback failed:", {
+            mediaTag: m.tagName,
+            err: String(e),
+            name: (e as any)?.name,
+            message: (e as any)?.message,
+            readyState: m.readyState,
+            networkState: m.networkState,
+            src: (m as any).currentSrc || m.src,
+            mediaError: m.error ? { code: m.error.code } : null,
+          });
+          localTtsUnlockedRef.current = false;
+          return false;
+        }
 
-    if mode == "romantic":
-        lines.append("You may be affectionate and flirty while remaining respectful.")
+        await new Promise<void>((resolve) => {
+          let done = false;
 
-    if mode == "intimate" and intimate_allowed:
-        lines.append(
-            "The user has consented to Intimate (18+) conversation. "
-            "You may engage in adult, sensual discussion, but avoid graphic or pornographic detail. "
-            "Focus on intimacy, emotion, and connection."
-        )
+          const cleanup = () => {
+            if (done) return;
+            done = true;
 
-    return " ".join(lines)
+            // If the Stop button was wired to this playback, clear it.
+            if (localTtsStopFnRef.current === cleanup) {
+              localTtsStopFnRef.current = null;
+            }
 
+            m.onended = null;
+            m.onerror = null;
+            m.onabort = null;
+            m.onloadedmetadata = null;
+            m.ondurationchange = null;
+            if (hardTimer != null) {
+              window.clearTimeout(hardTimer);
+              hardTimer = null;
+            }
 
-def _to_openai_messages(
-    messages: List[Dict[str, str]],
-    session_state: dict,
-    *,
-    mode: str,
-    intimate_allowed: bool,
-    debug: bool
-):
-    sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
-    _dbg(debug, "SYSTEM PROMPT:", sys)
+            try {
+              m.pause();
+              m.currentTime = 0;
+            } catch (e) {
+        }
 
-    out = [{"role": "system", "content": sys}]
-    for m in messages:
-        if m.get("role") in ("user", "assistant"):
-            out.append({"role": m["role"], "content": m.get("content", "")})
-    return out
+            // iOS Safari sometimes gets "stuck" if we leave the src attached.
+            if (isIOS) {
+              try {
+                m.removeAttribute("src");
+                (m as any).load?.();
+              } catch (e) {
+        }
+            }
 
+            resolve();
+          };
 
-def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
-    from openai import OpenAI
+          // Allow the Stop button to interrupt the currently playing local TTS.
+          localTtsStopFnRef.current = cleanup;
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+          m.onended = cleanup;
+          m.onerror = cleanup;
+          m.onabort = cleanup;
 
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-        messages=messages,
-        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
-    )
-    return (resp.choices[0].message.content or "").strip()
+          // Hard timeout if Safari never fires ended
+          // Safari occasionally fails to fire `ended`. Use a duration-aware hard timeout
+          // so we *don't* cut off longer audio, but we also don't hang forever.
+          let hardTimer: number | null = null;
 
+          const armHardTimeout = (ms: number) => {
+            if (hardTimer != null) window.clearTimeout(hardTimer);
+            hardTimer = window.setTimeout(() => cleanup(), ms);
+          };
 
+          // Start with a generous fallback; tighten once duration is known.
+          armHardTimeout(90_000);
 
-def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
-    """Summarization call with conservative limits for reliability."""
-    from openai import OpenAI
+          const maybeTightenHardTimeout = () => {
+            const d = Number.isFinite(m.duration) ? m.duration : NaN;
+            if (!Number.isFinite(d) || d <= 0) return;
+            // duration is seconds; add a small buffer
+            const ms = Math.min(5 * 60_000, Math.max(15_000, Math.ceil(d * 1000) + 2_000));
+            armHardTimeout(ms);
+          };
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+          m.onloadedmetadata = maybeTightenHardTimeout;
+          m.ondurationchange = maybeTightenHardTimeout;
 
-    timeout_s = float(os.getenv("SAVE_SUMMARY_OPENAI_TIMEOUT_S", "25") or "25")
-    client = OpenAI(api_key=api_key, timeout=timeout_s)
-    resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-        messages=messages,
-        temperature=float(os.getenv("SAVE_SUMMARY_TEMPERATURE", "0.2") or "0.2"),
-        max_tokens=int(os.getenv("SAVE_SUMMARY_MAX_TOKENS", "350") or "350"),
-    )
-    return (resp.choices[0].message.content or "").strip()
+        });
 
-def _normalize_payload(raw: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]], Dict[str, Any], bool]:
-    sid = raw.get("session_id") or raw.get("sid")
-    msgs = raw.get("messages") or []
-    state = raw.get("session_state") or {}
-    wants = bool(raw.get("wants_explicit"))
+        return true;
+      };
 
-    if not sid or not isinstance(sid, str):
-        raise HTTPException(422, "session_id required")
-    if not msgs or not isinstance(msgs, list):
-        raise HTTPException(422, "messages required")
-    if not isinstance(state, dict):
-        state = {}
+      // Elaralo policy: prefer the hidden VIDEO element for all audio-only TTS playback.
+      // We intentionally do NOT fall back to <audio> because alternate paths have been unstable
+      // across devices (and historically caused STT regressions after playback in some browsers).
+      if (preferVideo && videoEl) {
+        const ok = await playOn(videoEl, true);
+        if (ok) return;
 
-    return sid, msgs, state, wants
+        try {
+          hooks?.onDidNotSpeak?.();
+        } catch (e) {
+        }
+        return;
+      }
 
+      // Only allow <audio> fallback if hidden-video TTS has been explicitly disabled.
+      if (!forceHiddenVideo && audioEl) {
+        const ok = await playOn(audioEl, false);
+        if (ok) return;
+      }
 
-def _extract_voice_id(raw: Dict[str, Any]) -> str:
-    """
-    Supports both snake_case and camelCase for frontend convenience.
-    """
-    return (
-        (raw.get("voice_id") or raw.get("voiceId") or raw.get("eleven_voice_id") or raw.get("elevenVoiceId") or "")
-    ).strip()
+      try {
+        hooks?.onDidNotSpeak?.();
+      } catch (e) {
+        }
+    },
+    [isIOS, applyTtsGainRouting],
+  );
 
-
-# ----------------------------
-# TTS Helpers (ElevenLabs -> Azure Blob SAS)
-# ----------------------------
-_TTS_CONTAINER = os.getenv("AZURE_TTS_CONTAINER", os.getenv("AZURE_STORAGE_CONTAINER", "tts")) or "tts"
-_TTS_BLOB_PREFIX = os.getenv("TTS_BLOB_PREFIX", "audio") or "audio"
-_TTS_SAS_MINUTES = int(os.getenv("TTS_SAS_MINUTES", os.getenv("AZURE_BLOB_SAS_EXPIRY_MINUTES", "30")) or "30")
-
-# TTS cache (Azure Blob) — deterministic blob names to avoid regenerating identical audio.
-# Enabled by default. Disable by setting TTS_CACHE_ENABLED=0.
-_TTS_CACHE_ENABLED = (os.getenv("TTS_CACHE_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
-# Cache blobs live under this prefix within the same container.
-_TTS_CACHE_PREFIX = (os.getenv("TTS_CACHE_PREFIX", "tts_cache") or "tts_cache").strip().strip("/")
-# Whether to normalize whitespace in TTS text before hashing.
-_TTS_CACHE_NORMALIZE_WS = (os.getenv("TTS_CACHE_NORMALIZE_WS", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _normalize_tts_text_for_cache(text: str) -> str:
-    t = (text or "").strip()
-    if _TTS_CACHE_NORMALIZE_WS:
-        t = re.sub(r"\s+", " ", t)
-    return t
-
-
-def _tts_cache_blob_name(voice_id: str, text: str) -> str:
-    """Deterministic blob name for caching across sessions and workers."""
-    safe_voice = re.sub(r"[^A-Za-z0-9_-]", "_", (voice_id or "voice"))[:48]
-
-    model_id = (os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2") or "eleven_multilingual_v2").strip()
-    output_format = (os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128") or "mp3_44100_128").strip()
-    silence = str(_TTS_LEADING_SILENCE_COPIES)
-
-    norm_text = _normalize_tts_text_for_cache(text)
-    h = hashlib.sha256(
-        (safe_voice + "|" + model_id + "|" + output_format + "|" + silence + "|" + norm_text).encode("utf-8")
-    ).hexdigest()[:40]
-
-    # Keep under a predictable prefix; safe_voice helps partition blobs for listing/debug.
-    return f"{_TTS_CACHE_PREFIX}/{safe_voice}/{h}.mp3"
-
-
-
-
-# 235ms silent MP3 prefix used to prevent some clients (notably iOS/Safari in embedded contexts)
-# from clipping the first ~200ms of audio when switching from microphone capture to playback.
-# You can tune this without redeploying frontend by setting TTS_LEADING_SILENCE_COPIES (0,1,2...).
-_SILENT_MP3_PREFIX_B64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU5LjI3LjEwMAAAAAAAAAAAAAAA//tAwAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAJAAAEXgBBQUFBQUFBQUFBQVlZWVlZWVlZWVlZcXFxcXFxcXFxcXGIiIiIiIiIiIiIiKCgoKCgoKCgoKCguLi4uLi4uLi4uLjQ0NDQ0NDQ0NDQ0Ojo6Ojo6Ojo6Ojo//////////////8AAAAATGF2YzU5LjM3AAAAAAAAAAAAAAAAJAPMAAAAAAAABF6gwS6ZAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVf/7EMQpg8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVV//sQxFMDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVX/+xDEfIPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMSmA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxM+DwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/+xDE1gPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMTWA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxNYDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU="
-_SILENT_MP3_PREFIX_BYTES = base64.b64decode(_SILENT_MP3_PREFIX_B64)
-_TTS_LEADING_SILENCE_COPIES = max(0, int(os.getenv("TTS_LEADING_SILENCE_COPIES", "1") or "1"))
-
-def _tts_blob_name(session_id: str, voice_id: str, text: str) -> str:
-    safe_session = re.sub(r"[^A-Za-z0-9_-]", "_", (session_id or "session"))[:64]
-    safe_voice = re.sub(r"[^A-Za-z0-9_-]", "_", (voice_id or "voice"))[:48]
-    h = hashlib.sha1((safe_voice + "|" + (text or "")).encode("utf-8")).hexdigest()[:16]
-    ts_ms = int(time.time() * 1000)
-    # include hash for debugging/caching, but still unique by timestamp
-    return f"{_TTS_BLOB_PREFIX}/{safe_session}/{ts_ms}-{h}-{uuid.uuid4().hex}.mp3"
-
-
-def _elevenlabs_tts_mp3_bytes(voice_id: str, text: str) -> bytes:
-    import requests  # type: ignore
-
-    xi_api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if not xi_api_key:
-        raise RuntimeError("ELEVENLABS_API_KEY is not configured")
-
-    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip() or "eleven_multilingual_v2"
-    output_format = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128").strip() or "mp3_44100_128"
-
-    # Using /stream tends to be lower latency on ElevenLabs.
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format={output_format}"
-    headers = {
-        "xi-api-key": xi_api_key,
-        "Content-Type": "application/json",
-        "Accept": "audio/mpeg",
+  // Stop any in-progress local (audio-only) TTS playback immediately.
+  // This is required so the Stop button can reliably interrupt audio-only conversations.
+  const stopLocalTtsPlayback = useCallback(() => {
+    try {
+      localTtsStopFnRef.current?.();
+    } catch (e) {
+        // ignore
     }
-    body = {"text": text, "model_id": model_id}
+    localTtsStopFnRef.current = null;
 
-    r = requests.post(url, headers=headers, json=body, timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"ElevenLabs error {r.status_code}: {(r.text or '')[:400]}")
-    if not r.content:
-        raise RuntimeError("ElevenLabs returned empty audio")
-    audio_bytes = r.content
-    if _TTS_LEADING_SILENCE_COPIES:
-        audio_bytes = (_SILENT_MP3_PREFIX_BYTES * _TTS_LEADING_SILENCE_COPIES) + audio_bytes
-    return audio_bytes
+    const a = localTtsAudioRef.current;
+    if (a) {
+      try {
+        a.pause();
+        a.currentTime = 0;
+      } catch (e) {
+        }
+      try {
+        a.removeAttribute("src");
+        (a as any).load?.();
+      } catch (e) {
+        }
+    }
 
+    const v = localTtsVideoRef.current;
+    if (v) {
+      try {
+        v.pause();
+        v.currentTime = 0;
+      } catch (e) {
+        }
+      try {
+        v.removeAttribute("src");
+        (v as any).load?.();
+      } catch (e) {
+        }
+    }
+  }, []);
 
+  const speakLocalTtsReply = useCallback(
+    async (replyText: string, voiceId: string, hooks?: SpeakAssistantHooks) => {
+      const clean = (replyText || "").trim();
+      if (!clean) {
+        hooks?.onDidNotSpeak?.();
+        return;
+      }
 
+      // Guard against mid-stream Stop/Save/Clear: cancel any in-flight request and ignore late results.
+      const epoch = localTtsEpochRef.current;
+      try {
+        localTtsAbortRef.current?.abort();
+      } catch (e) {
+        }
+      const controller = new AbortController();
+      localTtsAbortRef.current = controller;
 
-def _azure_blob_sas_url(blob_name: str) -> str:
-    """Create a read-only SAS URL for an existing blob name in the TTS container."""
-    from azure.storage.blob import BlobServiceClient  # type: ignore
-    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
+      const audioUrl = await getTtsAudioUrl(clean, voiceId, controller.signal);
+      if (controller.signal.aborted || localTtsEpochRef.current != epoch) {
+        // Stop/Save/Clear happened while we were generating the audio URL.
+        hooks?.onDidNotSpeak?.();
+        return;
+      }
+      if (!audioUrl) {
+        hooks?.onDidNotSpeak?.();
+        return;
+      }
 
-    storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
-    if not storage_conn_str:
-        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+      // If a stop happens during playback start, playLocalTtsUrl will be interrupted by stopLocalTtsPlayback().
+      if (localTtsEpochRef.current != epoch) {
+        hooks?.onDidNotSpeak?.();
+        return;
+      }
 
-    blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
-    container_client = blob_service.get_container_client(_TTS_CONTAINER)
-    blob_client = container_client.get_blob_client(blob_name)
-
-    # Parse AccountName/AccountKey from connection string for SAS
-    parts: Dict[str, str] = {}
-    for seg in storage_conn_str.split(";"):
-        if "=" in seg:
-            k, v = seg.split("=", 1)
-            parts[k] = v
-    account_name = parts.get("AccountName") or getattr(blob_service, "account_name", None)
-    account_key = parts.get("AccountKey")
-    if not account_name or not account_key:
-        raise RuntimeError("Could not parse AccountName/AccountKey from AZURE_STORAGE_CONNECTION_STRING")
-
-    expiry = datetime.utcnow() + timedelta(minutes=max(5, min(_TTS_SAS_MINUTES, 24 * 60)))
-    sas = generate_blob_sas(
-        account_name=account_name,
-        container_name=_TTS_CONTAINER,
-        blob_name=blob_name,
-        account_key=account_key,
-        permission=BlobSasPermissions(read=True),
-        expiry=expiry,
-    )
-    return f"{blob_client.url}?{sas}"
-def _azure_upload_mp3_and_get_sas_url(blob_name: str, mp3_bytes: bytes) -> str:
-    from azure.storage.blob import BlobServiceClient, ContentSettings  # type: ignore
-    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
-
-    storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
-    if not storage_conn_str:
-        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
-
-    blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
-    container_client = blob_service.get_container_client(_TTS_CONTAINER)
-
-    # Ensure container exists (safe)
-    try:
-        container_client.get_container_properties()
-    except Exception:
-        try:
-            container_client.create_container()
-        except Exception:
-            pass
-
-    blob_client = container_client.get_blob_client(blob_name)
-    blob_client.upload_blob(
-        mp3_bytes,
-        overwrite=True,
-        content_settings=ContentSettings(content_type="audio/mpeg"),
-    )
-
-    # Parse AccountName/AccountKey from connection string for SAS
-    parts: Dict[str, str] = {}
-    for seg in storage_conn_str.split(";"):
-        if "=" in seg:
-            k, v = seg.split("=", 1)
-            parts[k] = v
-    account_name = parts.get("AccountName") or getattr(blob_service, "account_name", None)
-    account_key = parts.get("AccountKey")
-    if not account_name or not account_key:
-        raise RuntimeError("Could not parse AccountName/AccountKey from AZURE_STORAGE_CONNECTION_STRING")
-
-    expiry = datetime.utcnow() + timedelta(minutes=max(5, min(_TTS_SAS_MINUTES, 24 * 60)))
-    sas = generate_blob_sas(
-        account_name=account_name,
-        container_name=_TTS_CONTAINER,
-        blob_name=blob_name,
-        account_key=account_key,
-        permission=BlobSasPermissions(read=True),
-        expiry=expiry,
-    )
-    return f"{blob_client.url}?{sas}"
+      await playLocalTtsUrl(audioUrl, hooks);
+    },
+    [getTtsAudioUrl, playLocalTtsUrl]
+  );
 
 
-def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
-    text = (text or "").strip()
-    if not text:
-        raise RuntimeError("TTS text is empty")
+const speakAssistantReply = useCallback(
+    async (replyText: string, hooks?: SpeakAssistantHooks) => {
+    // NOTE: We intentionally keep STT paused while the avatar is speaking.
+    // The D-ID SDK's speak() promise can resolve before audio playback finishes,
+    // so we add a best-effort duration wait to prevent STT feedback (avatar "talking to itself").
+    const clean = (replyText || "").trim();
 
-    # Cache path: deterministic blob name, cross-session.
-    if _TTS_CACHE_ENABLED:
-        cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
-        try:
-            from azure.storage.blob import BlobServiceClient  # type: ignore
+    const callDidNotSpeak = () => {
+      try {
+        hooks?.onDidNotSpeak?.();
+      } catch (e) {
+        // ignore
+      }
+    };
 
-            storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
-            if not storage_conn_str:
-                raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+    let willSpeakCalled = false;
+    const callWillSpeakOnce = () => {
+      if (willSpeakCalled) return;
+      willSpeakCalled = true;
+      try {
+        hooks?.onWillSpeak?.();
+      } catch (e) {
+        // ignore
+      }
+    };
 
-            blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
-            container_client = blob_service.get_container_client(_TTS_CONTAINER)
-            blob_client = container_client.get_blob_client(cache_blob)
+    if (!clean) {
+      callDidNotSpeak();
+      return;
+    }
+    if (clean.startsWith("Error:")) {
+      callDidNotSpeak();
+      return;
+    }
 
-            # Fast existence check (SDK-level). If present, return SAS immediately.
-            exists = False
-            try:
-                exists = bool(blob_client.exists())
-            except Exception:
-                try:
-                    blob_client.get_blob_properties()
-                    exists = True
-                except Exception:
-                    exists = False
+    if (avatarStatus !== "connected") {
+      callDidNotSpeak();
+      return;
+    }
+    if (!phase1AvatarMedia) {
+      callDidNotSpeak();
+      return;
+    }
 
-            if exists:
-                _clear_inflight_marker(cache_blob)
+    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
+    if (!audioUrl) {
+      callDidNotSpeak();
+      return;
+    }
 
-                return _azure_blob_sas_url(blob_name=cache_blob)
+    // Estimate duration (fallback) based on text length.
+    const estimateSpeechMs = (text: string) => {
+      const words = text.trim().split(/\s+/).filter(Boolean).length;
+      // Typical conversational pace ~160-175 WPM. Use a slightly slower rate to be safe.
+      const wpm = 160;
+      const baseMs = (words / wpm) * 60_000;
+      const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
+      return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
+    };
 
-            # Cache miss: generate and upload.
+    const fallbackMs = estimateSpeechMs(clean);
 
+    // Best-effort: read actual audio duration from the blob URL (if metadata is accessible).
+    const probeAudioDurationMs = (url: string, fallback: number) =>
+      new Promise<number>((resolve) => {
+        if (typeof Audio === "undefined") return resolve(fallback);
+        const a = new Audio();
+        a.preload = "metadata";
+        // Some CDNs require this for cross-origin metadata access (best-effort).
+        try {
+        } catch (e) {
+        // ignore
+        }
 
-            _touch_inflight_marker(cache_blob)
-            mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
+        let doneCalled = false;
+        const done = (ms: number) => {
+          if (doneCalled) return;
+          doneCalled = true;
+          try {
+            a.onloadedmetadata = null as any;
+            a.onerror = null as any;
+          } catch (e) {
+        // ignore
+          }
+          // release resource
+          try {
+            a.src = "";
+          } catch (e) {
+        // ignore
+          }
+          resolve(ms);
+        };
 
-            # Upload without overwrite to avoid clobbering a concurrent writer.
-            try:
-                from azure.storage.blob import ContentSettings  # type: ignore
-                blob_client.upload_blob(
-                    mp3_bytes,
-                    overwrite=False,
-                    content_settings=ContentSettings(content_type="audio/mpeg"),
-                )
-            except Exception:
-                # If another worker won the race and uploaded first, just return SAS.
-                pass
+        const t = window.setTimeout(() => done(fallback), 2500);
 
-            return _azure_blob_sas_url(blob_name=cache_blob)
-        except Exception:
-            # Fail-open: if cache path fails for any reason, fall back to the legacy per-session upload.
-            pass
+        a.onloadedmetadata = () => {
+          window.clearTimeout(t);
+          const d = a.duration;
+          if (typeof d === "number" && isFinite(d) && d > 0) return done(Math.round(d * 1000));
+          return done(fallback);
+        };
+        a.onerror = () => {
+          window.clearTimeout(t);
+          return done(fallback);
+        };
 
-    # Legacy path: per-session unique blob (no caching).
-    blob_name = _tts_blob_name(session_id=session_id, voice_id=voice_id, text=text)
-    mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
-    return _azure_upload_mp3_and_get_sas_url(blob_name=blob_name, mp3_bytes=mp3_bytes)
+        a.src = url;
+      });
 
-# ----------------------------
-# STEP A (Latency): TTS Cache Prewarm (Azure Blob)
-# ----------------------------
-# Objective:
-#   Pre-generate a small set of common system phrases into the deterministic Azure Blob cache so that
-#   first-use latency for these phrases is near-zero after a cold start/restart.
-#
-# Safety properties:
-#   - Backend-only change; no frontend impact.
-#   - Fire-and-forget: does not block application startup.
-#   - Fail-open: any error during prewarm is ignored; normal runtime behavior is unchanged.
-#   - Uses the same TTS/cache path as production (/chat and /tts/audio-url), so behavior is consistent.
-#
-# Controls:
-#   TTS_PREWARM_ENABLED=1|0   (default: 1)
-#   TTS_PREWARM_VOICE_ID=<elevenlabs_voice_id>  (optional; if missing, prewarm is skipped)
-#   TTS_PREWARM_PHRASES_JSON='["Hello!", "..."]' (optional override)
+    const durationMsPromise = probeAudioDurationMs(audioUrl, fallbackMs);
 
-_TTS_PREWARM_ENABLED = (os.getenv("TTS_PREWARM_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+    const speakPayload = {
+      type: "audio",
+      audio_url: audioUrl,
+      audioType: "audio/mpeg",
+    } as any;
 
-# We deliberately do NOT guess a voice_id from companion here because this is backend-only and we want
-# to avoid unintended cross-companion behavior. If you want prewarm for a specific voice, set it explicitly.
-_TTS_PREWARM_VOICE_ID = (os.getenv("TTS_PREWARM_VOICE_ID", "") or "").strip()
+    let spoke = false;
 
-_DEFAULT_PREWARM_PHRASES: list[str] = [
-    "Hello!",
-    "Hi there!",
-    "How can I help you today?",
-    "Sure.",
-    "Okay.",
-    "Got it.",
-    "All set.",
-]
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const mgr = didAgentMgrRef.current;
+      if (!mgr) {
+        callDidNotSpeak();
+        return;
+      }
 
-def _load_prewarm_phrases() -> list[str]:
-    raw = (os.getenv("TTS_PREWARM_PHRASES_JSON", "") or "").strip()
-    if not raw:
-        return list(_DEFAULT_PREWARM_PHRASES)
-    try:
-        v = json.loads(raw)
-        if isinstance(v, list):
-            out: list[str] = []
-            for item in v:
-                s = str(item or "").strip()
-                if s:
-                    out.append(s)
-            return out or list(_DEFAULT_PREWARM_PHRASES)
-    except Exception:
-        pass
-    return list(_DEFAULT_PREWARM_PHRASES)
+      try {
+        callWillSpeakOnce();
+        await mgr.speak(speakPayload);
+        spoke = true;
+        break;
+      } catch (e) {
+        if (attempt === 0 && isDidSessionError(e)) {
+          console.warn("D-ID session error during speak; reconnecting and retrying...", e);
+          await reconnectLiveAvatar();
+          continue;
+        }
+        console.warn("D-ID speak failed:", e);
+        setAvatarError(formatDidError(e));
+        callDidNotSpeak();
+        return;
+      }
+    }
 
-async def _tts_prewarm_task() -> None:
-    if not _TTS_PREWARM_ENABLED:
-        return
-    if not _TTS_PREWARM_VOICE_ID:
-        # No explicit voice configured; skip prewarm to avoid generating for the wrong companion.
-        return
+    if (!spoke) {
+      callDidNotSpeak();
+      return;
+    }
 
-    phrases = _load_prewarm_phrases()
-    # Use a fixed session id; caching ignores session id when _TTS_CACHE_ENABLED is on.
-    sid = "prewarm"
-    for phrase in phrases:
-        try:
-            # run the synchronous generator in a thread to avoid blocking the event loop
-            await run_in_threadpool(_tts_audio_url_sync, sid, _TTS_PREWARM_VOICE_ID, phrase)
-        except Exception:
-            # fail-open: ignore
-            continue
+    // Wait for audio playback to finish (plus buffer) before allowing STT to resume.
+    const durationMs = await durationMsPromise;
+    const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
+    await new Promise((r) => window.setTimeout(r, waitMs));
+  },
+  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
+);
 
-@app.on_event("startup")
-async def _startup_tts_prewarm() -> None:
-    # Fire-and-forget. Do not await; do not block startup.
-    try:
-        asyncio.create_task(_tts_prewarm_task())
-    except Exception:
-        pass
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const key = "ELARALO_SESSION_ID";
+    let id = window.sessionStorage.getItem(key);
+    if (!id) {
+      id = (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      window.sessionStorage.setItem(key, id);
+    }
+    sessionIdRef.current = id;
+  }, []);
 
-# ----------------------------
-# STEP B (Latency): Cache-first TTS for audio/video (rule-preserving)
-# ----------------------------
-# Rule: For audio and live-avatar flows, do NOT return assistant text before audio/video is ready.
-# This step therefore keeps /chat synchronous when voice_id is present, but adds a cache-first fast path
-# to avoid an ElevenLabs call on repeats. It also adds a lightweight "inflight" marker so /tts/audio-url
-# can wait briefly for another request/worker that is already generating the same cached blob.
-#
-# No default voice is introduced; this engages only when the frontend supplies voice_id (as today).
-#
-# Controls:
-#   TTS_CHAT_CACHE_FIRST=1|0     (default: 1)
-#   TTS_INFLIGHT_WAIT_MS=1500    (default: 1500ms)
-#   TTS_INFLIGHT_STALE_S=90      (default: 90s)
-#   TTS_INFLIGHT_DIR=/home/tts_inflight
+  const [input, setInput] = useState("");
+  const inputElRef = useRef<HTMLInputElement | null>(null);
+  const [messages, setMessages] = useState<Msg[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
+  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
+  const [savingSummary, setSavingSummary] = useState(false);
+  const clearEpochRef = useRef(0);
 
-_TTS_CHAT_CACHE_FIRST = (os.getenv("TTS_CHAT_CACHE_FIRST", "1") or "1").strip().lower() not in {"0","false","no","off"}
-_TTS_INFLIGHT_WAIT_MS = max(0, int(os.getenv("TTS_INFLIGHT_WAIT_MS", "1500") or "1500"))
-_TTS_INFLIGHT_STALE_S = max(10, int(os.getenv("TTS_INFLIGHT_STALE_S", "90") or "90"))
-_TTS_INFLIGHT_DIR = (os.getenv("TTS_INFLIGHT_DIR", "/home/tts_inflight") or "/home/tts_inflight").strip()
+  const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
-def _inflight_marker_path(cache_blob_name: str) -> str:
-    h = hashlib.sha256((cache_blob_name or "").encode("utf-8")).hexdigest()[:40]
-    return os.path.join(_TTS_INFLIGHT_DIR, f"{h}.lock")
+  const [sessionState, setSessionState] = useState<SessionState>({
+    mode: "friend",
+    model: "gpt-4o",
+    adult_verified: false,
+    romance_consented: false,
+    explicit_consented: false,
+    pending_consent: null,
+  });
 
-def _touch_inflight_marker(cache_blob_name: str) -> None:
-    try:
-        os.makedirs(_TTS_INFLIGHT_DIR, exist_ok=True)
-        with open(_inflight_marker_path(cache_blob_name), "w", encoding="utf-8") as f:
-            f.write(str(int(time.time())))
-    except Exception:
-        pass
-
-def _clear_inflight_marker(cache_blob_name: str) -> None:
-    try:
-        p = _inflight_marker_path(cache_blob_name)
-        if os.path.exists(p):
-            os.remove(p)
-    except Exception:
-        pass
-
-def _inflight_marker_is_fresh(cache_blob_name: str) -> bool:
-    try:
-        p = _inflight_marker_path(cache_blob_name)
-        if not os.path.exists(p):
-            return False
-        age = time.time() - os.path.getmtime(p)
-        return age >= 0 and age <= _TTS_INFLIGHT_STALE_S
-    except Exception:
-        return False
-
-def _tts_cache_peek_sync(voice_id: str, text: str) -> Optional[str]:
-    """Cache-only lookup: returns SAS URL if deterministic cache blob exists, else None."""
-    if not _TTS_CACHE_ENABLED:
-        return None
-    t = (text or "").strip()
-    if not t:
-        return None
-    cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=t)
-    try:
-        from azure.storage.blob import BlobServiceClient  # type: ignore
-        storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
-        if not storage_conn_str:
-            return None
-        blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
-        container_client = blob_service.get_container_client(_TTS_CONTAINER)
-        blob_client = container_client.get_blob_client(cache_blob)
-        try:
-            if blob_client.exists():
-                return _azure_blob_sas_url(blob_name=cache_blob)
-        except Exception:
-            try:
-                blob_client.get_blob_properties()
-                return _azure_blob_sas_url(blob_name=cache_blob)
-            except Exception:
-                return None
-    except Exception:
-        return None
-    return None
+  const [planName, setPlanName] = useState<PlanName>(null);
+  const [memberId, setMemberId] = useState<string>("");
 
 
+  // Lightweight viewer auto-refresh: if you're not the host, keep polling until the host creates/starts the event.
+  // This avoids requiring manual page refresh for viewers waiting on the host.
+  useEffect(() => {
+    // Only poll while we are explicitly waiting and we don't yet have an embed URL.
+    if (avatarStatus !== "waiting") return;
+    if (streamEmbedUrl) return;
+
+    let cancelled = false;
+    const intervalMs = 3000;
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            brand: companyName,
+            avatar: companionName,
+            memberId: memberId || "",
+            embedDomain: typeof window !== "undefined" ? window.location.hostname : "",
+          }),
+        });
+
+        if (!res.ok) return;
+
+        const data = await res.json();
+        if (cancelled) return;
+
+        const eventRef = String(data?.eventRef || "").trim();
+        let embedUrl = String(data?.embedUrl || "").trim();
+        if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
+
+        // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
+        if (embedUrl) {
+          setStreamEventRef(eventRef);
+          setStreamEmbedUrl(embedUrl);
+
+          // Viewers can never "start", so we keep canStart false.
+          setStreamCanStart(false);
+
+          if (data?.message) setStreamNotice(String(data.message));
+        } else if (data?.message) {
+          setStreamNotice(String(data.message));
+        }
+      } catch (e) {
+        // Ignore transient failures; keep polling.
+      }
+    };
+
+    // Kick once immediately, then interval.
+    void poll();
+    const t = window.setInterval(() => {
+      void poll();
+    }, intervalMs);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
+  const [loggedIn, setLoggedIn] = useState<boolean>(false);
+  // True once we have received the Wix postMessage handoff (plan + companion).
+  // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
+  const [handoffReady, setHandoffReady] = useState<boolean>(false);
+  const [showModePicker, setShowModePicker] = useState(false);
+  const [setModeFlash, setSetModeFlash] = useState(false);
+  const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
+  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
+
+  const goToMyElaralo = useCallback(() => {
+    const url = "https://www.elaralo.com/myelaralo";
+
+    // If running inside an iframe, attempt to navigate the *top* browsing context
+    // so we leave the embed and avoid “stacked headers”.
+    try {
+      if (window.top && window.top !== window.self) {
+        window.top.location.href = url;
+        return;
+      }
+    } catch (e) {
+        // Cross-origin access to window.top can throw.
+    }
+
+    // Alternate attempt that may still target the top browsing context.
+    try {
+      window.open(url, "_top");
+      return;
+    } catch (e) {
+        // ignore
+    }
+
+    // Fallback: navigate the current frame.
+    window.location.href = url;
+  }, []);
+
+  const goToUpgrade = useCallback(() => {
+    const url = upgradeUrl;
+
+    // If running inside an iframe, attempt to navigate the *top* browsing context
+    // so we leave the embed and avoid “stacked headers”.
+    try {
+      if (window.top && window.top !== window.self) {
+        window.top.location.href = url;
+        return;
+      }
+    } catch (e) {
+        // Cross-origin access to window.top can throw.
+    }
+
+    // Alternate attempt that may still target the top browsing context.
+    try {
+      window.open(url, "_top");
+      return;
+    } catch (e) {
+        // ignore
+    }
+
+    // Fallback: navigate the current frame.
+    window.location.href = url;
+  }, [upgradeUrl]);
 
 
-# ----------------------------
-# CHAT (Optimized: optional audio_url in same response)
-# ----------------------------
-@app.post("/chat", response_model=None)
-async def chat(request: Request):
-    """
-    Backward-compatible /chat endpoint.
+  const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
+  const messagesBoxRef = useRef<HTMLDivElement>(null);
 
-    Optimization:
-      If the request includes `voice_id` (or `voiceId`), the API will ALSO generate
-      an ElevenLabs MP3, upload it to Azure Blob, and return `audio_url` in the same
-      /chat response — avoiding a second round-trip to /tts/audio-url.
+  useEffect(() => {
+    const el = messagesBoxRef.current;
+    if (!el) return;
 
-    Request (existing fields):
-      { session_id, messages, session_state, wants_explicit }
+    // Keep scrolling inside the message box so the page itself doesn't "jump"
+    el.scrollTop = el.scrollHeight;
+  }, [messages, loading]);
 
-    Additional optional fields:
-      { voice_id: "<elevenlabs_voice_id>" }   or  { voiceId: "<...>" }
-    """
-    debug = bool(getattr(settings, "DEBUG", False))
+  // Speech-to-text (Web Speech API): "hands-free" mode
+  // - User clicks mic once to start/stop
+  // - Auto-sends after 2s of silence
+  // - Automatically restarts recognition when it stops (browser behavior)
+  const sttRecRef = useRef<any>(null);
+  const sttSilenceTimerRef = useRef<number | null>(null);
+  const sttRestartTimerRef = useRef<number | null>(null);
+  const sttRecoverTimerRef = useRef<number | null>(null);
+  const sttAudioCaptureFailsRef = useRef<number>(0);
+  const sttLastAudioCaptureAtRef = useRef<number>(0);
 
-    raw = await request.json()
-    session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
+  const sttFinalRef = useRef<string>("");
+  const sttInterimRef = useRef<string>("");
+  const sttIgnoreUntilRef = useRef<number>(0); // suppress STT while avatar is speaking (prevents feedback loop)
+
+  const [sttEnabled, setSttEnabled] = useState(false);
+  const [sttRunning, setSttRunning] = useState(false);
+  const [sttError, setSttError] = useState<string | null>(null);
+  // Track whether the user has already granted microphone access in this session.
+  // On iOS Web Speech, this becomes true on SpeechRecognition.onstart (after the permission prompt).
+  const [micGranted, setMicGranted] = useState(false);
+  const micGrantedRef = useRef<boolean>(false);
+
+  // If a voice greeting is requested before mic permission is granted, we queue it here and
+  // play it as soon as both mic permission + (for live) the avatar connection are ready.
+  const pendingGreetingModeRef = useRef<("live" | "audio") | null>(null);
+
+
+  // iOS: prefer backend STT (MediaRecorder → /stt/transcribe) for **audio-only** mode.
+  // Browser SpeechRecognition can be flaky on iOS (especially after auto-restarts).
+  const [backendSttAvailable, setBackendSttAvailable] = useState(true);
+
+  // These state setters exist to trigger renders when backend STT updates refs (mobile stability).
+  // We intentionally ignore the state values to avoid UI changes.
+  const [, setSttInterim] = useState<string>("");
+  const [, setSttFinal] = useState<string>("");
+
+  const sttEnabledRef = useRef<boolean>(false);
+  useEffect(() => {
+    micGrantedRef.current = micGranted;
+  }, [micGranted]);
+
+  const sttPausedRef = useRef<boolean>(false);
+  // Backend STT (iOS-safe): record mic audio via getUserMedia + MediaRecorder and transcribe server-side.
+  const backendSttInFlightRef = useRef<boolean>(false);
+  const backendSttAbortRef = useRef<AbortController | null>(null);
+  const backendSttStreamRef = useRef<MediaStream | null>(null);
+  const backendSttRecorderRef = useRef<MediaRecorder | null>(null);
+  const backendSttAudioCtxRef = useRef<AudioContext | null>(null);
+  const backendSttRafRef = useRef<number | null>(null);
+  const backendSttHardStopTimerRef = useRef<number | null>(null);
+  const backendSttLastVoiceAtRef = useRef<number>(0);
+  const backendSttHasSpokenRef = useRef<boolean>(false);
+
+
+  const getEmbedHint = useCallback(() => {
+    if (typeof window === "undefined") return "";
+    const hint =
+      " (If this page is embedded, ensure the embed/iframe allows microphone access.)";
+    try {
+      return window.self !== window.top ? hint : "";
+    } catch (e) {
+        return hint;
+    }
+  }, []);
+
+
+  // Greeting once per browser session per companion
+// Fix: if companionName arrives AFTER the initial greeting timer (e.g., slow Wix postMessage),
+// we may have already inserted the default "Elara" greeting. If the user hasn't typed yet,
+// replace the greeting so it matches the selected companion.
+useEffect(() => {
+  if (typeof window === "undefined") return;
+
+  const desiredName =
+    (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+
+  const keyName = normalizeKeyForFile(desiredName);
+  const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
+
+  const tmr = window.setTimeout(() => {
+    const already = sessionStorage.getItem(greetKey) === "1";
+    const greetingText = greetingFor(desiredName);
+
+    const greetingMsg: Msg = {
+      role: "assistant",
+      content: greetingText,
+    };
+
+    setMessages((prev) => {
+      // If no messages yet, insert greeting only if we elara't greeted this companion in this session.
+      if (prev.length === 0) {
+        return already ? prev : [greetingMsg];
+      }
+
+      // If the only existing message is a greeting for a different companion (and no user messages yet),
+      // replace it so the name matches the current companion.
+      if (prev.length === 1 && prev[0].role === "assistant") {
+        const existing = String((prev[0] as any)?.content ?? "");
+        const m = existing.match(/^Hi,\s*(.+?)\s+here\./i);
+        const existingName = m?.[1]?.trim();
+        if (existingName && existingName.toLowerCase() !== desiredName.toLowerCase()) {
+          return [{ ...prev[0], content: greetingText }];
+        }
+      }
+
+      return prev;
+    });
+
+    if (!already) sessionStorage.setItem(greetKey, "1");
+  }, 150);
+
+  return () => window.clearTimeout(tmr);
+}, [companionName]);
+
+  function showUpgradeMessage(requestedMode: Mode) {
+    const modeLabel = MODE_LABELS[requestedMode];
+    const msg =
+      `The requested mode (${modeLabel}) isn't available on your current plan. ` +
+      `Please upgrade here: ${upgradeUrl} or click the upgrade button below the text input box`;
+
+    setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
+  }
+
+  // Receive plan + companion from Wix postMessage
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+  if (!isAllowedOrigin(event.origin)) return;
+
+  // Wix HTML components sometimes deliver the payload as a JSON string.
+  // Accept both object and string forms.
+  let data: any = (event as any).data;
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch (e) {
+        return;
+    }
+  }
+
+  if (!data || typeof data !== "object" || (data as any).type !== "MEMBER_PLAN") return;
+
+      // loggedIn must come from Wix; do NOT infer from memberId.
+      const incomingLoggedIn = (data as any).loggedIn;
+      if (typeof incomingLoggedIn === "boolean") {
+        setLoggedIn(incomingLoggedIn);
+      } else {
+        setLoggedIn(false);
+      }
+
+      const incomingPlan = normalizePlanName((data as any).planName);
+
+      // Optional white-label brand handoff from Wix.
+      // - Elaralo site should send: { rebrandingKey: "" }
+      // - Rebranding sites should send the full RebrandingKey (pipe-delimited).
+      //
+      // IMPORTANT: This must never alter STT/TTS start/stop code paths.
+      let rawRebrandingKey = "";
+
+      if (
+        "rebrandingKey" in (data as any) ||
+        "rebranding_key" in (data as any) ||
+        "RebrandingKey" in (data as any) ||
+        "rebrandingkey" in (data as any)
+      ) {
+        rawRebrandingKey =
+          typeof (data as any).rebrandingKey === "string"
+            ? String((data as any).rebrandingKey)
+            : typeof (data as any).rebranding_key === "string"
+              ? String((data as any).rebranding_key)
+              : typeof (data as any).rebrandingkey === "string"
+                ? String((data as any).rebrandingkey)
+                : typeof (data as any).RebrandingKey === "string"
+                  ? String((data as any).RebrandingKey)
+                  : "";
+        rawRebrandingKey = rawRebrandingKey.trim();
+
+        // Allow empty string to explicitly clear any previous rebranding state.
+        setRebrandingKey(rawRebrandingKey);
+      } else if ("rebranding" in (data as any)) {
+        // Legacy support: some older Wix pages may still send { rebranding: "BrandName" }.
+        rawRebrandingKey = typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
+        if (rawRebrandingKey) setRebrandingKey(rawRebrandingKey);
+      }
+
+      const rkParts = parseRebrandingKey(rawRebrandingKey);
+      const rebrandSlugFromMessage = normalizeRebrandingSlug(rkParts?.rebranding || "");
+
+
+
+
+      const incomingMemberId =
+        typeof (data as any).memberId === "string"
+          ? String((data as any).memberId).trim()
+          : typeof (data as any).member_id === "string"
+            ? String((data as any).member_id).trim()
+            : "";
+      setMemberId(incomingMemberId);
+
+      // When RebrandingKey is present, use ElaraloPlanMap for capability gating
+      // (Wix planName may be the rebrand site's plan names like "Supreme").
+      const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
+      const hasEntitledPlan = Boolean((mappedPlanFromKey || incomingPlan).trim());
+      const effectivePlan: PlanName = hasEntitledPlan ? (mappedPlanFromKey || incomingPlan) : "Trial";
+      setPlanName(effectivePlan);
+
+      // Display the rebranding site's plan label when provided (e.g., "Supreme"),
+      // but only for logged-in members (Free Trial ignores plan labels by design).
+      const planLabel = incomingMemberId ? String(rkParts?.plan || "").trim() : "";
+      setPlanLabelOverride(planLabel);
+
+      const incomingCompanion =
+        typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
+      const resolvedCompanionKey = incomingCompanion || "";
+      const { baseKey } = splitCompanionKey(resolvedCompanionKey);
+
+      if (resolvedCompanionKey) {
+        setCompanionKeyRaw(resolvedCompanionKey);
+        const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
+        setCompanionKey(parsed.key);
+        setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
+
+        // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
+        setSessionState((prev) => ({
+          ...prev,
+          companion: parsed.key,
+          companionName: parsed.key,
+          companion_name: parsed.key,
+        }));
+      } else {
+        setCompanionKeyRaw("");
+        setCompanionKey("");
+        setCompanionName(DEFAULT_COMPANION_NAME);
+
+        setSessionState((prev) => ({
+          ...prev,
+          companion: DEFAULT_COMPANION_NAME,
+          companionName: DEFAULT_COMPANION_NAME,
+          companion_name: DEFAULT_COMPANION_NAME,
+        }));
+      }
+
+      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, rebrandSlugFromMessage);
+      pickFirstLoadableImage(avatarCandidates).then((picked) => setAvatarSrc(picked));
+
+      // Brand-default starting mode:
+      // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
+      // - Fallback: entitled plans default to Intimate, Trial/visitors default to Romantic.
+      const desiredStartMode: Mode =
+        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) || (hasEntitledPlan ? "intimate" : "romantic");
+
+      const nextAllowed = allowedModesForPlan(effectivePlan);
+      setAllowedModes(nextAllowed);
+
+      setSessionState((prev) => {
+        let nextMode: Mode = prev.mode;
+
+        // If the previous mode is the default placeholder (Friend) or no longer allowed,
+        // snap to the brand-default start mode (if allowed).
+        if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
+          nextMode = desiredStartMode;
+        } else if (!nextAllowed.includes(nextMode)) {
+          nextMode = "friend";
+        }
+
+        if (nextMode === prev.mode) return prev;
+        return { ...prev, mode: nextMode, pending_consent: null };
+      });
+
+      // Mark handoff ready so the first audio-only TTS can deterministically use the selected companion voice.
+      setHandoffReady(true);
+    }
+
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+
+    const session_id =
+      sessionIdRef.current ||
+      (crypto as any).randomUUID?.() ||
+      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+const wants_explicit = stateToSend.mode === "intimate";
+
+// Ensure backend receives the selected companion so it can apply the correct persona.
+// Without this, the backend may fall back to the default companion ("Elara") even when the UI shows another.
+const companionForBackend =
+  (companionKey || "").trim() ||
+  (companionName || DEFAULT_COMPANION_NAME).trim() ||
+  DEFAULT_COMPANION_NAME;
+
+
+// NOTE:
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || "core").trim();
+const brandKey = safeBrandKey(rawBrand);
+
+// For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
+const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
+
+// If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
+// from the rebranding key so backend quota comes from the mapped Elaralo plan.
+
+// `loggedIn` is only available when the Wix parent posts it.
+const hasEntitledPlan = !!((memberId || "").trim() && loggedIn === true && !!planName && planName !== "Trial");
+const rebrandingKeyForBackend = hasEntitledPlan
+  ? stripTrialControlsFromRebrandingKey(rebrandingKey || "")
+  : (rebrandingKey || "");
+
+    const stateToSendWithCompanion: SessionState = {
+  ...stateToSend,
+  companion: companionForBackend,
+  // Backward/forward compatibility with any backend expecting different field names
+  companionName: companionForBackend,
+  companion_name: companionForBackend,
+  // Member identity (from Wix)
+  memberId: (memberIdForBackend || "").trim(),
+  member_id: (memberIdForBackend || "").trim(),
+
+  // Plan for entitlements (use mapped Elaralo plan when rebrandingKey provides one)
+  planName: (planName || "").trim(),
+  plan_name: (planName || "").trim(),
+
+  // Optional display label (white-label plan name). Backend can use this for messaging only.
+  planLabelOverride: (planLabelOverride || "").trim(),
+  plan_label_override: (planLabelOverride || "").trim(),
+
+  // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
+  rebrandingKey: (rebrandingKeyForBackend || "").trim(),
+  rebranding_key: (rebrandingKeyForBackend || "").trim(),
+  RebrandingKey: (rebrandingKeyForBackend || "").trim(),
+  // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
+  rebranding: (rebranding || "").trim(),
+};
+
+    const res = await fetch(`${API_BASE}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id,
+        wants_explicit,
+        session_state: stateToSendWithCompanion,
+        messages: trimMessagesForChat(nextMessages).map((m) => ({ role: m.role, content: m.content })),
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Backend error ${res.status}: ${errText}`);
+    }
+
+    return (await res.json()) as ChatApiResponse;
+  }
+
+  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+
+    const session_id =
+      sessionIdRef.current ||
+      (crypto as any).randomUUID?.() ||
+      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    const companionForBackend =
+      (companionKey || "").trim() ||
+      (companionName || DEFAULT_COMPANION_NAME).trim() ||
+      DEFAULT_COMPANION_NAME;
+
+    const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
+
     
-    voice_id = _extract_voice_id(raw)
+// NOTE:
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || "core").trim();
+const brandKey = safeBrandKey(rawBrand);
 
-    # ----------------------------
-    # Usage / minutes enforcement
-    # ----------------------------
-    # Rule: If we do NOT have a memberId, the visitor is on Free Trial (IP-based identity).
-    # Every plan (including subscriptions) has a minute budget. When exhausted, we return a pay/upgrade message.
-    member_id = _extract_member_id(session_state)
-    plan_name_raw = _extract_plan_name(session_state)
+// For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
+const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
 
-    # RebrandingKey (Wix) overrides (upgrade/pay links + quota settings) when present.
-    # Wix provides: Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
-    rebranding_key_raw = _extract_rebranding_key(session_state)
+// If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
+// from the rebranding key so backend quota comes from the mapped Elaralo plan.
+const hasEntitledPlan = !!((memberId || "").trim() && !!loggedIn && !!planName && planName !== "Trial");
+const rebrandingKeyForBackend = hasEntitledPlan
+  ? stripTrialControlsFromRebrandingKey(rebrandingKey || "")
+  : (rebrandingKey || "");
 
-    # NOTE: RebrandingKey validation is performed in Wix (Velo) before sending to this API.
-    # Server-side validation is intentionally disabled to avoid breaking existing Wix flows.
-    # If Wix-side validation is removed, you can enable the validator by uncommenting below:
-    # ok, err = _validate_rebranding_key_server_side(rebranding_key_raw)
-    # if not ok:
-    #     _dbg(debug, f"[RebrandingKey] rejected: {err}")
-    #     rebranding_key_raw = ""
-    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+  const stateToSendWithCompanion: SessionState = {
+      ...stateToSend,
+      companion: companionForBackend,
+      companionName: companionForBackend,
+      companion_name: companionForBackend,
+      planName: effectivePlanForBackend,
+      plan_name: effectivePlanForBackend,
+      plan: effectivePlanForBackend,
+      memberId: (memberIdForBackend || "").trim(),
+      member_id: (memberIdForBackend || "").trim(),
 
-    # Prefer explicit fields (if provided) and fall back to the parsed RebrandingKey.
-    upgrade_link_override = _session_get_str(session_state, "upgrade_link", "upgradeLink") or rebranding_parsed.get("upgrade_link", "")
-    pay_go_link_override = _session_get_str(session_state, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
-    pay_go_price = _session_get_str(session_state, "pay_go_price", "payGoPrice") or rebranding_parsed.get("pay_go_price", "")
-    pay_go_minutes_raw = _session_get_str(session_state, "pay_go_minutes", "payGoMinutes") or rebranding_parsed.get("pay_go_minutes", "")
-    plan_external = (
-        _session_get_str(session_state, "rebranding_plan", "rebrandingPlan", "planExternal", "plan_external")
-        or rebranding_parsed.get("plan", "")
-    )
-    plan_map = _session_get_str(session_state, "elaralo_plan_map", "elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map", "")
-    free_minutes_raw = _session_get_str(session_state, "free_minutes", "freeMinutes") or rebranding_parsed.get("free_minutes", "")
-    cycle_days_raw = _session_get_str(session_state, "cycle_days", "cycleDays") or rebranding_parsed.get("cycle_days", "")
+  // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
+  rebrandingKey: (rebrandingKeyForBackend || "").trim(),
+  rebranding_key: (rebrandingKeyForBackend || "").trim(),
+  RebrandingKey: (rebrandingKeyForBackend || "").trim(),
+  // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
+  rebranding: (rebranding || "").trim(),
+};
 
-    pay_go_minutes = _safe_int(pay_go_minutes_raw)
-    free_minutes = _safe_int(free_minutes_raw)
-    cycle_days = _safe_int(cycle_days_raw)
+    const res = await fetch(`${API_BASE}/chat/save-summary`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id,
+        session_state: stateToSendWithCompanion,
+        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+      }),
+    });
 
-    is_trial = not bool(member_id)
-    identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
-
-    # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
-    minutes_allowed_override: Optional[int] = None
-    if free_minutes is not None:
-        minutes_allowed_override = free_minutes
-    elif plan_map:
-        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
-
-    cycle_days_override: Optional[int] = None
-    if cycle_days is not None:
-        cycle_days_override = cycle_days
-
-    # Plan name used for quota purposes (fallback) should use the mapped plan if provided.
-    plan_name_for_limits = plan_map or plan_name_raw
-
-    # Plan label shown to the user should use the external plan name (if provided).
-    plan_label_for_messages = plan_external or plan_name_raw
-
-    # For rebranding, construct PAYG_PRICE_TEXT as:
-    #   PayGoPrice + " per " + PayGoMinutes + " minutes"
-    is_rebranding = bool(rebranding_key_raw or plan_external or plan_map or upgrade_link_override or pay_go_link_override or pay_go_price)
-
-    payg_price_text_override = ""
-    if is_rebranding:
-        minutes_part = ""
-        if pay_go_minutes is not None:
-            minutes_part = str(pay_go_minutes)
-        else:
-            minutes_part = str(pay_go_minutes_raw or "").strip()
-        if pay_go_price and minutes_part:
-            payg_price_text_override = f"{pay_go_price} per {minutes_part} minutes"
-
-    usage_ok, usage_info = await run_in_threadpool(
-        _usage_charge_and_check_sync,
-        identity_key,
-        is_trial=is_trial,
-        plan_name=plan_name_for_limits,
-        minutes_allowed_override=minutes_allowed_override,
-        cycle_days_override=cycle_days_override,
-    )
-
-
-    # Special-case: allow "minutes remaining" questions to return a status message
-    # even when minutes are exhausted (no OpenAI call).
-    probe_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-    probe_text = ((probe_last_user.get("content") if probe_last_user else "") or "").strip()
-    is_minutes_balance_query = _is_minutes_balance_question(probe_text)
-
-    if not usage_ok and not is_minutes_balance_query:
-        minutes_allowed = int(
-            usage_info.get("minutes_allowed")
-            or (minutes_allowed_override if minutes_allowed_override is not None else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits)))
-            or 0
-        )
-        session_state_out = dict(session_state)
-        session_state_out.update(
-            {
-                "minutes_exhausted": True,
-                "minutes_used": int(usage_info.get("minutes_used") or 0),
-                "minutes_allowed": int(minutes_allowed),
-                "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
-            }
-        )
-        reply = _usage_paywall_message(
-            is_trial=is_trial,
-            plan_name=plan_label_for_messages,
-            minutes_allowed=minutes_allowed,
-            upgrade_url=upgrade_link_override,
-            payg_pay_url=pay_go_link_override,
-            payg_increment_minutes=pay_go_minutes,
-            payg_price_text=payg_price_text_override,
-        )
-        return {
-            "session_id": session_id,
-            "mode": STATUS_SAFE,
-            "reply": reply,
-            "session_state": session_state_out,
-            "audio_url": None,
-        }
-
-# Best-effort retrieval of a previously saved chat summary.
-    # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
-    saved_summary: str | None = None
-    memory_key: str | None = None
-    try:
-        # Use the exact same keying logic as /chat/save-summary, otherwise retrieval will miss.
-        # If memberId is present but companion is missing/empty, _summary_store_key() returns 'unknown'
-        # and we deliberately do NOT inject memory (prevents cross-companion leakage).
-        key = _summary_store_key(session_state, session_id)
-        if key.startswith('session::'):
-            memory_key = key
-        else:
-            # memberId-based key: require a real companion key
-            if key.endswith('::unknown'):
-                memory_key = None
-            else:
-                memory_key = key
-
-        if memory_key:
-            _refresh_summary_store_if_needed()
-            rec = _CHAT_SUMMARY_STORE.get(memory_key) or {}
-            s = rec.get('summary')
-            if isinstance(s, str) and s.strip():
-                saved_summary = s.strip()
-    except Exception:
-        saved_summary = None
-        memory_key = None
-
-    # Helper to build responses consistently and optionally include audio_url.
-    async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
-        audio_url: Optional[str] = None
-        if voice_id and (reply or "").strip():
-            try:
-                if _TTS_CHAT_CACHE_FIRST and _TTS_CACHE_ENABLED:
-                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, reply)
-                if audio_url is None:
-                    audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply)
-            except Exception as e:
-                # Fail-open: never break chat because TTS failed
-                _dbg(debug, "TTS generation failed:", repr(e))
-                state_out = dict(state_out)
-                state_out["tts_error"] = f"{type(e).__name__}: {e}"
-
-        return {
-            "session_id": session_id,
-            "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
-            "reply": reply,
-            "session_state": state_out,
-            "audio_url": audio_url,       # NEW (optional)
-        }
-
-    # If the user is asking about their remaining minutes, answer deterministically
-    # (no OpenAI call). This also works when minutes are exhausted.
-    if is_minutes_balance_query:
-        minutes_used = int(usage_info.get("minutes_used") or 0)
-        minutes_allowed = int(usage_info.get("minutes_allowed") or 0)
-        minutes_remaining = int(usage_info.get("minutes_remaining") or 0)
-
-        effective_cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
-
-        session_state_out = dict(session_state)
-        session_state_out.update(
-            {
-                "minutes_exhausted": minutes_remaining <= 0,
-                "minutes_used": minutes_used,
-                "minutes_allowed": minutes_allowed,
-                "minutes_remaining": minutes_remaining,
-            }
-        )
-        # Ensure mode is always present for the frontend.
-        session_state_out["mode"] = session_state_out.get("mode") or "friend"
-
-        reply = _usage_status_message(
-            is_trial=is_trial,
-            plan_name=plan_label_for_messages,
-            minutes_used=minutes_used,
-            minutes_allowed=minutes_allowed,
-            minutes_remaining=minutes_remaining,
-            cycle_days=effective_cycle_days,
-            upgrade_url=upgrade_link_override,
-            payg_pay_url=pay_go_link_override,
-            payg_increment_minutes=pay_go_minutes,
-            payg_price_text=payg_price_text_override,
-        )
-        return await _respond(reply, STATUS_SAFE, session_state_out)
-
-    # last user message
-    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-    user_text = ((last_user.get("content") if last_user else "") or "").strip()
-    normalized_text = user_text.lower().strip()
-
-    # allow text-based mode switching
-    detected_switch = _detect_mode_switch_from_text(user_text)
-    if detected_switch:
-        session_state["mode"] = detected_switch
-
-    requested_mode = _normalize_mode(str(session_state.get("mode") or "friend"))
-    requested_intimate = (requested_mode == "intimate")
-
-    # authoritative consent flag should live in session_state (works across gunicorn workers)
-    intimate_allowed = bool(session_state.get("explicit_consented") is True)
-
-    # if user is requesting intimate OR the UI is in intimate mode, treat as intimate request
-    user_requesting_intimate = wants_explicit or requested_intimate or _looks_intimate(user_text)
-
-    # consent keywords
-    CONSENT_YES = {
-        "yes", "y", "yeah", "yep", "sure", "ok", "okay",
-        "i consent", "i agree", "i confirm", "confirm",
-        "i am 18+", "i'm 18+", "i am over 18", "i'm over 18",
-        "i confirm i am 18+", "i confirm that i am 18+",
-        "i confirm and consent",
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Backend error ${res.status}: ${errText}`);
     }
-    CONSENT_NO = {"no", "n", "nope", "nah", "decline", "cancel"}
 
-    pending = (session_state.get("pending_consent") or "")
-    pending = pending.strip().lower() if isinstance(pending, str) else ""
+    return (await res.json()) as any;
+  }
 
-    def _grant_intimate(state_in: Dict[str, Any]) -> Dict[str, Any]:
-        out = dict(state_in)
-        out["adult_verified"] = True
-        out["explicit_consented"] = True
-        out["pending_consent"] = None
-        out["mode"] = "intimate"
-        out["explicit_granted_at"] = _now_ts()
-        return out
+  // This is the mode that drives the UI highlight:
+  // - If backend is asking for intimate consent, keep intimate pill highlighted
+  const effectiveActiveMode: Mode =
+    sessionState.pending_consent === "intimate" ? "intimate" : sessionState.mode;
 
-    # If we are waiting on consent, only accept yes/no
-    if pending == "intimate" and not intimate_allowed:
-        if normalized_text in CONSENT_YES:
-            session_state_out = _grant_intimate(session_state)
-            return await _respond(
-                "Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
-                STATUS_ALLOWED,
-                session_state_out,
-            )
+  const showConsentOverlay =
+    sessionState.pending_consent === "intimate" || chatStatus === "explicit_blocked";
 
-        if normalized_text in CONSENT_NO:
-            session_state_out = dict(session_state)
-            session_state_out["pending_consent"] = None
-            session_state_out["explicit_consented"] = False
-            session_state_out["mode"] = "friend"
-            return await _respond(
-                "No problem — we’ll keep things in Friend mode.",
-                STATUS_SAFE,
-                session_state_out,
-            )
-
-        # still pending; remind
-        session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = "intimate"
-        session_state_out["mode"] = "intimate"  # keep pill highlighted
-        return await _respond(
-            "Please reply with 'yes' or 'no' to continue.",
-            STATUS_BLOCKED,
-            session_state_out,
-        )
-
-    # Start consent if intimate requested but not allowed
-    require_consent = bool(getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True))
-    if require_consent and user_requesting_intimate and not intimate_allowed:
-        session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = "intimate"
-        session_state_out["mode"] = "intimate"
-        return await _respond(
-            "Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
-            STATUS_BLOCKED,
-            session_state_out,
-        )
-
-    # Effective mode for the model (never intimate unless allowed)
-    effective_mode = requested_mode
-    if effective_mode == "intimate" and not intimate_allowed:
-        effective_mode = "friend"
-
-    _dbg(
-        debug,
-        f"/chat session={session_id} requested_mode={requested_mode} effective_mode={effective_mode} "
-        f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending} voice_id={'yes' if voice_id else 'no'}",
-    )
-
-    # call model
-    try:
-        openai_messages = _to_openai_messages(
-            messages,
-            session_state,
-            mode=effective_mode,
-            intimate_allowed=intimate_allowed,
-            debug=debug,
-        )
-
-        # Memory policy: do not guess about prior conversations.
-        # - If a saved summary is injected, you may use ONLY that as cross-session context.
-        # - If no saved summary is injected, explicitly say no saved summary is available if asked.
-        # Platform capability policy:
-        # - This app can speak your replies via TTS / Live Avatar. Do not claim you "don't have TTS".
-        memory_policy = (
-            "Memory rule: Only reference cross-session history if a 'Saved conversation summary' is provided. "
-            "If no saved summary is provided and the user asks about past conversations, say you do not have a saved summary for this companion.\n"
-            "Capability rule: Your replies may be spoken aloud in this app (audio TTS and/or a live avatar). "
-            "Do not say you lack text-to-speech; instead explain that you generate text and the platform voices it."
-        )
-        openai_messages.insert(1, {"role": "system", "content": memory_policy})
-
-        if saved_summary:
-            openai_messages.insert(
-                2,
-                {
-                    "role": "system",
-                    "content": "Saved conversation summary (user-authorized, for reference across devices):\n" + saved_summary,
-                },
-            )
-
-        assistant_reply = _call_gpt4o(openai_messages)
-    except Exception as e:
-        _dbg(debug, "OpenAI call failed:", repr(e))
-        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {e}")
-
-    # echo back session_state (ensure correct mode)
-    session_state_out = dict(session_state)
-    session_state_out["mode"] = effective_mode
-    session_state_out["pending_consent"] = None if intimate_allowed else session_state_out.get("pending_consent")
-    session_state_out["companion_meta"] = _parse_companion_meta(
-        session_state_out.get("companion")
-        or session_state_out.get("companionName")
-        or session_state_out.get("companion_name")
-    )
-
-    return await _respond(
-        assistant_reply,
-        STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
-        session_state_out,
-    )
-
-
-# ----------------------------
-# SAVE CHAT SUMMARY
-# ----------------------------
-# NOTE: This stores summaries server-side (in memory, with optional file persistence).
-# This is intentionally simple; durable storage / retrieval strategy can be evolved
-# incrementally without changing the frontend contract.
-_CHAT_SUMMARY_STORE: Dict[str, Dict[str, Any]] = {}
-_CHAT_SUMMARY_FILE = os.getenv("CHAT_SUMMARY_FILE", "")
-_CHAT_SUMMARY_FILE_MTIME: float = 0.0
-
-# Lock for cross-worker file refresh/write coordination (best-effort).
-# This only synchronizes within a single worker process; cross-worker sync is via atomic file replace + mtime.
-_CHAT_SUMMARY_LOCK = __import__("threading").RLock()
-
-
-def _load_summary_store() -> None:
-    """Best-effort load of persisted summary store.
-
-    Worker-safe behavior for single-instance App Service:
-      - Load from CHAT_SUMMARY_FILE if present.
-      - Clear and replace the in-memory store to match disk.
-      - Track file mtime to enable refresh-on-change across gunicorn workers.
-
-    Fail-open: never crashes the API.
-    """
-    global _CHAT_SUMMARY_FILE_MTIME
-    if not _CHAT_SUMMARY_FILE:
-        return
-    try:
-        if not os.path.isfile(_CHAT_SUMMARY_FILE):
-            return
-        with open(_CHAT_SUMMARY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            _CHAT_SUMMARY_STORE.clear()
-            for k, v in data.items():
-                if isinstance(k, str) and isinstance(v, dict):
-                    _CHAT_SUMMARY_STORE[k] = v
-        try:
-            _CHAT_SUMMARY_FILE_MTIME = os.stat(_CHAT_SUMMARY_FILE).st_mtime
-        except Exception:
-            pass
-    except Exception:
-        # Fail-open
-        return
-
-
-def _refresh_summary_store_if_needed() -> None:
-    """Refresh the in-memory store if the backing file changed.
-
-    This enables cross-worker consistency on a single instance because each gunicorn
-    worker sees the shared filesystem and can reload when another worker writes.
-    """
-    global _CHAT_SUMMARY_FILE_MTIME
-    if not _CHAT_SUMMARY_FILE:
-        return
-    try:
-        st = os.stat(_CHAT_SUMMARY_FILE)
-    except FileNotFoundError:
-        return
-    except Exception:
-        return
-
-    if st.st_mtime <= _CHAT_SUMMARY_FILE_MTIME:
-        return
-
-    with _CHAT_SUMMARY_LOCK:
-        # Re-check inside lock to avoid redundant reloads within this worker
-        try:
-            st2 = os.stat(_CHAT_SUMMARY_FILE)
-        except Exception:
-            return
-        if st2.st_mtime <= _CHAT_SUMMARY_FILE_MTIME:
-            return
-        _load_summary_store()
-
-
-def _normalize_companion_key(raw: Any) -> str:
-    """Normalize a companion identifier for stable keying.
-
-    Used ONLY for storage keys; display names remain unchanged.
-    """
-    s = "" if raw is None else str(raw)
-    s = re.sub(r"\s+", " ", s.strip())
-    # Strip any pipe-appended metadata to keep keys stable across live providers
-    s = s.split("|", 1)[0].strip()
-    return s.lower()
-
-
-def _extract_member_id(session_state: Dict[str, Any]) -> str:
-    member_id = (
-        session_state.get("memberId")
-        or session_state.get("member_id")
-        or session_state.get("member")
-        or ""
-    )
-    return str(member_id).strip() if member_id is not None else ""
-
-
-def _extract_companion_raw(session_state: Dict[str, Any]) -> str:
-    companion = (
-        session_state.get("companion")
-        or session_state.get("companionName")
-        or session_state.get("companion_name")
-        or ""
-    )
-    return str(companion).strip() if companion is not None else ""
-
-
-def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
-    """Stable key using memberId + normalized companion; falls back to session_id.
-
-    IMPORTANT: Companion isolation is enforced by including the normalized companion key.
-    If memberId is present but companion is missing/empty, we deliberately use 'unknown'
-    and retrieval must treat that as 'no saved memory'.
-    """
-    member_id = _extract_member_id(session_state)
-    companion_key = _normalize_companion_key(_extract_companion_raw(session_state))
-
-    if member_id:
-        return f"{member_id}::{companion_key or 'unknown'}"
-    return f"session::{session_id}"
-
-
-def _persist_summary_store() -> None:
-    """Best-effort atomic persistence to a shared file.
-
-    Uses write-to-temp + os.replace to avoid other workers reading partial files.
-    """
-    global _CHAT_SUMMARY_FILE_MTIME
-    if not _CHAT_SUMMARY_FILE:
-        return
-    try:
-        tmp_path = _CHAT_SUMMARY_FILE + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(_CHAT_SUMMARY_STORE, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, _CHAT_SUMMARY_FILE)
-        try:
-            _CHAT_SUMMARY_FILE_MTIME = os.stat(_CHAT_SUMMARY_FILE).st_mtime
-        except Exception:
-            pass
-    except Exception:
-        # Fail-open
-        return
-
-
-# Load persisted summaries once at startup (best-effort).
-_load_summary_store()
-
-
-@app.post("/chat/save-summary", response_model=None)
-async def save_chat_summary(request: Request):
-    """Saves a server-side summary of the chat history.
-
-    Reliability goals:
-      - Never leave the browser with an ambiguous network failure when possible.
-      - Cap inputs to avoid oversized payloads/timeouts.
-      - Return a structured JSON response even when summarization fails.
-
-    Request JSON:
-      { session_id, messages, session_state }
-
-    Response JSON:
-      { ok: true|false, summary?: "...", error_code?: "...", error?: "...", saved_at?: <ts>, key?: "..." }
-    """
-    debug = bool(getattr(settings, "DEBUG", False))
-
-    try:
-        raw = await request.json()
-    except Exception as e:
-        return {"ok": False, "error_code": "invalid_json", "error": f"{type(e).__name__}: {e}"}
-
-    session_id, messages, session_state, _wants_explicit = _normalize_payload(raw)
-
-    # Normalize + cap the conversation for summarization to reduce cost and avoid request failures.
-    max_msgs = int(os.getenv("SAVE_SUMMARY_MAX_MESSAGES", "80") or "80")
-    max_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS", "12000") or "12000")
-    per_msg_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS_PER_MESSAGE", "2000") or "2000")
-
-    convo_items: List[Dict[str, str]] = []
-    for m in messages:
-        role = m.get("role")
-        if role in ("user", "assistant"):
-            content = str(m.get("content") or "")
-            if per_msg_chars > 0 and len(content) > per_msg_chars:
-                content = content[:per_msg_chars] + " …"
-            convo_items.append({"role": role, "content": content})
-
-    if max_msgs > 0 and len(convo_items) > max_msgs:
-        convo_items = convo_items[-max_msgs:]
-
-    # Enforce a total character budget from the end (most recent is most useful).
-    total = 0
-    capped: List[Dict[str, str]] = []
-    for m in reversed(convo_items):
-        c = m["content"]
-        if total >= max_chars:
-            break
-        # keep at least some of this message
-        remaining = max_chars - total
-        if remaining <= 0:
-            break
-        if len(c) > remaining:
-            c = c[-remaining:]
-        capped.append({"role": m["role"], "content": c})
-        total += len(c)
-    convo_items = list(reversed(capped))
-
-    sys = (
-        "You are a concise assistant that creates a server-side chat summary for future context. "
-        "Write a compact summary that captures: relationship tone, key facts, user preferences/boundaries, "
-        "names/roles, and any commitments or plans. Avoid quoting long passages. "
-        "Output plain text only."
-    )
-
-    convo: List[Dict[str, str]] = [{"role": "system", "content": sys}] + convo_items
-
-    # Time-bound the summarization request to prevent upstream timeouts.
-    timeout_s = float(os.getenv("SAVE_SUMMARY_TIMEOUT_S", "30") or "30")
-    try:
-        summary = await asyncio.wait_for(run_in_threadpool(_call_gpt4o_summary, convo), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        return {"ok": False, "error_code": "timeout", "error": f"Save summary timed out after {timeout_s:.0f}s"}
-    except Exception as e:
-        _dbg(debug, "Summary generation failed:", repr(e))
-        return {"ok": False, "error_code": "summary_failed", "error": f"{type(e).__name__}: {e}"}
-
-    # Refresh from disk before write to avoid clobbering another worker's recent update.
-    _refresh_summary_store_if_needed()
-
-    key = _summary_store_key(session_state, session_id)
-    record = {
-        "saved_at": _now_ts(),
-        "session_id": session_id,
-        "member_id": session_state.get("memberId") or session_state.get("member_id"),
-        "companion": session_state.get("companion") or session_state.get("companionName") or session_state.get("companion_name"),
-        "summary": summary,
+  function setModeFromPill(m: Mode) {
+    if (!allowedModes.includes(m)) {
+      showUpgradeMessage(m);
+      return;
     }
-    _CHAT_SUMMARY_STORE[key] = record
-    _persist_summary_store()
 
-    return {"ok": True, "summary": summary, "saved_at": record["saved_at"], "key": key}
+    // Selecting Intimate (18+) requires explicit consent; trigger the consent overlay if not already consented.
+    if (m === "intimate" && !sessionState.explicit_consented) {
+      setChatStatus("explicit_blocked");
+    }
 
+    setSessionState((prev) => {
+      // If switching to intimate and consent is not yet granted, keep pending consent active so the overlay is shown.
+      const nextPending =
+        m === "intimate" && !prev.explicit_consented ? "intimate" : null;
+      return { ...prev, mode: m, pending_consent: nextPending };
+    });
 
-# ----------------------------
-# BACKWARD-COMPAT TTS ENDPOINT (still supported)
-# ----------------------------
-@app.post("/tts/audio-url")
-async def tts_audio_url(request: Request) -> Dict[str, Any]:
-    """
-    Backward compatible endpoint.
+    setMessages((prev) => [...prev, { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` }]);
+  }
 
-    Request JSON:
-      {
-        "session_id": "...",
-        "voice_id": "<ElevenLabsVoiceId>",
-        "text": "..."
+  async function send(textOverride?: string, stateOverride?: Partial<SessionState>) {
+    if (loading) return;
+
+    const rawText = (textOverride ?? input).trim();
+    if (!rawText) return;
+
+    // If the user clears messages mid-flight, we "invalidate" any in-progress send()
+    // so the assistant reply doesn't append into a cleared chat.
+    const epochAtStart = clearEpochRef.current;
+
+    // detect mode switch from prompt text
+    const { mode: detectedMode, cleaned } = detectModeSwitchAndClean(rawText);
+
+    // Plan-gate mode if user is attempting to switch
+    if (detectedMode && !allowedModes.includes(detectedMode)) {
+      showUpgradeMessage(detectedMode);
+      setInput("");
+      return;
+    }
+
+    // If the user message is ONLY a mode switch token, apply locally and don't call backend
+    // e.g. "[mode:romantic]" by itself
+    if (detectedMode && cleaned.length === 0) {
+      setSessionState((prev) => ({ ...prev, mode: detectedMode, pending_consent: null }));
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Mode set to: ${MODE_LABELS[detectedMode]}` },
+      ]);
+      setInput("");
+      return;
+    }
+
+    // Apply mode locally (so pill highlights immediately), but still send message.
+    // If detectedMode is intimate, keep/trigger pending overlay on response.
+    let nextState: SessionState = sessionState;
+    if (detectedMode) {
+      // If we switch away from intimate while consent is pending, clear the pending flag
+      const nextPending = detectedMode === "intimate" ? sessionState.pending_consent : null;
+      nextState = { ...sessionState, mode: detectedMode, pending_consent: nextPending };
+
+      // If user is switching away from intimate, also clear any explicit_blocked overlay state
+      if (detectedMode !== "intimate") {
+        setChatStatus("safe");
       }
 
-    Response JSON:
-      { "audio_url": "https://...sas..." }
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+      setSessionState(nextState);
+    }
 
-    session_id = (body.get("session_id") or body.get("sid") or "").strip()
-    if not session_id:
-        raise HTTPException(status_code=422, detail="session_id required")
+    // Build user message content:
+    // If a [mode:*] token was present, we remove it from content (cleaned) to keep chat natural.
+    const outgoingText = detectedMode ? cleaned : rawText;
 
-    voice_id = ((body.get("voice_id") or body.get("voiceId") or "")).strip()
-    text = (body.get("text") or "").strip()
+    const userMsg: Msg = { role: "user", content: outgoingText };
+    const nextMessages: Msg[] = [...messages, userMsg];
 
-    if not voice_id or not text:
-        raise HTTPException(status_code=422, detail="voice_id and text are required")
+    // If speech-to-text "hands-free" mode is enabled, pause recognition while we send
+    // and while the avatar speaks. We'll auto-resume after speaking finishes.
+    const resumeSttAfter = sttEnabledRef.current;
+    let resumeScheduled = false;
+    if (resumeSttAfter) {
+      pauseSpeechToText();
 
-    try:
-        # STEP B: if another worker/request is already generating the same cached blob, wait briefly.
-        audio_url: Optional[str] = None
-        if _TTS_CACHE_ENABLED and voice_id and text:
-            try:
-                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
-                if _inflight_marker_is_fresh(cache_blob):
-                    waited = 0
-                    while waited < _TTS_INFLIGHT_WAIT_MS:
-                        peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text)
-                        if peek:
-                            audio_url = peek
-                            break
-                        await asyncio.sleep(0.15)
-                        waited += 150
-            except Exception:
-                pass
-        if audio_url is None:
-            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
+      // Defensive: clear any in-progress transcript to avoid accidental duplicate sends.
+      sttFinalRef.current = "";
+      sttInterimRef.current = "";
+    }
 
-    return {"audio_url": audio_url}
+    setMessages(nextMessages);
+    setInput("");
+    setLoading(true);
 
+    try {
+      const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
+      const data = await callChat(nextMessages, sendState);
 
-# --------------------------
-# STT (Speech-to-Text)
-# --------------------------
-# NOTE: This endpoint intentionally accepts RAW audio bytes in the request body (not multipart/form-data)
-# to avoid requiring the `python-multipart` package (which can otherwise prevent FastAPI from starting).
-#
-# Frontend should POST the recorded Blob directly:
-#   fetch(`${API_BASE}/stt/transcribe`, { method:"POST", headers:{ "Content-Type": blob.type }, body: blob })
-#
-@app.post("/stt/transcribe")
-async def stt_transcribe(request: Request):
-    if not settings.OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+      // If the user hit "Clear Messages" while we were waiting on the response,
+      // ignore this result and do not append it to a cleared chat.
+      if (epochAtStart !== clearEpochRef.current) return;
 
-    content_type = (request.headers.get("content-type") or "").lower().strip()
-    audio_bytes = await request.body()
+      // status from backend (safe/explicit_blocked/explicit_allowed)
+      if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
+        setChatStatus(data.mode);
+      }
 
-    if not audio_bytes or len(audio_bytes) < 16:
-        raise HTTPException(status_code=400, detail="No audio received")
+      // Some backends return camelCase "sessionState" instead of snake_case "session_state"
+      const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
 
-    # Infer file extension for OpenAI transcription.
-    if "webm" in content_type:
-        ext = "webm"
-    elif "ogg" in content_type:
-        ext = "ogg"
-    elif "mp4" in content_type or "m4a" in content_type or "aac" in content_type:
-        ext = "mp4"
-    elif "wav" in content_type:
-        ext = "wav"
-    else:
-        # Fallback; OpenAI can often still detect format, but providing a filename helps.
-        ext = "bin"
+      // Normalize & apply server session state WITHOUT using data.mode as pill mode
+      if (serverSessionState) {
+        setSessionState((prev) => {
+          const merged: SessionState = { ...(prev as any), ...(serverSessionState as any) };
 
-    bio = io.BytesIO(audio_bytes)
-    bio.name = f"stt.{ext}"
+          // If backend says blocked, keep pill as intimate AND set pending
+          if (data.mode === "explicit_blocked") {
+            merged.mode = "intimate";
+            merged.pending_consent = "intimate";
+          }
 
-    try:
-        # Use the same OpenAI client used elsewhere in this service.
-        # `settings.STT_MODEL` can be set; fallback is whisper-1.
-        stt_model = getattr(settings, "STT_MODEL", None) or "whisper-1"
-        resp = client.audio.transcriptions.create(
-            model=stt_model,
-            file=bio,
-        )
-        text = getattr(resp, "text", None)
-        if text is None and isinstance(resp, dict):
-            text = resp.get("text")
-        if not text:
-            text = ""
-        return {"text": str(text).strip()}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
+          // If backend says allowed, clear pending (and keep mode whatever backend returned in session state)
+          if (data.mode === "explicit_allowed" && merged.pending_consent) {
+            merged.pending_consent = null;
+          }
 
+          // If the backend sent a mode (in session state OR top-level), normalize it so Romantic always highlights
+          const backendMode = normalizeMode((serverSessionState as any)?.mode ?? (data as any)?.mode);
+          if (backendMode && data.mode !== "explicit_blocked") {
+            merged.mode = backendMode;
+          }
 
+          // If we are not in intimate, never keep the intimate pending flag (prevents the Intimate pill from "sticking")
+          if (merged.mode !== "intimate" && merged.pending_consent === "intimate") {
+            merged.pending_consent = null;
+          }
 
-# =============================================================================
-# Option B — Separate Journaling Endpoint (does NOT touch /chat or TTS/STT)
-# =============================================================================
-#
-# Goal:
-#   Capture *copies* of incoming/outgoing messages to an append-only journal store.
-#   Summaries (manual or automated) can later be generated from this journal without
-#   invoking the existing /chat/save-summary flow that the frontend currently treats
-#   as a "stop everything" action.
-#
-# IMPORTANT:
-#   - This code path is separate from /chat, /tts/*, /stt/*.
-#   - It is only executed if the frontend calls /journal/append.
-#   - No TTS/STT logic is modified by this feature.
-#
-# Storage:
-#   - Default: local persistent /home on Azure App Service.
-#   - Set CHAT_JOURNAL_DIR to override.
-#
-# Payload contract (frontend → backend):
-#   POST /journal/append
-#   {
-#     "session_id": "....",
-#     "session_state": { ... },     # same object you send to /chat
-#     "events": [
-#       { "role": "user"|"assistant", "content": "...", "ts": 1730000000.123 }
-#     ]
-#   }
-#
-# Response:
-#   { ok: true|false, key: "...", count: N, error?: "..." }
-# =============================================================================
+          return merged;
+        });
+      } else {
+        // If blocked but session_state missing, still reflect pending
+        if (data.mode === "explicit_blocked") {
+          setSessionState((prev) => ({ ...prev, mode: "intimate", pending_consent: "intimate" }));
+        }
 
-_CHAT_JOURNAL_DIR = (os.getenv("CHAT_JOURNAL_DIR", "") or "/home/chat_journals").strip()
+        // If allowed but session_state missing, clear pending and mark consented
+        if (data.mode === "explicit_allowed") {
+          setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: true }));
+        }
 
+        // Fallback: if backend returned a pill mode at top-level, apply it
+        const backendMode = normalizeMode((data as any)?.mode);
+        if (backendMode && data.mode !== "explicit_blocked") {
+          setSessionState((prev) => ({
+            ...prev,
+            mode: backendMode,
+            pending_consent: backendMode === "intimate" ? prev.pending_consent : null,
+          }));
+        }
+      }
 
-def _journal_safe_filename(key: str) -> str:
-    # memberId::companionKey (contains ':' and other chars) → filesystem-safe slug
-    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", (key or "").strip())
-    if not safe:
-        safe = "unknown"
-    return safe + ".jsonl"
+      // Phase 1: Speak the assistant reply (if Live Avatar is connected).
+      // When Live Avatar is active, we delay the assistant's text from appearing until
+      // we are about to trigger the avatar speech.
+      const replyText = String(data.reply || "");
+      let assistantCommitted = false;
+      const commitAssistantMessage = () => {
+        if (assistantCommitted) return;
+        assistantCommitted = true;
+        setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
+      };
 
+      // Guard against STT feedback: ignore any recognition results until after the avatar finishes speaking.
+      // (We also keep STT paused during speak; this is an extra safety net.)
+      const estimateSpeechMs = (text: string) => {
+        const words = text.trim().split(/\s+/).filter(Boolean).length;
+        const wpm = 160;
+        const baseMs = (words / wpm) * 60_000;
+        const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
+        return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
+      };
+      const estimatedSpeechMs = estimateSpeechMs(replyText);
 
-def _journal_path_for_key(key: str) -> str:
-    try:
-        os.makedirs(_CHAT_JOURNAL_DIR, exist_ok=True)
-    except Exception:
-        # Fail-open: journaling should never break the API
-        pass
-    return os.path.join(_CHAT_JOURNAL_DIR, _journal_safe_filename(key))
+      const hooks: SpeakAssistantHooks = {
+        onWillSpeak: () => {
+          // We'll treat "speaking" the same whether it's Live Avatar or local audio-only.
+          if (!assistantCommitted) {
+            commitAssistantMessage();
+            assistantCommitted = true;
+          }
 
+          // Block STT from capturing the assistant speech.
+          if (sttEnabledRef.current) {
+            const now = Date.now();
+            const ignoreMs = estimatedSpeechMs + 1200;
+            sttIgnoreUntilRef.current = Math.max(sttIgnoreUntilRef.current || 0, now + ignoreMs);
+          }
+        },
+        onDidNotSpeak: () => {
+          // If we can't speak, still show the assistant message immediately.
+          if (!assistantCommitted) {
+            commitAssistantMessage();
+            assistantCommitted = true;
+          }
+        },
+      };
 
-def _append_journal_events_sync(path: str, events: List[Dict[str, Any]]) -> None:
-    # Append JSONL with a per-file lock for multi-worker safety.
-    lock = FileLock(path + ".lock")
-    with lock:
-        with open(path, "a", encoding="utf-8") as f:
-            for e in events:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+      const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
 
+      const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
 
-@app.post("/journal/append", response_model=None)
-async def journal_append(request: Request):
-    try:
-        raw = await request.json()
-    except Exception as e:
-        return {"ok": False, "error": f"invalid_json: {type(e).__name__}: {e}"}
+      const canLiveAvatarSpeak =
+        avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
 
-    session_id = str(raw.get("session_id") or "").strip()
-    session_state = raw.get("session_state") or {}
-    events_in = raw.get("events") or []
+      // Audio-only TTS is only played in hands-free STT mode (mic button enabled),
+      // when Live Avatar is NOT speaking.
+      const shouldUseLocalTts = !canLiveAvatarSpeak && sttEnabledRef.current;
 
-    if not isinstance(session_state, dict):
-        session_state = {}
-    if not isinstance(events_in, list):
-        events_in = []
-
-    # Compute the same stable keying scheme used by summaries.
-    # (memberId + normalized companion; falls back to session::<session_id>)
-    if not session_id:
-        # journaling must still have a stable file name; fall back to an ephemeral id
-        session_id = "session-" + uuid.uuid4().hex
-
-    key = _summary_store_key(session_state, session_id)
-
-    # Normalize/cap events (journaling must be cheap + safe)
-    now_ts = time.time()
-    max_events = int(os.getenv("CHAT_JOURNAL_MAX_EVENTS", "20") or "20")
-    max_chars = int(os.getenv("CHAT_JOURNAL_MAX_CHARS", "8000") or "8000")
-    max_chars_per_event = int(os.getenv("CHAT_JOURNAL_MAX_CHARS_PER_EVENT", "2000") or "2000")
-
-    norm: List[Dict[str, Any]] = []
-    for e in events_in[:max_events]:
-        if not isinstance(e, dict):
-            continue
-        role = str(e.get("role") or "").strip().lower()
-        if role not in {"user", "assistant"}:
-            continue
-        content = str(e.get("content") or "")
-        content = content.strip()
-        if not content:
-            continue
-        if len(content) > max_chars_per_event:
-            content = content[:max_chars_per_event] + "…"
-        ts = e.get("ts")
-        try:
-            ts_f = float(ts) if ts is not None else now_ts
-        except Exception:
-            ts_f = now_ts
-
-        norm.append(
-            {
-                "ts": ts_f,
-                "role": role,
-                "content": content,
-                "session_id": session_id,
-                "key": key,
-            }
-        )
-
-    # Global cap
-    total_chars = 0
-    capped: List[Dict[str, Any]] = []
-    for e in norm:
-        total_chars += len(e.get("content") or "")
-        if total_chars > max_chars:
-            break
-        capped.append(e)
-
-    if not capped:
-        return {"ok": True, "key": key, "count": 0}
-
-    path = _journal_path_for_key(key)
-    try:
-        await run_in_threadpool(_append_journal_events_sync, path, capped)
-        return {"ok": True, "key": key, "count": len(capped)}
-    except Exception as e:
-        # Fail-open: journaling errors shouldn't break UX.
-        return {"ok": False, "key": key, "count": 0, "error": f"{type(e).__name__}: {e}"}
+      const speakPromise = (canLiveAvatarSpeak
+        ? speakAssistantReply(replyText, hooks)
+        : shouldUseLocalTts
+          ? speakLocalTtsReply(replyText, voiceId, hooks)
+          : (hooks.onDidNotSpeak(), Promise.resolve())
+      ).catch(() => {
+        // If something goes wrong, just fall back to showing text.
+        hooks.onDidNotSpeak();
+      });
 
 
-# -----------------------------------------------------------------------------
-# (Optional / future) Server-side summarization from journal
-# -----------------------------------------------------------------------------
-# If, later, you decide to remove Wix-side validation or want backend-driven
-# automatic summaries, you can build it on top of the journal file(s) above.
-#
-# We are intentionally NOT enabling this now, because it introduces extra model
-# calls and could create new performance variables. Keep it as a controlled,
-# explicit feature rollout.
-#
-# @app.post("/journal/summarize", response_model=None)
-# async def journal_summarize(request: Request):
-#     ...
+      // If STT is enabled, resume listening only after the avatar finishes speaking.
+      if (resumeSttAfter) {
+        resumeScheduled = true;
+        speakPromise.finally(() => {
+          if (sttEnabledRef.current) resumeSpeechToText();
+        });
+      }
+    } catch (err: any) {
+      if (epochAtStart !== clearEpochRef.current) return;
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
+      ]);
+    } finally {
+      setLoading(false);
+      if (resumeSttAfter && !resumeScheduled) {
+        // No speech was triggered (e.g., request failed). Resume immediately.
+        if (sttEnabledRef.current) resumeSpeechToText();
+      }
+    }
+  }
+
+  // Keep a ref to the latest send() callback so STT handlers don't close over stale state.
+  const sendRef = useRef(send);
+  useEffect(() => {
+    sendRef.current = send;
+  }, [send]);
+
+  function clearSttSilenceTimer() {
+    if (sttSilenceTimerRef.current) {
+      window.clearTimeout(sttSilenceTimerRef.current);
+      sttSilenceTimerRef.current = null;
+    }
+  }
+
+  function clearSttRestartTimer() {
+    if (sttRestartTimerRef.current) {
+      window.clearTimeout(sttRestartTimerRef.current);
+      sttRestartTimerRef.current = null;
+    }
+  }
+
+  function clearSttRecoverTimer() {
+    if (sttRecoverTimerRef.current) {
+      window.clearTimeout(sttRecoverTimerRef.current);
+      sttRecoverTimerRef.current = null;
+    }
+  }
+
+  const resetSpeechRecognition = useCallback(() => {
+    const rec = sttRecRef.current as any;
+    if (!rec) return;
+
+    try {
+      rec.onstart = null;
+      rec.onend = null;
+      rec.onerror = null;
+      rec.onresult = null;
+    } catch (e) {
+        // ignore
+    }
+
+    try {
+      rec.abort?.();
+    } catch (e) {
+        // ignore
+    }
+    try {
+      rec.stop?.();
+    } catch (e) {
+        // ignore
+    }
+
+    sttRecRef.current = null;
+    setSttRunning(false);
+  }, []);
+
+  const getCurrentSttText = useCallback((): string => {
+    return `${(sttFinalRef.current || "").trim()} ${(sttInterimRef.current || "").trim()}`.trim();
+  }, []);
+
+    // ------------------------------------------------------------
+  // Backend STT (record + server-side transcription).
+  // iOS/iPadOS Web Speech STT can be unstable; this path is far more reliable.
+  // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
+  // ------------------------------------------------------------
+  const liveAvatarActive =
+    avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting";
+
+  // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
+  // Keep Live Avatar mode on browser STT (it is already stable across devices).
+  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
+
+  const cleanupBackendSttResources = useCallback(() => {
+    try {
+      if (backendSttRecorderRef.current && backendSttRecorderRef.current.state !== "inactive") {
+        backendSttRecorderRef.current.stop();
+      }
+    } catch (e) {
+        }
+    backendSttRecorderRef.current = null;
+
+    if (backendSttHardStopTimerRef.current) {
+      window.clearTimeout(backendSttHardStopTimerRef.current);
+      backendSttHardStopTimerRef.current = null;
+    }
+
+    if (backendSttRafRef.current !== null) {
+      cancelAnimationFrame(backendSttRafRef.current);
+      backendSttRafRef.current = null;
+    }
+
+    if (backendSttStreamRef.current) {
+      backendSttStreamRef.current.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch (e) {
+        }
+      });
+      backendSttStreamRef.current = null;
+    }
+
+    if (backendSttAudioCtxRef.current) {
+      try {
+        backendSttAudioCtxRef.current.close();
+      } catch (e) {
+        }
+      backendSttAudioCtxRef.current = null;
+    }
+
+    backendSttHasSpokenRef.current = false;
+    backendSttLastVoiceAtRef.current = 0;
+  }, []);
+
+  const abortBackendStt = useCallback(() => {
+    try {
+      backendSttAbortRef.current?.abort();
+    } catch (e) {
+        }
+    backendSttAbortRef.current = null;
+
+    cleanupBackendSttResources();
+
+    // NOTE: we intentionally do NOT flip backendSttInFlightRef here.
+    // startBackendSttOnce() owns that lifecycle and will clear it in its own finally blocks.
+    setSttRunning(false);
+  }, [cleanupBackendSttResources]);
+
+  const transcribeBackendStt = useCallback(
+    async (blob: Blob): Promise<string> => {
+      if (!API_BASE) throw new Error("Missing NEXT_PUBLIC_API_BASE_URL");
+
+      // Backend expects raw audio bytes in the request body (NOT multipart/form-data).
+      const controller = new AbortController();
+      backendSttAbortRef.current = controller;
+
+      const apiBase = API_BASE.replace(/\/+$/, "");
+      const contentType = blob.type || (isIOS ? "audio/mp4" : "audio/webm");
+
+      const resp = await fetch(`${apiBase}/stt/transcribe`, {
+        method: "POST",
+        headers: { "Content-Type": contentType, Accept: "application/json" },
+        body: blob,
+        signal: controller.signal,
+      });
+
+      if (!resp.ok) {
+        let detail = "";
+        try {
+          detail = await resp.text();
+        } catch (e) {
+        }
+        throw new Error(`STT backend error ${resp.status}: ${detail || resp.statusText}`);
+      }
+
+      const data = (await resp.json()) as any;
+      return String(data?.text ?? "").trim();
+    },
+    [API_BASE, isIOS],
+  );
+
+  const startBackendSttOnce = useCallback(async (): Promise<void> => {
+    if (!useBackendStt) return;
+    if (!sttEnabledRef.current || sttPausedRef.current) return;
+    if (backendSttInFlightRef.current) return;
+
+    const now0 = performance.now();
+    if (now0 < sttIgnoreUntilRef.current) {
+      const waitMs = Math.max(0, Math.ceil(sttIgnoreUntilRef.current - now0 + 50));
+      setTimeout(() => {
+        if (sttEnabledRef.current && !sttPausedRef.current) {
+          startBackendSttOnce().catch(() => {});
+        }
+      }, waitMs);
+      return;
+    }
+
+    backendSttInFlightRef.current = true;
+    backendSttHasSpokenRef.current = false;
+    backendSttLastVoiceAtRef.current = performance.now();
+
+    clearSttSilenceTimer();
+    setSttError(null);
+    setSttRunning(true);
+    setSttInterim("");
+    setSttFinal("");
+
+    try {
+      const getStreamWithRetries = async (): Promise<MediaStream> => {
+        const constraints: MediaStreamConstraints = {
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        };
+
+        let lastErr: any = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            return await navigator.mediaDevices.getUserMedia(constraints);
+          } catch (e: any) {
+            lastErr = e;
+            const name = e?.name || "";
+            // Permission/security errors won't succeed on retry.
+            if (name === "NotAllowedError" || name === "SecurityError") break;
+            await new Promise((r) => setTimeout(r, 250));
+          }
+        }
+
+        throw lastErr;
+      };
+
+      const stream = await getStreamWithRetries();
+      backendSttStreamRef.current = stream;
+
+      // Choose best available recording MIME type for this browser.
+      let mimeType = "";
+      try {
+        const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/aac", "audio/mpeg"];
+        for (const c of candidates) {
+          if (typeof MediaRecorder !== "undefined" && (MediaRecorder as any).isTypeSupported?.(c)) {
+            mimeType = c;
+            break;
+          }
+        }
+      } catch (e) {
+        }
+
+      let recorder: MediaRecorder;
+      try {
+        recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      } catch (e) {
+        throw new Error("This browser cannot record audio for STT. Please use Live Avatar mode on this device.");
+      }
+      backendSttRecorderRef.current = recorder;
+
+      const chunks: BlobPart[] = [];
+      recorder.ondataavailable = (ev: BlobEvent) => {
+        if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+      };
+
+      const blobPromise = new Promise<Blob>((resolve, reject) => {
+        recorder.onstop = () => {
+          const type = recorder.mimeType || mimeType || "audio/webm";
+          resolve(new Blob(chunks, { type }));
+        };
+        (recorder as any).onerror = (ev: any) => reject(ev?.error || new Error("Recorder error"));
+      });
+
+      // Simple VAD (silence detection) using AnalyserNode
+      try {
+        const Ctx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+        const ctx: AudioContext = new Ctx();
+        backendSttAudioCtxRef.current = ctx;
+        try {
+          await ctx.resume();
+        } catch (e) {
+        }
+
+        const src = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        src.connect(analyser);
+
+        const data = new Uint8Array(analyser.fftSize);
+
+        const threshold = 0.02; // RMS threshold
+        const minRecordMs = 350;
+        const maxRecordMs = 15000;
+        const silenceMs = 2000;
+        const startedAt = performance.now();
+
+        const tick = () => {
+          if (!sttEnabledRef.current || sttPausedRef.current) {
+            try {
+              if (recorder.state !== "inactive") recorder.stop();
+            } catch (e) {
+        }
+            return;
+          }
+
+          analyser.getByteTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) {
+            const v = (data[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / data.length);
+          const now = performance.now();
+
+          if (rms > threshold) {
+            backendSttLastVoiceAtRef.current = now;
+            backendSttHasSpokenRef.current = true;
+          }
+
+          const elapsed = now - startedAt;
+          const silentFor = now - backendSttLastVoiceAtRef.current;
+
+          if (elapsed >= maxRecordMs) {
+            try {
+              if (recorder.state !== "inactive") recorder.stop();
+            } catch (e) {
+        }
+            return;
+          }
+
+          if (backendSttHasSpokenRef.current && elapsed > minRecordMs && silentFor >= silenceMs) {
+            try {
+              if (recorder.state !== "inactive") recorder.stop();
+            } catch (e) {
+        }
+            return;
+          }
+
+          backendSttRafRef.current = requestAnimationFrame(tick);
+        };
+
+        backendSttRafRef.current = requestAnimationFrame(tick);
+      } catch (e) {
+        // If VAD setup fails, we still record; hard-stop timer will end it.
+      }
+
+      backendSttHardStopTimerRef.current = window.setTimeout(() => {
+        try {
+          if (recorder.state !== "inactive") recorder.stop();
+        } catch (e) {
+        }
+      }, 16000);
+
+      try {
+        recorder.start(250);
+      } catch (e) {
+        throw new Error("Failed to start recording.");
+      }
+
+      const blob = await blobPromise;
+      const hadSpeech = backendSttHasSpokenRef.current;
+
+      // Important: release the mic/audio session BEFORE we attempt any TTS playback.
+      cleanupBackendSttResources();
+      setSttRunning(false);
+
+      // If user disabled/paused during capture, do nothing further.
+      if (!sttEnabledRef.current || sttPausedRef.current) return;
+
+      // If we never detected speech, skip transcription to avoid cost/noise.
+      if (!hadSpeech) return;
+      if (!blob || blob.size < 2048) return;
+
+      const text = await transcribeBackendStt(blob);
+      if (!text) return;
+
+      // Ignore if we're still inside an ignore window (e.g., avatar speech bleed).
+      if (performance.now() < sttIgnoreUntilRef.current) return;
+
+      setSttFinal(text);
+      sttFinalRef.current = text;
+
+      await send(text);
+    } catch (e: any) {
+      setSttError(e?.message || "STT failed.");
+    } finally {
+      cleanupBackendSttResources();
+      setSttRunning(false);
+      backendSttInFlightRef.current = false;
+
+      // Hands-free loop: if still enabled, start listening again.
+      if (sttEnabledRef.current && !sttPausedRef.current) {
+        const now = performance.now();
+        const ignoreWait = now < sttIgnoreUntilRef.current ? Math.ceil(sttIgnoreUntilRef.current - now + 50) : 0;
+        const baseDelay = isIOS ? 100 : 0;
+
+        setTimeout(() => {
+          startBackendSttOnce().catch(() => {});
+        }, Math.max(ignoreWait, baseDelay));
+      }
+    }
+  }, [
+    clearSttSilenceTimer,
+    cleanupBackendSttResources,
+    isIOS,
+    send,
+    transcribeBackendStt,
+    useBackendStt,
+  ]);
+
+  const kickBackendStt = useCallback(() => {
+    if (!useBackendStt) return;
+    if (!sttEnabledRef.current || sttPausedRef.current) return;
+    if (backendSttInFlightRef.current) return;
+
+    // Small delay helps iOS fully exit previous audio state.
+    setTimeout(() => {
+      startBackendSttOnce().catch(() => {});
+    }, isIOS ? 100 : 0);
+  }, [isIOS, startBackendSttOnce, useBackendStt]);
+
+const pauseSpeechToText = useCallback(() => {
+    sttPausedRef.current = true;
+    clearSttSilenceTimer();
+
+    setSttInterim("");
+    setSttFinal("");
+
+    // Backend STT: abort any in-flight record/transcribe
+    abortBackendStt();
+
+    // Browser STT: stop recognition if it exists
+    const rec = sttRecRef.current;
+    try {
+      rec?.stop?.();
+    } catch (e) {
+        // ignore
+    }
+
+    // iOS Web Speech can get stuck after stop(); force a fresh recognizer next time.
+    // (Embedded iOS uses Web Speech; backend STT is disabled when embedded.)
+    if (isIOS && !useBackendStt) {
+      resetSpeechRecognition();
+    }
+
+    setSttRunning(false);
+  }, [abortBackendStt, clearSttSilenceTimer, isIOS, useBackendStt, resetSpeechRecognition]);
+
+  const scheduleSttAutoSend = useCallback(() => {
+    if (!sttEnabledRef.current) return;
+
+    clearSttSilenceTimer();
+
+    sttSilenceTimerRef.current = window.setTimeout(() => {
+      const text = getCurrentSttText();
+      if (!text) return;
+
+      // Pause BEFORE we send so the assistant doesn't "talk to itself".
+      pauseSpeechToText();
+
+      sttFinalRef.current = "";
+      sttInterimRef.current = "";
+      setInput("");
+
+      void sendRef.current(text);
+    }, 2000);
+  }, [getCurrentSttText, pauseSpeechToText]);
+
+  const requestMicPermission = useCallback(async (): Promise<boolean> => {
+    // NOTE: Web Speech API does not reliably prompt on iOS if start() is called
+    // outside the user's click. We still use getUserMedia to ensure permission exists.
+    if (!navigator.mediaDevices?.getUserMedia) return true;
+    // iOS Safari (especially when embedded) can reject getUserMedia even when SpeechRecognition still works.
+    // If we're not using backend STT, let SpeechRecognition trigger the permission prompt instead.
+    if (isIOS && !useBackendStt) return true;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((t) => t.stop());
+
+      // Mic permission is granted once getUserMedia succeeds.
+      micGrantedRef.current = true;
+      setMicGranted(true);
+      return true;
+    } catch (e: any) {
+      console.warn("Mic permission denied/unavailable:", e);
+      setSttError(getEmbedHint());
+
+      const name = e?.name || "";
+      // If backend STT can't access the mic (common in some embedded contexts),
+      // fall back to browser SpeechRecognition for this session.
+      if (name === "NotAllowedError" || name === "SecurityError") {
+        setBackendSttAvailable(false);
+        try {
+          sttRecRef.current?.abort?.();
+        } catch (e) {
+        // ignore
+        }
+        sttRecRef.current = null;
+      }
+
+      return false;
+    }
+  }, [getEmbedHint, isIOS, setBackendSttAvailable, useBackendStt]);
+
+  const ensureSpeechRecognition = useCallback((): any | null => {
+    if (typeof window === "undefined") return null;
+
+    const SpeechRecognitionCtor =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognitionCtor) return null;
+
+    if (sttRecRef.current) return sttRecRef.current as any;
+
+    const rec = new SpeechRecognitionCtor();
+
+    // iOS + embedded contexts are more stable with continuous=false and manual restarts.
+    try {
+      rec.continuous = !isIOS;
+    } catch (e) {
+        // ignore
+    }
+
+    try {
+      rec.interimResults = true;
+    } catch (e) {
+        // ignore
+    }
+
+    try {
+      rec.lang = "en-US";
+    } catch (e) {
+        // ignore
+    }
+
+    rec.onstart = () => {
+      setSttRunning(true);
+      setSttError(null);
+
+      micGrantedRef.current = true;
+      setMicGranted(true);
+      // reset audio-capture fail window on successful start
+      sttAudioCaptureFailsRef.current = 0;
+      sttLastAudioCaptureAtRef.current = 0;
+    };
+
+    rec.onend = () => {
+      setSttRunning(false);
+
+      if (!sttEnabledRef.current || sttPausedRef.current) return;
+
+      clearSttRestartTimer();
+
+      const now = Date.now();
+      const ignoreDelay = Math.max(0, (sttIgnoreUntilRef.current || 0) - now);
+
+      // iOS/iPadOS: keep restart delay short to reduce clipped first words; onerror recovery handles flaky starts.
+      const baseDelay = isIOS ? 200 : 250;
+
+      sttRestartTimerRef.current = window.setTimeout(() => {
+        if (!sttEnabledRef.current || sttPausedRef.current) return;
+
+        try {
+          rec.start();
+        } catch (e) {
+        // ignore
+        }
+      }, baseDelay + ignoreDelay);
+    };
+
+    rec.onerror = (event: any) => {
+      const code = String(event?.error || "");
+
+      if (code === "no-speech" || code === "aborted") {
+        return;
+      }
+
+      if (code === "not-allowed" || code === "service-not-allowed") {
+        sttEnabledRef.current = false;
+        sttPausedRef.current = false;
+        setSttEnabled(false);
+        setSttRunning(false);
+        clearSttSilenceTimer();
+        clearSttRestartTimer();
+        clearSttRecoverTimer();
+        clearSttRecoverTimer();
+        setSttError("Microphone permission was blocked." + getEmbedHint());
+        try {
+          rec.stop?.();
+        } catch (e) {
+        // ignore
+        }
+        return;
+      }
+
+      if (code === "audio-capture") {
+        const now = Date.now();
+        const withinWindow = now - sttLastAudioCaptureAtRef.current < 10_000;
+        sttAudioCaptureFailsRef.current = withinWindow
+          ? sttAudioCaptureFailsRef.current + 1
+          : 1;
+        sttLastAudioCaptureAtRef.current = now;
+
+        setSttError("Speech-to-text error: audio-capture (no microphone found). Retrying…");
+
+        // If it keeps failing, we stop instead of looping forever.
+        if (sttAudioCaptureFailsRef.current >= 4) {
+          sttEnabledRef.current = false;
+          sttPausedRef.current = false;
+          setSttEnabled(false);
+          setSttRunning(false);
+          clearSttSilenceTimer();
+          clearSttRestartTimer();
+        clearSttRecoverTimer();
+          clearSttRecoverTimer();
+          setSttError(
+            "Speech-to-text could not access the microphone on this device. Please reload the page and try again."
+              + getEmbedHint()
+          );
+          try {
+            rec.stop?.();
+          } catch (e) {
+        // ignore
+          }
+          return;
+        }
+
+        // Recovery path: recreate recognition (helps iOS) and try again after a short delay.
+        clearSttRecoverTimer();
+        sttRecoverTimerRef.current = window.setTimeout(async () => {
+          if (!sttEnabledRef.current || sttPausedRef.current) return;
+
+          resetSpeechRecognition();
+
+          const ok = await requestMicPermission();
+          if (!ok) return;
+
+          const r2 = ensureSpeechRecognition();
+          if (!r2) return;
+
+          try {
+            r2.start();
+          } catch (e) {
+        // ignore
+          }
+        }, isIOS ? 1200 : 650);
+
+        return;
+      }
+
+      console.warn("STT error:", code, event);
+      setSttError(`Speech-to-text error: ${code}`);
+    };
+
+    rec.onresult = (event: any) => {
+      if (!sttEnabledRef.current || sttPausedRef.current) return;
+      if (Date.now() < (sttIgnoreUntilRef.current || 0)) return;
+
+      let finalText = "";
+      let interimText = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        const txt = res?.[0]?.transcript ?? "";
+        if (res?.isFinal) finalText += txt;
+        else interimText += txt;
+      }
+
+      if (finalText) sttFinalRef.current = `${sttFinalRef.current} ${finalText}`.trim();
+      sttInterimRef.current = interimText.trim();
+
+      const combined = getCurrentSttText();
+      setInput(combined);
+
+      scheduleSttAutoSend();
+    };
+
+    sttRecRef.current = rec;
+    return rec;
+  }, [
+    isIOS,
+    getCurrentSttText,
+    scheduleSttAutoSend,
+    getEmbedHint,
+    requestMicPermission,
+    resetSpeechRecognition,
+  ]);
+
+  const resumeSpeechToText = useCallback(() => {
+    if (!sttEnabledRef.current) return;
+
+    sttPausedRef.current = false;
+
+    // iOS/iPadOS: use backend STT recorder (more stable than Web Speech)
+    if (useBackendStt) {
+      kickBackendStt();
+      return;
+    }
+
+    // iOS/iPadOS: starting recognition can be flaky right after media playback,
+    // but adding a big delay clips the user's first words. Start immediately and
+    // rely on the onerror recovery path to back off if Safari isn't ready yet.
+    clearSttRestartTimer();
+    const delayMs = 0; // Start immediately to avoid clipping the user's first words; onerror recovery handles mic warm-up.
+
+    sttRestartTimerRef.current = window.setTimeout(() => {
+      if (!sttEnabledRef.current) return;
+      if (sttPausedRef.current) return;
+
+      const ok = ensureSpeechRecognition();
+      if (!ok) {
+        sttEnabledRef.current = false;
+        setSttRunning(false);
+        setSttError("Speech-to-text is not supported in this browser.");
+        return;
+      }
+
+      const rec = sttRecRef.current;
+      if (!rec) return;
+
+      try {
+        rec.start();
+        setSttRunning(true);
+      } catch (e) {
+        // ignore; will restart on onend if needed
+      }
+    }, delayMs);
+  }, [
+    clearSttRestartTimer,
+    ensureSpeechRecognition,
+    isIOS,
+    kickBackendStt,
+    useBackendStt,
+  ]);
+
+  // Play the companion greeting in voice/video modes (once per session, per companion).
+  // (The greeting text is already injected into the chat on load — this only plays it.)
+const greetInFlightRef = useRef(false);
+
+const speakGreetingIfNeeded = useCallback(
+  async (mode: "live" | "audio") => {
+    // Ensure the first audio-only TTS greeting uses the selected companion voice.
+    // If Wix hasn't provided plan/companion yet, defer until the handoff arrives.
+    if (mode === "audio" && !handoffReady) {
+      pendingGreetingModeRef.current = "audio";
+      return;
+    }
+
+    const name = (companionName || "").trim() || "Companion";
+    const key = `ELARALO_GREET_SPOKEN:${name}`;
+
+    // Already spoken this session?
+    try {
+      if (sessionStorage.getItem(key) === "1") return;
+    } catch (e) {
+        }
+
+    // Prevent duplicates/races (e.g., Live Avatar connects right after mic-start).
+    if (greetInFlightRef.current) return;
+    greetInFlightRef.current = true;
+
+    // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
+    // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
+    const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
+    // Local audio-only greeting must always use the companion's ElevenLabs voice.
+    // (Live avatar uses its own configured voice via the DID agent.)
+    const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
+
+      const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
+
+    // Belt & suspenders: avoid STT re-capturing the greeting audio.
+    const prevIgnore = sttIgnoreUntilRef.current;
+    sttIgnoreUntilRef.current = performance.now() + 60_000; // 60s
+
+    try {
+      try {
+        await pauseSpeechToText();
+      } catch (e) {
+        }
+
+      const hooks: SpeakAssistantHooks = {
+        onWillSpeak: () => {},
+        onDidNotSpeak: () => {},
+      };
+
+      if (mode === "live" && didAgentMgrRef.current) {
+        // Live avatar speaks using the avatar's configured voice
+        await speakAssistantReply(greetText);
+      } else {
+        // Local audio-only (video element on iOS; audio element on desktop)
+        await speakLocalTtsReply(greetText, voiceId, hooks);
+      }
+
+      // Mark spoken ONLY after successful playback.
+      try {
+        sessionStorage.setItem(key, "1");
+      } catch (e) {
+        }
+    } catch (e) {
+      // Allow retry later if something failed.
+      try {
+        sessionStorage.removeItem(key);
+      } catch (e) {
+        }
+      console.warn("Greeting playback failed:", e);
+    } finally {
+      sttIgnoreUntilRef.current = prevIgnore;
+      greetInFlightRef.current = false;
+      try {
+        await resumeSpeechToText();
+      } catch (e) {
+        }
+    }
+  },
+  [companionName, handoffReady, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
+);
+
+  const maybePlayPendingGreeting = useCallback(async () => {
+    const mode = pendingGreetingModeRef.current;
+    if (!mode) return;
+    if (!micGrantedRef.current) return;
+
+    // Live Avatar greeting must wait until the agent is fully connected.
+    if (mode === "live") {
+      if (avatarStatus !== "connected" || !didAgentMgrRef.current) return;
+    }
+
+    // Clear first so we don't re-enter if something throws.
+    pendingGreetingModeRef.current = null;
+    await speakGreetingIfNeeded(mode);
+  }, [avatarStatus, speakGreetingIfNeeded]);
+
+  // If the user started an audio-only experience before the Wix handoff arrived,
+  // play the pending greeting once plan/companion information is available.
+  useEffect(() => {
+    if (!handoffReady) return;
+    if (!pendingGreetingModeRef.current) return;
+    void maybePlayPendingGreeting();
+  }, [handoffReady, maybePlayPendingGreeting]);
+
+  // Auto-play the greeting once the Live Avatar is connected, but ONLY after the user has granted mic access.
+  useEffect(() => {
+    if (!liveAvatarActive) return;
+    if (avatarStatus !== "connected") return;
+
+    pendingGreetingModeRef.current = "live";
+    void maybePlayPendingGreeting();
+  }, [avatarStatus, liveAvatarActive, maybePlayPendingGreeting]);
+
+  // Play any queued greeting as soon as mic access is granted.
+  useEffect(() => {
+    if (!micGranted) return;
+    void maybePlayPendingGreeting();
+  }, [micGranted, maybePlayPendingGreeting]);
+
+
+
+  const stopSpeechToText = useCallback(
+    (clearError: boolean = true) => {
+      sttEnabledRef.current = false;
+      sttPausedRef.current = false;
+      setSttEnabled(false);
+      clearSttSilenceTimer();
+
+      setSttInterim("");
+      setSttFinal("");
+      setSttRunning(false);
+
+      // Abort backend STT capture/transcribe if in flight
+      abortBackendStt();
+      backendSttInFlightRef.current = false;
+
+      // Stop browser SpeechRecognition if it exists
+      resetSpeechRecognition();
+
+      if (clearError) setSttError(null);
+    },
+    [abortBackendStt, clearSttSilenceTimer, resetSpeechRecognition]
+  );
+
+  const startSpeechToText = useCallback(async (opts?: { forceBrowser?: boolean; suppressGreeting?: boolean }) => {
+    const forceBrowser = !!opts?.forceBrowser;
+    // iOS Safari can enter a low-volume route after stop/start transitions.
+    // Apply the same "loud path" recovery we use for Clear/Save before kicking off STT.
+    // IMPORTANT: do not await here; iOS SpeechRecognition must start directly from the user gesture.
+    try { boostAllTtsVolumes(); } catch (e) {
+        }
+    void nudgeAudioSession();
+    primeLocalTtsAudio(true);
+    void ensureIphoneAudioContextUnlocked();
+
+    sttEnabledRef.current = true;
+    sttPausedRef.current = false;
+    setSttEnabled(true);
+    setSttError(null);
+
+    const usingBackend = useBackendStt && !forceBrowser;
+
+    // IMPORTANT (iOS Safari / iOS embedded): SpeechRecognition.start() must be invoked directly
+    // from the user's gesture. Avoid awaiting anything before starting browser STT.
+    if (isIOS && !usingBackend) {
+      const ok = ensureSpeechRecognition();
+      if (!ok) {
+        setSttError("Speech-to-text is not supported in this browser.");
+        stopSpeechToText(false);
+        return;
+      }
+      resumeSpeechToText();
+      if (!liveAvatarActive && !opts?.suppressGreeting) {
+        pendingGreetingModeRef.current = "audio";
+        void maybePlayPendingGreeting();
+      }
+      return;
+    }
+
+    const permOk = await requestMicPermission();
+    if (!permOk) {
+      setSttError("Microphone permission denied.");
+      stopSpeechToText(false);
+      return;
+    }
+
+    // iOS/iPadOS: prefer backend STT recorder (more stable than Web Speech)
+    // NOTE: When starting Live Avatar, we force browser STT so D-ID voice doesn't rely on backend recorder.
+    if (usingBackend) {
+      // Backend STT: if we need to play the audio greeting, do it first (after mic is granted),
+      // then resumeSpeechToText() will start the backend recorder.
+      if (!liveAvatarActive && !opts?.suppressGreeting) {
+        pendingGreetingModeRef.current = "audio";
+        void maybePlayPendingGreeting();
+      } else {
+        kickBackendStt();
+      }
+      return;
+    }
+
+    const ok = ensureSpeechRecognition();
+    if (!ok) {
+      setSttError("Speech-to-text is not supported in this browser.");
+      stopSpeechToText(false);
+      return;
+    }
+
+    resumeSpeechToText();
+    if (!liveAvatarActive && !opts?.suppressGreeting) {
+      pendingGreetingModeRef.current = "audio";
+      void maybePlayPendingGreeting();
+    }
+  }, [
+    boostAllTtsVolumes,
+    ensureSpeechRecognition,
+    kickBackendStt,
+    liveAvatarActive,
+    maybePlayPendingGreeting,
+    nudgeAudioSession,
+    primeLocalTtsAudio,
+    ensureIphoneAudioContextUnlocked,
+    requestMicPermission,
+    resumeSpeechToText,
+    speakGreetingIfNeeded,
+    stopSpeechToText,
+    useBackendStt,
+  ]);
+
+  const toggleSpeechToText = useCallback(async () => {
+    // Disable STT/TTS for the host during BeeStreamed live sessions.
+    if ((liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting"))) return;
+// In Live Avatar mode, mic is required. We don't allow toggling it off.
+    // If STT isn't running (permission denied or stopped), we try to start it again.
+    if (liveAvatarActive) {
+      if (!sttEnabledRef.current) {
+        await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
+      }
+      return;
+    }
+
+    if (sttEnabledRef.current) stopSpeechToText();
+    else await startSpeechToText();
+  }, [liveAvatarActive, startSpeechToText, stopSpeechToText]);
+
+  const stopHandsFreeSTT = useCallback(() => {
+    // Cancel any in-flight local TTS work and advance epoch so late callbacks are ignored.
+    localTtsEpochRef.current += 1;
+    try {
+      localTtsAbortRef.current?.abort();
+    } catch (e) {
+        }
+    localTtsAbortRef.current = null;
+    // Stop listening immediately
+    stopSpeechToText();
+
+    // Stop any local audio-only playback (audio OR video element).
+    stopLocalTtsPlayback();
+    // Force a fresh iOS audio-route prime next time the mic/audio starts (prevents low/silent volume after stop/cancel).
+    localTtsUnlockedRef.current = false;
+
+    // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
+    if (liveAvatarActive) {
+      void stopLiveAvatar();
+    }
+  }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
+
+  // Stop button handler (explicit user gesture): stop all comms AND immediately
+  // re-prime the iOS/Safari audio route so that when the user manually resumes
+  // (Live Avatar or Audio-only), volume does not drop to the quiet receiver path.
+  const handleStopClick = useCallback(() => {
+    try {
+      stopHandsFreeSTT();
+    } catch (e) {
+        }
+
+    // Re-assert boosted audio routing and nudge audio session on the same user gesture.
+    try { boostAllTtsVolumes(); } catch (e) {
+        }
+    try { void nudgeAudioSession(); } catch (e) {
+        }
+    try { primeLocalTtsAudio(true); } catch (e) {
+        }
+    try { void ensureIphoneAudioContextUnlocked(); } catch (e) {
+        }
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
+
+  // Clear Messages (with confirmation)
+  const requestClearMessages = useCallback(() => {
+    // Stop all audio/video + STT immediately on click (even before the user confirms).
+    // This is an overt user action and prevents the assistant from continuing to speak.
+    clearEpochRef.current += 1;
+    setLoading(false);
+
+    try {
+      stopHandsFreeSTT();
+    } catch (e) {
+        // ignore
+    }
+
+    // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
+    try {
+      boostAllTtsVolumes();
+    } catch (e) {
+        }
+    try {
+      void nudgeAudioSession();
+    } catch (e) {
+        }
+
+    // Strong iOS recovery: prime the hidden VIDEO element on this user gesture so audio-only TTS
+    // is not left in a silent/receiver route after the confirmation modal.
+    try {
+      primeLocalTtsAudio(true);
+    } catch (e) {
+        }
+    try {
+      void ensureIphoneAudioContextUnlocked();
+    } catch (e) {
+        }
+
+
+    setShowClearMessagesConfirm(true);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
+
+  // Save Chat Summary (with confirmation)
+  const requestSaveChatSummary = useCallback(() => {
+    // REQUIREMENT: behave like Clear Messages with respect to media stability.
+    // We halt all communication immediately using the Stop button logic.
+    // The user will manually choose what to resume after selecting Yes/No.
+    // IMPORTANT: Unlike Clear, do NOT bump clearEpochRef or change loading state here;
+    // doing so can interfere with subsequent reply speaking.
+
+    try {
+      stopHandsFreeSTT();
+    } catch (e) {
+        }
+
+    // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
+    try {
+      boostAllTtsVolumes();
+    } catch (e) {
+        }
+    try {
+      void nudgeAudioSession();
+    } catch (e) {
+        }
+
+    // Prime the hidden VIDEO element on this user gesture so audio-only TTS remains healthy.
+    try {
+      primeLocalTtsAudio(true);
+    } catch (e) {
+        }
+    try {
+      void ensureIphoneAudioContextUnlocked();
+    } catch (e) {
+        }
+
+    setShowSaveSummaryConfirm(true);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
+
+  // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
+  // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
+  // audio session back to normal playback volume and ensure our media elements
+  // are not left muted/low.
+  const restoreVolumesAfterClearCancel = useCallback(async () => {
+    // This function runs on a user gesture (Yes/No click). Its job is purely to ensure
+    // that *future* manual resumption of TTS is not routed to a silent/receiver path.
+
+    // Re-assert boosted routing first.
+    try { boostAllTtsVolumes(); } catch (e) {
+        }
+
+    // iOS route recovery: nudge the audio session back to normal playback.
+    try { await nudgeAudioSession(); } catch (e) {
+        }
+
+    // Prime the hidden VIDEO element (required by your constraint) so the next audio-only
+    // TTS playback is unlocked and uses the correct output route.
+    try { primeLocalTtsAudio(true); } catch (e) {
+        }
+
+    // If Live Avatar is used on iPhone, ensure its audio context is also unlocked.
+    try { void ensureIphoneAudioContextUnlocked(); } catch (e) {
+        }
+
+    // Ensure element mute/volume flags are sane (gain routing provides the loudness).
+    try {
+      const v = localTtsVideoRef.current;
+      if (v) {
+        v.muted = false;
+        v.volume = 1;
+        v.setAttribute?.("playsinline", "");
+        // @ts-ignore
+        v.playsInline = true;
+      }
+    } catch (e) {
+        }
+
+    try {
+      const a = localTtsAudioRef.current;
+      if (a) {
+        a.muted = false;
+        a.volume = 1;
+      }
+    } catch (e) {
+        }
+
+    try {
+      const av = avatarVideoRef.current;
+      if (av) {
+        av.muted = false;
+        av.volume = 1;
+      }
+    } catch (e) {
+        }
+  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes, nudgeAudioSession]);
+
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      try {
+        sttEnabledRef.current = false;
+        sttPausedRef.current = false;
+        clearSttSilenceTimer();
+        clearSttRestartTimer();
+        clearSttRecoverTimer();
+        const rec = sttRecRef.current;
+        if (rec) {
+          try {
+            rec.onstart = null;
+            rec.onend = null;
+            rec.onresult = null;
+            rec.onerror = null;
+          } catch (e) {
+        }
+          try {
+            rec.abort?.();
+          } catch (e) {
+        try {
+              rec.stop?.();
+            } catch (e) {
+        }
+          }
+        }
+      } catch (e) {
+        }
+    };
+  }, []);
+
+  // UI controls (layout-only): reused in multiple locations without changing logic.
+  const sttControls = (
+    <>
+      <button
+        type="button"
+        onClick={toggleSpeechToText}
+        disabled={((!sttEnabled && loading) || (liveAvatarActive && sttEnabled)) || (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting"))}
+        title="Audio"
+        style={{
+
+          width: 44,
+          minWidth: 44,
+          borderRadius: 10,
+          border: "1px solid #111",
+          background: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
+          color: sttEnabled ? "#fff" : "#111",
+          cursor: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
+          opacity: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? 0.6 : 1,
+          fontWeight: 700,
+        
+        }}
+      >
+        🎤
+      </button>
+
+      <button
+        type="button"
+        onClick={handleStopClick}
+        disabled={!sttEnabled}
+        title="Stop"
+        style={{
+          width: 44,
+          minWidth: 44,
+          borderRadius: 10,
+          border: "1px solid #111",
+          background: "#fff",
+          color: "#111",
+          cursor: sttEnabled ? "pointer" : "not-allowed",
+          opacity: sttEnabled ? 1 : 0.45,
+          fontWeight: 700,
+        }}
+      >
+        ■
+      </button>
+</>
+  );
+
+  
+  const visibleModePills = useMemo(() => {
+    // Keep stable ordering regardless of allowedModes ordering.
+    const ordered: Mode[] = ["friend", "romantic", "intimate"];
+    return ordered.filter((m) => allowedModes.includes(m));
+  }, [allowedModes]);
+
+  const showUpgradePill = useMemo(() => {
+    // Requirement: show Upgrade whenever Friend and/or Romantic pills are available,
+    // except when Intimate (18+) is available (no further upgrade path).
+    return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
+  }, [allowedModes]);
+
+  const modePillControls = (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+      {!showModePicker ? (
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button
+            type="button"
+            onClick={() => {
+              setSetModeFlash(true);
+              window.setTimeout(() => {
+                setShowModePicker(true);
+                setSetModeFlash(false);
+              }, 120);
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: setModeFlash ? "#111" : "#fff",
+              color: setModeFlash ? "#fff" : "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Set Mode
+          </button>
+          {(!rebrandingKey || rebrandingKey.trim() === "") && (
+
+
+
+          <button
+            type="button"
+            onClick={() => {
+              setSwitchCompanionFlash(true);
+              window.setTimeout(() => {
+                goToMyElaralo();
+                setSwitchCompanionFlash(false);
+              }, 120);
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: switchCompanionFlash ? "#111" : "#fff",
+              color: switchCompanionFlash ? "#fff" : "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Switch Companion
+          </button>
+          )}
+        </div>
+      ) : (
+        <>
+          {visibleModePills.map((m) => {
+            const active = effectiveActiveMode === m;
+            return (
+              <button
+                key={m}
+                onClick={() => {
+                  setModeFromPill(m);
+                  setShowModePicker(false);
+                }}
+                style={{
+                  padding: "8px 12px",
+                  borderRadius: 999,
+                  border: "1px solid #ddd",
+                  background: active ? "#111" : "#fff",
+                  color: active ? "#fff" : "#111",
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {MODE_LABELS[m]}
+              </button>
+            );
+          })}
+
+          {showUpgradePill ? (
+            <button
+              key="upgrade"
+              onClick={() => {
+                setShowModePicker(false);
+                goToUpgrade();
+              }}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 999,
+                border: "1px solid #ddd",
+                background: "#fff",
+                color: "#111",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Upgrade
+            </button>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+
+  return (
+    <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
+      {/* Hidden audio element for audio-only TTS (mic mode) */}
+      <audio ref={localTtsAudioRef} style={{ display: "none" }} />
+      {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
+      <video
+        ref={localTtsVideoRef}
+        playsInline
+        preload="auto"
+        style={{ position: "fixed", left: 0, bottom: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none", zIndex: -1 }}
+      />
+      <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
+          <img
+            // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
+            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
+            alt={companyName}
+            style={{ width: "100%", height: "100%" }}
+            onError={(e) => {
+              // IMPORTANT: Persist the fallback in state to prevent flicker on subsequent renders.
+              const fallback = (companyLogoSrc || DEFAULT_AVATAR);
+              (e.currentTarget as HTMLImageElement).src = fallback;
+              setAvatarSrc(fallback);
+            }}
+          />
+        </div>
+        <div>
+          <h1 style={{ margin: 0, fontSize: 22 }}>{companyName}</h1>
+          <div style={{ fontSize: 12, color: "#666" }}>
+            Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
+            <b>{displayPlanLabel(planName, memberId, planLabelOverride)}</b>
+          </div>
+          <div style={{ fontSize: 12, color: "#666" }}>
+            Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
+            {chatStatus === "explicit_allowed" ? (
+              <span style={{ marginLeft: 8, color: "#0a7a2f" }}>• Consent: Allowed</span>
+            ) : chatStatus === "explicit_blocked" ? (
+              <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
+            ) : null}
+          </div>
+        </div>
+      </header>
+
+{liveEnabled ? (
+  <section
+    style={{
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12,
+      marginBottom: 12,
+      flexWrap: "wrap",
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      <button
+        onClick={() => {
+          if (
+            avatarStatus === "connected" ||
+            avatarStatus === "connecting" ||
+            avatarStatus === "reconnecting"
+          ) {
+            void stopLiveAvatar();
+          } else {
+            void (async () => {
+              // Live Avatar requires microphone / STT. Start it automatically.
+              // BeeStreamed host: disable any STT/TTS while streaming.
+              if (liveProvider === "stream" && streamCanStart) {
+                try { stopHandsFreeSTT(); } catch (e) {
+        }
+                try { stopSpeechToText(); } catch (e) {
+        }
+              }
+
+              // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
+              if (sttEnabledRef.current && useBackendStt) {
+                stopSpeechToText();
+              }
+
+              if (liveProvider !== "stream" && !sttEnabledRef.current) {
+                await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
+              }
+
+              // If mic permission was denied, don't start Live Avatar.
+              if (liveProvider !== "stream" && !sttEnabledRef.current) return;
+
+              await startLiveAvatar();
+            })();
+          }
+        }}
+        style={{
+          padding: "10px 14px",
+          borderRadius: 10,
+          border: "1px solid #111",
+          background: "#fff",
+          color: "#111",
+          cursor: "pointer",
+          fontWeight: 700,
+        }}
+        aria-label={
+          avatarStatus === "connected" ||
+          avatarStatus === "connecting" ||
+          avatarStatus === "reconnecting"
+            ? "Stop Live Avatar"
+            : "Start Live Avatar"
+        }
+        title="Video"
+      >
+        {avatarStatus === "connected" ||
+        avatarStatus === "connecting" ||
+        avatarStatus === "reconnecting"
+          ? <PauseIcon />
+          : <PlayIcon />}
+      </button>
+
+      {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
+      {sttControls}
+
+      <div style={{ fontSize: 12, color: "#666" }}>
+        Live Avatar: <b>{avatarStatus}</b>
+        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+      </div>
+    </div>
+
+    {/* Right-justified Mode controls */}
+    {modePillControls}
+  </section>
+) : (
+  <section
+    style={{
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12,
+      marginBottom: 12,
+      flexWrap: "wrap",
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
+      {sttControls}
+
+      <div style={{ fontSize: 12, color: "#666" }}>
+        Live Avatar: <b>{avatarStatus}</b>
+        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+      </div>
+    </div>
+
+    {/* Right-justified Mode controls */}
+    {modePillControls}
+  </section>
+)}
+
+
+
+      {/* Conversation area (Avatar + Chat) */}
+      <section
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "stretch",
+          flexWrap: "wrap",
+          marginBottom: 12,
+        }}
+      >
+        {showAvatarFrame ? (
+          <div style={{ flex: "1 1 0", minWidth: 260, height: conversationHeight }}>
+            <div
+              style={{
+                border: "1px solid #e5e5e5",
+                borderRadius: 12,
+                overflow: "hidden",
+                background: "#000",
+                height: "100%",
+                position: "relative",
+              }}
+            >
+                            {liveProvider === "stream" && streamEmbedUrl ? (
+                <iframe
+                  src={streamEmbedUrl}
+                  title="Live Stream"
+                  style={{ width: "100%", height: "100%", border: 0 }}
+                  // Keep all navigation inside the frame (block popout/new-window behavior)
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+                  referrerPolicy="no-referrer-when-downgrade"
+                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
+                  allowFullScreen
+                />
+              ) : (
+                <video
+                  ref={avatarVideoRef}
+                  style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                  playsInline
+                  autoPlay
+                  muted={false}
+                />
+              )}
+              {avatarStatus !== "connected" ? (
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    color: "#fff",
+                    fontSize: 14,
+                    background: "rgba(0,0,0,0.25)",
+                    padding: 12,
+                    textAlign: "center",
+                  }}
+                >
+                  {avatarStatus === "connecting"
+                    ? "Connecting…"
+                    : avatarStatus === "reconnecting"
+                    ? "Reconnecting…"
+                    : avatarStatus === "waiting"
+                    ? streamNotice || "Waiting for the host to start…"
+                    : avatarStatus === "error"
+                    ? "Avatar error"
+                    : null}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+
+        <div
+          style={{
+            flex: showAvatarFrame ? "2 1 0" : "1 1 0",
+            minWidth: 280,
+            height: conversationHeight,
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          <div
+            ref={messagesBoxRef}
+            style={{
+              flex: "1 1 auto",
+              border: "1px solid #e5e5e5",
+              borderRadius: 12,
+              padding: 12,
+              overflowY: "auto",
+              background: "#fff",
+            }}
+          >
+            {messages.map((m, i) => (
+              <div
+                key={i}
+                style={{
+                  marginBottom: 10,
+                  whiteSpace: "pre-wrap",
+                  color: m.role === "assistant" ? "#111" : "#333",
+                }}
+              >
+                <b>{m.role === "assistant" ? companionName : "You"}:</b> {renderMsgContent(m)}
+              </div>
+            ))}
+            {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
+            {/** Input line with mode pills moved to the right (layout-only). */}
+            <button
+              type="button"
+              onClick={requestSaveChatSummary}
+              title="Save"
+              aria-label="Save"
+              style={{
+                width: 44,
+                height: 44,
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : "#fff",
+                cursor: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
+                opacity: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+              }}
+              disabled={liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}
+              >
+              <SaveIcon size={18} />
+            </button>
+
+            <button
+              type="button"
+              onClick={requestClearMessages}
+              title="Clear"
+              aria-label="Delete"
+              style={{
+                width: 44,
+                height: 44,
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : "#fff",
+                cursor: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
+                opacity: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+              }}
+              disabled={liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}
+              >
+              <TrashIcon size={18} />
+            </button>
+
+            <input
+              ref={inputElRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+              placeholder={sttEnabled ? "Listening…" : "Type a message…"}
+              style={{
+                flex: 1,
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid #ddd",
+              }}
+            />
+
+            <button
+              onClick={() => send()}
+              disabled={loading}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid #111",
+                background: "#111",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Send
+            </button>
+
+          </div>
+
+	          {sttError ? (
+	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+	          ) : null}
+        </div>
+      </section>
+
+      {/* Save Chat Summary confirmation overlay */}
+      {showSaveSummaryConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 10000,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 560,
+              width: "100%",
+              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
+              Save chat summary?
+            </div>
+            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
+              Saving stores a server-side summary of this conversation for future reference across your devices.
+              By selecting <b>Yes, save</b>, you authorize AI Elara to store chat summary data associated with your
+              account for later use.
+              <div style={{ marginTop: 8 }}>
+                All audio, video, and mic listening have been stopped. You can resume manually using the controls
+                after closing this dialog.
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (savingSummary) return;
+                  setShowSaveSummaryConfirm(false);
+                  // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
+                  try { boostAllTtsVolumes(); } catch (e) {
+        }
+                  void restoreVolumesAfterClearCancel();
+                }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                  background: "#fff",
+                  cursor: savingSummary ? "not-allowed" : "pointer",
+                  opacity: savingSummary ? 0.65 : 1,
+                }}
+              >
+                No
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (savingSummary) return;
+                  setSavingSummary(true);
+                  const rawCompanionLabel = (
+                     (companionName || "").trim() ||
+                    (companionKey || "").trim() ||
+                    DEFAULT_COMPANION_NAME
+                  ).trim() || DEFAULT_COMPANION_NAME;
+
+                  // For user-facing messages, show only the companion's first name (no demographics).
+                  const companionForDisplay = (() => {
+                    const s = rawCompanionLabel;
+                    const afterNs = s.includes("::") ? (s.split("::").pop() || s) : s;
+                    const base = (afterNs.split("-")[0] || "").trim();
+                    return base || afterNs || DEFAULT_COMPANION_NAME;
+                  })();
+                  try {
+                    const payloadMessages = messages.slice();
+                    if (payloadMessages.length === 0) {
+                      setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: "There is nothing to save yet." },
+                      ]);
+                      setShowSaveSummaryConfirm(false);
+                      return;
+                    }
+
+                    const resp = await callSaveChatSummary(payloadMessages, sessionState);
+                    if (resp?.ok) {
+                      const keyHint = typeof resp?.key === "string" ? resp.key : "";
+                      const persistHint = keyHint.startsWith("session::")
+                        ? " (note: no memberId detected; memory will not persist across new sessions)"
+                        : "";
+                      setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: `Chat saved for ${companionForDisplay}.${persistHint}` },
+                      ]);
+                    } else {
+                      setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: `Chat NOT saved for ${companionForDisplay}${resp?.error_code ? ` (reason: ${resp.error_code})` : ""}.` },
+                      ]);
+                    }
+                  } catch (e: any) {
+                    setMessages((prev) => [
+                      ...prev,
+                      { role: "assistant", content: `Save failed for ${companionForDisplay}: ${String(e?.message || e)}` },
+                    ]);
+                  } finally {
+                    setSavingSummary(false);
+                    setShowSaveSummaryConfirm(false);
+                    // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
+                    try { boostAllTtsVolumes(); } catch (e) {
+        }
+                    void restoreVolumesAfterClearCancel();
+                  }
+                }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#111",
+                  color: "#fff",
+                  cursor: savingSummary ? "not-allowed" : "pointer",
+                  opacity: savingSummary ? 0.7 : 1,
+                }}
+              >
+                {savingSummary ? "Saving…" : "Yes, save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear Messages confirmation overlay */}
+      {showClearMessagesConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 10000,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 520,
+              width: "100%",
+              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Clear messages?</div>
+            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
+              This will clear the conversation on your screen. All audio, video, and mic listening have been stopped. You can resume manually using the controls after closing this dialog.
+            </div>
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
+              <button
+                type="button"
+                onClick={() => {
+                    setShowClearMessagesConfirm(false);
+                    // User gesture: restore boosted routing so subsequent TTS isn't quiet.
+                    try { boostAllTtsVolumes(); } catch (e) {
+        }
+                    // Restore audio routing/volume immediately.
+                    void restoreVolumesAfterClearCancel();
+                  }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                  background: "#fff",
+                  cursor: "pointer",
+                }}
+              >
+                No
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMessages([]);
+                  setInput("");
+                  try { if (inputElRef.current) inputElRef.current.value = ""; } catch (e) {
+        }
+                  setShowClearMessagesConfirm(false);
+                  // User gesture: restore boosted routing so subsequent TTS isn't quiet.
+                  try { boostAllTtsVolumes(); } catch (e) {
+        }
+                  // Re-prime audio outputs after a hard stop so Audio TTS doesn't come back quiet (iOS/Safari).
+                  void restoreVolumesAfterClearCancel();
+                }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#111",
+                  color: "#fff",
+                  cursor: "pointer",
+                }}
+              >
+                Yes, clear
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+{/* Consent overlay */}
+      {showConsentOverlay && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 9999,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 520,
+              width: "100%",
+            }}
+          >
+            <h3 style={{ marginTop: 0 }}>Consent Required</h3>
+            <p style={{ marginTop: 0 }}>
+              To enable <b>Intimate (18+)</b> mode, please confirm you are 18+ and consent to an
+              Intimate (18+) conversation.
+            </p>
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={() => {
+                  // Ensure backend receives pending_consent + intimate mode
+                  setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
+                  send("Yes", { pending_consent: "intimate", mode: "intimate" });
+                }}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#111",
+                  color: "#fff",
+                }}
+              >
+                Yes
+              </button>
+
+              <button
+                onClick={() => {
+                  setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
+                  send("No", { pending_consent: "intimate", mode: "intimate" });
+                }}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #ddd",
+                  background: "#fff",
+                }}
+              >
+                No
+              </button>
+
+              <button
+                onClick={() => {
+                  setChatStatus("safe");
+                  setSessionState((prev) => ({ ...prev, pending_consent: null, mode: "friend" }));
+                }}
+                style={{
+                  marginLeft: "auto",
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #ddd",
+                  background: "#fff",
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12, color: "#666" }}>
+              Tip: You can also type <b>[mode:intimate]</b> or <b>[mode:romantic]</b> to switch.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Debug overlay (mobile-friendly) */}
+      {debugOpen && (
+        <div
+          style={{
+            position: "fixed",
+            left: 10,
+            right: 10,
+            // Place the overlay at the bottom so it doesn't cover the mic + input controls.
+            bottom: "calc(10px + env(safe-area-inset-bottom))",
+            zIndex: 999999,
+            background: "rgba(0,0,0,0.88)",
+            color: "#fff",
+            borderRadius: 12,
+            padding: 10,
+            boxShadow: "0 10px 24px rgba(0,0,0,0.35)",
+            maxHeight: "35vh",
+            overflow: "hidden",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <div style={{ fontWeight: 700, fontSize: 13 }}>Debug Logs ({debugLogs.length})</div>
+            <button
+              onClick={() => {
+                try {
+                  const text = debugLogs.join("\n");
+                  if (navigator.clipboard?.writeText) {
+                    navigator.clipboard.writeText(text);
+                  } else {
+                    // Fallback for older browsers
+                    // eslint-disable-next-line no-alert
+                    alert(text);
+                  }
+                } catch (e) {
+        }
+              }}
+              style={{
+                marginLeft: "auto",
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.25)",
+                background: "rgba(255,255,255,0.10)",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Copy
+            </button>
+            <button
+              onClick={() => setDebugLogs([])}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.25)",
+                background: "rgba(255,255,255,0.10)",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => setDebugOpen(false)}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.25)",
+                background: "rgba(255,255,255,0.10)",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Close
+            </button>
+            <button
+              onClick={() => {
+                setDebugOpen(false);
+                setDebugEnabled(false);
+                setDebugLogs([]);
+              }}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.25)",
+                background: "rgba(255,80,80,0.25)",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Disable
+            </button>
+          </div>
+
+          <div
+            style={{
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+              fontSize: 11,
+              lineHeight: 1.35,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              overflowY: "auto",
+              maxHeight: "26vh",
+              borderRadius: 10,
+              padding: 8,
+              background: "rgba(255,255,255,0.06)",
+              border: "1px solid rgba(255,255,255,0.12)",
+            }}
+          >
+            {debugLogs.length === 0 ? (
+              <div style={{ opacity: 0.8 }}>No logs yet. Tap around, then press Copy.</div>
+            ) : (
+              debugLogs.map((l, i) => <div key={i}>{l}</div>)
+            )}
+          </div>
+
+          <div style={{ marginTop: 8, fontSize: 11, opacity: 0.85 }}>
+            Tip: Tap the avatar image 5 times to toggle this overlay.
+          </div>
+        </div>
+      )}
+
+</main>
+  );
+}

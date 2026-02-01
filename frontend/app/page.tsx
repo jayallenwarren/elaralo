@@ -977,6 +977,44 @@ export default function Page() {
   const debugEnabledRef = useRef(false);
   const debugTapCountRef = useRef(0);
   const debugTapTimerRef = useRef<number | null>(null);
+
+  // Stop the current live session (video + STT/TTS). Used by Stop button and when switching companions.
+  // NOTE: Keep this as a function declaration (not const/useCallback) to avoid build-order/dependency issues.
+  async function stopLiveAvatar(): Promise<void> {
+    // Stop STT/TTS first (matches Stop button behavior).
+    try { stopHandsFreeSTT(); } catch (e) {}
+    try { stopSpeechToText(); } catch (e) {}
+
+    // BeeStreamed: stop the host stream server-side; viewers only disconnect locally.
+    if (liveProvider === "stream") {
+      if (streamCanStart) {
+        try {
+          await fetch(`${API_BASE}/stream/beestreamed/stop_embed`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              brand: companyName,
+              avatar: companionName,
+              memberId: memberId || "",
+              eventRef: streamEventRef || "",
+            }),
+          });
+        } catch (e) {
+          // Best-effort: still tear down local UI state even if stop fails.
+        }
+      }
+
+      // Local disconnect (host + viewer)
+      setStreamEmbedUrl("");
+      setStreamEventRef("");
+      setStreamCanStart(false);
+      setStreamNotice("");
+    }
+
+    // Reset avatar UI status
+    setAvatarStatus("idle");
+  }
+
 useEffect(() => {
   // Stop when switching companions
   void stopLiveAvatar();
