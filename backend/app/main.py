@@ -5,7 +5,6 @@ import time
 import re
 import uuid
 import json
-import shutil
 import hashlib
 import base64
 import asyncio
@@ -448,125 +447,18 @@ _COMPANION_MAPPINGS_LOADED_AT: float | None = None
 _COMPANION_MAPPINGS_SOURCE: str = ""
 
 
-
-# ---------------------------------------------------------------------------
-# Persistent mappings DB handling
-#
-# The repo ships ./video_voice_mappings.sqlite3 next to main.py (backend/app/).
-# On Azure App Service, only /home is durable. We therefore:
-#   - copy the repo DB to /home/video_voice_mappings.sqlite3 on first run
-#   - use /home/video_voice_mappings.sqlite3 for all reads/writes afterwards
-#   - after every write, create a timestamped backup in /home/video_voice_mappings_backups/
-#   - append a JSONL changelog of executed SQL statements for offline replay/sync
-# ---------------------------------------------------------------------------
-
-_MAPPINGS_DB_FILENAME = "video_voice_mappings.sqlite3"
-_MAPPINGS_DB_HOME_DIR = "/home"
-_MAPPINGS_DB_HOME_PATH = os.path.join(_MAPPINGS_DB_HOME_DIR, _MAPPINGS_DB_FILENAME)
-_MAPPINGS_DB_SEED_LOCK_PATH = os.path.join(_MAPPINGS_DB_HOME_DIR, f".{_MAPPINGS_DB_FILENAME}.seed.lock")
-_MAPPINGS_DB_WRITE_LOCK_PATH = os.path.join(_MAPPINGS_DB_HOME_DIR, f".{_MAPPINGS_DB_FILENAME}.write.lock")
-_MAPPINGS_DB_BACKUP_DIR = os.path.join(_MAPPINGS_DB_HOME_DIR, "video_voice_mappings_backups")
-_MAPPINGS_DB_CHANGELOG_PATH = os.path.join(_MAPPINGS_DB_HOME_DIR, f"{_MAPPINGS_DB_FILENAME}.changelog.jsonl")
-
-
-def _utc_iso_now() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-def _ensure_home_mappings_db_sync() -> Optional[str]:
-    """Ensure a durable mappings DB exists at /home/video_voice_mappings.sqlite3.
-
-    Returns:
-      - the durable /home path when available
-      - or a readable seed path (if copying fails)
-      - or None if no seed DB exists anywhere
-    """
-    try:
-        # If already seeded, prefer /home immediately.
-        if os.path.exists(_MAPPINGS_DB_HOME_PATH):
-            return _MAPPINGS_DB_HOME_PATH
-
-        base_dir = os.path.dirname(__file__)
-
-        # Optional override, but only if it points to the expected DB filename.
-        env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-        if env_path and os.path.basename(env_path) != _MAPPINGS_DB_FILENAME:
-            env_path = ""
-
-        seed_candidates = [
-            env_path,
-            os.path.join(base_dir, _MAPPINGS_DB_FILENAME),
-            os.path.join(base_dir, "data", _MAPPINGS_DB_FILENAME),
-            os.path.join(os.getcwd(), _MAPPINGS_DB_FILENAME),
-        ]
-        seed_path = next((p for p in seed_candidates if p and os.path.exists(p)), "")
-        if not seed_path:
-            return None
-
-        os.makedirs(_MAPPINGS_DB_HOME_DIR, exist_ok=True)
-
-        # Avoid races across multiple gunicorn workers.
-        with FileLock(_MAPPINGS_DB_SEED_LOCK_PATH):
-            if os.path.exists(_MAPPINGS_DB_HOME_PATH):
-                return _MAPPINGS_DB_HOME_PATH
-            try:
-                shutil.copy2(seed_path, _MAPPINGS_DB_HOME_PATH)
-                return _MAPPINGS_DB_HOME_PATH
-            except Exception:
-                # If we cannot copy (permissions), fall back to the seed path.
-                return seed_path
-    except Exception:
-        return None
-
-
-def _backup_mappings_db_sync(db_path: str, reason: str) -> Optional[str]:
-    """Best-effort: snapshot the DB file after a successful write."""
-    try:
-        if not db_path or not os.path.exists(db_path):
-            return None
-        os.makedirs(_MAPPINGS_DB_BACKUP_DIR, exist_ok=True)
-
-        stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
-        safe_reason = re.sub(r"[^a-zA-Z0-9_.-]+", "_", (reason or "update")).strip("_")[:60]
-        backup_name = f"{_MAPPINGS_DB_FILENAME}.{stamp}.{safe_reason}.bak"
-        backup_path = os.path.join(_MAPPINGS_DB_BACKUP_DIR, backup_name)
-
-        shutil.copy2(db_path, backup_path)
-        return backup_path
-    except Exception:
-        return None
-
-
-def _append_mappings_db_changelog_sync(record: Dict[str, Any]) -> None:
-    """Best-effort: append a JSONL record describing a DB write."""
-    try:
-        os.makedirs(_MAPPINGS_DB_HOME_DIR, exist_ok=True)
-        with open(_MAPPINGS_DB_CHANGELOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-
 def _norm_key(s: str) -> str:
     return (s or "").strip().lower()
 
 
 def _candidate_mapping_db_paths() -> List[str]:
     base_dir = os.path.dirname(__file__)
-
-    # Optional override, but only if it points to the expected DB filename.
     env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-    if env_path and os.path.basename(env_path) != _MAPPINGS_DB_FILENAME:
-        env_path = ""
-
     candidates = [
-        _MAPPINGS_DB_HOME_PATH,
         env_path,
-        os.path.join(base_dir, _MAPPINGS_DB_FILENAME),
-        os.path.join(base_dir, "data", _MAPPINGS_DB_FILENAME),
-        os.path.join(os.getcwd(), _MAPPINGS_DB_FILENAME),
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
     ]
-
     # keep unique, preserve order
     out: List[str] = []
     seen: set[str] = set()
@@ -582,9 +474,6 @@ def _candidate_mapping_db_paths() -> List[str]:
 
 def _load_companion_mappings_sync() -> None:
     global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE
-
-    # Seed /home/video_voice_mappings.sqlite3 (durable) from the repo DB on first run.
-    _ensure_home_mappings_db_sync()
 
     db_path = ""
     for p in _candidate_mapping_db_paths():
@@ -947,31 +836,6 @@ def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
 
     return event_ref
 
-
-def _beestreamed_patch_event_date_now_sync(event_ref: str, now_unix: Optional[int] = None) -> bool:
-    """Patch BeeStreamed event 'date' to now (UTC) so embeds don't show a future countdown."""
-    try:
-        event_ref = (event_ref or "").strip()
-        if not event_ref:
-            return False
-
-        if now_unix is None:
-            now_unix = int(time.time())
-
-        dt = datetime.utcfromtimestamp(int(now_unix)).replace(microsecond=0)
-        payload = {"date": dt.strftime("%Y-%m-%d %H:%M:%S")}
-
-        url = f"{_BEE_API_BASE}/events/{event_ref}"
-        r = requests.patch(url, headers=_beestreamed_headers(), json=payload, timeout=20)
-        if r.status_code >= 400:
-            logger.warning("BeeStreamed patch event date failed (%s): %s", r.status_code, r.text[:300])
-            return False
-        return True
-    except Exception as e:
-        logger.warning("BeeStreamed patch event date failed: %s", e)
-        return False
-
-
 def _beestreamed_start_webrtc_sync(event_ref: str) -> None:
     import requests  # type: ignore
     api_base = _beestreamed_api_base()
@@ -1012,145 +876,61 @@ def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str,
     return host
 
 def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> bool:
-    """Persist a newly created event_ref back into the companion_mappings table.
-
-    This makes the mapping durable across restarts and enables the frontend Video icon logic
-    to work without relying on in-memory state.
-    """
-    try:
-        brand = (brand or "").strip()
-        avatar = (avatar or "").strip()
-        event_ref = (event_ref or "").strip()
-        if not brand or not avatar or not event_ref:
-            return False
-
-        key = _norm_key(brand, avatar)
-        mapping = _COMPANION_MAPPINGS.get(key)
-        if mapping is None:
-            # Nothing to update in memory; DB might still have it, but we do not create rows here.
-            return False
-
-        # Always update in-memory first so the current process behaves consistently.
-        mapping["event_ref"] = event_ref
-
-        # Prefer the durable /home DB (seed it if needed).
-        db_path = _ensure_home_mappings_db_sync() or _COMPANION_MAPPINGS_SOURCE or ""
-        if os.path.exists(_MAPPINGS_DB_HOME_PATH):
-            db_path = _MAPPINGS_DB_HOME_PATH
-
-        if not db_path or not os.path.exists(db_path):
-            return False
-
-        sql_update = "UPDATE companion_mappings SET event_ref = ? WHERE brand = ? AND avatar = ?"
-        params = (event_ref, brand, avatar)
-
-        with FileLock(_MAPPINGS_DB_WRITE_LOCK_PATH):
-            conn = sqlite3.connect(db_path)
-            try:
-                cur = conn.cursor()
-
-                # Ensure the column exists (older DBs may not have it).
-                cur.execute("PRAGMA table_info(companion_mappings)")
-                cols = [row[1] for row in cur.fetchall()]  # type: ignore[index]
-                if "event_ref" not in cols:
-                    cur.execute("ALTER TABLE companion_mappings ADD COLUMN event_ref TEXT")
-
-                cur.execute(sql_update, params)
-                conn.commit()
-
-                backup_path = _backup_mappings_db_sync(db_path, reason="persist_event_ref")
-                _append_mappings_db_changelog_sync(
-                    {
-                        "ts": _utc_iso_now(),
-                        "action": "persist_event_ref",
-                        "brand": brand,
-                        "avatar": avatar,
-                        "sql": sql_update,
-                        "params": [event_ref, brand, avatar],
-                        "db_path": db_path,
-                        "backup_path": backup_path,
-                    }
-                )
-
-                return True
-            finally:
-                conn.close()
-    except Exception as e:
-        logger.warning("persist_event_ref failed: %s", e)
+    """Try to persist event_ref into the companion_mappings SQLite DB (if writable). Always updates in-memory mapping."""
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    e = (event_ref or "").strip()
+    if not b or not a or not e:
         return False
 
-
-def _persist_event_date_unix_best_effort(brand: str, avatar: str, event_date_unix: int) -> bool:
-    """Persist event_date_unix into the DB (best-effort).
-
-    This is used for operational visibility and to support offline replay/sync.
-    """
+    # Always update in-memory mapping so this process is consistent.
     try:
-        brand = (brand or "").strip()
-        avatar = (avatar or "").strip()
-        if not brand or not avatar:
+        key = (b.lower(), a.lower())
+        if key in _COMPANION_MAPPINGS:
+            _COMPANION_MAPPINGS[key]["event_ref"] = e
+    except Exception:
+        pass
+
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    if not db_path or not os.path.exists(db_path):
+        return False
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(companion_mappings)")
+        cols = [str(r[1] or "").strip() for r in cur.fetchall()]
+        cols_l = [c.lower() for c in cols]
+
+        # Ensure event_ref column exists
+        if "event_ref" not in cols_l:
+            try:
+                cur.execute("ALTER TABLE companion_mappings ADD COLUMN event_ref TEXT")
+                conn.commit()
+                cols_l.append("event_ref")
+            except Exception:
+                # read-only DB or unsupported ALTER; give up persistence but keep in-memory update
+                return False
+
+        # Determine key columns
+        brand_col = "brand" if "brand" in cols_l else ("brand_id" if "brand_id" in cols_l else "")
+        avatar_col = "avatar" if "avatar" in cols_l else ("companion" if "companion" in cols_l else "")
+        if not brand_col or not avatar_col:
             return False
 
+        cur.execute(
+            f"UPDATE companion_mappings SET event_ref = ? WHERE lower({brand_col}) = lower(?) AND lower({avatar_col}) = lower(?)",
+            (e, b, a),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
         try:
-            event_date_unix_int = int(event_date_unix)
+            conn.close()
         except Exception:
-            return False
-
-        key = _norm_key(brand, avatar)
-        mapping = _COMPANION_MAPPINGS.get(key)
-        if mapping is None:
-            return False
-
-        mapping["event_date_unix"] = str(event_date_unix_int)
-
-        # Prefer the durable /home DB (seed it if needed).
-        db_path = _ensure_home_mappings_db_sync() or _COMPANION_MAPPINGS_SOURCE or ""
-        if os.path.exists(_MAPPINGS_DB_HOME_PATH):
-            db_path = _MAPPINGS_DB_HOME_PATH
-
-        if not db_path or not os.path.exists(db_path):
-            return False
-
-        sql_update = "UPDATE companion_mappings SET event_date_unix = ? WHERE brand = ? AND avatar = ?"
-        params = (event_date_unix_int, brand, avatar)
-
-        with FileLock(_MAPPINGS_DB_WRITE_LOCK_PATH):
-            conn = sqlite3.connect(db_path)
-            try:
-                cur = conn.cursor()
-
-                # Ensure the column exists.
-                cur.execute("PRAGMA table_info(companion_mappings)")
-                cols = [row[1] for row in cur.fetchall()]  # type: ignore[index]
-                if "event_date_unix" not in cols:
-                    cur.execute("ALTER TABLE companion_mappings ADD COLUMN event_date_unix INTEGER")
-
-                cur.execute(sql_update, params)
-                conn.commit()
-
-                backup_path = _backup_mappings_db_sync(db_path, reason="persist_event_date_unix")
-                _append_mappings_db_changelog_sync(
-                    {
-                        "ts": _utc_iso_now(),
-                        "action": "persist_event_date_unix",
-                        "brand": brand,
-                        "avatar": avatar,
-                        "sql": sql_update,
-                        "params": [event_date_unix_int, brand, avatar],
-                        "db_path": db_path,
-                        "backup_path": backup_path,
-                    }
-                )
-
-                return True
-            finally:
-                conn.close()
-    except Exception as e:
-        logger.warning("persist_event_date_unix failed: %s", e)
-        return False
-
-
-
+            pass
 
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
@@ -1219,34 +999,8 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
             "message": "This session will start once the Human Companion starts the session.",
         }
 
-    # Host: keep the event scheduled for "now" and persist that time for ops/sync.
-    now_unix = int(time.time())
-    _beestreamed_patch_event_date_now_sync(event_ref, now_unix)
-    _persist_event_date_unix_best_effort(resolved_brand, resolved_avatar, now_unix)
-
     # Host: start the stream (idempotent on BeeStreamed side).
-    try:
-        _beestreamed_start_webrtc_sync(event_ref)
-    except HTTPException as e:
-        # Recovery path:
-        # If someone mistakenly saved BeeStreamed `event_client_ref` into our `event_ref` field,
-        # BeeStreamed will typically return 404 for event endpoints. In that case, create a fresh
-        # event_ref, persist it, and retry once.
-        if getattr(e, "status_code", None) in (400, 404):
-            logger.warning(
-                "BeeStreamed start failed for stored event_ref (status=%s). Creating a new event_ref.",
-                getattr(e, "status_code", None),
-            )
-            event_ref = _beestreamed_create_event_sync(title=f"{resolved_avatar} Live", embed_domain=embed_domain)
-            _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
-            embed_url = _beestreamed_public_event_url(event_ref)
-
-            _beestreamed_patch_event_date_now_sync(event_ref, now_unix)
-            _persist_event_date_unix_best_effort(resolved_brand, resolved_avatar, now_unix)
-
-            _beestreamed_start_webrtc_sync(event_ref)
-        else:
-            raise
+    _beestreamed_start_webrtc_sync(event_ref)
 
     return {
         "ok": True,
