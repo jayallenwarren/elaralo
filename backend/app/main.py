@@ -6,7 +6,7 @@ import re
 import uuid
 import json
 import hashlib
-import base64   
+import base64
 import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -493,8 +493,40 @@ def _load_companion_mappings_sync() -> None:
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
-        cur.execute("SELECT * FROM companion_mappings")
+
+        # The mapping table name differs between environments.
+        # Prefer the canonical names, but fall back to any table present.
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+        tables_lc = {t.lower(): t for t in table_names}
+
+        preferred = [
+            "companion_mappings",
+            "voice_video_mappings",
+            "voice_video_mapping",
+            "mappings",
+        ]
+        table = ""
+        for cand in preferred:
+            if cand.lower() in tables_lc:
+                table = tables_lc[cand.lower()]
+                break
+
+        # If none of the preferred names exist, pick the first available table.
+        if not table and table_names:
+            table = table_names[0]
+
+        if not table:
+            print(f"[mappings] WARNING: mapping DB found at {db_path} but contains no tables.")
+            _COMPANION_MAPPINGS = {}
+            _COMPANION_MAPPINGS_LOADED_AT = time.time()
+            _COMPANION_MAPPINGS_SOURCE = f"{db_path}:{table_name_for_source}"
+            return
+
+        # Quote the table name to safely handle names with special characters.
+        cur.execute(f'SELECT * FROM "{table}"')
         rows = cur.fetchall()
+        table_name_for_source = str(table or "")
     finally:
         conn.close()
 
@@ -539,7 +571,7 @@ def _load_companion_mappings_sync() -> None:
     _COMPANION_MAPPINGS = d
     _COMPANION_MAPPINGS_LOADED_AT = time.time()
     _COMPANION_MAPPINGS_SOURCE = db_path
-    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path}")
+    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path} (table={table_name_for_source})")
 
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
