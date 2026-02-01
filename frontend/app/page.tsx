@@ -141,7 +141,8 @@ function generateAnonId(): string {
       // @ts-ignore
       return crypto.randomUUID();
     }
-  } catch {}
+  } catch (e) {
+        }
   // Fallback: 32-hex chars
   const rand32 = () =>
     Math.floor(Math.random() * 0xffffffff)
@@ -161,8 +162,8 @@ function getOrCreateAnonMemberId(brand: string): string {
     const id = generateAnonId();
     window.localStorage.setItem(storageKey, id);
     return `${ANON_ID_PREFIX}${id}`;
-  } catch {
-    // Some browsers/settings can block localStorage in a third-party iframe context.
+  } catch (e) {
+        // Some browsers/settings can block localStorage in a third-party iframe context.
     // Secondary: sessionStorage (sticky for the tab session).
     try {
       const ssKey = `ELARALO_SESSION_ANON_ID::${safeBrandKey(brand)}`;
@@ -171,8 +172,8 @@ function getOrCreateAnonMemberId(brand: string): string {
       const id = generateAnonId();
       window.sessionStorage.setItem(ssKey, id);
       return `${ANON_ID_PREFIX}${id}`;
-    } catch {
-      return "";
+    } catch (e) {
+        return "";
     }
   }
 }
@@ -570,8 +571,8 @@ function formatDidError(err: any): string {
 
   try {
     return JSON.stringify(err);
-  } catch {
-    return String(err);
+  } catch (e) {
+        return String(err);
   }
 }
 
@@ -764,8 +765,8 @@ async function pickFirstExisting(urls: string[]) {
     try {
       const res = await fetch(url, { method: "HEAD", cache: "no-store" });
       if (res.ok) return url;
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
   }
   return DEFAULT_AVATAR;
@@ -833,8 +834,8 @@ function isAllowedOrigin(origin: string) {
         if (host.endsWith("." + refHost)) return true; // subdomain match
         if (refHost.endsWith("." + host)) return true; // inverse (defensive)
       }
-    } catch {
-      // ignore referrer parse issues
+    } catch (e) {
+        // ignore referrer parse issues
     }
 
     // Chrome-only fallback (helps in some embedded contexts)
@@ -850,18 +851,18 @@ function isAllowedOrigin(origin: string) {
             if (host === aHost) return true;
             if (host.endsWith("." + aHost)) return true;
             if (aHost.endsWith("." + host)) return true;
-          } catch {
-            // ignore per-origin parse issues
+          } catch (e) {
+        // ignore per-origin parse issues
           }
         }
       }
-    } catch {
-      // ignore ancestorOrigins issues
+    } catch (e) {
+        // ignore ancestorOrigins issues
     }
 
     return false;
-  } catch {
-    return false;
+  } catch (e) {
+        return false;
   }
 }
 
@@ -956,8 +957,8 @@ export default function Page() {
     if (typeof window === "undefined") return false;
     try {
       return window.self !== window.top;
-    } catch {
-      // Cross-origin access to window.top can throw; assume embedded.
+    } catch (e) {
+        // Cross-origin access to window.top can throw; assume embedded.
       return true;
     }
   }, []);
@@ -976,1139 +977,6 @@ export default function Page() {
   const debugEnabledRef = useRef(false);
   const debugTapCountRef = useRef(0);
   const debugTapTimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const qs = new URLSearchParams(window.location.search);
-      const fromQuery = qs.get("debug") === "1";
-      const fromStorage = window.localStorage.getItem(DEBUG_KEY) === "1";
-
-      // Never auto-open the overlay (it can cover important UI). Allow it to open only
-      // if explicitly requested via ?debugOpen=1, otherwise require the 5-tap gesture.
-      if (fromQuery || fromStorage) {
-        setDebugEnabled(true);
-        setDebugOpen(qs.get("debugOpen") === "1");
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  useEffect(() => {
-    debugEnabledRef.current = debugEnabled;
-    if (typeof window === "undefined") return;
-    try {
-      if (debugEnabled) window.localStorage.setItem(DEBUG_KEY, "1");
-      else window.localStorage.removeItem(DEBUG_KEY);
-    } catch {
-      // ignore
-    }
-  }, [debugEnabled]);
-
-  const pushDebug = useCallback((level: "log" | "warn" | "error", ...args: any[]) => {
-    if (!debugEnabledRef.current) return;
-    try {
-      const ts = new Date().toISOString().replace("T", " ").replace("Z", "");
-      const text = args
-        .map((a) => {
-          if (typeof a === "string") return a;
-          try {
-            return JSON.stringify(a);
-          } catch {
-            return String(a);
-          }
-        })
-        .join(" ");
-      const line = `[${ts}] ${level.toUpperCase()}: ${text}`;
-      setDebugLogs((prev) => {
-        const next = [...prev, line];
-        return next.length > 250 ? next.slice(next.length - 250) : next;
-      });
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!debugEnabled) return;
-
-    const origLog = console.log;
-    const origWarn = console.warn;
-    const origError = console.error;
-
-    console.log = (...args: any[]) => {
-      origLog(...args);
-      pushDebug("log", ...args);
-    };
-    console.warn = (...args: any[]) => {
-      origWarn(...args);
-      pushDebug("warn", ...args);
-    };
-    console.error = (...args: any[]) => {
-      origError(...args);
-      pushDebug("error", ...args);
-    };
-
-    const onError = (e: any) => {
-      pushDebug("error", "window.error", e?.message ?? e);
-    };
-    const onRejection = (e: any) => {
-      pushDebug("error", "unhandledrejection", e?.reason ?? e);
-    };
-
-    window.addEventListener("error", onError);
-    window.addEventListener("unhandledrejection", onRejection);
-
-    try {
-      pushDebug("log", "Debug enabled", {
-        href: window.location.href,
-        embedded: isEmbedded,
-        ua: navigator.userAgent,
-        apiBase: API_BASE,
-      });
-      console.log("[ELARALO] API_BASE =", API_BASE);
-    } catch {
-      // ignore
-    }
-
-    return () => {
-      console.log = origLog;
-      console.warn = origWarn;
-      console.error = origError;
-      window.removeEventListener("error", onError);
-      window.removeEventListener("unhandledrejection", onRejection);
-    };
-  }, [debugEnabled, isEmbedded, pushDebug]);
-
-  const secretDebugTap = useCallback(() => {
-    if (typeof window === "undefined") return;
-
-    debugTapCountRef.current += 1;
-
-    if (debugTapTimerRef.current) window.clearTimeout(debugTapTimerRef.current);
-    debugTapTimerRef.current = window.setTimeout(() => {
-      debugTapCountRef.current = 0;
-      debugTapTimerRef.current = null;
-    }, 1400);
-
-    if (debugTapCountRef.current >= 5) {
-      debugTapCountRef.current = 0;
-
-      if (!debugEnabledRef.current) {
-        debugEnabledRef.current = true;
-        setDebugEnabled(true);
-      }
-      setDebugOpen((v) => !v);
-    }
-  }, []);
-
-
-
-  // Local audio-only TTS element (used when Live Avatar is not active/available)
-  const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
-  const localTtsVideoRef = useRef<HTMLVideoElement | null>(null);
-  const localTtsUnlockedRef = useRef(false);
-  const localTtsStopFnRef = useRef<(() => void) | null>(null);
-  // Guards to cancel/ignore in-flight local TTS work when user stops communications mid-stream.
-  const localTtsEpochRef = useRef(0);
-  const localTtsAbortRef = useRef<AbortController | null>(null);
-
-  // Live Avatar element ref is declared early so it can be used by the global TTS volume booster.
-  const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
-
-  // ----------------------------
-  // Global TTS volume boost
-  // ----------------------------
-  // HTMLMediaElement.volume tops out at 1.0. To reliably boost perceived loudness—especially
-  // on iOS after an audio-capture session—we route TTS playback through WebAudio GainNodes.
-  // This applies to:
-  // - Local TTS <audio>/<video> playback (hands-free STT mode)
-  // - Live Avatar <video> element playback (non-iPhone)
-  // iPhone Live Avatar already routes MediaStream audio through WebAudio (see applyIphoneLiveAvatarAudioBoost).
-  // Volume boost for audio-only TTS and non-iPhone Live Avatar.
-  // Note: We intentionally use WebAudio gain to exceed HTMLMediaElement.volume (max 1.0).
-  const TTS_GAIN = 12.0;
-  const ttsAudioCtxRef = useRef<AudioContext | null>(null);
-  const ttsAudioMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const ttsAudioGainRef = useRef<GainNode | null>(null);
-  const ttsAudioBoundElRef = useRef<HTMLMediaElement | null>(null);
-  const ttsVideoMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const ttsVideoGainRef = useRef<GainNode | null>(null);
-  const ttsVideoBoundElRef = useRef<HTMLMediaElement | null>(null);
-  const avatarVideoMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const avatarVideoGainRef = useRef<GainNode | null>(null);
-  const avatarVideoBoundElRef = useRef<HTMLMediaElement | null>(null);
-
-  const ensureTtsAudioContext = useCallback((): AudioContext | null => {
-    if (typeof window === "undefined") return null;
-    try {
-      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return null;
-      if (!ttsAudioCtxRef.current) ttsAudioCtxRef.current = new AudioCtx();
-      const ctx = ttsAudioCtxRef.current;
-      if (ctx?.state === "suspended" && ctx.resume) {
-        ctx.resume().catch(() => {});
-      }
-      return ctx;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  // "Audio session nudge" (runs on a user gesture):
-  // iOS Safari can remain in a low/communications-volume route after mic capture or modal dialogs.
-  // A short, low-frequency, low-amplitude burst through WebAudio helps re-establish the normal
-  // playback route so subsequent audio-only TTS (hidden VIDEO path) is not silent/feeble.
-  //
-  // NOTE: This is intentionally slightly stronger than "inaudible" because the user's report
-  // indicates iOS can otherwise remain stuck after the Clear Messages modal.
-  const nudgeAudioSession = useCallback(async () => {
-    const ctx = ensureTtsAudioContext();
-    if (!ctx) return;
-    try {
-      if (ctx.state === "suspended") {
-        await ctx.resume();
-      }
-
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      g.gain.value = 0.02;
-      osc.frequency.value = 40;
-      osc.connect(g);
-      g.connect(ctx.destination);
-      const stopAt = ctx.currentTime + 0.12;
-      osc.start();
-      osc.stop(stopAt);
-
-      window.setTimeout(() => {
-        try { osc.disconnect(); } catch {}
-        try { g.disconnect(); } catch {}
-      }, 180);
-    } catch {
-      // ignore
-    }
-  }, [ensureTtsAudioContext]);
-
-  // Track whether we have already connected each gain routing chain.
-  const ttsAudioChainConnectedRef = useRef<boolean>(false);
-  const ttsVideoChainConnectedRef = useRef<boolean>(false);
-  const avatarVideoChainConnectedRef = useRef<boolean>(false);
-
-
-  const applyTtsGainRouting = useCallback(
-    (media: HTMLMediaElement | null, kind: "audio" | "video" | "avatar") => {
-      if (!media) return;
-      const ctx = ensureTtsAudioContext();
-      if (!ctx) return;
-
-      // iPhone Live Avatar uses MediaStream routing; do not double-route the <video> element.
-      if (kind === "avatar" && isIphone) return;
-
-      // IMPORTANT: Audio-only TTS must remain on the hidden <video> path, but routing
-      // cross-origin media through WebAudio can result in silence on some browsers (notably iOS Safari)
-      // if the media response is not CORS-enabled. To guarantee audibility, we do NOT route
-      // local (audio-only) TTS through WebAudio GainNodes. (We still keep the hidden VIDEO element.)
-      if (kind === "audio" || kind === "video") {
-        try { media.muted = false; media.volume = 1; } catch {}
-        return;
-      }
-
-      try {
-        // From here on, we only handle the non-iPhone Live Avatar <video> element.
-        // (Audio-only TTS elements return early above to avoid WebAudio routing issues.)
-
-        // If the underlying media element instance changed (common when Live Avatar is stopped/started),
-        // we must recreate the MediaElementSourceNode. Source nodes are permanently bound to a single element.
-        if (avatarVideoBoundElRef.current !== media) {
-          try { avatarVideoMediaSrcRef.current?.disconnect(); } catch {}
-          avatarVideoMediaSrcRef.current = null;
-          avatarVideoBoundElRef.current = media;
-          avatarVideoChainConnectedRef.current = false;
-        }
-
-        // If we already created a MediaElementSourceNode for this media element, reuse it.
-        // (Browsers throw if you call createMediaElementSource() more than once per element.)
-        let src: MediaElementAudioSourceNode | null = null;
-        let gain: GainNode | null = null;
-
-        // Avatar routing
-        {
-          src = avatarVideoMediaSrcRef.current;
-          gain = avatarVideoGainRef.current;
-          if (!src) {
-            src = ctx.createMediaElementSource(media);
-            avatarVideoMediaSrcRef.current = src;
-          }
-          if (!gain) {
-            gain = ctx.createGain();
-            avatarVideoGainRef.current = gain;
-          }
-        }
-
-        // Connect once and then only update gain. Repeated disconnect/reconnect can leave
-        // iOS Safari in a bad route after modal dialogs.
-        const connectOnce = (connectedRef: React.MutableRefObject<boolean>) => {
-          if (connectedRef.current) return;
-          try {
-            src!.connect(gain!);
-          } catch {}
-          try {
-            gain!.connect(ctx.destination);
-          } catch {}
-          connectedRef.current = true;
-        };
-        // kind is narrowed to "avatar" here (audio/video returned early above).
-        connectOnce(avatarVideoChainConnectedRef);
-
-        gain.gain.value = TTS_GAIN;
-
-        // Keep element volume at max so the gain node is the only limiter.
-        try {
-          media.muted = false;
-          media.volume = 1;
-        } catch {}
-      } catch (e) {
-        // If this fails (e.g., cross-origin media restrictions), we still keep media.volume at 1.
-        try {
-          media.muted = false;
-          media.volume = 1;
-        } catch {}
-      }
-    },
-    [ensureTtsAudioContext, isIphone]
-  );
-
-  const boostAllTtsVolumes = useCallback(() => {
-    try {
-      // Local (audio-only) TTS elements intentionally NOT routed through WebAudio.
-      // Live avatar video element (non-iPhone)
-      applyTtsGainRouting(avatarVideoRef.current, "avatar");
-    } catch {
-      // ignore
-    }
-  }, [applyTtsGainRouting]);
-
-
-  // Companion identity (drives persona + Phase 1 live avatar mapping)
-  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
-  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
-  // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
-  // IMPORTANT: This must never alter STT/TTS start/stop code paths.
-  const [rebrandingKey, setRebrandingKey] = useState<string>("");
-
-  // Derive legacy single-field rebranding string from the pipe-delimited RebrandingKey.
-  // Default: "" (treated as core / non-rebranded).
-  const rebranding = useMemo(() => {
-    const p = parseRebrandingKey(rebrandingKey || "");
-    return String(p?.rebranding || "").trim();
-  }, [rebrandingKey]);
-  const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
-
-  const renderMsgContent = useCallback(
-    (m: Msg): React.ReactNode => {
-      // For user messages we keep plain text.
-      if (m.role !== "assistant") return m.content;
-
-      // For assistant messages, we render PayGo/Upgrade URLs as friendly links.
-      const stripScheme = (u: string) => (u || "").replace(/^https?:/i, "");
-
-      const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
-      const upgradeKey = rebrandingInfo?.upgradeLink ? stripScheme(rebrandingInfo.upgradeLink).toLowerCase() : "";
-
-      const urlGlobal = /(https?:\/\/[^\s]+|\/\/[^\s]+)/g;
-      const parts = (m.content || "").split(urlGlobal);
-
-      return parts.map((part, idx) => {
-        if (!part) return null;
-
-        const isUrl = /^https?:\/\//i.test(part) || part.startsWith("//");
-        if (!isUrl) return <span key={idx}>{part}</span>;
-
-        // Peel trailing punctuation so it doesn't get included in the href.
-        const match = part.match(/^(.*?)([\)\]\.,;:!?]+)?$/);
-        const urlRaw = match?.[1] ?? part;
-        const punct = match?.[2] ?? "";
-
-        const comparable = stripScheme(urlRaw).toLowerCase();
-
-        let label = urlRaw;
-        if (paygKey && comparable === paygKey) label = "Pay as you Go";
-        else if (upgradeKey && comparable === upgradeKey) label = "Upgrade";
-
-        const href = urlRaw.startsWith("//") ? `https:${urlRaw}` : urlRaw;
-
-        return (
-          <React.Fragment key={idx}>
-            <a href={href} target="_blank" rel="noopener noreferrer" className="underline">
-              {label}
-            </a>
-            {punct}
-          </React.Fragment>
-        );
-      });
-    },
-    [rebrandingInfo]
-  );
-
-  const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), [rebrandingInfo]);
-  const rebrandingSlug = useMemo(() => normalizeRebrandingSlug(rebrandingName), [rebrandingName]);
-
-  // For rebrands, show the rebranding site's plan label when Wix provides it (e.g., "Supreme").
-  const [planLabelOverride, setPlanLabelOverride] = useState<string>("");
-
-  // Upgrade URL (defaults to env; overridden by RebrandingKey when present)
-  const upgradeUrl = useMemo(() => {
-    const u = String(rebrandingInfo?.upgradeLink || "").trim();
-    return u || UPGRADE_URL;
-  }, [rebrandingInfo]);
-
-  const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
-  const [companionKey, setCompanionKey] = useState<string>("");
-  const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
-
-  // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
-  const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      const brand = String(companyName || "").trim();
-      const avatar = String(companionName || "").trim();
-      if (!brand || !avatar) {
-        setCompanionMapping(null);
-        return;
-      }
-
-      if (!API_BASE) {
-        setCompanionMapping(null);
-        return;
-      }
-
-      try {
-        const url = `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(
-          avatar
-        )}`;
-        const res = await fetch(url, { method: "GET" });
-        const json = (await res.json()) as CompanionMappingRow;
-        if (cancelled) return;
-
-        if (res.ok && (json as any)?.found) setCompanionMapping(json);
-        else setCompanionMapping(null);
-      } catch {
-        if (!cancelled) setCompanionMapping(null);
-      }
-    }
-
-    void load();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [companyName, companionName]);
-
-  // Read `?rebrandingKey=...` for direct testing (outside Wix).
-  // Back-compat: also accept `?rebranding=BrandName`.
-  // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
-  useEffect(() => {
-    try {
-      const u = new URL(window.location.href);
-      const qKey = u.searchParams.get(REBRANDING_KEY_QUERY_PARAM);
-      const qLegacy = u.searchParams.get(LEGACY_REBRANDING_QUERY_PARAM);
-      const q = String(qKey || "").trim() || String(qLegacy || "").trim();
-      if (q) setRebrandingKey(q);
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  // Resolve the default company logo when rebranding is active.
-  // This only affects the header circle image when no companion image is available.
-  useEffect(() => {
-    const rawBrand = (rebrandingName || "").trim();
-    const slug = (rebrandingSlug || "").trim();
-
-    // No rebranding: revert to the default Elaralo logo.
-    if (!rawBrand) {
-      setCompanyLogoSrc(DEFAULT_AVATAR);
-
-      // Keep the header image in sync if we are currently showing a company logo.
-      // Do NOT override a companion headshot.
-      setAvatarSrc((prev) => {
-        const p = String(prev || "").trim();
-        if (!p) return DEFAULT_AVATAR;
-
-        // Covers both:
-        // - "/companion/headshot/..."
-        // - "/rebranding/<brand>/companion/headshot/..."
-        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
-
-        if (p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
-
-        // If we were previously showing a rebrand logo, revert to default.
-        if (p.includes("-logo.")) return DEFAULT_AVATAR;
-
-        return prev;
-      });
-
-      return;
-    }
-
-    const base = slug || normalizeRebrandingSlug(rawBrand);
-
-    const candidates: string[] = [];
-    if (base) {
-      // IMPORTANT:
-      // - Logo assets live under frontend/public.
-      // - For rebrands, the logo is now located under:
-      //     /rebranding/<brand>/<brand>-logo.(png|jpg|jpeg|webp)
-      // - We keep a legacy fallback for older deployments where the logo lived at site root.
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.png`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpeg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.webp`));
-
-      // Legacy fallback: root-level logo
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.png`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpeg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.webp`));
-    }
-
-    // Fallback: default Elaralo logo (imported asset)
-    candidates.push(DEFAULT_AVATAR);
-
-    let cancelled = false;
-
-    pickFirstLoadableImage(candidates).then((picked) => {
-      if (cancelled) return;
-
-      setCompanyLogoSrc(picked);
-
-      // If the current image is a company logo (default or previous rebrand), update it.
-      // Do NOT override a companion headshot.
-      setAvatarSrc((prev) => {
-        const p = String(prev || "").trim();
-        if (!p) return picked;
-
-        // Covers both default + rebrand headshots.
-        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
-
-        if (p === DEFAULT_AVATAR) return picked;
-
-        // If we were showing some other "-logo.*" asset, treat it as a company logo and swap it.
-        if (p.includes("-logo.")) return picked;
-
-        return prev;
-      });
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [rebrandingName, rebrandingSlug]);
-
-
-
-// ----------------------------
-// Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
-// ----------------------------
-const didSrcObjectRef = useRef<any | null>(null);
-const didAgentMgrRef = useRef<any | null>(null);
-const didReconnectInFlightRef = useRef<boolean>(false);
-
-// iPhone-only: boost Live Avatar audio by routing the streamed MediaStream audio through WebAudio.
-// This avoids iPhone's low/receiver-like WebRTC audio output and makes the avatar clearly audible.
-const didIphoneAudioCtxRef = useRef<AudioContext | null>(null);
-const didIphoneAudioSrcRef = useRef<MediaStreamAudioSourceNode | null>(null);
-const didIphoneAudioGainRef = useRef<GainNode | null>(null);
-const didIphoneBoostActiveRef = useRef<boolean>(false);
-
-
-  const [avatarStatus, setAvatarStatus] = useState<
-    "idle" | "connecting" | "connected" | "reconnecting" | "waiting" | "error"
-  >(
-  "idle"
-);
-const [avatarError, setAvatarError] = useState<string | null>(null);
-
-  // BeeStreamed (Human companion) embed state
-  const [streamEmbedUrl, setStreamEmbedUrl] = useState<string>("");
-  const [streamEventRef, setStreamEventRef] = useState<string>("");
-  const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
-  const [streamNotice, setStreamNotice] = useState<string>("");
-
-        if (!res.ok) return;
-        const data = await res.json();
-        if (cancelled) return;
-
-        const eventRef = String(data?.eventRef || "").trim();
-        let embedUrl = String(data?.embedUrl || "").trim();
-        if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
-
-        // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
-        if (embedUrl) {
-          setStreamEventRef(eventRef);
-          setStreamEmbedUrl(embedUrl);
-
-          // Viewers can never "start", so we keep waiting state (and message) until the stream is live.
-          // This is purely to allow the iframe to appear without requiring a hard refresh.
-          setStreamCanStart(false);
-
-          if (data?.message) {
-            setStreamNotice(String(data.message));
-          }
-        } else if (data?.message) {
-          setStreamNotice(String(data.message));
-        }
-      } catch {
-        // Ignore transient failures; keep polling.
-      }
-    };
-
-    // Kick once immediately, then interval.
-    poll();
-    const t = window.setInterval(poll, intervalMs);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(t);
-    };
-  }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
-
-
-
-
-const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
-
-const channelCap: ChannelCap = useMemo(() => {
-  const commFromDb = String(companionMapping?.communication || "").trim().toLowerCase();
-  if (commFromDb === "video") return "video";
-  if (commFromDb === "audio") return "audio";
-  return "";
-}, [companionMapping]);
-
-const liveProvider: LiveProvider = useMemo(() => {
-  // Prefer database mapping when present.
-  const liveFromDb = String(companionMapping?.live || "").trim().toLowerCase();
-	  // Be tolerant of values like "Stream", "Streamed", "BeeStreamed", or custom labels that include
-	  // these keywords (e.g., "Stream (BeeStreamed)").
-	  if (liveFromDb.includes("stream")) return "stream";
-	  if (liveFromDb.includes("d-id") || liveFromDb.includes("did") || liveFromDb.includes("d_id")) return "did";
-
-  // Backward compatibility: allow companionKey flags (older Wix payloads / test URLs)
-  const raw = String(companionKeyRaw || companionKey || "").trim();
-  const { flags } = splitCompanionKey(raw);
-  const v = String(flags["live"] || "").trim().toLowerCase();
-  if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
-
-  return "did";
-}, [companionMapping, companionKeyRaw, companionKey]);
-
-const streamUrl = useMemo(() => {
-  const raw = String(companionKeyRaw || "").trim();
-  const { flags } = splitCompanionKey(raw);
-  return String(flags["streamurl"] || "").trim() || STREAM_URL;
-}, [companionKeyRaw]);
-
-const liveEnabled = useMemo(() => {
-  // NOTE: The product requirement for showing the "video" control is driven by the
-  // SQLite "Live" column (values like "D-ID" or "Stream").
-  //
-  // Some rows also have a "communication" column (audio/video). In prior iterations we
-  // treated communication=audio as "no video" and hid the control — but that breaks the
-  // intended behavior for human companions (Live=Stream) and D-ID avatars (Live=D-ID)
-  // that may still be marked communication=audio.
-  //
-  // Therefore: if the mapping explicitly declares Live=Stream or Live=D-ID, we always
-  // enable the control regardless of communication.
-  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
-  const mappingSaysVideo =
-    liveRaw.includes("stream") || liveRaw.includes("d-id") || liveRaw.includes("did");
-  if (mappingSaysVideo) return true;
-
-  // If we *only* have a channel cap (and no Live mapping), honor it.
-  if (channelCap === "video") return true;
-  if (channelCap === "audio") return false;
-
-  // Final fallback: keep prior behavior when mapping is missing.
-  return liveProvider === "stream" || Boolean(phase1AvatarMedia);
-}, [companionMapping, channelCap, liveProvider, phase1AvatarMedia]);
-
-
-
-  // UI layout
-  const conversationHeight = 520;
-  const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (Boolean(phase1AvatarMedia) && avatarStatus !== "idle");
-
-const cleanupIphoneLiveAvatarAudio = useCallback(() => {
-  if (!didIphoneBoostActiveRef.current && !didIphoneAudioCtxRef.current) return;
-
-  didIphoneBoostActiveRef.current = false;
-
-  try {
-    didIphoneAudioSrcRef.current?.disconnect();
-  } catch {}
-  try {
-    didIphoneAudioGainRef.current?.disconnect();
-  } catch {}
-
-  didIphoneAudioSrcRef.current = null;
-  didIphoneAudioGainRef.current = null;
-
-  try {
-    // Closing releases resources; we recreate on demand.
-    didIphoneAudioCtxRef.current?.close?.();
-  } catch {}
-  didIphoneAudioCtxRef.current = null;
-
-  // Restore video element audio defaults (in case we muted it for iPhone boost)
-  const vid = avatarVideoRef.current;
-  if (vid) {
-    try {
-      vid.muted = false;
-      vid.volume = 1;
-    } catch {}
-  }
-}, []);
-
-const ensureIphoneAudioContextUnlocked = useCallback(() => {
-  if (!isIphone) return;
-  if (typeof window === "undefined") return;
-
-  try {
-    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (!AudioCtx) return;
-
-    if (!didIphoneAudioCtxRef.current) {
-      didIphoneAudioCtxRef.current = new AudioCtx();
-    }
-
-    const ctx = didIphoneAudioCtxRef.current;
-    // Resume inside user gesture when possible
-    if (ctx?.state === "suspended" && ctx.resume) {
-      ctx.resume().catch(() => {});
-    }
-  } catch {
-    // ignore
-  }
-}, [isIphone]);
-
-const applyIphoneLiveAvatarAudioBoost = useCallback(
-  (stream: any) => {
-    if (!isIphone) return;
-    if (typeof window === "undefined") return;
-
-    if (!stream || typeof stream.getAudioTracks !== "function") return;
-    const tracks = stream.getAudioTracks();
-    if (!tracks || tracks.length === 0) return;
-
-    try {
-      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-
-      let ctx = didIphoneAudioCtxRef.current;
-      if (!ctx) {
-        ctx = new AudioCtx();
-        didIphoneAudioCtxRef.current = ctx;
-      }
-
-      if (ctx?.state === "suspended" && ctx.resume) {
-        ctx.resume().catch(() => {});
-      }
-
-      // Clear any previous routing
-      try {
-        didIphoneAudioSrcRef.current?.disconnect();
-      } catch {}
-      try {
-        didIphoneAudioGainRef.current?.disconnect();
-      } catch {}
-
-      // Route MediaStream audio -> Gain -> destination
-      const source = ctx.createMediaStreamSource(stream);
-      const gain = ctx.createGain();
-
-      // Boost amount tuned for iPhone; iPad/Desktop already fine.
-      // Use a higher gain because iPhone often routes WebRTC audio at a receiver-like level.
-      gain.gain.value = 10.0;
-
-      source.connect(gain);
-      gain.connect(ctx.destination);
-
-      didIphoneAudioSrcRef.current = source;
-      didIphoneAudioGainRef.current = gain;
-      didIphoneBoostActiveRef.current = true;
-
-      // Mute the <video>'s audio so we don't get double audio (and avoid iPhone low WebRTC path)
-      const vid = avatarVideoRef.current;
-      if (vid) {
-        try {
-          vid.muted = true;
-          vid.volume = 0;
-        } catch {}
-      }
-    } catch (e) {
-      console.warn("iPhone Live Avatar audio boost failed:", e);
-    }
-  },
-  [isIphone]
-);
-
-
-
-
-const stopLiveAvatar = useCallback(async () => {
-  // Stop STT/TTS (same steps used by the Stop button).
-  try { stopHandsFreeSTT(); } catch {}
-  try { stopSpeechToText(); } catch {}
-  // Always clean up iPhone audio boost routing first
-  cleanupIphoneLiveAvatarAudio();
-
-  // BeeStreamed (Human companion) — stop the stream and clear the embed.
-  if (streamEmbedUrl || streamEventRef) {
-    try {
-      // Only the host can stop the underlying live stream.
-      // Non-host viewers can still close the embed locally without affecting the session.
-      if (streamCanStart) {
-        const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
-        await fetch(`${API_BASE}/stream/beestreamed/stop_embed`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            brand: companyName,
-            avatar: companionName,
-            embedDomain,
-            memberId: memberId || "",
-            eventRef: streamEventRef || undefined,
-          }),
-        });
-      }
-    } catch (e) {
-      console.warn("BeeStreamed stop_embed failed:", e);
-    } finally {
-      setStreamEmbedUrl("");
-      setStreamEventRef("");
-      setStreamCanStart(false);
-      setStreamNotice("");
-    }
-  }
-
-  try {
-    const mgr = didAgentMgrRef.current;
-    didAgentMgrRef.current = null;
-
-    // Stop any remembered MediaStream (important if we were showing idle_video and vid.srcObject is null)
-    const remembered = didSrcObjectRef.current;
-    didSrcObjectRef.current = null;
-
-    if (mgr) {
-      await mgr.disconnect();
-    }
-
-    try {
-      if (remembered && typeof remembered.getTracks === "function") {
-        remembered.getTracks().forEach((t: any) => t?.stop?.());
-      }
-    } catch {
-      // ignore
-    }
-
-    const vid = avatarVideoRef.current;
-    if (vid) {
-      const srcObj = vid.srcObject as MediaStream | null;
-      if (srcObj && typeof srcObj.getTracks === "function") {
-        srcObj.getTracks().forEach((t) => t.stop());
-      }
-      vid.srcObject = null;
-
-      // If we were displaying the presenter's idle_video, clear it too.
-      try {
-        vid.pause();
-        vid.removeAttribute("src");
-        (vid as any).src = "";
-        vid.load?.();
-      } catch {
-        // ignore
-      }
-    }
-  } catch {
-    // ignore
-  } finally {
-    setAvatarStatus("idle");
-    setAvatarError(null);
-  }
-}, [cleanupIphoneLiveAvatarAudio, streamEmbedUrl, streamEventRef, companyName, companionName]);
-
-const reconnectLiveAvatar = useCallback(async () => {
-  const mgr = didAgentMgrRef.current;
-  if (!mgr) return;
-  if (didReconnectInFlightRef.current) return;
-
-  didReconnectInFlightRef.current = true;
-  setAvatarError(null);
-  setAvatarStatus("reconnecting");
-
-  try {
-    if (typeof (mgr as any).reconnect === "function") {
-      await (mgr as any).reconnect();
-    } else {
-      // Fallback for SDK versions without reconnect()
-      await mgr.disconnect();
-      await mgr.connect();
-    }
-  } catch (err: any) {
-    console.error("D-ID reconnect failed", err);
-    setAvatarStatus("idle");
-    setAvatarError(`Live Avatar reconnect failed: ${formatDidError(err)}`);
-  } finally {
-    didReconnectInFlightRef.current = false;
-  }
-}, []);
-
-const startLiveAvatar = useCallback(async () => {
-  setAvatarError(null);
-  ensureIphoneAudioContextUnlocked();
-
-if (liveProvider === "stream") {
-  // BeeStreamed (Human companion) — start/ensure the event on the API, then embed inside the page.
-  setAvatarError(null);
-  setAvatarStatus("connecting");
-
-  try {
-    const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
-
-    // Ask the app server to:
-    //  - resolve/create an event_ref for this (brand, avatar)
-    //  - start the WebRTC stream for that event
-    //  - return an embed URL
-    const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        brand: companyName,
-        avatar: companionName,
-        embedDomain,
-        memberId: memberId || "",
-      }),
-    });
-
-    const data: any = await res.json().catch(() => ({}));
-    if (!res.ok || !data?.ok) {
-      throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
-    }
-
-    const eventRef = String(data?.eventRef || "").trim();
-
-// IMPORTANT: Always use our internal wrapper so the experience stays within the iframe.
-// The API may return a relative path like "/stream/beestreamed/embed/{eventRef}".
-let embedUrl = String(data?.embedUrl || "").trim();
-if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
-
-// If the host hasn't created the event yet, non-host users may legitimately have no embedUrl/eventRef.
-const canStart = !!data?.canStart;
-if (!embedUrl && eventRef) {
-  // Fallback to wrapper path (never direct beestreamed.com) if API returned eventRef only.
-  embedUrl = `${API_BASE}/stream/beestreamed/embed/${encodeURIComponent(eventRef)}`;
-}
-if (!embedUrl && canStart) {
-  throw new Error("BeeStreamed did not return an embedUrl/eventRef.");
-}
-setStreamEventRef(eventRef);
-    setStreamEmbedUrl(embedUrl);
-
-    setStreamCanStart(canStart);
-
-    if (!canStart) {
-      setStreamNotice(
-        `Waiting on ${companionName || "the host"} to start event`
-      );
-      setAvatarStatus("waiting");
-    } else if (String(data?.status || "").trim() === "start_failed") {
-      setStreamNotice("");
-      setAvatarStatus("error");
-      setAvatarError("Streaming failed to start. Please try again.");
-    } else {
-      setStreamNotice("");
-      setAvatarStatus("connected");
-    }
-  } catch (err: any) {
-    console.error("BeeStreamed start_embed failed:", err);
-    setAvatarStatus("error");
-    setAvatarError(
-      `Streaming failed to start. ${err?.message ? String(err.message) : String(err)}`,
-    );
-
-    // Fallback: if a direct streamUrl exists, open it externally.
-    if (streamUrl) {
-      try {
-        window.open(streamUrl, "_blank", "noopener,noreferrer");
-      } catch (_e) {
-        window.location.href = streamUrl;
-      }
-    }
-  }
-  return;
-}
-
-if (!phase1AvatarMedia) {
-  setAvatarStatus("error");
-  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
-  return;
-}
-
-  if (
-    avatarStatus === "connecting" ||
-    avatarStatus === "connected" ||
-    avatarStatus === "reconnecting"
-  )
-    return;
-
-  setAvatarStatus("connecting");
-
-  try {
-    // Defensive: if something is lingering from a prior attempt, disconnect & clear.
-    try {
-      if (didAgentMgrRef.current) {
-        await didAgentMgrRef.current.disconnect();
-      }
-    } catch {}
-    didAgentMgrRef.current = null;
-
-    try {
-      const existingStream = didSrcObjectRef.current;
-      if (existingStream && typeof existingStream.getTracks === "function") {
-        existingStream.getTracks().forEach((t: any) => t?.stop?.());
-      }
-    } catch {}
-    didSrcObjectRef.current = null;
-    if (avatarVideoRef.current) {
-      try {
-        const vid = avatarVideoRef.current;
-        vid.srcObject = null;
-        vid.pause();
-        vid.removeAttribute("src");
-        (vid as any).src = "";
-        vid.load?.();
-      } catch {
-        // ignore
-      }
-    }
-
-    const { createAgentManager } = await import("@d-id/client-sdk");
-    // NOTE: Some versions of @d-id/client-sdk ship stricter TS types (e.g., requiring
-    // additional top-level fields like `mode`) that are not present in the public
-    // quickstart snippets. We keep runtime behavior aligned with D-ID docs and
-    // cast the options object to `any` to avoid CI type-check failures.
-    const mgr = await createAgentManager(
-      phase1AvatarMedia.didAgentId,
-      {
-      auth: { type: "key", clientKey: phase1AvatarMedia.didClientKey },
-      callbacks: {
-        onConnectionStateChange: (state: any) => {
-          if (state === "connected") {
-            setAvatarStatus("connected");
-            setAvatarError(null);
-          }
-          if (state === "disconnected" || state === "closed") setAvatarStatus("idle");
-        },
-
-        // Mandatory per D-ID docs: bind the streamed MediaStream to the <video>.
-        onSrcObjectReady: (value: any) => {
-          didSrcObjectRef.current = value;
-          const vid = avatarVideoRef.current;
-          if (vid) {
-            // If we were showing the presenter's idle_video, clear it before attaching the MediaStream
-            try {
-              vid.removeAttribute("src");
-              (vid as any).src = "";
-              vid.load?.();
-            } catch {
-              // ignore
-            }
-            vid.loop = false;
-            vid.srcObject = value;
-            vid.play().catch(() => {});
-            // iPhone: route WebRTC audio through WebAudio gain so volume is audible
-            applyIphoneLiveAvatarAudioBoost(value);
-
-            // Non-iPhone: also route the <video> element through a gain node to ensure robust volume.
-            try {
-              applyTtsGainRouting(vid, "avatar");
-            } catch {}
-          }
-          return value;
-        },
-
-        onVideoStateChange: (state: any) => {
-          const vid = avatarVideoRef.current;
-          if (!vid) return;
-
-          const s = typeof state === "string" ? state : String(state ?? "");
-          const mgr = didAgentMgrRef.current;
-          const stream = didSrcObjectRef.current;
-
-          // When the live stream stops, switch to the presenter's idle_video so the avatar isn't frozen.
-          if (s === "STOP") {
-            const idleUrl = mgr?.agent?.presenter?.idle_video;
-            if (idleUrl) {
-              try {
-                // Detach the MediaStream (do NOT stop tracks; we may resume).
-                vid.srcObject = null;
-                if (vid.src !== idleUrl) vid.src = idleUrl;
-                vid.loop = true;
-                vid.play().catch(() => {});
-              } catch {
-                // ignore
-              }
-            }
-            return;
-          }
-
-          // Any non-STOP state: ensure we are showing the live MediaStream.
-          if (stream) {
-            try {
-              // Clear idle video if it was set
-              if (vid.src) {
-                vid.pause();
-                vid.removeAttribute("src");
-                (vid as any).src = "";
-                vid.load?.();
-              }
-              vid.loop = false;
-              vid.srcObject = stream;
-              vid.play().catch(() => {});
-            } catch {
-              // ignore
-            }
-          }
-        },
-
-        onError: (err: any) => {
-          if (isDidSessionError(err)) {
-            console.warn("D-ID SessionError; attempting reconnect", err);
-            void reconnectLiveAvatar();
-            return;
-          }
-          setAvatarStatus("error");
-          setAvatarError(formatDidError(err));
-        },
-      },
-      streamOptions: { compatibilityMode: "auto", streamWarmup: true },
-      } as any
-    );
-
-    didAgentMgrRef.current = mgr;
-    await mgr.connect();
-  } catch (e: any) {
-    setAvatarStatus("error");
-    setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
-    didAgentMgrRef.current = null;
-  }
-}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
-
 useEffect(() => {
   // Stop when switching companions
   void stopLiveAvatar();
@@ -2182,7 +1050,8 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
         try {
           (m as any).playsInline = true;
           (m as any).setAttribute?.("playsinline", "");
-        } catch {}
+        } catch (e) {
+        }
 
         const p = m.play();
         Promise.resolve(p)
@@ -2190,10 +1059,12 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
             markUnlocked();
             try {
               m.pause();
-            } catch {}
+            } catch (e) {
+        }
             try {
               (m as any).currentTime = 0;
-            } catch {}
+            } catch (e) {
+        }
           })
           .catch((e) => {
             console.warn("Failed to prime local TTS", {
@@ -2221,7 +1092,8 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
     // Ensure boosted routing is in place after priming.
     try {
       boostAllTtsVolumes();
-    } catch {}
+    } catch (e) {
+        }
 
     // If neither succeeds, localTtsUnlockedRef remains false and we'll retry on the next user gesture.
   }, []);
@@ -2256,21 +1128,22 @@ const playLocalTtsUrl = useCallback(
             (rec as any).onend = (...args: any[]) => {
               try {
                 prevOnEnd?.(...args);
-              } catch {}
+              } catch (e) {
+        }
               finish();
             };
 
             try {
               rec.stop();
-            } catch {
-              finish();
+            } catch (e) {
+        finish();
             }
 
             // Safety if onend never arrives
             setTimeout(finish, 220);
           });
-        } catch {
-          // ignore
+        } catch (e) {
+        // ignore
         }
       };
 
@@ -2287,10 +1160,12 @@ const playLocalTtsUrl = useCallback(
         try {
           m.pause();
           m.currentTime = 0;
-        } catch {}
+        } catch (e) {
+        }
 
         try {
-        } catch {}
+        } catch (e) {
+        }
 
         if (useVideo) {
           try {
@@ -2298,32 +1173,39 @@ const playLocalTtsUrl = useCallback(
             v.playsInline = true;
             v.setAttribute("playsinline", "true");
             v.setAttribute("webkit-playsinline", "true");
-          } catch {}
+          } catch (e) {
+        }
         }
 
         try {
           m.muted = false;
           m.volume = 1;
-        } catch {}
+        } catch (e) {
+        }
 
         // Local (audio-only) TTS stays on the hidden VIDEO element, but we do not
         // route it through WebAudio (can cause silence with non-CORS media).
-        try { m.muted = false; m.volume = 1; } catch {}
+        try { m.muted = false; m.volume = 1; } catch (e) {
+        }
 
         try {
           (m as any).preload = "auto";
-        } catch {}
+        } catch (e) {
+        }
 
         try {
           m.src = finalUrl;
           try {
             (m as any).load?.();
-          } catch {}
-        } catch {}
+          } catch (e) {
+        }
+        } catch (e) {
+        }
 
         try {
           hooks?.onWillSpeak?.();
-        } catch {}
+        } catch (e) {
+        }
 
         try {
           await m.play();
@@ -2340,7 +1222,8 @@ const playLocalTtsUrl = useCallback(
                 m.removeEventListener("playing", onPlaying);
                 m.removeEventListener("timeupdate", onTimeUpdate);
                 m.removeEventListener("error", onErr);
-              } catch {}
+              } catch (e) {
+        }
               resolve(ok);
             }
 
@@ -2358,8 +1241,8 @@ const playLocalTtsUrl = useCallback(
               m.addEventListener("playing", onPlaying, { once: true });
               m.addEventListener("timeupdate", onTimeUpdate);
               m.addEventListener("error", onErr, { once: true });
-            } catch {
-              // If we can't attach events, just accept.
+            } catch (e) {
+        // If we can't attach events, just accept.
               finish(true);
               return;
             }
@@ -2373,7 +1256,8 @@ const playLocalTtsUrl = useCallback(
             try {
               m.pause();
               m.currentTime = 0;
-            } catch {}
+            } catch (e) {
+        }
             return false;
           }
         } catch (e) {
@@ -2416,14 +1300,16 @@ const playLocalTtsUrl = useCallback(
             try {
               m.pause();
               m.currentTime = 0;
-            } catch {}
+            } catch (e) {
+        }
 
             // iOS Safari sometimes gets "stuck" if we leave the src attached.
             if (isIOS) {
               try {
                 m.removeAttribute("src");
                 (m as any).load?.();
-              } catch {}
+              } catch (e) {
+        }
             }
 
             resolve();
@@ -2474,7 +1360,8 @@ const playLocalTtsUrl = useCallback(
 
         try {
           hooks?.onDidNotSpeak?.();
-        } catch {}
+        } catch (e) {
+        }
         return;
       }
 
@@ -2486,7 +1373,8 @@ const playLocalTtsUrl = useCallback(
 
       try {
         hooks?.onDidNotSpeak?.();
-      } catch {}
+      } catch (e) {
+        }
     },
     [isIOS, applyTtsGainRouting],
   );
@@ -2496,8 +1384,8 @@ const playLocalTtsUrl = useCallback(
   const stopLocalTtsPlayback = useCallback(() => {
     try {
       localTtsStopFnRef.current?.();
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
     localTtsStopFnRef.current = null;
 
@@ -2506,11 +1394,13 @@ const playLocalTtsUrl = useCallback(
       try {
         a.pause();
         a.currentTime = 0;
-      } catch {}
+      } catch (e) {
+        }
       try {
         a.removeAttribute("src");
         (a as any).load?.();
-      } catch {}
+      } catch (e) {
+        }
     }
 
     const v = localTtsVideoRef.current;
@@ -2518,11 +1408,13 @@ const playLocalTtsUrl = useCallback(
       try {
         v.pause();
         v.currentTime = 0;
-      } catch {}
+      } catch (e) {
+        }
       try {
         v.removeAttribute("src");
         (v as any).load?.();
-      } catch {}
+      } catch (e) {
+        }
     }
   }, []);
 
@@ -2538,7 +1430,8 @@ const playLocalTtsUrl = useCallback(
       const epoch = localTtsEpochRef.current;
       try {
         localTtsAbortRef.current?.abort();
-      } catch {}
+      } catch (e) {
+        }
       const controller = new AbortController();
       localTtsAbortRef.current = controller;
 
@@ -2575,7 +1468,7 @@ const speakAssistantReply = useCallback(
     const callDidNotSpeak = () => {
       try {
         hooks?.onDidNotSpeak?.();
-      } catch {
+      } catch (e) {
         // ignore
       }
     };
@@ -2586,7 +1479,7 @@ const speakAssistantReply = useCallback(
       willSpeakCalled = true;
       try {
         hooks?.onWillSpeak?.();
-      } catch {
+      } catch (e) {
         // ignore
       }
     };
@@ -2635,8 +1528,8 @@ const speakAssistantReply = useCallback(
         a.preload = "metadata";
         // Some CDNs require this for cross-origin metadata access (best-effort).
         try {
-        } catch {
-          // ignore
+        } catch (e) {
+        // ignore
         }
 
         let doneCalled = false;
@@ -2646,14 +1539,14 @@ const speakAssistantReply = useCallback(
           try {
             a.onloadedmetadata = null as any;
             a.onerror = null as any;
-          } catch {
-            // ignore
+          } catch (e) {
+        // ignore
           }
           // release resource
           try {
             a.src = "";
-          } catch {
-            // ignore
+          } catch (e) {
+        // ignore
           }
           resolve(ms);
         };
@@ -2836,16 +1729,16 @@ const speakAssistantReply = useCallback(
         window.top.location.href = url;
         return;
       }
-    } catch {
-      // Cross-origin access to window.top can throw.
+    } catch (e) {
+        // Cross-origin access to window.top can throw.
     }
 
     // Alternate attempt that may still target the top browsing context.
     try {
       window.open(url, "_top");
       return;
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     // Fallback: navigate the current frame.
@@ -2862,16 +1755,16 @@ const speakAssistantReply = useCallback(
         window.top.location.href = url;
         return;
       }
-    } catch {
-      // Cross-origin access to window.top can throw.
+    } catch (e) {
+        // Cross-origin access to window.top can throw.
     }
 
     // Alternate attempt that may still target the top browsing context.
     try {
       window.open(url, "_top");
       return;
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     // Fallback: navigate the current frame.
@@ -2951,8 +1844,8 @@ const speakAssistantReply = useCallback(
       " (If this page is embedded, ensure the embed/iframe allows microphone access.)";
     try {
       return window.self !== window.top ? hint : "";
-    } catch {
-      return hint;
+    } catch (e) {
+        return hint;
     }
   }, []);
 
@@ -3025,8 +1918,8 @@ useEffect(() => {
   if (typeof data === "string") {
     try {
       data = JSON.parse(data);
-    } catch {
-      return;
+    } catch (e) {
+        return;
     }
   }
 
@@ -3610,19 +2503,19 @@ const rebrandingKeyForBackend = hasEntitledPlan
       rec.onend = null;
       rec.onerror = null;
       rec.onresult = null;
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     try {
       rec.abort?.();
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
     try {
       rec.stop?.();
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     sttRecRef.current = null;
@@ -3650,7 +2543,8 @@ const rebrandingKeyForBackend = hasEntitledPlan
       if (backendSttRecorderRef.current && backendSttRecorderRef.current.state !== "inactive") {
         backendSttRecorderRef.current.stop();
       }
-    } catch {}
+    } catch (e) {
+        }
     backendSttRecorderRef.current = null;
 
     if (backendSttHardStopTimerRef.current) {
@@ -3667,7 +2561,8 @@ const rebrandingKeyForBackend = hasEntitledPlan
       backendSttStreamRef.current.getTracks().forEach((t) => {
         try {
           t.stop();
-        } catch {}
+        } catch (e) {
+        }
       });
       backendSttStreamRef.current = null;
     }
@@ -3675,7 +2570,8 @@ const rebrandingKeyForBackend = hasEntitledPlan
     if (backendSttAudioCtxRef.current) {
       try {
         backendSttAudioCtxRef.current.close();
-      } catch {}
+      } catch (e) {
+        }
       backendSttAudioCtxRef.current = null;
     }
 
@@ -3686,7 +2582,8 @@ const rebrandingKeyForBackend = hasEntitledPlan
   const abortBackendStt = useCallback(() => {
     try {
       backendSttAbortRef.current?.abort();
-    } catch {}
+    } catch (e) {
+        }
     backendSttAbortRef.current = null;
 
     cleanupBackendSttResources();
@@ -3718,7 +2615,8 @@ const rebrandingKeyForBackend = hasEntitledPlan
         let detail = "";
         try {
           detail = await resp.text();
-        } catch {}
+        } catch (e) {
+        }
         throw new Error(`STT backend error ${resp.status}: ${detail || resp.statusText}`);
       }
 
@@ -3793,12 +2691,13 @@ const rebrandingKeyForBackend = hasEntitledPlan
             break;
           }
         }
-      } catch {}
+      } catch (e) {
+        }
 
       let recorder: MediaRecorder;
       try {
         recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      } catch {
+      } catch (e) {
         throw new Error("This browser cannot record audio for STT. Please use Live Avatar mode on this device.");
       }
       backendSttRecorderRef.current = recorder;
@@ -3823,7 +2722,8 @@ const rebrandingKeyForBackend = hasEntitledPlan
         backendSttAudioCtxRef.current = ctx;
         try {
           await ctx.resume();
-        } catch {}
+        } catch (e) {
+        }
 
         const src = ctx.createMediaStreamSource(stream);
         const analyser = ctx.createAnalyser();
@@ -3842,7 +2742,8 @@ const rebrandingKeyForBackend = hasEntitledPlan
           if (!sttEnabledRef.current || sttPausedRef.current) {
             try {
               if (recorder.state !== "inactive") recorder.stop();
-            } catch {}
+            } catch (e) {
+        }
             return;
           }
 
@@ -3866,14 +2767,16 @@ const rebrandingKeyForBackend = hasEntitledPlan
           if (elapsed >= maxRecordMs) {
             try {
               if (recorder.state !== "inactive") recorder.stop();
-            } catch {}
+            } catch (e) {
+        }
             return;
           }
 
           if (backendSttHasSpokenRef.current && elapsed > minRecordMs && silentFor >= silenceMs) {
             try {
               if (recorder.state !== "inactive") recorder.stop();
-            } catch {}
+            } catch (e) {
+        }
             return;
           }
 
@@ -3881,19 +2784,20 @@ const rebrandingKeyForBackend = hasEntitledPlan
         };
 
         backendSttRafRef.current = requestAnimationFrame(tick);
-      } catch {
+      } catch (e) {
         // If VAD setup fails, we still record; hard-stop timer will end it.
       }
 
       backendSttHardStopTimerRef.current = window.setTimeout(() => {
         try {
           if (recorder.state !== "inactive") recorder.stop();
-        } catch {}
+        } catch (e) {
+        }
       }, 16000);
 
       try {
         recorder.start(250);
-      } catch {
+      } catch (e) {
         throw new Error("Failed to start recording.");
       }
 
@@ -3973,8 +2877,8 @@ const pauseSpeechToText = useCallback(() => {
     const rec = sttRecRef.current;
     try {
       rec?.stop?.();
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     // iOS Web Speech can get stuck after stop(); force a fresh recognizer next time.
@@ -4033,8 +2937,8 @@ const pauseSpeechToText = useCallback(() => {
         setBackendSttAvailable(false);
         try {
           sttRecRef.current?.abort?.();
-        } catch {
-          // ignore
+        } catch (e) {
+        // ignore
         }
         sttRecRef.current = null;
       }
@@ -4058,20 +2962,20 @@ const pauseSpeechToText = useCallback(() => {
     // iOS + embedded contexts are more stable with continuous=false and manual restarts.
     try {
       rec.continuous = !isIOS;
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     try {
       rec.interimResults = true;
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     try {
       rec.lang = "en-US";
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     rec.onstart = () => {
@@ -4103,8 +3007,8 @@ const pauseSpeechToText = useCallback(() => {
 
         try {
           rec.start();
-        } catch {
-          // ignore
+        } catch (e) {
+        // ignore
         }
       }, baseDelay + ignoreDelay);
     };
@@ -4128,8 +3032,8 @@ const pauseSpeechToText = useCallback(() => {
         setSttError("Microphone permission was blocked." + getEmbedHint());
         try {
           rec.stop?.();
-        } catch {
-          // ignore
+        } catch (e) {
+        // ignore
         }
         return;
       }
@@ -4160,8 +3064,8 @@ const pauseSpeechToText = useCallback(() => {
           );
           try {
             rec.stop?.();
-          } catch {
-            // ignore
+          } catch (e) {
+        // ignore
           }
           return;
         }
@@ -4181,8 +3085,8 @@ const pauseSpeechToText = useCallback(() => {
 
           try {
             r2.start();
-          } catch {
-            // ignore
+          } catch (e) {
+        // ignore
           }
         }, isIOS ? 1200 : 650);
 
@@ -4262,7 +3166,7 @@ const pauseSpeechToText = useCallback(() => {
       try {
         rec.start();
         setSttRunning(true);
-      } catch {
+      } catch (e) {
         // ignore; will restart on onend if needed
       }
     }, delayMs);
@@ -4293,7 +3197,8 @@ const speakGreetingIfNeeded = useCallback(
     // Already spoken this session?
     try {
       if (sessionStorage.getItem(key) === "1") return;
-    } catch {}
+    } catch (e) {
+        }
 
     // Prevent duplicates/races (e.g., Live Avatar connects right after mic-start).
     if (greetInFlightRef.current) return;
@@ -4315,7 +3220,8 @@ const speakGreetingIfNeeded = useCallback(
     try {
       try {
         await pauseSpeechToText();
-      } catch {}
+      } catch (e) {
+        }
 
       const hooks: SpeakAssistantHooks = {
         onWillSpeak: () => {},
@@ -4333,19 +3239,22 @@ const speakGreetingIfNeeded = useCallback(
       // Mark spoken ONLY after successful playback.
       try {
         sessionStorage.setItem(key, "1");
-      } catch {}
+      } catch (e) {
+        }
     } catch (e) {
       // Allow retry later if something failed.
       try {
         sessionStorage.removeItem(key);
-      } catch {}
+      } catch (e) {
+        }
       console.warn("Greeting playback failed:", e);
     } finally {
       sttIgnoreUntilRef.current = prevIgnore;
       greetInFlightRef.current = false;
       try {
         await resumeSpeechToText();
-      } catch {}
+      } catch (e) {
+        }
     }
   },
   [companionName, handoffReady, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
@@ -4419,7 +3328,8 @@ const speakGreetingIfNeeded = useCallback(
     // iOS Safari can enter a low-volume route after stop/start transitions.
     // Apply the same "loud path" recovery we use for Clear/Save before kicking off STT.
     // IMPORTANT: do not await here; iOS SpeechRecognition must start directly from the user gesture.
-    try { boostAllTtsVolumes(); } catch {}
+    try { boostAllTtsVolumes(); } catch (e) {
+        }
     void nudgeAudioSession();
     primeLocalTtsAudio(true);
     void ensureIphoneAudioContextUnlocked();
@@ -4518,7 +3428,8 @@ const speakGreetingIfNeeded = useCallback(
     localTtsEpochRef.current += 1;
     try {
       localTtsAbortRef.current?.abort();
-    } catch {}
+    } catch (e) {
+        }
     localTtsAbortRef.current = null;
     // Stop listening immediately
     stopSpeechToText();
@@ -4540,13 +3451,18 @@ const speakGreetingIfNeeded = useCallback(
   const handleStopClick = useCallback(() => {
     try {
       stopHandsFreeSTT();
-    } catch {}
+    } catch (e) {
+        }
 
     // Re-assert boosted audio routing and nudge audio session on the same user gesture.
-    try { boostAllTtsVolumes(); } catch {}
-    try { void nudgeAudioSession(); } catch {}
-    try { primeLocalTtsAudio(true); } catch {}
-    try { void ensureIphoneAudioContextUnlocked(); } catch {}
+    try { boostAllTtsVolumes(); } catch (e) {
+        }
+    try { void nudgeAudioSession(); } catch (e) {
+        }
+    try { primeLocalTtsAudio(true); } catch (e) {
+        }
+    try { void ensureIphoneAudioContextUnlocked(); } catch (e) {
+        }
   }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
 
   // Clear Messages (with confirmation)
@@ -4558,26 +3474,30 @@ const speakGreetingIfNeeded = useCallback(
 
     try {
       stopHandsFreeSTT();
-    } catch {
-      // ignore
+    } catch (e) {
+        // ignore
     }
 
     // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
     try {
       boostAllTtsVolumes();
-    } catch {}
+    } catch (e) {
+        }
     try {
       void nudgeAudioSession();
-    } catch {}
+    } catch (e) {
+        }
 
     // Strong iOS recovery: prime the hidden VIDEO element on this user gesture so audio-only TTS
     // is not left in a silent/receiver route after the confirmation modal.
     try {
       primeLocalTtsAudio(true);
-    } catch {}
+    } catch (e) {
+        }
     try {
       void ensureIphoneAudioContextUnlocked();
-    } catch {}
+    } catch (e) {
+        }
 
 
     setShowClearMessagesConfirm(true);
@@ -4593,23 +3513,28 @@ const speakGreetingIfNeeded = useCallback(
 
     try {
       stopHandsFreeSTT();
-    } catch {}
+    } catch (e) {
+        }
 
     // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
     try {
       boostAllTtsVolumes();
-    } catch {}
+    } catch (e) {
+        }
     try {
       void nudgeAudioSession();
-    } catch {}
+    } catch (e) {
+        }
 
     // Prime the hidden VIDEO element on this user gesture so audio-only TTS remains healthy.
     try {
       primeLocalTtsAudio(true);
-    } catch {}
+    } catch (e) {
+        }
     try {
       void ensureIphoneAudioContextUnlocked();
-    } catch {}
+    } catch (e) {
+        }
 
     setShowSaveSummaryConfirm(true);
   }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
@@ -4623,17 +3548,21 @@ const speakGreetingIfNeeded = useCallback(
     // that *future* manual resumption of TTS is not routed to a silent/receiver path.
 
     // Re-assert boosted routing first.
-    try { boostAllTtsVolumes(); } catch {}
+    try { boostAllTtsVolumes(); } catch (e) {
+        }
 
     // iOS route recovery: nudge the audio session back to normal playback.
-    try { await nudgeAudioSession(); } catch {}
+    try { await nudgeAudioSession(); } catch (e) {
+        }
 
     // Prime the hidden VIDEO element (required by your constraint) so the next audio-only
     // TTS playback is unlocked and uses the correct output route.
-    try { primeLocalTtsAudio(true); } catch {}
+    try { primeLocalTtsAudio(true); } catch (e) {
+        }
 
     // If Live Avatar is used on iPhone, ensure its audio context is also unlocked.
-    try { void ensureIphoneAudioContextUnlocked(); } catch {}
+    try { void ensureIphoneAudioContextUnlocked(); } catch (e) {
+        }
 
     // Ensure element mute/volume flags are sane (gain routing provides the loudness).
     try {
@@ -4645,7 +3574,8 @@ const speakGreetingIfNeeded = useCallback(
         // @ts-ignore
         v.playsInline = true;
       }
-    } catch {}
+    } catch (e) {
+        }
 
     try {
       const a = localTtsAudioRef.current;
@@ -4653,7 +3583,8 @@ const speakGreetingIfNeeded = useCallback(
         a.muted = false;
         a.volume = 1;
       }
-    } catch {}
+    } catch (e) {
+        }
 
     try {
       const av = avatarVideoRef.current;
@@ -4661,7 +3592,8 @@ const speakGreetingIfNeeded = useCallback(
         av.muted = false;
         av.volume = 1;
       }
-    } catch {}
+    } catch (e) {
+        }
   }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes, nudgeAudioSession]);
 
 
@@ -4681,16 +3613,19 @@ const speakGreetingIfNeeded = useCallback(
             rec.onend = null;
             rec.onresult = null;
             rec.onerror = null;
-          } catch {}
+          } catch (e) {
+        }
           try {
             rec.abort?.();
-          } catch {
-            try {
+          } catch (e) {
+        try {
               rec.stop?.();
-            } catch {}
+            } catch (e) {
+        }
           }
         }
-      } catch {}
+      } catch (e) {
+        }
     };
   }, []);
 
@@ -4931,8 +3866,10 @@ const speakGreetingIfNeeded = useCallback(
               // Live Avatar requires microphone / STT. Start it automatically.
               // BeeStreamed host: disable any STT/TTS while streaming.
               if (liveProvider === "stream" && streamCanStart) {
-                try { stopHandsFreeSTT(); } catch {}
-                try { stopSpeechToText(); } catch {}
+                try { stopHandsFreeSTT(); } catch (e) {
+        }
+                try { stopSpeechToText(); } catch (e) {
+        }
               }
 
               // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
@@ -5255,7 +4192,8 @@ const speakGreetingIfNeeded = useCallback(
                   if (savingSummary) return;
                   setShowSaveSummaryConfirm(false);
                   // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
-                  try { boostAllTtsVolumes(); } catch {}
+                  try { boostAllTtsVolumes(); } catch (e) {
+        }
                   void restoreVolumesAfterClearCancel();
                 }}
                 style={{
@@ -5323,7 +4261,8 @@ const speakGreetingIfNeeded = useCallback(
                     setSavingSummary(false);
                     setShowSaveSummaryConfirm(false);
                     // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
-                    try { boostAllTtsVolumes(); } catch {}
+                    try { boostAllTtsVolumes(); } catch (e) {
+        }
                     void restoreVolumesAfterClearCancel();
                   }
                 }}
@@ -5379,7 +4318,8 @@ const speakGreetingIfNeeded = useCallback(
                 onClick={() => {
                     setShowClearMessagesConfirm(false);
                     // User gesture: restore boosted routing so subsequent TTS isn't quiet.
-                    try { boostAllTtsVolumes(); } catch {}
+                    try { boostAllTtsVolumes(); } catch (e) {
+        }
                     // Restore audio routing/volume immediately.
                     void restoreVolumesAfterClearCancel();
                   }}
@@ -5398,10 +4338,12 @@ const speakGreetingIfNeeded = useCallback(
                 onClick={() => {
                   setMessages([]);
                   setInput("");
-                  try { if (inputElRef.current) inputElRef.current.value = ""; } catch {}
+                  try { if (inputElRef.current) inputElRef.current.value = ""; } catch (e) {
+        }
                   setShowClearMessagesConfirm(false);
                   // User gesture: restore boosted routing so subsequent TTS isn't quiet.
-                  try { boostAllTtsVolumes(); } catch {}
+                  try { boostAllTtsVolumes(); } catch (e) {
+        }
                   // Re-prime audio outputs after a hard stop so Audio TTS doesn't come back quiet (iOS/Safari).
                   void restoreVolumesAfterClearCancel();
                 }}
@@ -5539,7 +4481,8 @@ const speakGreetingIfNeeded = useCallback(
                     // eslint-disable-next-line no-alert
                     alert(text);
                   }
-                } catch {}
+                } catch (e) {
+        }
               }}
               style={{
                 marginLeft: "auto",
