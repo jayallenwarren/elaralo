@@ -1556,7 +1556,7 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            brand: brandSlug,
+            brand: companyName,
             avatar: companionName,
             memberId: memberId || "",
             embedDomain: window?.location?.hostname || "",
@@ -1599,7 +1599,7 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
       cancelled = true;
       window.clearInterval(t);
     };
-  }, [avatarStatus, streamEmbedUrl, API_BASE, brandSlug, companionName, memberId]);
+  }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
 
 
 
