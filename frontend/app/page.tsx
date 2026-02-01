@@ -1540,47 +1540,6 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
 
-        if (!res.ok) return;
-        const data = await res.json();
-        if (cancelled) return;
-
-        const eventRef = String(data?.eventRef || "").trim();
-        let embedUrl = String(data?.embedUrl || "").trim();
-        if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
-
-        // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
-        if (embedUrl) {
-          setStreamEventRef(eventRef);
-          setStreamEmbedUrl(embedUrl);
-
-          // Viewers can never "start", so we keep waiting state (and message) until the stream is live.
-          // This is purely to allow the iframe to appear without requiring a hard refresh.
-          setStreamCanStart(false);
-
-          if (data?.message) {
-            setStreamNotice(String(data.message));
-          }
-        } else if (data?.message) {
-          setStreamNotice(String(data.message));
-        }
-      } catch (e) {
-        // Ignore transient failures; keep polling.
-      }
-    };
-
-    // Kick once immediately, then interval.
-    poll();
-    const t = window.setInterval(poll, intervalMs);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(t);
-    };
-  }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
-
-
-
-
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
@@ -1761,9 +1720,6 @@ const applyIphoneLiveAvatarAudioBoost = useCallback(
 
 
 const stopLiveAvatar = useCallback(async () => {
-  // Stop STT/TTS (same steps used by the Stop button).
-  try { stopHandsFreeSTT(); } catch (e) {}
-  try { stopSpeechToText(); } catch (e) {}
   // Always clean up iPhone audio boost routing first
   cleanupIphoneLiveAvatarAudio();
 
@@ -2756,8 +2712,7 @@ const speakAssistantReply = useCallback(
   const [planName, setPlanName] = useState<PlanName>(null);
   const [memberId, setMemberId] = useState<string>("");
 
-
-  // Lightweight viewer auto-refresh: if you're not the host, keep polling until the host creates/starts the event.
+  // Lightweight viewer auto-refresh: if you are not the host, keep polling until the host creates/starts the event.
   // This avoids requiring manual page refresh for viewers waiting on the host.
   useEffect(() => {
     // Only poll while we are explicitly waiting and we don't yet have an embed URL.
@@ -2768,6 +2723,8 @@ const speakAssistantReply = useCallback(
     const intervalMs = 3000;
 
     const poll = () => {
+      const embedDomain = (typeof window !== "undefined" && window.location) ? window.location.hostname : "";
+
       fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2775,37 +2732,37 @@ const speakAssistantReply = useCallback(
           brand: companyName,
           avatar: companionName,
           memberId: memberId || "",
-          embedDomain: typeof window !== "undefined" ? window.location.hostname : "",
+          embedDomain,
         }),
       })
-        .then((res) => {
-          if (!res.ok) return null;
-          return res.json();
-        })
-        .then((data) => {
+        .then((res) => (res && res.ok ? res.json() : null))
+        .then((data: any) => {
           if (!data || cancelled) return;
 
-          const eventRef = String((data as any)?.eventRef || "").trim();
-          let embedUrl = String((data as any)?.embedUrl || "").trim();
+          const eventRef = String(data?.eventRef || "").trim();
+          let embedUrl = String(data?.embedUrl || "").trim();
           if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
 
+          // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
           if (embedUrl) {
             setStreamEventRef(eventRef);
             setStreamEmbedUrl(embedUrl);
 
-            // Viewers can never "start", so we keep canStart false.
+            // Viewers can never "start", so we keep waiting state (and message) until the stream is live.
+            // This is purely to allow the iframe to appear without requiring a hard refresh.
             setStreamCanStart(false);
 
-            if ((data as any)?.message) setStreamNotice(String((data as any).message));
-          } else if ((data as any)?.message) {
-            setStreamNotice(String((data as any).message));
+            if (data?.message) setStreamNotice(String(data.message));
+          } else if (data?.message) {
+            setStreamNotice(String(data.message));
           }
         })
-        .catch(() => {
+        .catch((_e) => {
           // Ignore transient failures; keep polling.
         });
     };
 
+    // Kick once immediately, then interval.
     poll();
     const t = window.setInterval(poll, intervalMs);
 
@@ -2815,7 +2772,7 @@ const speakAssistantReply = useCallback(
     };
   }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
 
-const [loggedIn, setLoggedIn] = useState<boolean>(false);
+  const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
   // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
   const [handoffReady, setHandoffReady] = useState<boolean>(false);
@@ -4496,9 +4453,7 @@ const speakGreetingIfNeeded = useCallback(
   ]);
 
   const toggleSpeechToText = useCallback(async () => {
-    // Disable STT/TTS for the host during BeeStreamed live sessions.
-    if ((liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting"))) return;
-// In Live Avatar mode, mic is required. We don't allow toggling it off.
+    // In Live Avatar mode, mic is required. We don't allow toggling it off.
     // If STT isn't running (permission denied or stopped), we try to start it again.
     if (liveAvatarActive) {
       if (!sttEnabledRef.current) {
@@ -4697,21 +4652,22 @@ const speakGreetingIfNeeded = useCallback(
     <>
       <button
         type="button"
-        onClick={toggleSpeechToText}
-        disabled={((!sttEnabled && loading) || (liveAvatarActive && sttEnabled)) || (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting"))}
+        onClick={() => {
+          if (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) return;
+          void toggleSpeechToText();
+        }}
+        disabled={(liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) || (!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
         title="Audio"
         style={{
-
           width: 44,
           minWidth: 44,
           borderRadius: 10,
           border: "1px solid #111",
-          background: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
+          background: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
           color: sttEnabled ? "#fff" : "#111",
-          cursor: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-          opacity: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? 0.6 : 1,
+          cursor: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
+          opacity: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
           fontWeight: 700,
-        
         }}
       >
         🎤
@@ -4780,34 +4736,33 @@ const speakGreetingIfNeeded = useCallback(
           >
             Set Mode
           </button>
-          {(!rebrandingKey || rebrandingKey.trim() === "") && (
 
 
-
-          <button
-            type="button"
-            onClick={() => {
-              setSwitchCompanionFlash(true);
-              window.setTimeout(() => {
-                goToMyElaralo();
-                setSwitchCompanionFlash(false);
-              }, 120);
-            }}
-            style={{
-              padding: "10px 14px",
-              borderRadius: 10,
-              border: "1px solid #111",
-              background: switchCompanionFlash ? "#111" : "#fff",
-              color: switchCompanionFlash ? "#fff" : "#111",
-              cursor: "pointer",
-              fontWeight: 400,
-              whiteSpace: "nowrap",
-              display: "inline-flex",
-              alignItems: "center",
-            }}
-          >
-            Switch Companion
-          </button>
+          {(!rebrandingKey || String(rebrandingKey).trim() === "") && (
+            <button
+              type="button"
+              onClick={() => {
+                setSwitchCompanionFlash(true);
+                window.setTimeout(() => {
+                  goToMyElaralo();
+                  setSwitchCompanionFlash(false);
+                }, 120);
+              }}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid #111",
+                background: switchCompanionFlash ? "#111" : "#fff",
+                color: switchCompanionFlash ? "#fff" : "#111",
+                cursor: "pointer",
+                fontWeight: 400,
+                whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+              }}
+            >
+              Switch Companion
+            </button>
           )}
         </div>
       ) : (
@@ -4927,12 +4882,6 @@ const speakGreetingIfNeeded = useCallback(
           } else {
             void (async () => {
               // Live Avatar requires microphone / STT. Start it automatically.
-              // BeeStreamed host: disable any STT/TTS while streaming.
-              if (liveProvider === "stream" && streamCanStart) {
-                try { stopHandsFreeSTT(); } catch (e) {}
-                try { stopSpeechToText(); } catch (e) {}
-              }
-
               // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
               if (sttEnabledRef.current && useBackendStt) {
                 stopSpeechToText();
