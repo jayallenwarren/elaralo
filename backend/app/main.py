@@ -1082,14 +1082,6 @@ class BeeStreamedCreateEventRequest(BaseModel):
     startStream: bool = True
 
 
-    # This is the lowest-level primitive when you *don't* already have an event_ref.
-    Credentials are taken from env:
-      - STREAM_TOKEN_ID
-      - STREAM_SECRET_KEY
-    """
-    embedDomain: Optional[str] = None
-    startStream: bool = True
-
 class BeeStreamedEmbedUrlRequest(BaseModel):
     """Resolve a BeeStreamed embed URL that stays inside our iframe wrapper.
 
@@ -1245,8 +1237,6 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
         "message": "",
     }
 
-",
-    }
 
 
 @app.get("/stream/beestreamed/status")
