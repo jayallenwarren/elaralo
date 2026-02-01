@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from filelock import FileLock  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
@@ -526,6 +527,7 @@ def _load_companion_mappings_sync() -> None:
             "live": str(get_col("live", "Live", default="") or ""),
             "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
             "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
+            "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
             "did_embed_code": str(get_col("did_embed_code", "DID_EMBED_CODE", default="") or ""),
             "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
             "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
@@ -786,6 +788,62 @@ def _beestreamed_public_event_url(event_ref: str) -> str:
     base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
     return f"{base}?id={event_ref}"
 
+@app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
+async def beestreamed_embed_page(event_ref: str):
+    """Render a BeeStreamed event inside a sandboxed iframe.
+
+    Why this exists:
+      - The BeeStreamed viewer UI can include actions that open a pop-out / new window.
+      - By wrapping the viewer in a sandboxed iframe WITHOUT `allow-popups`, those actions
+        are prevented and the experience stays within the iframe container.
+    """
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="event_ref is required")
+
+    viewer_url = _beestreamed_public_event_url(event_ref)
+
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Live Stream</title>
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }}
+      .frame {{
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }}
+    </style>
+  </head>
+  <body>
+    <iframe
+      class="frame"
+      src="{viewer_url}"
+      title="Live Stream"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+      referrerpolicy="no-referrer-when-downgrade"
+      allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
+      allowfullscreen
+    ></iframe>
+  </body>
+</html>"""
+
+    # No caching: viewer state is time-sensitive.
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
+
+
 def _beestreamed_auth_headers() -> Dict[str, str]:
     token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
     secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
@@ -835,6 +893,39 @@ def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
             pass
 
     return event_ref
+
+
+def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_domain: str = "") -> None:
+    """Best-effort: set the event date to 'now' so the event is effectively scheduled immediately.
+
+    BeeStreamed docs: PATCH /events/[EVENT REF] supports `date` (formatted) and `title`.
+    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS". citeturn3view1turn3view0
+    """
+    import requests  # type: ignore
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        return
+
+    payload = {}
+    # Use UTC to avoid timezone ambiguity across API hosts.
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    payload["date"] = now_str
+
+    if (title or "").strip():
+        payload["title"] = (title or "").strip()
+
+    # Some BeeStreamed accounts may accept embed domain as a field; we keep this best-effort.
+    # If not supported, BeeStreamed will ignore or reject; we swallow failures.
+    if (embed_domain or "").strip():
+        payload["event_embed_domain"] = (embed_domain or "").strip()
+
+    try:
+        requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload, timeout=20)
+    except Exception:
+        pass
 
 def _beestreamed_start_webrtc_sync(event_ref: str) -> None:
     import requests  # type: ignore
@@ -944,6 +1035,40 @@ class BeeStreamedStopEmbedRequest(BaseModel):
     memberId: Optional[str] = None
     eventRef: Optional[str] = None
 
+class BeeStreamedCreateEventRequest(BaseModel):
+    """Create a BeeStreamed event for a specific (brand, avatar) mapping.
+
+    Only the user whose memberId matches the mapping's host_member_id may create/start the event.
+    Credentials are taken from env on the API host:
+      - STREAM_TOKEN_ID
+      - STREAM_SECRET_KEY
+    """
+    brand: str
+    avatar: str
+    memberId: str
+    embedDomain: Optional[str] = None
+    startStream: bool = True
+
+
+    This is the lowest-level primitive when you *don't* already have an event_ref.
+    Credentials are taken from env:
+      - STREAM_TOKEN_ID
+      - STREAM_SECRET_KEY
+    """
+    embedDomain: Optional[str] = None
+    startStream: bool = True
+
+class BeeStreamedEmbedUrlRequest(BaseModel):
+    """Resolve a BeeStreamed embed URL that stays inside our iframe wrapper.
+
+    Accepts either:
+      - eventRef / event_ref, OR
+      - streamUrl / stream_url (we'll try to parse the event ref out of it)
+    """
+    eventRef: Optional[str] = None
+    streamUrl: Optional[str] = None
+
+
 @app.post("/stream/beestreamed/start_embed")
 async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     brand = (req.brand or "").strip()
@@ -965,6 +1090,10 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     if "stream" not in live:
         raise HTTPException(status_code=400, detail="This companion is not configured for stream")
 
+    comp_type = str(mapping.get("companion_type") or "").strip()
+    if comp_type and comp_type.lower() != "human":
+        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
+
     member_id = (req.memberId or "").strip()
     host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
     is_host = bool(host_id and member_id and member_id == host_id)
@@ -985,10 +1114,10 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
             "isHost": False,
             "eventRef": "",
             "embedUrl": "",
-            "message": "This session will start once the Human Companion starts the session.",
+            "message": f"Waiting on {resolved_avatar} to start event",
         }
 
-    embed_url = _beestreamed_public_event_url(event_ref)
+    embed_url = f"/stream/beestreamed/embed/{event_ref}"
 
     if not is_host:
         return {
@@ -998,10 +1127,11 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
             "isHost": False,
             "eventRef": event_ref,
             "embedUrl": embed_url,
-            "message": "This session will start once the Human Companion starts the session.",
+            "message": f"Waiting on {resolved_avatar} to start event",
         }
 
-    # Host: start the stream (idempotent on BeeStreamed side).
+    # Host: ensure the event is scheduled for 'now' and then start the WebRTC stream.
+    _beestreamed_schedule_now_sync(event_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
     _beestreamed_start_webrtc_sync(event_ref)
 
     return {
@@ -1014,6 +1144,121 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
         "message": "",
     }
 
+
+
+
+
+@app.post("/stream/beestreamed/create_event")
+async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
+    """Create (and optionally start) a BeeStreamed event for a configured companion.
+
+    Authorization rule:
+      - Only the host (memberId == host_member_id in voice_video_mappings.sqlite3) may create/start.
+      - Everyone else gets a "waiting" response.
+    """
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
+    member_id = (req.memberId or "").strip()
+
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
+
+    resolved_brand = str(mapping.get("brand") or brand).strip()
+    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
+
+    live = str(mapping.get("live") or "").strip().lower()
+    if "stream" not in live:
+        raise HTTPException(status_code=400, detail="This companion is not configured for stream")
+
+    comp_type = str(mapping.get("companion_type") or "").strip()
+    if comp_type and comp_type.lower() != "human":
+        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
+
+    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
+    is_host = bool(host_id and member_id and member_id == host_id)
+
+    if not is_host:
+        existing_ref = str(mapping.get("event_ref") or "").strip()
+        return {
+            "ok": True,
+            "status": "waiting_for_host",
+            "canStart": False,
+            "isHost": False,
+            "eventRef": existing_ref,
+            "embedUrl": f"/stream/beestreamed/embed/{existing_ref}" if existing_ref else "",
+            "message": f"Waiting on {resolved_avatar} to start event",
+        }
+
+    # Host path: reuse existing event_ref if present, else create and persist.
+    event_ref = str(mapping.get("event_ref") or "").strip()
+    if not event_ref:
+        event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+
+    if bool(req.startStream):
+        _beestreamed_schedule_now_sync(event_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
+        _beestreamed_start_webrtc_sync(event_ref)
+
+    return {
+        "ok": True,
+        "status": "started",
+        "canStart": True,
+        "isHost": True,
+        "eventRef": event_ref,
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
+        "message": "",
+    }
+
+",
+    }
+
+
+@app.get("/stream/beestreamed/status")
+async def beestreamed_status(brand: str, avatar: str):
+    """Return current BeeStreamed mapping state for a companion (does not start anything)."""
+    brand = (brand or "").strip()
+    avatar = (avatar or "").strip()
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
+
+    event_ref = str(mapping.get("event_ref") or "").strip()
+    return {
+        "ok": True,
+        "eventRef": event_ref,
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
+        "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
+        "companionType": str(mapping.get("companion_type") or "").strip(),
+        "live": str(mapping.get("live") or "").strip(),
+    }
+@app.post("/stream/beestreamed/embed_url")
+async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
+    """Return an embeddable URL that *cannot* pop out of the iframe.
+
+    This is useful when the frontend already has an eventRef (or a BeeStreamed viewer URL)
+    and only needs the safe wrapper URL for the iframe container.
+    """
+    event_ref = (req.eventRef or "").strip()
+    stream_url = (req.streamUrl or "").strip()
+
+    if not event_ref and stream_url:
+        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
+
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="eventRef (or a streamUrl containing it) is required")
+
+    return {
+        "ok": True,
+        "eventRef": event_ref,
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
+    }
 @app.post("/stream/beestreamed/stop_embed")
 async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
     brand = (req.brand or "").strip()

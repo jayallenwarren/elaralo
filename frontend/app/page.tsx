@@ -1540,6 +1540,68 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
 
+  // Lightweight viewer auto-refresh: if you're not the host, keep polling until the host creates/starts the event.
+  // This avoids requiring manual page refresh for viewers waiting on the host.
+  useEffect(() => {
+    // Only poll while we are explicitly waiting and we don't yet have an embed URL.
+    if (avatarStatus !== "waiting") return;
+    if (streamEmbedUrl) return;
+
+    let cancelled = false;
+    const intervalMs = 3000;
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            brand: brandSlug,
+            avatar: companionName,
+            memberId: memberId || "",
+            embedDomain: window?.location?.hostname || "",
+          }),
+        });
+
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+
+        const eventRef = String(data?.eventRef || "").trim();
+        let embedUrl = String(data?.embedUrl || "").trim();
+        if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
+
+        // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
+        if (embedUrl) {
+          setStreamEventRef(eventRef);
+          setStreamEmbedUrl(embedUrl);
+
+          // Viewers can never "start", so we keep waiting state (and message) until the stream is live.
+          // This is purely to allow the iframe to appear without requiring a hard refresh.
+          setStreamCanStart(false);
+
+          if (data?.message) {
+            setStreamNotice(String(data.message));
+          }
+        } else if (data?.message) {
+          setStreamNotice(String(data.message));
+        }
+      } catch {
+        // Ignore transient failures; keep polling.
+      }
+    };
+
+    // Kick once immediately, then interval.
+    poll();
+    const t = window.setInterval(poll, intervalMs);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [avatarStatus, streamEmbedUrl, API_BASE, brandSlug, companionName, memberId]);
+
+
 
 
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
@@ -1722,6 +1784,9 @@ const applyIphoneLiveAvatarAudioBoost = useCallback(
 
 
 const stopLiveAvatar = useCallback(async () => {
+  // Stop STT/TTS (same steps used by the Stop button).
+  try { stopHandsFreeSTT(); } catch {}
+  try { stopSpeechToText(); } catch {}
   // Always clean up iPhone audio boost routing first
   cleanupIphoneLiveAvatarAudio();
 
@@ -1859,21 +1924,29 @@ if (liveProvider === "stream") {
     }
 
     const eventRef = String(data?.eventRef || "").trim();
-    const embedUrl =
-      String(data?.embedUrl || "").trim() ||
-      (eventRef ? `https://beestreamed.com/event?id=${encodeURIComponent(eventRef)}` : "");
 
-    if (!embedUrl) throw new Error("BeeStreamed did not return an embedUrl/eventRef.");
+// IMPORTANT: Always use our internal wrapper so the experience stays within the iframe.
+// The API may return a relative path like "/stream/beestreamed/embed/{eventRef}".
+let embedUrl = String(data?.embedUrl || "").trim();
+if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
 
-    setStreamEventRef(eventRef);
+// If the host hasn't created the event yet, non-host users may legitimately have no embedUrl/eventRef.
+const canStart = !!data?.canStart;
+if (!embedUrl && eventRef) {
+  // Fallback to wrapper path (never direct beestreamed.com) if API returned eventRef only.
+  embedUrl = `${API_BASE}/stream/beestreamed/embed/${encodeURIComponent(eventRef)}`;
+}
+if (!embedUrl && canStart) {
+  throw new Error("BeeStreamed did not return an embedUrl/eventRef.");
+}
+setStreamEventRef(eventRef);
     setStreamEmbedUrl(embedUrl);
 
-    const canStart = !!data?.canStart;
     setStreamCanStart(canStart);
 
     if (!canStart) {
       setStreamNotice(
-        `Waiting for ${companionName || "the host"} to start the live session…`
+        `Waiting on ${companionName || "the host"} to start event`
       );
       setAvatarStatus("waiting");
     } else if (String(data?.status || "").trim() === "start_failed") {
@@ -4386,7 +4459,9 @@ const speakGreetingIfNeeded = useCallback(
   ]);
 
   const toggleSpeechToText = useCallback(async () => {
-    // In Live Avatar mode, mic is required. We don't allow toggling it off.
+    // Disable STT/TTS for the host during BeeStreamed live sessions.
+    if ((liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting"))) return;
+// In Live Avatar mode, mic is required. We don't allow toggling it off.
     // If STT isn't running (permission denied or stopped), we try to start it again.
     if (liveAvatarActive) {
       if (!sttEnabledRef.current) {
@@ -4586,17 +4661,20 @@ const speakGreetingIfNeeded = useCallback(
       <button
         type="button"
         onClick={toggleSpeechToText}
-        disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
+        disabled={((!sttEnabled && loading) || (liveAvatarActive && sttEnabled)) || (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting"))}
         title="Audio"
         style={{
+
           width: 44,
           minWidth: 44,
           borderRadius: 10,
           border: "1px solid #111",
-          background: sttEnabled ? "#b00020" : "#fff",
+          background: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
           color: sttEnabled ? "#fff" : "#111",
-          cursor: "pointer",
+          cursor: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
+          opacity: (liveProvider === "stream" && streamCanStart && (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting")) ? 0.6 : 1,
           fontWeight: 700,
+        
         }}
       >
         🎤
@@ -4665,6 +4743,8 @@ const speakGreetingIfNeeded = useCallback(
           >
             Set Mode
           </button>
+          {(!rebrandingKey || rebrandingKey.trim() === "") && (
+
 
 
           <button
@@ -4691,6 +4771,7 @@ const speakGreetingIfNeeded = useCallback(
           >
             Switch Companion
           </button>
+          )}
         </div>
       ) : (
         <>
@@ -4809,6 +4890,12 @@ const speakGreetingIfNeeded = useCallback(
           } else {
             void (async () => {
               // Live Avatar requires microphone / STT. Start it automatically.
+              // BeeStreamed host: disable any STT/TTS while streaming.
+              if (liveProvider === "stream" && streamCanStart) {
+                try { stopHandsFreeSTT(); } catch {}
+                try { stopSpeechToText(); } catch {}
+              }
+
               // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
               if (sttEnabledRef.current && useBackendStt) {
                 stopSpeechToText();
@@ -4917,6 +5004,9 @@ const speakGreetingIfNeeded = useCallback(
                   src={streamEmbedUrl}
                   title="Live Stream"
                   style={{ width: "100%", height: "100%", border: 0 }}
+                  // Keep all navigation inside the frame (block popout/new-window behavior)
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+                  referrerPolicy="no-referrer-when-downgrade"
                   allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
                   allowFullScreen
                 />
@@ -5006,13 +5096,15 @@ const speakGreetingIfNeeded = useCallback(
                 height: 44,
                 borderRadius: 10,
                 border: "1px solid #bbb",
-                background: "#fff",
-                cursor: "pointer",
+                background: ({liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}) ? "#f3f3f3" : "#fff",
+                cursor: ({liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}) ? "not-allowed" : "pointer",
+                opacity: ({liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}) ? 0.6 : 1,
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
               }}
-            >
+              disabled={liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}
+              >
               <SaveIcon size={18} />
             </button>
 
@@ -5026,13 +5118,15 @@ const speakGreetingIfNeeded = useCallback(
                 height: 44,
                 borderRadius: 10,
                 border: "1px solid #bbb",
-                background: "#fff",
-                cursor: "pointer",
+                background: ({liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}) ? "#f3f3f3" : "#fff",
+                cursor: ({liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}) ? "not-allowed" : "pointer",
+                opacity: ({liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}) ? 0.6 : 1,
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
               }}
-            >
+              disabled={liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}
+              >
               <TrashIcon size={18} />
             </button>
 
