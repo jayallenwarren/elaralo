@@ -2851,7 +2851,7 @@ const speakAssistantReply = useCallback(
   // BeeStreamed broadcaster overlay (Host-only)
   // - Fetch the host_member_id for the current companion (no side effects; does NOT start the event).
   // - The "Broadcast" button (rendered only for the host) calls /stream/beestreamed/start_broadcast which
-  //   prepares the event and returns a broadcaster iframe URL.
+  //   prepares the event and returns a Producer View iframe URL.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (liveProvider !== "stream") {
@@ -5344,7 +5344,7 @@ const speakGreetingIfNeeded = useCallback(
 	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
 	          ) : null}
 
-          {/* BeeStreamed UI Broadcaster overlay (Host-only) */}
+          {/* BeeStreamed Producer View overlay (Host-only) */}
           {showBroadcastButton && showBroadcasterOverlay ? (
             <div
               style={{
@@ -5360,7 +5360,7 @@ const speakGreetingIfNeeded = useCallback(
               {broadcasterOverlayUrl ? (
                 <iframe
                   src={broadcasterOverlayUrl}
-                  title="BeeStreamed Broadcaster"
+                  title="BeeStreamed Producer View"
                   style={{ width: "100%", height: "100%", border: 0, background: "#fff" }}
                   // Keep navigation inside the frame; BeeStreamed UI needs scripts + camera/mic.
                   sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"

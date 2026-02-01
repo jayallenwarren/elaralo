@@ -822,43 +822,71 @@ def _beestreamed_public_event_url(event_ref: str) -> str:
 
 
 def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
-    """Return the BeeStreamed *broadcaster / producer* UI URL for an event.
+    """Return the BeeStreamed **Producer View** (broadcaster UI) URL for an event_ref.
 
-    This project embeds the broadcaster UI inside an iframe. BeeStreamed's exact producer URL can vary by account
-    configuration. To keep this integration drop-in and environment-configurable, we resolve the URL in this order:
+    Why this is configurable:
+      - The BeeStreamed API documentation focuses on API endpoints and does not currently document a public,
+        embeddable "Producer View" URL.
+      - Depending on account setup, the Producer View may live under different routes/domains.
 
-      1) BEESTREAMED_BROADCASTER_URL_TEMPLATE (preferred)
-           Example:
-             https://manage.beestreamed.com/producer?event_ref={event_ref}
-           Must include "{event_ref}" placeholder.
+    Resolution order:
+      1) BEESTREAMED_PRODUCER_URL_TEMPLATE (or legacy BEESTREAMED_BROADCASTER_URL_TEMPLATE)
+           - Must contain the placeholder "{event_ref}"
+           - Example:
+               https://manage.beestreamed.com/producer?event_ref={event_ref}
 
-      2) BEESTREAMED_BROADCASTER_BASE (+ optional BEESTREAMED_BROADCASTER_QUERY_KEY)
-           Example:
-             BEESTREAMED_BROADCASTER_BASE=https://manage.beestreamed.com/producer
-             BEESTREAMED_BROADCASTER_QUERY_KEY=event_ref   (default: "id")
-           Result:
-             https://manage.beestreamed.com/producer?event_ref=<event_ref>
+      2) BEESTREAMED_PRODUCER_BASE (or legacy BEESTREAMED_BROADCASTER_BASE)
+         + BEESTREAMED_PRODUCER_QUERY_KEY (or legacy BEESTREAMED_BROADCASTER_QUERY_KEY)
+           - We append the event_ref as a query parameter.
+           - Default base: https://manage.beestreamed.com/producer
+           - Default key:  event_ref
 
-      3) Fallback to the public event page with a "producer" hint parameter.
-         (If BeeStreamed ignores this parameter, set the template/base env vars above.)
+      3) If nothing is configured, we fall back to:
+           https://manage.beestreamed.com/producer?event_ref=<event_ref>&id=<event_ref>
+
+    Compatibility note:
+      - We include both "event_ref" and "id" query parameters (when they are not the configured primary key)
+        to maximize compatibility across BeeStreamed UI implementations.
     """
     ref = (event_ref or "").strip()
     if not ref:
         return ""
 
-    tmpl = (os.getenv("BEESTREAMED_BROADCASTER_URL_TEMPLATE", "") or "").strip()
+    tmpl = (
+        os.getenv("BEESTREAMED_PRODUCER_URL_TEMPLATE", "")
+        or os.getenv("BEESTREAMED_BROADCASTER_URL_TEMPLATE", "")
+        or ""
+    ).strip()
     if tmpl and "{event_ref}" in tmpl:
         return tmpl.replace("{event_ref}", ref)
 
-    base = (os.getenv("BEESTREAMED_BROADCASTER_BASE", "") or "").strip().rstrip("/")
-    if base:
-        key = (os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "") or "id").strip() or "id"
-        join = "&" if "?" in base else "?"
-        return f"{base}{join}{key}={ref}"
+    base = (
+        os.getenv("BEESTREAMED_PRODUCER_BASE", "")
+        or os.getenv("BEESTREAMED_BROADCASTER_BASE", "")
+        or "https://manage.beestreamed.com/producer"
+    ).strip().rstrip("/")
+    if not base:
+        return ""
 
-    # Best-effort fallback (works only if BeeStreamed supports a producer mode via query param).
-    viewer_base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
-    return f"{viewer_base}?id={ref}&producer=1"
+    key = (
+        os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "")
+        or os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "")
+        or "event_ref"
+    ).strip() or "event_ref"
+
+    join = "&" if "?" in base else "?"
+    url = f"{base}{join}{key}={ref}"
+
+    # Add common alias keys as well (most servers ignore unknown params).
+    extras: list[str] = []
+    if key != "event_ref":
+        extras.append(f"event_ref={ref}")
+    if key != "id":
+        extras.append(f"id={ref}")
+    if extras:
+        url = url + "&" + "&".join(extras)
+
+    return url
 
 
 @app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
@@ -929,7 +957,7 @@ async def beestreamed_broadcaster_page(event_ref: str):
     if not producer_url:
         raise HTTPException(
             status_code=500,
-            detail="Broadcaster URL could not be resolved. Configure BEESTREAMED_BROADCASTER_URL_TEMPLATE or BEESTREAMED_BROADCASTER_BASE.",
+            detail="Producer View URL could not be resolved. Configure BEESTREAMED_PRODUCER_URL_TEMPLATE (preferred) or BEESTREAMED_PRODUCER_BASE.",
         )
 
     html = f"""<!doctype html>
@@ -1308,7 +1336,7 @@ async def beestreamed_start_broadcast(req: BeeStreamedStartEmbedRequest):
 
     Frontend intent:
       - The host can click "Broadcast" and immediately see the BeeStreamed broadcaster UI already pointed at the
-        correct event; they only need to press "Start" in the BeeStreamed UI.
+        correct event; they only need to press "Go Live" in the BeeStreamed Producer View.
     """
     data = await beestreamed_start_embed(req)
 
