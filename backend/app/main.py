@@ -878,9 +878,6 @@ def _beestreamed_client_subdomain_sync() -> str:
 def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
     """Return the BeeStreamed Producer View ("broadcaster UI") URL for an event.
 
-    BeeStreamed Manage Panel Producer View deep link (confirmed by you):
-      https://manage.beestreamed.com/producer?ref=<event_ref>
-
     Resolution order:
 
       1) BEESTREAMED_PRODUCER_URL_TEMPLATE (preferred)
@@ -889,14 +886,12 @@ def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
            - {event_ref}
            - {client_subdomain}
 
-      2) BEESTREAMED_PRODUCER_BASE / BEESTREAMED_PRODUCER_QUERY_KEY
-         OR legacy: BEESTREAMED_BROADCASTER_BASE / BEESTREAMED_BROADCASTER_QUERY_KEY
+      2) BEESTREAMED_BROADCASTER_BASE (+ optional BEESTREAMED_BROADCASTER_QUERY_KEY)
          (Base can also contain {client_subdomain})
 
-      3) Defaults:
-         host: https://manage.beestreamed.com (override via BEESTREAMED_PRODUCER_HOST)
-         path: /producer (override via BEESTREAMED_PRODUCER_PATH)
-         key:  ref      (override via BEESTREAMED_PRODUCER_QUERY_KEY)
+      3) Default heuristic:
+         https://{client_subdomain}.beestreamed.com/producer?id={event_ref}
+         (Override path/query via BEESTREAMED_PRODUCER_PATH / BEESTREAMED_PRODUCER_QUERY_KEY)
     """
     ref = (event_ref or "").strip()
     if not ref:
@@ -904,42 +899,52 @@ def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
 
     client_subdomain = _beestreamed_client_subdomain_sync()
 
-    # Highest priority: explicit template
     tmpl = (os.getenv("BEESTREAMED_PRODUCER_URL_TEMPLATE", "") or "").strip()
     if not tmpl:
         tmpl = (os.getenv("BEESTREAMED_BROADCASTER_URL_TEMPLATE", "") or "").strip()
 
     if tmpl:
-        url = tmpl.replace("{event_ref}", ref).replace("{client_subdomain}", client_subdomain)
+        url = tmpl
+        url = url.replace("{event_ref}", ref)
+        url = url.replace("{client_subdomain}", client_subdomain)
         return url
 
-    # Next: explicit base + query key
-    base = (os.getenv("BEESTREAMED_PRODUCER_BASE", "") or "").strip().rstrip("/")
-    if not base:
-        base = (os.getenv("BEESTREAMED_BROADCASTER_BASE", "") or "").strip().rstrip("/")
-
+    base = (os.getenv("BEESTREAMED_BROADCASTER_BASE", "") or "").strip().rstrip("/")
     if base:
         base = base.replace("{client_subdomain}", client_subdomain)
-        key = (os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "") or "").strip()
-        if not key:
-            key = (os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "") or "").strip()
-        key = key or "ref"
+        key = (os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "") or "id").strip() or "id"
         join = "&" if "?" in base else "?"
         return f"{base}{join}{key}={ref}"
 
-    # Default: BeeStreamed Manage Panel Producer View
-    host = (os.getenv("BEESTREAMED_PRODUCER_HOST", "") or "").strip().rstrip("/") or "https://manage.beestreamed.com"
+    # Default: use the same tenant domain as the viewer URL (if possible), then fall back to subdomain.
+    host = (os.getenv("BEESTREAMED_PRODUCER_HOST", "") or "").strip().rstrip("/")
+    if not host:
+        # Derive host from the public event base (keeps producer & viewer on the same BeeStreamed tenant domain).
+        public_base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip()
+        try:
+            from urllib.parse import urlparse
+
+            u = urlparse(public_base)
+            if u.scheme and u.netloc:
+                host = f"{u.scheme}://{u.netloc}"
+        except Exception:
+            host = ""
+
+    if not host:
+        host = f"https://{client_subdomain}.beestreamed.com" if client_subdomain else "https://beestreamed.com"
 
     path = (os.getenv("BEESTREAMED_PRODUCER_PATH", "") or "/producer").strip()
     if not path.startswith("/"):
         path = "/" + path
 
-    key = (os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "") or "ref").strip() or "ref"
+    key = (os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "") or "id").strip() or "id"
     extra = (os.getenv("BEESTREAMED_PRODUCER_QUERY_EXTRA", "") or "").strip()
 
     url = f"{host}{path}?{key}={ref}"
     if extra:
-        url = url + "&" + extra.lstrip("&?")
+        # Allow passing through flags like "embed=1" without hardcoding assumptions.
+        url = url + ("&" if "?" in url else "?") + extra.lstrip("&?")
+
     return url
 
 
@@ -988,9 +993,9 @@ async def beestreamed_embed_page(event_ref: str):
       class="frame"
       src="{viewer_url}"
       title="Live Stream"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-storage-access-by-user-activation"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
       referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; storage-access"
+      allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
       allowfullscreen
     ></iframe>
   </body>
@@ -1044,9 +1049,9 @@ async def beestreamed_broadcaster_page(event_ref: str):
       class="frame"
       src="{producer_url}"
       title="Broadcast"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-storage-access-by-user-activation"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
       referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture; storage-access"
+      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
       allowfullscreen
     ></iframe>
   </body>
