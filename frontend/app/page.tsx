@@ -4618,11 +4618,8 @@ const speakGreetingIfNeeded = useCallback(
     // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
     if (liveAvatarActive) {
       void stopLiveAvatar();
-    } else if (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) {
-      // Viewer: allow Stop to close their individual stream session (no impact on host broadcast).
-      void stopLiveAvatar();
     }
-  }, [liveAvatarActive, liveProvider, streamEmbedUrl, streamCanStart, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
+  }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
   // Stop button handler (explicit user gesture): stop all comms AND immediately
   // re-prime the iOS/Safari audio route so that when the user manually resumes
@@ -4813,7 +4810,7 @@ const speakGreetingIfNeeded = useCallback(
       <button
         type="button"
         onClick={handleStopClick}
-        disabled={!sttEnabled && !(liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting" || avatarStatus === "connecting" || avatarStatus === "reconnecting"))}
+        disabled={!sttEnabled}
         title="Stop"
         style={{
           width: 44,
@@ -4822,8 +4819,8 @@ const speakGreetingIfNeeded = useCallback(
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: (sttEnabled || (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting" || avatarStatus === "connecting" || avatarStatus === "reconnecting"))) ? "pointer" : "not-allowed",
-          opacity: (sttEnabled || (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting" || avatarStatus === "connecting" || avatarStatus === "reconnecting"))) ? 1 : 0.45,
+          cursor: sttEnabled ? "pointer" : "not-allowed",
+          opacity: sttEnabled ? 1 : 0.45,
           fontWeight: 700,
         }}
       >
@@ -4845,26 +4842,10 @@ const speakGreetingIfNeeded = useCallback(
     return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
   }, [allowedModes]);
 
-  
-  // Hide Set Mode during Live Stream (Host + Viewer) to avoid mode-switching while streaming.
-  const hideSetModeInLiveStream =
-    liveProvider === "stream" &&
-    (avatarStatus === "connecting" ||
-      avatarStatus === "connected" ||
-      avatarStatus === "reconnecting" ||
-      avatarStatus === "waiting");
-
-  useEffect(() => {
-    if (hideSetModeInLiveStream && showModePicker) {
-      setShowModePicker(false);
-    }
-  }, [hideSetModeInLiveStream, showModePicker]);
-
-const modePillControls = (
+  const modePillControls = (
     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
       {!showModePicker ? (
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-          {!hideSetModeInLiveStream ? (
           <button
             type="button"
             onClick={() => {
@@ -4889,7 +4870,6 @@ const modePillControls = (
           >
             Set Mode
           </button>
-          ) : null}
 
 
           {showBroadcastButton ? (
@@ -5197,8 +5177,8 @@ const modePillControls = (
                   src={streamEmbedUrl}
                   title="Live Stream"
                   style={{ width: "100%", height: "100%", border: 0 }}
-                  // BeeStreamed cookie consent may require storage access / user-activation navigation; keep sandboxed but permissive
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-storage-access-by-user-activation"
+                  // Keep all navigation inside the frame (block popout/new-window behavior)
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-storage-access-by-user-activation"
                   referrerPolicy="no-referrer-when-downgrade"
                   allow="autoplay; fullscreen; picture-in-picture; microphone; camera; storage-access"
                   allowFullScreen
@@ -5223,7 +5203,6 @@ const modePillControls = (
                     color: "#fff",
                     fontSize: 14,
                     background: "rgba(0,0,0,0.25)",
-                    pointerEvents: "none",
                     padding: 12,
                     textAlign: "center",
                   }}
@@ -5384,9 +5363,9 @@ const modePillControls = (
                   title="BeeStreamed Producer View"
                   style={{ width: "100%", height: "100%", border: 0, background: "#fff" }}
                   // Keep navigation inside the frame; BeeStreamed UI needs scripts + camera/mic.
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-storage-access-by-user-activation"
                   referrerPolicy="no-referrer-when-downgrade"
-                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
+                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture; storage-access"
                   allowFullScreen
                 />
               ) : (

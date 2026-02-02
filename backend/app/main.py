@@ -815,28 +815,46 @@ DULCE_HOST_MEMBER_ID_FALLBACK = "1dc3fe06-c351-4678-8fe4-6a4b1350c556"
 def _beestreamed_api_base() -> str:
     return (os.getenv("BEESTREAMED_API_BASE", "") or "https://api.beestreamed.com").strip().rstrip("/")
 
-def _beestreamed_public_event_url(event_ref: str) -> str:
-    # BeeStreamed public event page (works as an embeddable viewer page in an iframe).
-    base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
-    return f"{base}?id={event_ref}"
+def _beestreamed_public_event_url(event_ref: str, embed: str | None = None) -> str:
+    """BeeStreamed public event page (embeddable viewer page).
 
+    Args:
+      event_ref: BeeStreamed event reference (id)
+      embed: optional BeeStreamed embed mode (e.g. "player"). When provided, appended as &embed=<mode>.
+    """
+    base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
+    url = f"{base}?id={event_ref}"
+    mode = (embed or "").strip()
+    if mode:
+        url = url + f"&embed={mode}"
+    return url
 
 def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
-    """Return a BeeStreamed broadcaster UI URL for a given event_ref.
+    """Return the BeeStreamed **Producer View** (broadcaster UI) URL for an event_ref.
 
-    Important practical constraint:
-      - BeeStreamed "manage" pages (e.g., manage.beestreamed.com) are often protected by login AND frequently
-        send X-Frame-Options / CSP frame-ancestors that prevent being embedded in an iframe.
-      - Until BeeStreamed provides an auth-free, embeddable Producer View deep link, our safe default is the
-        public event viewer page (beestreamed.com/event?id=...).
+    Why this is configurable:
+      - The BeeStreamed API documentation focuses on API endpoints and does not currently document a public,
+        embeddable "Producer View" URL.
+      - Depending on account setup, the Producer View may live under different routes/domains.
 
     Resolution order:
       1) BEESTREAMED_PRODUCER_URL_TEMPLATE (or legacy BEESTREAMED_BROADCASTER_URL_TEMPLATE)
-         - If set, we substitute any of: {event_ref}, {eventRef}, {ref}, {id}
+           - Must contain the placeholder "{event_ref}"
+           - Example:
+               https://manage.beestreamed.com/producer?event_ref={event_ref}
+
       2) BEESTREAMED_PRODUCER_BASE (or legacy BEESTREAMED_BROADCASTER_BASE)
          + BEESTREAMED_PRODUCER_QUERY_KEY (or legacy BEESTREAMED_BROADCASTER_QUERY_KEY)
-         - If set, we append ?<key>=<event_ref> plus common aliases (ref/event_ref/id) as extra query params.
-      3) Fallback: public event page via _beestreamed_public_event_url(event_ref)
+           - We append the event_ref as a query parameter.
+           - Default base: https://manage.beestreamed.com/producer
+           - Default key:  event_ref
+
+      3) If nothing is configured, we fall back to:
+           https://manage.beestreamed.com/producer?event_ref=<event_ref>&id=<event_ref>
+
+    Compatibility note:
+      - We include both "event_ref" and "id" query parameters (when they are not the configured primary key)
+        to maximize compatibility across BeeStreamed UI implementations.
     """
     ref = (event_ref or "").strip()
     if not ref:
@@ -847,38 +865,30 @@ def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
         or os.getenv("BEESTREAMED_BROADCASTER_URL_TEMPLATE", "")
         or ""
     ).strip()
-    if tmpl:
-        # Allow templates to use any of these placeholders.
-        url = tmpl
-        url = url.replace("{event_ref}", ref)
-        url = url.replace("{eventRef}", ref)
-        url = url.replace("{ref}", ref)
-        url = url.replace("{id}", ref)
-        return url
+    if tmpl and "{event_ref}" in tmpl:
+        return tmpl.replace("{event_ref}", ref)
 
     base = (
         os.getenv("BEESTREAMED_PRODUCER_BASE", "")
         or os.getenv("BEESTREAMED_BROADCASTER_BASE", "")
         or ""
     ).strip().rstrip("/")
-
-    # No configured producer base → fall back to the public viewer page (embeddable without login).
     if not base:
+        # Fallback (auth-free + iframe-friendly): show the public event page in "full" mode.
+        # This keeps the broadcaster overlay from duplicating the viewer *player-only* embed.
         return _beestreamed_public_event_url(ref)
 
     key = (
         os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "")
         or os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "")
-        or "ref"
-    ).strip() or "ref"
+        or "event_ref"
+    ).strip() or "event_ref"
 
     join = "&" if "?" in base else "?"
     url = f"{base}{join}{key}={ref}"
 
     # Add common alias keys as well (most servers ignore unknown params).
     extras: list[str] = []
-    if key != "ref":
-        extras.append(f"ref={ref}")
     if key != "event_ref":
         extras.append(f"event_ref={ref}")
     if key != "id":
@@ -889,9 +899,8 @@ def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
     return url
 
 
-
 @app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
-async def beestreamed_embed_page(event_ref: str):
+async def beestreamed_embed_page(event_ref: str, embed: str | None = None):
     """Render a BeeStreamed event inside a sandboxed iframe.
 
     Why this exists:
@@ -903,7 +912,13 @@ async def beestreamed_embed_page(event_ref: str):
     if not event_ref:
         raise HTTPException(status_code=400, detail="event_ref is required")
 
-    viewer_url = _beestreamed_public_event_url(event_ref)
+    # Viewer embed: default to BeeStreamed's "player" embed mode to avoid duplicating full UI and
+    # to reduce cookie/consent friction in embedded contexts. This preserves the v2 wrapper/iframe logic.
+    mode = (embed or os.getenv("BEESTREAMED_VIEWER_EMBED_MODE", "") or "player").strip()
+    if mode.lower() in ("", "none", "full"):
+        viewer_url = _beestreamed_public_event_url(event_ref)
+    else:
+        viewer_url = _beestreamed_public_event_url(event_ref, embed=mode)
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -934,7 +949,7 @@ async def beestreamed_embed_page(event_ref: str):
       class="frame"
       src="{viewer_url}"
       title="Live Stream"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-storage-access-by-user-activation"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-storage-access-by-user-activation"
       referrerpolicy="no-referrer-when-downgrade"
       allow="autoplay; fullscreen; picture-in-picture; microphone; camera; storage-access"
       allowfullscreen
@@ -990,7 +1005,7 @@ async def beestreamed_broadcaster_page(event_ref: str):
       class="frame"
       src="{producer_url}"
       title="Broadcast"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-storage-access-by-user-activation"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-storage-access-by-user-activation"
       referrerpolicy="no-referrer-when-downgrade"
       allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture; storage-access"
       allowfullscreen
