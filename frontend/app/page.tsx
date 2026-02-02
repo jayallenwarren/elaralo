@@ -4853,7 +4853,7 @@ const speakGreetingIfNeeded = useCallback(
   }, [allowedModes]);
 
   const hideSetModeInLiveStream =
-    liveProvider === "stream" && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting");
+    liveProvider === "stream" && (Boolean(streamEmbedUrl) || Boolean(streamEventRef));
 
   useEffect(() => {
     // Requirement: hide Set Mode while in live stream (and force-close the picker if it was open).
@@ -5198,9 +5198,9 @@ const speakGreetingIfNeeded = useCallback(
                   title="Live Stream"
                   style={{ width: "100%", height: "100%", border: 0 }}
                   // Keep all navigation inside the frame (block popout/new-window behavior)
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-storage-access-by-user-activation"
                   referrerPolicy="no-referrer-when-downgrade"
-                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
+                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; storage-access"
                   allowFullScreen
                 />
               ) : (
@@ -5413,9 +5413,9 @@ const speakGreetingIfNeeded = useCallback(
                   title="BeeStreamed Broadcaster"
                   style={{ width: "100%", height: "100%", border: 0, background: "#fff" }}
                   // Keep navigation inside the frame; BeeStreamed UI needs scripts + camera/mic.
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-storage-access-by-user-activation"
                   referrerPolicy="no-referrer-when-downgrade"
-                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
+                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture; storage-access"
                   allowFullScreen
                 />
               ) : (

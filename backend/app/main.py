@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from filelock import FileLock  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
@@ -949,14 +949,13 @@ def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
 
 
 
-@app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
+@app.get("/stream/beestreamed/embed/{event_ref}")
 async def beestreamed_embed_page(event_ref: str):
-    """Render a BeeStreamed event inside a sandboxed iframe.
+    """Redirect the iframe to the BeeStreamed viewer UI (single-frame).
 
-    Why this exists:
-      - The BeeStreamed viewer UI can include actions that open a pop-out / new window.
-      - By wrapping the viewer in a sandboxed iframe WITHOUT `allow-popups`, those actions
-        are prevented and the experience stays within the iframe container.
+    Why:
+      - Avoid nested iframes which can interfere with cookie-consent / storage access flows.
+      - The parent iframe element in the frontend applies sandboxing (no popouts/new windows).
     """
     event_ref = (event_ref or "").strip()
     if not event_ref:
@@ -964,51 +963,21 @@ async def beestreamed_embed_page(event_ref: str):
 
     viewer_url = _beestreamed_public_event_url(event_ref)
 
-    html = f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Live Stream</title>
-    <style>
-      html, body {{
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        background: #000;
-        overflow: hidden;
-      }}
-      .frame {{
-        position: fixed;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        border: 0;
-      }}
-    </style>
-  </head>
-  <body>
-    <iframe
-      class="frame"
-      src="{viewer_url}"
-      title="Live Stream"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
-      referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
-      allowfullscreen
-    ></iframe>
-  </body>
-</html>"""
-
     # No caching: viewer state is time-sensitive.
-    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
+    return RedirectResponse(viewer_url, status_code=302, headers={"Cache-Control": "no-store"})
 
 
 
-@app.get("/stream/beestreamed/broadcaster/{event_ref}", response_class=HTMLResponse)
+
+
+@app.get("/stream/beestreamed/broadcaster/{event_ref}")
 async def beestreamed_broadcaster_page(event_ref: str):
-    """Render the BeeStreamed *broadcaster / producer* UI inside a sandboxed iframe."""
+    """Redirect to the BeeStreamed *broadcaster / producer* UI.
+
+    NOTE:
+      - The producer URL is resolved by _beestreamed_broadcaster_ui_url().
+      - The parent iframe element in the frontend applies sandboxing + camera/mic permissions.
+    """
     event_ref = (event_ref or "").strip()
     if not event_ref:
         raise HTTPException(status_code=400, detail="event_ref is required")
@@ -1020,45 +989,10 @@ async def beestreamed_broadcaster_page(event_ref: str):
             detail="Broadcaster URL could not be resolved. Configure BEESTREAMED_BROADCASTER_URL_TEMPLATE or BEESTREAMED_BROADCASTER_BASE.",
         )
 
-    html = f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Broadcast</title>
-    <style>
-      html, body {{
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        background: #000;
-        overflow: hidden;
-      }}
-      .frame {{
-        position: fixed;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        border: 0;
-      }}
-    </style>
-  </head>
-  <body>
-    <iframe
-      class="frame"
-      src="{producer_url}"
-      title="Broadcast"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
-      referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
-      allowfullscreen
-    ></iframe>
-  </body>
-</html>"""
+    # No caching: producer UI is time-sensitive.
+    return RedirectResponse(producer_url, status_code=302, headers={"Cache-Control": "no-store"})
 
-    # No caching: broadcast UI is stateful.
-    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
+
 
 
 def _beestreamed_auth_headers() -> Dict[str, str]:
