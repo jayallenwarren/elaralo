@@ -821,72 +821,127 @@ def _beestreamed_public_event_url(event_ref: str) -> str:
     return f"{base}?id={event_ref}"
 
 
-def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
-    """Return the BeeStreamed **Producer View** (broadcaster UI) URL for an event_ref.
+# Cache BeeStreamed client details (primarily used for resolving the Producer View URL).
+_BEESTREAMED_CLIENT_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "subdomain": ""}
 
-    Why this is configurable:
-      - The BeeStreamed API documentation focuses on API endpoints and does not currently document a public,
-        embeddable "Producer View" URL.
-      - Depending on account setup, the Producer View may live under different routes/domains.
+
+def _beestreamed_client_subdomain_sync() -> str:
+    """Best-effort resolve this BeeStreamed channel's subdomain.
+
+    BeeStreamed uses per-channel subdomains (e.g. https://{client_subdomain}.beestreamed.com/event?id=...).
+    We use the same subdomain to build a default Producer View URL when no explicit template/base is configured.
+    """
+    env = (os.getenv("BEESTREAMED_CLIENT_SUBDOMAIN", "") or "").strip()
+    if env:
+        return env
+
+    # Cache to avoid repeated API calls on every page load.
+    now = time.time()
+    cached = str(_BEESTREAMED_CLIENT_CACHE.get("subdomain") or "").strip()
+    fetched_at = float(_BEESTREAMED_CLIENT_CACHE.get("fetched_at") or 0.0)
+    if cached and (now - fetched_at) < 600:  # 10 minutes
+        return cached
+
+    try:
+        import requests  # type: ignore
+
+        api_base = _beestreamed_api_base()
+        headers = _beestreamed_auth_headers()
+
+        r = requests.get(f"{api_base}/client", headers=headers, timeout=20)
+        if r.status_code >= 400:
+            return cached
+
+        payload = {}
+        try:
+            payload = r.json()  # type: ignore[assignment]
+        except Exception:
+            payload = {}
+
+        sub = ""
+        if isinstance(payload, dict):
+            if isinstance(payload.get("data"), dict):
+                sub = str(payload["data"].get("client_subdomain") or payload["data"].get("subdomain") or "").strip()
+            sub = sub or str(payload.get("client_subdomain") or payload.get("subdomain") or "").strip()
+
+        if sub:
+            _BEESTREAMED_CLIENT_CACHE["subdomain"] = sub
+            _BEESTREAMED_CLIENT_CACHE["fetched_at"] = now
+            return sub
+    except Exception:
+        # Silent best-effort: if this fails, callers will fall back to beestreamed.com.
+        pass
+
+    return cached
+
+
+def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
+    """Return the BeeStreamed Producer View ("broadcaster UI") URL for an event.
+
+    BeeStreamed Manage Panel Producer View deep link (confirmed by you):
+      https://manage.beestreamed.com/producer?ref=<event_ref>
 
     Resolution order:
-      1) BEESTREAMED_PRODUCER_URL_TEMPLATE (or legacy BEESTREAMED_BROADCASTER_URL_TEMPLATE)
-           - Must contain the placeholder "{event_ref}"
-           - Example:
-               https://manage.beestreamed.com/producer?event_ref={event_ref}
 
-      2) BEESTREAMED_PRODUCER_BASE (or legacy BEESTREAMED_BROADCASTER_BASE)
-         + BEESTREAMED_PRODUCER_QUERY_KEY (or legacy BEESTREAMED_BROADCASTER_QUERY_KEY)
-           - We append the event_ref as a query parameter.
-           - Default base: https://manage.beestreamed.com/producer
-           - Default key:  event_ref
+      1) BEESTREAMED_PRODUCER_URL_TEMPLATE (preferred)
+         OR legacy alias: BEESTREAMED_BROADCASTER_URL_TEMPLATE
+         Supports placeholders:
+           - {event_ref}
+           - {client_subdomain}
 
-      3) If nothing is configured, we fall back to:
-           https://manage.beestreamed.com/producer?event_ref=<event_ref>&id=<event_ref>
+      2) BEESTREAMED_PRODUCER_BASE / BEESTREAMED_PRODUCER_QUERY_KEY
+         OR legacy: BEESTREAMED_BROADCASTER_BASE / BEESTREAMED_BROADCASTER_QUERY_KEY
+         (Base can also contain {client_subdomain})
 
-    Compatibility note:
-      - We include both "event_ref" and "id" query parameters (when they are not the configured primary key)
-        to maximize compatibility across BeeStreamed UI implementations.
+      3) Defaults:
+         host: https://manage.beestreamed.com (override via BEESTREAMED_PRODUCER_HOST)
+         path: /producer (override via BEESTREAMED_PRODUCER_PATH)
+         key:  ref      (override via BEESTREAMED_PRODUCER_QUERY_KEY)
     """
     ref = (event_ref or "").strip()
     if not ref:
         return ""
 
-    tmpl = (
-        os.getenv("BEESTREAMED_PRODUCER_URL_TEMPLATE", "")
-        or os.getenv("BEESTREAMED_BROADCASTER_URL_TEMPLATE", "")
-        or ""
-    ).strip()
-    if tmpl and "{event_ref}" in tmpl:
-        return tmpl.replace("{event_ref}", ref)
+    client_subdomain = _beestreamed_client_subdomain_sync()
 
-    base = (
-        os.getenv("BEESTREAMED_PRODUCER_BASE", "")
-        or os.getenv("BEESTREAMED_BROADCASTER_BASE", "")
-        or "https://manage.beestreamed.com/producer"
-    ).strip().rstrip("/")
+    # Highest priority: explicit template
+    tmpl = (os.getenv("BEESTREAMED_PRODUCER_URL_TEMPLATE", "") or "").strip()
+    if not tmpl:
+        tmpl = (os.getenv("BEESTREAMED_BROADCASTER_URL_TEMPLATE", "") or "").strip()
+
+    if tmpl:
+        url = tmpl.replace("{event_ref}", ref).replace("{client_subdomain}", client_subdomain)
+        return url
+
+    # Next: explicit base + query key
+    base = (os.getenv("BEESTREAMED_PRODUCER_BASE", "") or "").strip().rstrip("/")
     if not base:
-        return ""
+        base = (os.getenv("BEESTREAMED_BROADCASTER_BASE", "") or "").strip().rstrip("/")
 
-    key = (
-        os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "")
-        or os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "")
-        or "event_ref"
-    ).strip() or "event_ref"
+    if base:
+        base = base.replace("{client_subdomain}", client_subdomain)
+        key = (os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "") or "").strip()
+        if not key:
+            key = (os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "") or "").strip()
+        key = key or "ref"
+        join = "&" if "?" in base else "?"
+        return f"{base}{join}{key}={ref}"
 
-    join = "&" if "?" in base else "?"
-    url = f"{base}{join}{key}={ref}"
+    # Default: BeeStreamed Manage Panel Producer View
+    host = (os.getenv("BEESTREAMED_PRODUCER_HOST", "") or "").strip().rstrip("/") or "https://manage.beestreamed.com"
 
-    # Add common alias keys as well (most servers ignore unknown params).
-    extras: list[str] = []
-    if key != "event_ref":
-        extras.append(f"event_ref={ref}")
-    if key != "id":
-        extras.append(f"id={ref}")
-    if extras:
-        url = url + "&" + "&".join(extras)
+    path = (os.getenv("BEESTREAMED_PRODUCER_PATH", "") or "/producer").strip()
+    if not path.startswith("/"):
+        path = "/" + path
 
+    key = (os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "") or "ref").strip() or "ref"
+    extra = (os.getenv("BEESTREAMED_PRODUCER_QUERY_EXTRA", "") or "").strip()
+
+    url = f"{host}{path}?{key}={ref}"
+    if extra:
+        url = url + "&" + extra.lstrip("&?")
     return url
+
 
 
 @app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
@@ -933,9 +988,9 @@ async def beestreamed_embed_page(event_ref: str):
       class="frame"
       src="{viewer_url}"
       title="Live Stream"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-storage-access-by-user-activation"
       referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
+      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; storage-access"
       allowfullscreen
     ></iframe>
   </body>
@@ -957,7 +1012,7 @@ async def beestreamed_broadcaster_page(event_ref: str):
     if not producer_url:
         raise HTTPException(
             status_code=500,
-            detail="Producer View URL could not be resolved. Configure BEESTREAMED_PRODUCER_URL_TEMPLATE (preferred) or BEESTREAMED_PRODUCER_BASE.",
+            detail="Broadcaster URL could not be resolved. Configure BEESTREAMED_BROADCASTER_URL_TEMPLATE or BEESTREAMED_BROADCASTER_BASE.",
         )
 
     html = f"""<!doctype html>
@@ -989,9 +1044,9 @@ async def beestreamed_broadcaster_page(event_ref: str):
       class="frame"
       src="{producer_url}"
       title="Broadcast"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-storage-access-by-user-activation"
       referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
+      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture; storage-access"
       allowfullscreen
     ></iframe>
   </body>
@@ -1204,7 +1259,7 @@ class BeeStreamedCreateEventRequest(BaseModel):
     avatar: str
     memberId: str
     embedDomain: Optional[str] = None
-    startStream: bool = True
+    startStream: bool = False
 
 
 class BeeStreamedEmbedUrlRequest(BaseModel):
@@ -1281,19 +1336,21 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
             "message": f"Waiting on {resolved_avatar} to start event",
         }
 
-    # Host: ensure the event is scheduled for 'now' and then start the WebRTC stream.
+    # Host: ensure the event is scheduled for 'now' so the producer UI is ready.
+    # Optionally start the WebRTC stream if startStream=True.
     # If BeeStreamed returns a 404 for an existing/stale event_ref, we transparently generate a fresh one,
     # persist it, and retry once.
-    def _start_event(_ref: str) -> None:
+    def _prepare_event(_ref: str) -> None:
         _beestreamed_schedule_now_sync(
             _ref,
             title=f"{resolved_avatar} Live",
             embed_domain=(req.embedDomain or "").strip(),
         )
-        _beestreamed_start_webrtc_sync(_ref)
+        if bool(getattr(req, "startStream", False)):
+            _beestreamed_start_webrtc_sync(_ref)
 
     try:
-        _start_event(event_ref)
+        _prepare_event(event_ref)
     except HTTPException as e:
         if int(getattr(e, "status_code", 0) or 0) == 404:
             if created_in_this_call:
@@ -1301,13 +1358,13 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
                 import time as _time
 
                 _time.sleep(1.0)
-                _start_event(event_ref)
+                _prepare_event(event_ref)
             else:
                 # Stale/invalid event_ref in DB: regenerate, persist, and retry once.
                 event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
                 _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
                 embed_url = f"/stream/beestreamed/embed/{event_ref}"
-                _start_event(event_ref)
+                _prepare_event(event_ref)
         else:
             raise
 
@@ -1331,14 +1388,17 @@ async def beestreamed_start_broadcast(req: BeeStreamedStartEmbedRequest):
     """Host helper: prepare a BeeStreamed event and return a broadcaster iframe URL.
 
     - Uses the same host-gating logic as /stream/beestreamed/start_embed.
-    - Ensures the event exists (host-only), schedules it for "now", and starts the WebRTC stream.
+    - Ensures the event exists (host-only) and schedules it for "now" so the BeeStreamed Producer View is ready.
+    - Does NOT auto-start streaming; the host still clicks "Go Live" inside BeeStreamed.
     - Returns a same-origin wrapper URL (/stream/beestreamed/broadcaster/{event_ref}) suitable for iframing.
 
     Frontend intent:
       - The host can click "Broadcast" and immediately see the BeeStreamed broadcaster UI already pointed at the
-        correct event; they only need to press "Go Live" in the BeeStreamed Producer View.
+        correct event; they only need to press "Start" in the BeeStreamed UI.
     """
-    data = await beestreamed_start_embed(req)
+    # Force startStream=False: the BeeStreamed Producer View should handle "Go Live".
+    req2 = BeeStreamedStartEmbedRequest(**{**req.dict(), "startStream": False})
+    data = await beestreamed_start_embed(req2)
 
     try:
         is_host = bool(data.get("isHost"))

@@ -1838,7 +1838,8 @@ if (liveProvider === "stream") {
 
     // Ask the app server to:
     //  - resolve/create an event_ref for this (brand, avatar)
-    //  - start the WebRTC stream for that event
+    //  - prepare the event for broadcast (host creates and schedules it)
+    //  - streaming starts when the host clicks "Go Live" in the BeeStreamed Producer View
     //  - return an embed URL
     const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
       method: "POST",
@@ -1848,6 +1849,7 @@ if (liveProvider === "stream") {
         avatar: companionName,
         embedDomain,
         memberId: memberId || "",
+        startStream: false,
       }),
     });
 
@@ -2725,6 +2727,7 @@ const speakAssistantReply = useCallback(
           brand: companyName,
           avatar: companionName,
           memberId: memberId || "",
+          startStream: false,
           embedDomain,
         }),
       })
@@ -2851,7 +2854,7 @@ const speakAssistantReply = useCallback(
   // BeeStreamed broadcaster overlay (Host-only)
   // - Fetch the host_member_id for the current companion (no side effects; does NOT start the event).
   // - The "Broadcast" button (rendered only for the host) calls /stream/beestreamed/start_broadcast which
-  //   prepares the event and returns a Producer View iframe URL.
+  //   prepares the event and returns a broadcaster iframe URL.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (liveProvider !== "stream") {
@@ -4615,11 +4618,13 @@ const speakGreetingIfNeeded = useCallback(
     // Force a fresh iOS audio-route prime next time the mic/audio starts (prevents low/silent volume after stop/cancel).
     localTtsUnlockedRef.current = false;
 
-    // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
-    if (liveAvatarActive) {
+    // If Live Avatar is running, stop it too (mic is required in Live Avatar mode).
+    // BeeStreamed: viewers must be able to close ONLY their local embed session (video + STT/TTS)
+    // without stopping the host's stream session.
+    if (liveAvatarActive || (liveProvider === "stream" && (streamEmbedUrl || streamEventRef))) {
       void stopLiveAvatar();
     }
-  }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
+  }, [liveAvatarActive, liveProvider, streamEmbedUrl, streamEventRef, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
   // Stop button handler (explicit user gesture): stop all comms AND immediately
   // re-prime the iOS/Safari audio route so that when the user manually resumes
@@ -4782,6 +4787,11 @@ const speakGreetingIfNeeded = useCallback(
   }, []);
 
   // UI controls (layout-only): reused in multiple locations without changing logic.
+  // BeeStreamed (viewer): allow Stop to close ONLY the viewer's local session (video + STT/TTS),
+  // even if the viewer never enabled the mic. This must not affect the Host stream.
+  const viewerStreamSessionActive = liveProvider === "stream" && !streamCanStart && !!streamEmbedUrl;
+  const stopButtonEnabled = sttEnabled || viewerStreamSessionActive;
+
   const sttControls = (
     <>
       <button
@@ -4810,7 +4820,7 @@ const speakGreetingIfNeeded = useCallback(
       <button
         type="button"
         onClick={handleStopClick}
-        disabled={!sttEnabled}
+        disabled={!stopButtonEnabled}
         title="Stop"
         style={{
           width: 44,
@@ -4819,8 +4829,8 @@ const speakGreetingIfNeeded = useCallback(
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: sttEnabled ? "pointer" : "not-allowed",
-          opacity: sttEnabled ? 1 : 0.45,
+          cursor: stopButtonEnabled ? "pointer" : "not-allowed",
+          opacity: stopButtonEnabled ? 1 : 0.45,
           fontWeight: 700,
         }}
       >
@@ -4842,34 +4852,44 @@ const speakGreetingIfNeeded = useCallback(
     return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
   }, [allowedModes]);
 
+  const hideSetModeInLiveStream =
+    liveProvider === "stream" && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting");
+
+  useEffect(() => {
+    // Requirement: hide Set Mode while in live stream (and force-close the picker if it was open).
+    if (hideSetModeInLiveStream && showModePicker) setShowModePicker(false);
+  }, [hideSetModeInLiveStream, showModePicker]);
+
   const modePillControls = (
     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
       {!showModePicker ? (
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-          <button
-            type="button"
-            onClick={() => {
-              setSetModeFlash(true);
-              window.setTimeout(() => {
-                setShowModePicker(true);
-                setSetModeFlash(false);
-              }, 120);
-            }}
-            style={{
-              padding: "10px 14px",
-              borderRadius: 10,
-              border: "1px solid #111",
-              background: setModeFlash ? "#111" : "#fff",
-              color: setModeFlash ? "#fff" : "#111",
-              cursor: "pointer",
-              fontWeight: 400,
-              whiteSpace: "nowrap",
-              display: "inline-flex",
-              alignItems: "center",
-            }}
-          >
-            Set Mode
-          </button>
+          {!hideSetModeInLiveStream ? (
+            <button
+              type="button"
+              onClick={() => {
+                setSetModeFlash(true);
+                window.setTimeout(() => {
+                  setShowModePicker(true);
+                  setSetModeFlash(false);
+                }, 120);
+              }}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid #111",
+                background: setModeFlash ? "#111" : "#fff",
+                color: setModeFlash ? "#fff" : "#111",
+                cursor: "pointer",
+                fontWeight: 400,
+                whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+              }}
+            >
+              Set Mode
+            </button>
+          ) : null}
 
 
           {showBroadcastButton ? (
@@ -5192,7 +5212,7 @@ const speakGreetingIfNeeded = useCallback(
                   muted={false}
                 />
               )}
-              {avatarStatus !== "connected" ? (
+              {liveProvider !== "stream" && avatarStatus !== "connected" ? (
                 <div
                   style={{
                     position: "absolute",
@@ -5215,6 +5235,36 @@ const speakGreetingIfNeeded = useCallback(
                     ? streamNotice || "Waiting for the host to start…"
                     : avatarStatus === "error"
                     ? "Avatar error"
+                    : null}
+                </div>
+              ) : null}
+
+              {liveProvider === "stream" && avatarStatus !== "connected" ? (
+                <div
+                  style={{
+                    position: "absolute",
+                    left: 10,
+                    top: 10,
+                    padding: "6px 10px",
+                    borderRadius: 999,
+                    background: "rgba(0,0,0,0.55)",
+                    color: "#fff",
+                    fontSize: 12,
+                    maxWidth: "calc(100% - 20px)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    pointerEvents: "none", // allow viewers to click cookie prompts etc inside the iframe
+                  }}
+                >
+                  {avatarStatus === "waiting"
+                    ? streamNotice || "Waiting for the host to start…"
+                    : avatarStatus === "connecting"
+                    ? "Connecting…"
+                    : avatarStatus === "reconnecting"
+                    ? "Reconnecting…"
+                    : avatarStatus === "error"
+                    ? "Stream error"
                     : null}
                 </div>
               ) : null}
@@ -5344,7 +5394,7 @@ const speakGreetingIfNeeded = useCallback(
 	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
 	          ) : null}
 
-          {/* BeeStreamed Producer View overlay (Host-only) */}
+          {/* BeeStreamed UI Broadcaster overlay (Host-only) */}
           {showBroadcastButton && showBroadcasterOverlay ? (
             <div
               style={{
@@ -5360,7 +5410,7 @@ const speakGreetingIfNeeded = useCallback(
               {broadcasterOverlayUrl ? (
                 <iframe
                   src={broadcasterOverlayUrl}
-                  title="BeeStreamed Producer View"
+                  title="BeeStreamed Broadcaster"
                   style={{ width: "100%", height: "100%", border: 0, background: "#fff" }}
                   // Keep navigation inside the frame; BeeStreamed UI needs scripts + camera/mic.
                   sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
