@@ -1605,19 +1605,6 @@ const liveEnabled = useMemo(() => {
   // Viewer-only: treat any active BeeStreamed embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
 
-// Viewer-only: treat the companion's BeeStreamed session as "Live Streaming" when the HOST is live.
-// This is intentionally *global* (not tied to whether the viewer currently has the iframe open),
-// because we must block AI responses for everyone while the host is streaming.
-const viewerLiveStreaming =
-  liveProvider === "stream" &&
-  !streamCanStart &&
-  (beestreamedSessionActive ||
-    (Boolean(streamEmbedUrl || streamEventRef) &&
-      (avatarStatus === "connected" ||
-        avatarStatus === "waiting" ||
-        avatarStatus === "connecting" ||
-        avatarStatus === "reconnecting")));
-
 const cleanupIphoneLiveAvatarAudio = useCallback(() => {
   if (!didIphoneBoostActiveRef.current && !didIphoneAudioCtxRef.current) return;
 
@@ -2817,6 +2804,19 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
     const hid = String(beestreamedHostMemberId || "").trim();
     return Boolean(mid && hid && mid === hid);
   }, [memberId, beestreamedHostMemberId]);
+  // Viewer-only: treat the companion's BeeStreamed session as "Live Streaming" when the HOST is live.
+  // This is intentionally *global* (not tied to whether the viewer currently has the iframe open),
+  // because we must block AI responses for everyone while the host is streaming.
+  const viewerLiveStreaming =
+    liveProvider === "stream" &&
+    !streamCanStart &&
+    (beestreamedSessionActive ||
+      (Boolean(streamEmbedUrl || streamEventRef) &&
+        (avatarStatus === "connected" ||
+          avatarStatus === "waiting" ||
+          avatarStatus === "connecting" ||
+          avatarStatus === "reconnecting")));
+
 
   const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
   const [broadcasterOverlayUrl, setBroadcasterOverlayUrl] = useState<string>("");
