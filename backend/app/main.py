@@ -517,10 +517,12 @@ def _load_companion_mappings_sync() -> None:
             table = table_names[0]
 
         if not table:
+            # No tables found — keep mappings empty.
             print(f"[mappings] WARNING: mapping DB found at {db_path} but contains no tables.")
             _COMPANION_MAPPINGS = {}
             _COMPANION_MAPPINGS_LOADED_AT = time.time()
-            _COMPANION_MAPPINGS_SOURCE = f"{db_path}:{table_name_for_source}"
+            # Include an empty table name so downstream persistence logic can still parse the source.
+            _COMPANION_MAPPINGS_SOURCE = f"{db_path}:"
             return
 
         # Quote the table name to safely handle names with special characters.
@@ -570,7 +572,8 @@ def _load_companion_mappings_sync() -> None:
 
     _COMPANION_MAPPINGS = d
     _COMPANION_MAPPINGS_LOADED_AT = time.time()
-    _COMPANION_MAPPINGS_SOURCE = db_path
+    # Persist the resolved table name in the source string so we can update the correct table later.
+    _COMPANION_MAPPINGS_SOURCE = f"{db_path}:{table_name_for_source}"
     print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path} (table={table_name_for_source})")
 
 
@@ -815,46 +818,38 @@ DULCE_HOST_MEMBER_ID_FALLBACK = "1dc3fe06-c351-4678-8fe4-6a4b1350c556"
 def _beestreamed_api_base() -> str:
     return (os.getenv("BEESTREAMED_API_BASE", "") or "https://api.beestreamed.com").strip().rstrip("/")
 
-def _beestreamed_public_event_url(event_ref: str, embed: str | None = None) -> str:
-    """BeeStreamed public event page (embeddable viewer page).
-
-    Args:
-      event_ref: BeeStreamed event reference (id)
-      embed: optional BeeStreamed embed mode (e.g. "player"). When provided, appended as &embed=<mode>.
-    """
+def _beestreamed_public_event_url(event_ref: str) -> str:
+    # BeeStreamed public event page (works as an embeddable viewer page in an iframe).
     base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
-    url = f"{base}?id={event_ref}"
-    mode = (embed or "").strip()
-    if mode:
-        url = url + f"&embed={mode}"
-    return url
+    return f"{base}?id={event_ref}"
+
 
 def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
     """Return the BeeStreamed **Producer View** (broadcaster UI) URL for an event_ref.
 
-    Why this is configurable:
-      - The BeeStreamed API documentation focuses on API endpoints and does not currently document a public,
-        embeddable "Producer View" URL.
-      - Depending on account setup, the Producer View may live under different routes/domains.
+    Notes:
+      - The Producer View appears to live under `manage.beestreamed.com/producer` and commonly accepts
+        `ref=<event_ref>` (observed) as well as `event_ref` / `id` on some deployments.
+      - BeeStreamed may block embedding of the manage UI (X-Frame-Options / CSP). When that happens, the iframe
+        will show "refused to connect". The wrapper still remains useful to allow pop-outs to a new tab.
 
     Resolution order:
       1) BEESTREAMED_PRODUCER_URL_TEMPLATE (or legacy BEESTREAMED_BROADCASTER_URL_TEMPLATE)
            - Must contain the placeholder "{event_ref}"
            - Example:
-               https://manage.beestreamed.com/producer?event_ref={event_ref}
+               https://manage.beestreamed.com/producer?ref={event_ref}
 
       2) BEESTREAMED_PRODUCER_BASE (or legacy BEESTREAMED_BROADCASTER_BASE)
          + BEESTREAMED_PRODUCER_QUERY_KEY (or legacy BEESTREAMED_BROADCASTER_QUERY_KEY)
            - We append the event_ref as a query parameter.
            - Default base: https://manage.beestreamed.com/producer
-           - Default key:  event_ref
+           - Default key:  ref
 
       3) If nothing is configured, we fall back to:
-           https://manage.beestreamed.com/producer?event_ref=<event_ref>&id=<event_ref>
+           https://manage.beestreamed.com/producer?ref=<event_ref>&event_ref=<event_ref>&id=<event_ref>
 
     Compatibility note:
-      - We include both "event_ref" and "id" query parameters (when they are not the configured primary key)
-        to maximize compatibility across BeeStreamed UI implementations.
+      - We include multiple common keys (`ref`, `event_ref`, `id`) to maximize compatibility.
     """
     ref = (event_ref or "").strip()
     if not ref:
@@ -871,24 +866,24 @@ def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
     base = (
         os.getenv("BEESTREAMED_PRODUCER_BASE", "")
         or os.getenv("BEESTREAMED_BROADCASTER_BASE", "")
-        or ""
+        or "https://manage.beestreamed.com/producer"
     ).strip().rstrip("/")
     if not base:
-        # Fallback (auth-free + iframe-friendly): show the public event page in "full" mode.
-        # This keeps the broadcaster overlay from duplicating the viewer *player-only* embed.
-        return _beestreamed_public_event_url(ref)
+        return ""
 
     key = (
         os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "")
         or os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "")
-        or "event_ref"
-    ).strip() or "event_ref"
+        or "ref"
+    ).strip() or "ref"
 
     join = "&" if "?" in base else "?"
     url = f"{base}{join}{key}={ref}"
 
     # Add common alias keys as well (most servers ignore unknown params).
     extras: list[str] = []
+    if key != "ref":
+        extras.append(f"ref={ref}")
     if key != "event_ref":
         extras.append(f"event_ref={ref}")
     if key != "id":
@@ -900,7 +895,7 @@ def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
 
 
 @app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
-async def beestreamed_embed_page(event_ref: str, embed: str | None = None):
+async def beestreamed_embed_page(event_ref: str):
     """Render a BeeStreamed event inside a sandboxed iframe.
 
     Why this exists:
@@ -912,13 +907,7 @@ async def beestreamed_embed_page(event_ref: str, embed: str | None = None):
     if not event_ref:
         raise HTTPException(status_code=400, detail="event_ref is required")
 
-    # Viewer embed: default to BeeStreamed's "player" embed mode to avoid duplicating full UI and
-    # to reduce cookie/consent friction in embedded contexts. This preserves the v2 wrapper/iframe logic.
-    mode = (embed or os.getenv("BEESTREAMED_VIEWER_EMBED_MODE", "") or "player").strip()
-    if mode.lower() in ("", "none", "full"):
-        viewer_url = _beestreamed_public_event_url(event_ref)
-    else:
-        viewer_url = _beestreamed_public_event_url(event_ref, embed=mode)
+    viewer_url = _beestreamed_public_event_url(event_ref)
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -1005,7 +994,7 @@ async def beestreamed_broadcaster_page(event_ref: str):
       class="frame"
       src="{producer_url}"
       title="Broadcast"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-storage-access-by-user-activation"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-storage-access-by-user-activation"
       referrerpolicy="no-referrer-when-downgrade"
       allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture; storage-access"
       allowfullscreen
@@ -1140,7 +1129,19 @@ def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str,
     return host
 
 def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> bool:
-    """Try to persist event_ref into the companion_mappings SQLite DB (if writable). Always updates in-memory mapping."""
+    """Persist event_ref into the **same SQLite table** we loaded mappings from.
+
+    Why this exists:
+      - Some deployments ship the mapping DB as `voice_video_mappings.sqlite3` with a table named
+        `voice_video_mappings` (not `companion_mappings`).
+      - The original v2 implementation only updated `companion_mappings`, which meant `event_ref`
+        was never saved for those environments.
+
+    Behavior:
+      - Always updates the in-memory mapping for this process.
+      - Best-effort tries to update the backing SQLite DB if it exists and is writable.
+      - Detects the mapping table name and relevant columns dynamically.
+    """
     b = (brand or "").strip()
     a = (avatar or "").strip()
     e = (event_ref or "").strip()
@@ -1155,39 +1156,91 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
     except Exception:
         pass
 
-    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    src = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    # Source is stored as "<db_path>:<table_name>" (table name may be empty)
+    if ":" in src:
+        db_path, table_hint = src.split(":", 1)
+        db_path, table_hint = db_path.strip(), (table_hint or "").strip()
+    else:
+        db_path, table_hint = src.strip(), ""
+
     if not db_path or not os.path.exists(db_path):
         return False
+
+    def _pick_col(keys_lc: Dict[str, str], *candidates: str) -> str:
+        for c in candidates:
+            k = keys_lc.get(str(c).lower())
+            if k:
+                return k
+        return ""
 
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute("PRAGMA table_info(companion_mappings)")
-        cols = [str(r[1] or "").strip() for r in cur.fetchall()]
-        cols_l = [c.lower() for c in cols]
 
-        # Ensure event_ref column exists
-        if "event_ref" not in cols_l:
+        # Discover tables
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+        tables_lc = {t.lower(): t for t in table_names}
+
+        preferred = [
+            table_hint,
+            "voice_video_mappings",
+            "companion_mappings",
+            "voice_video_mapping",
+            "mappings",
+        ]
+
+        targets: List[str] = []
+        seen: set[str] = set()
+        for cand in preferred:
+            cand = (cand or "").strip()
+            if not cand:
+                continue
+            real = tables_lc.get(cand.lower())
+            if real and real not in seen:
+                targets.append(real)
+                seen.add(real)
+
+        # Fallback: try the first table if nothing matched.
+        if not targets and table_names:
+            targets = [table_names[0]]
+
+        for table in targets:
+            # Column discovery
+            cur.execute(f'PRAGMA table_info("{table}")')
+            cols = [str(r[1] or "").strip() for r in cur.fetchall()]
+            keys_lc = {c.lower(): c for c in cols if c}
+
+            brand_col = _pick_col(keys_lc, "brand", "rebranding", "company", "brand_id")
+            avatar_col = _pick_col(keys_lc, "avatar", "companion", "first_name", "firstname")
+            if not brand_col or not avatar_col:
+                continue
+
+            event_col = _pick_col(keys_lc, "event_ref", "eventref", "event_ref ", "event")
+            if not event_col:
+                # Try adding event_ref column if possible.
+                try:
+                    cur.execute(f'ALTER TABLE "{table}" ADD COLUMN event_ref TEXT')
+                    conn.commit()
+                    event_col = "event_ref"
+                except Exception:
+                    # Read-only DB or ALTER not allowed.
+                    continue
+
+            cur.execute(
+                f'UPDATE "{table}" SET "{event_col}" = ? WHERE lower("{brand_col}") = lower(?) AND lower("{avatar_col}") = lower(?)',
+                (e, b, a),
+            )
+            conn.commit()
             try:
-                cur.execute("ALTER TABLE companion_mappings ADD COLUMN event_ref TEXT")
-                conn.commit()
-                cols_l.append("event_ref")
+                if int(cur.rowcount or 0) > 0:
+                    return True
             except Exception:
-                # read-only DB or unsupported ALTER; give up persistence but keep in-memory update
-                return False
+                # Some sqlite drivers may not set rowcount reliably. If we got here without error, accept.
+                return True
 
-        # Determine key columns
-        brand_col = "brand" if "brand" in cols_l else ("brand_id" if "brand_id" in cols_l else "")
-        avatar_col = "avatar" if "avatar" in cols_l else ("companion" if "companion" in cols_l else "")
-        if not brand_col or not avatar_col:
-            return False
-
-        cur.execute(
-            f"UPDATE companion_mappings SET event_ref = ? WHERE lower({brand_col}) = lower(?) AND lower({avatar_col}) = lower(?)",
-            (e, b, a),
-        )
-        conn.commit()
-        return True
+        return False
     except Exception:
         return False
     finally:

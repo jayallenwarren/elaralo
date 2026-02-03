@@ -1872,6 +1872,12 @@ if (!embedUrl && eventRef) {
 if (!embedUrl && canStart) {
   throw new Error("BeeStreamed did not return an embedUrl/eventRef.");
 }
+// Viewer UX: use BeeStreamed's player-only embed to avoid interactive UI issues (cookies/consent) in iframes.
+// We pass this hint to our *wrapper* page, which then appends &embed=player to the BeeStreamed URL.
+if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
+  embedUrl += (embedUrl.includes("?") ? "&" : "?") + "embed=player";
+}
+
 setStreamEventRef(eventRef);
     setStreamEmbedUrl(embedUrl);
 
@@ -2735,6 +2741,12 @@ const speakAssistantReply = useCallback(
           const eventRef = String(data?.eventRef || "").trim();
           let embedUrl = String(data?.embedUrl || "").trim();
           if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
+const canStart = !!data?.canStart;
+// Viewer UX: prefer player-only embed inside iframes.
+if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
+  embedUrl += (embedUrl.includes("?") ? "&" : "?") + "embed=player";
+}
+
 
           // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
           if (embedUrl) {
@@ -4628,13 +4640,19 @@ const speakGreetingIfNeeded = useCallback(
     try {
       stopHandsFreeSTT();
     } catch (e) {}
+// Viewer-only (Live Stream): enable Stop to close the embedded player even when mic/STT isn't running.
+// This does NOT affect the underlying stream session because stopLiveAvatar only calls stop_embed for the host.
+if (liveProvider === "stream" && !streamCanStart && (streamEmbedUrl || streamEventRef)) {
+  void stopLiveAvatar();
+}
+
 
     // Re-assert boosted audio routing and nudge audio session on the same user gesture.
     try { boostAllTtsVolumes(); } catch (e) {}
     try { void nudgeAudioSession(); } catch (e) {}
     try { primeLocalTtsAudio(true); } catch (e) {}
     try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, streamEmbedUrl, streamEventRef, stopLiveAvatar]);
 
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
@@ -4782,7 +4800,19 @@ const speakGreetingIfNeeded = useCallback(
   }, []);
 
   // UI controls (layout-only): reused in multiple locations without changing logic.
-  const sttControls = (
+// Viewer requirement: in Live Stream mode, the Stop button should allow a viewer to close *their own*
+// embedded player (and halt any STT/TTS) without affecting the host's stream session.
+const viewerCanStopStream =
+  liveProvider === "stream" &&
+  !streamCanStart &&
+  !!streamEmbedUrl &&
+  (avatarStatus === "connected" ||
+    avatarStatus === "waiting" ||
+    avatarStatus === "connecting" ||
+    avatarStatus === "reconnecting");
+
+const sttControls = (
+
     <>
       <button
         type="button"
@@ -4810,7 +4840,7 @@ const speakGreetingIfNeeded = useCallback(
       <button
         type="button"
         onClick={handleStopClick}
-        disabled={!sttEnabled}
+        disabled={!(sttEnabled || viewerCanStopStream)}
         title="Stop"
         style={{
           width: 44,
@@ -4819,8 +4849,8 @@ const speakGreetingIfNeeded = useCallback(
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: sttEnabled ? "pointer" : "not-allowed",
-          opacity: sttEnabled ? 1 : 0.45,
+          cursor: (sttEnabled || viewerCanStopStream) ? "pointer" : "not-allowed",
+          opacity: (sttEnabled || viewerCanStopStream) ? 1 : 0.45,
           fontWeight: 700,
         }}
       >
@@ -4840,12 +4870,28 @@ const speakGreetingIfNeeded = useCallback(
     // Requirement: show Upgrade whenever Friend and/or Romantic pills are available,
     // except when Intimate (18+) is available (no further upgrade path).
     return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
-  }, [allowedModes]);
+}, [allowedModes]);
 
-  const modePillControls = (
+// Hide "Set Mode" while the Live Stream UI is active (host + viewer).
+// Requirement: "Please hide the Set Mode button when in live stream."
+const hideSetModeInStream =
+  liveProvider === "stream" &&
+  (avatarStatus === "connecting" ||
+    avatarStatus === "connected" ||
+    avatarStatus === "reconnecting" ||
+    avatarStatus === "waiting");
+
+// If the picker is open and we enter live stream state, close it.
+useEffect(() => {
+  if (hideSetModeInStream && showModePicker) setShowModePicker(false);
+}, [hideSetModeInStream, showModePicker]);
+
+const modePillControls = (
+
     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
       {!showModePicker ? (
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>{!hideSetModeInStream ? (
+
           <button
             type="button"
             onClick={() => {
@@ -4870,6 +4916,7 @@ const speakGreetingIfNeeded = useCallback(
           >
             Set Mode
           </button>
+) : null}
 
 
           {showBroadcastButton ? (
@@ -5161,7 +5208,7 @@ const speakGreetingIfNeeded = useCallback(
         }}
       >
         {showAvatarFrame ? (
-          <div style={{ flex: "1 1 0", minWidth: 260, height: conversationHeight }}>
+          <div style={{ flex: (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "2 1 0" : "1 1 0", minWidth: 260, height: conversationHeight }}>
             <div
               style={{
                 border: "1px solid #e5e5e5",
@@ -5205,6 +5252,7 @@ const speakGreetingIfNeeded = useCallback(
                     background: "rgba(0,0,0,0.25)",
                     padding: 12,
                     textAlign: "center",
+                    pointerEvents: "none",
                   }}
                 >
                   {avatarStatus === "connecting"
@@ -5224,7 +5272,7 @@ const speakGreetingIfNeeded = useCallback(
 
         <div
           style={{
-            flex: showAvatarFrame ? "2 1 0" : "1 1 0",
+            flex: showAvatarFrame ? ((liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
             minWidth: 280,
             height: conversationHeight,
             display: "flex",
@@ -5363,9 +5411,9 @@ const speakGreetingIfNeeded = useCallback(
                   title="BeeStreamed Producer View"
                   style={{ width: "100%", height: "100%", border: 0, background: "#fff" }}
                   // Keep navigation inside the frame; BeeStreamed UI needs scripts + camera/mic.
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-storage-access-by-user-activation"
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
                   referrerPolicy="no-referrer-when-downgrade"
-                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture; storage-access"
+                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
                   allowFullScreen
                 />
               ) : (
