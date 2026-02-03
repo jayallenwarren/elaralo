@@ -1602,6 +1602,22 @@ const liveEnabled = useMemo(() => {
   const conversationHeight = 520;
   const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (Boolean(phase1AvatarMedia) && avatarStatus !== "idle");
 
+  // Viewer-only: treat any active BeeStreamed embed as "Live Streaming".
+  // Used to hide controls that must not be available to viewers during the stream.
+
+// Viewer-only: treat the companion's BeeStreamed session as "Live Streaming" when the HOST is live.
+// This is intentionally *global* (not tied to whether the viewer currently has the iframe open),
+// because we must block AI responses for everyone while the host is streaming.
+const viewerLiveStreaming =
+  liveProvider === "stream" &&
+  !streamCanStart &&
+  (beestreamedSessionActive ||
+    (Boolean(streamEmbedUrl || streamEventRef) &&
+      (avatarStatus === "connected" ||
+        avatarStatus === "waiting" ||
+        avatarStatus === "connecting" ||
+        avatarStatus === "reconnecting")));
+
 const cleanupIphoneLiveAvatarAudio = useCallback(() => {
   if (!didIphoneBoostActiveRef.current && !didIphoneAudioCtxRef.current) return;
 
@@ -1749,6 +1765,8 @@ const stopLiveAvatar = useCallback(async () => {
       setStreamEventRef("");
       setStreamCanStart(false);
       setStreamNotice("");
+      // Host stop -> mark global session inactive immediately (poll will also confirm)
+      if (streamCanStart) setBeestreamedSessionActive(false);
     }
   }
 
@@ -1882,6 +1900,9 @@ setStreamEventRef(eventRef);
     setStreamEmbedUrl(embedUrl);
 
     setStreamCanStart(canStart);
+
+    // Host started a BeeStreamed session -> mark global session active immediately (poll will also confirm)
+    if (canStart) setBeestreamedSessionActive(true);
 
     if (!canStart) {
       setStreamNotice(
@@ -2790,6 +2811,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   // - "host" is determined by comparing the current Wix memberId to the BeeStreamed host_member_id
   //   stored in voice_video_mappings.sqlite3 (exposed via /stream/beestreamed/status).
   const [beestreamedHostMemberId, setBeestreamedHostMemberId] = useState<string>("");
+  const [beestreamedSessionActive, setBeestreamedSessionActive] = useState<boolean>(false);
   const isBeeStreamedHost = useMemo(() => {
     const mid = String(memberId || "").trim();
     const hid = String(beestreamedHostMemberId || "").trim();
@@ -2800,6 +2822,27 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   const [broadcasterOverlayUrl, setBroadcasterOverlayUrl] = useState<string>("");
   const [broadcastPreparing, setBroadcastPreparing] = useState<boolean>(false);
   const [broadcastError, setBroadcastError] = useState<string>("");
+
+
+// BeeStreamed "live session" gating (global per companion)
+// - While the host is streaming, we must NOT generate AI responses for anyone.
+// - We queue user messages locally and flush them once the host stops streaming.
+const streamDeferredQueueRef = useRef<Array<{ text: string; state: SessionState; queuedAt: number; noticeIndex: number }>>([]);
+const streamDeferredFlushInFlightRef = useRef<boolean>(false);
+const streamPreSessionHistoryRef = useRef<Msg[] | null>(null);
+const prevBeeStreamedSessionActiveRef = useRef<boolean>(false);
+
+// Keep refs to the latest state for async flush logic (avoids stale closures).
+const messagesRef = useRef<Msg[]>([]);
+useEffect(() => {
+  messagesRef.current = messages;
+}, [messages]);
+
+const sessionStateRef = useRef<SessionState>(sessionState);
+useEffect(() => {
+  sessionStateRef.current = sessionState;
+}, [sessionState]);
+
 
   const showBroadcastButton = useMemo(() => {
     return liveProvider === "stream" && isBeeStreamedHost;
@@ -2859,57 +2902,82 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   }, [upgradeUrl]);
 
 
-  // ---------------------------------------------------------------------------
-  // BeeStreamed broadcaster overlay (Host-only)
-  // - Fetch the host_member_id for the current companion (no side effects; does NOT start the event).
-  // - The "Broadcast" button (rendered only for the host) calls /stream/beestreamed/start_broadcast which
-  //   prepares the event and returns a Producer View iframe URL.
-  // ---------------------------------------------------------------------------
-  useEffect(() => {
-    if (liveProvider !== "stream") {
-      setBeestreamedHostMemberId("");
-      return;
-    }
-    if (!companyName || !companionName) {
-      setBeestreamedHostMemberId("");
-      return;
-    }
 
-    let cancelled = false;
+// ---------------------------------------------------------------------------
+// BeeStreamed broadcaster overlay (Host-only) + session status (Host + Viewer)
+// - Fetch the host_member_id + current sessionActive flag for the current companion.
+// - Polls so viewers can detect when the host stops streaming and we can flush any queued messages.
+// ---------------------------------------------------------------------------
+useEffect(() => {
+  if (liveProvider !== "stream") {
+    setBeestreamedHostMemberId("");
+    setBeestreamedSessionActive(false);
+    return;
+  }
+  if (!companyName || !companionName) {
+    setBeestreamedHostMemberId("");
+    setBeestreamedSessionActive(false);
+    return;
+  }
 
-    (async () => {
-      try {
-        const url = `${API_BASE}/stream/beestreamed/status?brand=${encodeURIComponent(
-          companyName,
-        )}&avatar=${encodeURIComponent(companionName)}`;
+  let cancelled = false;
+  let timer: any = null;
 
-        const res = await fetch(url);
-        const data: any = await res.json().catch(() => ({}));
-        if (cancelled) return;
+  const fetchStatus = async () => {
+    try {
+      const url = `${API_BASE}/stream/beestreamed/status?brand=${encodeURIComponent(
+        companyName,
+      )}&avatar=${encodeURIComponent(companionName)}`;
 
-        if (!res.ok || !data?.ok) {
-          setBeestreamedHostMemberId("");
-          return;
-        }
+      const res = await fetch(url);
+      const data: any = await res.json().catch(() => ({}));
+      if (cancelled) return;
 
-        setBeestreamedHostMemberId(String(data?.hostMemberId || "").trim());
-      } catch (e) {
-        if (!cancelled) setBeestreamedHostMemberId("");
+      if (!res.ok || !data?.ok) {
+        setBeestreamedHostMemberId("");
+        setBeestreamedSessionActive(false);
+        return;
       }
-    })();
 
-    return () => {
-      cancelled = true;
-    };
-  }, [API_BASE, companyName, companionName, liveProvider]);
+      setBeestreamedHostMemberId(String(data?.hostMemberId || "").trim());
+      setBeestreamedSessionActive(Boolean(data?.sessionActive));
+    } catch (e) {
+      if (cancelled) return;
+      setBeestreamedHostMemberId("");
+      setBeestreamedSessionActive(false);
+    }
+  };
+
+  // initial
+  void fetchStatus();
+
+  // poll
+  timer = window.setInterval(() => {
+    void fetchStatus();
+  }, 2500);
+
+  return () => {
+    cancelled = true;
+    try {
+      if (timer) window.clearInterval(timer);
+    } catch (e) {}
+  };
+}, [API_BASE, companyName, companionName, liveProvider]);
 
   // Reset broadcaster UI when switching companion / provider.
-  useEffect(() => {
-    setShowBroadcasterOverlay(false);
-    setBroadcasterOverlayUrl("");
-    setBroadcastPreparing(false);
-    setBroadcastError("");
-  }, [companyName, companionName, liveProvider]);
+  
+useEffect(() => {
+  setShowBroadcasterOverlay(false);
+  setBroadcasterOverlayUrl("");
+  setBroadcastPreparing(false);
+  setBroadcastError("");
+  setBeestreamedSessionActive(false);
+
+  // Reset any queued user messages when switching companion/provider.
+  streamDeferredQueueRef.current = [];
+  streamPreSessionHistoryRef.current = null;
+  prevBeeStreamedSessionActiveRef.current = false;
+}, [companyName, companionName, liveProvider]);
 
   // If host-eligibility changes (e.g., user logs out), force-hide the overlay.
   useEffect(() => {
@@ -3447,6 +3515,25 @@ const rebrandingKeyForBackend = hasEntitledPlan
     setMessages((prev) => [...prev, { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` }]);
   }
 
+
+const isLiveSessionNoticeText = (s: string) => {
+  const t = String(s || "").toLowerCase();
+  // Back-compat: earlier builds used "Streaming live right now..."
+  if (t.includes("streaming live right now") && t.includes("will respond")) return true;
+  if (t.includes("in a live session") && t.includes("will respond")) return true;
+  return false;
+};
+
+const filterMessagesForBackend = (msgs: Msg[]): Msg[] => {
+  // Never send our local "live session" notice bubbles to the backend.
+  // They are UI-only and can confuse the model if included as conversation context.
+  return (msgs || []).filter((m) => {
+    if (!m) return false;
+    if (m.role === "assistant" && isLiveSessionNoticeText(String(m.content || ""))) return false;
+    return true;
+  });
+};
+
   async function send(textOverride?: string, stateOverride?: Partial<SessionState>) {
     if (loading) return;
 
@@ -3502,6 +3589,48 @@ const rebrandingKeyForBackend = hasEntitledPlan
     const userMsg: Msg = { role: "user", content: outgoingText };
     const nextMessages: Msg[] = [...messages, userMsg];
 
+
+// ---------------------------------------------------------------------
+// Live Stream rule (BeeStreamed):
+// As soon as the HOST hits Play, BeeStreamed sessionActive becomes true.
+// While sessionActive is true, the AI companion must NOT generate responses.
+//
+// Behavior:
+//   - Everyone: we queue the user's message locally (no /chat call).
+//   - Visitors/members NOT currently inside the live stream session (no stream iframe open):
+//       show a deterministic notice message.
+//   - Members currently inside the live stream session:
+//       allow them to type freely (no notice), but still queue messages.
+//   - When the host stops streaming (sessionActive -> false): flush queued messages.
+// ---------------------------------------------------------------------
+const streamSessionActive = liveProvider === "stream" && beestreamedSessionActive;
+const userInStreamSession = liveProvider === "stream" && Boolean(streamEmbedUrl || streamEventRef);
+
+if (streamSessionActive) {
+  const who = (companionName || "This companion").trim() || "This companion";
+  const notice = `${who} is in a live session now but will respond once the session concludes.`;
+
+  // Capture the pre-stream chat history snapshot once (used when flushing queued messages).
+  if (!streamPreSessionHistoryRef.current) {
+    streamPreSessionHistoryRef.current = filterMessagesForBackend(messages);
+  }
+
+  // Queue the message so we can respond automatically when the host stops streaming.
+  const queuedState: SessionState = { ...nextState, ...(stateOverride || {}) };
+  const noticeIndex = userInStreamSession ? -1 : nextMessages.length;
+  streamDeferredQueueRef.current.push({
+    text: outgoingText,
+    state: queuedState,
+    queuedAt: Date.now(),
+    noticeIndex,
+  });
+
+  // In-session members type freely (no notice). Out-of-session visitors/members get the notice.
+  setMessages(userInStreamSession ? nextMessages : [...nextMessages, { role: "assistant", content: notice }]);
+  setInput("");
+  return;
+}
+
     // If speech-to-text "hands-free" mode is enabled, pause recognition while we send
     // and while the avatar speaks. We'll auto-resume after speaking finishes.
     const resumeSttAfter = sttEnabledRef.current;
@@ -3520,7 +3649,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
 
     try {
       const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
-      const data = await callChat(nextMessages, sendState);
+      const data = await callChat(filterMessagesForBackend(nextMessages), sendState);
 
       // If the user hit "Clear Messages" while we were waiting on the response,
       // ignore this result and do not append it to a cleared chat.
@@ -3593,7 +3722,19 @@ const rebrandingKeyForBackend = hasEntitledPlan
       const commitAssistantMessage = () => {
         if (assistantCommitted) return;
         assistantCommitted = true;
-        setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
+        // Replace the queued "live session" notice bubble in-place so chat ordering stays coherent.
+const noticeIndex = Number((item as any)?.noticeIndex ?? -1);
+setMessages((prev) => {
+  if (!Array.isArray(prev)) return prev as any;
+  if (noticeIndex < 0 || noticeIndex >= prev.length) {
+    // Fallback: append if the index is missing/out-of-range (should be rare).
+    return [...prev, { role: "assistant", content: replyText }];
+  }
+  const next = prev.slice();
+  next[noticeIndex] = { role: "assistant", content: replyText };
+  return next;
+});
+
       };
 
       // Guard against STT feedback: ignore any recognition results until after the avatar finishes speaking.
@@ -3633,7 +3774,8 @@ const rebrandingKeyForBackend = hasEntitledPlan
 
       const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
 
-      const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
+      // Prefer the DB-mapped ElevenLabs voice when present (fixes Dulce voice fallback).
+      const voiceId = ((companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey));
 
       const canLiveAvatarSpeak =
         avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
@@ -3680,6 +3822,139 @@ const rebrandingKeyForBackend = hasEntitledPlan
   useEffect(() => {
     sendRef.current = send;
   }, [send]);
+
+
+// ---------------------------------------------------------------------
+// Flush queued viewer/host messages once the host stops streaming.
+// This keeps the "no AI responses while live" rule, while still responding later.
+// ---------------------------------------------------------------------
+const flushQueuedStreamMessages = useCallback(async () => {
+  if (streamDeferredFlushInFlightRef.current) return;
+  if (!streamDeferredQueueRef.current.length) return;
+
+  // If the user clears messages mid-flight, we invalidate any in-progress flush.
+  const epochAtStart = clearEpochRef.current;
+
+  streamDeferredFlushInFlightRef.current = true;
+  setLoading(true);
+
+  try {
+    // Start from the chat history snapshot taken when the stream session started.
+    // Fall back to current messages filtered (should be rare).
+    let history: Msg[] = streamPreSessionHistoryRef.current
+      ? [...streamPreSessionHistoryRef.current]
+      : filterMessagesForBackend(messagesRef.current || []);
+
+    // Use the latest session state at flush time, then allow server updates to merge in.
+    let workingState: SessionState = { ...(sessionStateRef.current as any) };
+
+    // Process in FIFO order.
+    while (streamDeferredQueueRef.current.length) {
+      if (epochAtStart !== clearEpochRef.current) return;
+
+      const item = streamDeferredQueueRef.current[0];
+      const userMsg: Msg = { role: "user", content: String(item?.text || "").trim() };
+      if (!userMsg.content) {
+        streamDeferredQueueRef.current.shift();
+        continue;
+      }
+
+      const callMsgs: Msg[] = [...history, userMsg];
+
+      const data = await callChat(callMsgs, item?.state ? (item.state as any) : (workingState as any));
+
+      if (epochAtStart !== clearEpochRef.current) return;
+
+      // status from backend (safe/explicit_blocked/explicit_allowed)
+      if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
+        setChatStatus(data.mode);
+      }
+
+      const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
+
+      if (serverSessionState) {
+        const merged: SessionState = { ...(workingState as any), ...(serverSessionState as any) };
+
+        // If backend says blocked, keep pill as intimate AND set pending
+        if (data.mode === "explicit_blocked") {
+          (merged as any).mode = "intimate";
+          (merged as any).pending_consent = "intimate";
+        }
+
+        // If backend says allowed, clear pending
+        if (data.mode === "explicit_allowed" && (merged as any).pending_consent) {
+          (merged as any).pending_consent = null;
+        }
+
+        // Normalize & apply backend mode when present
+        const backendMode = normalizeMode((serverSessionState as any)?.mode ?? (data as any)?.mode);
+        if (backendMode && data.mode !== "explicit_blocked") {
+          (merged as any).mode = backendMode;
+        }
+
+        // If we are not in intimate, never keep the intimate pending flag
+        if ((merged as any).mode !== "intimate" && (merged as any).pending_consent === "intimate") {
+          (merged as any).pending_consent = null;
+        }
+
+        workingState = merged;
+        sessionStateRef.current = merged;
+        setSessionState(merged);
+      } else {
+        // If blocked but session_state missing, still reflect pending
+        if (data.mode === "explicit_blocked") {
+          workingState = { ...(workingState as any), mode: "intimate", pending_consent: "intimate" } as any;
+          sessionStateRef.current = workingState;
+          setSessionState(workingState);
+        }
+
+        // If allowed but session_state missing, clear pending and mark consented
+        if (data.mode === "explicit_allowed") {
+          workingState = { ...(workingState as any), pending_consent: null, explicit_consented: true } as any;
+          sessionStateRef.current = workingState;
+          setSessionState(workingState);
+        }
+      }
+
+      const replyText = String((data as any).reply || "");
+      setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
+
+      // Advance the backend history used for subsequent queued messages
+      history = [...callMsgs, { role: "assistant", content: replyText }];
+
+      // Remove the item only after successful processing
+      streamDeferredQueueRef.current.shift();
+    }
+  } catch (err: any) {
+    if (epochAtStart !== clearEpochRef.current) return;
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
+    ]);
+  } finally {
+    streamPreSessionHistoryRef.current = null;
+    streamDeferredFlushInFlightRef.current = false;
+    setLoading(false);
+  }
+}, [callChat]);
+
+// Detect BeeStreamed session start/stop to capture history + flush queue.
+useEffect(() => {
+  const prev = prevBeeStreamedSessionActiveRef.current;
+  const cur = Boolean(beestreamedSessionActive);
+
+  // When the stream starts (host begins live session), snapshot the current chat history for the flush.
+  if (!prev && cur) {
+    streamPreSessionHistoryRef.current = filterMessagesForBackend(messagesRef.current || []);
+  }
+
+  // When the stream ends, flush queued messages automatically.
+  if (prev && !cur) {
+    void flushQueuedStreamMessages();
+  }
+
+  prevBeeStreamedSessionActiveRef.current = cur;
+}, [beestreamedSessionActive, flushQueuedStreamMessages]);
 
   function clearSttSilenceTimer() {
     if (sttSilenceTimerRef.current) {
@@ -4096,8 +4371,14 @@ const pauseSpeechToText = useCallback(() => {
       const text = getCurrentSttText();
       if (!text) return;
 
-      // Pause BEFORE we send so the assistant doesn't "talk to itself".
-      pauseSpeechToText();
+      const streamSessionActive = liveProvider === "stream" && beestreamedSessionActive;
+
+      // During BeeStreamed sessions we keep STT running so members can keep talking/typing freely.
+      // We still capture/queue messages, but we do NOT pause STT here (prevents iOS/Safari from getting stuck).
+      if (!streamSessionActive) {
+        // Pause BEFORE we send so the assistant doesn't "talk to itself".
+        pauseSpeechToText();
+      }
 
       sttFinalRef.current = "";
       sttInterimRef.current = "";
@@ -4105,7 +4386,7 @@ const pauseSpeechToText = useCallback(() => {
 
       void sendRef.current(text);
     }, 2000);
-  }, [getCurrentSttText, pauseSpeechToText]);
+  }, [getCurrentSttText, pauseSpeechToText, liveProvider, beestreamedSessionActive]);
 
   const requestMicPermission = useCallback(async (): Promise<boolean> => {
     // NOTE: Web Speech API does not reliably prompt on iOS if start() is called
@@ -4407,7 +4688,8 @@ const speakGreetingIfNeeded = useCallback(
     // (Live avatar uses its own configured voice via the DID agent.)
     const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
 
-      const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
+      // Prefer DB-driven voice mapping when available (fixes rebrands like Dulce using the default voice).
+      const voiceId = ((companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey));
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
     const prevIgnore = sttIgnoreUntilRef.current;
@@ -4449,7 +4731,16 @@ const speakGreetingIfNeeded = useCallback(
       } catch (e) {}
     }
   },
-  [companionName, handoffReady, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
+  [
+    companionName,
+    companionKey,
+    companionMapping,
+    handoffReady,
+    pauseSpeechToText,
+    resumeSpeechToText,
+    speakAssistantReply,
+    speakLocalTtsReply,
+  ],
 );
 
   const maybePlayPendingGreeting = useCallback(async () => {
@@ -4640,11 +4931,22 @@ const speakGreetingIfNeeded = useCallback(
     try {
       stopHandsFreeSTT();
     } catch (e) {}
-// Viewer-only (Live Stream): enable Stop to close the embedded player even when mic/STT isn't running.
-// This does NOT affect the underlying stream session because stopLiveAvatar only calls stop_embed for the host.
-if (liveProvider === "stream" && !streamCanStart && (streamEmbedUrl || streamEventRef)) {
-  void stopLiveAvatar();
-}
+
+    // Viewer-only (Live Stream): enable Stop to close the embedded player even when mic/STT isn't running.
+    // IMPORTANT: This must be synchronous on the user gesture on iOS to avoid breaking future TTS routing.
+    // This does NOT affect the underlying stream session because ONLY the host calls stop_embed.
+    if (liveProvider === "stream" && !streamCanStart && (streamEmbedUrl || streamEventRef)) {
+      try {
+        setStreamEmbedUrl("");
+        setStreamEventRef("");
+        setStreamCanStart(false);
+        setStreamNotice("");
+      } catch (e) {}
+      try {
+        setAvatarStatus("idle");
+        setAvatarError(null);
+      } catch (e) {}
+    }
 
 
     // Re-assert boosted audio routing and nudge audio session on the same user gesture.
@@ -4652,7 +4954,7 @@ if (liveProvider === "stream" && !streamCanStart && (streamEmbedUrl || streamEve
     try { void nudgeAudioSession(); } catch (e) {}
     try { primeLocalTtsAudio(true); } catch (e) {}
     try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, streamEmbedUrl, streamEventRef, stopLiveAvatar]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, streamEmbedUrl, streamEventRef]);
 
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
@@ -4872,11 +5174,16 @@ const sttControls = (
     return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
 }, [allowedModes]);
 
-// Hide "Set Mode" while the Live Stream UI is active (host + viewer).
+
+// Hide "Set Mode" while the BeeStreamed live session UI is active (host + viewer).
 // Requirement: "Please hide the Set Mode button when in live stream."
+//
+// IMPORTANT: this is a *global* gate — if the host is currently streaming, Set Mode is hidden
+// even if a viewer has closed the iframe locally.
 const hideSetModeInStream =
   liveProvider === "stream" &&
-  (avatarStatus === "connecting" ||
+  (beestreamedSessionActive ||
+    avatarStatus === "connecting" ||
     avatarStatus === "connected" ||
     avatarStatus === "reconnecting" ||
     avatarStatus === "waiting");
@@ -5308,49 +5615,51 @@ const modePillControls = (
 
           <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
             {/** Input line with mode pills moved to the right (layout-only). */}
-            <button
-              type="button"
-              onClick={requestSaveChatSummary}
-              title="Save"
-              aria-label="Save"
-              style={{
-                width: 44,
-                height: 44,
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : "#fff",
-                cursor: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-                opacity: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-              disabled={liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}
-              >
-              <SaveIcon size={18} />
-            </button>
+            {!viewerLiveStreaming ? (
+              <>
+                <button
+                  type="button"
+                  onClick={requestSaveChatSummary}
+                  title="Save"
+                  aria-label="Save"
+                  style={{
+                    width: 44,
+                    height: 44,
+                    borderRadius: 10,
+                    border: "1px solid #bbb",
+                    background: "#fff",
+                    cursor: "pointer",
+                    opacity: 1,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <SaveIcon size={18} />
+                </button>
 
-            <button
-              type="button"
-              onClick={requestClearMessages}
-              title="Clear"
-              aria-label="Delete"
-              style={{
-                width: 44,
-                height: 44,
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : "#fff",
-                cursor: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-                opacity: (liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-              disabled={liveProvider === "stream" && !streamCanStart && (avatarStatus === "connected" || avatarStatus === "waiting")}
-              >
-              <TrashIcon size={18} />
-            </button>
+                <button
+                  type="button"
+                  onClick={requestClearMessages}
+                  title="Clear"
+                  aria-label="Delete"
+                  style={{
+                    width: 44,
+                    height: 44,
+                    borderRadius: 10,
+                    border: "1px solid #bbb",
+                    background: "#fff",
+                    cursor: "pointer",
+                    opacity: 1,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <TrashIcon size={18} />
+                </button>
+              </>
+            ) : null}
 
             <input
               ref={inputElRef}
@@ -5627,6 +5936,11 @@ const modePillControls = (
               <button
                 type="button"
                 onClick={() => {
+                  // Clear UI + any queued (live-session) messages.
+                  streamDeferredQueueRef.current = [];
+                  streamPreSessionHistoryRef.current = null;
+                  prevBeeStreamedSessionActiveRef.current = false;
+
                   setMessages([]);
                   setInput("");
                   try { if (inputElRef.current) inputElRef.current.value = ""; } catch (e) {}

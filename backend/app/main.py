@@ -447,9 +447,61 @@ _COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _COMPANION_MAPPINGS_LOADED_AT: float | None = None
 _COMPANION_MAPPINGS_SOURCE: str = ""
 
+# BeeStreamed live-session tracking (best-effort, in-memory; resets on API restart)
+_BEE_STREAM_SESSION_ACTIVE: Dict[Tuple[str, str], bool] = {}
+_BEE_STREAM_SESSION_EVENT_REF: Dict[Tuple[str, str], str] = {}
+
+
 
 def _norm_key(s: str) -> str:
-    return (s or "").strip().lower()
+    """Normalize mapping lookup keys.
+
+    The mapping DB is manually edited across rebrands and historically contains
+    inconsistent brand formatting (e.g., "DulceMoon" vs "Dulce Moon").
+    We normalize by:
+      - lowercasing
+      - stripping
+      - removing whitespace and underscores
+
+    IMPORTANT: We intentionally preserve hyphens so composite avatar keys
+    (e.g., "Ashley-Female-...") can still be split on "-" later.
+    """
+    t = (s or "").strip().lower()
+    t = re.sub(r"[\s_]+", "", t)
+    return t
+
+def _stream_session_key(brand: str, avatar: str) -> Tuple[str, str]:
+    """Build a stable key for BeeStreamed live-session tracking."""
+    return (_norm_key(brand), _norm_key(avatar))
+
+
+def _set_stream_session_active(brand: str, avatar: str, active: bool, event_ref: str = "") -> None:
+    """Mark a (brand, avatar) BeeStreamed session as active/inactive (best-effort)."""
+    try:
+        key = _stream_session_key(brand, avatar)
+        _BEE_STREAM_SESSION_ACTIVE[key] = bool(active)
+        if active and event_ref:
+            _BEE_STREAM_SESSION_EVENT_REF[key] = str(event_ref).strip()
+    except Exception:
+        # Never allow session bookkeeping to break API calls
+        pass
+
+
+def _get_stream_session_active(brand: str, avatar: str) -> bool:
+    try:
+        key = _stream_session_key(brand, avatar)
+        return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
+    except Exception:
+        return False
+
+
+def _get_stream_session_event_ref(brand: str, avatar: str) -> str:
+    try:
+        key = _stream_session_key(brand, avatar)
+        return str(_BEE_STREAM_SESSION_EVENT_REF.get(key, "") or "").strip()
+    except Exception:
+        return ""
+
 
 
 def _candidate_mapping_db_paths() -> List[str]:
@@ -1380,6 +1432,8 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
         else:
             raise
 
+    _set_stream_session_active(resolved_brand, resolved_avatar, True, event_ref)
+
     return {
         "ok": True,
         "status": "started",
@@ -1519,13 +1573,23 @@ async def beestreamed_status(brand: str, avatar: str):
     if not mapping:
         raise HTTPException(status_code=404, detail="Companion mapping not found")
 
+    resolved_brand = str(mapping.get("brand") or brand).strip()
+    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
+
     event_ref = str(mapping.get("event_ref") or "").strip()
-    host_id = _resolve_host_member_id(brand, avatar, mapping)
+    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
+
+    session_active = _get_stream_session_active(resolved_brand, resolved_avatar)
+    session_event_ref = _get_stream_session_event_ref(resolved_brand, resolved_avatar)
+
     return {
         "ok": True,
         "eventRef": event_ref,
         "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
         "hostMemberId": host_id,
+        "sessionActive": bool(session_active),
+        "sessionEventRef": session_event_ref,
+
         "companionType": str(mapping.get("companion_type") or "").strip(),
         "live": str(mapping.get("live") or "").strip(),
     }
@@ -1576,6 +1640,10 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
         return {"ok": True, "status": "no_event"}
 
     _beestreamed_stop_webrtc_sync(event_ref)
+
+    # Mark session inactive for global gating (host-only)
+    _set_stream_session_active(resolved_brand, resolved_avatar, False, event_ref)
+
     return {"ok": True, "status": "stopped", "eventRef": event_ref}
 
 
