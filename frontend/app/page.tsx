@@ -3722,18 +3722,7 @@ if (streamSessionActive) {
       const commitAssistantMessage = () => {
         if (assistantCommitted) return;
         assistantCommitted = true;
-        // Replace the queued "live session" notice bubble in-place so chat ordering stays coherent.
-const noticeIndex = Number((item as any)?.noticeIndex ?? -1);
-setMessages((prev) => {
-  if (!Array.isArray(prev)) return prev as any;
-  if (noticeIndex < 0 || noticeIndex >= prev.length) {
-    // Fallback: append if the index is missing/out-of-range (should be rare).
-    return [...prev, { role: "assistant", content: replyText }];
-  }
-  const next = prev.slice();
-  next[noticeIndex] = { role: "assistant", content: replyText };
-  return next;
-});
+        setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
 
       };
 
@@ -3917,7 +3906,20 @@ const flushQueuedStreamMessages = useCallback(async () => {
       }
 
       const replyText = String((data as any).reply || "");
-      setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
+
+      // If this queued message came from an out-of-session user, we rendered a placeholder
+      // notice bubble at noticeIndex. Replace it in-place so chat ordering stays coherent.
+      const noticeIndex = Number((item as any)?.noticeIndex ?? -1);
+      setMessages((prev) => {
+        if (!Array.isArray(prev)) return prev as any;
+        if (noticeIndex >= 0 && noticeIndex < prev.length) {
+          const next = prev.slice();
+          next[noticeIndex] = { role: "assistant", content: replyText };
+          return next;
+        }
+        // Fallback: append if index missing/out-of-range (or in-session member).
+        return [...prev, { role: "assistant", content: replyText }];
+      });
 
       // Advance the backend history used for subsequent queued messages
       history = [...callMsgs, { role: "assistant", content: replyText }];
