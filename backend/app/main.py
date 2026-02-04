@@ -504,6 +504,24 @@ def _get_stream_session_event_ref(brand: str, avatar: str) -> str:
         return ""
 
 
+def _is_stream_session_active_for_event_ref(event_ref: str) -> bool:
+    """True iff the BeeStreamed session has been activated by the host (Play) for this event_ref.
+
+    This is used to ensure that only the Host can *initiate* shared in-stream chat.
+    Viewers may only join the chat room after the Host has started the BeeStreamed session.
+    """
+    ref = (event_ref or "").strip()
+    if not ref:
+        return False
+    try:
+        for key, ev in _BEE_STREAM_SESSION_EVENT_REF.items():
+            if str(ev or "").strip() == ref:
+                return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
+    except Exception:
+        return False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # BeeStreamed in-stream shared chat (Host + joined Viewers)
 #
@@ -630,8 +648,15 @@ def _candidate_mapping_db_paths() -> List[str]:
     env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
     candidates = [
         env_path,
+        # canonical filename (used by older builds)
         os.path.join(base_dir, "voice_video_mappings.sqlite3"),
         os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+        # common alternative filename (some deployments)
+        os.path.join(base_dir, "video_voice_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "video_voice_mappings.sqlite3"),
+        # tolerate historical typo (sqllite)
+        os.path.join(base_dir, "video_voice_mappings.sqllite3"),
+        os.path.join(base_dir, "data", "video_voice_mappings.sqllite3"),
     ]
     # keep unique, preserve order
     out: List[str] = []
@@ -1322,8 +1347,12 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
         return False
 
     # Always update in-memory mapping so this process is consistent.
+    #
+    # IMPORTANT: mapping keys use _norm_key(), which removes whitespace/underscores.
+    # We must use the same normalization here or the in-memory update may miss,
+    # causing a new event to be created on each host Play.
     try:
-        key = (b.lower(), a.lower())
+        key = (_norm_key(b), _norm_key(a))
         if key in _COMPANION_MAPPINGS:
             _COMPANION_MAPPINGS[key]["event_ref"] = e
     except Exception:
@@ -1422,6 +1451,99 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
         except Exception:
             pass
 
+
+
+def _read_persisted_event_ref_best_effort(brand: str, avatar: str) -> str:
+    """Read event_ref from the mapping SQLite DB for (brand, avatar), best-effort.
+
+    This prevents duplicate BeeStreamed events when multiple API workers/instances are running.
+    A worker that did not create the event can still pick up the persisted event_ref and reuse it.
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return ""
+
+    src = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    # Source is stored as "<db_path>:<table_name>" (table name may be empty)
+    if ":" in src:
+        db_path, table_hint = src.split(":", 1)
+        db_path, table_hint = db_path.strip(), (table_hint or "").strip()
+    else:
+        db_path, table_hint = src.strip(), ""
+
+    if not db_path or not os.path.exists(db_path):
+        return ""
+
+    def _pick_col(keys_lc: Dict[str, str], *candidates: str) -> str:
+        for c in candidates:
+            k = keys_lc.get(str(c).lower())
+            if k:
+                return k
+        return ""
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        # Discover tables
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+        tables_lc = {t.lower(): t for t in table_names}
+
+        preferred = [
+            table_hint,
+            "voice_video_mappings",
+            "video_voice_mappings",
+            "companion_mappings",
+            "voice_video_mapping",
+            "mappings",
+        ]
+
+        targets: List[str] = []
+        seen: set[str] = set()
+        for cand in preferred:
+            cand = (cand or "").strip()
+            if not cand:
+                continue
+            real = tables_lc.get(cand.lower())
+            if real and real not in seen:
+                targets.append(real)
+                seen.add(real)
+
+        # Fallback: try the first table if nothing matched.
+        if not targets and table_names:
+            targets = [table_names[0]]
+
+        for table in targets:
+            # Column discovery
+            cur.execute(f'PRAGMA table_info("{table}")')
+            cols = [str(r[1] or "").strip() for r in cur.fetchall()]
+            keys_lc = {c.lower(): c for c in cols if c}
+
+            brand_col = _pick_col(keys_lc, "brand", "rebranding", "company", "brand_id")
+            avatar_col = _pick_col(keys_lc, "avatar", "companion", "first_name", "firstname")
+            event_col = _pick_col(keys_lc, "event_ref", "eventref", "event_ref ", "event")
+            if not brand_col or not avatar_col or not event_col:
+                continue
+
+            cur.execute(
+                f'SELECT "{event_col}" FROM "{table}" WHERE lower("{brand_col}") = lower(?) AND lower("{avatar_col}") = lower(?) LIMIT 1',
+                (b, a),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                return str(row[0]).strip()
+
+        return ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
     avatar: str
@@ -1510,6 +1632,17 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
 
     event_ref = str(mapping.get("event_ref") or "").strip()
     created_in_this_call = False
+
+    # If event_ref is missing in the in-memory cache, it may have been persisted by another
+    # worker/instance. Refresh from SQLite before creating a new BeeStreamed event.
+    if not event_ref:
+        persisted = _read_persisted_event_ref_best_effort(resolved_brand, resolved_avatar)
+        if persisted:
+            event_ref = persisted
+            try:
+                mapping["event_ref"] = persisted
+            except Exception:
+                pass
 
     # Only the host is allowed to create the event_ref automatically.
     if not event_ref and is_host:
@@ -1681,6 +1814,16 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
     # Host path: reuse existing event_ref if present, else create and persist.
     event_ref = str(mapping.get("event_ref") or "").strip()
     created_in_this_call = False
+
+    # Refresh event_ref from SQLite before creating a new event (handles multi-worker/multi-instance).
+    if not event_ref:
+        persisted = _read_persisted_event_ref_best_effort(resolved_brand, resolved_avatar)
+        if persisted:
+            event_ref = persisted
+            try:
+                mapping["event_ref"] = persisted
+            except Exception:
+                pass
     if not event_ref:
         created_in_this_call = True
         event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
@@ -1826,6 +1969,11 @@ async def beestreamed_livechat_send(req: BeeStreamedLiveChatSendRequest):
     if not text:
         return {"ok": True, "status": "empty"}
 
+    # Only the Host can initiate shared in-stream chat. Viewers may only send once the
+    # Host has activated the BeeStreamed session (Host pressed Play).
+    if not _is_stream_session_active_for_event_ref(event_ref):
+        raise HTTPException(status_code=409, detail="Stream session is not active")
+
     member_id = (req.memberId or "").strip() or f"anon:{uuid.uuid4().hex}"
     role = (req.role or "viewer").strip().lower()
     if role not in {"host", "viewer"}:
@@ -1871,6 +2019,22 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
     ref = (event_ref or "").strip()
     if not ref:
         await websocket.close(code=1008)
+        return
+
+    # Only the Host can initiate shared in-stream chat. Reject early join attempts.
+    if not _is_stream_session_active_for_event_ref(ref):
+        try:
+            await websocket.accept()
+        except Exception:
+            pass
+        try:
+            await websocket.send_json({"type": "inactive", "detail": "Stream session is not active"})
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1008)
+        except Exception:
+            pass
         return
 
     qp = websocket.query_params
