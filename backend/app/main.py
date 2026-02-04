@@ -45,106 +45,68 @@ app = FastAPI(title="Elaralo API")
 # ----------------------------
 # CORS
 # ----------------------------
-# CORS_ALLOW_ORIGINS can be:
-#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
-#   - entries with wildcards (e.g. https://*.azurestaticapps.net)
-#   - or a single "*" to allow all (NOT recommended for production)
-cors_env = (
-    os.getenv("CORS_ALLOW_ORIGINS", "")
-    or getattr(settings, "CORS_ALLOW_ORIGINS", None)
-    or ""
-).strip()
-
-# If CORS_ALLOW_ORIGINS is not set, we use a conservative default that supports:
-#   - Your production site (dulcemoon.net)
-#   - Azure Static Web Apps preview/staging domains (*.azurestaticapps.net)
-#   - Local development
+# Strict CORS allow-list (exact origin matches only).
 #
-# You can (and should) override this in production via an App Service env var:
-#   CORS_ALLOW_ORIGINS="https://www.dulcemoon.net,https://dulcemoon.net,https://*.azurestaticapps.net"
+# REQUIRED environment variable:
+#   CORS_ALLOW_ORIGINS
 #
-# NOTE: This default avoids the common "Failed to fetch" / missing Access-Control-Allow-Origin
-# failure when testing from an Azure Static Web Apps generated domain.
-if not cors_env:
-    cors_env = ",".join(
-        [
-            "https://dulcemoon.net",
-            "https://www.dulcemoon.net",
-            "https://*.azurestaticapps.net",
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-        ]
-    )
-    print(f"[CORS] CORS_ALLOW_ORIGINS not set; defaulting to: {cors_env}")
+# Format: comma-separated list of origins, e.g.
+#   https://elaralo.com,https://www.elaralo.com,http://localhost:3000
+#
+# Notes:
+# - Origins must match EXACTLY (scheme + host + optional port). No wildcards.
+# - Trailing slashes are ignored.
+cors_env = os.environ.get("CORS_ALLOW_ORIGINS")
+if cors_env is None:
+    raise RuntimeError("Missing required environment variable: CORS_ALLOW_ORIGINS")
 
-
-def _split_cors_origins(raw: str) -> list[str]:
-    """Split + normalize CORS origins from an env var.
-
-    Supports comma and/or whitespace separation.
-    Removes trailing slashes (browser Origin never includes a trailing slash).
-    De-dupes while preserving order.
-    """
+def _parse_cors_allowlist(raw: str) -> list[str]:
+    raw = (raw or "").strip()
     if not raw:
-        return []
-    tokens = re.split(r"[\s,]+", raw.strip())
-    out: list[str] = []
+        raise RuntimeError("CORS_ALLOW_ORIGINS is empty")
+
+    items: list[str] = []
+    for part in raw.split(","):
+        origin = (part or "").strip().strip('"').strip("'").strip()
+        if not origin:
+            continue
+        # Normalize: remove trailing slash.
+        if origin.endswith("/"):
+            origin = origin[:-1]
+        if chr(42) in origin:
+            raise RuntimeError(
+                f"Invalid origin in CORS_ALLOW_ORIGINS (wildcards not allowed): {origin}"
+            )
+        items.append(origin)
+
+    # De-dupe while preserving order
+    deduped: list[str] = []
     seen: set[str] = set()
-    for t in tokens:
-        if not t:
-            continue
-        t = t.strip()
-        if not t:
-            continue
-        if t != "*" and t.endswith("/"):
-            t = t.rstrip("/")
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
-    return out
+    for o in items:
+        if o not in seen:
+            deduped.append(o)
+            seen.add(o)
 
-raw_items = _split_cors_origins(cors_env)
-allow_all = (len(raw_items) == 1 and raw_items[0] == "*")
+    if not deduped:
+        raise RuntimeError("CORS_ALLOW_ORIGINS parsed to an empty allow-list")
 
-allow_origins: list[str] = []
-allow_origin_regex: str | None = None
-allow_credentials = True
+    return deduped
 
-if allow_all:
-    # Allow-all is only enabled when explicitly configured via "*".
-    allow_origins = ["*"]
-    allow_credentials = False  # cannot be True with wildcard
-else:
-    # Support optional wildcards (e.g., "https://*.azurestaticapps.net").
-    literal: list[str] = []
-    wildcard: list[str] = []
-    for o in raw_items:
-        if "*" in o:
-            wildcard.append(o)
-        else:
-            literal.append(o)
-
-    allow_origins = literal
-
-    if wildcard:
-        # Convert wildcard origins to a regex.
-        parts: list[str] = []
-        for w in wildcard:
-            parts.append("^" + re.escape(w).replace("\\*", ".*") + "$")
-        allow_origin_regex = "|".join(parts)
-
-    # Security-first default: if CORS_ALLOW_ORIGINS is empty, we do NOT allow browser cross-origin calls.
-    # (Server-to-server calls without an Origin header still work.)
-    if not allow_origins and not allow_origin_regex:
-        print("[CORS] WARNING: CORS_ALLOW_ORIGINS is empty. Browser requests from other origins will be blocked.")
+cors_origins = _parse_cors_allowlist(cors_env)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_origin_regex=allow_origin_regex,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    # Explicit list (no wildcards).
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Accept",
+        "Authorization",
+        "X-Requested-With",
+        "X-Admin-Token",
+    ],
 )
 
 # ----------------------------
@@ -527,24 +489,6 @@ def _get_stream_session_event_ref(brand: str, avatar: str) -> str:
         return ""
 
 
-def _is_stream_session_active_for_event_ref(event_ref: str) -> bool:
-    """True iff the BeeStreamed session has been activated by the host (Play) for this event_ref.
-
-    This is used to ensure that only the Host can *initiate* shared in-stream chat.
-    Viewers may only join the chat room after the Host has started the BeeStreamed session.
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return False
-    try:
-        for key, ev in _BEE_STREAM_SESSION_EVENT_REF.items():
-            if str(ev or "").strip() == ref:
-                return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-    except Exception:
-        return False
-    return False
-
-
 # ---------------------------------------------------------------------------
 # BeeStreamed in-stream shared chat (Host + joined Viewers)
 #
@@ -666,84 +610,42 @@ _LIVECHAT = _LiveChatManager()
 
 
 
-# Strict mapping DB enforcement:
-#   - Only `voice_video_mappings.sqlite3` is allowed (per deployment requirement).
-#   - If the DB is missing or not writable when we need to persist event_ref, we fail loudly.
-_MAPPING_DB_PATH: str = ""
-_MAPPING_DB_TABLE: str = ""
-_MAPPING_DB_EVENT_REF_COL: str = ""
-
-
-def _mapping_db_path_strict() -> str:
-    """Resolve the required SQLite mapping database.
-
-    Product requirement:
-      - The API must use ONLY `voice_video_mappings.sqlite3` for mapping persistence.
-      - If the DB cannot be found unambiguously, the API must fail fast (startup error).
-      - You MAY provide VOICE_VIDEO_DB_PATH, but it MUST point to a file named exactly
-        `voice_video_mappings.sqlite3`.
-
-    Why this is strict:
-      - If multiple copies of the DB exist (common in deploy pipelines), writing to one file
-        while reading from another will cause "event_ref not saved" symptoms and repeated
-        BeeStreamed event creation.
-    """
-    filename = "voice_video_mappings.sqlite3"
-    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-
-    if env_path:
-        if os.path.basename(env_path) != filename:
-            raise RuntimeError(
-                f"VOICE_VIDEO_DB_PATH must point to {filename} (got: {env_path})"
-            )
-        if not os.path.exists(env_path):
-            raise RuntimeError(f"Required mapping DB not found at VOICE_VIDEO_DB_PATH: {env_path}")
-        return os.path.realpath(env_path)
-
+def _candidate_mapping_db_paths() -> List[str]:
     base_dir = os.path.dirname(__file__)
-    search_dirs: list[str] = []
-    for d in [base_dir, os.getcwd(), os.path.abspath(os.path.join(base_dir, os.pardir))]:
-        if d and d not in search_dirs:
-            search_dirs.append(d)
-
-    candidates: list[str] = []
-    for d in search_dirs:
-        p = os.path.realpath(os.path.join(d, filename))
-        if os.path.exists(p):
-            candidates.append(p)
-
-    # De-dupe while preserving order
-    unique: list[str] = []
+    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    candidates = [
+        env_path,
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+    ]
+    # keep unique, preserve order
+    out: List[str] = []
     seen: set[str] = set()
-    for c in candidates:
-        if c not in seen:
-            unique.append(c)
-            seen.add(c)
-
-    if not unique:
-        raise RuntimeError(
-            f"Required mapping DB not found. Looked for {filename} in: {search_dirs}. "
-            f"Set VOICE_VIDEO_DB_PATH to the correct absolute path."
-        )
-
-    if len(unique) > 1:
-        raise RuntimeError(
-            f"Multiple '{filename}' files found: {unique}. "
-            f"This is ambiguous and can cause event_ref persistence bugs. "
-            f"Set VOICE_VIDEO_DB_PATH to choose the correct one."
-        )
-
-    return unique[0]
-
+    for p in candidates:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
 
 
 def _load_companion_mappings_sync() -> None:
     global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE
 
-    global _MAPPING_DB_PATH, _MAPPING_DB_TABLE, _MAPPING_DB_EVENT_REF_COL
+    db_path = ""
+    for p in _candidate_mapping_db_paths():
+        if os.path.exists(p):
+            db_path = p
+            break
 
-    db_path = _mapping_db_path_strict()
-    _MAPPING_DB_PATH = db_path
+    if not db_path:
+        print("[mappings] WARNING: voice/video mappings DB not found. Video/audio capabilities will fall back to frontend defaults.")
+        _COMPANION_MAPPINGS = {}
+        _COMPANION_MAPPINGS_LOADED_AT = time.time()
+        _COMPANION_MAPPINGS_SOURCE = ""
+        return
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -757,8 +659,10 @@ def _load_companion_mappings_sync() -> None:
         tables_lc = {t.lower(): t for t in table_names}
 
         preferred = [
-            "voice_video_mappings",
             "companion_mappings",
+            "voice_video_mappings",
+            "voice_video_mapping",
+            "mappings",
         ]
         table = ""
         for cand in preferred:
@@ -766,40 +670,21 @@ def _load_companion_mappings_sync() -> None:
                 table = tables_lc[cand.lower()]
                 break
 
+        # If none of the preferred names exist, pick the first available table.
+        if not table and table_names:
+            table = table_names[0]
+
         if not table:
-            raise RuntimeError(
-                f"[mappings] Required table not found in {db_path}. Expected one of {preferred}. Found tables: {table_names}"
-            )
+            # No tables found — keep mappings empty.
+            print(f"[mappings] WARNING: mapping DB found at {db_path} but contains no tables.")
+            _COMPANION_MAPPINGS = {}
+            _COMPANION_MAPPINGS_LOADED_AT = time.time()
+            # Include an empty table name so downstream persistence logic can still parse the source.
+            _COMPANION_MAPPINGS_SOURCE = f"{db_path}:"
+            return
 
-        # Discover the actual event_ref column name (case-insensitive). Add it if missing.
-        cur.execute(f'PRAGMA table_info("{table}")')
-        cols = [str(r[1] or "").strip() for r in cur.fetchall() if r and r[1]]
-        cols_lc = {c.lower(): c for c in cols if c}
-
-        def _pick_col(*candidates: str) -> str:
-            for cand in candidates:
-                real = cols_lc.get(str(cand).lower())
-                if real:
-                    return real
-            return ""
-
-        event_col = _pick_col("event_ref", "eventref", "eventRef", "EventRef", "EVENT_REF")
-        if not event_col:
-            # Try adding event_ref column (required for stream persistence).
-            try:
-                cur.execute(f'ALTER TABLE "{table}" ADD COLUMN event_ref TEXT')
-                conn.commit()
-                event_col = "event_ref"
-            except Exception as e:
-                raise RuntimeError(
-                    f"[mappings] Table '{table}' in {db_path} lacks an event_ref column and cannot be altered: {e!r}"
-                )
-
-        _MAPPING_DB_TABLE = table
-        _MAPPING_DB_EVENT_REF_COL = event_col
-
-# Quote the table name to safely handle names with special characters.
-        cur.execute(f'SELECT rowid as __rowid, * FROM "{table}"')
+        # Quote the table name to safely handle names with special characters.
+        cur.execute(f'SELECT * FROM "{table}"')
         rows = cur.fetchall()
         table_name_for_source = str(table or "")
     finally:
@@ -826,7 +711,6 @@ def _load_companion_mappings_sync() -> None:
         key = (_norm_key(brand), _norm_key(avatar))
 
         d[key] = {
-            "__rowid": int(get_col("__rowid", default=0) or 0),
             "brand": brand,
             "avatar": avatar,
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
@@ -883,8 +767,11 @@ def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any
 
 @app.on_event("startup")
 async def _startup_load_companion_mappings() -> None:
-    # Fail fast if mappings DB is missing/misconfigured (per deployment requirement).
-    await run_in_threadpool(_load_companion_mappings_sync)
+    # Load once at startup; do not block on errors.
+    try:
+        await run_in_threadpool(_load_companion_mappings_sync)
+    except Exception as e:
+        print(f"[mappings] ERROR loading companion mappings: {e!r}")
 
 
 @app.get("/mappings/companion")
@@ -1399,284 +1286,126 @@ def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str,
             host = DULCE_HOST_MEMBER_ID_FALLBACK
     return host
 
-def _persist_event_ref_strict(brand: str, avatar: str, event_ref: str) -> None:
-    """Persist event_ref into `voice_video_mappings.sqlite3` (strict + verified).
+def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> bool:
+    """Persist event_ref into the **same SQLite table** we loaded mappings from.
 
-    Requirements:
-      - Uses ONLY the mapping DB file resolved at startup.
-      - Must update the host's record so we do NOT create a new BeeStreamed event on each Play.
-      - If persistence fails, raise (do not silently continue).
+    Why this exists:
+      - Some deployments ship the mapping DB as `voice_video_mappings.sqlite3` with a table named
+        `voice_video_mappings` (not `companion_mappings`).
+      - The original v2 implementation only updated `companion_mappings`, which meant `event_ref`
+        was never saved for those environments.
 
-    Notes:
-      - We update the in-memory mapping cache first (for this process).
-      - Then we take a filesystem lock and update SQLite.
-      - Finally, we VERIFY by reading back the stored value.
+    Behavior:
+      - Always updates the in-memory mapping for this process.
+      - Best-effort tries to update the backing SQLite DB if it exists and is writable.
+      - Detects the mapping table name and relevant columns dynamically.
     """
-    b_in = (brand or "").strip()
-    a_in = (avatar or "").strip()
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
     e = (event_ref or "").strip()
-    if not b_in or not a_in or not e:
-        raise RuntimeError("persist_event_ref: brand, avatar, and event_ref are required")
+    if not b or not a or not e:
+        return False
 
-    if not _MAPPING_DB_PATH or not _MAPPING_DB_TABLE:
-        raise RuntimeError("persist_event_ref: mappings DB was not initialized at startup")
-
-    mapping = _lookup_companion_mapping(b_in, a_in)
-    if not mapping:
-        raise RuntimeError(f"persist_event_ref: companion mapping not found for {b_in}/{a_in}")
-
-    # Update in-memory cache using the same key normalization as lookups.
+    # Always update in-memory mapping so this process is consistent.
     try:
-        mapping["event_ref"] = e
+        key = (b.lower(), a.lower())
+        if key in _COMPANION_MAPPINGS:
+            _COMPANION_MAPPINGS[key]["event_ref"] = e
     except Exception:
         pass
 
-    rowid = 0
-    try:
-        rowid = int(mapping.get("__rowid") or 0)
-    except Exception:
-        rowid = 0
+    src = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    # Source is stored as "<db_path>:<table_name>" (table name may be empty)
+    if ":" in src:
+        db_path, table_hint = src.split(":", 1)
+        db_path, table_hint = db_path.strip(), (table_hint or "").strip()
+    else:
+        db_path, table_hint = src.strip(), ""
 
-    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    if not db_path or not os.path.exists(db_path):
+        return False
 
-    def _pick_col(cols_lc: Dict[str, str], *candidates: str) -> str:
-        for cand in candidates:
-            real = cols_lc.get(str(cand).lower())
-            if real:
-                return real
+    def _pick_col(keys_lc: Dict[str, str], *candidates: str) -> str:
+        for c in candidates:
+            k = keys_lc.get(str(c).lower())
+            if k:
+                return k
         return ""
 
-    def _sql_norm(col_expr: str) -> str:
-        # Normalize similarly to _norm_key: trim, lowercase, remove spaces/underscores.
-        return f"lower(replace(replace(trim({col_expr}), ' ', ''), '_', ''))"
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
 
-    # Serialize writes to the DB to avoid race conditions/corruption.
-    lock = FileLock(f"{_MAPPING_DB_PATH}.lock")
-    with lock:
-        conn = sqlite3.connect(_MAPPING_DB_PATH, timeout=30)
-        try:
-            cur = conn.cursor()
+        # Discover tables
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+        tables_lc = {t.lower(): t for t in table_names}
 
-            # Discover columns for the chosen table
-            cur.execute(f'PRAGMA table_info("{_MAPPING_DB_TABLE}")')
-            cols = [str(r[1] or "").strip() for r in cur.fetchall() if r and r[1]]
-            cols_lc = {c.lower(): c for c in cols if c}
+        preferred = [
+            table_hint,
+            "voice_video_mappings",
+            "companion_mappings",
+            "voice_video_mapping",
+            "mappings",
+        ]
 
-            # Determine the actual event_ref column name (case-insensitive). Add if missing.
-            event_col = _pick_col(
-                cols_lc,
-                _MAPPING_DB_EVENT_REF_COL or "",
-                "event_ref",
-                "eventref",
-                "eventRef",
-                "EventRef",
-                "EVENT_REF",
-            )
+        targets: List[str] = []
+        seen: set[str] = set()
+        for cand in preferred:
+            cand = (cand or "").strip()
+            if not cand:
+                continue
+            real = tables_lc.get(cand.lower())
+            if real and real not in seen:
+                targets.append(real)
+                seen.add(real)
+
+        # Fallback: try the first table if nothing matched.
+        if not targets and table_names:
+            targets = [table_names[0]]
+
+        for table in targets:
+            # Column discovery
+            cur.execute(f'PRAGMA table_info("{table}")')
+            cols = [str(r[1] or "").strip() for r in cur.fetchall()]
+            keys_lc = {c.lower(): c for c in cols if c}
+
+            brand_col = _pick_col(keys_lc, "brand", "rebranding", "company", "brand_id")
+            avatar_col = _pick_col(keys_lc, "avatar", "companion", "first_name", "firstname")
+            if not brand_col or not avatar_col:
+                continue
+
+            event_col = _pick_col(keys_lc, "event_ref", "eventref", "event_ref ", "event")
             if not event_col:
+                # Try adding event_ref column if possible.
                 try:
-                    cur.execute(f'ALTER TABLE "{_MAPPING_DB_TABLE}" ADD COLUMN event_ref TEXT')
+                    cur.execute(f'ALTER TABLE "{table}" ADD COLUMN event_ref TEXT')
                     conn.commit()
                     event_col = "event_ref"
-                except Exception as ex:
-                    raise RuntimeError(
-                        f"persist_event_ref: table '{_MAPPING_DB_TABLE}' lacks event_ref and cannot be altered: {ex!r}"
-                    )
-
-            def _confirm_by_rowid(rid: int) -> bool:
-                if rid <= 0:
-                    return False
-                cur.execute(
-                    f'SELECT "{event_col}" FROM "{_MAPPING_DB_TABLE}" WHERE rowid = ?',
-                    (rid,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return False
-                stored = str(row[0] or "").strip()
-                return stored == e
-
-            updated = False
-
-            # 1) Preferred: update by rowid if we have it.
-            if rowid > 0:
-                cur.execute(
-                    f'UPDATE "{_MAPPING_DB_TABLE}" SET "{event_col}" = ? WHERE rowid = ?',
-                    (e, rowid),
-                )
-                conn.commit()
-                # rowcount can be 0 if value was already the same; confirm by read-back.
-                if _confirm_by_rowid(rowid):
-                    updated = True
-
-            # 2) Fallback: update by host_member_id if present (host record targeting).
-            if not updated and host_member_id:
-                host_col = _pick_col(
-                    cols_lc,
-                    "host_member_id",
-                    "hostMemberId",
-                    "HOST_MEMBER_ID",
-                    "host_id",
-                    "HostId",
-                    "member_id",
-                    "memberId",
-                )
-                if host_col:
-                    cur.execute(
-                        f'UPDATE "{_MAPPING_DB_TABLE}" SET "{event_col}" = ? WHERE trim("{host_col}") = ?',
-                        (e, host_member_id),
-                    )
-                    conn.commit()
-                    # Verify by selecting back.
-                    cur.execute(
-                        f'SELECT "{event_col}" FROM "{_MAPPING_DB_TABLE}" WHERE trim("{host_col}") = ? LIMIT 1',
-                        (host_member_id,),
-                    )
-                    row = cur.fetchone()
-                    if row and str(row[0] or "").strip() == e:
-                        updated = True
-
-            # 3) Fallback: update by normalized brand/avatar match.
-            if not updated:
-                brand_col = _pick_col(cols_lc, "brand", "rebranding", "company", "brand_id", "Brand")
-                avatar_col = _pick_col(cols_lc, "avatar", "companion", "first_name", "firstname", "Companion")
-
-                if not brand_col or not avatar_col:
-                    raise RuntimeError(
-                        f"persist_event_ref: cannot locate brand/avatar columns in '{_MAPPING_DB_TABLE}'"
-                    )
-
-                b_norm = _norm_key(b_in)
-                a_norm = _norm_key(a_in)
-
-                brand_expr = _sql_norm(f'"{brand_col}"')
-                avatar_expr = _sql_norm(f'"{avatar_col}"')
-
-                cur.execute(
-                    f'UPDATE "{_MAPPING_DB_TABLE}" '
-                    f'SET "{event_col}" = ? '
-                    f'WHERE {brand_expr} = ? AND {avatar_expr} = ?',
-                    (e, b_norm, a_norm),
-                )
-                conn.commit()
-
-                # Verify by selecting back.
-                cur.execute(
-                    f'SELECT "{event_col}" FROM "{_MAPPING_DB_TABLE}" '
-                    f'WHERE {brand_expr} = ? AND {avatar_expr} = ? LIMIT 1',
-                    (b_norm, a_norm),
-                )
-                row = cur.fetchone()
-                if row and str(row[0] or "").strip() == e:
-                    updated = True
-
-            if not updated:
-                raise RuntimeError(
-                    f"persist_event_ref: failed to persist event_ref for {b_in}/{a_in}. "
-                    f"DB={_MAPPING_DB_PATH} table={_MAPPING_DB_TABLE}. "
-                    f"Ensure the DB is writable and the mapping row exists."
-                )
-
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-
-def _db_read_event_ref_sync(brand: str, avatar: str, host_member_id: str = "") -> str:
-    """Read the persisted event_ref for (brand, avatar) from voice_video_mappings.sqlite3.
-
-    This is intentionally a DB read (not cache) to support multi-worker/multi-instance deployments.
-    """
-    b_in = (brand or "").strip()
-    a_in = (avatar or "").strip()
-    if not b_in or not a_in:
-        return ""
-
-    if not _MAPPING_DB_PATH or not _MAPPING_DB_TABLE:
-        raise RuntimeError("db_read_event_ref: mappings DB was not initialized at startup")
-
-    def _pick_col(cols_lc: Dict[str, str], *candidates: str) -> str:
-        for cand in candidates:
-            real = cols_lc.get(str(cand).lower())
-            if real:
-                return real
-        return ""
-
-    def _sql_norm(col_expr: str) -> str:
-        return f"lower(replace(replace(trim({col_expr}), ' ', ''), '_', ''))"
-
-    lock = FileLock(f"{_MAPPING_DB_PATH}.lock")
-    with lock:
-        conn = sqlite3.connect(_MAPPING_DB_PATH, timeout=30)
-        try:
-            cur = conn.cursor()
-            cur.execute(f'PRAGMA table_info("{_MAPPING_DB_TABLE}")')
-            cols = [str(r[1] or "").strip() for r in cur.fetchall() if r and r[1]]
-            cols_lc = {c.lower(): c for c in cols if c}
-
-            event_col = _pick_col(
-                cols_lc,
-                _MAPPING_DB_EVENT_REF_COL or "",
-                "event_ref",
-                "eventref",
-                "eventRef",
-                "EventRef",
-                "EVENT_REF",
-            )
-            if not event_col:
-                return ""
-
-            # Prefer host_member_id match when provided
-            hm = (host_member_id or "").strip()
-            if hm:
-                host_col = _pick_col(
-                    cols_lc,
-                    "host_member_id",
-                    "hostMemberId",
-                    "HOST_MEMBER_ID",
-                    "host_id",
-                    "HostId",
-                    "member_id",
-                    "memberId",
-                )
-                if host_col:
-                    cur.execute(
-                        f'SELECT "{event_col}" FROM "{_MAPPING_DB_TABLE}" WHERE trim("{host_col}") = ? LIMIT 1',
-                        (hm,),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        val = str(row[0] or "").strip()
-                        if val:
-                            return val
-
-            brand_col = _pick_col(cols_lc, "brand", "rebranding", "company", "brand_id", "Brand")
-            avatar_col = _pick_col(cols_lc, "avatar", "companion", "first_name", "firstname", "Companion")
-            if not brand_col or not avatar_col:
-                return ""
-
-            b_norm = _norm_key(b_in)
-            a_norm = _norm_key(a_in)
-            brand_expr = _sql_norm(f'"{brand_col}"')
-            avatar_expr = _sql_norm(f'"{avatar_col}"')
+                except Exception:
+                    # Read-only DB or ALTER not allowed.
+                    continue
 
             cur.execute(
-                f'SELECT "{event_col}" FROM "{_MAPPING_DB_TABLE}" '
-                f'WHERE {brand_expr} = ? AND {avatar_expr} = ? LIMIT 1',
-                (b_norm, a_norm),
+                f'UPDATE "{table}" SET "{event_col}" = ? WHERE lower("{brand_col}") = lower(?) AND lower("{avatar_col}") = lower(?)',
+                (e, b, a),
             )
-            row = cur.fetchone()
-            if not row:
-                return ""
-            return str(row[0] or "").strip()
-        finally:
+            conn.commit()
             try:
-                conn.close()
+                if int(cur.rowcount or 0) > 0:
+                    return True
             except Exception:
-                pass
+                # Some sqlite drivers may not set rowcount reliably. If we got here without error, accept.
+                return True
 
+        return False
+    except Exception:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
@@ -1764,16 +1493,6 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
     is_host = bool(host_id and member_id and member_id == host_id)
 
-    # Refresh event_ref from SQLite on every call (important for multi-instance deployments).
-    # Without this, one server instance may persist the event_ref, but another instance (with a warm cache)
-    # could still see an empty event_ref and create a new BeeStreamed event on each Play.
-    try:
-        db_event_ref = _db_read_event_ref_sync(resolved_brand, resolved_avatar, host_id or "")
-        if db_event_ref:
-            mapping["event_ref"] = db_event_ref
-    except Exception as ex:
-        raise HTTPException(status_code=500, detail=f"Failed to read voice_video_mappings.sqlite3: {ex}")
-
     event_ref = str(mapping.get("event_ref") or "").strip()
     created_in_this_call = False
 
@@ -1781,7 +1500,7 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     if not event_ref and is_host:
         created_in_this_call = True
         event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-        _persist_event_ref_strict(resolved_brand, resolved_avatar, event_ref)
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
 
     # If we still have no event_ref, non-host users should wait.
     if not event_ref:
@@ -1839,7 +1558,7 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
             else:
                 # Stale/invalid event_ref in DB: regenerate, persist, and retry once.
                 event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-                _persist_event_ref_strict(resolved_brand, resolved_avatar, event_ref)
+                _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
                 embed_url = f"/stream/beestreamed/embed/{event_ref}"
 
                 # Update session event_ref immediately so pollers see the correct event id.
@@ -1950,7 +1669,7 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
     if not event_ref:
         created_in_this_call = True
         event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-        _persist_event_ref_strict(resolved_brand, resolved_avatar, event_ref)
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
 
     if bool(req.startStream):
         def _start_event(_ref: str) -> None:
@@ -1968,7 +1687,7 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
                     _start_event(event_ref)
                 else:
                     event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-                    _persist_event_ref_strict(resolved_brand, resolved_avatar, event_ref)
+                    _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
                     _start_event(event_ref)
             else:
                 raise
@@ -2092,11 +1811,6 @@ async def beestreamed_livechat_send(req: BeeStreamedLiveChatSendRequest):
     if not text:
         return {"ok": True, "status": "empty"}
 
-    # Only the Host can initiate shared in-stream chat. Viewers may only send once the
-    # Host has activated the BeeStreamed session (Host pressed Play).
-    if not _is_stream_session_active_for_event_ref(event_ref):
-        raise HTTPException(status_code=409, detail="Stream session is not active")
-
     member_id = (req.memberId or "").strip() or f"anon:{uuid.uuid4().hex}"
     role = (req.role or "viewer").strip().lower()
     if role not in {"host", "viewer"}:
@@ -2142,22 +1856,6 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
     ref = (event_ref or "").strip()
     if not ref:
         await websocket.close(code=1008)
-        return
-
-    # Only the Host can initiate shared in-stream chat. Reject early join attempts.
-    if not _is_stream_session_active_for_event_ref(ref):
-        try:
-            await websocket.accept()
-        except Exception:
-            pass
-        try:
-            await websocket.send_json({"type": "inactive", "detail": "Stream session is not active"})
-        except Exception:
-            pass
-        try:
-            await websocket.close(code=1008)
-        except Exception:
-            pass
         return
 
     qp = websocket.query_params
