@@ -45,84 +45,80 @@ app = FastAPI(title="Elaralo API")
 # ----------------------------
 # CORS
 # ----------------------------
-# CORS_ALLOW_ORIGINS can be:
-#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
-#   - entries with wildcards (e.g. https://*.azurestaticapps.net)
-#   - or a single "*" to allow all (NOT recommended for production)
-cors_env = (
-    os.getenv("CORS_ALLOW_ORIGINS", "")
-    or getattr(settings, "CORS_ALLOW_ORIGINS", None)
-    or ""
-).strip()
+# Strict CORS configuration.
+#
+# Requirements (per project policy):
+#   - Allowed origins MUST be provided via the CORS_ALLOW_ORIGINS env var.
+#   - The value MUST be a comma-separated (or whitespace-separated) list of exact Origins
+#     (scheme + host + optional port). Example:
+#       https://example.com,http://localhost:3000
+#   - No pattern matching is supported.
+#   - If CORS_ALLOW_ORIGINS is missing or empty, the API fails fast at startup.
+cors_env = os.getenv("CORS_ALLOW_ORIGINS")
 
-def _split_cors_origins(raw: str) -> list[str]:
-    """Split + normalize CORS origins from an env var.
+if cors_env is None or not cors_env.strip():
+    raise RuntimeError(
+        "CORS_ALLOW_ORIGINS is required. Set it to a comma-separated list of allowed Origins."
+    )
 
-    Supports comma and/or whitespace separation.
-    Removes trailing slashes (browser Origin never includes a trailing slash).
-    De-dupes while preserving order.
+from urllib.parse import urlparse
+
+_WILDCARD_CHAR = chr(42)  # ASCII 42
+
+def _split_cors_origins_strict(raw: str) -> list[str]:
+    """Split + normalize strict CORS origins.
+
+    - Accepts comma and/or whitespace separation.
+    - Removes trailing slashes (browser Origin never includes a trailing slash).
+    - De-dupes while preserving order.
+    - Validates that each entry is a well-formed Origin (no path/query/fragment).
     """
-    if not raw:
-        return []
     tokens = re.split(r"[\s,]+", raw.strip())
     out: list[str] = []
     seen: set[str] = set()
+
     for t in tokens:
+        t = (t or "").strip()
         if not t:
             continue
-        t = t.strip()
-        if not t:
-            continue
-        if t != "*" and t.endswith("/"):
+
+        if _WILDCARD_CHAR in t:
+            raise RuntimeError(
+                "CORS_ALLOW_ORIGINS contains an invalid character. Only exact Origins are allowed."
+            )
+
+        if t.endswith("/"):
             t = t.rstrip("/")
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
+
+        p = urlparse(t)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            raise RuntimeError(f"Invalid CORS origin: {t}")
+        if p.path not in ("", "/") or p.params or p.query or p.fragment:
+            raise RuntimeError(f"Invalid CORS origin (must not include a path/query): {t}")
+
+        origin = f"{p.scheme}://{p.netloc}"
+        if origin not in seen:
+            out.append(origin)
+            seen.add(origin)
+
+    if not out:
+        raise RuntimeError(
+            "CORS_ALLOW_ORIGINS is required and must contain at least one valid Origin."
+        )
+
     return out
 
-raw_items = _split_cors_origins(cors_env)
-allow_all = (len(raw_items) == 1 and raw_items[0] == "*")
+allow_origins: list[str] = _split_cors_origins_strict(cors_env)
 
-allow_origins: list[str] = []
-allow_origin_regex: str | None = None
-allow_credentials = True
-
-if allow_all:
-    # Allow-all is only enabled when explicitly configured via "*".
-    allow_origins = ["*"]
-    allow_credentials = False  # cannot be True with wildcard
-else:
-    # Support optional wildcards (e.g., "https://*.azurestaticapps.net").
-    literal: list[str] = []
-    wildcard: list[str] = []
-    for o in raw_items:
-        if "*" in o:
-            wildcard.append(o)
-        else:
-            literal.append(o)
-
-    allow_origins = literal
-
-    if wildcard:
-        # Convert wildcard origins to a regex.
-        parts: list[str] = []
-        for w in wildcard:
-            parts.append("^" + re.escape(w).replace("\\*", ".*") + "$")
-        allow_origin_regex = "|".join(parts)
-
-    # Security-first default: if CORS_ALLOW_ORIGINS is empty, we do NOT allow browser cross-origin calls.
-    # (Server-to-server calls without an Origin header still work.)
-    if not allow_origins and not allow_origin_regex:
-        print("[CORS] WARNING: CORS_ALLOW_ORIGINS is empty. Browser requests from other origins will be blocked.")
-
+# Explicitly enumerate methods/headers (no allow-all settings).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
-    allow_origin_regex=allow_origin_regex,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "Authorization", "X-Requested-With", "X-Admin-Token"],
 )
+
 
 # ----------------------------
 # Routes

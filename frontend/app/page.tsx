@@ -2960,22 +2960,6 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   const viewerHasJoinedStream =
     liveProvider === "stream" && !streamCanStart && Boolean(streamEmbedUrl || streamEventRef);
 
-  // Host UX:
-  // Once the Host starts the BeeStreamed session (Play), disable the Play button to avoid
-  // mixed state toggles between shared chat and normal AI. Pressing Stop re-enables Play.
-  const hostHasStartedStream =
-    liveProvider === "stream" && streamCanStart && Boolean(streamEmbedUrl || streamEventRef);
-
-  const hostPlayLocked = hostHasStartedStream;
-
-  // Unified Play button disable logic:
-  // - Viewer: disabled after join (until Stop)
-  // - Host: disabled after starting the stream (until Stop)
-  // - Any user: disabled while connecting
-  const playButtonDisabled =
-    viewerHasJoinedStream || hostPlayLocked || avatarStatus === "connecting";
-
-
   // ---------------------------------------------------------------------------
   // BeeStreamed shared in-stream live chat (Host + joined Viewers)
   // - Only participants who have joined the stream UI (Play) connect.
@@ -5920,15 +5904,15 @@ const modePillControls = (
             })();
           }
         }}
-        disabled={playButtonDisabled}
+        disabled={viewerHasJoinedStream}
         style={{
           padding: "10px 14px",
           borderRadius: 10,
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: playButtonDisabled ? "not-allowed" : "pointer",
-          opacity: playButtonDisabled ? 0.6 : 1,
+          cursor: viewerHasJoinedStream ? "not-allowed" : "pointer",
+          opacity: viewerHasJoinedStream ? 0.6 : 1,
           fontWeight: 700,
         }}
         aria-label={
