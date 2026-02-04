@@ -44,11 +44,9 @@ jobs:
         env:
           # IMPORTANT: Next.js uses NEXT_PUBLIC_* at build time.
           # Keep this value WITHOUT a trailing slash for safest URL joining.
-          NEXT_PUBLIC_API_BASE_URL: https://elaralo-api-01.azurewebsites.net
+          NEXT_PUBLIC_API_BASE_URL: ${{ vars.NEXT_PUBLIC_API_BASE_URL }}
           # Optional (overrides the default upgrade URL in the UI)
           NEXT_PUBLIC_UPGRADE_URL: https://www.elaralo.com/pricing-plans/list
-          # Optional: default streaming / web conference URL (can be overridden per companion key)
-          NEXT_PUBLIC_STREAM_URL: ${{ secrets.NEXT_PUBLIC_STREAM_URL }}
 
   close_pull_request_job:
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
