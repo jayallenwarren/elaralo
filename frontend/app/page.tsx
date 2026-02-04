@@ -1397,58 +1397,6 @@ export default function Page() {
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
-  // Viewer-only: display name used in the shared in-stream chat.
-  // - Stored locally so we only prompt once per (brand, companion).
-  const liveChatUsernameStorageKey = useMemo(() => {
-    const b = safeBrandKey(String(companyName || "").trim() || "core") || "core";
-    const a = safeBrandKey(String(companionName || "").trim() || "companion") || "companion";
-    return `beestreamed_livechat_username:${b}:${a}`;
-  }, [companyName, companionName]);
-
-  const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
-
-  useEffect(() => {
-    // Keep state in sync with localStorage as the user switches companions/brands.
-    try {
-      if (typeof window === "undefined") return;
-      const stored = String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
-      setViewerLiveChatName(stored);
-    } catch (e) {
-      setViewerLiveChatName("");
-    }
-  }, [liveChatUsernameStorageKey]);
-
-  const ensureViewerLiveChatName = useCallback((): string => {
-    try {
-      if (typeof window === "undefined") return "";
-      const current = String(viewerLiveChatName || "").trim();
-      if (current) return current;
-
-      const stored = String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
-      if (stored) {
-        setViewerLiveChatName(stored);
-        return stored;
-      }
-
-      // Prompt only when Viewer explicitly joins the live stream (Play).
-      const raw = window.prompt("Choose a username to display during the live session:", "") || "";
-      const cleaned = raw
-        .replace(/[\r\n\t]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 32);
-
-      if (!cleaned) return "";
-
-      window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
-      setViewerLiveChatName(cleaned);
-      return cleaned;
-    } catch (e) {
-      return "";
-    }
-  }, [viewerLiveChatName, liveChatUsernameStorageKey]);
-
-
   // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
   const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
 
@@ -1951,21 +1899,6 @@ if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
 
 // If the host hasn't created the event yet, non-host users may legitimately have no embedUrl/eventRef.
 const canStart = !!data?.canStart;
-
-// Viewer: ask for a display name the first time they join the live session.
-// Stored locally so it persists across reloads.
-if (!canStart) {
-  const uname = ensureViewerLiveChatName();
-  if (!uname) {
-    // User cancelled / empty name: do not join the stream.
-    setStreamNotice("");
-    setAvatarStatus("idle");
-    setAvatarError(null);
-    return;
-  }
-}
-
-
 if (!embedUrl && eventRef) {
   // Fallback to wrapper path (never direct beestreamed.com) if API returned eventRef only.
   embedUrl = `${API_BASE}/stream/beestreamed/embed/${encodeURIComponent(eventRef)}`;
@@ -2828,8 +2761,7 @@ const speakAssistantReply = useCallback(
     return getOrCreateAnonMemberId(brandKeyForAnon);
   }, [memberId, brandKeyForAnon]);
 
-
-    // Lightweight viewer auto-refresh: if you are not the host, keep polling until the host creates/starts the event.
+  // Lightweight viewer auto-refresh: if you are not the host, keep polling until the host creates/starts the event.
   // This avoids requiring manual page refresh for viewers waiting on the host.
   useEffect(() => {
     // Only poll while we are explicitly waiting and we don't yet have an embed URL.
@@ -2860,7 +2792,6 @@ const speakAssistantReply = useCallback(
           let embedUrl = String(data?.embedUrl || "").trim();
           if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
 const canStart = !!data?.canStart;
-
 // Viewer UX: prefer player-only embed inside iframes.
 if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   embedUrl += (embedUrl.includes("?") ? "&" : "?") + "embed=player";
@@ -2977,11 +2908,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
       const senderId = String(payload?.senderId || '').trim();
       const senderRole = String(payload?.senderRole || '').trim().toLowerCase();
       const nameRaw = String(payload?.name || '').trim();
-      const fallbackLabel =
-        senderRole === 'host'
-          ? (String(companionName || 'Host').trim() || 'Host')
-          : (senderId ? `Viewer-${senderId.slice(-4)}` : 'Viewer');
-      const label = nameRaw || fallbackLabel;
+      const label = nameRaw || (senderRole === 'host' ? 'Host' : (senderId ? `Viewer-${senderId.slice(-4)}` : 'Viewer'));
 
       // Only include *our own* live-chat messages in future /chat context.
       const includeInAiContext = senderId && senderId === String(memberIdForLiveChat || '').trim();
@@ -2990,12 +2917,12 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
         ...prev,
         {
           role: 'user',
-          content: text,
-          meta: { liveChat: true, senderId, senderRole, name: label, includeInAiContext, clientMsgId },
+          content: `${label}: ${text}`,
+          meta: { liveChat: true, senderId, includeInAiContext, clientMsgId },
         },
       ]);
     },
-    [memberIdForLiveChat, companionName, rememberLiveChatId],
+    [memberIdForLiveChat, rememberLiveChatId],
   );
 
   // Connect/disconnect the live chat websocket as the viewer/host joins/leaves the stream UI.
@@ -3043,10 +2970,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
 
     // Build connection identity.
     const role = isBeeStreamedHost ? 'host' : 'viewer';
-    const name =
-      role === 'host'
-        ? (String(companionName || 'Host').trim() || 'Host')
-        : (String(viewerLiveChatName || '').trim() || (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer'));
+    const name = role === 'host' ? 'Host' : (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer');
 
     let ws: WebSocket | null = null;
     let cancelled = false;
@@ -3110,7 +3034,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
         if (ws) ws.close();
       } catch (e) {}
     };
-  }, [API_BASE, liveProvider, beestreamedSessionActive, streamEmbedUrl, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, appendLiveChatMessage]);
+  }, [API_BASE, liveProvider, beestreamedSessionActive, streamEmbedUrl, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, appendLiveChatMessage]);
 
   const sendLiveChatMessage = useCallback(
     async (text: string, clientMsgId: string) => {
@@ -3120,10 +3044,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
       if (!clean) return;
 
       const role = isBeeStreamedHost ? 'host' : 'viewer';
-      const name =
-        role === 'host'
-          ? (String(companionName || 'Host').trim() || 'Host')
-          : (String(viewerLiveChatName || '').trim() || (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer'));
+      const name = role === 'host' ? 'Host' : (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer');
       const payload = {
         type: 'chat',
         text: clean,
@@ -3160,7 +3081,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
         // ignore
       }
     },
-    [API_BASE, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName],
+    [API_BASE, streamEventRef, isBeeStreamedHost, memberIdForLiveChat],
   );
 
   const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
@@ -4011,20 +3932,11 @@ if (streamSessionActive) {
       (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     // Mark this message as a live-chat line (used for dedupe + AI context filtering).
-    const senderRole = isBeeStreamedHost ? "host" : "viewer";
-    const senderName =
-      senderRole === "host"
-        ? (String(companionName || "Host").trim() || "Host")
-        : (String(viewerLiveChatName || "").trim() ||
-           (memberIdForLiveChat ? `Viewer-${String(memberIdForLiveChat).slice(-4)}` : "Viewer"));
-
     userMsg = {
       ...userMsg,
       meta: {
         liveChat: true,
-        senderId: String(memberIdForLiveChat || "").trim(),
-        senderRole,
-        name: senderName,
+        senderId: String(memberIdForLiveChat || '').trim(),
         includeInAiContext: true,
         clientMsgId,
       },
@@ -6030,28 +5942,18 @@ const modePillControls = (
               background: "#fff",
             }}
           >
-            {messages.map((m, i) => {
-              const meta: any = (m as any).meta;
-              const displayName =
-                meta?.liveChat && meta?.name
-                  ? String(meta.name)
-                  : m.role === "assistant"
-                  ? (companionName || DEFAULT_COMPANION_NAME)
-                  : "You";
-
-              return (
-                <div
-                  key={i}
-                  style={{
-                    marginBottom: 10,
-                    whiteSpace: "pre-wrap",
-                    color: m.role === "assistant" ? "#111" : "#333",
-                  }}
-                >
-                  <b>{displayName}:</b> {renderMsgContent(m)}
-                </div>
-              );
-            })}
+            {messages.map((m, i) => (
+              <div
+                key={i}
+                style={{
+                  marginBottom: 10,
+                  whiteSpace: "pre-wrap",
+                  color: m.role === "assistant" ? "#111" : "#333",
+                }}
+              >
+                <b>{m.role === "assistant" ? companionName : "You"}:</b> {renderMsgContent(m)}
+              </div>
+            ))}
             {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
           </div>
 

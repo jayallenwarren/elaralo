@@ -504,24 +504,6 @@ def _get_stream_session_event_ref(brand: str, avatar: str) -> str:
         return ""
 
 
-def _is_stream_session_active_for_event_ref(event_ref: str) -> bool:
-    """True iff the BeeStreamed session has been activated by the host (Play) for this event_ref.
-
-    This is used to ensure that only the Host can *initiate* shared in-stream chat.
-    Viewers may only join the chat room after the Host has started the BeeStreamed session.
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return False
-    try:
-        for key, ev in _BEE_STREAM_SESSION_EVENT_REF.items():
-            if str(ev or "").strip() == ref:
-                return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-    except Exception:
-        return False
-    return False
-
-
 # ---------------------------------------------------------------------------
 # BeeStreamed in-stream shared chat (Host + joined Viewers)
 #
@@ -1844,11 +1826,6 @@ async def beestreamed_livechat_send(req: BeeStreamedLiveChatSendRequest):
     if not text:
         return {"ok": True, "status": "empty"}
 
-    # Only the Host can initiate shared in-stream chat. Viewers may only send once the
-    # Host has activated the BeeStreamed session (Host pressed Play).
-    if not _is_stream_session_active_for_event_ref(event_ref):
-        raise HTTPException(status_code=409, detail="Stream session is not active")
-
     member_id = (req.memberId or "").strip() or f"anon:{uuid.uuid4().hex}"
     role = (req.role or "viewer").strip().lower()
     if role not in {"host", "viewer"}:
@@ -1894,22 +1871,6 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
     ref = (event_ref or "").strip()
     if not ref:
         await websocket.close(code=1008)
-        return
-
-    # Only the Host can initiate shared in-stream chat. Reject early join attempts.
-    if not _is_stream_session_active_for_event_ref(ref):
-        try:
-            await websocket.accept()
-        except Exception:
-            pass
-        try:
-            await websocket.send_json({"type": "inactive", "detail": "Stream session is not active"})
-        except Exception:
-            pass
-        try:
-            await websocket.close(code=1008)
-        except Exception:
-            pass
         return
 
     qp = websocket.query_params
