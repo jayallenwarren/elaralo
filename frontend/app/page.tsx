@@ -2841,55 +2841,6 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   //   stored in voice_video_mappings.sqlite3 (exposed via /stream/beestreamed/status).
   const [beestreamedHostMemberId, setBeestreamedHostMemberId] = useState<string>("");
   const [beestreamedSessionActive, setBeestreamedSessionActive] = useState<boolean>(false);
-  // Viewer live-chat display name (stored locally; prompted on first join).
-  // - Only asked when a *viewer* clicks Play to join the live stream UI.
-  // - Stored in localStorage and reused across sessions until cleared.
-  const liveChatUsernameStorageKey = useMemo(() => {
-    const b = String(brandKeyForAnon || "core").trim() || "core";
-    return `beestreamed_livechat_username:${b}`;
-  }, [brandKeyForAnon]);
-
-  const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const v = window.localStorage.getItem(liveChatUsernameStorageKey) || "";
-      const clean = String(v || "").trim();
-      if (clean) setViewerLiveChatName(clean);
-    } catch (e) {}
-  }, [liveChatUsernameStorageKey]);
-
-  const ensureViewerLiveChatName = useCallback((): string | null => {
-    if (typeof window === "undefined") return null;
-
-    // Prefer state, then localStorage.
-    let existing = String(viewerLiveChatName || "").trim();
-    if (!existing) {
-      try {
-        existing = String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
-      } catch (e) {}
-    }
-    if (existing) {
-      if (existing !== viewerLiveChatName) setViewerLiveChatName(existing);
-      return existing;
-    }
-
-    const entered = window.prompt("Choose a username to display during the live stream:", "");
-    const clean = String(entered || "")
-      .replace(/[\r\n\t]+/g, " ")
-      .replace(/\s{2,}/g, " ")
-      .trim();
-    if (!clean) return null;
-
-    const clipped = clean.length > 32 ? clean.slice(0, 32) : clean;
-    try {
-      window.localStorage.setItem(liveChatUsernameStorageKey, clipped);
-    } catch (e) {}
-    setViewerLiveChatName(clipped);
-    return clipped;
-  }, [viewerLiveChatName, liveChatUsernameStorageKey]);
-
   const isBeeStreamedHost = useMemo(() => {
     const mid = String(memberId || "").trim();
     const hid = String(beestreamedHostMemberId || "").trim();
@@ -2957,8 +2908,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
       const senderId = String(payload?.senderId || '').trim();
       const senderRole = String(payload?.senderRole || '').trim().toLowerCase();
       const nameRaw = String(payload?.name || '').trim();
-      const hostLabel = (companionName || 'Host').trim() || 'Host';
-      const label = nameRaw || (senderRole === 'host' ? hostLabel : (senderId ? `Viewer-${senderId.slice(-4)}` : 'Viewer'));
+      const label = nameRaw || (senderRole === 'host' ? 'Host' : (senderId ? `Viewer-${senderId.slice(-4)}` : 'Viewer'));
 
       // Only include *our own* live-chat messages in future /chat context.
       const includeInAiContext = senderId && senderId === String(memberIdForLiveChat || '').trim();
@@ -2967,12 +2917,12 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
         ...prev,
         {
           role: 'user',
-          content: text,
-          meta: { liveChat: true, senderId, name: label, includeInAiContext, clientMsgId },
+          content: `${label}: ${text}`,
+          meta: { liveChat: true, senderId, includeInAiContext, clientMsgId },
         },
       ]);
     },
-    [memberIdForLiveChat, rememberLiveChatId, companionName],
+    [memberIdForLiveChat, rememberLiveChatId],
   );
 
   // Connect/disconnect the live chat websocket as the viewer/host joins/leaves the stream UI.
@@ -3020,11 +2970,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
 
     // Build connection identity.
     const role = isBeeStreamedHost ? 'host' : 'viewer';
-    const hostLabel = (companionName || 'Host').trim() || 'Host';
-    const viewerLabel =
-      (viewerLiveChatName || '').trim() ||
-      (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer');
-    const name = role === 'host' ? hostLabel : viewerLabel;
+    const name = role === 'host' ? 'Host' : (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer');
 
     let ws: WebSocket | null = null;
     let cancelled = false;
@@ -3098,11 +3044,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
       if (!clean) return;
 
       const role = isBeeStreamedHost ? 'host' : 'viewer';
-      const hostLabel = (companionName || 'Host').trim() || 'Host';
-      const viewerLabel =
-        (viewerLiveChatName || '').trim() ||
-        (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer');
-      const name = role === 'host' ? hostLabel : viewerLabel;
+      const name = role === 'host' ? 'Host' : (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer');
       const payload = {
         type: 'chat',
         text: clean,
@@ -3139,7 +3081,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
         // ignore
       }
     },
-    [API_BASE, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName],
+    [API_BASE, streamEventRef, isBeeStreamedHost, memberIdForLiveChat],
   );
 
   const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
@@ -3995,9 +3937,6 @@ if (streamSessionActive) {
       meta: {
         liveChat: true,
         senderId: String(memberIdForLiveChat || '').trim(),
-        name: (isBeeStreamedHost
-          ? ((companionName || "Host").trim() || "Host")
-          : ((viewerLiveChatName || "").trim() || "Viewer")),
         includeInAiContext: true,
         clientMsgId,
       },
@@ -5838,11 +5777,6 @@ const modePillControls = (
               // If mic permission was denied, don't start Live Avatar.
               if (liveProvider !== "stream" && !sttEnabledRef.current) return;
 
-              if (liveProvider === "stream" && !isBeeStreamedHost) {
-                const chosen = ensureViewerLiveChatName();
-                if (!chosen) return;
-              }
-
               await startLiveAvatar();
             })();
           }
@@ -6008,26 +5942,18 @@ const modePillControls = (
               background: "#fff",
             }}
           >
-            {messages.map((m, i) => {
-              const meta: any = (m as any).meta;
-              let label = m.role === "assistant" ? companionName : "You";
-              if (meta?.liveChat === true) {
-                const nm = String(meta?.name || "").trim();
-                if (nm) label = nm;
-              }
-              return (
-                <div
-                  key={i}
-                  style={{
-                    marginBottom: 10,
-                    whiteSpace: "pre-wrap",
-                    color: m.role === "assistant" ? "#111" : "#333",
-                  }}
-                >
-                  <b>{label}:</b> {renderMsgContent(m)}
-                </div>
-              );
-            })}
+            {messages.map((m, i) => (
+              <div
+                key={i}
+                style={{
+                  marginBottom: 10,
+                  whiteSpace: "pre-wrap",
+                  color: m.role === "assistant" ? "#111" : "#333",
+                }}
+              >
+                <b>{m.role === "assistant" ? companionName : "You"}:</b> {renderMsgContent(m)}
+              </div>
+            ))}
             {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
           </div>
 
