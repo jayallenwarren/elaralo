@@ -5904,15 +5904,15 @@ const modePillControls = (
             })();
           }
         }}
-        disabled={viewerHasJoinedStream}
+        disabled={viewerHasJoinedStream || (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl)}
         style={{
           padding: "10px 14px",
           borderRadius: 10,
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: viewerHasJoinedStream ? "not-allowed" : "pointer",
-          opacity: viewerHasJoinedStream ? 0.6 : 1,
+          cursor: (viewerHasJoinedStream || (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl)) ? "not-allowed" : "pointer",
+          opacity: (viewerHasJoinedStream || (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl)) ? 0.6 : 1,
           fontWeight: 700,
         }}
         aria-label={
@@ -5922,7 +5922,7 @@ const modePillControls = (
             ? "Stop Live Avatar"
             : "Start Live Avatar"
         }
-        title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
+        title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl) ? "Streaming started. Use Stop to end." : "Video"}
       >
         {avatarStatus === "connected" ||
         avatarStatus === "connecting" ||
@@ -6673,4 +6673,3 @@ const modePillControls = (
 </main>
   );
 }
-//
