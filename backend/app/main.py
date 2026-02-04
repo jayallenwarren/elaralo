@@ -8,6 +8,7 @@ import json
 import hashlib
 import base64
 import asyncio
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,7 +16,7 @@ from pydantic import BaseModel
 
 from filelock import FileLock  # type: ignore
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -501,6 +502,126 @@ def _get_stream_session_event_ref(brand: str, avatar: str) -> str:
         return str(_BEE_STREAM_SESSION_EVENT_REF.get(key, "") or "").strip()
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# BeeStreamed in-stream shared chat (Host + joined Viewers)
+#
+# Requirement:
+#   - While a BeeStreamed session is active, the host + all joined viewers should see
+#     each other's messages in a shared in-stream chat.
+#   - This chat is intentionally separate from the /chat (AI) endpoint.
+#
+# Implementation notes:
+#   - Uses WebSockets for low-latency broadcast.
+#   - Maintains a small in-memory backlog per event_ref so late joiners can see recent
+#     chat messages.
+#   - This is best-effort / single-instance. If you run multiple API replicas, you will
+#     need a shared pub/sub (Redis, etc.) to broadcast across instances.
+# ---------------------------------------------------------------------------
+
+
+class _LiveChatRoom:
+    __slots__ = ("sockets", "history")
+
+    def __init__(self) -> None:
+        self.sockets: set[WebSocket] = set()
+        self.history = deque(maxlen=250)  # last ~250 messages
+
+
+class _LiveChatManager:
+    def __init__(self) -> None:
+        self._rooms: Dict[str, _LiveChatRoom] = {}
+        self._lock = asyncio.Lock()
+
+    async def connect(self, event_ref: str, ws: WebSocket) -> list[dict[str, Any]]:
+        """Accept the socket and register it in the event_ref room.
+
+        Returns the current room history snapshot.
+        """
+        await ws.accept()
+        ref = (event_ref or "").strip()
+        if not ref:
+            return []
+
+        async with self._lock:
+            room = self._rooms.get(ref)
+            if room is None:
+                room = _LiveChatRoom()
+                self._rooms[ref] = room
+
+            room.sockets.add(ws)
+            history = list(room.history)
+
+        return history
+
+    async def disconnect(self, event_ref: str, ws: WebSocket) -> None:
+        ref = (event_ref or "").strip()
+        if not ref:
+            return
+        async with self._lock:
+            room = self._rooms.get(ref)
+            if not room:
+                return
+            room.sockets.discard(ws)
+            # Keep history for late joiners, even if empty room.
+            if not room.sockets:
+                # Optional: keep the room for a while; for now we keep it.
+                pass
+
+    async def broadcast(self, event_ref: str, payload: dict[str, Any]) -> None:
+        ref = (event_ref or "").strip()
+        if not ref:
+            return
+
+        # Snapshot sockets under lock, then send outside lock.
+        async with self._lock:
+            room = self._rooms.get(ref)
+            if room is None:
+                room = _LiveChatRoom()
+                self._rooms[ref] = room
+            room.history.append(payload)
+            sockets = list(room.sockets)
+
+        dead: list[WebSocket] = []
+        for s in sockets:
+            try:
+                await s.send_json(payload)
+            except Exception:
+                dead.append(s)
+
+        if dead:
+            async with self._lock:
+                room = self._rooms.get(ref)
+                if room:
+                    for d in dead:
+                        room.sockets.discard(d)
+
+    async def close_room(self, event_ref: str, reason: str = "session_ended") -> None:
+        """Broadcast a session-ended event and close all sockets for an event_ref."""
+        ref = (event_ref or "").strip()
+        if not ref:
+            return
+
+        async with self._lock:
+            room = self._rooms.pop(ref, None)
+
+        if not room:
+            return
+
+        payload = {"type": reason}
+        for s in list(room.sockets):
+            try:
+                await s.send_json(payload)
+            except Exception:
+                pass
+            try:
+                await s.close()
+            except Exception:
+                pass
+
+
+_LIVECHAT = _LiveChatManager()
 
 
 
@@ -1339,6 +1460,25 @@ class BeeStreamedEmbedUrlRequest(BaseModel):
     streamUrl: Optional[str] = None
 
 
+class BeeStreamedLiveChatSendRequest(BaseModel):
+    """Send a message to the shared in-stream chat room (HTTP fallback).
+
+    Frontend primarily uses WebSockets, but this endpoint provides a reliable
+    fallback (e.g., before WS connect finishes).
+    """
+
+    eventRef: str
+    text: str
+
+    brand: Optional[str] = None
+    avatar: Optional[str] = None
+    memberId: Optional[str] = None
+    role: Optional[str] = None  # "host" | "viewer"
+    name: Optional[str] = None
+    clientMsgId: Optional[str] = None
+    ts: Optional[int] = None
+
+
 @app.post("/stream/beestreamed/start_embed")
 async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     brand = (req.brand or "").strip()
@@ -1662,7 +1802,139 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
     # Mark session inactive for global gating (host-only)
     _set_stream_session_active(resolved_brand, resolved_avatar, False, event_ref)
 
+    # Close any in-stream live chat sockets for this event (best-effort).
+    try:
+        asyncio.create_task(_LIVECHAT.close_room(event_ref, reason="session_ended"))
+    except Exception:
+        pass
+
     return {"ok": True, "status": "stopped", "eventRef": event_ref}
+
+
+@app.post("/stream/beestreamed/livechat/send")
+async def beestreamed_livechat_send(req: BeeStreamedLiveChatSendRequest):
+    """HTTP fallback for sending live chat messages.
+
+    The frontend primarily uses WebSockets, but this endpoint is useful when the
+    user sends a message before the WS handshake completes.
+    """
+
+    event_ref = (req.eventRef or "").strip()
+    text = (req.text or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="eventRef is required")
+    if not text:
+        return {"ok": True, "status": "empty"}
+
+    member_id = (req.memberId or "").strip() or f"anon:{uuid.uuid4().hex}"
+    role = (req.role or "viewer").strip().lower()
+    if role not in {"host", "viewer"}:
+        role = "viewer"
+
+    # Deterministic display name (can be overridden by optional req.name)
+    name = (req.name or "").strip()
+    if not name:
+        if role == "host":
+            name = "Host"
+        else:
+            tail = member_id[-4:] if member_id else ""
+            name = f"Viewer-{tail}" if tail else "Viewer"
+
+    client_msg_id = (req.clientMsgId or "").strip() or uuid.uuid4().hex
+    ts = int(req.ts or int(time.time() * 1000))
+
+    payload = {
+        "type": "chat",
+        "eventRef": event_ref,
+        "text": text[:4000],
+        "senderId": member_id,
+        "senderRole": role,
+        "name": name,
+        "clientMsgId": client_msg_id,
+        "ts": ts,
+    }
+
+    await _LIVECHAT.broadcast(event_ref, payload)
+    return {"ok": True}
+
+
+@app.websocket("/stream/beestreamed/livechat/{event_ref}")
+async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
+    """WebSocket room for BeeStreamed in-stream chat.
+
+    Query params:
+      - memberId: viewer/host id (Wix memberId or our anon:... id)
+      - role: host|viewer
+      - name: optional display label
+    """
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        await websocket.close(code=1008)
+        return
+
+    qp = websocket.query_params
+    member_id = (qp.get("memberId") or "").strip() or f"anon:{uuid.uuid4().hex}"
+    role = (qp.get("role") or "viewer").strip().lower()
+    if role not in {"host", "viewer"}:
+        role = "viewer"
+    name = (qp.get("name") or "").strip()
+    if not name:
+        if role == "host":
+            name = "Host"
+        else:
+            tail = member_id[-4:] if member_id else ""
+            name = f"Viewer-{tail}" if tail else "Viewer"
+
+    history = await _LIVECHAT.connect(ref, websocket)
+    try:
+        if history:
+            await websocket.send_json({"type": "history", "messages": history})
+
+        while True:
+            try:
+                data = await websocket.receive_json()
+            except Exception:
+                # Fall back to raw text
+                raw = await websocket.receive_text()
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+
+            if not isinstance(data, dict):
+                continue
+
+            msg_type = str(data.get("type") or "chat").strip().lower()
+            if msg_type != "chat":
+                continue
+
+            text = str(data.get("text") or "").strip()
+            if not text:
+                continue
+
+            client_msg_id = str(data.get("clientMsgId") or "").strip() or uuid.uuid4().hex
+            ts = int(data.get("ts") or int(time.time() * 1000))
+
+            payload = {
+                "type": "chat",
+                "eventRef": ref,
+                "text": text[:4000],
+                "senderId": member_id,
+                "senderRole": role,
+                "name": name,
+                "clientMsgId": client_msg_id,
+                "ts": ts,
+            }
+
+            await _LIVECHAT.broadcast(ref, payload)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        # Never crash the app on websocket errors
+        pass
+    finally:
+        await _LIVECHAT.disconnect(ref, websocket)
 
 
 def _safe_int(val: Any) -> Optional[int]:
