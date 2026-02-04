@@ -476,51 +476,156 @@ def _stream_session_key(brand: str, avatar: str) -> Tuple[str, str]:
     return (_norm_key(brand), _norm_key(avatar))
 
 
-def _set_stream_session_active(brand: str, avatar: str, active: bool, event_ref: str = "") -> None:
-    """Mark a (brand, avatar) BeeStreamed session as active/inactive (best-effort)."""
+def _beestreamed_session_state_db_path() -> str:
+    """Best-effort: use the same sqlite DB we already rely on (voice_video_mappings) to persist
+    BeeStreamed session state across processes/workers."""
+    global _COMPANION_MAPPINGS_SOURCE
     try:
-        key = _stream_session_key(brand, avatar)
-        _BEE_STREAM_SESSION_ACTIVE[key] = bool(active)
-        if active and event_ref:
-            _BEE_STREAM_SESSION_EVENT_REF[key] = str(event_ref).strip()
+        src = str(_COMPANION_MAPPINGS_SOURCE or "").strip()
+        if src and ":" in src:
+            db_path = src.split(":", 1)[0].strip()
+            if db_path and os.path.exists(db_path):
+                return db_path
     except Exception:
-        # Never allow session bookkeeping to break API calls
+        pass
+
+    # Fallback: probe common mapping DB locations.
+    try:
+        for p in _candidate_mapping_db_paths():
+            p = str(p or "").strip()
+            if p and os.path.exists(p):
+                return p
+    except Exception:
+        pass
+
+    return ""
+
+
+def _beestreamed_ensure_session_state_table(conn: "sqlite3.Connection") -> None:
+    """Create the session state table if missing."""
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS beestreamed_session_state (
+                brand_norm TEXT NOT NULL,
+                avatar_norm TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0,
+                event_ref TEXT DEFAULT '',
+                updated_at INTEGER,
+                PRIMARY KEY (brand_norm, avatar_norm)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_beestreamed_session_state_event_ref
+            ON beestreamed_session_state(event_ref)
+            """
+        )
+        conn.commit()
+    except Exception:
+        # Table creation is best-effort; callers will fall back to in-memory state.
         pass
 
 
-def _get_stream_session_active(brand: str, avatar: str) -> bool:
+def _set_stream_session_active(brand: str, avatar: str, active: bool, event_ref: str = "") -> None:
+    key = _stream_session_key(brand, avatar)
+    _BEE_STREAM_SESSION_ACTIVE[key] = bool(active)
+    if event_ref:
+        _BEE_STREAM_SESSION_EVENT_REF[key] = str(event_ref)
+
+    # Persist across workers when possible (best-effort).
+    db_path = _beestreamed_session_state_db_path()
+    if not db_path:
+        return
+
     try:
-        key = _stream_session_key(brand, avatar)
-        return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
+        conn = sqlite3.connect(db_path, timeout=5)
+        _beestreamed_ensure_session_state_table(conn)
+
+        brand_norm, avatar_norm = key
+        now_ts = int(time.time())
+        ev = str(event_ref or "")
+        conn.execute(
+            """
+            INSERT INTO beestreamed_session_state (brand_norm, avatar_norm, active, event_ref, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(brand_norm, avatar_norm) DO UPDATE SET
+                active=excluded.active,
+                event_ref=CASE
+                    WHEN excluded.event_ref != '' THEN excluded.event_ref
+                    ELSE beestreamed_session_state.event_ref
+                END,
+                updated_at=excluded.updated_at
+            """,
+            (brand_norm, avatar_norm, 1 if active else 0, ev, now_ts),
+        )
+        conn.commit()
     except Exception:
-        return False
+        # Best-effort; ignore persistence failures.
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _get_stream_session_active(brand: str, avatar: str) -> bool:
+    key = _stream_session_key(brand, avatar)
+
+    # Prefer persisted state so multiple workers stay in sync.
+    db_path = _beestreamed_session_state_db_path()
+    if db_path:
+        try:
+            conn = sqlite3.connect(db_path, timeout=5)
+            _beestreamed_ensure_session_state_table(conn)
+
+            brand_norm, avatar_norm = key
+            row = conn.execute(
+                """SELECT active FROM beestreamed_session_state
+                   WHERE brand_norm=? AND avatar_norm=? LIMIT 1""",
+                (brand_norm, avatar_norm),
+            ).fetchone()
+            if row is not None:
+                return bool(int(row[0] or 0))
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
 
 
 def _get_stream_session_event_ref(brand: str, avatar: str) -> str:
-    try:
-        key = _stream_session_key(brand, avatar)
-        return str(_BEE_STREAM_SESSION_EVENT_REF.get(key, "") or "").strip()
-    except Exception:
-        return ""
+    key = _stream_session_key(brand, avatar)
 
+    db_path = _beestreamed_session_state_db_path()
+    if db_path:
+        try:
+            conn = sqlite3.connect(db_path, timeout=5)
+            _beestreamed_ensure_session_state_table(conn)
 
-def _is_stream_session_active_for_event_ref(event_ref: str) -> bool:
-    """True iff the BeeStreamed session has been activated by the host (Play) for this event_ref.
+            brand_norm, avatar_norm = key
+            row = conn.execute(
+                """SELECT event_ref FROM beestreamed_session_state
+                   WHERE brand_norm=? AND avatar_norm=? LIMIT 1""",
+                (brand_norm, avatar_norm),
+            ).fetchone()
+            if row is not None and row[0]:
+                return str(row[0])
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    This is used to ensure that only the Host can *initiate* shared in-stream chat.
-    Viewers may only join the chat room after the Host has started the BeeStreamed session.
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return False
-    try:
-        for key, ev in _BEE_STREAM_SESSION_EVENT_REF.items():
-            if str(ev or "").strip() == ref:
-                return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-    except Exception:
-        return False
-    return False
-
+    return str(_BEE_STREAM_SESSION_EVENT_REF.get(key, ""))
 
 # ---------------------------------------------------------------------------
 # BeeStreamed in-stream shared chat (Host + joined Viewers)
@@ -1844,11 +1949,6 @@ async def beestreamed_livechat_send(req: BeeStreamedLiveChatSendRequest):
     if not text:
         return {"ok": True, "status": "empty"}
 
-    # Only the Host can initiate shared in-stream chat. Viewers may only send once the
-    # Host has activated the BeeStreamed session (Host pressed Play).
-    if not _is_stream_session_active_for_event_ref(event_ref):
-        raise HTTPException(status_code=409, detail="Stream session is not active")
-
     member_id = (req.memberId or "").strip() or f"anon:{uuid.uuid4().hex}"
     role = (req.role or "viewer").strip().lower()
     if role not in {"host", "viewer"}:
@@ -1894,22 +1994,6 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
     ref = (event_ref or "").strip()
     if not ref:
         await websocket.close(code=1008)
-        return
-
-    # Only the Host can initiate shared in-stream chat. Reject early join attempts.
-    if not _is_stream_session_active_for_event_ref(ref):
-        try:
-            await websocket.accept()
-        except Exception:
-            pass
-        try:
-            await websocket.send_json({"type": "inactive", "detail": "Stream session is not active"})
-        except Exception:
-            pass
-        try:
-            await websocket.close(code=1008)
-        except Exception:
-            pass
         return
 
     qp = websocket.query_params
