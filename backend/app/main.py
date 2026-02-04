@@ -1402,6 +1402,13 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
             "message": f"Waiting on {resolved_avatar} to start event",
         }
 
+    # Host: mark the stream session as active as soon as the host hits Play.
+    # This drives the "in a live session" gating for everyone else (visitors + members) *before* "Go Live".
+    #
+    # NOTE: We set this flag before talking to BeeStreamed so that even if BeeStreamed calls take a moment,
+    # clients immediately start gating messages.
+    _set_stream_session_active(resolved_brand, resolved_avatar, True, event_ref)
+
     # Host: ensure the event is scheduled for 'now' and then start the WebRTC stream.
     # If BeeStreamed returns a 404 for an existing/stale event_ref, we transparently generate a fresh one,
     # persist it, and retry once.
@@ -1428,10 +1435,21 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
                 event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
                 _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
                 embed_url = f"/stream/beestreamed/embed/{event_ref}"
+
+                # Update session event_ref immediately so pollers see the correct event id.
+                _set_stream_session_active(resolved_brand, resolved_avatar, True, event_ref)
+
                 _start_event(event_ref)
         else:
+            # If we fail to start the event, clear the session flag so clients don't stay gated.
+            _set_stream_session_active(resolved_brand, resolved_avatar, False, "")
             raise
+    except Exception:
+        # Non-HTTP error: clear the session flag so clients don't stay gated.
+        _set_stream_session_active(resolved_brand, resolved_avatar, False, "")
+        raise
 
+    # Ensure the stored session event_ref matches the final event_ref we ended up using.
     _set_stream_session_active(resolved_brand, resolved_avatar, True, event_ref)
 
     return {

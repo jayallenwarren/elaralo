@@ -1173,18 +1173,18 @@ export default function Page() {
 
       const osc = ctx.createOscillator();
       const g = ctx.createGain();
-      g.gain.value = 0.02;
+      g.gain.value = 0.04;
       osc.frequency.value = 40;
       osc.connect(g);
       g.connect(ctx.destination);
-      const stopAt = ctx.currentTime + 0.12;
+      const stopAt = ctx.currentTime + 0.16;
       osc.start();
       osc.stop(stopAt);
 
       window.setTimeout(() => {
         try { osc.disconnect(); } catch (e) {}
         try { g.disconnect(); } catch (e) {}
-      }, 180);
+      }, 220);
     } catch (e) {
       // ignore
     }
@@ -3603,8 +3603,34 @@ const filterMessagesForBackend = (msgs: Msg[]): Msg[] => {
 //       allow them to type freely (no notice), but still queue messages.
 //   - When the host stops streaming (sessionActive -> false): flush queued messages.
 // ---------------------------------------------------------------------
-const streamSessionActive = liveProvider === "stream" && beestreamedSessionActive;
+let streamSessionActive = liveProvider === "stream" && beestreamedSessionActive;
 const userInStreamSession = liveProvider === "stream" && Boolean(streamEmbedUrl || streamEventRef);
+
+// Avoid race with the polling loop:
+// right before deciding to call /chat, do a one-off status check.
+// This ensures the moment the Host hits Play (sessionActive flips) we immediately gate messages.
+if (liveProvider === "stream" && !streamSessionActive && API_BASE && companyName && companionName) {
+  try {
+    const url = new URL(`${API_BASE}/stream/beestreamed/status`);
+    url.searchParams.set("brand", companyName);
+    url.searchParams.set("avatar", companionName);
+
+    const res = await fetch(url.toString(), { cache: "no-store" });
+    if (res.ok) {
+      const data: any = await res.json().catch(() => ({}));
+      const active = Boolean(data?.sessionActive);
+      const hostId = String(data?.hostMemberId || "").trim();
+
+      // Keep UI state in sync (poller will also keep updating).
+      if (active !== Boolean(beestreamedSessionActive)) setBeestreamedSessionActive(active);
+      if (hostId && hostId !== beestreamedHostMemberId) setBeestreamedHostMemberId(hostId);
+
+      streamSessionActive = active;
+    }
+  } catch (e) {
+    // ignore
+  }
+}
 
 if (streamSessionActive) {
   const who = (companionName || "This companion").trim() || "This companion";
@@ -3631,7 +3657,7 @@ if (streamSessionActive) {
   return;
 }
 
-    // If speech-to-text "hands-free" mode is enabled, pause recognition while we send
+// If speech-to-text "hands-free" mode is enabled, pause recognition while we send
     // and while the avatar speaks. We'll auto-resume after speaking finishes.
     const resumeSttAfter = sttEnabledRef.current;
     let resumeScheduled = false;
@@ -4373,22 +4399,18 @@ const pauseSpeechToText = useCallback(() => {
       const text = getCurrentSttText();
       if (!text) return;
 
-      const streamSessionActive = liveProvider === "stream" && beestreamedSessionActive;
-
-      // During BeeStreamed sessions we keep STT running so members can keep talking/typing freely.
-      // We still capture/queue messages, but we do NOT pause STT here (prevents iOS/Safari from getting stuck).
-      if (!streamSessionActive) {
-        // Pause BEFORE we send so the assistant doesn't "talk to itself".
-        pauseSpeechToText();
-      }
-
+      // NOTE:
+      // We intentionally do NOT pause STT here.
+      // - send() already pauses/resumes STT as needed for normal (non-stream) interactions to prevent feedback.
+      // - During BeeStreamed live sessions, send() will *not* call the backend and will *not* pause STT,
+      //   which keeps iOS/Safari stable and lets members keep speaking/typing freely.
       sttFinalRef.current = "";
       sttInterimRef.current = "";
       setInput("");
 
       void sendRef.current(text);
     }, 2000);
-  }, [getCurrentSttText, pauseSpeechToText, liveProvider, beestreamedSessionActive]);
+  }, [getCurrentSttText, clearSttSilenceTimer]);
 
   const requestMicPermission = useCallback(async (): Promise<boolean> => {
     // NOTE: Web Speech API does not reliably prompt on iOS if start() is called
@@ -4702,6 +4724,15 @@ const speakGreetingIfNeeded = useCallback(
         await pauseSpeechToText();
       } catch (e) {}
 
+      // iOS/Safari can start the first post-mic playback in a low/communications-volume route.
+      // Re-prime the audio session right before the first greeting so it isn't feeble.
+      if (mode === "audio") {
+        try { boostAllTtsVolumes(); } catch (e) {}
+        try { await nudgeAudioSession(); } catch (e) {}
+        try { primeLocalTtsAudio(true); } catch (e) {}
+        try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
+      }
+
       const hooks: SpeakAssistantHooks = {
         onWillSpeak: () => {},
         onDidNotSpeak: () => {},
@@ -4742,6 +4773,10 @@ const speakGreetingIfNeeded = useCallback(
     resumeSpeechToText,
     speakAssistantReply,
     speakLocalTtsReply,
+    boostAllTtsVolumes,
+    nudgeAudioSession,
+    primeLocalTtsAudio,
+    ensureIphoneAudioContextUnlocked,
   ],
 );
 
