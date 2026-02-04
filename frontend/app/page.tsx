@@ -5578,6 +5578,19 @@ const viewerCanStopStream =
     avatarStatus === "connecting" ||
     avatarStatus === "reconnecting");
 
+
+// Host requirement: in Live Stream mode, the Stop button must be enabled for the host
+// even when mic/STT isn't running, so the host can end the underlying stream session.
+const hostCanStopStream =
+  liveProvider === "stream" &&
+  streamCanStart &&
+  Boolean(streamEmbedUrl || streamEventRef) &&
+  (avatarStatus === "connected" ||
+    avatarStatus === "waiting" ||
+    avatarStatus === "connecting" ||
+    avatarStatus === "reconnecting");
+
+
 const sttControls = (
 
     <>
@@ -5607,7 +5620,7 @@ const sttControls = (
       <button
         type="button"
         onClick={handleStopClick}
-        disabled={!(sttEnabled || viewerCanStopStream)}
+        disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream)}
         title="Stop"
         style={{
           width: 44,
@@ -5616,8 +5629,8 @@ const sttControls = (
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: (sttEnabled || viewerCanStopStream) ? "pointer" : "not-allowed",
-          opacity: (sttEnabled || viewerCanStopStream) ? 1 : 0.45,
+          cursor: (sttEnabled || viewerCanStopStream || hostCanStopStream) ? "pointer" : "not-allowed",
+          opacity: (sttEnabled || viewerCanStopStream || hostCanStopStream) ? 1 : 0.45,
           fontWeight: 700,
         }}
       >
@@ -5879,6 +5892,13 @@ const modePillControls = (
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
       <button
         onClick={() => {
+          // Live Stream (BeeStreamed): this control is "Start" only. Stopping is done via the Stop (■) button.
+          if (liveProvider === "stream") {
+            void startLiveAvatar();
+            return;
+          }
+
+          // Live Avatar (D-ID): toggle Start/Stop.
           if (
             avatarStatus === "connected" ||
             avatarStatus === "connecting" ||
@@ -5904,31 +5924,59 @@ const modePillControls = (
             })();
           }
         }}
-        disabled={viewerHasJoinedStream}
+        disabled={
+          viewerHasJoinedStream ||
+          (liveProvider === "stream" &&
+            (avatarStatus === "connecting" || (streamCanStart && !!streamEmbedUrl)))
+        }
         style={{
           padding: "10px 14px",
           borderRadius: 10,
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: viewerHasJoinedStream ? "not-allowed" : "pointer",
-          opacity: viewerHasJoinedStream ? 0.6 : 1,
+          cursor:
+            viewerHasJoinedStream ||
+            (liveProvider === "stream" &&
+              (avatarStatus === "connecting" || (streamCanStart && !!streamEmbedUrl)))
+              ? "not-allowed"
+              : "pointer",
+          opacity:
+            viewerHasJoinedStream ||
+            (liveProvider === "stream" &&
+              (avatarStatus === "connecting" || (streamCanStart && !!streamEmbedUrl)))
+              ? 0.6
+              : 1,
           fontWeight: 700,
         }}
         aria-label={
-          avatarStatus === "connected" ||
-          avatarStatus === "connecting" ||
-          avatarStatus === "reconnecting"
+          liveProvider === "stream"
+            ? "Start Live Stream"
+            : avatarStatus === "connected" ||
+              avatarStatus === "connecting" ||
+              avatarStatus === "reconnecting"
             ? "Stop Live Avatar"
             : "Start Live Avatar"
         }
-        title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
+        title={
+          viewerHasJoinedStream
+            ? "Already joined. Press Stop to leave."
+            : liveProvider === "stream" && (streamCanStart && !!streamEmbedUrl)
+            ? "Streaming started. Use Stop to end."
+            : liveProvider === "stream" && avatarStatus === "connecting"
+            ? "Starting stream..."
+            : "Video"
+        }
       >
-        {avatarStatus === "connected" ||
-        avatarStatus === "connecting" ||
-        avatarStatus === "reconnecting"
-          ? <PauseIcon />
-          : <PlayIcon />}
+        {liveProvider === "stream" ? (
+          <PlayIcon />
+        ) : avatarStatus === "connected" ||
+          avatarStatus === "connecting" ||
+          avatarStatus === "reconnecting" ? (
+          <PauseIcon />
+        ) : (
+          <PlayIcon />
+        )}
       </button>
 
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
