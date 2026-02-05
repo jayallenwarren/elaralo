@@ -1884,6 +1884,9 @@ const stopLiveAvatar = useCallback(async () => {
         setStreamEventRef("");
         setStreamCanStart(false);
         setStreamNotice("");
+
+        // Leaving the in-stream experience (Stop pressed).
+        joinedStreamRef.current = false;
       }
 
       // Host stop -> mark global session inactive immediately (poll will also confirm)
@@ -2037,14 +2040,22 @@ setStreamEventRef(eventRef);
 
     setStreamCanStart(canStart);
 
+    // This client has now explicitly joined the in-stream experience (until Stop is pressed).
+    joinedStreamRef.current = true;
+
     // Host started a BeeStreamed session -> mark global session active immediately (poll will also confirm)
     if (canStart) setBeestreamedSessionActive(true);
 
     if (!canStart) {
-      setStreamNotice(
-        `Waiting on ${companionName || "the host"} to start event`
-      );
-      setAvatarStatus("waiting");
+      // If the host session is already active, the viewer shouldn't stay in the "waiting" UX.
+      // They can watch immediately and participate in the shared in-stream chat.
+      if (beestreamedSessionActive) {
+        setStreamNotice("");
+        setAvatarStatus("connected");
+      } else {
+        setStreamNotice(`Waiting on ${companionName || "the host"} to start event`);
+        setAvatarStatus("waiting");
+      }
     } else if (String(data?.status || "").trim() === "start_failed") {
       setStreamNotice("");
       setAvatarStatus("error");
@@ -3060,8 +3071,10 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   // Connect/disconnect the live chat websocket as the viewer/host joins/leaves the stream UI.
   useEffect(() => {
     const eventRef = String(streamEventRef || '').trim();
+    // IMPORTANT: this must be independent from the current UI mode (liveProvider).
+    // Once a user has joined the in-stream experience, they should remain connected to
+    // shared chat until they explicitly press Stop.
     const inStreamUi =
-      liveProvider === 'stream' &&
       Boolean(beestreamedSessionActive) &&
       Boolean(streamEmbedUrl || streamEventRef) &&
       !!eventRef;
@@ -3177,7 +3190,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
         if (ws) ws.close();
       } catch (e) {}
     };
-  }, [API_BASE, liveProvider, beestreamedSessionActive, streamEmbedUrl, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, appendLiveChatMessage]);
+  }, [API_BASE, beestreamedSessionActive, streamEmbedUrl, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, appendLiveChatMessage]);
 
   const sendLiveChatMessage = useCallback(
     async (text: string, clientMsgId: string) => {
@@ -3243,6 +3256,13 @@ const streamDeferredQueueRef = useRef<Array<{ text: string; state: SessionState;
 const streamDeferredFlushInFlightRef = useRef<boolean>(false);
 const streamPreSessionHistoryRef = useRef<Msg[] | null>(null);
 const prevBeeStreamedSessionActiveRef = useRef<boolean>(false);
+
+// True when THIS browser session has explicitly joined the in-stream experience
+// (Play pressed and not yet stopped). This is intentionally independent from the
+// global beestreamedSessionActive flag, because that flag indicates that *someone*
+// (the Host) is streaming, while this ref indicates whether *this user* is in the
+// shared in-stream chat.
+const joinedStreamRef = useRef<boolean>(false);
 
 // Keep refs to the latest state for async flush logic (avoids stale closures).
 const messagesRef = useRef<Msg[]>([]);
@@ -3372,6 +3392,19 @@ useEffect(() => {
   };
 }, [API_BASE, companyName, companionName]);
 
+// Viewer UX: if a viewer joined before the host activated the session, we initially show a
+// "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
+// remove the waiting notice.
+useEffect(() => {
+  if (!beestreamedSessionActive) return;
+  if (streamCanStart) return; // host
+  if (!joinedStreamRef.current) return;
+  if (avatarStatus !== "waiting") return;
+
+  setStreamNotice("");
+  setAvatarStatus("connected");
+}, [beestreamedSessionActive, streamCanStart, avatarStatus]);
+
   // Reset broadcaster UI when switching companion / provider.
 useEffect(() => {
   // Broadcaster overlay is stream-only and must never persist across companion/provider switches.
@@ -3387,6 +3420,7 @@ useEffect(() => {
   streamDeferredQueueRef.current = [];
   streamPreSessionHistoryRef.current = null;
   prevBeeStreamedSessionActiveRef.current = false;
+  joinedStreamRef.current = false;
 
   setBeestreamedHostMemberId("");
   setBeestreamedSessionActive(false);
@@ -4024,7 +4058,10 @@ const filterMessagesForBackend = (msgs: Msg[]): Msg[] => {
 //   - When the host stops streaming (sessionActive -> false): flush queued messages.
 // ---------------------------------------------------------------------
 let streamSessionActive = Boolean(beestreamedSessionActive);
-const userInStreamSession = liveProvider === "stream" && Boolean(streamEmbedUrl || streamEventRef);
+  // Whether THIS user is currently inside the shared in-stream experience.
+  // (Important: this must NOT depend on the current UI mode selection; users can switch modes
+  // and must still remain blocked from AI while the host is live until the stream ends.)
+  const userInStreamSession = joinedStreamRef.current;
 
 // Avoid race with the polling loop:
 // right before deciding to call /chat, do a one-off status check.
@@ -5444,10 +5481,21 @@ const speakGreetingIfNeeded = useCallback(
         setStreamEventRef("");
         setStreamCanStart(false);
         setStreamNotice("");
+
+        // Viewer explicitly left the in-stream experience.
+        joinedStreamRef.current = false;
       } catch (e) {}
       try {
         setAvatarStatus("idle");
         setAvatarError(null);
+      } catch (e) {}
+    }
+
+    // Host (Live Stream): ensure Stop always ends the session even if mic/STT isn't running.
+    // (This is idempotent; stopLiveAvatar has its own in-flight guard.)
+    if (liveProvider === "stream" && streamCanStart && (streamEmbedUrl || streamEventRef)) {
+      try {
+        void stopLiveAvatar();
       } catch (e) {}
     }
 
@@ -5457,7 +5505,7 @@ const speakGreetingIfNeeded = useCallback(
     try { void nudgeAudioSession(); } catch (e) {}
     try { primeLocalTtsAudio(true); } catch (e) {}
     try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, streamEmbedUrl, streamEventRef]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, streamEmbedUrl, streamEventRef, stopLiveAvatar]);
 
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
@@ -5610,7 +5658,17 @@ const speakGreetingIfNeeded = useCallback(
 const viewerCanStopStream =
   liveProvider === "stream" &&
   !streamCanStart &&
-  !!streamEmbedUrl &&
+  Boolean(streamEmbedUrl || streamEventRef) &&
+  (avatarStatus === "connected" ||
+    avatarStatus === "waiting" ||
+    avatarStatus === "connecting" ||
+    avatarStatus === "reconnecting");
+
+// Host requirement: Stop must end the live session (and send the end-event signal to BeeStreamed).
+const hostCanStopStream =
+  liveProvider === "stream" &&
+  streamCanStart &&
+  Boolean(streamEmbedUrl || streamEventRef) &&
   (avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
@@ -5645,7 +5703,7 @@ const sttControls = (
       <button
         type="button"
         onClick={handleStopClick}
-        disabled={!(sttEnabled || viewerCanStopStream)}
+        disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream)}
         title="Stop"
         style={{
           width: 44,
@@ -5654,8 +5712,8 @@ const sttControls = (
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: (sttEnabled || viewerCanStopStream) ? "pointer" : "not-allowed",
-          opacity: (sttEnabled || viewerCanStopStream) ? 1 : 0.45,
+          cursor: (sttEnabled || viewerCanStopStream || hostCanStopStream) ? "pointer" : "not-allowed",
+          opacity: (sttEnabled || viewerCanStopStream || hostCanStopStream) ? 1 : 0.45,
           fontWeight: 700,
         }}
       >
@@ -5917,6 +5975,14 @@ const modePillControls = (
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
       <button
         onClick={() => {
+          // Stream provider: Play = join/start. It must NOT toggle to Pause.
+          // Leaving the session is done exclusively via Stop.
+          if (liveProvider === "stream") {
+            if (viewerHasJoinedStream || avatarStatus !== "idle") return;
+            void startLiveAvatar();
+            return;
+          }
+
           if (
             avatarStatus === "connected" ||
             avatarStatus === "connecting" ||
@@ -5942,31 +6008,39 @@ const modePillControls = (
             })();
           }
         }}
-        disabled={viewerHasJoinedStream}
+        disabled={liveProvider === "stream" ? viewerHasJoinedStream || avatarStatus !== "idle" : false}
         style={{
           padding: "10px 14px",
           borderRadius: 10,
           border: "1px solid #111",
           background: "#fff",
           color: "#111",
-          cursor: viewerHasJoinedStream ? "not-allowed" : "pointer",
-          opacity: viewerHasJoinedStream ? 0.6 : 1,
+          cursor:
+            liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle")
+              ? "not-allowed"
+              : "pointer",
+          opacity:
+            liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle") ? 0.6 : 1,
           fontWeight: 700,
         }}
         aria-label={
-          avatarStatus === "connected" ||
-          avatarStatus === "connecting" ||
-          avatarStatus === "reconnecting"
-            ? "Stop Live Avatar"
-            : "Start Live Avatar"
+          liveProvider === "stream"
+            ? viewerHasJoinedStream
+              ? "Already joined"
+              : "Join live stream"
+            : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting"
+              ? "Stop Live Avatar"
+              : "Start Live Avatar"
         }
         title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
       >
-        {avatarStatus === "connected" ||
-        avatarStatus === "connecting" ||
-        avatarStatus === "reconnecting"
-          ? <PauseIcon />
-          : <PlayIcon />}
+        {liveProvider === "stream" ? (
+          <PlayIcon />
+        ) : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" ? (
+          <PauseIcon />
+        ) : (
+          <PlayIcon />
+        )}
       </button>
 
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}

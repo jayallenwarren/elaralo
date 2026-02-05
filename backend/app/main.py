@@ -1788,6 +1788,10 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     # If BeeStreamed returns a 404 for an existing/stale event_ref, we transparently generate a fresh one,
     # persist it, and retry once.
     def _start_event(_ref: str) -> None:
+        # If a previous session ended the event (e.g., status="done"), reset back to a reusable
+        # state before starting WebRTC. Best-effort: do not fail the entire start if this patch
+        # is rejected by BeeStreamed.
+        _beestreamed_patch_event_status_best_effort(_ref, "idle")
         _beestreamed_schedule_now_sync(
             _ref,
             title=f"{resolved_avatar} Live",
@@ -2034,8 +2038,10 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
 
     _beestreamed_stop_webrtc_sync(event_ref)
 
-    # Best-effort: ensure the event is not left in a 'live' state (keeps the event reusable).
-    _beestreamed_patch_event_status_best_effort(event_ref, "idle")
+    # Best-effort: ensure the event is not left in a 'live' state once Stop is pressed.
+    # BeeStreamed supports status values including: idle, live, video, done, force_live.
+    # We use "done" to explicitly end the event session.
+    _beestreamed_patch_event_status_best_effort(event_ref, "done")
 
 
     # Mark session inactive for global gating (host-only)
