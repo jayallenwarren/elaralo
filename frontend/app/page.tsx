@@ -6677,7 +6677,7 @@ const modePillControls = (
               lineHeight: 1.35,
               whiteSpace: "pre-wrap",
               wordBreak: "break-word",
-              overflowY: "auto"
+              overflowY: "auto",
               maxHeight: "26vh",
               borderRadius: 10,
               padding: 8,
