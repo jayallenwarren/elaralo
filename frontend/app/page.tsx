@@ -994,6 +994,11 @@ export default function Page() {
 
   const sessionIdRef = useRef<string | null>(null);
 
+  // Keep the latest Wix memberId available for callbacks defined earlier in this file.
+  // This avoids TypeScript/TDZ issues where a callback dependency array would otherwise
+  // reference `memberId` before its declaration.
+  const memberIdRef = useRef<string>("");
+
   // -----------------------
   // Debug overlay (mobile-friendly)
   // Enable with ?debug=1 OR tap the avatar image 5 times quickly.
@@ -1835,7 +1840,7 @@ const stopLiveAvatar = useCallback(async () => {
 
   // BeeStreamed (Human companion) — stop the stream and clear the embed.
   if (streamEmbedUrl || streamEventRef) {
-    const hostStopping = Boolean(isBeeStreamedHost || streamCanStart);
+    const hostStopping = Boolean(streamCanStart);
     let stopSucceeded = false;
 
     try {
@@ -1848,7 +1853,7 @@ const stopLiveAvatar = useCallback(async () => {
           body: JSON.stringify({
             brand: companyName,
             avatar: companionName,
-            memberId: memberId || "",
+            memberId: memberIdRef.current || "",
             eventRef: streamEventRef || undefined,
           }),
         });
@@ -1930,7 +1935,7 @@ const stopLiveAvatar = useCallback(async () => {
     setAvatarStatus("idle");
     setAvatarError(null);
   }
-}, [cleanupIphoneLiveAvatarAudio, streamEmbedUrl, streamEventRef, streamCanStart, isBeeStreamedHost, API_BASE, companyName, companionName, memberId]);
+}, [cleanupIphoneLiveAvatarAudio, streamEmbedUrl, streamEventRef, streamCanStart, API_BASE, companyName, companionName]);
 
 const reconnectLiveAvatar = useCallback(async () => {
   const mgr = didAgentMgrRef.current;
@@ -1981,7 +1986,7 @@ if (liveProvider === "stream") {
         brand: companyName,
         avatar: companionName,
         embedDomain,
-        memberId: memberId || "",
+        memberId: memberIdRef.current || "",
       }),
     });
 
@@ -2863,6 +2868,11 @@ const speakAssistantReply = useCallback(
   const [planName, setPlanName] = useState<PlanName>(null);
   const [memberId, setMemberId] = useState<string>("");
 
+  // Sync memberId into a ref so callbacks defined above can always access the latest value.
+  useEffect(() => {
+    memberIdRef.current = String(memberId || "").trim();
+  }, [memberId]);
+
   // Stable member id used for live chat (Wix memberId when available, otherwise anon:...)
   const brandKeyForAnon = useMemo(() => {
     // `rebranding` is derived from RebrandingKey and is safe to use here.
@@ -2896,7 +2906,7 @@ const speakAssistantReply = useCallback(
         body: JSON.stringify({
           brand: companyName,
           avatar: companionName,
-          memberId: memberId || "",
+          memberId: memberIdRef.current || "",
           embedDomain,
         }),
       })
@@ -3415,7 +3425,7 @@ useEffect(() => {
           brand: companyName,
           avatar: companionName,
           embedDomain,
-          memberId: memberId || "",
+          memberId: memberIdRef.current || "",
         }),
       });
 
