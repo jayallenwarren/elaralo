@@ -18,7 +18,6 @@ try:
 except Exception:  # pragma: no cover
     from pydantic.v1 import BaseModel, validator  # type: ignore
 
-
 from filelock import FileLock  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request
