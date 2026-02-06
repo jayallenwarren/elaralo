@@ -77,12 +77,14 @@ type CompanionMappingRow = {
   found?: boolean;
   brand?: string;
   avatar?: string;
-  communication?: string; // "Audio" | "Video"
+  channel_cap?: string; // "Audio" | "Video"
+  channelCap?: string; // optional camelCase alias
   live?: string; // "D-ID" | "Stream"
   didClientKey?: string;
   didAgentId?: string;
   elevenVoiceId?: string;
 };
+
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
@@ -1504,11 +1506,29 @@ export default function Page() {
           avatar
         )}`;
         const res = await fetch(url, { method: "GET" });
-        const json = (await res.json()) as CompanionMappingRow;
+
+        // Strict API: 200 => mapping exists, 404 => mapping missing.
+        let json: any = null;
+        try {
+          json = await res.json();
+        } catch (e) {
+          json = null;
+        }
+
         if (cancelled) return;
 
-        if (res.ok && (json as any)?.found) setCompanionMapping(json);
-        else setCompanionMapping(null);
+        if (!res.ok) {
+          console.error("[mappings] companion mapping lookup failed", {
+            brand,
+            avatar,
+            status: res.status,
+            body: json,
+          });
+          setCompanionMapping(null);
+          return;
+        }
+
+        setCompanionMapping(json as CompanionMappingRow);
       } catch (e) {
         if (!cancelled) setCompanionMapping(null);
       }
@@ -1655,9 +1675,16 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
-  const commFromDb = String(companionMapping?.communication || "").trim().toLowerCase();
-  if (commFromDb === "video") return "video";
-  if (commFromDb === "audio") return "audio";
+  // IMPORTANT: Do not use the legacy `communication` column.
+  // The DB contract is: channel_cap ∈ {"Video","Audio"} (case-insensitive).
+  const capFromDb = String(
+    (companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? ""
+  )
+    .trim()
+    .toLowerCase();
+
+  if (capFromDb === "video") return "video";
+  if (capFromDb === "audio") return "audio";
   return "";
 }, [companionMapping]);
 
@@ -6049,147 +6076,147 @@ const modePillControls = (
         </div>
       </header>
 
-{liveEnabled ? (
-  <section
-    style={{
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 12,
-      marginBottom: 12,
-      flexWrap: "wrap",
-    }}
-  >
-    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-      <button
-        onClick={() => {
-          // Stream provider: Play = join/start. It must NOT toggle to Pause.
-          // Leaving the session is done exclusively via Stop.
-          if (liveProvider === "stream") {
-            if (viewerHasJoinedStream || avatarStatus !== "idle") return;
-            void startLiveAvatar();
-            return;
-          }
-
-          if (
-            avatarStatus === "connected" ||
-            avatarStatus === "connecting" ||
-            avatarStatus === "reconnecting"
-          ) {
-            void stopLiveAvatar();
-          } else {
-            void (async () => {
-              // Live Avatar requires microphone / STT. Start it automatically.
-              // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
-              if (sttEnabledRef.current && useBackendStt) {
-                stopSpeechToText();
-              }
-
-              if (!sttEnabledRef.current) {
-                await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
-              }
-
-              // If mic permission was denied, don't start Live Avatar.
-              if (!sttEnabledRef.current) return;
-
-              await startLiveAvatar();
-            })();
-          }
-        }}
-        disabled={liveProvider === "stream" ? viewerHasJoinedStream || avatarStatus !== "idle" : false}
+<section
         style={{
-          padding: "10px 14px",
-          borderRadius: 10,
-          border: "1px solid #111",
-          background: "#fff",
-          color: "#111",
-          cursor:
-            liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle")
-              ? "not-allowed"
-              : "pointer",
-          opacity:
-            liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle") ? 0.6 : 1,
-          fontWeight: 700,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          marginBottom: 12,
+          flexWrap: "wrap",
         }}
-        aria-label={
-          liveProvider === "stream"
-            ? viewerHasJoinedStream
-              ? "Already joined"
-              : "Join live stream"
-            : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting"
-              ? "Stop Live Avatar"
-              : "Start Live Avatar"
-        }
-        title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
       >
-        {liveProvider === "stream" ? (
-          <PlayIcon />
-        ) : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" ? (
-          <PauseIcon />
-        ) : (
-          <PlayIcon />
-        )}
-      </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <button
+            onClick={() => {
+              // IMPORTANT: The Play (Video) control is never hidden.
+              // When video is not available for the current companion (liveEnabled=false),
+              // the button is disabled and does nothing.
+              if (!liveEnabled) return;
 
-      {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
-      {sttControls}
+              // Stream provider: Play = join/start. It must NOT toggle to Pause.
+              // Leaving the session is done exclusively via Stop.
+              if (liveProvider === "stream") {
+                if (viewerHasJoinedStream || avatarStatus !== "idle") return;
+                void startLiveAvatar();
+                return;
+              }
 
-      {liveProvider === "stream" && !isBeeStreamedHost ? (
-        <button
-          type="button"
-          onClick={changeViewerLiveChatName}
-          style={{
-            border: "none",
-            background: "transparent",
-            padding: 0,
-            margin: 0,
-            fontSize: 12,
-            color: "#111",
-            textDecoration: "underline",
-            cursor: "pointer",
-            whiteSpace: "nowrap",
-          }}
-          aria-label="Change username"
-          title="Change the name shown to others during the live session"
-        >
-          {String(viewerLiveChatName || "").trim() ? "Change username" : "Set username"}
-        </button>
-      ) : null}
+              if (
+                avatarStatus === "connected" ||
+                avatarStatus === "connecting" ||
+                avatarStatus === "reconnecting"
+              ) {
+                void stopLiveAvatar();
+              } else {
+                void (async () => {
+                  // Live Avatar requires microphone / STT. Start it automatically.
+                  // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
+                  if (sttEnabledRef.current && useBackendStt) {
+                    stopSpeechToText();
+                  }
 
-      <div style={{ fontSize: 12, color: "#666" }}>
-        Live Avatar: <b>{avatarStatus}</b>
-        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
-      </div>
-    </div>
+                  if (!sttEnabledRef.current) {
+                    await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
+                  }
 
-    {/* Right-justified Mode controls */}
-    {modePillControls}
-  </section>
-) : (
-  <section
-    style={{
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 12,
-      marginBottom: 12,
-      flexWrap: "wrap",
-    }}
-  >
-    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-      {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
-      {sttControls}
+                  // If mic permission was denied, don't start Live Avatar.
+                  if (!sttEnabledRef.current) return;
 
-      <div style={{ fontSize: 12, color: "#666" }}>
-        Live Avatar: <b>{avatarStatus}</b>
-        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
-      </div>
-    </div>
+                  await startLiveAvatar();
+                })();
+              }
+            }}
+            disabled={
+              !liveEnabled ||
+              (liveProvider === "stream" ? viewerHasJoinedStream || avatarStatus !== "idle" : false)
+            }
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: "#fff",
+              color: "#111",
+              cursor:
+                !liveEnabled ||
+                (liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle"))
+                  ? "not-allowed"
+                  : "pointer",
+              opacity:
+                !liveEnabled ||
+                (liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle"))
+                  ? 0.6
+                  : 1,
+              fontWeight: 700,
+            }}
+            aria-label={
+              !liveEnabled
+                ? "Video not available"
+                : liveProvider === "stream"
+                ? viewerHasJoinedStream
+                  ? "Already joined"
+                  : "Join live stream"
+                : avatarStatus === "connected" ||
+                  avatarStatus === "connecting" ||
+                  avatarStatus === "reconnecting"
+                ? "Stop Live Avatar"
+                : "Start Live Avatar"
+            }
+            title={
+              !liveEnabled
+                ? "Video not available for this companion"
+                : liveProvider === "stream" && viewerHasJoinedStream
+                ? "Already joined. Press Stop to leave."
+                : "Video"
+            }
+          >
+            {liveProvider === "stream" ? (
+              <PlayIcon />
+            ) : avatarStatus === "connected" ||
+              avatarStatus === "connecting" ||
+              avatarStatus === "reconnecting" ? (
+              <PauseIcon />
+            ) : (
+              <PlayIcon />
+            )}
+          </button>
 
-    {/* Right-justified Mode controls */}
-    {modePillControls}
-  </section>
-)}
+          {/* Place mic/stop controls to the right of the video control */}
+          {sttControls}
+
+          {liveEnabled && liveProvider === "stream" && !isBeeStreamedHost ? (
+            <button
+              type="button"
+              onClick={changeViewerLiveChatName}
+              style={{
+                border: "none",
+                background: "transparent",
+                padding: 0,
+                margin: 0,
+                fontSize: 12,
+                color: "#111",
+                textDecoration: "underline",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+              aria-label="Change username"
+              title="Change the name shown to others during the live session"
+            >
+              {String(viewerLiveChatName || "").trim() ? "Change username" : "Set username"}
+            </button>
+          ) : null}
+
+          <div style={{ fontSize: 12, color: "#666" }}>
+            Live Avatar: <b>{avatarStatus}</b>
+            {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+          </div>
+        </div>
+
+        {/* Right-justified Mode controls */}
+        {modePillControls}
+      </section>
+
+
 
 
 

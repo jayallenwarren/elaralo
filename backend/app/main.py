@@ -613,8 +613,13 @@ def _load_companion_mappings_sync() -> None:
 
         brand = str(get_col("brand", "rebranding", "company", "brand_id", "Brand", default="") or "").strip()
         avatar = str(get_col("avatar", "companion", "Companion", "first_name", "firstname", default="") or "").strip()
-        if not brand or not avatar:
+
+        # Core brand (Elaralo): some DBs store brand as empty/NULL for core rows.
+        # Treat that as the core brand name so lookups by brand="Elaralo" work.
+        if not avatar:
             continue
+        if not brand:
+            brand = "Elaralo"
 
         key = (_norm_key(brand), _norm_key(avatar))
 
@@ -624,12 +629,8 @@ def _load_companion_mappings_sync() -> None:
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
             # UI uses channel_cap to decide whether to show the video/play controls.
             # Many DBs also have a legacy "communication" column; prefer channel_cap when present.
-            "communication": str(
-                (
-                    get_col("channel_cap", "channelCap", "channel_capability", default="")
-                    or get_col("communication", "Communication", default="")
-                    or ""
-                )
+            "channel_cap": str(
+                get_col("channel_cap", "chanel_cap", "channelCap", "channel_capability", default="") or ""
             ),
             "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
             "live": str(get_col("live", "Live", default="") or ""),
@@ -685,7 +686,6 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         found: bool,
         brand: str,
         avatar: str,
-        communication: "Audio"|"Video"|"" ,
         live: "D-ID"|"Stream"|"" ,
         elevenVoiceId: str,
         elevenVoiceName: str,
@@ -702,27 +702,24 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
 
     m = _lookup_companion_mapping(b, a)
     if not m:
-        return {
-            "found": False,
-            "brand": b,
-            "avatar": a,
-            "communication": "",
-            "live": "",
-            "elevenVoiceId": "",
-            "elevenVoiceName": "",
-            "didAgentId": "",
-            "didClientKey": "",
-            "didAgentLink": "",
-            "didEmbedCode": "",
-            "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-            "source": _COMPANION_MAPPINGS_SOURCE,
-        }
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "Companion mapping not found",
+                "brand": b,
+                "avatar": a,
+                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+                "source": _COMPANION_MAPPINGS_SOURCE,
+                "table": _COMPANION_MAPPINGS_TABLE,
+            },
+        )
 
     return {
         "found": True,
         "brand": str(m.get("brand") or ""),
         "avatar": str(m.get("avatar") or ""),
-        "communication": str(m.get("communication") or ""),
+        "channelCap": str(m.get("channel_cap") or ""),
+        "channel_cap": str(m.get("channel_cap") or ""),
         "live": str(m.get("live") or ""),
         "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
         "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
