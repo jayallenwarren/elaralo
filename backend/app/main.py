@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+
+import logging
+logging.warning("BOOT SIGNATURE: threadingfix-2026-02-06")
 import os
 import time
 import re
