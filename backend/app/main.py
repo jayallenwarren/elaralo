@@ -8,16 +8,13 @@ import json
 import hashlib
 import base64
 import asyncio
-from collections import deque
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel
-
 from filelock import FileLock  # type: ignore
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
@@ -45,80 +42,84 @@ app = FastAPI(title="Elaralo API")
 # ----------------------------
 # CORS
 # ----------------------------
-# Strict CORS configuration.
-#
-# Requirements (per project policy):
-#   - Allowed origins MUST be provided via the CORS_ALLOW_ORIGINS env var.
-#   - The value MUST be a comma-separated (or whitespace-separated) list of exact Origins
-#     (scheme + host + optional port). Example:
-#       https://example.com,http://localhost:3000
-#   - No pattern matching is supported.
-#   - If CORS_ALLOW_ORIGINS is missing or empty, the API fails fast at startup.
-cors_env = os.getenv("CORS_ALLOW_ORIGINS")
+# CORS_ALLOW_ORIGINS can be:
+#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
+#   - entries with wildcards (e.g. https://*.azurestaticapps.net)
+#   - or a single "*" to allow all (NOT recommended for production)
+cors_env = (
+    os.getenv("CORS_ALLOW_ORIGINS", "")
+    or getattr(settings, "CORS_ALLOW_ORIGINS", None)
+    or ""
+).strip()
 
-if cors_env is None or not cors_env.strip():
-    raise RuntimeError(
-        "CORS_ALLOW_ORIGINS is required. Set it to a comma-separated list of allowed Origins."
-    )
+def _split_cors_origins(raw: str) -> list[str]:
+    """Split + normalize CORS origins from an env var.
 
-from urllib.parse import urlparse
-
-_WILDCARD_CHAR = chr(42)  # ASCII 42
-
-def _split_cors_origins_strict(raw: str) -> list[str]:
-    """Split + normalize strict CORS origins.
-
-    - Accepts comma and/or whitespace separation.
-    - Removes trailing slashes (browser Origin never includes a trailing slash).
-    - De-dupes while preserving order.
-    - Validates that each entry is a well-formed Origin (no path/query/fragment).
+    Supports comma and/or whitespace separation.
+    Removes trailing slashes (browser Origin never includes a trailing slash).
+    De-dupes while preserving order.
     """
+    if not raw:
+        return []
     tokens = re.split(r"[\s,]+", raw.strip())
     out: list[str] = []
     seen: set[str] = set()
-
     for t in tokens:
-        t = (t or "").strip()
         if not t:
             continue
-
-        if _WILDCARD_CHAR in t:
-            raise RuntimeError(
-                "CORS_ALLOW_ORIGINS contains an invalid character. Only exact Origins are allowed."
-            )
-
-        if t.endswith("/"):
+        t = t.strip()
+        if not t:
+            continue
+        if t != "*" and t.endswith("/"):
             t = t.rstrip("/")
-
-        p = urlparse(t)
-        if p.scheme not in ("http", "https") or not p.netloc:
-            raise RuntimeError(f"Invalid CORS origin: {t}")
-        if p.path not in ("", "/") or p.params or p.query or p.fragment:
-            raise RuntimeError(f"Invalid CORS origin (must not include a path/query): {t}")
-
-        origin = f"{p.scheme}://{p.netloc}"
-        if origin not in seen:
-            out.append(origin)
-            seen.add(origin)
-
-    if not out:
-        raise RuntimeError(
-            "CORS_ALLOW_ORIGINS is required and must contain at least one valid Origin."
-        )
-
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
     return out
 
-allow_origins: list[str] = _split_cors_origins_strict(cors_env)
+raw_items = _split_cors_origins(cors_env)
+allow_all = (len(raw_items) == 1 and raw_items[0] == "*")
 
-# Explicitly enumerate methods/headers (no allow-all settings).
+allow_origins: list[str] = []
+allow_origin_regex: str | None = None
+allow_credentials = True
+
+if allow_all:
+    # Allow-all is only enabled when explicitly configured via "*".
+    allow_origins = ["*"]
+    allow_credentials = False  # cannot be True with wildcard
+else:
+    # Support optional wildcards (e.g., "https://*.azurestaticapps.net").
+    literal: list[str] = []
+    wildcard: list[str] = []
+    for o in raw_items:
+        if "*" in o:
+            wildcard.append(o)
+        else:
+            literal.append(o)
+
+    allow_origins = literal
+
+    if wildcard:
+        # Convert wildcard origins to a regex.
+        parts: list[str] = []
+        for w in wildcard:
+            parts.append("^" + re.escape(w).replace("\\*", ".*") + "$")
+        allow_origin_regex = "|".join(parts)
+
+    # Security-first default: if CORS_ALLOW_ORIGINS is empty, we do NOT allow browser cross-origin calls.
+    # (Server-to-server calls without an Origin header still work.)
+    if not allow_origins and not allow_origin_regex:
+        print("[CORS] WARNING: CORS_ALLOW_ORIGINS is empty. Browser requests from other origins will be blocked.")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Accept", "Authorization", "X-Requested-With", "X-Admin-Token"],
+    allow_origin_regex=allow_origin_regex,
+    allow_credentials=allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
 
 # ----------------------------
 # Routes
@@ -444,585 +445,104 @@ _COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _COMPANION_MAPPINGS_LOADED_AT: float | None = None
 _COMPANION_MAPPINGS_SOURCE: str = ""
 
-# BeeStreamed live-session tracking (best-effort, in-memory; resets on API restart)
-_BEE_STREAM_SESSION_ACTIVE: Dict[Tuple[str, str], bool] = {}
-_BEE_STREAM_SESSION_EVENT_REF: Dict[Tuple[str, str], str] = {}
-
-
 
 def _norm_key(s: str) -> str:
-    """Normalize mapping lookup keys.
+    return (s or "").strip().lower()
 
-    The mapping DB is manually edited across rebrands and historically contains
-    inconsistent brand formatting (e.g., "DulceMoon" vs "Dulce Moon").
-    We normalize by:
-      - lowercasing
-      - stripping
-      - removing whitespace and underscores
 
-    IMPORTANT: We intentionally preserve hyphens so composite avatar keys
-    (e.g., "Ashley-Female-...") can still be split on "-" later.
-    """
-    t = (s or "").strip().lower()
-    t = re.sub(r"[\s_]+", "", t)
-    return t
-
-def _stream_session_key(brand: str, avatar: str) -> Tuple[str, str]:
-    """Build a stable key for BeeStreamed live-session tracking."""
-    return (_norm_key(brand), _norm_key(avatar))
-
-
-_STREAM_STATE_DB_LOCK = threading.Lock()
-
-
-def _ensure_beestreamed_session_columns(conn: sqlite3.Connection, table: str) -> None:
-    """Ensure the mappings table has BeeStreamed session state columns."""
-    cols = set(_get_table_columns(conn, table))
-    if "beestreamed_session_active" not in cols:
-        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN beestreamed_session_active INTEGER DEFAULT 0')
-    if "beestreamed_session_updated_at" not in cols:
-        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN beestreamed_session_updated_at TEXT')
-    conn.commit()
-
-
-def _detect_mapping_table_for_session(conn: sqlite3.Connection) -> str:
-    """Detect which mapping table to use."""
-    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = {str(r[0]) for r in cur.fetchall()}
-
-    # Prefer table discovered/selected at startup
-    t = globals().get("_MAPPING_DB_TABLE")
-    if t and t in tables:
-        return str(t)
-
-    if "voice_video_mappings" in tables:
-        return "voice_video_mappings"
-    if "companion_mappings" in tables:
-        return "companion_mappings"
-
-    raise RuntimeError(f"No recognized mappings table found. Tables={sorted(tables)}")
-
-
-def _detect_brand_avatar_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, str]:
-    cols = _get_table_columns(conn, table)
-
-    def pick(candidates: List[str]) -> str:
-        for c in candidates:
-            if c in cols:
-                return c
-        raise RuntimeError(f"Missing required mapping columns. Needed one of {candidates}, found {cols}")
-
-    brand_col = pick(["brand", "company", "rebranding", "rebranding_name", "rebrandingName"])
-    avatar_col = pick(["avatar", "companion", "companion_name", "companionName", "name"])
-    return brand_col, avatar_col
-
-
-def _set_stream_session_active(brand: str, avatar: str, active: bool, event_ref: str = "") -> None:
-    """Persist BeeStreamed sessionActive for (brand, avatar) in SQLite.
-
-    This prevents /stream/beestreamed/status from flickering across workers/instances.
-    This function must never raise to callers.
-    """
-    key = _stream_session_key(brand, avatar)
-    _BEE_STREAM_SESSION_ACTIVE[key] = bool(active)
-    if active and event_ref:
-        _BEE_STREAM_SESSION_EVENT_REF[key] = str(event_ref).strip()
-
-    try:
-        with _STREAM_STATE_DB_LOCK:
-            conn = _open_mapping_db_or_fail()
-            try:
-                table = _detect_mapping_table_for_session(conn)
-                _ensure_beestreamed_session_columns(conn, table)
-                brand_col, avatar_col = _detect_brand_avatar_columns(conn, table)
-
-                b = _norm_key(brand)
-                a = _norm_key(avatar)
-                ts = datetime.utcnow().isoformat() + "Z"
-
-                cur = conn.execute(
-                    f'''
-                    UPDATE "{table}"
-                    SET beestreamed_session_active = ?, beestreamed_session_updated_at = ?
-                    WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
-                    ''',
-                    (1 if active else 0, ts, b, a),
-                )
-                if cur.rowcount == 0 and b != "elaralo":
-                    conn.execute(
-                        f'''
-                        UPDATE "{table}"
-                        SET beestreamed_session_active = ?, beestreamed_session_updated_at = ?
-                        WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
-                        ''',
-                        (1 if active else 0, ts, "elaralo", a),
-                    )
-
-                conn.commit()
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    except Exception:
-        # keep in-memory fallback only
-        pass
-
-
-def _get_stream_session_active(brand: str, avatar: str) -> bool:
-    """Return BeeStreamed sessionActive for (brand, avatar) from SQLite."""
-    try:
-        with _STREAM_STATE_DB_LOCK:
-            conn = _open_mapping_db_or_fail()
-            try:
-                table = _detect_mapping_table_for_session(conn)
-                _ensure_beestreamed_session_columns(conn, table)
-                brand_col, avatar_col = _detect_brand_avatar_columns(conn, table)
-
-                b = _norm_key(brand)
-                a = _norm_key(avatar)
-
-                row = conn.execute(
-                    f'''
-                    SELECT beestreamed_session_active
-                    FROM "{table}"
-                    WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
-                    ORDER BY rowid ASC
-                    LIMIT 1
-                    ''',
-                    (b, a),
-                ).fetchone()
-                if row is None and b != "elaralo":
-                    row = conn.execute(
-                        f'''
-                        SELECT beestreamed_session_active
-                        FROM "{table}"
-                        WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
-                        ORDER BY rowid ASC
-                        LIMIT 1
-                        ''',
-                        ("elaralo", a),
-                    ).fetchone()
-
-                if row is None:
-                    key = _stream_session_key(brand, avatar)
-                    return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-
-                return bool(int(row[0] or 0))
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    except Exception:
-        key = _stream_session_key(brand, avatar)
-        return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-
-
-def _get_stream_session_event_ref(brand: str, avatar: str) -> str:
-    """Return persisted event_ref for (brand, avatar) from SQLite."""
-    try:
-        with _STREAM_STATE_DB_LOCK:
-            conn = _open_mapping_db_or_fail()
-            try:
-                table = _detect_mapping_table_for_session(conn)
-                _ensure_beestreamed_session_columns(conn, table)
-                brand_col, avatar_col = _detect_brand_avatar_columns(conn, table)
-
-                event_col = str(globals().get("_MAPPING_DB_EVENT_REF_COL") or "event_ref")
-
-                b = _norm_key(brand)
-                a = _norm_key(avatar)
-
-                row = conn.execute(
-                    f'''
-                    SELECT {event_col}
-                    FROM "{table}"
-                    WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
-                    ORDER BY CASE WHEN coalesce(trim({event_col}), '') <> '' THEN 0 ELSE 1 END, rowid ASC
-                    LIMIT 1
-                    ''',
-                    (b, a),
-                ).fetchone()
-                if row is None and b != "elaralo":
-                    row = conn.execute(
-                        f'''
-                        SELECT {event_col}
-                        FROM "{table}"
-                        WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
-                        ORDER BY CASE WHEN coalesce(trim({event_col}), '') <> '' THEN 0 ELSE 1 END, rowid ASC
-                        LIMIT 1
-                        ''',
-                        ("elaralo", a),
-                    ).fetchone()
-
-                if row is None:
-                    key = _stream_session_key(brand, avatar)
-                    return str(_BEE_STREAM_SESSION_EVENT_REF.get(key, "") or "").strip()
-
-                return str(row[0] or "").strip()
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    except Exception:
-        key = _stream_session_key(brand, avatar)
-        return str(_BEE_STREAM_SESSION_EVENT_REF.get(key, "") or "").strip()
-
-
-def _is_stream_session_active_for_event_ref(event_ref: str) -> bool:
-    """True iff the host has activated a session for this event_ref (DB-backed)."""
-    ref = (event_ref or "").strip()
-    if not ref:
-        return False
-
-    try:
-        with _STREAM_STATE_DB_LOCK:
-            conn = _open_mapping_db_or_fail()
-            try:
-                table = _detect_mapping_table_for_session(conn)
-                _ensure_beestreamed_session_columns(conn, table)
-                event_col = str(globals().get("_MAPPING_DB_EVENT_REF_COL") or "event_ref")
-
-                row = conn.execute(
-                    f'''
-                    SELECT beestreamed_session_active
-                    FROM "{table}"
-                    WHERE trim({event_col}) = ?
-                    ORDER BY rowid ASC
-                    LIMIT 1
-                    ''',
-                    (ref,),
-                ).fetchone()
-                if row is None:
-                    # fallback to in-memory
-                    for key, ev in _BEE_STREAM_SESSION_EVENT_REF.items():
-                        if str(ev or "").strip() == ref:
-                            return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-                    return False
-
-                return bool(int(row[0] or 0))
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    except Exception:
-        # fallback
-        for key, ev in _BEE_STREAM_SESSION_EVENT_REF.items():
-            if str(ev or "").strip() == ref:
-                return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-        return False
-
-# ---------------------------------------------------------------------------
-# BeeStreamed in-stream shared chat (Host + joined Viewers)
-#
-# Requirement:
-#   - While a BeeStreamed session is active, the host + all joined viewers should see
-#     each other's messages in a shared in-stream chat.
-#   - This chat is intentionally separate from the /chat (AI) endpoint.
-#
-# Implementation notes:
-#   - Uses WebSockets for low-latency broadcast.
-#   - Maintains a small in-memory backlog per event_ref so late joiners can see recent
-#     chat messages.
-#   - This is best-effort / single-instance. If you run multiple API replicas, you will
-#     need a shared pub/sub (Redis, etc.) to broadcast across instances.
-# ---------------------------------------------------------------------------
-
-
-class _LiveChatRoom:
-    __slots__ = ("sockets", "history")
-
-    def __init__(self) -> None:
-        self.sockets: set[WebSocket] = set()
-        self.history = deque(maxlen=250)  # last ~250 messages
-
-
-class _LiveChatManager:
-    def __init__(self) -> None:
-        self._rooms: Dict[str, _LiveChatRoom] = {}
-        self._lock = asyncio.Lock()
-
-    async def connect(self, event_ref: str, ws: WebSocket) -> list[dict[str, Any]]:
-        """Accept the socket and register it in the event_ref room.
-
-        Returns the current room history snapshot.
-        """
-        await ws.accept()
-        ref = (event_ref or "").strip()
-        if not ref:
-            return []
-
-        async with self._lock:
-            room = self._rooms.get(ref)
-            if room is None:
-                room = _LiveChatRoom()
-                self._rooms[ref] = room
-
-            room.sockets.add(ws)
-            history = list(room.history)
-
-        return history
-
-    async def disconnect(self, event_ref: str, ws: WebSocket) -> None:
-        ref = (event_ref or "").strip()
-        if not ref:
-            return
-        async with self._lock:
-            room = self._rooms.get(ref)
-            if not room:
-                return
-            room.sockets.discard(ws)
-            # Keep history for late joiners, even if empty room.
-            if not room.sockets:
-                # Optional: keep the room for a while; for now we keep it.
-                pass
-
-    async def broadcast(self, event_ref: str, payload: dict[str, Any]) -> None:
-        ref = (event_ref or "").strip()
-        if not ref:
-            return
-
-        # Snapshot sockets under lock, then send outside lock.
-        async with self._lock:
-            room = self._rooms.get(ref)
-            if room is None:
-                room = _LiveChatRoom()
-                self._rooms[ref] = room
-            room.history.append(payload)
-            sockets = list(room.sockets)
-
-        dead: list[WebSocket] = []
-        for s in sockets:
-            try:
-                await s.send_json(payload)
-            except Exception:
-                dead.append(s)
-
-        if dead:
-            async with self._lock:
-                room = self._rooms.get(ref)
-                if room:
-                    for d in dead:
-                        room.sockets.discard(d)
-
-    async def close_room(self, event_ref: str, reason: str = "session_ended") -> None:
-        """Broadcast a session-ended event and close all sockets for an event_ref."""
-        ref = (event_ref or "").strip()
-        if not ref:
-            return
-
-        async with self._lock:
-            room = self._rooms.pop(ref, None)
-
-        if not room:
-            return
-
-        payload = {"type": reason}
-        for s in list(room.sockets):
-            try:
-                await s.send_json(payload)
-            except Exception:
-                pass
-            try:
-                await s.close()
-            except Exception:
-                pass
-
-
-_LIVECHAT = _LiveChatManager()
-
-
-
-# Strict mapping DB enforcement:
-#   - Only `voice_video_mappings.sqlite3` is allowed (per deployment requirement).
-#   - If the DB is missing or not writable when we need to persist event_ref, we fail loudly.
-_MAPPING_DB_PATH: str = ""
-_MAPPING_DB_TABLE: str = ""
-_MAPPING_DB_EVENT_REF_COL: str = ""
-
-
-def _mapping_db_path_strict() -> str:
-    """Return the absolute path to the required `voice_video_mappings.sqlite3`.
-
-    Rules (per product requirement):
-      - This API must use ONLY the `voice_video_mappings.sqlite3` database.
-      - If the DB cannot be found, the API should fail fast at startup.
-      - If multiple candidate files are found, the API should fail fast to avoid writing the wrong DB.
-      - An optional VOICE_VIDEO_DB_PATH may be provided, but it MUST point to a file
-        named exactly `voice_video_mappings.sqlite3`.
-    """
-    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-    if env_path:
-        if os.path.basename(env_path) != "voice_video_mappings.sqlite3":
-            raise RuntimeError(
-                f"VOICE_VIDEO_DB_PATH must point to voice_video_mappings.sqlite3 (got: {env_path})"
-            )
-        if not os.path.exists(env_path):
-            raise RuntimeError(f"Required mapping DB not found: {env_path}")
-        return env_path
-
-    # No env override: search common locations, but REQUIRE a single unambiguous hit.
+def _candidate_mapping_db_paths() -> List[str]:
     base_dir = os.path.dirname(__file__)
-    cwd = os.getcwd()
-
-    # Azure App Service common roots (safe to probe even if they don't exist)
-    azure_wwwroot = "/home/site/wwwroot"
-    azure_api = "/home/site/wwwroot/api"
-
-    search_dirs = [
-        base_dir,
-        cwd,
-        azure_api,
-        azure_wwwroot,
+    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    candidates = [
+        env_path,
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
     ]
-
-    candidates = []
-    for d in search_dirs:
-        try:
-            p = os.path.join(d, "voice_video_mappings.sqlite3")
-            if os.path.exists(p):
-                candidates.append(os.path.abspath(p))
-        except Exception:
+    # keep unique, preserve order
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in candidates:
+        p = (p or "").strip()
+        if not p:
             continue
-
-    # De-dupe while preserving order
-    seen = set()
-    uniq = []
-    for c in candidates:
-        if c not in seen:
-            uniq.append(c)
-            seen.add(c)
-
-    if not uniq:
-        raise RuntimeError(
-            "Required mapping DB not found. Looked for voice_video_mappings.sqlite3 in: "
-            + ", ".join(search_dirs)
-        )
-
-    if len(uniq) > 1:
-        raise RuntimeError(
-            "Multiple voice_video_mappings.sqlite3 files were found (ambiguous). "
-            "Set VOICE_VIDEO_DB_PATH to the intended one. Found: " + ", ".join(uniq)
-        )
-
-    return uniq[0]
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
 
 
 def _load_companion_mappings_sync() -> None:
     global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE
 
-    global _MAPPING_DB_PATH, _MAPPING_DB_TABLE, _MAPPING_DB_EVENT_REF_COL
+    db_path = ""
+    for p in _candidate_mapping_db_paths():
+        if os.path.exists(p):
+            db_path = p
+            break
 
-    db_path = _mapping_db_path_strict()
-    _MAPPING_DB_PATH = db_path
+    if not db_path:
+        print("[mappings] WARNING: voice/video mappings DB not found. Video/audio capabilities will fall back to frontend defaults.")
+        _COMPANION_MAPPINGS = {}
+        _COMPANION_MAPPINGS_LOADED_AT = time.time()
+        _COMPANION_MAPPINGS_SOURCE = ""
+        return
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
+        # Detect optional columns so this module works with older + newer SQLite schemas.
+        cur.execute("PRAGMA table_info(companion_mappings)")
+        cols = {row["name"] for row in cur.fetchall()}
 
-        # The mapping table name differs between environments.
-        # Prefer the canonical names, but fall back to any table present.
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        table_names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
-        tables_lc = {t.lower(): t for t in table_names}
-
-        preferred = [
-            "voice_video_mappings",
-            "companion_mappings",
+        select_cols = [
+            "brand",
+            "avatar",
+            "eleven_voice_name",
+            "communication",
+            "eleven_voice_id",
+            "live",
+            "did_embed_code",
+            "did_agent_link",
+            "did_agent_id",
+            "did_client_key",
         ]
-        table = ""
-        for cand in preferred:
-            if cand.lower() in tables_lc:
-                table = tables_lc[cand.lower()]
-                break
+        if "event_ref" in cols:
+            select_cols.append("event_ref")
+        if "host_member_id" in cols:
+            select_cols.append("host_member_id")
 
-        if not table:
-            raise RuntimeError(
-                f"[mappings] Required table not found in {db_path}. Expected one of {preferred}. Found tables: {table_names}"
-            )
-
-        # Discover the actual event_ref column name (case-insensitive). Add it if missing.
-        cur.execute(f'PRAGMA table_info("{table}")')
-        cols = [str(r[1] or "").strip() for r in cur.fetchall() if r and r[1]]
-        cols_lc = {c.lower(): c for c in cols if c}
-
-        def _pick_col(*candidates: str) -> str:
-            for cand in candidates:
-                real = cols_lc.get(str(cand).lower())
-                if real:
-                    return real
-            return ""
-
-        event_col = _pick_col("event_ref", "eventref", "eventRef", "EventRef", "EVENT_REF")
-        if not event_col:
-            # Try adding event_ref column (required for stream persistence).
-            try:
-                cur.execute(f'ALTER TABLE "{table}" ADD COLUMN event_ref TEXT')
-                conn.commit()
-                event_col = "event_ref"
-            except Exception as e:
-                raise RuntimeError(
-                    f"[mappings] Table '{table}' in {db_path} lacks an event_ref column and cannot be altered: {e!r}"
-                )
-
-        _MAPPING_DB_TABLE = table
-        _MAPPING_DB_EVENT_REF_COL = event_col
-
-# Quote the table name to safely handle names with special characters.
-        cur.execute(f'SELECT rowid as __rowid, * FROM "{table}"')
+        cur.execute(f"SELECT {', '.join(select_cols)} FROM companion_mappings")
         rows = cur.fetchall()
-        table_name_for_source = str(table or "")
     finally:
         conn.close()
 
     d: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for r in rows:
-        # sqlite3.Row keys preserve the column names from the DB. Different environments may
-        # have different capitalization (e.g., Live vs live) or legacy names (e.g., Companion).
-        keys_lc = {str(k).lower(): k for k in r.keys()}
-
-        def get_col(*candidates: str, default: Any = "") -> Any:
-            for cand in candidates:
-                k = keys_lc.get(str(cand).lower())
-                if k is not None:
-                    return r[k]
-            return default
-
-        brand = str(get_col("brand", "rebranding", "company", "brand_id", "Brand", default="") or "").strip()
-        avatar = str(get_col("avatar", "companion", "Companion", "first_name", "firstname", default="") or "").strip()
+        brand = str(r["brand"] or "").strip()
+        avatar = str(r["avatar"] or "").strip()
         if not brand or not avatar:
             continue
-
         key = (_norm_key(brand), _norm_key(avatar))
-
         d[key] = {
-            "__rowid": int(get_col("__rowid", default=0) or 0),
             "brand": brand,
             "avatar": avatar,
-            "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
-            "communication": str(get_col("communication", "Communication", default="") or ""),
-            "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
-            "live": str(get_col("live", "Live", default="") or ""),
-            "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
-            "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
-            "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
-            "did_embed_code": str(get_col("did_embed_code", "DID_EMBED_CODE", default="") or ""),
-            "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
-            "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
-            "did_client_key": str(get_col("did_client_key", "DID_CLIENT_KEY", default="") or ""),
-            # Preserve common extra fields when present (helps debugging / future UIs).
-            "companion_id": str(get_col("companion_id", "Companion_ID", "CompanionId", default="") or ""),
+            "eleven_voice_name": (r["eleven_voice_name"] or "") if r["eleven_voice_name"] is not None else "",
+            "communication": (r["communication"] or "") if r["communication"] is not None else "",
+            "eleven_voice_id": (r["eleven_voice_id"] or "") if r["eleven_voice_id"] is not None else "",
+            "live": (r["live"] or "") if r["live"] is not None else "",
+            "did_embed_code": (r["did_embed_code"] or "") if r["did_embed_code"] is not None else "",
+            "did_agent_link": (r["did_agent_link"] or "") if r["did_agent_link"] is not None else "",
+            "did_agent_id": (r["did_agent_id"] or "") if r["did_agent_id"] is not None else "",
+            "did_client_key": (r["did_client_key"] or "") if r["did_client_key"] is not None else "",
+            "event_ref": (r["event_ref"] or "") if "event_ref" in r.keys() and r["event_ref"] is not None else "",
+            "host_member_id": (r["host_member_id"] or "") if "host_member_id" in r.keys() and r["host_member_id"] is not None else "",
         }
 
     _COMPANION_MAPPINGS = d
     _COMPANION_MAPPINGS_LOADED_AT = time.time()
-    # Persist the resolved table name in the source string so we can update the correct table later.
-    _COMPANION_MAPPINGS_SOURCE = f"{db_path}:{table_name_for_source}"
-    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path} (table={table_name_for_source})")
+    _COMPANION_MAPPINGS_SOURCE = db_path
+    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path}")
 
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
@@ -1055,129 +575,336 @@ def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any
     return None
 
 
-@app.on_event("startup")
-async def _startup_load_companion_mappings() -> None:
-    # Fail fast if mappings DB is missing/misconfigured (per deployment requirement).
-    await run_in_threadpool(_load_companion_mappings_sync)
+# -----------------------------------------------------------------------------
+# BeeStreamed: Companion embed sessions (event_ref per Human companion)
+#
+# Goal:
+# - Keep streaming UX inside the Companion page (no new tab).
+# - Treat each Human companion as having a stable BeeStreamed `event_ref`.
+# - If an event_ref is not configured yet, we auto-create it (Variant B) and persist it
+#   in a small JSON store under /home so it survives restarts.
+#
+# Configuration priority (highest to lowest):
+#  1) Request override: `eventRef`
+#  2) Per-companion env var: STREAM_EVENT_REF__{BRAND}__{AVATAR}   (slugified to A-Z0-9_)
+#  3) Global env var: STREAM_EVENT_REF
+#  4) Persisted JSON store: STREAM_EVENT_REFS_PATH (default /home/beestreamed_event_refs.json)
+#  5) Auto-create via POST https://api.beestreamed.com/events (requires STREAM_TOKEN_ID/STREAM_SECRET_KEY)
+#
+# The returned embed URL is:
+#   https://beestreamed.com/event?id=<event_ref>
+# (This matches BeeStreamed's own event links.)
+# -----------------------------------------------------------------------------
 
+_STREAM_EVENT_REFS_PATH = os.getenv("STREAM_EVENT_REFS_PATH", "/home/beestreamed_event_refs.json")
+_STREAM_EVENT_REFS_LOCK = FileLock(_STREAM_EVENT_REFS_PATH + ".lock")
 
-@app.get("/mappings/companion")
-async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
-    """Lookup a companion mapping row by (brand, avatar).
+def _slug_stream_key(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return ""
+    v = re.sub(r"[^A-Za-z0-9]+", "_", v)
+    v = v.strip("_")
+    return v.upper()
 
-    Query params:
-      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
-      - avatar: Avatar first name (e.g., "Jennifer")
+def _stream_env_event_ref_key(brand: str, avatar: str) -> str:
+    sb = _slug_stream_key(brand) or "CORE"
+    sa = _slug_stream_key(avatar) or "AVATAR"
+    return f"STREAM_EVENT_REF__{sb}__{sa}"
 
-    Response:
-      {
-        found: bool,
-        brand: str,
-        avatar: str,
-        communication: "Audio"|"Video"|"" ,
-        live: "D-ID"|"Stream"|"" ,
-        elevenVoiceId: str,
-        elevenVoiceName: str,
-        didAgentId: str,
-        didClientKey: str,
-        didAgentLink: str,
-        didEmbedCode: str,
-        loadedAt: <unix seconds> | null,
-        source: <db path> | ""
-      }
-    """
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
+def _read_stream_event_refs_store() -> dict:
+    try:
+        if not os.path.exists(_STREAM_EVENT_REFS_PATH):
+            return {}
+        with _STREAM_EVENT_REFS_LOCK:
+            with open(_STREAM_EVENT_REFS_PATH, "r", encoding="utf-8") as f:
+                raw = f.read()
+            if not raw.strip():
+                return {}
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
-    m = _lookup_companion_mapping(b, a)
-    if not m:
-        return {
-            "found": False,
-            "brand": b,
-            "avatar": a,
-            "communication": "",
-            "live": "",
-            "elevenVoiceId": "",
-            "elevenVoiceName": "",
-            "didAgentId": "",
-            "didClientKey": "",
-            "didAgentLink": "",
-            "didEmbedCode": "",
-            "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-            "source": _COMPANION_MAPPINGS_SOURCE,
-        }
+def _write_stream_event_refs_store(store: dict) -> None:
+    try:
+        parent = os.path.dirname(_STREAM_EVENT_REFS_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with _STREAM_EVENT_REFS_LOCK:
+            with open(_STREAM_EVENT_REFS_PATH, "w", encoding="utf-8") as f:
+                json.dump(store, f)
+    except Exception:
+        # fail-open
+        return
 
+def _beestreamed_embed_url(event_ref: str) -> str:
+    # BeeStreamed event viewer URL format (embed-friendly).
+    return f"https://beestreamed.com/event?id={event_ref}"
+
+def _beestreamed_headers_or_500() -> dict:
+    token_id = (os.getenv("STREAM_TOKEN_ID") or "").strip()
+    secret_key = (os.getenv("STREAM_SECRET_KEY") or "").strip()
+    if not token_id or not secret_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing STREAM_TOKEN_ID/STREAM_SECRET_KEY environment variables for BeeStreamed API.",
+        )
     return {
-        "found": True,
-        "brand": str(m.get("brand") or ""),
-        "avatar": str(m.get("avatar") or ""),
-        "communication": str(m.get("communication") or ""),
-        "live": str(m.get("live") or ""),
-        "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
-        "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
-        "didAgentId": str(m.get("did_agent_id") or ""),
-        "didClientKey": str(m.get("did_client_key") or ""),
-        "didAgentLink": str(m.get("did_agent_link") or ""),
-        "didEmbedCode": str(m.get("did_embed_code") or ""),
-        "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-        "source": _COMPANION_MAPPINGS_SOURCE,
+        "Authorization": _beestreamed_auth_header(token_id, secret_key),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
+def _beestreamed_create_event_sync(headers: dict) -> str:
+    import requests
+    r = requests.post(f"{BEE_BASE}/events", headers=headers, timeout=20)
+    if not r.ok:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed create-event failed: {r.status_code} {r.text}")
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+    event_ref = (data.get("event_ref") or data.get("eventRef") or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed create-event missing event_ref: {data}")
+    return event_ref
 
-# ---------------------------------------------------------------------------
-# BeeStreamed: Start WebRTC streams (Live=Stream companions)
-# ---------------------------------------------------------------------------
-# IMPORTANT:
-# - BeeStreamed tokens MUST NOT be exposed to the browser. The frontend calls this endpoint,
-#   and the API performs BeeStreamed authentication server-side.
-# - Authentication format per BeeStreamed docs:
-#     Authorization: Basic base64_encode({token_id}:{secret_key})
-# - Start WebRTC stream endpoint:
-#     POST https://api.beestreamed.com/events/[EVENT REF]/startwebrtcstream
-#
-# Docs: https://docs.beestreamed.com/introduction (API Overview / Authentication)
+def _beestreamed_update_event_embed_domain_sync(event_ref: str, embed_domain: str | None, headers: dict) -> None:
+    embed_domain = (embed_domain or "").strip()
+    if not embed_domain:
+        return
+    # best-effort: ignore failures
+    import requests
+    try:
+        requests.patch(
+            f"{BEE_BASE}/events/{event_ref}",
+            headers=headers,
+            json={"event_embed_domain": embed_domain},
+            timeout=20,
+        )
+    except Exception:
+        return
+
+def _resolve_or_create_event_ref_sync(brand: str, avatar: str, embed_domain: str | None, override_event_ref: str | None) -> str:
+    # 1) request override
+    if override_event_ref and str(override_event_ref).strip():
+        return str(override_event_ref).strip()
+
+    brand_s = (brand or "").strip() or "core"
+    avatar_s = (avatar or "").strip() or "unknown"
+    # Prefer explicit event_ref stored in the companion mapping database (when present).
+    mapping = _lookup_companion_mapping(brand_s, avatar_s)
+    if mapping:
+        ref = str(mapping.get("event_ref") or mapping.get("eventRef") or "").strip()
+        if ref:
+            return ref
 
 
-def _extract_beestreamed_event_ref_from_url(stream_url: str) -> str:
-    """Best-effort extraction of BeeStreamed event_ref from a viewer URL.
+    # 2) per-companion env var
+    env_key = _stream_env_event_ref_key(brand_s, avatar_s)
+    env_val = (os.getenv(env_key) or "").strip()
+    if env_val:
+        return env_val
 
-    This is intentionally flexible because BeeStreamed viewer URLs can be customized.
-    We attempt, in order:
-      1) query string parameters: event_ref / eventRef
-      2) last path segment that looks like an alphanumeric ref (6-32 chars)
+    # 3) global env var
+    env_global = (os.getenv("STREAM_EVENT_REF") or "").strip()
+    if env_global:
+        return env_global
+
+    # 4) persisted JSON store
+    store_key = f"{_slug_stream_key(brand_s) or 'CORE'}__{_slug_stream_key(avatar_s) or 'AVATAR'}"
+    store = _read_stream_event_refs_store()
+    stored = (store.get(store_key) or "").strip()
+    if stored:
+        return stored
+
+    # 5) create event (Variant B) + persist
+    headers = _beestreamed_headers_or_500()
+    event_ref = _beestreamed_create_event_sync(headers=headers)
+    _beestreamed_update_event_embed_domain_sync(event_ref, embed_domain, headers=headers)
+    store[store_key] = event_ref
+    _write_stream_event_refs_store(store)
+    return event_ref
+
+
+def _stream_env_host_member_id_key(brand: str, avatar: str) -> str:
+    b = _slug_stream_key(brand) or 'CORE'
+    a = _slug_stream_key(avatar) or 'AVATAR'
+    return f"STREAM_HOST_MEMBER_ID__{b}__{a}"
+
+def _resolve_stream_host_member_id(brand: str, avatar: str) -> str:
+    """Return the Wix memberId that is allowed to START/STOP the BeeStreamed session for this companion."""
+    brand_s = (brand or '').strip() or 'core'
+    avatar_s = (avatar or '').strip() or 'unknown'
+
+    # 1) Prefer DB-stored host_member_id (when present).
+    mapping = _lookup_companion_mapping(brand_s, avatar_s)
+    if mapping:
+        host = str(mapping.get('host_member_id') or mapping.get('hostMemberId') or '').strip()
+        if host:
+            return host
+
+    # 2) Per-companion env var override.
+    env_key = _stream_env_host_member_id_key(brand_s, avatar_s)
+    env_val = str(os.getenv(env_key) or '').strip()
+    if env_val:
+        return env_val
+
+    # 3) Global env var override.
+    env_global = str(os.getenv('STREAM_HOST_MEMBER_ID') or '').strip()
+    if env_global:
+        return env_global
+
+    # 4) Optional hardcoded override for DulceMoon/Dulce (safe fallback).
+    if _slug_stream_key(brand_s) == 'DULCEMOON' and _slug_stream_key(avatar_s) == 'DULCE':
+        return '1dc3fe06-c351-4678-8fe4-6a4b1350c556'
+
+    return ''
+
+def _is_stream_host(brand: str, avatar: str, member_id: str | None) -> bool:
+    mid = str(member_id or '').strip()
+    if not mid:
+        return False
+    host = _resolve_stream_host_member_id(brand, avatar)
+    return bool(host and mid == host)
+
+class BeeStreamedCompanionRequest(BaseModel):
+    brand: str | None = None
+    avatar: str | None = None
+    embedDomain: str | None = None
+    memberId: str | None = None  # Wix member id (host-only start/stop gating)
+    eventRef: str | None = None  # optional override
+
+@app.post("/stream/beestreamed/start_embed")
+async def beestreamed_start_embed(req: BeeStreamedCompanionRequest):
+    """Returns an embeddable BeeStreamed URL and (if caller is the host) starts the WebRTC stream.
+
+    Host gating:
+    - Only the companion's `host_member_id` (Wix memberId) may start/stop the live stream.
+    - Everyone else receives the embed URL + a `waiting_for_host` status.
     """
-    u = (stream_url or "").strip()
-    if not u:
-        return ""
 
-    try:
-        parsed = urlparse(u)
-    except Exception:
-        return ""
+    brand = (req.brand or "").strip() or "core"
+    avatar = (req.avatar or "").strip()
+    if not avatar:
+        raise HTTPException(status_code=400, detail="Missing avatar")
 
-    try:
-        qs = parse_qs(parsed.query or "")
-        for k in ("event_ref", "eventRef", "event", "ref"):
-            v = qs.get(k)
-            if v and isinstance(v, list) and v[0]:
-                cand = str(v[0]).strip()
-                if re.fullmatch(r"[A-Za-z0-9]{6,32}", cand):
-                    return cand
-    except Exception:
-        pass
+    embed_domain = (req.embedDomain or "").strip() or None
+    member_id = (req.memberId or "").strip()
 
-    # Path fallback
-    try:
-        segments = [s for s in (parsed.path or "").split("/") if s]
-        for seg in reversed(segments):
-            seg = seg.strip()
-            if re.fullmatch(r"[A-Za-z0-9]{6,32}", seg):
-                return seg
-    except Exception:
-        pass
+    can_start = await run_in_threadpool(_is_stream_host, brand, avatar, member_id)
 
-    return ""
+    # Prefer DB event_ref (if present). Falls back to env var / persisted JSON store.
+    event_ref = await run_in_threadpool(
+        _resolve_or_create_event_ref_sync,
+        brand,
+        avatar,
+        embed_domain,
+        req.eventRef,
+    )
 
+    if not event_ref:
+        # If you don't want fallback creation, set the per-companion STREAM_EVENT_REF__* env var
+        # or populate the `event_ref` column in the companion mapping DB.
+        return {
+            "ok": False,
+            "eventRef": "",
+            "embedUrl": "",
+            "canStart": bool(can_start),
+            "started": False,
+            "status": "no_event_ref",
+        }
+
+    # Keep the embed domain in-sync so the iframe loads on the current host.
+    headers = _beestreamed_headers_or_500()
+    if embed_domain:
+        try:
+            await run_in_threadpool(_beestreamed_update_event_embed_domain_sync, event_ref, embed_domain, headers)
+        except Exception as e:
+            # Non-fatal: embed might still work depending on the event's settings.
+            print("BeeStreamed embed domain update failed: %s", e)
+
+    started = False
+    status = "waiting_for_host"
+
+    if can_start:
+        try:
+            await run_in_threadpool(_beestreamed_start_webrtc_sync, event_ref)
+            started = True
+            status = "started"
+        except Exception as e:
+            print("BeeStreamed start stream failed: %s", e)
+            status = "start_failed"
+
+    return {
+        "ok": True,
+        "eventRef": event_ref,
+        "embedUrl": _beestreamed_embed_url(event_ref),
+        "canStart": bool(can_start),
+        "started": bool(started),
+        "status": status,
+    }
+
+@app.post("/stream/beestreamed/stop_embed")
+async def beestreamed_stop_embed(req: BeeStreamedCompanionRequest):
+    """Stops the BeeStreamed WebRTC stream (host-only) and returns the embed URL."""
+
+    brand = (req.brand or "").strip() or "core"
+    avatar = (req.avatar or "").strip()
+    if not avatar:
+        raise HTTPException(status_code=400, detail="Missing avatar")
+
+    embed_domain = (req.embedDomain or "").strip() or None
+    member_id = (req.memberId or "").strip()
+
+    can_stop = await run_in_threadpool(_is_stream_host, brand, avatar, member_id)
+
+    event_ref = await run_in_threadpool(
+        _resolve_or_create_event_ref_sync,
+        brand,
+        avatar,
+        embed_domain,
+        req.eventRef,
+    )
+
+    if not event_ref:
+        return {
+            "ok": False,
+            "eventRef": "",
+            "embedUrl": "",
+            "canStop": bool(can_stop),
+            "stopped": False,
+            "status": "no_event_ref",
+        }
+
+    headers = _beestreamed_headers_or_500()
+    if embed_domain:
+        try:
+            await run_in_threadpool(_beestreamed_update_event_embed_domain_sync, event_ref, embed_domain, headers)
+        except Exception as e:
+            print("BeeStreamed embed domain update failed (stop): %s", e)
+
+    stopped = False
+    status = "noop_not_host"
+
+    if can_stop:
+        try:
+            await run_in_threadpool(_beestreamed_stop_webrtc_sync, event_ref)
+            stopped = True
+            status = "stopped"
+        except Exception as e:
+            print("BeeStreamed stop stream failed: %s", e)
+            status = "stop_failed"
+
+    return {
+        "ok": True,
+        "eventRef": event_ref,
+        "embedUrl": _beestreamed_embed_url(event_ref),
+        "canStop": bool(can_stop),
+        "stopped": bool(stopped),
+        "status": status,
+    }
 
 @app.post("/stream/beestreamed/start")
 async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
@@ -1243,1225 +970,6 @@ async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
         data = {"message": (r.text or "").strip(), "status": r.status_code}
 
     return {"ok": True, "event_ref": event_ref, "beestreamed": data}
-
-# ---------------------------------------------------------------------------
-# BeeStreamed embed + host gating (white-label friendly)
-#
-# Goals:
-# - Each "Human / Stream" companion has a stable event_ref (preferably stored in the SQLite mapping DB).
-# - Only the Human Companion (host) can start/stop the WebRTC stream.
-# - Everyone else can open the embed and will see a "waiting for host" experience until the host starts.
-#
-# Notes:
-# - host_member_id can be stored per companion in the mapping DB as `host_member_id`.
-# - If `host_member_id` is missing for DulceMoon/Dulce, we fall back to a known host id (single human companion).
-# - If `event_ref` is missing, ONLY the host will create it (via BeeStreamed API) and we will best-effort persist it.
-# ---------------------------------------------------------------------------
-
-DULCE_HOST_MEMBER_ID_FALLBACK = "1dc3fe06-c351-4678-8fe4-6a4b1350c556"
-
-def _beestreamed_api_base() -> str:
-    return (os.getenv("BEESTREAMED_API_BASE", "") or "https://api.beestreamed.com").strip().rstrip("/")
-
-def _beestreamed_public_event_url(event_ref: str) -> str:
-    # BeeStreamed public event page (works as an embeddable viewer page in an iframe).
-    base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
-    return f"{base}?id={event_ref}"
-
-
-def _beestreamed_broadcaster_ui_url(event_ref: str) -> str:
-    """Return the BeeStreamed **Producer View** (broadcaster UI) URL for an event_ref.
-
-    Notes:
-      - The Producer View appears to live under `manage.beestreamed.com/producer` and commonly accepts
-        `ref=<event_ref>` (observed) as well as `event_ref` / `id` on some deployments.
-      - BeeStreamed may block embedding of the manage UI (X-Frame-Options / CSP). When that happens, the iframe
-        will show "refused to connect". The wrapper still remains useful to allow pop-outs to a new tab.
-
-    Resolution order:
-      1) BEESTREAMED_PRODUCER_URL_TEMPLATE (or legacy BEESTREAMED_BROADCASTER_URL_TEMPLATE)
-           - Must contain the placeholder "{event_ref}"
-           - Example:
-               https://manage.beestreamed.com/producer?ref={event_ref}
-
-      2) BEESTREAMED_PRODUCER_BASE (or legacy BEESTREAMED_BROADCASTER_BASE)
-         + BEESTREAMED_PRODUCER_QUERY_KEY (or legacy BEESTREAMED_BROADCASTER_QUERY_KEY)
-           - We append the event_ref as a query parameter.
-           - Default base: https://manage.beestreamed.com/producer
-           - Default key:  ref
-
-      3) If nothing is configured, we fall back to:
-           https://manage.beestreamed.com/producer?ref=<event_ref>&event_ref=<event_ref>&id=<event_ref>
-
-    Compatibility note:
-      - We include multiple common keys (`ref`, `event_ref`, `id`) to maximize compatibility.
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return ""
-
-    tmpl = (
-        os.getenv("BEESTREAMED_PRODUCER_URL_TEMPLATE", "")
-        or os.getenv("BEESTREAMED_BROADCASTER_URL_TEMPLATE", "")
-        or ""
-    ).strip()
-    if tmpl and "{event_ref}" in tmpl:
-        return tmpl.replace("{event_ref}", ref)
-
-    base = (
-        os.getenv("BEESTREAMED_PRODUCER_BASE", "")
-        or os.getenv("BEESTREAMED_BROADCASTER_BASE", "")
-        or "https://manage.beestreamed.com/producer"
-    ).strip().rstrip("/")
-    if not base:
-        return ""
-
-    key = (
-        os.getenv("BEESTREAMED_PRODUCER_QUERY_KEY", "")
-        or os.getenv("BEESTREAMED_BROADCASTER_QUERY_KEY", "")
-        or "ref"
-    ).strip() or "ref"
-
-    join = "&" if "?" in base else "?"
-    url = f"{base}{join}{key}={ref}"
-
-    # Add common alias keys as well (most servers ignore unknown params).
-    extras: list[str] = []
-    if key != "ref":
-        extras.append(f"ref={ref}")
-    if key != "event_ref":
-        extras.append(f"event_ref={ref}")
-    if key != "id":
-        extras.append(f"id={ref}")
-    if extras:
-        url = url + "&" + "&".join(extras)
-
-    return url
-
-
-@app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
-async def beestreamed_embed_page(event_ref: str):
-    """Render a BeeStreamed event inside a sandboxed iframe.
-
-    Why this exists:
-      - The BeeStreamed viewer UI can include actions that open a pop-out / new window.
-      - By wrapping the viewer in a sandboxed iframe WITHOUT `allow-popups`, those actions
-        are prevented and the experience stays within the iframe container.
-    """
-    event_ref = (event_ref or "").strip()
-    if not event_ref:
-        raise HTTPException(status_code=400, detail="event_ref is required")
-
-    viewer_url = _beestreamed_public_event_url(event_ref)
-
-    html = f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Live Stream</title>
-    <style>
-      html, body {{
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        background: #000;
-        overflow: hidden;
-      }}
-      .frame {{
-        position: fixed;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        border: 0;
-      }}
-    </style>
-  </head>
-  <body>
-    <iframe
-      class="frame"
-      src="{viewer_url}"
-      title="Live Stream"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-storage-access-by-user-activation"
-      referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; storage-access"
-      allowfullscreen
-    ></iframe>
-  </body>
-</html>"""
-
-    # No caching: viewer state is time-sensitive.
-    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
-
-
-
-@app.get("/stream/beestreamed/broadcaster/{event_ref}", response_class=HTMLResponse)
-async def beestreamed_broadcaster_page(event_ref: str):
-    """Render the BeeStreamed *broadcaster / producer* UI inside a sandboxed iframe."""
-    event_ref = (event_ref or "").strip()
-    if not event_ref:
-        raise HTTPException(status_code=400, detail="event_ref is required")
-
-    producer_url = _beestreamed_broadcaster_ui_url(event_ref)
-    if not producer_url:
-        raise HTTPException(
-            status_code=500,
-            detail="Producer View URL could not be resolved. Configure BEESTREAMED_PRODUCER_URL_TEMPLATE (preferred) or BEESTREAMED_PRODUCER_BASE.",
-        )
-
-    html = f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Broadcast</title>
-    <style>
-      html, body {{
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        background: #000;
-        overflow: hidden;
-      }}
-      .frame {{
-        position: fixed;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        border: 0;
-      }}
-    </style>
-  </head>
-  <body>
-    <iframe
-      class="frame"
-      src="{producer_url}"
-      title="Broadcast"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-storage-access-by-user-activation"
-      referrerpolicy="no-referrer-when-downgrade"
-      allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture; storage-access"
-      allowfullscreen
-    ></iframe>
-  </body>
-</html>"""
-
-    # No caching: broadcast UI is stateful.
-    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
-
-
-def _beestreamed_auth_headers() -> Dict[str, str]:
-    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
-    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
-    if not token_id or not secret_key:
-        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
-
-    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {basic}", "Content-Type": "application/json"}
-
-def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
-    import requests  # type: ignore
-
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-
-    # Create an event
-    try:
-        r = requests.post(f"{api_base}/events", headers=headers, json={}, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed create event failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed create event error {r.status_code}: {msg[:500]}")
-
-    try:
-        data = r.json()
-    except Exception:
-        data = {}
-
-    event_ref = (data.get("event_ref") or data.get("eventRef") or data.get("id") or "").strip()
-    if not event_ref:
-        raise HTTPException(status_code=502, detail="BeeStreamed create event did not return an event_ref")
-
-    # Best-effort: set embed domain on the event so the iframe host is allowed.
-    # If this fails, we continue — the embed may still work depending on BeeStreamed account settings.
-    embed_domain = (embed_domain or "").strip()
-    if embed_domain:
-        try:
-            requests.patch(
-                f"{api_base}/events/{event_ref}",
-                headers=headers,
-                json={"event_embed_domain": embed_domain},
-                timeout=20,
-            )
-        except Exception:
-            pass
-
-    return event_ref
-
-
-def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_domain: str = "") -> None:
-    """Best-effort: set the event date to 'now' so the event is effectively scheduled immediately.
-
-    BeeStreamed docs: PATCH /events/[EVENT REF] supports `date` (formatted) and `title`.
-    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS". 
-    """
-    import requests  # type: ignore
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-
-    ref = (event_ref or "").strip()
-    if not ref:
-        return
-
-    payload = {}
-    # Use UTC to avoid timezone ambiguity across API hosts.
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    payload["date"] = now_str
-
-    if (title or "").strip():
-        payload["title"] = (title or "").strip()
-
-    # Some BeeStreamed accounts may accept embed domain as a field; we keep this best-effort.
-    # If not supported, BeeStreamed will ignore or reject; we swallow failures.
-    if (embed_domain or "").strip():
-        payload["event_embed_domain"] = (embed_domain or "").strip()
-
-    try:
-        requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload, timeout=20)
-    except Exception:
-        pass
-
-
-def _beestreamed_patch_event_status_best_effort(event_ref: str, status: str) -> None:
-    """Best-effort helper to update BeeStreamed event status.
-
-    We keep this non-fatal because the primary 'end stream' operation is stopwebrtcstream().
-    """
-    import requests  # type: ignore
-
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-    try:
-        requests.patch(
-            f"{api_base}/events/{event_ref}",
-            headers=headers,
-            json={"status": status},
-            timeout=20,
-        )
-    except Exception:
-        pass
-
-# Cache BeeStreamed event status lookups so /status polling doesn't hammer the provider.
-_BEESTREAMED_EVENT_STATUS_CACHE: Dict[str, Tuple[float, str]] = {}
-_BEESTREAMED_EVENT_STATUS_TTL_SECS: float = 10.0
-
-
-def _beestreamed_get_event_status_best_effort(event_ref: str) -> Optional[str]:
-    """Fetch event_status from BeeStreamed (best-effort).
-
-    Returns:
-      - "done", "live", "idle", "force_live", ... if available
-      - "missing" if event 404s
-      - None on errors / missing credentials
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return None
-
-    now = time.time()
-    cached = _BEESTREAMED_EVENT_STATUS_CACHE.get(ref)
-    if cached and (now - float(cached[0])) < _BEESTREAMED_EVENT_STATUS_TTL_SECS:
-        return str(cached[1])
-
-    try:
-        headers = _beestreamed_auth_headers()
-        # If credentials are missing, auth_headers returns empty values; fail fast.
-        if not headers.get("X-Stream-Token-Id") or not headers.get("X-Stream-Secret-Key"):
-            return None
-
-        url = f"{_beestreamed_api_base().rstrip('/')}/events/{ref}"
-        resp = requests.get(url, headers=headers, timeout=10)
-
-        if resp.status_code == 404:
-            _BEESTREAMED_EVENT_STATUS_CACHE[ref] = (now, "missing")
-            return "missing"
-
-        resp.raise_for_status()
-        data = resp.json() if resp.content else {}
-
-        status = str(data.get("event_status") or data.get("status") or "").strip().lower()
-        if not status:
-            return None
-
-        _BEESTREAMED_EVENT_STATUS_CACHE[ref] = (now, status)
-        return status
-    except Exception:
-        return None
-
-
-def _beestreamed_start_webrtc_sync(event_ref: str) -> None:
-    import requests  # type: ignore
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-
-    try:
-        r = requests.post(f"{api_base}/events/{event_ref}/startwebrtcstream", headers=headers, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed start failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed start error {r.status_code}: {msg[:500]}")
-
-def _beestreamed_stop_webrtc_sync(event_ref: str) -> None:
-    import requests  # type: ignore
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
-
-    try:
-        r = requests.post(f"{api_base}/events/{event_ref}/stopwebrtcstream", headers=headers, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed stop failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed stop error {r.status_code}: {msg[:500]}")
-
-def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str, Any]]) -> str:
-    host = ""
-    if mapping:
-        host = str(mapping.get("host_member_id") or "").strip()
-
-    # Fallback for current single-host deployment (DulceMoon/Dulce).
-    if not host:
-        if (brand or "").strip().lower() == "dulcemoon" and (avatar or "").strip().lower().startswith("dulce"):
-            host = DULCE_HOST_MEMBER_ID_FALLBACK
-    return host
-
-def _persist_event_ref_strict(brand: str, avatar: str, event_ref: str) -> None:
-    """Persist event_ref into `voice_video_mappings.sqlite3` (strict).
-
-    Per requirement:
-      - This deployment uses ONLY `voice_video_mappings.sqlite3`.
-      - If we cannot persist the host's event_ref, we must error out so the issue is visible,
-        rather than silently creating a new BeeStreamed event on each Play.
-
-    Strategy:
-      - Prefer updating by the rowid captured at mapping-load time (most reliable).
-      - Fallback to a normalized brand/avatar match (handles WITHOUT ROWID tables or odd schemas).
-    """
-    b_in = (brand or "").strip()
-    a_in = (avatar or "").strip()
-    e = (event_ref or "").strip()
-    if not b_in or not a_in or not e:
-        raise RuntimeError("persist_event_ref: brand, avatar, and event_ref are required")
-
-    if not _MAPPING_DB_PATH or not _MAPPING_DB_TABLE:
-        raise RuntimeError("persist_event_ref: mappings DB was not initialized at startup")
-
-    # Always update in-memory mapping (so this process is consistent).
-    mapping = _lookup_companion_mapping(b_in, a_in)
-    if not mapping:
-        raise RuntimeError(f"persist_event_ref: companion mapping not found for {b_in}/{a_in}")
-
-    mapping["event_ref"] = e
-
-    rowid = 0
-    try:
-        rowid = int(mapping.get("__rowid") or 0)
-    except Exception:
-        rowid = 0
-
-    def _pick_col(cols_lc: Dict[str, str], *candidates: str) -> str:
-        for cand in candidates:
-            real = cols_lc.get(str(cand).lower())
-            if real:
-                return real
-        return ""
-
-    lock_path = _MAPPING_DB_PATH + ".lock"
-    lock = FileLock(lock_path)
-    lock.acquire()
-    try:
-        conn = sqlite3.connect(_MAPPING_DB_PATH)
-        cur = conn.cursor()
-
-        # Discover columns for the chosen table
-        cur.execute(f'PRAGMA table_info("{_MAPPING_DB_TABLE}")')
-        cols = [str(r[1] or "").strip() for r in cur.fetchall() if r and r[1]]
-        cols_lc = {c.lower(): c for c in cols if c}
-
-        # Determine the actual event_ref column name (case-insensitive). Add if missing.
-        event_col = _pick_col(
-            cols_lc,
-            _MAPPING_DB_EVENT_REF_COL or "",
-            "event_ref",
-            "eventref",
-            "eventRef",
-            "EventRef",
-            "EVENT_REF",
-        )
-        if not event_col:
-            try:
-                cur.execute(f'ALTER TABLE "{_MAPPING_DB_TABLE}" ADD COLUMN event_ref TEXT')
-                conn.commit()
-                event_col = "event_ref"
-            except Exception as ex:
-                raise RuntimeError(
-                    f"persist_event_ref: table '{_MAPPING_DB_TABLE}' lacks event_ref and cannot be altered: {ex!r}"
-                )
-
-        # 1) Preferred: update by rowid if we have it.
-        updated = False
-        if rowid > 0:
-            cur.execute(
-                f'UPDATE "{_MAPPING_DB_TABLE}" SET "{event_col}" = ? WHERE rowid = ?',
-                (e, rowid),
-            )
-            conn.commit()
-            try:
-                if int(cur.rowcount or 0) > 0:
-                    updated = True
-            except Exception:
-                updated = True  # accept if no exception
-
-        # 2) Fallback: update by normalized brand/avatar match (handles WITHOUT ROWID / mismatched rowid).
-        if not updated:
-            brand_col = _pick_col(cols_lc, "brand", "rebranding", "company", "brand_id", "Brand")
-            avatar_col = _pick_col(cols_lc, "avatar", "companion", "first_name", "firstname", "Companion")
-
-            if not brand_col or not avatar_col:
-                raise RuntimeError(
-                    f"persist_event_ref: cannot locate brand/avatar columns in '{_MAPPING_DB_TABLE}'"
-                )
-
-            # Normalize inside SQL similarly to _norm_key (remove spaces/underscores, lowercase, trim).
-            def _sql_norm(col_expr: str) -> str:
-                return f"lower(replace(replace(trim({col_expr}), ' ', ''), '_', ''))"
-
-            b_norm = _norm_key(b_in)
-            a_norm = _norm_key(a_in)
-
-            brand_expr = _sql_norm(f'"{brand_col}"')
-            avatar_expr = _sql_norm(f'"{avatar_col}"')
-
-            cur.execute(
-                f'UPDATE "{_MAPPING_DB_TABLE}" '
-                f'SET "{event_col}" = ? '
-                f'WHERE {brand_expr} = ? AND {avatar_expr} = ?',
-                (e, b_norm, a_norm),
-            )
-            conn.commit()
-            try:
-                if int(cur.rowcount or 0) > 0:
-                    updated = True
-            except Exception:
-                updated = True
-
-        if not updated:
-            raise RuntimeError(
-                f"persist_event_ref: UPDATE affected 0 rows for {b_in}/{a_in}. "
-                f"Ensure voice_video_mappings.sqlite3 is writable and contains the companion row."
-            )
-
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        try:
-            lock.release()
-        except Exception:
-            pass
-
-
-
-def _db_get_event_ref_strict(brand: str, avatar: str, mapping: Dict[str, Any]) -> str:
-    """Read the current event_ref from `voice_video_mappings.sqlite3` for this companion.
-
-    This is used to avoid stale in-memory caches across multiple API workers/processes.
-    We always prefer rowid when available, with a normalized brand/avatar fallback.
-
-    Returns a stripped string (may be empty).
-    """
-    b_in = (brand or "").strip()
-    a_in = (avatar or "").strip()
-    if not b_in or not a_in:
-        return ""
-
-    if not _MAPPING_DB_PATH or not _MAPPING_DB_TABLE:
-        raise RuntimeError("db_get_event_ref: mappings DB was not initialized at startup")
-
-    rowid = 0
-    try:
-        rowid = int((mapping or {}).get("__rowid") or 0)
-    except Exception:
-        rowid = 0
-
-    lock_path = _MAPPING_DB_PATH + ".lock"
-    with FileLock(lock_path):
-        conn = sqlite3.connect(_MAPPING_DB_PATH)
-        try:
-            cur = conn.cursor()
-
-            # Discover columns for the chosen table
-            cur.execute(f'PRAGMA table_info("{_MAPPING_DB_TABLE}")')
-            cols = [str(r[1] or "").strip() for r in cur.fetchall() if r and r[1]]
-            cols_lc = {c.lower(): c for c in cols if c}
-
-            def _pick_col(*candidates: str) -> str:
-                for cand in candidates:
-                    real = cols_lc.get(str(cand).lower())
-                    if real:
-                        return real
-                return ""
-
-            event_col = _pick_col(
-                _MAPPING_DB_EVENT_REF_COL or "",
-                "event_ref",
-                "eventref",
-                "eventRef",
-                "EventRef",
-                "EVENT_REF",
-            )
-            if not event_col:
-                # If the schema truly doesn't have an event_ref column yet, treat as empty.
-                return ""
-
-            # 1) Preferred: by rowid
-            if rowid > 0:
-                cur.execute(
-                    f'SELECT "{event_col}" FROM "{_MAPPING_DB_TABLE}" WHERE rowid = ?',
-                    (rowid,),
-                )
-                r = cur.fetchone()
-                if r and r[0]:
-                    return str(r[0]).strip()
-
-            # 2) Fallback: normalized brand/avatar match
-            brand_col = _pick_col("brand", "rebranding", "company", "brand_id", "Brand")
-            avatar_col = _pick_col("avatar", "companion", "Companion", "first_name", "firstname", "Avatar")
-            if not brand_col or not avatar_col:
-                return ""
-
-            def _sql_norm(col_expr: str) -> str:
-                return f"lower(replace(replace(trim({col_expr}), ' ', ''), '_', ''))"
-
-            b_norm = _norm_key(b_in)
-            a_norm = _norm_key(a_in)
-
-            brand_expr = _sql_norm(f'"{brand_col}"')
-            avatar_expr = _sql_norm(f'"{avatar_col}"')
-
-            cur.execute(
-                f'SELECT "{event_col}" FROM "{_MAPPING_DB_TABLE}" '
-                f'WHERE {brand_expr} = ? AND {avatar_expr} = ? LIMIT 1',
-                (b_norm, a_norm),
-            )
-            r = cur.fetchone()
-            if r and r[0]:
-                return str(r[0]).strip()
-
-            return ""
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-class BeeStreamedStartEmbedRequest(BaseModel):
-    brand: str
-    avatar: str
-    embedDomain: Optional[str] = None
-    memberId: Optional[str] = None
-
-class BeeStreamedStopEmbedRequest(BaseModel):
-    brand: str
-    avatar: str
-    memberId: Optional[str] = None
-    eventRef: Optional[str] = None
-
-class BeeStreamedCreateEventRequest(BaseModel):
-    """Create a BeeStreamed event for a specific (brand, avatar) mapping.
-
-    Only the user whose memberId matches the mapping's host_member_id may create/start the event.
-    Credentials are taken from env on the API host:
-      - STREAM_TOKEN_ID
-      - STREAM_SECRET_KEY
-    """
-    brand: str
-    avatar: str
-    memberId: str
-    embedDomain: Optional[str] = None
-    startStream: bool = True
-
-
-class BeeStreamedEmbedUrlRequest(BaseModel):
-    """Resolve a BeeStreamed embed URL that stays inside our iframe wrapper.
-
-    Accepts either:
-      - eventRef / event_ref, OR
-      - streamUrl / stream_url (we'll try to parse the event ref out of it)
-    """
-    eventRef: Optional[str] = None
-    streamUrl: Optional[str] = None
-
-
-class BeeStreamedLiveChatSendRequest(BaseModel):
-    """Send a message to the shared in-stream chat room (HTTP fallback).
-
-    Frontend primarily uses WebSockets, but this endpoint provides a reliable
-    fallback (e.g., before WS connect finishes).
-    """
-
-    eventRef: str
-    text: str
-
-    brand: Optional[str] = None
-    avatar: Optional[str] = None
-    memberId: Optional[str] = None
-    role: Optional[str] = None  # "host" | "viewer"
-    name: Optional[str] = None
-    clientMsgId: Optional[str] = None
-    ts: Optional[int] = None
-
-
-@app.post("/stream/beestreamed/start_embed")
-async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    # Use the resolved mapping keys for persistence (first-name fallback etc).
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
-
-    live = str(mapping.get("live") or "").strip().lower()
-
-    # Be tolerant of values like "Stream", "BeeStreamed", or labels that include these keywords.
-    if "stream" not in live:
-        raise HTTPException(status_code=400, detail="This companion is not configured for stream")
-
-    comp_type = str(mapping.get("companion_type") or "").strip()
-    if comp_type and comp_type.lower() != "human":
-        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
-
-    member_id = (req.memberId or "").strip()
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and member_id == host_id)
-
-    # Refresh event_ref from the required mapping DB on every call.
-    # This prevents a "new event every Play" issue in multi-worker deployments where
-    # other workers may have a stale in-memory mapping cache.
-    try:
-        db_event_ref = _db_get_event_ref_strict(resolved_brand, resolved_avatar, mapping)
-        if db_event_ref:
-            mapping["event_ref"] = db_event_ref
-    except Exception as ex:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to read event_ref from voice_video_mappings.sqlite3: {ex}",
-        )
-
-    created_in_this_call = False
-
-
-    # Always use the persisted event_ref if present (prevents creating a new event on every Play).
-    # IMPORTANT: do not rely on the in-memory mapping cache here; workers/instances may differ.
-    event_ref = _get_stream_session_event_ref(resolved_brand, resolved_avatar) or str(mapping.get("event_ref") or "").strip()
-    event_ref = str(event_ref or "").strip()
-
-    # Only the host is allowed to create the event_ref automatically.
-    if not event_ref and is_host:
-        created_in_this_call = True
-        event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-        _persist_event_ref_strict(resolved_brand, resolved_avatar, event_ref)
-
-        # Read-after-write verification (strict):
-        # If the DB cannot reflect the new event_ref immediately, we must surface the issue
-        # because otherwise the host will create a new BeeStreamed event on each Play.
-        persisted = _db_get_event_ref_strict(resolved_brand, resolved_avatar, mapping)
-        if not persisted or str(persisted).strip() != str(event_ref).strip():
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Failed to persist BeeStreamed event_ref to voice_video_mappings.sqlite3. "
-                    "Ensure the DB file is writable and the companion row exists."
-                ),
-            )
-
-    # If we still have no event_ref, non-host users should wait.
-    if not event_ref:
-        return {
-            "ok": True,
-            "status": "waiting_for_host",
-            "canStart": False,
-            "isHost": False,
-            "eventRef": "",
-            "embedUrl": "",
-            "message": f"Waiting on {resolved_avatar} to start event",
-        }
-
-    embed_url = f"/stream/beestreamed/embed/{event_ref}"
-
-    if not is_host:
-        return {
-            "ok": True,
-            "status": "waiting_for_host",
-            "canStart": False,
-            "isHost": False,
-            "eventRef": event_ref,
-            "embedUrl": embed_url,
-            "message": f"Waiting on {resolved_avatar} to start event",
-        }
-
-    # Host: mark the stream session as active as soon as the host hits Play.
-    # This drives the "in a live session" gating for everyone else (visitors + members) *before* "Go Live".
-    #
-    # NOTE: We set this flag before talking to BeeStreamed so that even if BeeStreamed calls take a moment,
-    # clients immediately start gating messages.
-    _set_stream_session_active(resolved_brand, resolved_avatar, True, event_ref)
-
-    # Host: ensure the event is scheduled for 'now' and then start the WebRTC stream.
-    # If BeeStreamed returns a 404 for an existing/stale event_ref, we transparently generate a fresh one,
-    # persist it, and retry once.
-    def _start_event(_ref: str) -> None:
-        # If a previous session ended the event (e.g., status="idle"), reset back to a reusable
-        # state before starting WebRTC. Best-effort: do not fail the entire start if this patch
-        # is rejected by BeeStreamed.
-        _beestreamed_patch_event_status_best_effort(_ref, "idle")
-        _beestreamed_schedule_now_sync(
-            _ref,
-            title=f"{resolved_avatar} Live",
-            embed_domain=(req.embedDomain or "").strip(),
-        )
-        _beestreamed_start_webrtc_sync(_ref)
-
-    try:
-        _start_event(event_ref)
-    except HTTPException as e:
-        if int(getattr(e, "status_code", 0) or 0) == 404:
-            if created_in_this_call:
-                # Sometimes BeeStreamed is eventually-consistent right after creation; retry once.
-                import time as _time
-
-                _time.sleep(1.0)
-                _start_event(event_ref)
-            else:
-                # Stale/invalid event_ref in DB: regenerate, persist, and retry once.
-                event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-                _persist_event_ref_strict(resolved_brand, resolved_avatar, event_ref)
-                embed_url = f"/stream/beestreamed/embed/{event_ref}"
-
-                # Update session event_ref immediately so pollers see the correct event id.
-                _set_stream_session_active(resolved_brand, resolved_avatar, True, event_ref)
-
-                _start_event(event_ref)
-        else:
-            # If we fail to start the event, clear the session flag so clients don't stay gated.
-            _set_stream_session_active(resolved_brand, resolved_avatar, False, "")
-            raise
-    except Exception:
-        # Non-HTTP error: clear the session flag so clients don't stay gated.
-        _set_stream_session_active(resolved_brand, resolved_avatar, False, "")
-        raise
-
-    # Ensure the stored session event_ref matches the final event_ref we ended up using.
-    _set_stream_session_active(resolved_brand, resolved_avatar, True, event_ref)
-
-    return {
-        "ok": True,
-        "status": "started",
-        "canStart": True,
-        "isHost": True,
-        "eventRef": event_ref,
-        "embedUrl": embed_url,
-        "message": "",
-    }
-
-
-
-
-
-
-@app.post("/stream/beestreamed/start_broadcast")
-async def beestreamed_start_broadcast(req: BeeStreamedStartEmbedRequest):
-    """Host helper: prepare a BeeStreamed event and return a broadcaster iframe URL.
-
-    - Uses the same host-gating logic as /stream/beestreamed/start_embed.
-    - Ensures the event exists (host-only), schedules it for "now", and starts the WebRTC stream.
-    - Returns a same-origin wrapper URL (/stream/beestreamed/broadcaster/{event_ref}) suitable for iframing.
-
-    Frontend intent:
-      - The host can click "Broadcast" and immediately see the BeeStreamed broadcaster UI already pointed at the
-        correct event; they only need to press "Go Live" in the BeeStreamed Producer View.
-    """
-    data = await beestreamed_start_embed(req)
-
-    try:
-        is_host = bool(data.get("isHost"))
-        event_ref = str(data.get("eventRef") or "").strip()
-    except Exception:
-        is_host = False
-        event_ref = ""
-
-    data["broadcasterUrl"] = f"/stream/beestreamed/broadcaster/{event_ref}" if (is_host and event_ref) else ""
-    return data
-
-
-
-@app.post("/stream/beestreamed/create_event")
-async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
-    """Create (and optionally start) a BeeStreamed event for a configured companion.
-
-    Authorization rule:
-      - Only the host (memberId == host_member_id in voice_video_mappings.sqlite3) may create/start.
-      - Everyone else gets a "waiting" response.
-    """
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    member_id = (req.memberId or "").strip()
-
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
-
-    live = str(mapping.get("live") or "").strip().lower()
-    if "stream" not in live:
-        raise HTTPException(status_code=400, detail="This companion is not configured for stream")
-
-    comp_type = str(mapping.get("companion_type") or "").strip()
-    if comp_type and comp_type.lower() != "human":
-        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
-
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and member_id == host_id)
-
-    if not is_host:
-        existing_ref = str(mapping.get("event_ref") or "").strip()
-        return {
-            "ok": True,
-            "status": "waiting_for_host",
-            "canStart": False,
-            "isHost": False,
-            "eventRef": existing_ref,
-            "embedUrl": f"/stream/beestreamed/embed/{existing_ref}" if existing_ref else "",
-            "message": f"Waiting on {resolved_avatar} to start event",
-        }
-
-    # Host path: reuse existing event_ref if present, else create and persist.
-    event_ref = str(mapping.get("event_ref") or "").strip()
-    created_in_this_call = False
-    if not event_ref:
-        created_in_this_call = True
-        event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-        _persist_event_ref_strict(resolved_brand, resolved_avatar, event_ref)
-
-    if bool(req.startStream):
-        def _start_event(_ref: str) -> None:
-            _beestreamed_schedule_now_sync(_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
-            _beestreamed_start_webrtc_sync(_ref)
-
-        try:
-            _start_event(event_ref)
-        except HTTPException as e:
-            if int(getattr(e, "status_code", 0) or 0) == 404:
-                if created_in_this_call:
-                    import time as _time
-
-                    _time.sleep(1.0)
-                    _start_event(event_ref)
-                else:
-                    event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-                    _persist_event_ref_strict(resolved_brand, resolved_avatar, event_ref)
-                    _start_event(event_ref)
-            else:
-                raise
-
-    return {
-        "ok": True,
-        "status": "started",
-        "canStart": True,
-        "isHost": True,
-        "eventRef": event_ref,
-        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
-        "message": "",
-    }
-
-
-
-@app.get("/stream/beestreamed/status")
-async def beestreamed_status(brand: str, avatar: str):
-    """Return current BeeStreamed mapping state for a companion (does not start anything)."""
-    brand = (brand or "").strip()
-    avatar = (avatar or "").strip()
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
-
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-
-    # DB-backed session state (stable across workers/instances)
-    session_active = _get_stream_session_active(resolved_brand, resolved_avatar)
-    session_event_ref = _get_stream_session_event_ref(resolved_brand, resolved_avatar)
-
-    # Prefer DB event_ref if available; fallback to cached mapping.
-    event_ref = str(session_event_ref or mapping.get("event_ref") or "").strip()
-
-    # If the host ended the stream in the BeeStreamed Producer, the event will typically
-    # transition to "done". In that case, clear sessionActive so visitors/members can
-    # resume AI chat immediately.
-    if session_active and event_ref:
-        status = _beestreamed_get_event_status_best_effort(event_ref)
-        if status in ("done", "missing"):
-            _set_stream_session_active(resolved_brand, resolved_avatar, False, event_ref)
-            session_active = False
-
-    return {
-        "ok": True,
-        "eventRef": event_ref,
-        "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
-        "hostMemberId": host_id,
-        "sessionActive": bool(session_active),
-        "sessionEventRef": event_ref,
-
-        "companionType": str(mapping.get("companion_type") or "").strip(),
-        "live": str(mapping.get("live") or "").strip(),
-    }
-
-@app.post("/stream/beestreamed/embed_url")
-async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
-    """Return an embeddable URL that *cannot* pop out of the iframe.
-
-    This is useful when the frontend already has an eventRef (or a BeeStreamed viewer URL)
-    and only needs the safe wrapper URL for the iframe container.
-    """
-    event_ref = (req.eventRef or "").strip()
-    stream_url = (req.streamUrl or "").strip()
-
-    if not event_ref and stream_url:
-        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
-
-    if not event_ref:
-        raise HTTPException(status_code=400, detail="eventRef (or a streamUrl containing it) is required")
-
-    return {
-        "ok": True,
-        "eventRef": event_ref,
-        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
-    }
-@app.post("/stream/beestreamed/stop_embed")
-async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
-
-    member_id = (req.memberId or "").strip()
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and member_id == host_id)
-
-    if not is_host:
-        return {"ok": True, "status": "not_host"}
-
-    event_ref = (req.eventRef or "").strip() or str(mapping.get("event_ref") or "").strip()
-    if not event_ref:
-        return {"ok": True, "status": "no_event"}
-
-    _beestreamed_stop_webrtc_sync(event_ref)
-
-    # Best-effort: ensure the event is not left in a 'live' state once Stop is pressed.
-    # BeeStreamed supports status values including: idle, live, video, done, force_live.
-    # We use "done" to explicitly end the event session.
-    _beestreamed_patch_event_status_best_effort(event_ref, "done")
-
-
-    # Mark session inactive for global gating (host-only)
-    _set_stream_session_active(resolved_brand, resolved_avatar, False, event_ref)
-
-    # Close any in-stream live chat sockets for this event (best-effort).
-    try:
-        asyncio.create_task(_LIVECHAT.close_room(event_ref, reason="session_ended"))
-    except Exception:
-        pass
-
-    return {"ok": True, "status": "stopped", "eventRef": event_ref}
-
-
-@app.post("/stream/beestreamed/livechat/send")
-async def beestreamed_livechat_send(req: BeeStreamedLiveChatSendRequest):
-    """HTTP fallback for sending live chat messages.
-
-    The frontend primarily uses WebSockets, but this endpoint is useful when the
-    user sends a message before the WS handshake completes.
-    """
-
-    event_ref = (req.eventRef or "").strip()
-    text = (req.text or "").strip()
-    if not event_ref:
-        raise HTTPException(status_code=400, detail="eventRef is required")
-    if not text:
-        return {"ok": True, "status": "empty"}
-
-    # Only the Host can initiate shared in-stream chat. Viewers may only send once the
-    # Host has activated the BeeStreamed session (Host pressed Play).
-    if not _is_stream_session_active_for_event_ref(event_ref):
-        raise HTTPException(status_code=409, detail="Stream session is not active")
-
-    member_id = (req.memberId or "").strip() or f"anon:{uuid.uuid4().hex}"
-    role = (req.role or "viewer").strip().lower()
-    if role not in {"host", "viewer"}:
-        role = "viewer"
-
-    # Deterministic display name (can be overridden by optional req.name)
-    name = (req.name or "").strip()
-    if not name:
-        if role == "host":
-            name = "Host"
-        else:
-            tail = member_id[-4:] if member_id else ""
-            name = f"Viewer-{tail}" if tail else "Viewer"
-
-    client_msg_id = (req.clientMsgId or "").strip() or uuid.uuid4().hex
-    ts = int(req.ts or int(time.time() * 1000))
-
-    payload = {
-        "type": "chat",
-        "eventRef": event_ref,
-        "text": text[:4000],
-        "senderId": member_id,
-        "senderRole": role,
-        "name": name,
-        "clientMsgId": client_msg_id,
-        "ts": ts,
-    }
-
-    await _LIVECHAT.broadcast(event_ref, payload)
-    return {"ok": True}
-
-
-@app.websocket("/stream/beestreamed/livechat/{event_ref}")
-async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
-    """WebSocket room for BeeStreamed in-stream chat.
-
-    Query params:
-      - memberId: viewer/host id (Wix memberId or our anon:... id)
-      - role: host|viewer
-      - name: optional display label
-    """
-
-    ref = (event_ref or "").strip()
-    if not ref:
-        await websocket.close(code=1008)
-        return
-
-    # Only the Host can initiate shared in-stream chat. Reject early join attempts.
-    if not _is_stream_session_active_for_event_ref(ref):
-        try:
-            await websocket.accept()
-        except Exception:
-            pass
-        try:
-            await websocket.send_json({"type": "inactive", "detail": "Stream session is not active"})
-        except Exception:
-            pass
-        try:
-            await websocket.close(code=1008)
-        except Exception:
-            pass
-        return
-
-    qp = websocket.query_params
-    member_id = (qp.get("memberId") or "").strip() or f"anon:{uuid.uuid4().hex}"
-    role = (qp.get("role") or "viewer").strip().lower()
-    if role not in {"host", "viewer"}:
-        role = "viewer"
-    name = (qp.get("name") or "").strip()
-    if not name:
-        if role == "host":
-            name = "Host"
-        else:
-            tail = member_id[-4:] if member_id else ""
-            name = f"Viewer-{tail}" if tail else "Viewer"
-
-    history = await _LIVECHAT.connect(ref, websocket)
-    try:
-        if history:
-            await websocket.send_json({"type": "history", "messages": history})
-
-        while True:
-            try:
-                data = await websocket.receive_json()
-            except Exception:
-                # Fall back to raw text
-                raw = await websocket.receive_text()
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    continue
-
-            if not isinstance(data, dict):
-                continue
-
-            msg_type = str(data.get("type") or "chat").strip().lower()
-            if msg_type != "chat":
-                continue
-
-            text = str(data.get("text") or "").strip()
-            if not text:
-                continue
-
-            client_msg_id = str(data.get("clientMsgId") or "").strip() or uuid.uuid4().hex
-            ts = int(data.get("ts") or int(time.time() * 1000))
-
-            payload = {
-                "type": "chat",
-                "eventRef": ref,
-                "text": text[:4000],
-                "senderId": member_id,
-                "senderRole": role,
-                "name": name,
-                "clientMsgId": client_msg_id,
-                "ts": ts,
-            }
-
-            await _LIVECHAT.broadcast(ref, payload)
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        # Never crash the app on websocket errors
-        pass
-    finally:
-        await _LIVECHAT.disconnect(ref, websocket)
-
 
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
