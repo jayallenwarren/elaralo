@@ -735,7 +735,43 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
 
     m = _lookup_companion_mapping(b, a)
     if not m:
-        raise HTTPException(status_code=404, detail=f"Companion mapping not found for brand='{b}' avatar='{a}'")
+        # Strict error: do not attempt fuzzy matching (whitespace is significant).
+        # Provide debug context so mis-deployments / brand typos can be diagnosed quickly.
+        b_norm = _norm_key(b)
+        available_avatars = sorted(
+            {
+                str(v.get("avatar") or "").strip()
+                for (br, av), v in _COMPANION_MAPPINGS.items()
+                if br == b_norm and v
+            }
+        )
+        sample = [x for x in available_avatars if x][:20]
+        more = max(0, len([x for x in available_avatars if x]) - len(sample))
+
+        hint = ""
+        if sample:
+            hint = f" Available avatars for brand '{b}': {sample}" + (f" (+{more} more)" if more > 0 else "")
+        else:
+            known_brands = sorted(
+                {
+                    str(v.get("brand") or "").strip()
+                    for v in _COMPANION_MAPPINGS.values()
+                    if str(v.get("brand") or "").strip()
+                }
+            )
+            known_sample = known_brands[:20]
+            known_more = max(0, len(known_brands) - len(known_sample))
+            if known_sample:
+                hint = f" Known brands in loaded DB: {known_sample}" + (f" (+{known_more} more)" if known_more > 0 else "")
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Companion mapping not found for brand='{b}' avatar='{a}'."
+                f" LoadedRows={len(_COMPANION_MAPPINGS)} Source='{_COMPANION_MAPPINGS_SOURCE}' Table='{_COMPANION_MAPPINGS_TABLE}'."
+                + hint
+            ),
+        )
 
     cap = str(m.get("channel_cap") or "").strip()
     live = str(m.get("live") or "").strip()
@@ -755,12 +791,41 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
             detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live!r} (expected 'Stream', 'D-ID', or NULL)",
         )
 
-    # Product rule: Video icon requires BOTH channel_cap=Video and live in (Stream, D-ID).
-    if cap_lc == "video" and not live:
+    companion_type = str(m.get("companion_type") or "").strip()
+    ct_lc = companion_type.lower()
+    if ct_lc not in ("human", "ai"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: channel_cap=Video but live is NULL/empty for brand='{b}' avatar='{a}'",
+            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {companion_type!r} (expected 'Human' or 'AI')",
         )
+
+    # Product invariants:
+    # - Video companions require a Live provider and it must match companion_type:
+    #     Human => Stream
+    #     AI    => D-ID
+    # - Audio companions must NOT have a Live provider.
+    if cap_lc == "video":
+        if not live:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: channel_cap=Video but live is NULL/empty for brand='{b}' avatar='{a}'",
+            )
+        if ct_lc == "human" and live_lc != "stream":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: Human companions require live='Stream' for brand='{b}' avatar='{a}' (got {live!r})",
+            )
+        if ct_lc == "ai" and live_lc != "d-id":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: AI companions require live='D-ID' for brand='{b}' avatar='{a}' (got {live!r})",
+            )
+    else:
+        if live:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: channel_cap=Audio but live is {live!r} for brand='{b}' avatar='{a}' (expected NULL)",
+            )
     return {
         "found": True,
         "brand": str(m.get("brand") or ""),
@@ -768,6 +833,8 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "channel_cap": cap,
         "channelCap": cap,
         "live": live,
+        "companionType": companion_type,
+        "companion_type": companion_type,
         "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
         "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
         "didAgentId": str(m.get("did_agent_id") or ""),
@@ -1418,17 +1485,6 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     resolved_brand = mapping.get("brand") or req.brand
     resolved_avatar = mapping.get("avatar") or req.avatar
 
-
-    # Enforce provider separation:
-    # - Human companions: live == "Stream"
-    # - AI companions (D-ID): live == "D-ID"
-    live_raw = str(mapping.get("live") or "").strip().lower()
-    if live_raw != "stream":
-        raise HTTPException(status_code=400, detail="This companion is not configured for Stream (Human livestream)")
-
-    comp_type = str(mapping.get("companion_type") or "").strip()
-    if comp_type and comp_type.lower() != "human":
-        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
     # Host auth: only the configured host can START the stream.
     host_id = (mapping.get("host_member_id") or "").strip()
     member_id = (req.memberId or "").strip()
@@ -1535,7 +1591,7 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
     resolved_avatar = str(mapping.get("avatar") or avatar).strip()
 
     live = str(mapping.get("live") or "").strip().lower()
-    if live != "stream":
+    if "stream" not in live:
         raise HTTPException(status_code=400, detail="This companion is not configured for stream")
 
     comp_type = str(mapping.get("companion_type") or "").strip()
@@ -1662,15 +1718,6 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
 
     resolved_brand = mapping.get("brand") or req.brand
     resolved_avatar = mapping.get("avatar") or req.avatar
-
-    # Enforce provider separation: BeeStreamed endpoints are ONLY for live == "Stream" (Human).
-    live_raw = str(mapping.get("live") or "").strip().lower()
-    if live_raw != "stream":
-        raise HTTPException(status_code=400, detail="This companion is not configured for Stream (Human livestream)")
-
-    comp_type = str(mapping.get("companion_type") or "").strip()
-    if comp_type and comp_type.lower() != "human":
-        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
 
     host_id = (mapping.get("host_member_id") or "").strip()
     member_id = (req.memberId or "").strip()
