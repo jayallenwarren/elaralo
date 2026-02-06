@@ -588,7 +588,8 @@ def _load_companion_mappings_sync() -> None:
             print(f"[mappings] WARNING: mapping DB found at {db_path} but contains no tables.")
             _COMPANION_MAPPINGS = {}
             _COMPANION_MAPPINGS_LOADED_AT = time.time()
-            _COMPANION_MAPPINGS_SOURCE = f"{db_path}:{table_name_for_source}"
+            _COMPANION_MAPPINGS_SOURCE = db_path
+            _COMPANION_MAPPINGS_TABLE = ""
             return
 
         # Quote the table name to safely handle names with special characters.
@@ -611,15 +612,39 @@ def _load_companion_mappings_sync() -> None:
                     return r[k]
             return default
 
-        brand = str(get_col("brand", "rebranding", "company", "brand_id", "Brand", default="") or "").strip()
-        avatar = str(get_col("avatar", "companion", "Companion", "first_name", "firstname", default="") or "").strip()
+        brand = str(
+            get_col(
+                "brand",
+                "rebranding",
+                "company",
+                "brand_id",
+                "Brand",
+                default="",
+           )
+            or ""
+       ).strip()
 
-        # Core brand (Elaralo): some DBs store brand as empty/NULL for core rows.
-        # Treat that as the core brand name so lookups by brand="Elaralo" work.
-        if not avatar:
-            continue
+        # Core brand behavior:
+        # - Wix sends rebrandingKey="" (or NULL) when there is NO white label.
+        # - An empty/NULL brand is therefore treated as the core brand: "Elaralo".
         if not brand:
             brand = "Elaralo"
+
+        avatar = str(
+            get_col(
+                "avatar",
+                "companion",
+                "Companion",
+                "companion_name",
+                "companionName",
+                "first_name",
+                "firstname",
+                default="",
+           )
+            or ""
+       ).strip()
+        if not brand or not avatar:
+            continue
 
         key = (_norm_key(brand), _norm_key(avatar))
 
@@ -628,12 +653,9 @@ def _load_companion_mappings_sync() -> None:
             "avatar": avatar,
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
             # UI uses channel_cap to decide whether to show the video/play controls.
-            # Many DBs also have a legacy "communication" column; prefer channel_cap when present.
-            "channel_cap": str(
-                get_col("channel_cap", "chanel_cap", "channelCap", "channel_capability", default="") or ""
-            ),
+            "channel_cap": str(get_col("channel_cap", "channelCap", "chanel_cap", "channel_capability", default="") or "").strip(),
             "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
-            "live": str(get_col("live", "Live", default="") or ""),
+            "live": str(get_col("live", "Live", default="") or "").strip(),
             "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
             "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
             "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
@@ -653,14 +675,13 @@ def _load_companion_mappings_sync() -> None:
 
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
+    # Strict: exact (brand, avatar) match required (case-insensitive via _norm_key).
+    # Core brand: empty brand is treated as Elaralo.
     b = _norm_key(brand) or "elaralo"
     a = _norm_key(avatar)
     if not a:
         return None
 
-    # Brand is authoritative: when a rebrandingKey supplies brand (e.g. "DulceMoon"),
-    # we must NOT fall back to the default brand ("Elaralo").
-    # Avatar is also authoritative; do not attempt to split or normalize composite keys.
     return _COMPANION_MAPPINGS.get((b, a))
 
 
@@ -677,15 +698,21 @@ async def _startup_load_companion_mappings() -> None:
 async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
     """Lookup a companion mapping row by (brand, avatar).
 
+    This endpoint is intentionally STRICT:
+      - exact (brand, avatar) match required (case-insensitive via lower/strip normalization)
+      - errors out when a mapping is missing, so configuration issues are visible during development
+
     Query params:
       - brand: Brand name (e.g., "Elaralo", "DulceMoon")
       - avatar: Avatar first name (e.g., "Jennifer")
 
-    Response:
+    Response (200):
       {
-        found: bool,
+        found: true,
         brand: str,
         avatar: str,
+        channel_cap: "Video"|"Audio" ,
+        channelCap: "Video"|"Audio" ,   # alias for convenience
         live: "D-ID"|"Stream"|"" ,
         elevenVoiceId: str,
         elevenVoiceName: str,
@@ -697,30 +724,50 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         source: <db path> | ""
       }
     """
-    b = (brand or "").strip()
+    b_in = (brand or "").strip()
     a = (avatar or "").strip()
+
+    if not a:
+        raise HTTPException(status_code=400, detail="avatar is required")
+
+    # Core brand default: empty brand => Elaralo
+    b = b_in or "Elaralo"
 
     m = _lookup_companion_mapping(b, a)
     if not m:
+        raise HTTPException(status_code=404, detail=f"Companion mapping not found for brand='{b}' avatar='{a}'")
+
+    cap = str(m.get("channel_cap") or "").strip()
+    live = str(m.get("live") or "").strip()
+
+    # Strict validation (config contract)
+    cap_lc = cap.lower()
+    if cap_lc not in ("video", "audio"):
         raise HTTPException(
-            status_code=404,
-            detail={
-                "error": "Companion mapping not found",
-                "brand": b,
-                "avatar": a,
-                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-                "source": _COMPANION_MAPPINGS_SOURCE,
-                "table": _COMPANION_MAPPINGS_TABLE,
-            },
+            status_code=500,
+            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap!r} (expected 'Video' or 'Audio')",
         )
 
+    live_lc = live.lower()
+    if live and live_lc not in ("stream", "d-id"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live!r} (expected 'Stream', 'D-ID', or NULL)",
+        )
+
+    # Product rule: Video icon requires BOTH channel_cap=Video and live in (Stream, D-ID).
+    if cap_lc == "video" and not live:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid mapping: channel_cap=Video but live is NULL/empty for brand='{b}' avatar='{a}'",
+        )
     return {
         "found": True,
         "brand": str(m.get("brand") or ""),
         "avatar": str(m.get("avatar") or ""),
-        "channelCap": str(m.get("channel_cap") or ""),
-        "channel_cap": str(m.get("channel_cap") or ""),
-        "live": str(m.get("live") or ""),
+        "channel_cap": cap,
+        "channelCap": cap,
+        "live": live,
         "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
         "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
         "didAgentId": str(m.get("did_agent_id") or ""),
@@ -1371,6 +1418,17 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     resolved_brand = mapping.get("brand") or req.brand
     resolved_avatar = mapping.get("avatar") or req.avatar
 
+
+    # Enforce provider separation:
+    # - Human companions: live == "Stream"
+    # - AI companions (D-ID): live == "D-ID"
+    live_raw = str(mapping.get("live") or "").strip().lower()
+    if live_raw != "stream":
+        raise HTTPException(status_code=400, detail="This companion is not configured for Stream (Human livestream)")
+
+    comp_type = str(mapping.get("companion_type") or "").strip()
+    if comp_type and comp_type.lower() != "human":
+        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
     # Host auth: only the configured host can START the stream.
     host_id = (mapping.get("host_member_id") or "").strip()
     member_id = (req.memberId or "").strip()
@@ -1477,7 +1535,7 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
     resolved_avatar = str(mapping.get("avatar") or avatar).strip()
 
     live = str(mapping.get("live") or "").strip().lower()
-    if "stream" not in live:
+    if live != "stream":
         raise HTTPException(status_code=400, detail="This companion is not configured for stream")
 
     comp_type = str(mapping.get("companion_type") or "").strip()
@@ -1604,6 +1662,15 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
 
     resolved_brand = mapping.get("brand") or req.brand
     resolved_avatar = mapping.get("avatar") or req.avatar
+
+    # Enforce provider separation: BeeStreamed endpoints are ONLY for live == "Stream" (Human).
+    live_raw = str(mapping.get("live") or "").strip().lower()
+    if live_raw != "stream":
+        raise HTTPException(status_code=400, detail="This companion is not configured for Stream (Human livestream)")
+
+    comp_type = str(mapping.get("companion_type") or "").strip()
+    if comp_type and comp_type.lower() != "human":
+        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
 
     host_id = (mapping.get("host_member_id") or "").strip()
     member_id = (req.memberId or "").strip()

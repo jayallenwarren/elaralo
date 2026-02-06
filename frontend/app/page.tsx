@@ -70,21 +70,24 @@ type Msg = { role: Role; content: string; meta?: any };
 
 type Mode = "friend" | "romantic" | "intimate";
 
-type LiveProvider = "did" | "stream";
+type LiveProvider = "d-id" | "stream";
 type ChannelCap = "audio" | "video" | "";
 
 type CompanionMappingRow = {
   found?: boolean;
   brand?: string;
   avatar?: string;
-  channel_cap?: string; // "Audio" | "Video"
-  channelCap?: string; // optional camelCase alias
-  live?: string; // "D-ID" | "Stream"
+
+  // DB columns
+  channel_cap?: string; // "Video" | "Audio"
+  channelCap?: string;  // API alias (optional)
+  live?: string;        // "Stream" | "D-ID" | ""
+
+  // Provider-specific fields (optional)
   didClientKey?: string;
   didAgentId?: string;
   elevenVoiceId?: string;
 };
-
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
@@ -1416,9 +1419,34 @@ export default function Page() {
 
   useEffect(() => {
     // Keep state in sync with localStorage as the user switches companions/brands.
+    // Fallback to sessionStorage if localStorage is blocked (common in some iframe/privacy modes).
     try {
       if (typeof window === "undefined") return;
-      const stored = String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+
+      let stored = "";
+      try {
+        stored = String((() => {
+          try {
+            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
+            if (v && String(v).trim()) return v;
+          } catch (e) {}
+          try {
+            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
+            if (v2 && String(v2).trim()) return v2;
+          } catch (e) {}
+          return "";
+        })() || "").trim();
+      } catch (e) {
+        stored = "";
+      }
+      if (!stored) {
+        try {
+          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+        } catch (e) {
+          stored = "";
+        }
+      }
+
       setViewerLiveChatName(stored);
     } catch (e) {
       setViewerLiveChatName("");
@@ -1431,7 +1459,29 @@ export default function Page() {
       const current = String(viewerLiveChatName || "").trim();
       if (current) return current;
 
-      const stored = String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+      let stored = "";
+      try {
+        stored = String((() => {
+          try {
+            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
+            if (v && String(v).trim()) return v;
+          } catch (e) {}
+          try {
+            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
+            if (v2 && String(v2).trim()) return v2;
+          } catch (e) {}
+          return "";
+        })() || "").trim();
+      } catch (e) {
+        stored = "";
+      }
+      if (!stored) {
+        try {
+          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+        } catch (e) {
+          stored = "";
+        }
+      }
       if (stored) {
         setViewerLiveChatName(stored);
         return stored;
@@ -1447,7 +1497,19 @@ export default function Page() {
 
       if (!cleaned) return "";
 
-      window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
+      try {
+        try {
+        window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
+      } catch (e) {
+        try {
+          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
+        } catch (e) {}
+      }
+      } catch (e) {
+        try {
+          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
+        } catch (e) {}
+      }
       setViewerLiveChatName(cleaned);
       return cleaned;
     } catch (e) {
@@ -1461,7 +1523,17 @@ export default function Page() {
       if (typeof window === "undefined") return;
       const existing =
         String(viewerLiveChatName || "").trim() ||
-        String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+        String((() => {
+          try {
+            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
+            if (v && String(v).trim()) return v;
+          } catch (e) {}
+          try {
+            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
+            if (v2 && String(v2).trim()) return v2;
+          } catch (e) {}
+          return "";
+        })() || "").trim();
 
       const raw =
         window.prompt("Change your username for the live session:", existing) || "";
@@ -1474,7 +1546,13 @@ export default function Page() {
 
       if (!cleaned) return;
 
-      window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
+      try {
+        window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
+      } catch (e) {
+        try {
+          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
+        } catch (e) {}
+      }
       setViewerLiveChatName(cleaned);
     } catch (e) {
       // ignore
@@ -1485,19 +1563,25 @@ export default function Page() {
   // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
   const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
 
-  useEffect(() => {
+  
+  const [companionMappingError, setCompanionMappingError] = useState<string>("");
+useEffect(() => {
     let cancelled = false;
 
     async function load() {
       const brand = String(companyName || "").trim();
       const avatar = String(companionName || "").trim();
+
+      // Strict: brand+avatar must be present (core brand defaults to Elaralo when rebrandingKey is empty).
       if (!brand || !avatar) {
         setCompanionMapping(null);
+        setCompanionMappingError("Missing brand or avatar for companion mapping lookup.");
         return;
       }
 
       if (!API_BASE) {
         setCompanionMapping(null);
+        setCompanionMappingError("API_BASE is not configured; cannot load companion mapping.");
         return;
       }
 
@@ -1507,30 +1591,33 @@ export default function Page() {
         )}`;
         const res = await fetch(url, { method: "GET" });
 
-        // Strict API: 200 => mapping exists, 404 => mapping missing.
-        let json: any = null;
-        try {
-          json = await res.json();
-        } catch (e) {
-          json = null;
-        }
-
+        // Backend is strict and may return 404; surface its error message.
+        const json: any = await res.json().catch(() => ({}));
         if (cancelled) return;
 
         if (!res.ok) {
-          console.error("[mappings] companion mapping lookup failed", {
-            brand,
-            avatar,
-            status: res.status,
-            body: json,
-          });
+          const detail = String(json?.detail || json?.message || "").trim();
           setCompanionMapping(null);
+          setCompanionMappingError(
+            detail || `Companion mapping request failed (${res.status} ${res.statusText}).`
+          );
+          return;
+        }
+
+        // Strict: mapping endpoint must return found=true
+        if (!(json as any)?.found) {
+          setCompanionMapping(null);
+          setCompanionMappingError(`Companion mapping not found for brand='${brand}' avatar='${avatar}'.`);
           return;
         }
 
         setCompanionMapping(json as CompanionMappingRow);
-      } catch (e) {
-        if (!cancelled) setCompanionMapping(null);
+        setCompanionMappingError("");
+      } catch (e: any) {
+        if (!cancelled) {
+          setCompanionMapping(null);
+          setCompanionMappingError(String(e?.message || e || "Failed to load companion mapping."));
+        }
       }
     }
 
@@ -1539,7 +1626,7 @@ export default function Page() {
     return () => {
       cancelled = true;
     };
-  }, [companyName, companionName]);
+  }, [API_BASE, companyName, companionName]);
 
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
@@ -1675,36 +1762,41 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
-  // IMPORTANT: Do not use the legacy `communication` column.
-  // The DB contract is: channel_cap ∈ {"Video","Audio"} (case-insensitive).
-  const capFromDb = String(
-    (companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? ""
-  )
+  // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
+  const capRaw = String((companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? "")
     .trim()
     .toLowerCase();
 
-  if (capFromDb === "video") return "video";
-  if (capFromDb === "audio") return "audio";
+  if (capRaw === "video") return "video";
+  if (capRaw === "audio") return "audio";
   return "";
 }, [companionMapping]);
 
 const liveProvider: LiveProvider = useMemo(() => {
-  // Prefer database mapping when present.
-  const liveFromDb = String(companionMapping?.live || "").trim().toLowerCase();
-	  // Be tolerant of values like "Stream", "Streamed", "BeeStreamed", or custom labels that include
-	  // these keywords (e.g., "Stream (BeeStreamed)").
-	  if (liveFromDb.includes("stream")) return "stream";
-	  if (liveFromDb.includes("d-id") || liveFromDb.includes("did") || liveFromDb.includes("d_id")) return "did";
+  // Strict mapping: DB values are Stream, D-ID, or NULL.
+  // NOTE: "did" (no hyphen) is NOT accepted.
+  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
-  // Backward compatibility: allow companionKey flags (older Wix payloads / test URLs)
-  const raw = String(companionKeyRaw || companionKey || "").trim();
-  const { flags } = splitCompanionKey(raw);
-  const v = String(flags["live"] || "").trim().toLowerCase();
-  if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
+  if (liveRaw === "stream") return "stream";
+  if (liveRaw === "d-id") return "d-id";
 
-  return "did";
-}, [companionMapping, companionKeyRaw, companionKey]);
+  // If channel_cap=Video but live is empty/invalid, treat as misconfigured.
+  // We default to "d-id" as a safe runtime fallback, but we also surface an error via companionMappingError.
+  return "d-id";
+}, [companionMapping]);
 
+
+// Strict validation: Video companions must have a Live provider (Stream or D-ID).
+useEffect(() => {
+  if (channelCap === "video") {
+    const liveRaw = String(companionMapping?.live || "").trim();
+    if (!liveRaw) {
+      setCompanionMappingError(
+        `Invalid companion mapping: channel_cap=Video but live is NULL/empty for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`
+      );
+    }
+  }
+}, [channelCap, companionMapping, companyName, companionName]);
 const streamUrl = useMemo(() => {
   const raw = String(companionKeyRaw || "").trim();
   const { flags } = splitCompanionKey(raw);
@@ -1712,34 +1804,32 @@ const streamUrl = useMemo(() => {
 }, [companionKeyRaw]);
 
 const liveEnabled = useMemo(() => {
-  // NOTE: The product requirement for showing the "video" control is driven by the
-  // SQLite "Live" column (values like "D-ID" or "Stream").
-  //
-  // Some rows also have a "communication" column (audio/video). In prior iterations we
-  // treated communication=audio as "no video" and hid the control — but that breaks the
-  // intended behavior for human companions (Live=Stream) and D-ID avatars (Live=D-ID)
-  // that may still be marked communication=audio.
-  //
-  // Therefore: if the mapping explicitly declares Live=Stream or Live=D-ID, we always
-  // enable the control regardless of communication.
+  // Product requirement (Video Icon next to the microphone):
+  // - Show when channel_cap === "Video" AND live is "Stream" or "D-ID"
+  // - Hide otherwise
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
-  const mappingSaysVideo =
-    liveRaw.includes("stream") || liveRaw.includes("d-id") || liveRaw.includes("did");
-  if (mappingSaysVideo) return true;
-
-  // If we *only* have a channel cap (and no Live mapping), honor it.
-  if (channelCap === "video") return true;
-  if (channelCap === "audio") return false;
-
-  // Final fallback: keep prior behavior when mapping is missing.
-  return liveProvider === "stream" || Boolean(phase1AvatarMedia);
-}, [companionMapping, channelCap, liveProvider, phase1AvatarMedia]);
+  const liveOk = liveRaw === "stream" || liveRaw === "d-id";
+  return channelCap === "video" && liveOk;
+}, [channelCap, companionMapping]);
 
 
 
   // UI layout
   const conversationHeight = 520;
-  const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (Boolean(phase1AvatarMedia) && avatarStatus !== "idle");
+  // UI: show the video frame whenever the user is in a Live Video session.
+// For Stream (BeeStreamed): show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
+// so the click is never perceived as a no-op and the viewer can always press Stop to exit waiting.
+const streamUiActive =
+  liveProvider === "stream" &&
+  (avatarStatus === "connecting" ||
+    avatarStatus === "waiting" ||
+    avatarStatus === "connected" ||
+    avatarStatus === "reconnecting" ||
+    Boolean(streamEmbedUrl || streamEventRef));
+
+const showAvatarFrame =
+  (liveProvider === "stream" && streamUiActive) ||
+  (Boolean(phase1AvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
 
   // Viewer-only: treat any active BeeStreamed embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
@@ -2915,7 +3005,7 @@ const speakAssistantReply = useCallback(
   // Stable member id used for live chat (Wix memberId when available, otherwise anon:...)
   const brandKeyForAnon = useMemo(() => {
     // `rebranding` is derived from RebrandingKey and is safe to use here.
-    const rawBrand = String(rebranding || "core").trim() || "core";
+    const rawBrand = String(rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
     return safeBrandKey(rawBrand);
   }, [rebranding]);
 
@@ -3033,7 +3123,12 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   // Once a Viewer joins the live stream session (Play -> iframe open), disable the Play button
   // to prevent duplicate joins. Pressing Stop re-enables Play.
   const viewerHasJoinedStream =
-    liveProvider === "stream" && !streamCanStart && Boolean(streamEmbedUrl || streamEventRef);
+    liveProvider === "stream" &&
+    !streamCanStart &&
+    (avatarStatus === "connected" ||
+      avatarStatus === "waiting" ||
+      avatarStatus === "connecting" ||
+      avatarStatus === "reconnecting");
 
   // ---------------------------------------------------------------------------
   // BeeStreamed shared in-stream live chat (Host + joined Viewers)
@@ -3855,7 +3950,7 @@ const companionForBackend =
 // NOTE:
 	// - `rebranding` (legacy) is not guaranteed to be present in this build.
 	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || "core").trim();
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -3934,7 +4029,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
 // NOTE:
 	// - `rebranding` (legacy) is not guaranteed to be present in this build.
 	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || "core").trim();
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -4597,7 +4692,7 @@ useEffect(() => {
   // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
   // ------------------------------------------------------------
   const liveAvatarActive =
-    liveProvider === "did" &&
+    liveProvider === "d-id" &&
     (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
 
   // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
@@ -5527,7 +5622,10 @@ const speakGreetingIfNeeded = useCallback(
     // Viewer-only (Live Stream): enable Stop to close the embedded player even when mic/STT isn't running.
     // IMPORTANT: This must be synchronous on the user gesture on iOS to avoid breaking future TTS routing.
     // This does NOT affect the underlying stream session because ONLY the host calls stop_embed.
-    if (liveProvider === "stream" && !streamCanStart && (streamEmbedUrl || streamEventRef)) {
+    if (liveProvider === "stream" && !streamCanStart && (joinedStreamRef.current || avatarStatus !== "idle")) {
+      // Viewer stop:
+      // - Always allow leaving the waiting/connected UI, even if the host has not created an eventRef yet.
+      // - This MUST NOT stop the underlying live session (only the host can do that).
       try {
         setStreamEmbedUrl("");
         setStreamEventRef("");
@@ -5710,26 +5808,33 @@ const speakGreetingIfNeeded = useCallback(
 const viewerCanStopStream =
   liveProvider === "stream" &&
   !streamCanStart &&
-  Boolean(streamEmbedUrl || streamEventRef) &&
-  (avatarStatus === "connected" ||
+  // Allow Stop even before an eventRef/embedUrl exists (viewer waiting for host).
+  (Boolean(joinedStreamRef.current) ||
+    avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
-    avatarStatus === "reconnecting");
+    avatarStatus === "reconnecting" ||
+    avatarStatus === "error");
 
 // Host requirement: Stop must end the live session (and send the end-event signal to BeeStreamed).
 const hostCanStopStream =
   liveProvider === "stream" &&
   streamCanStart &&
-  Boolean(streamEmbedUrl || streamEventRef) &&
-  (avatarStatus === "connected" ||
+  (Boolean(streamEmbedUrl || streamEventRef) ||
+    avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
-    avatarStatus === "reconnecting");
+    avatarStatus === "reconnecting" ||
+    avatarStatus === "error");
 
 const hostInStreamUi =
   liveProvider === "stream" &&
   streamCanStart &&
-  Boolean(streamEmbedUrl || streamEventRef);
+  (Boolean(streamEmbedUrl || streamEventRef) ||
+    avatarStatus === "connected" ||
+    avatarStatus === "waiting" ||
+    avatarStatus === "connecting" ||
+    avatarStatus === "reconnecting");
 
 const viewerInStreamUi = viewerHasJoinedStream;
 
@@ -6076,147 +6181,164 @@ const modePillControls = (
         </div>
       </header>
 
-<section
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 12,
-          marginBottom: 12,
-          flexWrap: "wrap",
+{companionMappingError ? (
+  <div
+    style={{
+      margin: "10px 0",
+      padding: "10px 12px",
+      borderRadius: 10,
+      background: "#ffebee",
+      color: "#b71c1c",
+      fontSize: 13,
+      fontWeight: 700,
+      lineHeight: 1.35,
+    }}
+  >
+    {companionMappingError}
+  </div>
+) : null}
+
+{liveEnabled ? (
+  <section
+    style={{
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12,
+      marginBottom: 12,
+      flexWrap: "wrap",
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      <button
+        onClick={() => {
+          // Stream provider: Play = join/start. It must NOT toggle to Pause.
+          // Leaving the session is done exclusively via Stop.
+          if (liveProvider === "stream") {
+            if (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) return;
+            void startLiveAvatar();
+            return;
+          }
+
+          if (
+            avatarStatus === "connected" ||
+            avatarStatus === "connecting" ||
+            avatarStatus === "reconnecting"
+          ) {
+            void stopLiveAvatar();
+          } else {
+            void (async () => {
+              // Live Avatar requires microphone / STT. Start it automatically.
+              // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
+              if (sttEnabledRef.current && useBackendStt) {
+                stopSpeechToText();
+              }
+
+              if (!sttEnabledRef.current) {
+                await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
+              }
+
+              // If mic permission was denied, don't start Live Avatar.
+              if (!sttEnabledRef.current) return;
+
+              await startLiveAvatar();
+            })();
+          }
         }}
+        disabled={liveProvider === "stream" ? (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) : false}
+        style={{
+          padding: "10px 14px",
+          borderRadius: 10,
+          border: "1px solid #111",
+          background: "#fff",
+          color: "#111",
+          cursor:
+            liveProvider === "stream" && (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error"))
+              ? "not-allowed"
+              : "pointer",
+          opacity:
+            liveProvider === "stream" && (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) ? 0.6 : 1,
+          fontWeight: 700,
+        }}
+        aria-label={
+          liveProvider === "stream"
+            ? viewerHasJoinedStream
+              ? "Already joined"
+              : "Join live stream"
+            : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting"
+              ? "Stop Live Avatar"
+              : "Start Live Avatar"
+        }
+        title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <button
-            onClick={() => {
-              // IMPORTANT: The Play (Video) control is never hidden.
-              // When video is not available for the current companion (liveEnabled=false),
-              // the button is disabled and does nothing.
-              if (!liveEnabled) return;
+        {liveProvider === "stream" ? (
+          <PlayIcon />
+        ) : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" ? (
+          <PauseIcon />
+        ) : (
+          <PlayIcon />
+        )}
+      </button>
 
-              // Stream provider: Play = join/start. It must NOT toggle to Pause.
-              // Leaving the session is done exclusively via Stop.
-              if (liveProvider === "stream") {
-                if (viewerHasJoinedStream || avatarStatus !== "idle") return;
-                void startLiveAvatar();
-                return;
-              }
+      {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
+      {sttControls}
 
-              if (
-                avatarStatus === "connected" ||
-                avatarStatus === "connecting" ||
-                avatarStatus === "reconnecting"
-              ) {
-                void stopLiveAvatar();
-              } else {
-                void (async () => {
-                  // Live Avatar requires microphone / STT. Start it automatically.
-                  // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
-                  if (sttEnabledRef.current && useBackendStt) {
-                    stopSpeechToText();
-                  }
+      {liveProvider === "stream" && !isBeeStreamedHost ? (
+        <button
+          type="button"
+          onClick={changeViewerLiveChatName}
+          style={{
+            border: "none",
+            background: "transparent",
+            padding: 0,
+            margin: 0,
+            fontSize: 12,
+            color: "#111",
+            textDecoration: "underline",
+            cursor: "pointer",
+            whiteSpace: "nowrap",
+          }}
+          aria-label="Change username"
+          title="Change the name shown to others during the live session"
+        >
+          {String(viewerLiveChatName || "").trim() ? "Change username" : "Set username"}
+        </button>
+      ) : null}
 
-                  if (!sttEnabledRef.current) {
-                    await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
-                  }
+      <div style={{ fontSize: 12, color: "#666" }}>
+        Live Avatar: <b>{avatarStatus}</b>
+        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+      </div>
+    </div>
 
-                  // If mic permission was denied, don't start Live Avatar.
-                  if (!sttEnabledRef.current) return;
+    {/* Right-justified Mode controls */}
+    {modePillControls}
+  </section>
+) : (
+  <section
+    style={{
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12,
+      marginBottom: 12,
+      flexWrap: "wrap",
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
+      {sttControls}
 
-                  await startLiveAvatar();
-                })();
-              }
-            }}
-            disabled={
-              !liveEnabled ||
-              (liveProvider === "stream" ? viewerHasJoinedStream || avatarStatus !== "idle" : false)
-            }
-            style={{
-              padding: "10px 14px",
-              borderRadius: 10,
-              border: "1px solid #111",
-              background: "#fff",
-              color: "#111",
-              cursor:
-                !liveEnabled ||
-                (liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle"))
-                  ? "not-allowed"
-                  : "pointer",
-              opacity:
-                !liveEnabled ||
-                (liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle"))
-                  ? 0.6
-                  : 1,
-              fontWeight: 700,
-            }}
-            aria-label={
-              !liveEnabled
-                ? "Video not available"
-                : liveProvider === "stream"
-                ? viewerHasJoinedStream
-                  ? "Already joined"
-                  : "Join live stream"
-                : avatarStatus === "connected" ||
-                  avatarStatus === "connecting" ||
-                  avatarStatus === "reconnecting"
-                ? "Stop Live Avatar"
-                : "Start Live Avatar"
-            }
-            title={
-              !liveEnabled
-                ? "Video not available for this companion"
-                : liveProvider === "stream" && viewerHasJoinedStream
-                ? "Already joined. Press Stop to leave."
-                : "Video"
-            }
-          >
-            {liveProvider === "stream" ? (
-              <PlayIcon />
-            ) : avatarStatus === "connected" ||
-              avatarStatus === "connecting" ||
-              avatarStatus === "reconnecting" ? (
-              <PauseIcon />
-            ) : (
-              <PlayIcon />
-            )}
-          </button>
+      <div style={{ fontSize: 12, color: "#666" }}>
+        Live Avatar: <b>{avatarStatus}</b>
+        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+      </div>
+    </div>
 
-          {/* Place mic/stop controls to the right of the video control */}
-          {sttControls}
-
-          {liveEnabled && liveProvider === "stream" && !isBeeStreamedHost ? (
-            <button
-              type="button"
-              onClick={changeViewerLiveChatName}
-              style={{
-                border: "none",
-                background: "transparent",
-                padding: 0,
-                margin: 0,
-                fontSize: 12,
-                color: "#111",
-                textDecoration: "underline",
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-              }}
-              aria-label="Change username"
-              title="Change the name shown to others during the live session"
-            >
-              {String(viewerLiveChatName || "").trim() ? "Change username" : "Set username"}
-            </button>
-          ) : null}
-
-          <div style={{ fontSize: 12, color: "#666" }}>
-            Live Avatar: <b>{avatarStatus}</b>
-            {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
-          </div>
-        </div>
-
-        {/* Right-justified Mode controls */}
-        {modePillControls}
-      </section>
-
-
+    {/* Right-justified Mode controls */}
+    {modePillControls}
+  </section>
+)}
 
 
 
