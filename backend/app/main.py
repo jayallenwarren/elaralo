@@ -42,32 +42,85 @@ STATUS_ALLOWED = "explicit_allowed"
 app = FastAPI(title="Elaralo API")
 
 # ----------------------------
-# CORS (strict)
-cors_allow_origins_env = os.environ.get("CORS_ALLOW_ORIGINS")
-if cors_allow_origins_env is None or not cors_allow_origins_env.strip():
-    raise RuntimeError("CORS_ALLOW_ORIGINS must be set (comma-separated list of allowed origins).")
+# CORS
+# ----------------------------
+# CORS_ALLOW_ORIGINS can be:
+#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
+#   - entries with wildcards (e.g. https://*.azurestaticapps.net)
+#   - or a single "*" to allow all (NOT recommended for production)
+cors_env = (
+    os.getenv("CORS_ALLOW_ORIGINS", "")
+    or getattr(settings, "CORS_ALLOW_ORIGINS", None)
+    or ""
+).strip()
 
-cors_allow_origins = [o.strip().rstrip("/") for o in cors_allow_origins_env.split(",") if o.strip()]
-if not cors_allow_origins:
-    raise RuntimeError("CORS_ALLOW_ORIGINS parsed to an empty list; check formatting.")
+def _split_cors_origins(raw: str) -> list[str]:
+    """Split + normalize CORS origins from an env var.
 
-_CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-_CORS_ALLOW_HEADERS = [
-    "Accept",
-    "Accept-Language",
-    "Authorization",
-    "Content-Language",
-    "Content-Type",
-    "X-Admin-Token",
-    "X-Requested-With",
-]
+    Supports comma and/or whitespace separation.
+    Removes trailing slashes (browser Origin never includes a trailing slash).
+    De-dupes while preserving order.
+    """
+    if not raw:
+        return []
+    tokens = re.split(r"[\s,]+", raw.strip())
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in tokens:
+        if not t:
+            continue
+        t = t.strip()
+        if not t:
+            continue
+        if t != "*" and t.endswith("/"):
+            t = t.rstrip("/")
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+raw_items = _split_cors_origins(cors_env)
+allow_all = (len(raw_items) == 1 and raw_items[0] == "*")
+
+allow_origins: list[str] = []
+allow_origin_regex: str | None = None
+allow_credentials = True
+
+if allow_all:
+    # Allow-all is only enabled when explicitly configured via "*".
+    allow_origins = ["*"]
+    allow_credentials = False  # cannot be True with wildcard
+else:
+    # Support optional wildcards (e.g., "https://*.azurestaticapps.net").
+    literal: list[str] = []
+    wildcard: list[str] = []
+    for o in raw_items:
+        if "*" in o:
+            wildcard.append(o)
+        else:
+            literal.append(o)
+
+    allow_origins = literal
+
+    if wildcard:
+        # Convert wildcard origins to a regex.
+        parts: list[str] = []
+        for w in wildcard:
+            parts.append("^" + re.escape(w).replace("\\*", ".*") + "$")
+        allow_origin_regex = "|".join(parts)
+
+    # Security-first default: if CORS_ALLOW_ORIGINS is empty, we do NOT allow browser cross-origin calls.
+    # (Server-to-server calls without an Origin header still work.)
+    if not allow_origins and not allow_origin_regex:
+        print("[CORS] WARNING: CORS_ALLOW_ORIGINS is empty. Browser requests from other origins will be blocked.")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_allow_origins,
-    allow_credentials=True,
-    allow_methods=_CORS_ALLOW_METHODS,
-    allow_headers=_CORS_ALLOW_HEADERS,
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
+    allow_credentials=allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ----------------------------
@@ -388,11 +441,14 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
 # Default lookup key is (brand, avatar), case-insensitive.
 
 import sqlite3
+import shutil
+import tempfile
 from urllib.parse import urlparse, parse_qs
 
 _COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _COMPANION_MAPPINGS_LOADED_AT: float | None = None
 _COMPANION_MAPPINGS_SOURCE: str = ""
+_COMPANION_MAPPINGS_TABLE: str = ""
 
 
 def _norm_key(s: str) -> str:
@@ -420,8 +476,64 @@ def _candidate_mapping_db_paths() -> List[str]:
     return out
 
 
+def _ensure_writable_db_copy(src_db_path: str) -> str:
+    """Return a DB path we can safely write to.
+
+    Azure App Service commonly runs the deployed package from a read-only mount
+    (e.g. WEBSITE_RUN_FROM_PACKAGE=1). In that mode, writes to files shipped with
+    the app (including SQLite DBs) can fail.
+
+    Strategy:
+      - Prefer a stable writable path (env VOICE_VIDEO_DB_RW_PATH if set).
+      - Otherwise prefer /home/site (persisted) when available.
+      - Fall back to /tmp (ephemeral but writable).
+      - If the writable copy already exists, use it (do NOT overwrite).
+      - If it doesn't exist, copy from the packaged DB.
+
+    This keeps runtime state (like BeeStreamed event_ref) consistent across
+    multiple Uvicorn workers and across restarts (when /home is used).
+    """
+
+    src_db_path = (src_db_path or "").strip()
+    if not src_db_path:
+        return src_db_path
+
+    # Explicit override for the *writable* DB path.
+    rw_path = (os.getenv("VOICE_VIDEO_DB_RW_PATH", "") or "").strip()
+
+    # If not explicitly set, prefer /home/site for persistence.
+    if not rw_path:
+        home_site = "/home/site"
+        if os.path.isdir(home_site) and os.access(home_site, os.W_OK):
+            rw_path = os.path.join(home_site, os.path.basename(src_db_path))
+        else:
+            rw_path = os.path.join(tempfile.gettempdir(), os.path.basename(src_db_path))
+
+    # If the source already IS the writable path, we're done.
+    try:
+        if os.path.abspath(rw_path) == os.path.abspath(src_db_path):
+            return src_db_path
+    except Exception:
+        pass
+
+    # If a writable copy already exists, use it (do not overwrite; it may contain
+    # persisted runtime state like event_ref).
+    if os.path.exists(rw_path):
+        return rw_path
+
+    # Create parent dir, then copy.
+    try:
+        parent = os.path.dirname(rw_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        shutil.copy2(src_db_path, rw_path)
+        return rw_path
+    except Exception as e:
+        print(f"[mappings] WARNING: Failed to create writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
+        return src_db_path
+
+
 def _load_companion_mappings_sync() -> None:
-    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE
+    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
 
     db_path = ""
     for p in _candidate_mapping_db_paths():
@@ -435,6 +547,10 @@ def _load_companion_mappings_sync() -> None:
         _COMPANION_MAPPINGS_LOADED_AT = time.time()
         _COMPANION_MAPPINGS_SOURCE = ""
         return
+
+    # Ensure we can persist runtime state (e.g. event_ref) even when the deployed
+    # package is mounted read-only (common on Azure App Service).
+    db_path = _ensure_writable_db_copy(db_path)
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -501,7 +617,15 @@ def _load_companion_mappings_sync() -> None:
             "brand": brand,
             "avatar": avatar,
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
-            "communication": str(get_col("communication", "Communication", default="") or ""),
+            # UI uses channel_cap to decide whether to show the video/play controls.
+            # Many DBs also have a legacy "communication" column; prefer channel_cap when present.
+            "communication": str(
+                (
+                    get_col("channel_cap", "channelCap", "channel_capability", default="")
+                    or get_col("communication", "Communication", default="")
+                    or ""
+                )
+            ),
             "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
             "live": str(get_col("live", "Live", default="") or ""),
             "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
@@ -518,17 +642,19 @@ def _load_companion_mappings_sync() -> None:
     _COMPANION_MAPPINGS = d
     _COMPANION_MAPPINGS_LOADED_AT = time.time()
     _COMPANION_MAPPINGS_SOURCE = db_path
+    _COMPANION_MAPPINGS_TABLE = table_name_for_source
     print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path} (table={table_name_for_source})")
 
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
-    # Business rule:
-    # - If brand is empty/None, treat it as the default brand "Elaralo".
-    # - If brand is provided, DO NOT fall back to other brands.
     b = _norm_key(brand) or "elaralo"
     a = _norm_key(avatar)
     if not a:
         return None
+
+    # Brand is authoritative: when a rebrandingKey supplies brand (e.g. "DulceMoon"),
+    # we must NOT fall back to the default brand ("Elaralo").
+    # Avatar is also authoritative; do not attempt to split or normalize composite keys.
     return _COMPANION_MAPPINGS.get((b, a))
 
 
@@ -947,16 +1073,21 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
         return False
 
     try:
+        table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+        # table_name comes from sqlite_master at startup, but keep this defensive.
+        if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+            table_name = "companion_mappings"
+
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute("PRAGMA table_info(companion_mappings)")
+        cur.execute(f"PRAGMA table_info({table_name})")
         cols = [str(r[1] or "").strip() for r in cur.fetchall()]
         cols_l = [c.lower() for c in cols]
 
         # Ensure event_ref column exists
         if "event_ref" not in cols_l:
             try:
-                cur.execute("ALTER TABLE companion_mappings ADD COLUMN event_ref TEXT")
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN event_ref TEXT")
                 conn.commit()
                 cols_l.append("event_ref")
             except Exception:
@@ -970,7 +1101,7 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
             return False
 
         cur.execute(
-            f"UPDATE companion_mappings SET event_ref = ? WHERE lower({brand_col}) = lower(?) AND lower({avatar_col}) = lower(?)",
+            f"UPDATE {table_name} SET event_ref = ? WHERE lower({brand_col}) = lower(?) AND lower({avatar_col}) = lower(?)",
             (e, b, a),
         )
         conn.commit()
@@ -980,6 +1111,52 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
     finally:
         try:
             conn.close()
+        except Exception:
+            pass
+
+
+def _read_event_ref_from_db(brand: str, avatar: str) -> str:
+    """Read event_ref directly from SQLite.
+
+    This avoids cross-worker inconsistencies when the API is running with
+    multiple worker processes (each with its own in-memory cache).
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return ""
+
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    if not db_path or not os.path.exists(db_path):
+        return ""
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        # If the column isn't present (older DB), treat as empty.
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
+        if "event_ref" not in cols:
+            return ""
+
+        cur.execute(
+            f"SELECT event_ref FROM {table_name} WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
+            (b, a),
+        )
+        row = cur.fetchone()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            if conn:
+                conn.close()
         except Exception:
             pass
 
@@ -1226,7 +1403,11 @@ async def beestreamed_status(brand: str, avatar: str):
     if not mapping:
         raise HTTPException(status_code=404, detail="Companion mapping not found")
 
-    event_ref = str(mapping.get("event_ref") or "").strip()
+    # Use DB as the source of truth for event_ref.
+    # When the app runs with multiple workers, each worker has its own in-memory
+    # mapping cache; without this DB read, pollers can observe eventRef
+    event_ref = _read_event_ref_from_db(brand, avatar)
+    mapping["event_ref"] = event_ref
     return {
         "ok": True,
         "eventRef": event_ref,
