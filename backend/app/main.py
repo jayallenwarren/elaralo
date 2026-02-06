@@ -8,14 +8,15 @@ import json
 import hashlib
 import base64
 import asyncio
+import threading
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from pydantic import BaseModel
 
 from filelock import FileLock  # type: ignore
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -732,6 +733,144 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
 
 # ---------------------------------------------------------------------------
 # BeeStreamed: Start WebRTC streams (Live=Stream companions)
+# -----------------------------------------------------------------------------
+# BeeStreamed in-memory session state + shared live chat hub
+# -----------------------------------------------------------------------------
+
+_BEE_SESSION_LOCK = threading.Lock()
+# _BEE_SESSION_STATE[key] = {"active": bool, "event_ref": str, "updated_at": float}
+_BEE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
+
+_LIVECHAT_LOCK = threading.Lock()
+# _LIVECHAT_CLIENTS[event_ref] = set(WebSocket)
+_LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
+
+
+def _session_key(brand: str, avatar: str) -> str:
+    return f"{(brand or '').strip().lower()}|{(avatar or '').strip().lower()}"
+
+
+def _get_session_state(brand: str, avatar: str) -> Dict[str, Any]:
+    key = _session_key(brand, avatar)
+    with _BEE_SESSION_LOCK:
+        return dict(_BEE_SESSION_STATE.get(key, {}))
+
+
+def _is_session_active(brand: str, avatar: str) -> bool:
+    st = _get_session_state(brand, avatar)
+    return bool(st.get("active"))
+
+
+def _set_session_active(brand: str, avatar: str, *, active: bool, event_ref: Optional[str] = None) -> None:
+    key = _session_key(brand, avatar)
+    with _BEE_SESSION_LOCK:
+        st = _BEE_SESSION_STATE.get(key, {})
+        st["active"] = bool(active)
+        if event_ref:
+            st["event_ref"] = str(event_ref)
+        st["updated_at"] = time.time()
+        _BEE_SESSION_STATE[key] = st
+
+
+async def _livechat_broadcast(event_ref: str, payload: Dict[str, Any]) -> None:
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
+        return
+
+    with _LIVECHAT_LOCK:
+        sockets = list(_LIVECHAT_CLIENTS.get(event_ref, set()))
+
+    if not sockets:
+        return
+
+    msg = json.dumps(payload, ensure_ascii=False)
+    dead: List[WebSocket] = []
+    for ws in sockets:
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            dead.append(ws)
+
+    if dead:
+        with _LIVECHAT_LOCK:
+            s = _LIVECHAT_CLIENTS.get(event_ref, set())
+            for ws in dead:
+                try:
+                    s.discard(ws)
+                except Exception:
+                    pass
+            if not s:
+                _LIVECHAT_CLIENTS.pop(event_ref, None)
+
+
+class LiveChatSendRequest(BaseModel):
+    eventRef: str = ""
+    clientMsgId: Optional[str] = None
+    role: Optional[str] = None
+    name: Optional[str] = None
+    message: str = ""
+    ts: Optional[float] = None
+
+
+@app.websocket("/stream/beestreamed/livechat/{event_ref}")
+async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
+    event_ref = (event_ref or "").strip()
+    await websocket.accept()
+
+    if not event_ref:
+        await websocket.close(code=1008)
+        return
+
+    with _LIVECHAT_LOCK:
+        _LIVECHAT_CLIENTS.setdefault(event_ref, set()).add(websocket)
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    payload = {"message": str(payload)}
+            except Exception:
+                payload = {"message": raw}
+
+            payload.setdefault("eventRef", event_ref)
+            payload.setdefault("ts", time.time())
+            await _livechat_broadcast(event_ref, payload)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        # Keep the server resilient: drop the connection silently.
+        pass
+    finally:
+        with _LIVECHAT_LOCK:
+            s = _LIVECHAT_CLIENTS.get(event_ref, set())
+            try:
+                s.discard(websocket)
+            except Exception:
+                pass
+            if not s:
+                _LIVECHAT_CLIENTS.pop(event_ref, None)
+
+
+@app.post("/stream/beestreamed/livechat/send")
+async def beestreamed_livechat_send(req: LiveChatSendRequest):
+    event_ref = (req.eventRef or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="eventRef is required")
+
+    payload: Dict[str, Any] = {
+        "eventRef": event_ref,
+        "clientMsgId": (req.clientMsgId or str(uuid.uuid4())),
+        "role": (req.role or "viewer"),
+        "name": (req.name or ""),
+        "message": (req.message or ""),
+        "ts": (req.ts if req.ts is not None else time.time()),
+    }
+
+    await _livechat_broadcast(event_ref, payload)
+    return {"ok": True}
+
 # ---------------------------------------------------------------------------
 # IMPORTANT:
 # - BeeStreamed tokens MUST NOT be exposed to the browser. The frontend calls this endpoint,
@@ -1027,20 +1166,44 @@ def _beestreamed_start_webrtc_sync(event_ref: str) -> None:
         msg = (r.text or "").strip()
         raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed start error {r.status_code}: {msg[:500]}")
 
-def _beestreamed_stop_webrtc_sync(event_ref: str) -> None:
-    import requests  # type: ignore
+def _beestreamed_stop_webrtc_sync(event_ref: str) -> Dict[str, Any]:
+    """Stop the BeeStreamed WebRTC stream.
+
+    BeeStreamed's UI "End Live" behavior results in an "Idle" event state. The API
+    sometimes needs an explicit follow-up update after stopping WebRTC.
+
+    This function is deliberately best-effort on the "Idle" update: stopping the
+    stream is the priority; the Idle update is attempted and logged in the response.
+    """
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
+        return {"ok": False, "error": "event_ref required"}
+
+    token_id, secret_key = _beestreamed_creds()
     api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
+    url = f"{api_base}/events/{event_ref}/stopwebrtcstream?tokenid={token_id}&secretkey={secret_key}"
 
     try:
-        r = requests.post(f"{api_base}/events/{event_ref}/stopwebrtcstream", headers=headers, timeout=20)
+        r = requests.post(url, timeout=20)
+        res: Dict[str, Any] = {"ok": (r.status_code // 100 == 2), "status_code": r.status_code, "body": r.text}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed stop failed: {e!r}")
+        return {"ok": False, "error": str(e)}
 
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed stop error {r.status_code}: {msg[:500]}")
+    # Best-effort: attempt to move the event to an Idle state so viewers stop seeing "waiting" overlays
+    # and the host can restart cleanly.
+    if res.get("ok"):
+        try:
+            patch_url = f"{api_base}/events/{event_ref}?tokenid={token_id}&secretkey={secret_key}"
+            payload = {"status": "Idle", "Status": "Idle"}
+            r2 = requests.patch(patch_url, json=payload, timeout=20)
+            res["idle_ok"] = (r2.status_code // 100 == 2)
+            res["idle_status_code"] = r2.status_code
+            res["idle_body"] = r2.text
+        except Exception as e:
+            res["idle_ok"] = False
+            res["idle_error"] = str(e)
 
+    return res
 def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str, Any]]) -> str:
     host = ""
     if mapping:
@@ -1200,111 +1363,96 @@ class BeeStreamedEmbedUrlRequest(BaseModel):
 
 @app.post("/stream/beestreamed/start_embed")
 async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    mapping = _lookup_companion_mapping(brand, avatar)
+    mapping = _lookup_companion_mapping(req.brand, req.avatar)
     if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
+        raise HTTPException(status_code=404, detail="No mapping for that brand/avatar")
 
-    # Use the resolved mapping keys for persistence (first-name fallback etc).
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
+    resolved_brand = mapping.get("brand") or req.brand
+    resolved_avatar = mapping.get("avatar") or req.avatar
 
-    live = str(mapping.get("live") or "").strip().lower()
-
-    # Be tolerant of values like "Stream", "BeeStreamed", or labels that include these keywords.
-    if "stream" not in live:
-        raise HTTPException(status_code=400, detail="This companion is not configured for stream")
-
-    comp_type = str(mapping.get("companion_type") or "").strip()
-    if comp_type and comp_type.lower() != "human":
-        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
-
+    # Host auth: only the configured host can START the stream.
+    host_id = (mapping.get("host_member_id") or "").strip()
     member_id = (req.memberId or "").strip()
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and member_id == host_id)
+    is_host = bool(host_id) and bool(member_id) and (host_id.lower() == member_id.lower())
 
-    event_ref = str(mapping.get("event_ref") or "").strip()
-    created_in_this_call = False
+    # We intentionally track "session active" in-memory so viewers can JOIN after the host has started,
+    # without needing to be the host themselves.
+    session_active = _is_session_active(resolved_brand, resolved_avatar)
 
-    # Only the host is allowed to create the event_ref automatically.
-    if not event_ref and is_host:
-        created_in_this_call = True
-        event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+    # Always read the latest persisted event_ref (this is the value viewers must use to join).
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar) or ""
+    embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
 
-    # If we still have no event_ref, non-host users should wait.
-    if not event_ref:
-        return {
-            "ok": True,
-            "status": "waiting_for_host",
-            "canStart": False,
-            "isHost": False,
-            "eventRef": "",
-            "embedUrl": "",
-            "message": f"Waiting on {resolved_avatar} to start event",
-        }
-
-    embed_url = f"/stream/beestreamed/embed/{event_ref}"
-
+    # Viewer path: allow join only when the host has started a session.
     if not is_host:
+        if not session_active or not event_ref:
+            return {
+                "ok": True,
+                "status": "waiting",
+                "canStart": False,
+                "isHost": False,
+                "sessionActive": bool(session_active),
+                "eventRef": event_ref,
+                "embedUrl": embed_url,
+                "message": f"Waiting on {resolved_avatar} to start event",
+            }
+
         return {
             "ok": True,
-            "status": "waiting_for_host",
+            "status": "started",
             "canStart": False,
             "isHost": False,
+            "sessionActive": True,
             "eventRef": event_ref,
             "embedUrl": embed_url,
-            "message": f"Waiting on {resolved_avatar} to start event",
+            "message": "",
         }
 
-    # Host: ensure the event is scheduled for 'now' and then start the WebRTC stream.
-    # If BeeStreamed returns a 404 for an existing/stale event_ref, we transparently generate a fresh one,
-    # persist it, and retry once.
-    def _start_event(_ref: str) -> None:
+    # Host path: ensure an event_ref exists, then start WebRTC.
+    if not event_ref:
+        event_ref = _beestreamed_create_event_sync(req.embedDomain)
+        embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+
+    # Ensure event is scheduled "now" and bound to the correct embed domain (prevents pop-out issues).
+    _beestreamed_schedule_now_sync(
+        event_ref,
+        title=f"{resolved_brand} {resolved_avatar}",
+        embed_domain=req.embedDomain,
+    )
+
+    start_res = _beestreamed_start_webrtc_sync(event_ref)
+
+    # BeeStreamed occasionally returns 404 for a stale event ref. Recreate once and retry.
+    if (not start_res.get("ok")) and (start_res.get("status_code") == 404):
+        event_ref = _beestreamed_create_event_sync(req.embedDomain)
+        embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
         _beestreamed_schedule_now_sync(
-            _ref,
-            title=f"{resolved_avatar} Live",
-            embed_domain=(req.embedDomain or "").strip(),
+            event_ref,
+            title=f"{resolved_brand} {resolved_avatar}",
+            embed_domain=req.embedDomain,
         )
-        _beestreamed_start_webrtc_sync(_ref)
+        start_res = _beestreamed_start_webrtc_sync(event_ref)
 
-    try:
-        _start_event(event_ref)
-    except HTTPException as e:
-        if int(getattr(e, "status_code", 0) or 0) == 404:
-            if created_in_this_call:
-                # Sometimes BeeStreamed is eventually-consistent right after creation; retry once.
-                import time as _time
+    if not start_res.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"BeeStreamed start_webrtc failed: {start_res.get('error') or start_res.get('body') or start_res}",
+        )
 
-                _time.sleep(1.0)
-                _start_event(event_ref)
-            else:
-                # Stale/invalid event_ref in DB: regenerate, persist, and retry once.
-                event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
-                _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
-                embed_url = f"/stream/beestreamed/embed/{event_ref}"
-                _start_event(event_ref)
-        else:
-            raise
+    _set_session_active(resolved_brand, resolved_avatar, active=True, event_ref=event_ref)
 
     return {
         "ok": True,
         "status": "started",
         "canStart": True,
         "isHost": True,
+        "sessionActive": True,
         "eventRef": event_ref,
         "embedUrl": embed_url,
         "message": "",
     }
-
-
-
-
-
 @app.post("/stream/beestreamed/create_event")
 async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
     """Create (and optionally start) a BeeStreamed event for a configured companion.
@@ -1403,11 +1551,15 @@ async def beestreamed_status(brand: str, avatar: str):
     if not mapping:
         raise HTTPException(status_code=404, detail="Companion mapping not found")
 
+    resolved_brand = mapping.get("brand") or brand
+    resolved_avatar = mapping.get("avatar") or avatar
+
     # Use DB as the source of truth for event_ref.
     # When the app runs with multiple workers, each worker has its own in-memory
-    # mapping cache; without this DB read, pollers can observe eventRef
-    event_ref = _read_event_ref_from_db(brand, avatar)
+    # mapping cache; without this DB read, pollers can observe different eventRef values.
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar)
     mapping["event_ref"] = event_ref
+
     return {
         "ok": True,
         "eventRef": event_ref,
@@ -1415,6 +1567,7 @@ async def beestreamed_status(brand: str, avatar: str):
         "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
         "companionType": str(mapping.get("companion_type") or "").strip(),
         "live": str(mapping.get("live") or "").strip(),
+        "sessionActive": bool(_is_session_active(resolved_brand, resolved_avatar)),
     }
 @app.post("/stream/beestreamed/embed_url")
 async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
@@ -1439,33 +1592,80 @@ async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
     }
 @app.post("/stream/beestreamed/stop_embed")
 async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
+    """Stop a BeeStreamed stream session.
 
-    mapping = _lookup_companion_mapping(brand, avatar)
+    - Only the configured host may actually stop/end the stream.
+    - Viewers may call this endpoint (e.g., when closing the iframe) but it won't stop the stream.
+    """
+    mapping = _lookup_companion_mapping(req.brand, req.avatar)
     if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
+        raise HTTPException(status_code=404, detail="No mapping for that brand/avatar")
 
-    resolved_brand = str(mapping.get("brand") or brand).strip()
-    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
+    resolved_brand = mapping.get("brand") or req.brand
+    resolved_avatar = mapping.get("avatar") or req.avatar
 
+    host_id = (mapping.get("host_member_id") or "").strip()
     member_id = (req.memberId or "").strip()
-    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and member_id == host_id)
+    is_host = bool(host_id) and bool(member_id) and (host_id.lower() == member_id.lower())
+
+    # Prefer explicit eventRef from the client; fall back to DB.
+    event_ref = (req.eventRef or "").strip() or (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip()
 
     if not is_host:
-        return {"ok": True, "status": "not_host"}
+        return {
+            "ok": True,
+            "status": "not_host",
+            "isHost": False,
+            "canStop": False,
+            "sessionActive": bool(_is_session_active(resolved_brand, resolved_avatar)),
+            "eventRef": event_ref,
+            "message": "",
+        }
 
-    event_ref = (req.eventRef or "").strip() or str(mapping.get("event_ref") or "").strip()
     if not event_ref:
-        return {"ok": True, "status": "no_event"}
+        # If the host tries to stop without an eventRef, mark the session inactive anyway.
+        _set_session_active(resolved_brand, resolved_avatar, active=False)
+        return {
+            "ok": True,
+            "status": "no_event_ref",
+            "isHost": True,
+            "canStop": True,
+            "sessionActive": False,
+            "eventRef": "",
+            "message": "No eventRef to stop.",
+        }
 
-    _beestreamed_stop_webrtc_sync(event_ref)
-    return {"ok": True, "status": "stopped", "eventRef": event_ref}
+    stop_res = _beestreamed_stop_webrtc_sync(event_ref)
+    if not stop_res.get("ok"):
+        raise HTTPException(status_code=502, detail=f"BeeStreamed stop failed: {stop_res}")
 
+    _set_session_active(resolved_brand, resolved_avatar, active=False, event_ref=event_ref)
 
+    # Best-effort: notify any connected shared-live-chat clients.
+    try:
+        await _livechat_broadcast(
+            event_ref,
+            {
+                "eventRef": event_ref,
+                "clientMsgId": str(uuid.uuid4()),
+                "role": "system",
+                "name": "",
+                "message": "Host ended the live stream.",
+                "ts": time.time(),
+            },
+        )
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "status": "stopped",
+        "isHost": True,
+        "canStop": True,
+        "sessionActive": False,
+        "eventRef": event_ref,
+        "message": "",
+    }
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
     try:
