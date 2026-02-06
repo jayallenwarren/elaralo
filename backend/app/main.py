@@ -1309,7 +1309,7 @@ def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_dom
     """Best-effort: set the event date to 'now' so the event is effectively scheduled immediately.
 
     BeeStreamed docs: PATCH /events/[EVENT REF] supports `date` (formatted) and `title`.
-    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS". citeturn3view1turn3view0
+    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS". 
     """
     import requests  # type: ignore
     api_base = _beestreamed_api_base()
@@ -1788,7 +1788,7 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
     # If BeeStreamed returns a 404 for an existing/stale event_ref, we transparently generate a fresh one,
     # persist it, and retry once.
     def _start_event(_ref: str) -> None:
-        # If a previous session ended the event (e.g., status="done"), reset back to a reusable
+        # If a previous session ended the event (e.g., status="idle"), reset back to a reusable
         # state before starting WebRTC. Best-effort: do not fail the entire start if this patch
         # is rejected by BeeStreamed.
         _beestreamed_patch_event_status_best_effort(_ref, "idle")
@@ -2041,7 +2041,7 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
     # Best-effort: ensure the event is not left in a 'live' state once Stop is pressed.
     # BeeStreamed supports status values including: idle, live, video, done, force_live.
     # We use "done" to explicitly end the event session.
-    _beestreamed_patch_event_status_best_effort(event_ref, "done")
+    _beestreamed_patch_event_status_best_effort(event_ref, "idle")
 
 
     # Mark session inactive for global gating (host-only)
