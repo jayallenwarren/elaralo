@@ -1710,6 +1710,16 @@ const liveEnabled = useMemo(() => {
 
 
 
+
+const showVideoControl = useMemo(() => {
+  // STRICT: Show the Video (Play) control only when the companion mapping DB says this
+  // companion supports Video (channelCap/communication = "Video").
+  //
+  // This is intentionally used as a health signal: if the Video button is missing for a
+  // companion that should support Video, it indicates the mapping DB row was not read/found.
+  return channelCap === "video";
+}, [channelCap]);
+
   // UI layout
   const conversationHeight = 520;
   const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (Boolean(phase1AvatarMedia) && avatarStatus !== "idle");
@@ -6049,7 +6059,7 @@ const modePillControls = (
         </div>
       </header>
 
-{liveEnabled ? (
+{showVideoControl ? (
   <section
     style={{
       display: "flex",
