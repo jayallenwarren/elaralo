@@ -472,51 +472,248 @@ def _stream_session_key(brand: str, avatar: str) -> Tuple[str, str]:
     return (_norm_key(brand), _norm_key(avatar))
 
 
+_STREAM_STATE_DB_LOCK = threading.Lock()
+
+
+def _ensure_beestreamed_session_columns(conn: sqlite3.Connection, table: str) -> None:
+    """Ensure the mappings table has BeeStreamed session state columns."""
+    cols = set(_get_table_columns(conn, table))
+    if "beestreamed_session_active" not in cols:
+        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN beestreamed_session_active INTEGER DEFAULT 0')
+    if "beestreamed_session_updated_at" not in cols:
+        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN beestreamed_session_updated_at TEXT')
+    conn.commit()
+
+
+def _detect_mapping_table_for_session(conn: sqlite3.Connection) -> str:
+    """Detect which mapping table to use."""
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {str(r[0]) for r in cur.fetchall()}
+
+    # Prefer table discovered/selected at startup
+    t = globals().get("_MAPPING_DB_TABLE")
+    if t and t in tables:
+        return str(t)
+
+    if "voice_video_mappings" in tables:
+        return "voice_video_mappings"
+    if "companion_mappings" in tables:
+        return "companion_mappings"
+
+    raise RuntimeError(f"No recognized mappings table found. Tables={sorted(tables)}")
+
+
+def _detect_brand_avatar_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, str]:
+    cols = _get_table_columns(conn, table)
+
+    def pick(candidates: List[str]) -> str:
+        for c in candidates:
+            if c in cols:
+                return c
+        raise RuntimeError(f"Missing required mapping columns. Needed one of {candidates}, found {cols}")
+
+    brand_col = pick(["brand", "company", "rebranding", "rebranding_name", "rebrandingName"])
+    avatar_col = pick(["avatar", "companion", "companion_name", "companionName", "name"])
+    return brand_col, avatar_col
+
+
 def _set_stream_session_active(brand: str, avatar: str, active: bool, event_ref: str = "") -> None:
-    """Mark a (brand, avatar) BeeStreamed session as active/inactive (best-effort)."""
+    """Persist BeeStreamed sessionActive for (brand, avatar) in SQLite.
+
+    This prevents /stream/beestreamed/status from flickering across workers/instances.
+    This function must never raise to callers.
+    """
+    key = _stream_session_key(brand, avatar)
+    _BEE_STREAM_SESSION_ACTIVE[key] = bool(active)
+    if active and event_ref:
+        _BEE_STREAM_SESSION_EVENT_REF[key] = str(event_ref).strip()
+
     try:
-        key = _stream_session_key(brand, avatar)
-        _BEE_STREAM_SESSION_ACTIVE[key] = bool(active)
-        if active and event_ref:
-            _BEE_STREAM_SESSION_EVENT_REF[key] = str(event_ref).strip()
+        with _STREAM_STATE_DB_LOCK:
+            conn = _open_mapping_db_or_fail()
+            try:
+                table = _detect_mapping_table_for_session(conn)
+                _ensure_beestreamed_session_columns(conn, table)
+                brand_col, avatar_col = _detect_brand_avatar_columns(conn, table)
+
+                b = _norm_key(brand)
+                a = _norm_key(avatar)
+                ts = datetime.utcnow().isoformat() + "Z"
+
+                cur = conn.execute(
+                    f'''
+                    UPDATE "{table}"
+                    SET beestreamed_session_active = ?, beestreamed_session_updated_at = ?
+                    WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
+                    ''',
+                    (1 if active else 0, ts, b, a),
+                )
+                if cur.rowcount == 0 and b != "elaralo":
+                    conn.execute(
+                        f'''
+                        UPDATE "{table}"
+                        SET beestreamed_session_active = ?, beestreamed_session_updated_at = ?
+                        WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
+                        ''',
+                        (1 if active else 0, ts, "elaralo", a),
+                    )
+
+                conn.commit()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     except Exception:
-        # Never allow session bookkeeping to break API calls
+        # keep in-memory fallback only
         pass
 
 
 def _get_stream_session_active(brand: str, avatar: str) -> bool:
+    """Return BeeStreamed sessionActive for (brand, avatar) from SQLite."""
     try:
+        with _STREAM_STATE_DB_LOCK:
+            conn = _open_mapping_db_or_fail()
+            try:
+                table = _detect_mapping_table_for_session(conn)
+                _ensure_beestreamed_session_columns(conn, table)
+                brand_col, avatar_col = _detect_brand_avatar_columns(conn, table)
+
+                b = _norm_key(brand)
+                a = _norm_key(avatar)
+
+                row = conn.execute(
+                    f'''
+                    SELECT beestreamed_session_active
+                    FROM "{table}"
+                    WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
+                    ORDER BY rowid ASC
+                    LIMIT 1
+                    ''',
+                    (b, a),
+                ).fetchone()
+                if row is None and b != "elaralo":
+                    row = conn.execute(
+                        f'''
+                        SELECT beestreamed_session_active
+                        FROM "{table}"
+                        WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
+                        ORDER BY rowid ASC
+                        LIMIT 1
+                        ''',
+                        ("elaralo", a),
+                    ).fetchone()
+
+                if row is None:
+                    key = _stream_session_key(brand, avatar)
+                    return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
+
+                return bool(int(row[0] or 0))
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
         key = _stream_session_key(brand, avatar)
         return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-    except Exception:
-        return False
 
 
 def _get_stream_session_event_ref(brand: str, avatar: str) -> str:
+    """Return persisted event_ref for (brand, avatar) from SQLite."""
     try:
+        with _STREAM_STATE_DB_LOCK:
+            conn = _open_mapping_db_or_fail()
+            try:
+                table = _detect_mapping_table_for_session(conn)
+                _ensure_beestreamed_session_columns(conn, table)
+                brand_col, avatar_col = _detect_brand_avatar_columns(conn, table)
+
+                event_col = str(globals().get("_MAPPING_DB_EVENT_REF_COL") or "event_ref")
+
+                b = _norm_key(brand)
+                a = _norm_key(avatar)
+
+                row = conn.execute(
+                    f'''
+                    SELECT {event_col}
+                    FROM "{table}"
+                    WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
+                    ORDER BY CASE WHEN coalesce(trim({event_col}), '') <> '' THEN 0 ELSE 1 END, rowid ASC
+                    LIMIT 1
+                    ''',
+                    (b, a),
+                ).fetchone()
+                if row is None and b != "elaralo":
+                    row = conn.execute(
+                        f'''
+                        SELECT {event_col}
+                        FROM "{table}"
+                        WHERE lower(trim("{brand_col}")) = ? AND lower(trim("{avatar_col}")) = ?
+                        ORDER BY CASE WHEN coalesce(trim({event_col}), '') <> '' THEN 0 ELSE 1 END, rowid ASC
+                        LIMIT 1
+                        ''',
+                        ("elaralo", a),
+                    ).fetchone()
+
+                if row is None:
+                    key = _stream_session_key(brand, avatar)
+                    return str(_BEE_STREAM_SESSION_EVENT_REF.get(key, "") or "").strip()
+
+                return str(row[0] or "").strip()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
         key = _stream_session_key(brand, avatar)
         return str(_BEE_STREAM_SESSION_EVENT_REF.get(key, "") or "").strip()
-    except Exception:
-        return ""
 
 
 def _is_stream_session_active_for_event_ref(event_ref: str) -> bool:
-    """True iff the BeeStreamed session has been activated by the host (Play) for this event_ref.
-
-    This is used to ensure that only the Host can *initiate* shared in-stream chat.
-    Viewers may only join the chat room after the Host has started the BeeStreamed session.
-    """
+    """True iff the host has activated a session for this event_ref (DB-backed)."""
     ref = (event_ref or "").strip()
     if not ref:
         return False
+
     try:
+        with _STREAM_STATE_DB_LOCK:
+            conn = _open_mapping_db_or_fail()
+            try:
+                table = _detect_mapping_table_for_session(conn)
+                _ensure_beestreamed_session_columns(conn, table)
+                event_col = str(globals().get("_MAPPING_DB_EVENT_REF_COL") or "event_ref")
+
+                row = conn.execute(
+                    f'''
+                    SELECT beestreamed_session_active
+                    FROM "{table}"
+                    WHERE trim({event_col}) = ?
+                    ORDER BY rowid ASC
+                    LIMIT 1
+                    ''',
+                    (ref,),
+                ).fetchone()
+                if row is None:
+                    # fallback to in-memory
+                    for key, ev in _BEE_STREAM_SESSION_EVENT_REF.items():
+                        if str(ev or "").strip() == ref:
+                            return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
+                    return False
+
+                return bool(int(row[0] or 0))
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        # fallback
         for key, ev in _BEE_STREAM_SESSION_EVENT_REF.items():
             if str(ev or "").strip() == ref:
                 return bool(_BEE_STREAM_SESSION_ACTIVE.get(key, False))
-    except Exception:
         return False
-    return False
-
 
 # ---------------------------------------------------------------------------
 # BeeStreamed in-stream shared chat (Host + joined Viewers)
@@ -1357,6 +1554,54 @@ def _beestreamed_patch_event_status_best_effort(event_ref: str, status: str) -> 
     except Exception:
         pass
 
+# Cache BeeStreamed event status lookups so /status polling doesn't hammer the provider.
+_BEESTREAMED_EVENT_STATUS_CACHE: Dict[str, Tuple[float, str]] = {}
+_BEESTREAMED_EVENT_STATUS_TTL_SECS: float = 10.0
+
+
+def _beestreamed_get_event_status_best_effort(event_ref: str) -> Optional[str]:
+    """Fetch event_status from BeeStreamed (best-effort).
+
+    Returns:
+      - "done", "live", "idle", "force_live", ... if available
+      - "missing" if event 404s
+      - None on errors / missing credentials
+    """
+    ref = (event_ref or "").strip()
+    if not ref:
+        return None
+
+    now = time.time()
+    cached = _BEESTREAMED_EVENT_STATUS_CACHE.get(ref)
+    if cached and (now - float(cached[0])) < _BEESTREAMED_EVENT_STATUS_TTL_SECS:
+        return str(cached[1])
+
+    try:
+        headers = _beestreamed_auth_headers()
+        # If credentials are missing, auth_headers returns empty values; fail fast.
+        if not headers.get("X-Stream-Token-Id") or not headers.get("X-Stream-Secret-Key"):
+            return None
+
+        url = f"{_beestreamed_api_base().rstrip('/')}/events/{ref}"
+        resp = requests.get(url, headers=headers, timeout=10)
+
+        if resp.status_code == 404:
+            _BEESTREAMED_EVENT_STATUS_CACHE[ref] = (now, "missing")
+            return "missing"
+
+        resp.raise_for_status()
+        data = resp.json() if resp.content else {}
+
+        status = str(data.get("event_status") or data.get("status") or "").strip().lower()
+        if not status:
+            return None
+
+        _BEESTREAMED_EVENT_STATUS_CACHE[ref] = (now, status)
+        return status
+    except Exception:
+        return None
+
+
 def _beestreamed_start_webrtc_sync(event_ref: str) -> None:
     import requests  # type: ignore
     api_base = _beestreamed_api_base()
@@ -1731,7 +1976,9 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
 
 
     # Always use the persisted event_ref if present (prevents creating a new event on every Play).
-    event_ref = str(mapping.get("event_ref") or "").strip()
+    # IMPORTANT: do not rely on the in-memory mapping cache here; workers/instances may differ.
+    event_ref = _get_stream_session_event_ref(resolved_brand, resolved_avatar) or str(mapping.get("event_ref") or "").strip()
+    event_ref = str(event_ref or "").strip()
 
     # Only the host is allowed to create the event_ref automatically.
     if not event_ref and is_host:
@@ -1973,11 +2220,23 @@ async def beestreamed_status(brand: str, avatar: str):
     resolved_brand = str(mapping.get("brand") or brand).strip()
     resolved_avatar = str(mapping.get("avatar") or avatar).strip()
 
-    event_ref = str(mapping.get("event_ref") or "").strip()
     host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
 
+    # DB-backed session state (stable across workers/instances)
     session_active = _get_stream_session_active(resolved_brand, resolved_avatar)
     session_event_ref = _get_stream_session_event_ref(resolved_brand, resolved_avatar)
+
+    # Prefer DB event_ref if available; fallback to cached mapping.
+    event_ref = str(session_event_ref or mapping.get("event_ref") or "").strip()
+
+    # If the host ended the stream in the BeeStreamed Producer, the event will typically
+    # transition to "done". In that case, clear sessionActive so visitors/members can
+    # resume AI chat immediately.
+    if session_active and event_ref:
+        status = _beestreamed_get_event_status_best_effort(event_ref)
+        if status in ("done", "missing"):
+            _set_stream_session_active(resolved_brand, resolved_avatar, False, event_ref)
+            session_active = False
 
     return {
         "ok": True,
@@ -1985,11 +2244,12 @@ async def beestreamed_status(brand: str, avatar: str):
         "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
         "hostMemberId": host_id,
         "sessionActive": bool(session_active),
-        "sessionEventRef": session_event_ref,
+        "sessionEventRef": event_ref,
 
         "companionType": str(mapping.get("companion_type") or "").strip(),
         "live": str(mapping.get("live") or "").strip(),
     }
+
 @app.post("/stream/beestreamed/embed_url")
 async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
     """Return an embeddable URL that *cannot* pop out of the iframe.
@@ -2041,7 +2301,7 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
     # Best-effort: ensure the event is not left in a 'live' state once Stop is pressed.
     # BeeStreamed supports status values including: idle, live, video, done, force_live.
     # We use "done" to explicitly end the event session.
-    _beestreamed_patch_event_status_best_effort(event_ref, "idle")
+    _beestreamed_patch_event_status_best_effort(event_ref, "done")
 
 
     # Mark session inactive for global gating (host-only)

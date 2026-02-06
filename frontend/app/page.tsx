@@ -2980,6 +2980,10 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   //   stored in voice_video_mappings.sqlite3 (exposed via /stream/beestreamed/status).
   const [beestreamedHostMemberId, setBeestreamedHostMemberId] = useState<string>("");
   const [beestreamedSessionActive, setBeestreamedSessionActive] = useState<boolean>(false);
+
+  // BeeStreamed status polling can hit different backend instances; avoid flickering UI by
+  // only changing sessionActive on confirmed status responses.
+  const beestreamedStatusInactivePollsRef = useRef<number>(0);
   const isBeeStreamedHost = useMemo(() => {
     const mid = String(memberId || "").trim();
     const hid = String(beestreamedHostMemberId || "").trim();
@@ -3343,55 +3347,74 @@ useEffect(() => {
 //   as soon as the Host hits Play.
 // ---------------------------------------------------------------------------
 useEffect(() => {
-  if (!API_BASE || !companyName || !companionName) {
-    setBeestreamedHostMemberId("");
-    setBeestreamedSessionActive(false);
-    return;
-  }
-
-  let cancelled = false;
-  let timer: any = null;
-
-  const fetchStatus = async () => {
-    try {
-      const url = `${API_BASE}/stream/beestreamed/status?brand=${encodeURIComponent(
-        companyName,
-      )}&avatar=${encodeURIComponent(companionName)}`;
-
-      const res = await fetch(url, { cache: "no-store" });
-      const data: any = await res.json().catch(() => ({}));
-      if (cancelled) return;
-
-      if (!res.ok || !data?.ok) {
-        setBeestreamedHostMemberId("");
-        setBeestreamedSessionActive(false);
-        return;
-      }
-
-      setBeestreamedHostMemberId(String(data?.hostMemberId || "").trim());
-      setBeestreamedSessionActive(Boolean(data?.sessionActive));
-    } catch (e) {
-      if (cancelled) return;
+    if (!API_BASE || !companyName || !companionName) {
       setBeestreamedHostMemberId("");
       setBeestreamedSessionActive(false);
+      beestreamedStatusInactivePollsRef.current = 0;
+      return;
     }
-  };
 
-  // initial
-  void fetchStatus();
+    let cancelled = false;
+    let pollTimer: any = null;
 
-  // poll
-  timer = window.setInterval(() => {
+    const fetchStatus = async () => {
+      try {
+        const url = `${API_BASE}/stream/beestreamed/status?brand=${encodeURIComponent(
+          companyName,
+        )}&avatar=${encodeURIComponent(companionName)}`;
+        const res = await fetch(url, { cache: "no-store" });
+
+        if (cancelled) return;
+
+        let data: any = null;
+        try {
+          data = await res.json();
+        } catch (_) {
+          data = null;
+        }
+
+        if (cancelled) return;
+
+        if (!res.ok || !data?.ok) {
+          // Keep last known-good; do not flicker sessionActive on transient poll failures.
+          return;
+        }
+
+        const nextHostId = String(data.hostMemberId || "").trim();
+        if (nextHostId) {
+          setBeestreamedHostMemberId(nextHostId);
+        }
+
+        const nextActive = Boolean(data.sessionActive);
+        if (nextActive) {
+          beestreamedStatusInactivePollsRef.current = 0;
+          setBeestreamedSessionActive(true);
+        } else {
+          beestreamedStatusInactivePollsRef.current += 1;
+          // Require consecutive "inactive" polls before clearing. This prevents a 3s poll interval
+          // from causing the badge/message to blink when the backend returns transient errors.
+          if (beestreamedStatusInactivePollsRef.current >= 2) {
+            setBeestreamedSessionActive(false);
+          }
+        }
+      } catch (_e) {
+        // Keep last known-good on fetch errors.
+        return;
+      }
+    };
+
     void fetchStatus();
-  }, 2500);
+    pollTimer = window.setInterval(() => {
+      void fetchStatus();
+    }, 2500);
 
-  return () => {
-    cancelled = true;
-    try {
-      if (timer) window.clearInterval(timer);
-    } catch (e) {}
-  };
-}, [API_BASE, companyName, companionName]);
+    return () => {
+      cancelled = true;
+      if (pollTimer) {
+        window.clearInterval(pollTimer);
+      }
+    };
+  }, [API_BASE, companyName, companionName]);
 
 // Viewer UX: if a viewer joined before the host activated the session, we initially show a
 // "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
@@ -5679,12 +5702,9 @@ const hostCanStopStream =
 const hostInStreamUi =
   liveProvider === "stream" &&
   streamCanStart &&
-  avatarStatus !== "idle";
+  Boolean(streamEmbedUrl || streamEventRef);
 
-const viewerInStreamUi =
-  liveProvider === "stream" &&
-  !streamCanStart &&
-  avatarStatus !== "idle";
+const viewerInStreamUi = viewerHasJoinedStream;
 
 useEffect(() => {
   // Viewer STT must be disabled while in the BeeStreamed stream UI to avoid transcribing the host audio.
