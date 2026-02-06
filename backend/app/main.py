@@ -11,6 +11,9 @@ import asyncio
 
 import threading
 
+import logging
+logging.warning("BOOT SIGNATURE: basemodelfix-2026-02-06")
+
 # Pydantic (v1/v2 compatibility)
 try:
     from pydantic import BaseModel, validator  # type: ignore
