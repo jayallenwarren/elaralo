@@ -521,16 +521,136 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
     except Exception:
         pass
 
-    # If a writable copy already exists, use it (do not overwrite; it may contain
-    # persisted runtime state like event_ref).
+    # If a writable copy already exists, prefer it — but refresh it when the packaged DB changes.
+    #
+    # Why:
+    # - We often copy the packaged DB into /home/site on first boot so we can persist runtime state (e.g., event_ref).
+    # - If we later deploy a NEW packaged DB (new mappings/rows), the persisted copy would otherwise stay stale
+    #   forever and strict lookups like ("DulceMoon","Dulce") will 404 even though they exist in the repo DB.
+    #
+    # Refresh behavior:
+    # - We track the SHA256 of the packaged DB in a sidecar file <rw_path>.packaged.sha256.
+    # - If that hash changes, we overwrite the writable copy with the new packaged DB and then migrate runtime-only
+    #   columns (currently: event_ref) from the old copy into the refreshed DB when possible.
     if os.path.exists(rw_path):
-        return rw_path
+        lock_path = rw_path + ".lock"
+        marker_path = rw_path + ".packaged.sha256"
+        try:
+            with FileLock(lock_path):
+                def _sha256_file(path: str) -> str:
+                    h = hashlib.sha256()
+                    with open(path, "rb") as f:
+                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                            h.update(chunk)
+                    return h.hexdigest()
+
+                try:
+                    src_hash = _sha256_file(src_db_path)
+                except Exception:
+                    return rw_path
+
+                prev_hash = ""
+                try:
+                    prev_hash = str(open(marker_path, "r", encoding="utf-8").read() or "").strip()
+                except Exception:
+                    prev_hash = ""
+
+                # If the packaged DB hasn't changed since the last refresh, keep the existing writable DB
+                # (which may have updated runtime fields like event_ref).
+                if prev_hash and prev_hash == src_hash:
+                    return rw_path
+
+                # Backup old writable DB, then refresh from packaged DB.
+                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                backup_path = f"{rw_path}.bak.{ts}"
+                try:
+                    shutil.copy2(rw_path, backup_path)
+                except Exception:
+                    backup_path = ""
+
+                try:
+                    parent = os.path.dirname(rw_path) or "."
+                    os.makedirs(parent, exist_ok=True)
+                    shutil.copy2(src_db_path, rw_path)
+                    try:
+                        with open(marker_path, "w", encoding="utf-8") as f:
+                            f.write(src_hash)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"[mappings] WARNING: Failed to refresh writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
+                    return rw_path
+
+                # Best-effort: migrate runtime event_ref from the previous writable copy into the refreshed DB.
+                try:
+                    if backup_path and os.path.exists(backup_path):
+                        def _pick_table(conn: sqlite3.Connection) -> str:
+                            cur = conn.cursor()
+                            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                            names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+                            lc = {n.lower(): n for n in names}
+                            for cand in ("companion_mappings", "voice_video_mappings", "voice_video_mapping", "mappings"):
+                                if cand in lc:
+                                    return lc[cand]
+                            return names[0] if names else ""
+
+                        def _colset(conn: sqlite3.Connection, table: str) -> set[str]:
+                            cur = conn.cursor()
+                            cur.execute(f'PRAGMA table_info("{table}")')
+                            return {str(r[1]).lower() for r in cur.fetchall() if r and len(r) > 1}
+
+                        old_conn = sqlite3.connect(backup_path)
+                        old_conn.row_factory = sqlite3.Row
+                        new_conn = sqlite3.connect(rw_path)
+                        new_conn.row_factory = sqlite3.Row
+                        try:
+                            old_table = _pick_table(old_conn)
+                            new_table = _pick_table(new_conn)
+                            if old_table and new_table:
+                                old_cols = _colset(old_conn, old_table)
+                                new_cols = _colset(new_conn, new_table)
+                                if {"brand", "avatar", "event_ref"}.issubset(old_cols) and {"brand", "avatar", "event_ref"}.issubset(new_cols):
+                                    cur_old = old_conn.cursor()
+                                    cur_old.execute(f'SELECT brand, avatar, event_ref FROM "{old_table}" WHERE event_ref IS NOT NULL AND trim(event_ref) != ""')
+                                    rows = cur_old.fetchall()
+                                    cur_new = new_conn.cursor()
+                                    for r in rows:
+                                        b = str(r["brand"] or "").strip()
+                                        a = str(r["avatar"] or "").strip()
+                                        ev = str(r["event_ref"] or "").strip()
+                                        if not b or not a or not ev:
+                                            continue
+                                        cur_new.execute(
+                                            f'UPDATE "{new_table}" SET event_ref=? WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) AND (event_ref IS NULL OR trim(event_ref) = "")',
+                                            (ev, b, a),
+                                        )
+                                    new_conn.commit()
+                        finally:
+                            old_conn.close()
+                            new_conn.close()
+                except Exception as e:
+                    print(f"[mappings] WARNING: failed migrating event_ref after DB refresh: {e}")
+
+                print(f"[mappings] Refreshed writable mapping DB at {rw_path} from packaged DB {src_db_path}")
+                return rw_path
+        except Exception:
+            return rw_path
 
     # Create parent dir, then copy.
     try:
         parent = os.path.dirname(rw_path) or "."
         os.makedirs(parent, exist_ok=True)
         shutil.copy2(src_db_path, rw_path)
+        # Record packaged DB fingerprint so future startups can detect when the packaged DB changes.
+        try:
+            h = hashlib.sha256()
+            with open(src_db_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            with open(rw_path + ".packaged.sha256", "w", encoding="utf-8") as f:
+                f.write(h.hexdigest())
+        except Exception:
+            pass
         return rw_path
     except Exception as e:
         print(f"[mappings] WARNING: Failed to create writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
@@ -711,9 +831,10 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         found: true,
         brand: str,
         avatar: str,
+        companionType: "Human"|"AI",
         channel_cap: "Video"|"Audio" ,
         channelCap: "Video"|"Audio" ,   # alias for convenience
-        live: "D-ID"|"Stream"|"" ,
+        live: "D-ID"|"Stream" ,
         elevenVoiceId: str,
         elevenVoiceName: str,
         didAgentId: str,
@@ -735,106 +856,70 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
 
     m = _lookup_companion_mapping(b, a)
     if not m:
-        # Strict error: do not attempt fuzzy matching (whitespace is significant).
-        # Provide debug context so mis-deployments / brand typos can be diagnosed quickly.
-        b_norm = _norm_key(b)
-        available_avatars = sorted(
-            {
-                str(v.get("avatar") or "").strip()
-                for (br, av), v in _COMPANION_MAPPINGS.items()
-                if br == b_norm and v
-            }
-        )
-        sample = [x for x in available_avatars if x][:20]
-        more = max(0, len([x for x in available_avatars if x]) - len(sample))
-
-        hint = ""
-        if sample:
-            hint = f" Available avatars for brand '{b}': {sample}" + (f" (+{more} more)" if more > 0 else "")
-        else:
-            known_brands = sorted(
-                {
-                    str(v.get("brand") or "").strip()
-                    for v in _COMPANION_MAPPINGS.values()
-                    if str(v.get("brand") or "").strip()
-                }
-            )
-            known_sample = known_brands[:20]
-            known_more = max(0, len(known_brands) - len(known_sample))
-            if known_sample:
-                hint = f" Known brands in loaded DB: {known_sample}" + (f" (+{known_more} more)" if known_more > 0 else "")
-
         raise HTTPException(
             status_code=404,
-            detail=(
-                f"Companion mapping not found for brand='{b}' avatar='{a}'."
-                f" LoadedRows={len(_COMPANION_MAPPINGS)} Source='{_COMPANION_MAPPINGS_SOURCE}' Table='{_COMPANION_MAPPINGS_TABLE}'."
-                + hint
-            ),
+            detail={
+                "error": "Companion mapping not found",
+                "brand": b,
+                "avatar": a,
+                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+                "source": _COMPANION_MAPPINGS_SOURCE,
+                "table": _COMPANION_MAPPINGS_TABLE,
+                "count": len(_COMPANION_MAPPINGS),
+            },
         )
 
-    cap = str(m.get("channel_cap") or "").strip()
-    live = str(m.get("live") or "").strip()
+    cap_raw = str(m.get("channel_cap") or "").strip()
+    live_raw = str(m.get("live") or "").strip()
+    ctype_raw = str(m.get("companion_type") or "").strip()
 
     # Strict validation (config contract)
-    cap_lc = cap.lower()
+    cap_lc = cap_raw.lower()
     if cap_lc not in ("video", "audio"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap!r} (expected 'Video' or 'Audio')",
+            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
         )
 
-    live_lc = live.lower()
-    if live and live_lc not in ("stream", "d-id"):
+    live_lc = live_raw.lower()
+    if live_lc not in ("stream", "d-id"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live!r} (expected 'Stream', 'D-ID', or NULL)",
+            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
         )
 
-    companion_type = str(m.get("companion_type") or "").strip()
-    ct_lc = companion_type.lower()
-    if ct_lc not in ("human", "ai"):
+    ctype_lc = ctype_raw.lower()
+    if ctype_lc not in ("human", "ai"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {companion_type!r} (expected 'Human' or 'AI')",
+            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
         )
 
-    # Product invariants:
-    # - Video companions require a Live provider and it must match companion_type:
-    #     Human => Stream
-    #     AI    => D-ID
-    # - Audio companions must NOT have a Live provider.
-    if cap_lc == "video":
-        if not live:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Invalid mapping: channel_cap=Video but live is NULL/empty for brand='{b}' avatar='{a}'",
-            )
-        if ct_lc == "human" and live_lc != "stream":
-            raise HTTPException(
-                status_code=500,
-                detail=f"Invalid mapping: Human companions require live='Stream' for brand='{b}' avatar='{a}' (got {live!r})",
-            )
-        if ct_lc == "ai" and live_lc != "d-id":
-            raise HTTPException(
-                status_code=500,
-                detail=f"Invalid mapping: AI companions require live='D-ID' for brand='{b}' avatar='{a}' (got {live!r})",
-            )
-    else:
-        if live:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Invalid mapping: channel_cap=Audio but live is {live!r} for brand='{b}' avatar='{a}' (expected NULL)",
-            )
+    # Business rule: AI companions must use D-ID. Human companions must use Stream.
+    if ctype_lc == "human" and live_lc != "stream":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
+        )
+    if ctype_lc == "ai" and live_lc != "d-id":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
+        )
+
+    cap_out = "Video" if cap_lc == "video" else "Audio"
+    live_out = "Stream" if live_lc == "stream" else "D-ID"
+    ctype_out = "Human" if ctype_lc == "human" else "AI"
+
     return {
         "found": True,
-        "brand": str(m.get("brand") or ""),
-        "avatar": str(m.get("avatar") or ""),
-        "channel_cap": cap,
-        "channelCap": cap,
-        "live": live,
-        "companionType": companion_type,
-        "companion_type": companion_type,
+        "brand": str(m.get("brand") or b),
+        "avatar": str(m.get("avatar") or a),
+        "companionType": ctype_out,
+        "companion_type": ctype_out,
+        "channel_cap": cap_out,
+        "channelCap": cap_out,
+        "live": live_out,
         "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
         "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
         "didAgentId": str(m.get("did_agent_id") or ""),
@@ -843,6 +928,7 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "didEmbedCode": str(m.get("did_embed_code") or ""),
         "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
         "source": _COMPANION_MAPPINGS_SOURCE,
+        "table": _COMPANION_MAPPINGS_TABLE,
     }
 
 
@@ -1484,6 +1570,24 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
 
     resolved_brand = mapping.get("brand") or req.brand
     resolved_avatar = mapping.get("avatar") or req.avatar
+
+    # Guardrail: BeeStreamed is ONLY for Human companions configured for Stream video.
+    live_lc = str(mapping.get("live") or "").strip().lower()
+    ctype_lc = str(mapping.get("companion_type") or "").strip().lower()
+    cap_lc = str(mapping.get("channel_cap") or "").strip().lower()
+
+    if live_lc != "stream" or ctype_lc != "human" or cap_lc != "video":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "BeeStreamed is only valid for Human companions with channel_cap=Video and live=Stream",
+                "brand": str(resolved_brand),
+                "avatar": str(resolved_avatar),
+                "companion_type": str(mapping.get("companion_type") or ""),
+                "channel_cap": str(mapping.get("channel_cap") or ""),
+                "live": str(mapping.get("live") or ""),
+            },
+        )
 
     # Host auth: only the configured host can START the stream.
     host_id = (mapping.get("host_member_id") or "").strip()

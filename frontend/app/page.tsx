@@ -79,6 +79,10 @@ type CompanionMappingRow = {
   avatar?: string;
 
   // DB columns
+  companion_type?: string; // "Human" | "AI"
+  companionType?: string;  // API alias (optional)
+
+  // DB columns
   channel_cap?: string; // "Video" | "Audio"
   channelCap?: string;  // API alias (optional)
   live?: string;        // "Stream" | "D-ID" | ""
@@ -342,18 +346,10 @@ const HEADSHOT_DIR = "/companion/headshot";
 // Resolve companion key/name for backend requests and TTS voice selection.
 // This must be browser-safe and never rely on DOM parsing.
 function resolveCompanionForBackend(opts: { companionKey?: string; companionName?: string }): string {
-  const ckRaw = (opts.companionKey || "").trim();
-  if (ckRaw) {
-    // companionKey may contain flags (pipe-delimited) and/or a trailing member UUID.
-    // We must strip those so backend persona + voice lookups remain stable.
-    const { baseKey } = splitCompanionKey(ckRaw);
-    const cleaned = stripTrailingUuid(String(baseKey || ckRaw).trim()).trim();
-    if (cleaned) return cleaned;
-  }
-
-  const cn = (opts.companionName || "").trim();
+  const ck = (opts.companionKey || '').trim();
+  if (ck) return ck;
+  const cn = (opts.companionName || '').trim();
   if (cn) return cn;
-
   return DEFAULT_COMPANION_NAME;
 }
 
@@ -672,14 +668,6 @@ function stripTrailingUuid(raw: string): string {
     /-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
     "",
   );
-}
-
-function extractTrailingUuid(raw: string): string {
-  const s = String(raw || "").trim();
-  const m = s.match(
-    /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i,
-  );
-  return m ? String(m[1] || "").trim() : "";
 }
 
 function titleCaseToken(token: string): string {
@@ -1537,7 +1525,30 @@ useEffect(() => {
         if (cancelled) return;
 
         if (!res.ok) {
-          const detail = String(json?.detail || json?.message || "").trim();
+          const rawDetail = (json as any)?.detail ?? (json as any)?.message ?? "";
+          let detail = "";
+          if (typeof rawDetail === "string") detail = rawDetail.trim();
+          else if (rawDetail && typeof rawDetail === "object") {
+            // Backend may return a structured {detail:{...}} object; format it so it’s human-readable.
+            const err = String((rawDetail as any).error || "").trim();
+            const b = String((rawDetail as any).brand || brand).trim();
+            const a = String((rawDetail as any).avatar || avatar).trim();
+            const src = String((rawDetail as any).source || "").trim();
+            const cnt = (rawDetail as any).count;
+            if (err) {
+              const extra =
+                src || typeof cnt !== "undefined"
+                  ? ` (loaded ${typeof cnt !== "undefined" ? String(cnt) : "?"} rows from ${src || "unknown source"})`
+                  : "";
+              detail = `${err} for brand='${b}' avatar='${a}'${extra}`;
+            } else {
+              try {
+                detail = JSON.stringify(rawDetail);
+              } catch (e) {
+                detail = "[Unserializable error detail]";
+              }
+            }
+          }
           setCompanionMapping(null);
           setCompanionMappingError(
             detail || `Companion mapping request failed (${res.status} ${res.statusText}).`
@@ -1714,7 +1725,7 @@ const channelCap: ChannelCap = useMemo(() => {
 }, [companionMapping]);
 
 const liveProvider: LiveProvider = useMemo(() => {
-  // Strict mapping: DB values are Stream, D-ID, or NULL.
+  // Strict mapping: DB values are Stream or D-ID.
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
   if (liveRaw === "stream") return "stream";
@@ -1730,9 +1741,10 @@ const liveProvider: LiveProvider = useMemo(() => {
 useEffect(() => {
   if (channelCap === "video") {
     const liveRaw = String(companionMapping?.live || "").trim();
-    if (!liveRaw) {
+    const liveLc = liveRaw.toLowerCase();
+    if (liveLc !== "stream" && liveLc !== "d-id") {
       setCompanionMappingError(
-        `Invalid companion mapping: channel_cap=Video but live is NULL/empty for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`
+        `Invalid companion mapping: channel_cap=Video requires live=Stream or live=D-ID for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}' (got '${liveRaw || "NULL"}').`
       );
     }
   }
@@ -3790,26 +3802,9 @@ useEffect(() => {
       const resolvedCompanionKey = incomingCompanion || "";
       const { baseKey } = splitCompanionKey(resolvedCompanionKey);
 
-      // Some Wix implementations append the Wix member UUID to the companion key for uniqueness.
-      // Example: "dulce-female-black-millennials-<memberId>"
-      // If Wix does not pass memberId separately, infer it from this suffix so Host/Viewer logic works.
-      const baseKeyForId = stripExt(String(baseKey || resolvedCompanionKey || "").trim());
-      const inferredMemberId = extractTrailingUuid(baseKeyForId);
-
-      if (!incomingMemberId && inferredMemberId) {
-        setMemberId(inferredMemberId);
-        memberIdRef.current = inferredMemberId;
-      } else {
-        memberIdRef.current = incomingMemberId;
-      }
-
-      // IMPORTANT: strip the trailing UUID from the companion key before we send it to the backend.
-      // Otherwise persona selection and ElevenLabs fallbacks can incorrectly default to "Elara".
-      const baseKeyNoUuid = stripTrailingUuid(baseKeyForId);
-
       if (resolvedCompanionKey) {
         setCompanionKeyRaw(resolvedCompanionKey);
-        const parsed = parseCompanionMeta(baseKeyNoUuid || baseKey || resolvedCompanionKey);
+        const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
 
@@ -3833,7 +3828,7 @@ useEffect(() => {
         }));
       }
 
-      const avatarCandidates = buildAvatarCandidates(baseKeyNoUuid || baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, rebrandSlugFromMessage);
+      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, rebrandSlugFromMessage);
       pickFirstLoadableImage(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       // Brand-default starting mode:
