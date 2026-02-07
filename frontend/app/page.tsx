@@ -1501,6 +1501,24 @@ useEffect(() => {
       const brand = String(companyName || "").trim();
       const avatar = String(companionName || "").trim();
 
+      // IMPORTANT (Wix embed):
+      // The page boots with placeholder defaults (brand=Elaralo, avatar=Elara) until Wix posts the MEMBER_PLAN payload.
+      // Avoid calling the backend with placeholders; wait until we have the companionKeyRaw handoff.
+      let embedded = false;
+      try {
+        embedded = typeof window !== "undefined" && !!window.top && window.top !== window.self;
+      } catch (e) {
+        // Cross-origin access to window.top can throw; treat as embedded.
+        embedded = true;
+      }
+
+      const hasCompanionHandoff = Boolean(String(companionKeyRaw || "").trim());
+      if (embedded && !hasCompanionHandoff) {
+        setCompanionMapping(null);
+        setCompanionMappingError("");
+        return;
+      }
+
       // Strict: brand+avatar must be present (core brand defaults to Elaralo when rebrandingKey is empty).
       if (!brand || !avatar) {
         setCompanionMapping(null);
@@ -1578,7 +1596,7 @@ useEffect(() => {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, companyName, companionName]);
+  }, [API_BASE, companyName, companionName, companionKeyRaw]);
 
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
@@ -3403,6 +3421,23 @@ useEffect(() => {
 //   as soon as the Host hits Play.
 // ---------------------------------------------------------------------------
 useEffect(() => {
+    // IMPORTANT (Wix embed):
+    // Avoid polling BeeStreamed status for placeholder defaults before Wix hands off the companionKey.
+    let embedded = false;
+    try {
+      embedded = typeof window !== "undefined" && !!window.top && window.top !== window.self;
+    } catch (e) {
+      embedded = true;
+    }
+
+    const hasCompanionHandoff = Boolean(String(companionKeyRaw || "").trim());
+    if (embedded && !hasCompanionHandoff) {
+      setBeestreamedHostMemberId("");
+      setBeestreamedSessionActive(false);
+      beestreamedStatusInactivePollsRef.current = 0;
+      return;
+    }
+
     if (!API_BASE || !companyName || !companionName) {
       setBeestreamedHostMemberId("");
       setBeestreamedSessionActive(false);
@@ -3470,7 +3505,7 @@ useEffect(() => {
         window.clearInterval(pollTimer);
       }
     };
-  }, [API_BASE, companyName, companionName]);
+  }, [API_BASE, companyName, companionName, companionKeyRaw]);
 
 // Viewer UX: if a viewer joined before the host activated the session, we initially show a
 // "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
