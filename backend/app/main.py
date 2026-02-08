@@ -455,9 +455,6 @@ _COMPANION_MAPPINGS_LOADED_AT: float | None = None
 _COMPANION_MAPPINGS_SOURCE: str = ""
 _COMPANION_MAPPINGS_TABLE: str = ""
 
-# Reverse index: ElevenLabs voice_id -> mapping row (used for phonetic pronunciation)
-_ELEVEN_VOICE_INDEX: Dict[str, Dict[str, Any]] = {}
-
 
 def _norm_key(s: str) -> str:
     return (s or "").strip().lower()
@@ -661,7 +658,7 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
 
 
 def _load_companion_mappings_sync() -> None:
-    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE, _ELEVEN_VOICE_INDEX
+    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
 
     db_path = ""
     for p in _candidate_mapping_db_paths():
@@ -774,7 +771,6 @@ def _load_companion_mappings_sync() -> None:
         d[key] = {
             "brand": brand,
             "avatar": avatar,
-            "phonetic": str(get_col("phonetic", "Phonetic", "PHONETIC", default="") or "").strip(),
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
             # UI uses channel_cap to decide whether to show the video/play controls.
             "channel_cap": str(get_col("channel_cap", "channelCap", "chanel_cap", "channel_capability", default="") or "").strip(),
@@ -792,14 +788,6 @@ def _load_companion_mappings_sync() -> None:
         }
 
     _COMPANION_MAPPINGS = d
-
-    # Build reverse index for phonetic pronunciation lookups by ElevenLabs voice_id.
-    idx: Dict[str, Dict[str, Any]] = {}
-    for row in d.values():
-        vid = str(row.get("eleven_voice_id") or "").strip()
-        if vid:
-            idx[vid] = row
-    _ELEVEN_VOICE_INDEX = idx
     _COMPANION_MAPPINGS_LOADED_AT = time.time()
     _COMPANION_MAPPINGS_SOURCE = db_path
     _COMPANION_MAPPINGS_TABLE = table_name_for_source
@@ -927,7 +915,6 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "found": True,
         "brand": str(m.get("brand") or b),
         "avatar": str(m.get("avatar") or a),
-        "phonetic": str(m.get("phonetic") or ""),
         "companionType": ctype_out,
         "companion_type": ctype_out,
         "channel_cap": cap_out,
@@ -958,84 +945,61 @@ _BEE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
 _LIVECHAT_LOCK = threading.Lock()
 # _LIVECHAT_CLIENTS[event_ref] = set(WebSocket)
 _LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
+# Per-connection identity metadata, keyed by websocket instance.
+# Used so the server can attach senderRole/name to each broadcast.
+_LIVECHAT_CLIENT_META: Dict[WebSocket, Dict[str, str]] = {}
+# Simple in-memory message history per event_ref so late-joiners see recent chat.
+_LIVECHAT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
+_LIVECHAT_HISTORY_MAX = 200
 
 
-def _session_key(brand: str, avatar: str) -> str:
-    return f"{(brand or '').strip().lower()}|{(avatar or '').strip().lower()}"
+def _normalize_livechat_role(role: str) -> str:
+    r = (role or "").strip().lower()
+    if r in ("host", "viewer", "system"):
+        return r
+    return "viewer"
 
 
-def _get_session_state(brand: str, avatar: str) -> Dict[str, Any]:
-    key = _session_key(brand, avatar)
-    with _BEE_SESSION_LOCK:
-        return dict(_BEE_SESSION_STATE.get(key, {}))
-
-
-def _is_session_active(brand: str, avatar: str) -> bool:
-    st = _get_session_state(brand, avatar)
-    return bool(st.get("active"))
-
-
-def _set_session_active(brand: str, avatar: str, *, active: bool, event_ref: Optional[str] = None) -> None:
-    key = _session_key(brand, avatar)
-    with _BEE_SESSION_LOCK:
-        st = _BEE_SESSION_STATE.get(key, {})
-        st["active"] = bool(active)
-        if event_ref:
-            st["event_ref"] = str(event_ref)
-        st["updated_at"] = time.time()
-        _BEE_SESSION_STATE[key] = st
-
-
-async def _livechat_broadcast(event_ref: str, payload: Dict[str, Any]) -> None:
+def _livechat_push_history(event_ref: str, msg: Dict[str, Any]) -> None:
+    # Append a chat message to in-memory history (bounded).
     event_ref = (event_ref or "").strip()
     if not event_ref:
         return
-
     with _LIVECHAT_LOCK:
-        sockets = list(_LIVECHAT_CLIENTS.get(event_ref, set()))
-
-    if not sockets:
-        return
-
-    msg = json.dumps(payload, ensure_ascii=False)
-    dead: List[WebSocket] = []
-    for ws in sockets:
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.append(ws)
-
-    if dead:
-        with _LIVECHAT_LOCK:
-            s = _LIVECHAT_CLIENTS.get(event_ref, set())
-            for ws in dead:
-                try:
-                    s.discard(ws)
-                except Exception:
-                    pass
-            if not s:
-                _LIVECHAT_CLIENTS.pop(event_ref, None)
+        hist = _LIVECHAT_HISTORY.get(event_ref)
+        if hist is None:
+            hist = []
+            _LIVECHAT_HISTORY[event_ref] = hist
+        hist.append(msg)
+        if len(hist) > _LIVECHAT_HISTORY_MAX:
+            # Keep the most recent N messages
+            del hist[: len(hist) - _LIVECHAT_HISTORY_MAX]
 
 
 class LiveChatSendRequest(BaseModel):
     eventRef: str = ""
     clientMsgId: Optional[str] = None
-    memberId: str = ""
-    role: Optional[str] = None   # "host" | "viewer"
+
+    # Accept either 'role' or 'senderRole' from older/newer clients.
+    role: Optional[str] = None
+    senderRole: Optional[str] = None
+
+    # Display name
     name: Optional[str] = None
-    # Accept either "text" (frontend) or "message" (legacy) for the message content.
-    text: str = ""
-    message: str = ""
+
+    # Accept either 'text' or 'message' from older/newer clients.
+    text: Optional[str] = None
+    message: Optional[str] = None
+
+    # Accept either 'memberId' or 'senderId' from older/newer clients.
+    memberId: Optional[str] = None
+    senderId: Optional[str] = None
+
     ts: Optional[float] = None
 
 
 @app.websocket("/stream/beestreamed/livechat/{event_ref}")
 async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
-    """Shared live chat for BeeStreamed sessions.
-
-    The browser connects with query params (memberId, role, name). We attach those fields to every
-    broadcast so both sides can render correct labels (Host name + Viewer username).
-    """
     event_ref = (event_ref or "").strip()
     await websocket.accept()
 
@@ -1043,51 +1007,88 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
         await websocket.close(code=1008)
         return
 
-    # Identity is bound at connect-time.
-    qp = websocket.query_params
-    sender_id = str(qp.get("memberId") or qp.get("member_id") or "").strip()
-    sender_role = str(qp.get("role") or "viewer").strip().lower()
-    if sender_role not in ("host", "viewer"):
-        sender_role = "viewer"
-    sender_name = str(qp.get("name") or "").strip()
+    # Capture identity from connection query params.
+    qs = websocket.query_params
+    member_id = (qs.get("memberId") or qs.get("member_id") or qs.get("senderId") or qs.get("sender_id") or "").strip()
+    role = _normalize_livechat_role(qs.get("role") or "")
+    name = (qs.get("name") or "").strip()
 
+    # Register socket + identity
     with _LIVECHAT_LOCK:
         _LIVECHAT_CLIENTS.setdefault(event_ref, set()).add(websocket)
+        _LIVECHAT_CLIENT_META[websocket] = {
+            "eventRef": event_ref,
+            "memberId": member_id,
+            "role": role,
+            "name": name,
+        }
+        history = list(_LIVECHAT_HISTORY.get(event_ref, []))
+
+    # Send recent history to the newly connected client.
+    if history:
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {"type": "history", "eventRef": event_ref, "messages": history, "ts": time.time()},
+                    ensure_ascii=False,
+                )
+            )
+        except Exception:
+            pass
 
     try:
         while True:
             raw = await websocket.receive_text()
             try:
-                payload = json.loads(raw)
-                if not isinstance(payload, dict):
-                    payload = {"text": str(payload)}
+                incoming = json.loads(raw)
+                if not isinstance(incoming, dict):
+                    incoming = {"text": str(incoming)}
             except Exception:
-                payload = {"text": raw}
+                incoming = {"text": raw}
 
-            text = str(payload.get("text") or payload.get("message") or "").strip()
-            if not text:
+            msg_type = str(incoming.get("type") or "chat").strip().lower()
+
+            # Optional ping/pong
+            if msg_type == "ping":
+                try:
+                    await websocket.send_text(json.dumps({"type": "pong", "ts": time.time()}))
+                except Exception:
+                    pass
                 continue
 
-            client_msg_id = str(payload.get("clientMsgId") or "").strip() or str(uuid.uuid4())
-            ts = payload.get("ts")
+            # We only broadcast chat messages.
+            if msg_type not in ("chat", "message"):
+                continue
+
+            text_val = incoming.get("text")
+            if text_val is None or str(text_val).strip() == "":
+                text_val = incoming.get("message") or incoming.get("content") or ""
+            text_val = str(text_val).strip()
+            if not text_val:
+                continue
+
+            client_msg_id = str(incoming.get("clientMsgId") or incoming.get("client_msg_id") or "").strip() or str(uuid.uuid4())
+
+            ts_in = incoming.get("ts")
             try:
-                ts_out = float(ts) if ts is not None else time.time()
+                ts = float(ts_in) if ts_in is not None else time.time()
             except Exception:
-                ts_out = time.time()
+                ts = time.time()
 
             out: Dict[str, Any] = {
                 "type": "chat",
                 "eventRef": event_ref,
+                "text": text_val,
                 "clientMsgId": client_msg_id,
-                "senderId": sender_id or str(payload.get("senderId") or payload.get("memberId") or "").strip(),
-                "senderRole": sender_role or str(payload.get("senderRole") or payload.get("role") or "viewer").strip().lower(),
-                "name": sender_name or str(payload.get("name") or "").strip(),
-                "text": text,
-                "message": text,
-                "ts": ts_out,
+                "ts": ts,
+                "senderId": member_id,
+                "senderRole": role,
+                "name": name,
             }
 
+            _livechat_push_history(event_ref, out)
             await _livechat_broadcast(event_ref, out)
+
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -1100,37 +1101,43 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
                 s.discard(websocket)
             except Exception:
                 pass
+            _LIVECHAT_CLIENT_META.pop(websocket, None)
             if not s:
                 _LIVECHAT_CLIENTS.pop(event_ref, None)
+                _LIVECHAT_HISTORY.pop(event_ref, None)
 
 
 @app.post("/stream/beestreamed/livechat/send")
-
 async def beestreamed_livechat_send(req: LiveChatSendRequest):
     event_ref = (req.eventRef or "").strip()
     if not event_ref:
         raise HTTPException(status_code=400, detail="eventRef is required")
 
-    role = str(req.role or "viewer").strip().lower()
-    if role not in ("host", "viewer"):
-        role = "viewer"
+    text_val = str((req.text or req.message or "")).strip()
+    if not text_val:
+        return {"ok": True}
 
-    text = (req.text or req.message or "").strip()
-    if not text:
-        return {"ok": True, "ignored": True}
+    sender_id = str((req.senderId or req.memberId or "")).strip()
+    sender_role = _normalize_livechat_role(req.senderRole or req.role or "viewer")
+    name = str((req.name or "")).strip()
+
+    try:
+        ts = float(req.ts) if req.ts is not None else time.time()
+    except Exception:
+        ts = time.time()
 
     payload: Dict[str, Any] = {
         "type": "chat",
         "eventRef": event_ref,
         "clientMsgId": (req.clientMsgId or str(uuid.uuid4())),
-        "senderId": str(req.memberId or "").strip(),
-        "senderRole": role,
-        "name": str(req.name or "").strip(),
-        "text": text,
-        "message": text,
-        "ts": (req.ts if req.ts is not None else time.time()),
+        "text": text_val,
+        "ts": ts,
+        "senderId": sender_id,
+        "senderRole": sender_role,
+        "name": name,
     }
 
+    _livechat_push_history(event_ref, payload)
     await _livechat_broadcast(event_ref, payload)
     return {"ok": True}
 
@@ -1341,122 +1348,6 @@ def _beestreamed_auth_headers() -> Dict[str, str]:
     basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
     return {"Authorization": f"Basic {basic}", "Content-Type": "application/json"}
 
-@app.post("/stream/beestreamed/start_embed")
-async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
-    mapping = _lookup_companion_mapping(req.brand, req.avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="No mapping for that brand/avatar")
-
-    resolved_brand = mapping.get("brand") or req.brand
-    resolved_avatar = mapping.get("avatar") or req.avatar
-
-    # Guardrail: BeeStreamed is ONLY for Human companions configured for Stream video.
-    live_lc = str(mapping.get("live") or "").strip().lower()
-    ctype_lc = str(mapping.get("companion_type") or "").strip().lower()
-    cap_lc = str(mapping.get("channel_cap") or "").strip().lower()
-
-    if live_lc != "stream" or ctype_lc != "human" or cap_lc != "video":
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "BeeStreamed is only valid for Human companions with channel_cap=Video and live=Stream",
-                "brand": str(resolved_brand),
-                "avatar": str(resolved_avatar),
-                "companion_type": str(mapping.get("companion_type") or ""),
-                "channel_cap": str(mapping.get("channel_cap") or ""),
-                "live": str(mapping.get("live") or ""),
-            },
-        )
-
-    # Host auth: only the configured host can START the stream.
-    host_id = (mapping.get("host_member_id") or "").strip()
-    member_id = (req.memberId or "").strip()
-    is_host = bool(host_id) and bool(member_id) and (host_id.lower() == member_id.lower())
-
-    # Track "session active" in-memory so viewers can JOIN after the host has started.
-    session_active = _is_session_active(resolved_brand, resolved_avatar)
-
-    # Always read the latest persisted event_ref (this is the value viewers must use to join).
-    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar) or ""
-    embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
-
-    # Viewer path: allow join only when the host has started a session.
-    if not is_host:
-        if not session_active or not event_ref:
-            return {
-                "ok": True,
-                "status": "waiting",
-                "canStart": False,
-                "isHost": False,
-                "sessionActive": bool(session_active),
-                "eventRef": event_ref,
-                "embedUrl": embed_url,
-                "message": f"Waiting on {resolved_avatar} to start event",
-            }
-
-        return {
-            "ok": True,
-            "status": "started",
-            "canStart": False,
-            "isHost": False,
-            "sessionActive": True,
-            "eventRef": event_ref,
-            "embedUrl": embed_url,
-            "message": "",
-        }
-
-    # Host path: ensure an event_ref exists, then start WebRTC.
-    if not event_ref:
-        event_ref = _beestreamed_create_event_sync(req.embedDomain)
-        if not event_ref:
-            raise HTTPException(status_code=502, detail="BeeStreamed create_event returned empty event_ref")
-        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
-
-    # Ensure event is scheduled "now" and bound to the correct embed domain (prevents pop-out issues).
-    try:
-        _beestreamed_schedule_now_sync(
-            event_ref,
-            title=f"{resolved_brand} {resolved_avatar}",
-            embed_domain=req.embedDomain,
-        )
-    except Exception:
-        # best-effort
-        pass
-
-    # Start WebRTC. BeeStreamed occasionally returns 404 for a stale event_ref. Recreate once and retry.
-    try:
-        _beestreamed_start_webrtc_sync(event_ref)
-    except HTTPException as e:
-        if int(getattr(e, "status_code", 0) or 0) == 404:
-            # stale ref: recreate and retry once
-            event_ref = _beestreamed_create_event_sync(req.embedDomain)
-            _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
-            try:
-                _beestreamed_schedule_now_sync(
-                    event_ref,
-                    title=f"{resolved_brand} {resolved_avatar}",
-                    embed_domain=req.embedDomain,
-                )
-            except Exception:
-                pass
-            _beestreamed_start_webrtc_sync(event_ref)
-        else:
-            raise
-
-    _set_session_active(resolved_brand, resolved_avatar, active=True, event_ref=event_ref)
-
-    embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
-
-    return {
-        "ok": True,
-        "status": "started",
-        "canStart": True,
-        "isHost": True,
-        "sessionActive": True,
-        "eventRef": event_ref,
-        "embedUrl": embed_url,
-        "message": "",
-    }
 def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
     import requests  # type: ignore
 
@@ -1531,51 +1422,90 @@ def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_dom
     except Exception:
         pass
 
-def _beestreamed_start_webrtc_sync(event_ref: str) -> None:
+def _beestreamed_start_webrtc_sync(event_ref: str) -> Dict[str, Any]:
     import requests  # type: ignore
-    api_base = _beestreamed_api_base()
-    headers = _beestreamed_auth_headers()
 
-    try:
-        r = requests.post(f"{api_base}/events/{event_ref}/startwebrtcstream", headers=headers, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BeeStreamed start failed: {e!r}")
-
-    if r.status_code >= 400:
-        msg = (r.text or "").strip()
-        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed start error {r.status_code}: {msg[:500]}")
-
-def _beestreamed_stop_webrtc_sync(event_ref: str) -> Dict[str, Any]:
-    """Stop the BeeStreamed WebRTC stream.
-
-    Uses the same server-side authentication scheme as startwebrtcstream (Authorization header),
-    and then best-effort PATCHes the event to an Idle state (mirrors BeeStreamed UI behavior).
-    """
-    event_ref = (event_ref or "").strip()
-    if not event_ref:
+    ref = (event_ref or "").strip()
+    if not ref:
         return {"ok": False, "error": "event_ref required"}
 
     api_base = _beestreamed_api_base()
     headers = _beestreamed_auth_headers()
 
-    url = f"{api_base}/events/{event_ref}/stopwebrtcstream"
     try:
-        r = requests.post(url, headers=headers, timeout=20)
-        ok = (r.status_code // 100 == 2)
-        res: Dict[str, Any] = {"ok": ok, "status_code": r.status_code, "body": r.text}
+        r = requests.post(f"{api_base}/events/{ref}/startwebrtcstream", headers=headers, timeout=20)
+        return {
+            "ok": (r.status_code // 100 == 2),
+            "status_code": r.status_code,
+            "body": (r.text or ""),
+            "authMode": "basic",
+        }
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "authMode": "basic"}
+def _beestreamed_stop_webrtc_sync(event_ref: str) -> Dict[str, Any]:
+    """Stop the BeeStreamed WebRTC stream.
 
-    # Best-effort: attempt to move the event to Idle so viewers stop seeing "waiting" overlays
-    # and the host can restart cleanly.
+    We authenticate server-side (never expose tokens to the browser).
+    Preferred auth is Basic (STREAM_TOKEN_ID/STREAM_SECRET_KEY).
+    As a defensive fallback, we also attempt legacy query-param auth if Basic fails.
+    """
+    import requests  # type: ignore
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        return {"ok": False, "error": "event_ref required"}
+
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    # 1) Try Basic auth first
+    try:
+        r = requests.post(f"{api_base}/events/{ref}/stopwebrtcstream", headers=headers, timeout=20)
+        res: Dict[str, Any] = {
+            "ok": (r.status_code // 100 == 2),
+            "status_code": r.status_code,
+            "body": (r.text or ""),
+            "authMode": "basic",
+        }
+    except Exception as e:
+        res = {"ok": False, "error": str(e), "authMode": "basic"}
+
+    # 2) Fallback: query-param auth (only if basic did not succeed)
+    if not res.get("ok"):
+        token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
+        secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
+        if token_id and secret_key:
+            try:
+                url = f"{api_base}/events/{ref}/stopwebrtcstream?tokenid={token_id}&secretkey={secret_key}"
+                r2 = requests.post(url, timeout=20)
+                res = {
+                    "ok": (r2.status_code // 100 == 2),
+                    "status_code": r2.status_code,
+                    "body": (r2.text or ""),
+                    "authMode": "query",
+                }
+            except Exception as e:
+                res = {"ok": False, "error": str(e), "authMode": "query"}
+
+    # 3) Best-effort: attempt to move the event to an Idle state so viewers stop seeing overlays.
     if res.get("ok"):
         try:
-            patch_url = f"{api_base}/events/{event_ref}"
-            payload = {"status": "Idle", "Status": "Idle"}
-            r2 = requests.patch(patch_url, headers=headers, json=payload, timeout=20)
-            res["idle_ok"] = (r2.status_code // 100 == 2)
-            res["idle_status_code"] = r2.status_code
-            res["idle_body"] = r2.text
+            if res.get("authMode") == "query":
+                token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
+                secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
+                patch_url = f"{api_base}/events/{ref}?tokenid={token_id}&secretkey={secret_key}"
+                r3 = requests.patch(patch_url, json={"status": "Idle", "Status": "Idle"}, timeout=20)
+            else:
+                r3 = requests.patch(
+                    f"{api_base}/events/{ref}",
+                    headers=headers,
+                    json={"status": "Idle", "Status": "Idle"},
+                    timeout=20,
+                )
+
+            res["idle_ok"] = (r3.status_code // 100 == 2)
+            res["idle_status_code"] = r3.status_code
+            res["idle_body"] = (r3.text or "")
         except Exception as e:
             res["idle_ok"] = False
             res["idle_error"] = str(e)
@@ -1871,7 +1801,7 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
     resolved_avatar = str(mapping.get("avatar") or avatar).strip()
 
     live = str(mapping.get("live") or "").strip().lower()
-    if live != "stream":
+    if "stream" not in live:
         raise HTTPException(status_code=400, detail="This companion is not configured for stream")
 
     comp_type = str(mapping.get("companion_type") or "").strip()
@@ -1879,7 +1809,7 @@ async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
         raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
 
     host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
-    is_host = bool(host_id and member_id and host_id.lower() == member_id.lower())
+    is_host = bool(host_id and member_id and member_id == host_id)
 
     if not is_host:
         existing_ref = str(mapping.get("event_ref") or "").strip()
@@ -2038,15 +1968,25 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
 
         # Best-effort: notify any connected shared-live-chat clients.
     try:
+        # 1) Force clients to exit live-chat mode cleanly.
         await _livechat_broadcast(
             event_ref,
-            {
-                "type": "session_ended",
-                "eventRef": event_ref,
-                "clientMsgId": str(uuid.uuid4()),
-                "ts": time.time(),
-            },
+            {"type": "session_ended", "eventRef": event_ref, "ts": time.time()},
         )
+
+        # 2) Also emit a visible system line into the chat history/UI.
+        sys_msg: Dict[str, Any] = {
+            "type": "chat",
+            "eventRef": event_ref,
+            "text": "Host ended the live stream.",
+            "clientMsgId": str(uuid.uuid4()),
+            "ts": time.time(),
+            "senderId": "",
+            "senderRole": "system",
+            "name": "System",
+        }
+        _livechat_push_history(event_ref, sys_msg)
+        await _livechat_broadcast(event_ref, sys_msg)
     except Exception:
         pass
 
@@ -3656,27 +3596,10 @@ async def save_chat_summary(request: Request):
 # ----------------------------
 # BACKWARD-COMPAT TTS ENDPOINT (still supported)
 # ----------------------------
-def _replace_display_name_with_phonetic(text: str, display_name: str, phonetic: str) -> str:
-    """Replace occurrences of a companion's display name with its phonetic pronunciation.
-
-    - Case-insensitive match
-    - Word-boundary guarded so "Dulce" won't match "DulceMoon"
-    """
-    try:
-        t = str(text or "")
-        dn = str(display_name or "").strip()
-        ph = str(phonetic or "").strip()
-        if not t or not dn or not ph:
-            return t
-        pattern = re.compile(rf"(?<![\w]){re.escape(dn)}(?![\w])", flags=re.IGNORECASE)
-        return pattern.sub(ph, t)
-    except Exception:
-        return str(text or "")
-
-
 @app.post("/tts/audio-url")
 async def tts_audio_url(request: Request) -> Dict[str, Any]:
-    """Backward compatible endpoint.
+    """
+    Backward compatible endpoint.
 
     Request JSON:
       {
@@ -3684,10 +3607,6 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
         "voice_id": "<ElevenLabsVoiceId>",
         "text": "..."
       }
-
-    Optional (recommended) fields:
-      - brand / company / rebranding
-      - avatar / companion / companionName
 
     Response JSON:
       { "audio_url": "https://...sas..." }
@@ -3701,37 +3620,46 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
     if not session_id:
         raise HTTPException(status_code=422, detail="session_id required")
 
-    voice_id = str(body.get("voice_id") or body.get("voiceId") or "").strip()
-    text = str(body.get("text") or "").strip()
-
-    # Optional: apply phonetic pronunciation for the companion name when generating audio.
-    # The UI display name is unchanged; this only affects the spoken audio.
-    brand = str(body.get("brand") or body.get("company") or body.get("rebranding") or "").strip()
-    avatar = str(body.get("avatar") or body.get("companion") or body.get("companionName") or body.get("companion_name") or "").strip()
-
-    mapping: Optional[Dict[str, Any]] = None
-    if avatar:
-        mapping = _lookup_companion_mapping(brand or "Elaralo", avatar)
-    if mapping is None and voice_id:
-        mapping = _ELEVEN_VOICE_INDEX.get(voice_id)
-
-    if mapping:
-        phonetic = str(mapping.get("phonetic") or "").strip()
-        display_avatar = str(mapping.get("avatar") or avatar or "").strip()
-        if phonetic and display_avatar:
-            text = _replace_display_name_with_phonetic(text, display_avatar, phonetic)
+    voice_id = ((body.get("voice_id") or body.get("voiceId") or "")).strip()
+    text = (body.get("text") or "").strip()
 
     if not voice_id or not text:
-        raise HTTPException(status_code=422, detail="voice_id and text required")
+        raise HTTPException(status_code=422, detail="voice_id and text are required")
 
     try:
-        audio_url = _tts_audio_url_sync(session_id=session_id, voice_id=voice_id, text=text)
+        # STEP B: if another worker/request is already generating the same cached blob, wait briefly.
+        audio_url: Optional[str] = None
+        if _TTS_CACHE_ENABLED and voice_id and text:
+            try:
+                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
+                if _inflight_marker_is_fresh(cache_blob):
+                    waited = 0
+                    while waited < _TTS_INFLIGHT_WAIT_MS:
+                        peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text)
+                        if peek:
+                            audio_url = peek
+                            break
+                        await asyncio.sleep(0.15)
+                        waited += 150
+            except Exception:
+                pass
+        if audio_url is None:
+            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS failed: {e!r}")
+        raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
 
     return {"audio_url": audio_url}
 
 
+# --------------------------
+# STT (Speech-to-Text)
+# --------------------------
+# NOTE: This endpoint intentionally accepts RAW audio bytes in the request body (not multipart/form-data)
+# to avoid requiring the `python-multipart` package (which can otherwise prevent FastAPI from starting).
+#
+# Frontend should POST the recorded Blob directly:
+#   fetch(`${API_BASE}/stt/transcribe`, { method:"POST", headers:{ "Content-Type": blob.type }, body: blob })
+#
 @app.post("/stt/transcribe")
 async def stt_transcribe(request: Request):
     if not settings.OPENAI_API_KEY:
