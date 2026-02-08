@@ -1295,7 +1295,7 @@ export default function Page() {
   }, [applyTtsGainRouting]);
 
 
-  // Companion identity (drives persona + live avatar mapping)
+  // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
@@ -1698,7 +1698,7 @@ useEffect(() => {
 
 
 // ----------------------------
-// Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
+// Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
 // ----------------------------
 const didSrcObjectRef = useRef<any | null>(null);
 const didAgentMgrRef = useRef<any | null>(null);
@@ -1753,7 +1753,8 @@ const channelCap: ChannelCap = useMemo(() => {
 }, [companionMapping]);
 
 const liveProvider: LiveProvider = useMemo(() => {
-  // Strict mapping: DB values are Stream or D-ID.
+  // Strict mapping: DB values are Stream, D-ID, or NULL.
+  // NOTE: "did" (no hyphen) is NOT accepted.
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
   if (liveRaw === "stream") return "stream";
@@ -2175,7 +2176,7 @@ setStreamEventRef(eventRef);
 
 if (!didConfig) {
   setAvatarStatus("error");
-  setAvatarError("Live Avatar is not enabled for this companion (missing D-ID configuration in the DB).");
+  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
   return;
 }
 
@@ -3181,9 +3182,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
     // Once a user has joined the in-stream experience, they should remain connected to
     // shared chat until they explicitly press Stop.
     const inStreamUi =
-      // Connect as soon as THIS user joins the in-stream experience (Play pressed),
-      // even if the host hasn't started streaming yet. This prevents a delay where
-      // the viewer misses early live-chat messages while waiting for the polling loop.
+      Boolean(beestreamedSessionActive) &&
       Boolean(streamEmbedUrl || streamEventRef) &&
       !!eventRef;
 
@@ -3298,7 +3297,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
         if (ws) ws.close();
       } catch (e) {}
     };
-  }, [API_BASE, streamEmbedUrl, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, appendLiveChatMessage]);
+  }, [API_BASE, beestreamedSessionActive, streamEmbedUrl, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, appendLiveChatMessage]);
 
   const sendLiveChatMessage = useCallback(
     async (text: string, clientMsgId: string) => {
@@ -4378,7 +4377,7 @@ if (streamSessionActive) {
         }
       }
 
-      // Speak the assistant reply (if Live Avatar is connected).
+      // Phase 1: Speak the assistant reply (if Live Avatar is connected).
       // When Live Avatar is active, we delay the assistant's text from appearing until
       // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");

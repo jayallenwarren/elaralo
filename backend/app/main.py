@@ -1503,7 +1503,7 @@ def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_dom
     """Best-effort: set the event date to 'now' so the event is effectively scheduled immediately.
 
     BeeStreamed docs: PATCH /events/[EVENT REF] supports `date` (formatted) and `title`.
-    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS".
+    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS". citeturn3view1turn3view0
     """
     import requests  # type: ignore
     api_base = _beestreamed_api_base()
