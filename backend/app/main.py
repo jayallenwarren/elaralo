@@ -521,136 +521,16 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
     except Exception:
         pass
 
-    # If a writable copy already exists, prefer it — but refresh it when the packaged DB changes.
-    #
-    # Why:
-    # - We often copy the packaged DB into /home/site on first boot so we can persist runtime state (e.g., event_ref).
-    # - If we later deploy a NEW packaged DB (new mappings/rows), the persisted copy would otherwise stay stale
-    #   forever and strict lookups like ("DulceMoon","Dulce") will 404 even though they exist in the repo DB.
-    #
-    # Refresh behavior:
-    # - We track the SHA256 of the packaged DB in a sidecar file <rw_path>.packaged.sha256.
-    # - If that hash changes, we overwrite the writable copy with the new packaged DB and then migrate runtime-only
-    #   columns (currently: event_ref) from the old copy into the refreshed DB when possible.
+    # If a writable copy already exists, use it (do not overwrite; it may contain
+    # persisted runtime state like event_ref).
     if os.path.exists(rw_path):
-        lock_path = rw_path + ".lock"
-        marker_path = rw_path + ".packaged.sha256"
-        try:
-            with FileLock(lock_path):
-                def _sha256_file(path: str) -> str:
-                    h = hashlib.sha256()
-                    with open(path, "rb") as f:
-                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                            h.update(chunk)
-                    return h.hexdigest()
-
-                try:
-                    src_hash = _sha256_file(src_db_path)
-                except Exception:
-                    return rw_path
-
-                prev_hash = ""
-                try:
-                    prev_hash = str(open(marker_path, "r", encoding="utf-8").read() or "").strip()
-                except Exception:
-                    prev_hash = ""
-
-                # If the packaged DB hasn't changed since the last refresh, keep the existing writable DB
-                # (which may have updated runtime fields like event_ref).
-                if prev_hash and prev_hash == src_hash:
-                    return rw_path
-
-                # Backup old writable DB, then refresh from packaged DB.
-                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-                backup_path = f"{rw_path}.bak.{ts}"
-                try:
-                    shutil.copy2(rw_path, backup_path)
-                except Exception:
-                    backup_path = ""
-
-                try:
-                    parent = os.path.dirname(rw_path) or "."
-                    os.makedirs(parent, exist_ok=True)
-                    shutil.copy2(src_db_path, rw_path)
-                    try:
-                        with open(marker_path, "w", encoding="utf-8") as f:
-                            f.write(src_hash)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"[mappings] WARNING: Failed to refresh writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
-                    return rw_path
-
-                # Best-effort: migrate runtime event_ref from the previous writable copy into the refreshed DB.
-                try:
-                    if backup_path and os.path.exists(backup_path):
-                        def _pick_table(conn: sqlite3.Connection) -> str:
-                            cur = conn.cursor()
-                            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                            names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
-                            lc = {n.lower(): n for n in names}
-                            for cand in ("companion_mappings", "voice_video_mappings", "voice_video_mapping", "mappings"):
-                                if cand in lc:
-                                    return lc[cand]
-                            return names[0] if names else ""
-
-                        def _colset(conn: sqlite3.Connection, table: str) -> set[str]:
-                            cur = conn.cursor()
-                            cur.execute(f'PRAGMA table_info("{table}")')
-                            return {str(r[1]).lower() for r in cur.fetchall() if r and len(r) > 1}
-
-                        old_conn = sqlite3.connect(backup_path)
-                        old_conn.row_factory = sqlite3.Row
-                        new_conn = sqlite3.connect(rw_path)
-                        new_conn.row_factory = sqlite3.Row
-                        try:
-                            old_table = _pick_table(old_conn)
-                            new_table = _pick_table(new_conn)
-                            if old_table and new_table:
-                                old_cols = _colset(old_conn, old_table)
-                                new_cols = _colset(new_conn, new_table)
-                                if {"brand", "avatar", "event_ref"}.issubset(old_cols) and {"brand", "avatar", "event_ref"}.issubset(new_cols):
-                                    cur_old = old_conn.cursor()
-                                    cur_old.execute(f'SELECT brand, avatar, event_ref FROM "{old_table}" WHERE event_ref IS NOT NULL AND trim(event_ref) != ""')
-                                    rows = cur_old.fetchall()
-                                    cur_new = new_conn.cursor()
-                                    for r in rows:
-                                        b = str(r["brand"] or "").strip()
-                                        a = str(r["avatar"] or "").strip()
-                                        ev = str(r["event_ref"] or "").strip()
-                                        if not b or not a or not ev:
-                                            continue
-                                        cur_new.execute(
-                                            f'UPDATE "{new_table}" SET event_ref=? WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) AND (event_ref IS NULL OR trim(event_ref) = "")',
-                                            (ev, b, a),
-                                        )
-                                    new_conn.commit()
-                        finally:
-                            old_conn.close()
-                            new_conn.close()
-                except Exception as e:
-                    print(f"[mappings] WARNING: failed migrating event_ref after DB refresh: {e}")
-
-                print(f"[mappings] Refreshed writable mapping DB at {rw_path} from packaged DB {src_db_path}")
-                return rw_path
-        except Exception:
-            return rw_path
+        return rw_path
 
     # Create parent dir, then copy.
     try:
         parent = os.path.dirname(rw_path) or "."
         os.makedirs(parent, exist_ok=True)
         shutil.copy2(src_db_path, rw_path)
-        # Record packaged DB fingerprint so future startups can detect when the packaged DB changes.
-        try:
-            h = hashlib.sha256()
-            with open(src_db_path, "rb") as f:
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-            with open(rw_path + ".packaged.sha256", "w", encoding="utf-8") as f:
-                f.write(h.hexdigest())
-        except Exception:
-            pass
         return rw_path
     except Exception as e:
         print(f"[mappings] WARNING: Failed to create writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
@@ -708,8 +588,7 @@ def _load_companion_mappings_sync() -> None:
             print(f"[mappings] WARNING: mapping DB found at {db_path} but contains no tables.")
             _COMPANION_MAPPINGS = {}
             _COMPANION_MAPPINGS_LOADED_AT = time.time()
-            _COMPANION_MAPPINGS_SOURCE = db_path
-            _COMPANION_MAPPINGS_TABLE = ""
+            _COMPANION_MAPPINGS_SOURCE = f"{db_path}:{table_name_for_source}"
             return
 
         # Quote the table name to safely handle names with special characters.
@@ -732,37 +611,8 @@ def _load_companion_mappings_sync() -> None:
                     return r[k]
             return default
 
-        brand = str(
-            get_col(
-                "brand",
-                "rebranding",
-                "company",
-                "brand_id",
-                "Brand",
-                default="",
-           )
-            or ""
-       ).strip()
-
-        # Core brand behavior:
-        # - Wix sends rebrandingKey="" (or NULL) when there is NO white label.
-        # - An empty/NULL brand is therefore treated as the core brand: "Elaralo".
-        if not brand:
-            brand = "Elaralo"
-
-        avatar = str(
-            get_col(
-                "avatar",
-                "companion",
-                "Companion",
-                "companion_name",
-                "companionName",
-                "first_name",
-                "firstname",
-                default="",
-           )
-            or ""
-       ).strip()
+        brand = str(get_col("brand", "rebranding", "company", "brand_id", "Brand", default="") or "").strip()
+        avatar = str(get_col("avatar", "companion", "Companion", "first_name", "firstname", default="") or "").strip()
         if not brand or not avatar:
             continue
 
@@ -772,11 +622,17 @@ def _load_companion_mappings_sync() -> None:
             "brand": brand,
             "avatar": avatar,
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
-            "phonetic": str(get_col("phonetic", "Phonetic", default="") or "").strip(),
             # UI uses channel_cap to decide whether to show the video/play controls.
-            "channel_cap": str(get_col("channel_cap", "channelCap", "chanel_cap", "channel_capability", default="") or "").strip(),
+            # Many DBs also have a legacy "communication" column; prefer channel_cap when present.
+            "communication": str(
+                (
+                    get_col("channel_cap", "channelCap", "channel_capability", default="")
+                    or get_col("communication", "Communication", default="")
+                    or ""
+                )
+            ),
             "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
-            "live": str(get_col("live", "Live", default="") or "").strip(),
+            "live": str(get_col("live", "Live", default="") or ""),
             "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
             "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
             "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
@@ -796,13 +652,14 @@ def _load_companion_mappings_sync() -> None:
 
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
-    # Strict: exact (brand, avatar) match required (case-insensitive via _norm_key).
-    # Core brand: empty brand is treated as Elaralo.
     b = _norm_key(brand) or "elaralo"
     a = _norm_key(avatar)
     if not a:
         return None
 
+    # Brand is authoritative: when a rebrandingKey supplies brand (e.g. "DulceMoon"),
+    # we must NOT fall back to the default brand ("Elaralo").
+    # Avatar is also authoritative; do not attempt to split or normalize composite keys.
     return _COMPANION_MAPPINGS.get((b, a))
 
 
@@ -819,23 +676,17 @@ async def _startup_load_companion_mappings() -> None:
 async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
     """Lookup a companion mapping row by (brand, avatar).
 
-    This endpoint is intentionally STRICT:
-      - exact (brand, avatar) match required (case-insensitive via lower/strip normalization)
-      - errors out when a mapping is missing, so configuration issues are visible during development
-
     Query params:
       - brand: Brand name (e.g., "Elaralo", "DulceMoon")
       - avatar: Avatar first name (e.g., "Jennifer")
 
-    Response (200):
+    Response:
       {
-        found: true,
+        found: bool,
         brand: str,
         avatar: str,
-        companionType: "Human"|"AI",
-        channel_cap: "Video"|"Audio" ,
-        channelCap: "Video"|"Audio" ,   # alias for convenience
-        live: "D-ID"|"Stream" ,
+        communication: "Audio"|"Video"|"" ,
+        live: "D-ID"|"Stream"|"" ,
         elevenVoiceId: str,
         elevenVoiceName: str,
         didAgentId: str,
@@ -846,91 +697,41 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         source: <db path> | ""
       }
     """
-    b_in = (brand or "").strip()
+    b = (brand or "").strip()
     a = (avatar or "").strip()
-
-    if not a:
-        raise HTTPException(status_code=400, detail="avatar is required")
-
-    # Core brand default: empty brand => Elaralo
-    b = b_in or "Elaralo"
 
     m = _lookup_companion_mapping(b, a)
     if not m:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": "Companion mapping not found",
-                "brand": b,
-                "avatar": a,
-                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-                "source": _COMPANION_MAPPINGS_SOURCE,
-                "table": _COMPANION_MAPPINGS_TABLE,
-                "count": len(_COMPANION_MAPPINGS),
-            },
-        )
-
-    cap_raw = str(m.get("channel_cap") or "").strip()
-    live_raw = str(m.get("live") or "").strip()
-    ctype_raw = str(m.get("companion_type") or "").strip()
-
-    # Strict validation (config contract)
-    cap_lc = cap_raw.lower()
-    if cap_lc not in ("video", "audio"):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
-        )
-
-    live_lc = live_raw.lower()
-    if live_lc not in ("stream", "d-id"):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
-        )
-
-    ctype_lc = ctype_raw.lower()
-    if ctype_lc not in ("human", "ai"):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
-        )
-
-    # Business rule: AI companions must use D-ID. Human companions must use Stream.
-    if ctype_lc == "human" and live_lc != "stream":
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
-        )
-    if ctype_lc == "ai" and live_lc != "d-id":
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
-        )
-
-    cap_out = "Video" if cap_lc == "video" else "Audio"
-    live_out = "Stream" if live_lc == "stream" else "D-ID"
-    ctype_out = "Human" if ctype_lc == "human" else "AI"
+        return {
+            "found": False,
+            "brand": b,
+            "avatar": a,
+            "communication": "",
+            "live": "",
+            "elevenVoiceId": "",
+            "elevenVoiceName": "",
+            "didAgentId": "",
+            "didClientKey": "",
+            "didAgentLink": "",
+            "didEmbedCode": "",
+            "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+            "source": _COMPANION_MAPPINGS_SOURCE,
+        }
 
     return {
         "found": True,
-        "brand": str(m.get("brand") or b),
-        "avatar": str(m.get("avatar") or a),
-        "companionType": ctype_out,
-        "companion_type": ctype_out,
-        "channel_cap": cap_out,
-        "channelCap": cap_out,
-        "live": live_out,
+        "brand": str(m.get("brand") or ""),
+        "avatar": str(m.get("avatar") or ""),
+        "communication": str(m.get("communication") or ""),
+        "live": str(m.get("live") or ""),
         "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
         "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
-        "phonetic": str(m.get("phonetic") or ""),
         "didAgentId": str(m.get("did_agent_id") or ""),
         "didClientKey": str(m.get("did_client_key") or ""),
         "didAgentLink": str(m.get("did_agent_link") or ""),
         "didEmbedCode": str(m.get("did_embed_code") or ""),
         "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
         "source": _COMPANION_MAPPINGS_SOURCE,
-        "table": _COMPANION_MAPPINGS_TABLE,
     }
 
 
@@ -947,714 +748,71 @@ _BEE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
 _LIVECHAT_LOCK = threading.Lock()
 # _LIVECHAT_CLIENTS[event_ref] = set(WebSocket)
 _LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
-# Per-connection identity metadata, keyed by websocket instance.
-# Used so the server can attach senderRole/name to each broadcast.
-_LIVECHAT_CLIENT_META: Dict[WebSocket, Dict[str, str]] = {}
-# Simple in-memory message history per event_ref so late-joiners see recent chat.
-_LIVECHAT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-_LIVECHAT_HISTORY_MAX = 200
 
 
-def _normalize_livechat_role(role: str) -> str:
-    r = (role or "").strip().lower()
-    if r in ("host", "viewer", "system"):
-        return r
-    return "viewer"
+def _session_key(brand: str, avatar: str) -> str:
+    return f"{(brand or '').strip().lower()}|{(avatar or '').strip().lower()}"
 
 
-def _livechat_push_history(event_ref: str, msg: Dict[str, Any]) -> None:
-    # Append a chat message to in-memory history (bounded).
+def _get_session_state(brand: str, avatar: str) -> Dict[str, Any]:
+    key = _session_key(brand, avatar)
+    with _BEE_SESSION_LOCK:
+        return dict(_BEE_SESSION_STATE.get(key, {}))
+
+
+def _is_session_active(brand: str, avatar: str) -> bool:
+    st = _get_session_state(brand, avatar)
+    return bool(st.get("active"))
+
+
+def _set_session_active(brand: str, avatar: str, *, active: bool, event_ref: Optional[str] = None) -> None:
+    key = _session_key(brand, avatar)
+    with _BEE_SESSION_LOCK:
+        st = _BEE_SESSION_STATE.get(key, {})
+        st["active"] = bool(active)
+        if event_ref:
+            st["event_ref"] = str(event_ref)
+        st["updated_at"] = time.time()
+        _BEE_SESSION_STATE[key] = st
+
+
+async def _livechat_broadcast(event_ref: str, payload: Dict[str, Any]) -> None:
     event_ref = (event_ref or "").strip()
     if not event_ref:
         return
-    with _LIVECHAT_LOCK:
-        hist = _LIVECHAT_HISTORY.get(event_ref)
-        if hist is None:
-            hist = []
-            _LIVECHAT_HISTORY[event_ref] = hist
-        hist.append(msg)
-        if len(hist) > _LIVECHAT_HISTORY_MAX:
-            # Keep the most recent N messages
-            del hist[: len(hist) - _LIVECHAT_HISTORY_MAX]
-
-
-
-# ---------------------------------------------------------------------------
-# BeeStreamed Shared Live Chat (multi-worker safe)
-# ---------------------------------------------------------------------------
-# IMPORTANT:
-# - With multiple API workers, in-memory websocket hubs cannot mirror messages across workers.
-# - To preserve UX, we use SQLite (same DB file as companion_mappings) as a lightweight relay bus.
-# - We DO NOT retain full transcripts long-term:
-#     * messages are deleted when the host ends the session
-#     * and a TTL cleanup runs as a failsafe
-# - We DO retain minimal session metadata + participant (username <-> memberId) mapping.
-
-_LIVECHAT_DB_INIT_LOCK = threading.Lock()
-_LIVECHAT_DB_INITIALIZED = False
-
-_LIVECHAT_DB_MESSAGES_TABLE = "beestreamed_livechat_messages"
-_LIVECHAT_DB_PARTICIPANTS_TABLE = "beestreamed_livechat_participants"
-_LIVECHAT_DB_SESSIONS_TABLE = "beestreamed_livechat_sessions"
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        v = int(str(os.getenv(name, "") or "").strip() or default)
-        return v
-    except Exception:
-        return default
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        v = float(str(os.getenv(name, "") or "").strip() or default)
-        return v
-    except Exception:
-        return default
-
-# How many recent live-chat rows to send to a newly connected client.
-_LIVECHAT_DB_HISTORY_LIMIT = _env_int("LIVECHAT_DB_HISTORY_LIMIT", 200)
-# Poll interval (seconds) used by each worker to mirror DB rows to its locally-connected sockets.
-_LIVECHAT_DB_POLL_INTERVAL = _env_float("LIVECHAT_DB_POLL_INTERVAL", 0.5)
-# Failsafe TTL (seconds) to prevent orphaned rows from persisting indefinitely if stop never happens.
-_LIVECHAT_DB_TTL_SECONDS = _env_int("LIVECHAT_DB_TTL_SECONDS", 6 * 3600)
-
-# Per-worker polling tasks and cursors (each worker broadcasts to its own local websockets).
-_LIVECHAT_DB_POLL_TASKS: Dict[str, "asyncio.Task[None]"] = {}
-_LIVECHAT_DB_LAST_ID: Dict[str, int] = {}
-
-def _livechat_db_path(for_write: bool = True) -> str:
-    # Reuse the same DB path resolution logic as session_active/event_ref.
-    try:
-        return _get_companion_mappings_db_path(for_write=for_write)  # type: ignore[name-defined]
-    except Exception:
-        # Fallback: rely on the mapping source if available.
-        return str(_COMPANION_MAPPINGS_SOURCE or "").strip()
-
-def _sqlite_connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("PRAGMA busy_timeout=5000")
-    except Exception:
-        pass
-    return conn
-
-def _livechat_db_init_sync() -> None:
-    global _LIVECHAT_DB_INITIALIZED
-    with _LIVECHAT_DB_INIT_LOCK:
-        if _LIVECHAT_DB_INITIALIZED:
-            return
-
-        db_path = _livechat_db_path(for_write=True)
-        if not db_path or not os.path.exists(db_path):
-            # Mark initialized to avoid repeated attempts; relay will operate in-memory only.
-            _LIVECHAT_DB_INITIALIZED = True
-            return
-
-        conn: Optional[sqlite3.Connection] = None
-        try:
-            conn = _sqlite_connect(db_path)
-            cur = conn.cursor()
-
-            # Improve concurrency for multi-worker reads while a single worker writes.
-            try:
-                cur.execute("PRAGMA journal_mode=WAL")
-            except Exception:
-                pass
-            try:
-                cur.execute("PRAGMA synchronous=NORMAL")
-            except Exception:
-                pass
-
-            # Messages are relay-only (deleted at end of session).
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {_LIVECHAT_DB_MESSAGES_TABLE} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_ref TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    client_msg_id TEXT,
-                    sender_id TEXT,
-                    sender_role TEXT,
-                    name TEXT,
-                    text TEXT,
-                    ts REAL,
-                    payload_json TEXT NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{_LIVECHAT_DB_MESSAGES_TABLE}_event_id ON {_LIVECHAT_DB_MESSAGES_TABLE}(event_ref, id)"
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{_LIVECHAT_DB_MESSAGES_TABLE}_created ON {_LIVECHAT_DB_MESSAGES_TABLE}(created_at)"
-            )
-            cur.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{_LIVECHAT_DB_MESSAGES_TABLE}_event_clientmsg ON {_LIVECHAT_DB_MESSAGES_TABLE}(event_ref, client_msg_id)"
-            )
-
-            # Participants: lightweight mapping of username<->memberId for the session.
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {_LIVECHAT_DB_PARTICIPANTS_TABLE} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_ref TEXT NOT NULL,
-                    member_id TEXT NOT NULL,
-                    role TEXT,
-                    username TEXT,
-                    first_seen_at REAL,
-                    last_seen_at REAL
-                )
-                """
-            )
-            cur.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{_LIVECHAT_DB_PARTICIPANTS_TABLE}_event_member ON {_LIVECHAT_DB_PARTICIPANTS_TABLE}(event_ref, member_id)"
-            )
-
-            # Session summaries: durable metadata only (no transcript).
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {_LIVECHAT_DB_SESSIONS_TABLE} (
-                    event_ref TEXT PRIMARY KEY,
-                    brand TEXT,
-                    avatar TEXT,
-                    host_member_id TEXT,
-                    started_at REAL,
-                    ended_at REAL,
-                    summary TEXT
-                )
-                """
-            )
-
-            conn.commit()
-        except Exception:
-            try:
-                if conn:
-                    conn.rollback()
-            except Exception:
-                pass
-        finally:
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
-
-        _LIVECHAT_DB_INITIALIZED = True
-
-def _sqlite_retry(op, *, retries: int = 6, base_sleep: float = 0.05):
-    """Retry SQLite ops on transient 'database is locked' errors."""
-    last_err: Optional[Exception] = None
-    for i in range(retries):
-        try:
-            return op()
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            if "database is locked" in msg or "locked" in msg:
-                time.sleep(base_sleep * (i + 1))
-                continue
-            raise
-    if last_err:
-        raise last_err
-    return None
-
-def _livechat_db_upsert_participant_sync(event_ref: str, member_id: str, role: str, username: str) -> None:
-    _livechat_db_init_sync()
-    db_path = _livechat_db_path(for_write=True)
-    if not db_path or not os.path.exists(db_path):
-        return
-
-    ev = (event_ref or "").strip()
-    mid = (member_id or "").strip()
-    if not ev or not mid:
-        return
-
-    r = _normalize_livechat_role(role)
-    nm = (username or "").strip()[:64]
-    now = time.time()
-
-    def _op():
-        conn = _sqlite_connect(db_path)
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                f"INSERT OR IGNORE INTO {_LIVECHAT_DB_PARTICIPANTS_TABLE} (event_ref, member_id, role, username, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (ev, mid, r, nm, now, now),
-            )
-            cur.execute(
-                f"UPDATE {_LIVECHAT_DB_PARTICIPANTS_TABLE} SET role = ?, username = ?, last_seen_at = ? WHERE event_ref = ? AND member_id = ?",
-                (r, nm, now, ev, mid),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    try:
-        _sqlite_retry(_op)
-    except Exception:
-        pass
-
-def _livechat_db_insert_message_sync(event_ref: str, payload: Dict[str, Any]) -> Optional[int]:
-    _livechat_db_init_sync()
-    db_path = _livechat_db_path(for_write=True)
-    if not db_path or not os.path.exists(db_path):
-        return None
-
-    ev = (event_ref or "").strip()
-    if not ev:
-        return None
-
-    # Normalize + fill required fields
-    msg_type = str(payload.get("type") or "chat").strip().lower()
-    if msg_type not in ("chat", "history", "session_ended", "system"):
-        msg_type = "chat"
-
-    text_val = str(payload.get("text") or payload.get("message") or "").strip()
-    # session_ended is an event, may not have text.
-    if msg_type == "chat" and not text_val:
-        return None
-
-    client_msg_id = str(payload.get("clientMsgId") or payload.get("client_msg_id") or "").strip() or str(uuid.uuid4())
-    sender_id = str(payload.get("senderId") or payload.get("memberId") or "").strip()
-    sender_role = _normalize_livechat_role(str(payload.get("senderRole") or payload.get("role") or "viewer"))
-    name = str(payload.get("name") or "").strip()
-    try:
-        ts = float(payload.get("ts")) if payload.get("ts") is not None else time.time()
-    except Exception:
-        ts = time.time()
-
-    out = dict(payload)
-    out.update(
-        {
-            "type": "chat" if msg_type == "chat" else msg_type,
-            "eventRef": ev,
-            "text": text_val,
-            "clientMsgId": client_msg_id,
-            "ts": ts,
-            "senderId": sender_id,
-            "senderRole": sender_role,
-            "name": name,
-        }
-    )
-    payload_json = json.dumps(out, ensure_ascii=False)
-
-    created_at = time.time()
-
-    # Upsert participant mapping when we have a member id
-    if sender_id:
-        try:
-            _livechat_db_upsert_participant_sync(ev, sender_id, sender_role, name)
-        except Exception:
-            pass
-
-    # Failsafe cleanup (TTL) on write path
-    try:
-        _livechat_db_cleanup_ttl_sync()
-    except Exception:
-        pass
-
-    def _op() -> Optional[int]:
-        conn = _sqlite_connect(db_path)
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                f"INSERT OR IGNORE INTO {_LIVECHAT_DB_MESSAGES_TABLE} (event_ref, created_at, client_msg_id, sender_id, sender_role, name, text, ts, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ev, created_at, client_msg_id, sender_id, sender_role, name, text_val, ts, payload_json),
-            )
-            if cur.rowcount == 0:
-                # Duplicate client_msg_id for this event_ref; fetch existing id
-                cur.execute(
-                    f"SELECT id FROM {_LIVECHAT_DB_MESSAGES_TABLE} WHERE event_ref = ? AND client_msg_id = ? LIMIT 1",
-                    (ev, client_msg_id),
-                )
-                row = cur.fetchone()
-                conn.commit()
-                try:
-                    return int(row[0]) if row and row[0] is not None else None
-                except Exception:
-                    return None
-            rowid = cur.lastrowid
-            conn.commit()
-            try:
-                return int(rowid) if rowid is not None else None
-            except Exception:
-                return None
-        finally:
-            conn.close()
-
-    try:
-        return _sqlite_retry(_op)
-    except Exception:
-        return None
-
-def _livechat_db_fetch_recent_sync(event_ref: str, limit: int) -> Tuple[List[Dict[str, Any]], int]:
-    """Return (messages_asc, max_id)."""
-    _livechat_db_init_sync()
-    db_path = _livechat_db_path(for_write=False)
-    if not db_path or not os.path.exists(db_path):
-        return ([], 0)
-
-    ev = (event_ref or "").strip()
-    if not ev:
-        return ([], 0)
-
-    lim = max(0, min(int(limit or 0), 500))
-    conn = _sqlite_connect(db_path)
-    try:
-        cur = conn.cursor()
-        max_id = 0
-        try:
-            cur.execute(f"SELECT MAX(id) FROM {_LIVECHAT_DB_MESSAGES_TABLE} WHERE event_ref = ?", (ev,))
-            row = cur.fetchone()
-            max_id = int(row[0]) if row and row[0] is not None else 0
-        except Exception:
-            max_id = 0
-
-        if lim <= 0:
-            return ([], max_id)
-
-        cur.execute(
-            f"SELECT payload_json FROM {_LIVECHAT_DB_MESSAGES_TABLE} WHERE event_ref = ? ORDER BY id DESC LIMIT ?",
-            (ev, lim),
-        )
-        rows = cur.fetchall() or []
-        msgs: List[Dict[str, Any]] = []
-        for r in rows:
-            try:
-                pj = r[0]
-                d = json.loads(pj) if pj else None
-                if isinstance(d, dict):
-                    msgs.append(d)
-            except Exception:
-                continue
-        msgs.reverse()
-        return (msgs, max_id)
-    finally:
-        conn.close()
-
-def _livechat_db_fetch_after_sync(event_ref: str, after_id: int, limit: int = 200) -> Tuple[List[Dict[str, Any]], int]:
-    """Return (messages_asc, new_max_id)."""
-    _livechat_db_init_sync()
-    db_path = _livechat_db_path(for_write=False)
-    if not db_path or not os.path.exists(db_path):
-        return ([], int(after_id or 0))
-
-    ev = (event_ref or "").strip()
-    if not ev:
-        return ([], int(after_id or 0))
-
-    aft = int(after_id or 0)
-    lim = max(1, min(int(limit or 0), 500))
-    conn = _sqlite_connect(db_path)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT id, payload_json FROM {_LIVECHAT_DB_MESSAGES_TABLE} WHERE event_ref = ? AND id > ? ORDER BY id ASC LIMIT ?",
-            (ev, aft, lim),
-        )
-        rows = cur.fetchall() or []
-        msgs: List[Dict[str, Any]] = []
-        new_max = aft
-        for r in rows:
-            try:
-                rid = int(r[0])
-                pj = r[1]
-                d = json.loads(pj) if pj else None
-                if isinstance(d, dict):
-                    msgs.append(d)
-                    if rid > new_max:
-                        new_max = rid
-            except Exception:
-                continue
-        return (msgs, new_max)
-    finally:
-        conn.close()
-
-def _livechat_db_cleanup_ttl_sync() -> None:
-    """Failsafe: delete old relay rows regardless of session end."""
-    _livechat_db_init_sync()
-    db_path = _livechat_db_path(for_write=True)
-    if not db_path or not os.path.exists(db_path):
-        return
-
-    cutoff = time.time() - float(max(60, _LIVECHAT_DB_TTL_SECONDS))
-    def _op():
-        conn = _sqlite_connect(db_path)
-        try:
-            cur = conn.cursor()
-            cur.execute(f"DELETE FROM {_LIVECHAT_DB_MESSAGES_TABLE} WHERE created_at < ?", (cutoff,))
-            conn.commit()
-        finally:
-            conn.close()
-
-    try:
-        _sqlite_retry(_op)
-    except Exception:
-        pass
-
-def _livechat_db_start_session_sync(event_ref: str, brand: str, avatar: str, host_member_id: str) -> None:
-    """Create or update a durable session row (no transcript)."""
-    _livechat_db_init_sync()
-    db_path = _livechat_db_path(for_write=True)
-    if not db_path or not os.path.exists(db_path):
-        return
-
-    ev = (event_ref or "").strip()
-    if not ev:
-        return
-
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
-    hid = (host_member_id or "").strip()
-    now = time.time()
-
-    def _op():
-        conn = _sqlite_connect(db_path)
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                f"INSERT OR IGNORE INTO {_LIVECHAT_DB_SESSIONS_TABLE} (event_ref, brand, avatar, host_member_id, started_at, ended_at, summary) VALUES (?, ?, ?, ?, ?, NULL, '')",
-                (ev, b, a, hid, now),
-            )
-            # If exists but missing started_at, set it.
-            cur.execute(
-                f"UPDATE {_LIVECHAT_DB_SESSIONS_TABLE} SET brand = COALESCE(NULLIF(brand, ''), ?), avatar = COALESCE(NULLIF(avatar, ''), ?), host_member_id = COALESCE(NULLIF(host_member_id, ''), ?) WHERE event_ref = ?",
-                (b, a, hid, ev),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    try:
-        _sqlite_retry(_op)
-    except Exception:
-        pass
-
-def _livechat_db_finalize_session_sync(event_ref: str, brand: str, avatar: str, host_member_id: str) -> None:
-    """Persist a summary and delete the transcript rows for the session."""
-    _livechat_db_init_sync()
-    db_path = _livechat_db_path(for_write=True)
-    if not db_path or not os.path.exists(db_path):
-        return
-
-    ev = (event_ref or "").strip()
-    if not ev:
-        return
-
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
-    hid = (host_member_id or "").strip()
-    ended_at = time.time()
-
-    def _op():
-        conn = _sqlite_connect(db_path)
-        try:
-            cur = conn.cursor()
-
-            # Participants
-            cur.execute(
-                f"SELECT member_id, role, username FROM {_LIVECHAT_DB_PARTICIPANTS_TABLE} WHERE event_ref = ? ORDER BY last_seen_at ASC",
-                (ev,),
-            )
-            parts = cur.fetchall() or []
-            participants: List[str] = []
-            for r in parts:
-                try:
-                    mid = str(r[0] or '').strip()
-                    role = str(r[1] or '').strip()
-                    uname = str(r[2] or '').strip()
-                    if uname:
-                        participants.append(f"{uname} ({role or 'viewer'})")
-                    elif mid:
-                        participants.append(f"{mid[-4:]} ({role or 'viewer'})")
-                except Exception:
-                    continue
-
-            # Message count (transcript will be deleted)
-            cur.execute(f"SELECT COUNT(1) FROM {_LIVECHAT_DB_MESSAGES_TABLE} WHERE event_ref = ?", (ev,))
-            row = cur.fetchone()
-            msg_count = int(row[0]) if row and row[0] is not None else 0
-
-            # Ensure a session row exists
-            cur.execute(
-                f"INSERT OR IGNORE INTO {_LIVECHAT_DB_SESSIONS_TABLE} (event_ref, brand, avatar, host_member_id, started_at, ended_at, summary) VALUES (?, ?, ?, ?, ?, ?, '')",
-                (ev, b, a, hid, ended_at, ended_at),
-            )
-
-            # Compose a lightweight summary (no transcript content)
-            part_str = ", ".join(participants[:12])
-            summary = f"Live stream ended. Participants: {part_str or 'unknown'}. Messages exchanged: {msg_count}."
-
-            cur.execute(
-                f"UPDATE {_LIVECHAT_DB_SESSIONS_TABLE} SET brand = ?, avatar = ?, host_member_id = ?, ended_at = ?, summary = ? WHERE event_ref = ?",
-                (b, a, hid, ended_at, summary, ev),
-            )
-
-            # Delete transcript rows
-            cur.execute(f"DELETE FROM {_LIVECHAT_DB_MESSAGES_TABLE} WHERE event_ref = ?", (ev,))
-            conn.commit()
-        finally:
-            conn.close()
-
-    try:
-        _sqlite_retry(_op)
-    except Exception:
-        pass
-
-async def _livechat_broadcast(event_ref: str, payload: Dict[str, Any]) -> None:
-    """Broadcast to locally-connected sockets on THIS worker."""
-    ev = (event_ref or "").strip()
-    if not ev:
-        return
 
     with _LIVECHAT_LOCK:
-        clients = list(_LIVECHAT_CLIENTS.get(ev, set()))
+        sockets = list(_LIVECHAT_CLIENTS.get(event_ref, set()))
 
-    if not clients:
+    if not sockets:
         return
 
-    raw = ""
-    try:
-        raw = json.dumps(payload, ensure_ascii=False)
-    except Exception:
-        try:
-            raw = json.dumps({"type": "chat", "eventRef": ev, "text": str(payload)}, ensure_ascii=False)
-        except Exception:
-            return
-
+    msg = json.dumps(payload, ensure_ascii=False)
     dead: List[WebSocket] = []
-    for ws in clients:
+    for ws in sockets:
         try:
-            await ws.send_text(raw)
+            await ws.send_text(msg)
         except Exception:
             dead.append(ws)
 
     if dead:
         with _LIVECHAT_LOCK:
-            s = _LIVECHAT_CLIENTS.get(ev, set())
-            for d in dead:
+            s = _LIVECHAT_CLIENTS.get(event_ref, set())
+            for ws in dead:
                 try:
-                    s.discard(d)
+                    s.discard(ws)
                 except Exception:
                     pass
-                _LIVECHAT_CLIENT_META.pop(d, None)
             if not s:
-                _LIVECHAT_CLIENTS.pop(ev, None)
-                _LIVECHAT_HISTORY.pop(ev, None)
-
-async def _ensure_livechat_poller(event_ref: str, *, start_cursor: Optional[int] = None) -> None:
-    ev = (event_ref or "").strip()
-    if not ev:
-        return
-
-    with _LIVECHAT_LOCK:
-        existing = _LIVECHAT_DB_POLL_TASKS.get(ev)
-        if existing and not existing.done():
-            if start_cursor is not None:
-                _LIVECHAT_DB_LAST_ID[ev] = max(int(_LIVECHAT_DB_LAST_ID.get(ev, 0)), int(start_cursor))
-            return
-
-        if start_cursor is not None:
-            _LIVECHAT_DB_LAST_ID[ev] = int(start_cursor)
-        else:
-            _LIVECHAT_DB_LAST_ID.setdefault(ev, 0)
-
-        try:
-            task = asyncio.create_task(_livechat_db_poller(ev))
-            _LIVECHAT_DB_POLL_TASKS[ev] = task
-        except Exception:
-            pass
-
-async def _livechat_db_poller(event_ref: str) -> None:
-    """Poll DB for new rows and broadcast to locally-connected sockets (multi-worker relay)."""
-    ev = (event_ref or "").strip()
-    if not ev:
-        return
-
-    try:
-        while True:
-            with _LIVECHAT_LOCK:
-                has_clients = bool(_LIVECHAT_CLIENTS.get(ev))
-                last_id = int(_LIVECHAT_DB_LAST_ID.get(ev, 0))
-            if not has_clients:
-                break
-
-            # Fetch new rows from DB without blocking event loop
-            try:
-                msgs, new_max = await run_in_threadpool(_livechat_db_fetch_after_sync, ev, last_id, 200)
-            except Exception:
-                msgs, new_max = ([], last_id)
-
-            if msgs:
-                for m in msgs:
-                    # Only broadcast chat payloads (frontend ignores unknown types anyway)
-                    try:
-                        await _livechat_broadcast(ev, m)
-                    except Exception:
-                        pass
-
-            with _LIVECHAT_LOCK:
-                _LIVECHAT_DB_LAST_ID[ev] = int(max(last_id, new_max))
-
-            await asyncio.sleep(max(0.2, float(_LIVECHAT_DB_POLL_INTERVAL)))
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        pass
-    finally:
-        with _LIVECHAT_LOCK:
-            _LIVECHAT_DB_POLL_TASKS.pop(ev, None)
-            _LIVECHAT_DB_LAST_ID.pop(ev, None)
-
-async def _livechat_maintenance_task() -> None:
-    """Background cleanup task (failsafe TTL)."""
-    while True:
-        try:
-            await run_in_threadpool(_livechat_db_cleanup_ttl_sync)
-        except Exception:
-            pass
-        # run every ~10 minutes
-        await asyncio.sleep(600)
-
-
-async def _livechat_finalize_after_delay(
-    event_ref: str,
-    brand: str,
-    avatar: str,
-    host_member_id: str,
-    delay_seconds: float = 8.0,
-) -> None:
-    """After a short grace period (allows other workers to poll/broadcast), persist a summary and delete transcript rows."""
-    try:
-        await asyncio.sleep(max(0.0, float(delay_seconds)))
-    except Exception:
-        return
-    try:
-        await run_in_threadpool(_livechat_db_finalize_session_sync, event_ref, brand, avatar, host_member_id)
-    except Exception:
-        pass
-
+                _LIVECHAT_CLIENTS.pop(event_ref, None)
 
 
 class LiveChatSendRequest(BaseModel):
     eventRef: str = ""
     clientMsgId: Optional[str] = None
-
-    # Accept either 'role' or 'senderRole' from older/newer clients.
     role: Optional[str] = None
-    senderRole: Optional[str] = None
-
-    # Display name
     name: Optional[str] = None
-
-    # Accept either 'text' or 'message' from older/newer clients.
-    text: Optional[str] = None
-    message: Optional[str] = None
-
-    # Accept either 'memberId' or 'senderId' from older/newer clients.
-    memberId: Optional[str] = None
-    senderId: Optional[str] = None
-
+    message: str = ""
     ts: Optional[float] = None
 
 
@@ -1667,141 +825,36 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
         await websocket.close(code=1008)
         return
 
-    # Capture identity from connection query params.
-    qs = websocket.query_params
-    member_id = (qs.get("memberId") or qs.get("member_id") or qs.get("senderId") or qs.get("sender_id") or "").strip()
-    role = _normalize_livechat_role(qs.get("role") or "")
-    name = (qs.get("name") or "").strip()
-
-    # Register socket + identity
     with _LIVECHAT_LOCK:
         _LIVECHAT_CLIENTS.setdefault(event_ref, set()).add(websocket)
-        _LIVECHAT_CLIENT_META[websocket] = {
-            "eventRef": event_ref,
-            "memberId": member_id,
-            "role": role,
-            "name": name,
-        }
-
-    # Best-effort: persist participant mapping (username <-> memberId) for this session.
-    if member_id:
-        try:
-            await run_in_threadpool(_livechat_db_upsert_participant_sync, event_ref, member_id, role, name)
-        except Exception:
-            pass
-
-    # Fetch recent history from DB (multi-worker safe) and start the DB poller.
-    history: List[Dict[str, Any]] = []
-    max_id: int = 0
-    try:
-        history, max_id = await run_in_threadpool(_livechat_db_fetch_recent_sync, event_ref, _LIVECHAT_DB_HISTORY_LIMIT)
-    except Exception:
-        history, max_id = ([], 0)
-
-    with _LIVECHAT_LOCK:
-        _LIVECHAT_DB_LAST_ID[event_ref] = int(max_id or 0)
-
-    try:
-        await _ensure_livechat_poller(event_ref, start_cursor=int(max_id or 0))
-    except Exception:
-        pass
-
-    # Send recent history to the newly connected client.
-    if history:
-        try:
-            await websocket.send_text(
-                json.dumps(
-                    {"type": "history", "eventRef": event_ref, "messages": history, "ts": time.time()},
-                    ensure_ascii=False,
-                )
-            )
-        except Exception:
-            pass
 
     try:
         while True:
             raw = await websocket.receive_text()
             try:
-                incoming = json.loads(raw)
-                if not isinstance(incoming, dict):
-                    incoming = {"text": str(incoming)}
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    payload = {"message": str(payload)}
             except Exception:
-                incoming = {"text": raw}
+                payload = {"message": raw}
 
-            msg_type = str(incoming.get("type") or "chat").strip().lower()
-
-            # Optional ping/pong
-            if msg_type == "ping":
-                try:
-                    await websocket.send_text(json.dumps({"type": "pong", "ts": time.time()}))
-                except Exception:
-                    pass
-                continue
-
-            # We only broadcast chat messages.
-            if msg_type not in ("chat", "message"):
-                continue
-
-            text_val = incoming.get("text")
-            if text_val is None or str(text_val).strip() == "":
-                text_val = incoming.get("message") or incoming.get("content") or ""
-            text_val = str(text_val).strip()
-            if not text_val:
-                continue
-
-            client_msg_id = str(incoming.get("clientMsgId") or incoming.get("client_msg_id") or "").strip() or str(uuid.uuid4())
-
-            ts_in = incoming.get("ts")
-            try:
-                ts = float(ts_in) if ts_in is not None else time.time()
-            except Exception:
-                ts = time.time()
-
-            out: Dict[str, Any] = {
-                "type": "chat",
-                "eventRef": event_ref,
-                "text": text_val,
-                "clientMsgId": client_msg_id,
-                "ts": ts,
-                "senderId": member_id,
-                "senderRole": role,
-                "name": name,
-            }
-            try:
-                # Persist to DB so other workers can mirror it to their connected clients.
-                await run_in_threadpool(_livechat_db_insert_message_sync, event_ref, out)
-            except Exception:
-                pass
-
-            # Keep a small in-memory buffer for this worker (optional; bounded).
-            _livechat_push_history(event_ref, out)
-            await _livechat_broadcast(event_ref, out)
-
+            payload.setdefault("eventRef", event_ref)
+            payload.setdefault("ts", time.time())
+            await _livechat_broadcast(event_ref, payload)
     except WebSocketDisconnect:
         pass
     except Exception:
         # Keep the server resilient: drop the connection silently.
         pass
     finally:
-        task_to_cancel = None
         with _LIVECHAT_LOCK:
             s = _LIVECHAT_CLIENTS.get(event_ref, set())
             try:
                 s.discard(websocket)
             except Exception:
                 pass
-            _LIVECHAT_CLIENT_META.pop(websocket, None)
             if not s:
                 _LIVECHAT_CLIENTS.pop(event_ref, None)
-                _LIVECHAT_HISTORY.pop(event_ref, None)
-                task_to_cancel = _LIVECHAT_DB_POLL_TASKS.pop(event_ref, None)
-                _LIVECHAT_DB_LAST_ID.pop(event_ref, None)
-
-        if task_to_cancel is not None:
-            try:
-                task_to_cancel.cancel()
-            except Exception:
-                pass
 
 
 @app.post("/stream/beestreamed/livechat/send")
@@ -1810,36 +863,15 @@ async def beestreamed_livechat_send(req: LiveChatSendRequest):
     if not event_ref:
         raise HTTPException(status_code=400, detail="eventRef is required")
 
-    text_val = str((req.text or req.message or "")).strip()
-    if not text_val:
-        return {"ok": True}
-
-    sender_id = str((req.senderId or req.memberId or "")).strip()
-    sender_role = _normalize_livechat_role(req.senderRole or req.role or "viewer")
-    name = str((req.name or "")).strip()
-
-    try:
-        ts = float(req.ts) if req.ts is not None else time.time()
-    except Exception:
-        ts = time.time()
-
     payload: Dict[str, Any] = {
-        "type": "chat",
         "eventRef": event_ref,
         "clientMsgId": (req.clientMsgId or str(uuid.uuid4())),
-        "text": text_val,
-        "ts": ts,
-        "senderId": sender_id,
-        "senderRole": sender_role,
-        "name": name,
+        "role": (req.role or "viewer"),
+        "name": (req.name or ""),
+        "message": (req.message or ""),
+        "ts": (req.ts if req.ts is not None else time.time()),
     }
-    try:
-        # Persist to DB so other workers can mirror it to their connected clients.
-        await run_in_threadpool(_livechat_db_insert_message_sync, event_ref, payload)
-    except Exception:
-        pass
 
-    _livechat_push_history(event_ref, payload)
     await _livechat_broadcast(event_ref, payload)
     return {"ok": True}
 
@@ -2124,95 +1156,71 @@ def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_dom
     except Exception:
         pass
 
-def _beestreamed_start_webrtc_sync(event_ref: str) -> Dict[str, Any]:
+def _beestreamed_start_webrtc_sync(event_ref: str) -> None:
     import requests  # type: ignore
-
-    ref = (event_ref or "").strip()
-    if not ref:
-        return {"ok": False, "error": "event_ref required"}
-
     api_base = _beestreamed_api_base()
     headers = _beestreamed_auth_headers()
 
     try:
-        r = requests.post(f"{api_base}/events/{ref}/startwebrtcstream", headers=headers, timeout=20)
-        return {
-            "ok": (r.status_code // 100 == 2),
-            "status_code": r.status_code,
-            "body": (r.text or ""),
-            "authMode": "basic",
-        }
+        r = requests.post(f"{api_base}/events/{event_ref}/startwebrtcstream", headers=headers, timeout=20)
     except Exception as e:
-        return {"ok": False, "error": str(e), "authMode": "basic"}
+        raise HTTPException(status_code=502, detail=f"BeeStreamed start failed: {e!r}")
+
+    if r.status_code >= 400:
+        msg = (r.text or "").strip()
+        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed start error {r.status_code}: {msg[:500]}")
+
 def _beestreamed_stop_webrtc_sync(event_ref: str) -> Dict[str, Any]:
-    """Stop the BeeStreamed WebRTC stream.
+    """Stop the BeeStreamed WebRTC stream and end the event.
 
-    We authenticate server-side (never expose tokens to the browser).
-    Preferred auth is Basic (STREAM_TOKEN_ID/STREAM_SECRET_KEY).
-    As a defensive fallback, we also attempt legacy query-param auth if Basic fails.
+    BeeStreamed status values are lowercase:
+      - idle, live, video, done, force_live
+
+    In practice, stopping WebRTC does not always transition the event out of a live state,
+    so we best-effort PATCH the event status to "done" after stopping. If "done" is not
+    accepted, we fall back to "idle".
     """
-    import requests  # type: ignore
-
-    ref = (event_ref or "").strip()
-    if not ref:
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
         return {"ok": False, "error": "event_ref required"}
 
     api_base = _beestreamed_api_base()
     headers = _beestreamed_auth_headers()
 
-    # 1) Try Basic auth first
+    import requests  # type: ignore
+
+    # 1) Stop WebRTC stream
     try:
-        r = requests.post(f"{api_base}/events/{ref}/stopwebrtcstream", headers=headers, timeout=20)
-        res: Dict[str, Any] = {
-            "ok": (r.status_code // 100 == 2),
-            "status_code": r.status_code,
-            "body": (r.text or ""),
-            "authMode": "basic",
-        }
+        r = requests.post(f"{api_base}/events/{event_ref}/stopwebrtcstream", headers=headers, timeout=20)
+        res: Dict[str, Any] = {"ok": (r.status_code // 100 == 2), "status_code": r.status_code, "body": r.text}
     except Exception as e:
-        res = {"ok": False, "error": str(e), "authMode": "basic"}
+        return {"ok": False, "error": str(e)}
 
-    # 2) Fallback: query-param auth (only if basic did not succeed)
-    if not res.get("ok"):
-        token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
-        secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
-        if token_id and secret_key:
-            try:
-                url = f"{api_base}/events/{ref}/stopwebrtcstream?tokenid={token_id}&secretkey={secret_key}"
-                r2 = requests.post(url, timeout=20)
-                res = {
-                    "ok": (r2.status_code // 100 == 2),
-                    "status_code": r2.status_code,
-                    "body": (r2.text or ""),
-                    "authMode": "query",
-                }
-            except Exception as e:
-                res = {"ok": False, "error": str(e), "authMode": "query"}
-
-    # 3) Best-effort: attempt to move the event to an Idle state so viewers stop seeing overlays.
+    # 2) Best-effort: mark event done; fallback to idle.
     if res.get("ok"):
-        try:
-            if res.get("authMode") == "query":
-                token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
-                secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
-                patch_url = f"{api_base}/events/{ref}?tokenid={token_id}&secretkey={secret_key}"
-                r3 = requests.patch(patch_url, json={"status": "Idle", "Status": "Idle"}, timeout=20)
-            else:
-                r3 = requests.patch(
-                    f"{api_base}/events/{ref}",
-                    headers=headers,
-                    json={"status": "Idle", "Status": "Idle"},
-                    timeout=20,
-                )
+        patch_url = f"{api_base}/events/{event_ref}"
 
-            res["idle_ok"] = (r3.status_code // 100 == 2)
-            res["idle_status_code"] = r3.status_code
-            res["idle_body"] = (r3.text or "")
+        try:
+            r2 = requests.patch(patch_url, headers=headers, json={"status": "done"}, timeout=20)
+            res["done_ok"] = (r2.status_code // 100 == 2)
+            res["done_status_code"] = r2.status_code
+            res["done_body"] = r2.text
         except Exception as e:
-            res["idle_ok"] = False
-            res["idle_error"] = str(e)
+            res["done_ok"] = False
+            res["done_error"] = str(e)
+
+        if not res.get("done_ok"):
+            try:
+                r3 = requests.patch(patch_url, headers=headers, json={"status": "idle"}, timeout=20)
+                res["idle_ok"] = (r3.status_code // 100 == 2)
+                res["idle_status_code"] = r3.status_code
+                res["idle_body"] = r3.text
+            except Exception as e:
+                res["idle_ok"] = False
+                res["idle_error"] = str(e)
 
     return res
+
 def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str, Any]]) -> str:
     host = ""
     if mapping:
@@ -2290,16 +1298,15 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
 def _read_event_ref_from_db(brand: str, avatar: str) -> str:
     """Read event_ref directly from SQLite.
 
-    Uses the same resolved DB path as session_active so that reads reflect any
-    updates made at runtime (e.g., when /home/site is read-only and we write to
-    the writable /tmp copy).
+    This avoids cross-worker inconsistencies when the API is running with
+    multiple worker processes (each with its own in-memory cache).
     """
     b = (brand or "").strip()
     a = (avatar or "").strip()
     if not b or not a:
         return ""
 
-    db_path = _get_companion_mappings_db_path(for_write=False)
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
     if not db_path or not os.path.exists(db_path):
         return ""
 
@@ -2332,158 +1339,6 @@ def _read_event_ref_from_db(brand: str, avatar: str) -> str:
                 conn.close()
         except Exception:
             pass
-
-
-
-
-def _get_companion_mappings_db_path(for_write: bool = False) -> str:
-    """Return the SQLite path to use for companion_mappings reads/writes.
-
-    In Azure App Service, /home/site is often read-only at runtime. When we need to
-    write (or read what we previously wrote), we use the writable copy under /tmp
-    created by _ensure_writable_db_copy().
-    """
-    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
-    if not db_path:
-        return ""
-    if for_write:
-        try:
-            return _ensure_writable_db_copy(db_path)
-        except Exception:
-            return db_path
-    # For reads, prefer the writable copy *if it already exists*; otherwise fall back
-    # to the source path.
-    try:
-        writable = _ensure_writable_db_copy(db_path)
-        return writable or db_path
-    except Exception:
-        return db_path
-
-
-def _is_session_active(brand: str, avatar: str) -> bool:
-    """Read session_active from SQLite (fallback to False if missing)."""
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
-    if not b or not a:
-        return False
-
-    db_path = _get_companion_mappings_db_path(for_write=False)
-    if not db_path or not os.path.exists(db_path):
-        return False
-
-    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
-    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
-        table_name = "companion_mappings"
-
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-
-        cur.execute(f"PRAGMA table_info({table_name})")
-        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
-        if "session_active" not in cols:
-            return False
-
-        cur.execute(
-            f"SELECT session_active FROM {table_name} "
-            f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
-            (b, a),
-        )
-        row = cur.fetchone()
-        try:
-            return bool(int(row[0])) if row and row[0] is not None else False
-        except Exception:
-            return bool(row[0]) if row else False
-    except Exception:
-        return False
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-
-def _set_session_active(brand: str, avatar: str, active: bool, event_ref: Optional[str] = None) -> bool:
-    """Persist session_active (and optionally event_ref if currently empty) to SQLite.
-
-    Returns True if an UPDATE/INSERT was attempted successfully.
-    """
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
-    if not b or not a:
-        return False
-
-    db_path = _get_companion_mappings_db_path(for_write=True)
-    if not db_path or not os.path.exists(db_path):
-        return False
-
-    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
-    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
-        table_name = "companion_mappings"
-
-    ev = (event_ref or "").strip()
-
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-
-        # Ensure columns exist; if session_active is missing, do nothing (caller already migrated DB).
-        cur.execute(f"PRAGMA table_info({table_name})")
-        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
-        if "session_active" not in cols:
-            return False
-
-        # Update existing row.
-        if ev and ("event_ref" in cols):
-            # Only set event_ref if it's currently NULL/empty, to keep the DB as source of truth.
-            cur.execute(
-                f"UPDATE {table_name} "
-                f"SET session_active = ?, "
-                f"    event_ref = CASE WHEN event_ref IS NULL OR trim(event_ref) = '' THEN ? ELSE event_ref END "
-                f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?)",
-                (1 if active else 0, ev, b, a),
-            )
-        else:
-            cur.execute(
-                f"UPDATE {table_name} "
-                f"SET session_active = ? "
-                f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?)",
-                (1 if active else 0, b, a),
-            )
-
-        if cur.rowcount == 0:
-            # If row doesn't exist, insert minimal keys (other columns nullable).
-            if ev and ("event_ref" in cols):
-                cur.execute(
-                    f"INSERT INTO {table_name} (brand, avatar, session_active, event_ref) VALUES (?, ?, ?, ?)",
-                    (b, a, 1 if active else 0, ev),
-                )
-            else:
-                cur.execute(
-                    f"INSERT INTO {table_name} (brand, avatar, session_active) VALUES (?, ?, ?)",
-                    (b, a, 1 if active else 0),
-                )
-
-        conn.commit()
-        return True
-    except Exception:
-        try:
-            if conn:
-                conn.rollback()
-        except Exception:
-            pass
-        return False
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-
 
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
@@ -2531,24 +1386,6 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
 
     resolved_brand = mapping.get("brand") or req.brand
     resolved_avatar = mapping.get("avatar") or req.avatar
-
-    # Guardrail: BeeStreamed is ONLY for Human companions configured for Stream video.
-    live_lc = str(mapping.get("live") or "").strip().lower()
-    ctype_lc = str(mapping.get("companion_type") or "").strip().lower()
-    cap_lc = str(mapping.get("channel_cap") or "").strip().lower()
-
-    if live_lc != "stream" or ctype_lc != "human" or cap_lc != "video":
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "BeeStreamed is only valid for Human companions with channel_cap=Video and live=Stream",
-                "brand": str(resolved_brand),
-                "avatar": str(resolved_avatar),
-                "companion_type": str(mapping.get("companion_type") or ""),
-                "channel_cap": str(mapping.get("channel_cap") or ""),
-                "live": str(mapping.get("live") or ""),
-            },
-        )
 
     # Host auth: only the configured host can START the stream.
     host_id = (mapping.get("host_member_id") or "").strip()
@@ -2622,13 +1459,6 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
         )
 
     _set_session_active(resolved_brand, resolved_avatar, active=True, event_ref=event_ref)
-
-    # Persist session metadata (no transcript) so we can maintain UX with multiple workers.
-    try:
-        await run_in_threadpool(_livechat_db_start_session_sync, event_ref, resolved_brand, resolved_avatar, host_id)
-    except Exception:
-        pass
-
 
     return {
         "ok": True,
@@ -2828,47 +1658,19 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
 
     _set_session_active(resolved_brand, resolved_avatar, active=False, event_ref=event_ref)
 
-        # Best-effort: notify any connected shared-live-chat clients.
+    # Best-effort: notify any connected shared-live-chat clients.
     try:
-        # 1) Force clients to exit live-chat mode cleanly.
-        end_evt: Dict[str, Any] = {
-            "type": "session_ended",
-            "eventRef": event_ref,
-            "clientMsgId": str(uuid.uuid4()),
-            "ts": time.time(),
-        }
-        try:
-            await run_in_threadpool(_livechat_db_insert_message_sync, event_ref, end_evt)
-        except Exception:
-            pass
-        await _livechat_broadcast(event_ref, end_evt)
-
-        # 2) Also emit a visible system line into the chat history/UI.
-        sys_msg: Dict[str, Any] = {
-            "type": "chat",
-            "eventRef": event_ref,
-            "text": "Host ended the live stream.",
-            "clientMsgId": str(uuid.uuid4()),
-            "ts": time.time(),
-            "senderId": "",
-            "senderRole": "system",
-            "name": "System",
-        }
-        try:
-            await run_in_threadpool(_livechat_db_insert_message_sync, event_ref, sys_msg)
-        except Exception:
-            pass
-
-        _livechat_push_history(event_ref, sys_msg)
-        await _livechat_broadcast(event_ref, sys_msg)
-
-        # 3) After a short grace period, persist a lightweight summary and delete the transcript rows.
-        try:
-            asyncio.create_task(
-                _livechat_finalize_after_delay(event_ref, resolved_brand, resolved_avatar, host_id, delay_seconds=8.0)
-            )
-        except Exception:
-            pass
+        await _livechat_broadcast(
+            event_ref,
+            {
+                "eventRef": event_ref,
+                "clientMsgId": str(uuid.uuid4()),
+                "role": "system",
+                "name": "",
+                "message": "Host ended the live stream.",
+                "ts": time.time(),
+            },
+        )
     except Exception:
         pass
 
@@ -3897,6 +2699,30 @@ async def chat(request: Request):
     #     rebranding_key_raw = ""
     rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
 
+    # If a live stream session is active for this brand/avatar, AI chat must be paused.
+    # This prevents STT/TTS echo during live sessions and matches the frontend UX (messages queued).
+    try:
+        brand_for_mapping = (
+            (session_state.get("rebranding") or "")
+            or (rebranding_parsed.get("rebranding") or "")
+        ).strip() or "Elaralo"
+        companion_key = _normalize_companion_key(_extract_companion_raw(session_state))
+        avatar_first = (companion_key.split("-", 1)[0] if companion_key else "").strip()
+        if brand_for_mapping and avatar_first and _is_session_active(brand_for_mapping, avatar_first):
+            session_state_out = dict(session_state)
+            session_state_out["live_session_active"] = True
+            return {
+                "reply": "AI chat is paused while the Live Stream is active. Your message will be answered after the stream ends.",
+                "audio_url": None,
+                "safe": True,
+                "mode": session_state_out.get("mode"),
+                "session_state": session_state_out,
+            }
+    except Exception:
+        # Never block chat due to a guard failure; fall through to normal behavior.
+        pass
+
+
     # Prefer explicit fields (if provided) and fall back to the parsed RebrandingKey.
     upgrade_link_override = _session_get_str(session_state, "upgrade_link", "upgradeLink") or rebranding_parsed.get("upgrade_link", "")
     pay_go_link_override = _session_get_str(session_state, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
@@ -4505,6 +3331,19 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
     voice_id = ((body.get("voice_id") or body.get("voiceId") or "")).strip()
     text = (body.get("text") or "").strip()
 
+    # Optional: if the caller provides brand/avatar, enforce "no TTS during live stream".
+    # This is a safety net (frontend already suppresses AI TTS during Stream sessions).
+    try:
+        brand = (body.get("brand") or body.get("rebranding") or "").strip()
+        avatar = (body.get("avatar") or body.get("companion") or "").strip()
+        if avatar:
+            avatar = avatar.split("-", 1)[0].strip()
+        if avatar and _is_session_active(brand or "Elaralo", avatar):
+            return {"audio_url": None, "blocked": True, "reason": "live_session_active"}
+    except Exception:
+        pass
+
+
     if not voice_id or not text:
         raise HTTPException(status_code=422, detail="voice_id and text are required")
 
@@ -4745,14 +3584,3 @@ async def journal_append(request: Request):
 # @app.post("/journal/summarize", response_model=None)
 # async def journal_summarize(request: Request):
 #     ...
-
-# ---------------------------------------------------------------------------
-# Live chat maintenance (failsafe TTL cleanup)
-# ---------------------------------------------------------------------------
-@app.on_event("startup")
-async def _startup_livechat_maintenance() -> None:
-    # Fire-and-forget. Do not await; do not block startup.
-    try:
-        asyncio.create_task(_livechat_maintenance_task())
-    except Exception:
-        pass
