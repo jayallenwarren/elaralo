@@ -70,7 +70,7 @@ type Msg = { role: Role; content: string; meta?: any };
 
 type Mode = "friend" | "romantic" | "intimate";
 
-type LiveProvider = "did" | "stream";
+type LiveProvider = "d-id" | "stream";
 type ChannelCap = "audio" | "video" | "";
 
 type CompanionMappingRow = {
@@ -91,6 +91,7 @@ type CompanionMappingRow = {
   didClientKey?: string;
   didAgentId?: string;
   elevenVoiceId?: string;
+  phonetic?: string;      // Phonetic pronunciation for TTS (DB column)
 };
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
@@ -1729,7 +1730,18 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
 
-const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
+const phase1AvatarMedia = useMemo<Phase1AvatarMedia | null>(() => {
+  // DB-driven D-ID config (replaces Phase 1 hardcoding).
+  // For D-ID companions we require: didAgentId + didClientKey + elevenVoiceId.
+  const didAgentId = String((companionMapping as any)?.didAgentId || "").trim();
+  const didClientKey = String((companionMapping as any)?.didClientKey || "").trim();
+  const elevenVoiceId = String((companionMapping as any)?.elevenVoiceId || "").trim();
+
+  if (!didAgentId || !didClientKey || !elevenVoiceId) return null;
+  return { didAgentId, didClientKey, elevenVoiceId };
+}, [companionMapping]);
+
+const phoneticName = useMemo(() => String((companionMapping as any)?.phonetic || "").trim(), [companionMapping]);
 
 const channelCap: ChannelCap = useMemo(() => {
   // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
@@ -1747,11 +1759,11 @@ const liveProvider: LiveProvider = useMemo(() => {
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
   if (liveRaw === "stream") return "stream";
-  if (liveRaw === "d-id") return "did";
+  if (liveRaw === "d-id") return "d-id";
 
   // If channel_cap=Video but live is empty, treat as misconfigured.
   // Default to D-ID to avoid breaking the page, but surface an error.
-  return "did";
+  return "d-id";
 }, [companionMapping]);
 
 
@@ -2153,7 +2165,7 @@ setStreamEventRef(eventRef);
 
 if (!phase1AvatarMedia) {
   setAvatarStatus("error");
-  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
+  setAvatarError("Live Avatar is not enabled for this companion (missing D-ID config in DB mapping).");
   return;
 }
 
@@ -2724,6 +2736,25 @@ const playLocalTtsUrl = useCallback(
     }
   }, []);
 
+
+  // Apply phonetic pronunciation for the companion name in any text we send to TTS.
+  // Display names stay the same in the UI; only the spoken audio uses phonetic.
+  const applyPhoneticToTtsText = useCallback(
+    (text: string) => {
+      const t = String(text || "");
+      const phon = String(phoneticName || "").trim();
+      const display = String(companionName || "").trim();
+      if (!phon || !display) return t;
+
+      const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const esc = escapeRegExp(display);
+
+      // Require non-alphanumeric boundaries so e.g. "Dulce Moon" never matches "DulceMoon".
+      const re = new RegExp(`(^|[^A-Za-z0-9])(${esc})([^A-Za-z0-9]|$)`, "gi");
+      return t.replace(re, (_m, p1, _p2, p3) => `${p1}${phon}${p3}`);
+    },
+    [phoneticName, companionName],
+  );
   const speakLocalTtsReply = useCallback(
     async (replyText: string, voiceId: string, hooks?: SpeakAssistantHooks) => {
       const clean = (replyText || "").trim();
@@ -2740,7 +2771,7 @@ const playLocalTtsUrl = useCallback(
       const controller = new AbortController();
       localTtsAbortRef.current = controller;
 
-      const audioUrl = await getTtsAudioUrl(clean, voiceId, controller.signal);
+      const audioUrl = await getTtsAudioUrl(applyPhoneticToTtsText(clean), voiceId, controller.signal);
       if (controller.signal.aborted || localTtsEpochRef.current != epoch) {
         // Stop/Save/Clear happened while we were generating the audio URL.
         hooks?.onDidNotSpeak?.();
@@ -2759,7 +2790,7 @@ const playLocalTtsUrl = useCallback(
 
       await playLocalTtsUrl(audioUrl, hooks);
     },
-    [getTtsAudioUrl, playLocalTtsUrl]
+    [getTtsAudioUrl, playLocalTtsUrl, applyPhoneticToTtsText]
   );
 
 
@@ -2807,7 +2838,7 @@ const speakAssistantReply = useCallback(
       return;
     }
 
-    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
+    const audioUrl = await getTtsAudioUrl(applyPhoneticToTtsText(clean), phase1AvatarMedia.elevenVoiceId);
     if (!audioUrl) {
       callDidNotSpeak();
       return;
@@ -2917,7 +2948,7 @@ const speakAssistantReply = useCallback(
     const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
     await new Promise((r) => window.setTimeout(r, waitMs));
   },
-  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
+  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar, applyPhoneticToTtsText]
 );
 
   useEffect(() => {
@@ -3114,7 +3145,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   const appendLiveChatMessage = useCallback(
     (payload: any) => {
       if (!payload || typeof payload !== 'object') return;
-      const text = String(payload?.text || '').trim();
+      const text = String(payload?.text || payload?.message || '').trim();
       if (!text) return;
 
       const clientMsgId = String(payload?.clientMsgId || '').trim();
@@ -3123,8 +3154,8 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
         rememberLiveChatId(clientMsgId);
       }
 
-      const senderId = String(payload?.senderId || '').trim();
-      const senderRole = String(payload?.senderRole || '').trim().toLowerCase();
+      const senderId = String(payload?.senderId || payload?.memberId || '').trim();
+      const senderRole = String(payload?.senderRole || payload?.role || '').trim().toLowerCase();
       const nameRaw = String(payload?.name || '').trim();
       const fallbackLabel =
         senderRole === 'host'
@@ -3285,8 +3316,12 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
       const payload = {
         type: 'chat',
         text: clean,
+        message: clean,
         clientMsgId: String(clientMsgId || '').trim(),
         ts: Date.now(),
+        senderId: memberIdForLiveChat,
+        senderRole: role,
+        name,
       } as any;
 
       const ws = liveChatWsRef.current;
@@ -3307,8 +3342,11 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
           body: JSON.stringify({
             eventRef,
             text: clean,
+            message: clean,
             memberId: memberIdForLiveChat,
+            senderId: memberIdForLiveChat,
             role,
+            senderRole: role,
             name,
             clientMsgId: payload.clientMsgId,
             ts: payload.ts,
@@ -4660,7 +4698,7 @@ useEffect(() => {
   // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
   // ------------------------------------------------------------
   const liveAvatarActive =
-    liveProvider === "did" &&
+    liveProvider === "d-id" &&
     (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
 
   // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
