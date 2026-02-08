@@ -455,10 +455,58 @@ _COMPANION_MAPPINGS_LOADED_AT: float | None = None
 _COMPANION_MAPPINGS_SOURCE: str = ""
 _COMPANION_MAPPINGS_TABLE: str = ""
 
+# TTS pronunciation overrides (loaded from companion_mappings.phonetic).
+# We keep display names unchanged in the UI, but substitute phonetic spellings ONLY for TTS generation.
+# Keyed by ElevenLabs voice_id (case-insensitive).
+_TTS_PRONUNCIATION_BY_VOICE_ID: Dict[str, Dict[str, str]] = {}
+_TTS_PRON_RE_BY_VOICE_ID: Dict[str, re.Pattern] = {}
+
+
+
 
 def _norm_key(s: str) -> str:
     return (s or "").strip().lower()
 
+
+
+
+def _apply_phonetic_pronunciation_for_tts(text: str, voice_id: str) -> str:
+    """
+    TTS-only substitution:
+      - UI text stays exactly as generated (display names unchanged)
+      - Audio generation swaps the companion's display name for `phonetic` from SQLite
+
+    This prevents cases like:
+      - "Elara" matching inside "Elaralo"
+      - "Dulce" matching inside "DulceMoon"
+    """
+    t = (text or "")
+    vid = _norm_key(voice_id)
+    if not vid or not t.strip():
+        return text
+
+    info = _TTS_PRONUNCIATION_BY_VOICE_ID.get(vid)
+    if not info:
+        return text
+
+    display = str(info.get("display") or "").strip()
+    phonetic = str(info.get("phonetic") or "").strip()
+    if not display or not phonetic:
+        return text
+
+    # If phonetic is identical (case-insensitive), do nothing.
+    if display.lower() == phonetic.lower():
+        return text
+
+    try:
+        pat = _TTS_PRON_RE_BY_VOICE_ID.get(vid)
+        if pat is None:
+            # Whole-token match only: not preceded/followed by alphanumeric.
+            pat = re.compile(rf"(?<![A-Za-z0-9]){re.escape(display)}(?![A-Za-z0-9])", flags=re.IGNORECASE)
+            _TTS_PRON_RE_BY_VOICE_ID[vid] = pat
+        return pat.sub(phonetic, t)
+    except Exception:
+        return text
 
 def _candidate_mapping_db_paths() -> List[str]:
     base_dir = os.path.dirname(__file__)
@@ -658,7 +706,7 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
 
 
 def _load_companion_mappings_sync() -> None:
-    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
+    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE, _TTS_PRONUNCIATION_BY_VOICE_ID, _TTS_PRON_RE_BY_VOICE_ID
 
     db_path = ""
     for p in _candidate_mapping_db_paths():
@@ -779,6 +827,7 @@ def _load_companion_mappings_sync() -> None:
             "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
             "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
             "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
+            "phonetic": str(get_col("phonetic", "Phonetic", default="") or ""),
             "did_embed_code": str(get_col("did_embed_code", "DID_EMBED_CODE", default="") or ""),
             "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
             "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
@@ -788,6 +837,22 @@ def _load_companion_mappings_sync() -> None:
         }
 
     _COMPANION_MAPPINGS = d
+
+
+    # Build per-voice pronunciation map for TTS (voice_id -> {display, phonetic}).
+    # This is used to swap only the NAME tokens inside TTS text; UI text remains unchanged.
+    pron: Dict[str, Dict[str, str]] = {}
+    for _k, _m in d.items():
+        vid = str(_m.get("eleven_voice_id") or "").strip()
+        disp = str(_m.get("avatar") or "").strip()
+        phon = str(_m.get("phonetic") or "").strip()
+        if vid and disp and phon:
+            pron[_norm_key(vid)] = {"display": disp, "phonetic": phon}
+
+    _TTS_PRONUNCIATION_BY_VOICE_ID = pron
+    # Clear compiled regex cache; it will be lazily rebuilt.
+    _TTS_PRON_RE_BY_VOICE_ID = {}
+
     _COMPANION_MAPPINGS_LOADED_AT = time.time()
     _COMPANION_MAPPINGS_SOURCE = db_path
     _COMPANION_MAPPINGS_TABLE = table_name_for_source
@@ -915,6 +980,7 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "found": True,
         "brand": str(m.get("brand") or b),
         "avatar": str(m.get("avatar") or a),
+        "phonetic": str(m.get("phonetic") or ""),
         "companionType": ctype_out,
         "companion_type": ctype_out,
         "channel_cap": cap_out,
@@ -1640,25 +1706,28 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
         embed_domain=req.embedDomain,
     )
 
-    start_res = _beestreamed_start_webrtc_sync(event_ref)
+    # Start WebRTC (host). BeeStreamed can return 404 for stale event refs; recreate once and retry.
+    try:
+        _beestreamed_start_webrtc_sync(event_ref)
+    except HTTPException as e:
+        if int(getattr(e, "status_code", 0) or 0) == 404:
+            event_ref = _beestreamed_create_event_sync(req.embedDomain)
+            if not event_ref:
+                raise HTTPException(status_code=502, detail="BeeStreamed create_event failed: no eventRef returned")
 
-    # BeeStreamed occasionally returns 404 for a stale event ref. Recreate once and retry.
-    if (not start_res.get("ok")) and (start_res.get("status_code") == 404):
-        event_ref = _beestreamed_create_event_sync(req.embedDomain)
-        embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
-        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
-        _beestreamed_schedule_now_sync(
-            event_ref,
-            title=f"{resolved_brand} {resolved_avatar}",
-            embed_domain=req.embedDomain,
-        )
-        start_res = _beestreamed_start_webrtc_sync(event_ref)
+            embed_url = f"/stream/beestreamed/embed/{event_ref}"
+            _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
 
-    if not start_res.get("ok"):
-        raise HTTPException(
-            status_code=502,
-            detail=f"BeeStreamed start_webrtc failed: {start_res.get('error') or start_res.get('body') or start_res}",
-        )
+            _beestreamed_schedule_now_sync(
+                event_ref,
+                title=f"{resolved_brand} {resolved_avatar}",
+                embed_domain=req.embedDomain,
+            )
+            _beestreamed_start_webrtc_sync(event_ref)
+        else:
+            raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed start_webrtc failed: {e!r}")
 
     _set_session_active(resolved_brand, resolved_avatar, active=True, event_ref=event_ref)
 
@@ -2636,6 +2705,9 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
     if not text:
         raise RuntimeError("TTS text is empty")
 
+    # Apply phonetic name substitution for TTS (UI text remains unchanged).
+    text = _apply_phonetic_pronunciation_for_tts(text=text, voice_id=voice_id)
+
     # Cache path: deterministic blob name, cross-session.
     if _TTS_CACHE_ENABLED:
         cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
@@ -2829,6 +2901,9 @@ def _tts_cache_peek_sync(voice_id: str, text: str) -> Optional[str]:
     t = (text or "").strip()
     if not t:
         return None
+
+    t = _apply_phonetic_pronunciation_for_tts(text=t, voice_id=voice_id)
+
     cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=t)
     try:
         from azure.storage.blob import BlobServiceClient  # type: ignore
