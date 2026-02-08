@@ -1588,15 +1588,16 @@ def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> b
 def _read_event_ref_from_db(brand: str, avatar: str) -> str:
     """Read event_ref directly from SQLite.
 
-    This avoids cross-worker inconsistencies when the API is running with
-    multiple worker processes (each with its own in-memory cache).
+    Uses the same resolved DB path as session_active so that reads reflect any
+    updates made at runtime (e.g., when /home/site is read-only and we write to
+    the writable /tmp copy).
     """
     b = (brand or "").strip()
     a = (avatar or "").strip()
     if not b or not a:
         return ""
 
-    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    db_path = _get_companion_mappings_db_path(for_write=False)
     if not db_path or not os.path.exists(db_path):
         return ""
 
@@ -1629,6 +1630,158 @@ def _read_event_ref_from_db(brand: str, avatar: str) -> str:
                 conn.close()
         except Exception:
             pass
+
+
+
+
+def _get_companion_mappings_db_path(for_write: bool = False) -> str:
+    """Return the SQLite path to use for companion_mappings reads/writes.
+
+    In Azure App Service, /home/site is often read-only at runtime. When we need to
+    write (or read what we previously wrote), we use the writable copy under /tmp
+    created by _ensure_writable_db_copy().
+    """
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    if not db_path:
+        return ""
+    if for_write:
+        try:
+            return _ensure_writable_db_copy(db_path)
+        except Exception:
+            return db_path
+    # For reads, prefer the writable copy *if it already exists*; otherwise fall back
+    # to the source path.
+    try:
+        writable = _ensure_writable_db_copy(db_path)
+        return writable or db_path
+    except Exception:
+        return db_path
+
+
+def _is_session_active(brand: str, avatar: str) -> bool:
+    """Read session_active from SQLite (fallback to False if missing)."""
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return False
+
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    if not db_path or not os.path.exists(db_path):
+        return False
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
+        if "session_active" not in cols:
+            return False
+
+        cur.execute(
+            f"SELECT session_active FROM {table_name} "
+            f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
+            (b, a),
+        )
+        row = cur.fetchone()
+        try:
+            return bool(int(row[0])) if row and row[0] is not None else False
+        except Exception:
+            return bool(row[0]) if row else False
+    except Exception:
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _set_session_active(brand: str, avatar: str, active: bool, event_ref: Optional[str] = None) -> bool:
+    """Persist session_active (and optionally event_ref if currently empty) to SQLite.
+
+    Returns True if an UPDATE/INSERT was attempted successfully.
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return False
+
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    if not db_path or not os.path.exists(db_path):
+        return False
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    ev = (event_ref or "").strip()
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        # Ensure columns exist; if session_active is missing, do nothing (caller already migrated DB).
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
+        if "session_active" not in cols:
+            return False
+
+        # Update existing row.
+        if ev and ("event_ref" in cols):
+            # Only set event_ref if it's currently NULL/empty, to keep the DB as source of truth.
+            cur.execute(
+                f"UPDATE {table_name} "
+                f"SET session_active = ?, "
+                f"    event_ref = CASE WHEN event_ref IS NULL OR trim(event_ref) = '' THEN ? ELSE event_ref END "
+                f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?)",
+                (1 if active else 0, ev, b, a),
+            )
+        else:
+            cur.execute(
+                f"UPDATE {table_name} "
+                f"SET session_active = ? "
+                f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?)",
+                (1 if active else 0, b, a),
+            )
+
+        if cur.rowcount == 0:
+            # If row doesn't exist, insert minimal keys (other columns nullable).
+            if ev and ("event_ref" in cols):
+                cur.execute(
+                    f"INSERT INTO {table_name} (brand, avatar, session_active, event_ref) VALUES (?, ?, ?, ?)",
+                    (b, a, 1 if active else 0, ev),
+                )
+            else:
+                cur.execute(
+                    f"INSERT INTO {table_name} (brand, avatar, session_active) VALUES (?, ?, ?)",
+                    (b, a, 1 if active else 0),
+                )
+
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
 
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
