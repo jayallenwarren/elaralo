@@ -70,7 +70,7 @@ type Msg = { role: Role; content: string; meta?: any };
 
 type Mode = "friend" | "romantic" | "intimate";
 
-type LiveProvider = "d-id" | "stream" | "";
+type LiveProvider = "did" | "stream";
 type ChannelCap = "audio" | "video" | "";
 
 type CompanionMappingRow = {
@@ -78,25 +78,19 @@ type CompanionMappingRow = {
   brand?: string;
   avatar?: string;
 
-  // DB columns (preferred)
-  channel_cap?: string; // "Video" | "Audio"
-  channelCap?: string;  // API alias (optional)
-  live?: string;        // "Stream" | "D-ID"
-
-  // Optional extra metadata
+  // DB columns
   companion_type?: string; // "Human" | "AI"
   companionType?: string;  // API alias (optional)
-  phonetic?: string;       // phonetic pronunciation of the companion name (optional)
 
-  // Provider keys
+  // DB columns
+  channel_cap?: string; // "Video" | "Audio"
+  channelCap?: string;  // API alias (optional)
+  live?: string;        // "Stream" | "D-ID" | ""
+
+  // Provider-specific fields (optional)
   didClientKey?: string;
   didAgentId?: string;
-  didAgentLink?: string;
-  didEmbedCode?: string;
-
   elevenVoiceId?: string;
-  elevenVoiceName?: string;
-
 };
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
@@ -503,12 +497,29 @@ function buildWsUrl(httpBase: string, path: string, query: Record<string, string
   return u.toString();
 }
 
-type DidConfig = {
+type Phase1AvatarMedia = {
   didAgentId: string;
   didClientKey: string;
   elevenVoiceId: string;
 };
 
+const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
+  "Jennifer": {
+    "didAgentId": "v2_agt_n7itFF6f",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "19STyYD15bswVz51nqLf"
+  },
+  "Jason": {
+    "didAgentId": "v2_agt_WpC1hOBQ",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "j0jBf06B5YHDbCWVmlmr"
+  },
+  "Tonya": {
+    "didAgentId": "v2_agt_2lL6f5YY",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "Hybl6rg76ZOcgqZqN5WN"
+  }
+} as any;
 
 const ELEVEN_VOICE_ID_BY_AVATAR: Record<string, string> = {
   "Jennifer": "19STyYD15bswVz51nqLf",
@@ -557,6 +568,17 @@ function getElevenVoiceIdForAvatar(avatarName: string | null | undefined): strin
 
   // Fallback to Elara so audio-only TTS always has a voice.
   return ELEVEN_VOICE_ID_BY_AVATAR["Elara"] || "";
+}
+function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
+  if (!avatarName) return null;
+
+  const direct = PHASE1_AVATAR_MEDIA[avatarName];
+  if (direct) return direct;
+
+  const key = Object.keys(PHASE1_AVATAR_MEDIA).find(
+    (k) => k.toLowerCase() === avatarName.toLowerCase()
+  );
+  return key ? PHASE1_AVATAR_MEDIA[key] : null;
 }
 
 function isDidSessionError(err: any): boolean {
@@ -1311,7 +1333,7 @@ export default function Page() {
   }, [applyTtsGainRouting]);
 
 
-  // Companion identity (drives persona + live avatar mapping)
+  // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
@@ -1479,6 +1501,24 @@ useEffect(() => {
       const brand = String(companyName || "").trim();
       const avatar = String(companionName || "").trim();
 
+      // IMPORTANT (Wix embed):
+      // The page boots with placeholder defaults (brand=Elaralo, avatar=Elara) until Wix posts the MEMBER_PLAN payload.
+      // Avoid calling the backend with placeholders; wait until we have the companionKeyRaw handoff.
+      let embedded = false;
+      try {
+        embedded = typeof window !== "undefined" && !!window.top && window.top !== window.self;
+      } catch (e) {
+        // Cross-origin access to window.top can throw; treat as embedded.
+        embedded = true;
+      }
+
+      const hasCompanionHandoff = Boolean(String(companionKeyRaw || "").trim());
+      if (embedded && !hasCompanionHandoff) {
+        setCompanionMapping(null);
+        setCompanionMappingError("");
+        return;
+      }
+
       // Strict: brand+avatar must be present (core brand defaults to Elaralo when rebrandingKey is empty).
       if (!brand || !avatar) {
         setCompanionMapping(null);
@@ -1556,7 +1596,7 @@ useEffect(() => {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, companyName, companionName]);
+  }, [API_BASE, companyName, companionName, companionKeyRaw]);
 
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
@@ -1662,7 +1702,7 @@ useEffect(() => {
 
 
 // ----------------------------
-// Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
+// Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
 // ----------------------------
 const didSrcObjectRef = useRef<any | null>(null);
 const didAgentMgrRef = useRef<any | null>(null);
@@ -1689,47 +1729,30 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
 
-const didConfig = useMemo<DidConfig | null>(() => {
-  // NOTE: D-ID configuration comes exclusively from the companion_mappings DB.
-  // There is no Phase 1 hard-coded allowlist.
-  const didAgentId = String(companionMapping?.didAgentId || "").trim();
-  const didClientKey = String(companionMapping?.didClientKey || "").trim();
-  const elevenVoiceId = String(companionMapping?.elevenVoiceId || "").trim();
-
-  if (!didAgentId || !didClientKey) return null;
-  if (!elevenVoiceId) return null;
-
-  return { didAgentId, didClientKey, elevenVoiceId };
-}, [companionMapping]);
+const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
-  const capFromDb = String(
-    (companionMapping as any)?.channel_cap ??
-    (companionMapping as any)?.channelCap ??
-    ""
-  )
+  // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
+  const capRaw = String((companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? "")
     .trim()
     .toLowerCase();
 
-  if (capFromDb === "video") return "video";
-  if (capFromDb === "audio") return "audio";
+  if (capRaw === "video") return "video";
+  if (capRaw === "audio") return "audio";
   return "";
 }, [companionMapping]);
-
 
 const liveProvider: LiveProvider = useMemo(() => {
-  // Strict DB-driven mapping:
-  //   live="Stream" (Human companion)  -> BeeStreamed
-  //   live="D-ID"   (AI companion)     -> D-ID Live Avatar
-  //
-  const liveFromDb = String(companionMapping?.live || "").trim().toLowerCase();
-  if (liveFromDb === "stream") return "stream";
-  if (liveFromDb === "d-id") return "d-id";
+  // Strict mapping: DB values are Stream or D-ID.
+  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
-  // Invalid/missing mapping => no provider. (UI will surface companionMappingError.)
-  return "";
+  if (liveRaw === "stream") return "stream";
+  if (liveRaw === "d-id") return "did";
+
+  // If channel_cap=Video but live is empty, treat as misconfigured.
+  // Default to D-ID to avoid breaking the page, but surface an error.
+  return "did";
 }, [companionMapping]);
-
 
 
 // Strict validation: Video companions must have a Live provider (Stream or D-ID).
@@ -1763,7 +1786,7 @@ const liveEnabled = useMemo(() => {
 
   // UI layout
   const conversationHeight = 520;
-  const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (liveProvider === "d-id" && !!didConfig && avatarStatus !== "idle");
+  const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (Boolean(phase1AvatarMedia) && avatarStatus !== "idle");
 
   // Viewer-only: treat any active BeeStreamed embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
@@ -2128,11 +2151,11 @@ setStreamEventRef(eventRef);
   return;
 }
 
-if (!didConfig) {
-      setAvatarStatus("error");
-      setAvatarError("Live Avatar is not configured for this companion in the database.");
-      return;
-    }
+if (!phase1AvatarMedia) {
+  setAvatarStatus("error");
+  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
+  return;
+}
 
   if (
     avatarStatus === "connecting" ||
@@ -2178,9 +2201,9 @@ if (!didConfig) {
     // quickstart snippets. We keep runtime behavior aligned with D-ID docs and
     // cast the options object to `any` to avoid CI type-check failures.
     const mgr = await createAgentManager(
-      didConfig.didAgentId,
+      phase1AvatarMedia.didAgentId,
       {
-      auth: { type: "key", clientKey: didConfig.didClientKey },
+      auth: { type: "key", clientKey: phase1AvatarMedia.didClientKey },
       callbacks: {
         onConnectionStateChange: (state: any) => {
           if (state === "connected") {
@@ -2282,7 +2305,7 @@ if (!didConfig) {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [didConfig, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
+}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -2779,12 +2802,12 @@ const speakAssistantReply = useCallback(
       callDidNotSpeak();
       return;
     }
-    if (!didConfig) {
+    if (!phase1AvatarMedia) {
       callDidNotSpeak();
       return;
     }
 
-    const audioUrl = await getTtsAudioUrl(clean, didConfig.elevenVoiceId);
+    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
     if (!audioUrl) {
       callDidNotSpeak();
       return;
@@ -2894,7 +2917,7 @@ const speakAssistantReply = useCallback(
     const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
     await new Promise((r) => window.setTimeout(r, waitMs));
   },
-  [avatarStatus, didConfig, getTtsAudioUrl, reconnectLiveAvatar]
+  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
 );
 
   useEffect(() => {
@@ -3131,7 +3154,6 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
     // Once a user has joined the in-stream experience, they should remain connected to
     // shared chat until they explicitly press Stop.
     const inStreamUi =
-      Boolean(beestreamedSessionActive) &&
       Boolean(streamEmbedUrl || streamEventRef) &&
       !!eventRef;
 
@@ -3398,6 +3420,23 @@ useEffect(() => {
 //   as soon as the Host hits Play.
 // ---------------------------------------------------------------------------
 useEffect(() => {
+    // IMPORTANT (Wix embed):
+    // Avoid polling BeeStreamed status for placeholder defaults before Wix hands off the companionKey.
+    let embedded = false;
+    try {
+      embedded = typeof window !== "undefined" && !!window.top && window.top !== window.self;
+    } catch (e) {
+      embedded = true;
+    }
+
+    const hasCompanionHandoff = Boolean(String(companionKeyRaw || "").trim());
+    if (embedded && !hasCompanionHandoff) {
+      setBeestreamedHostMemberId("");
+      setBeestreamedSessionActive(false);
+      beestreamedStatusInactivePollsRef.current = 0;
+      return;
+    }
+
     if (!API_BASE || !companyName || !companionName) {
       setBeestreamedHostMemberId("");
       setBeestreamedSessionActive(false);
@@ -3465,7 +3504,7 @@ useEffect(() => {
         window.clearInterval(pollTimer);
       }
     };
-  }, [API_BASE, companyName, companionName]);
+  }, [API_BASE, companyName, companionName, companionKeyRaw]);
 
 // Viewer UX: if a viewer joined before the host activated the session, we initially show a
 // "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
@@ -4318,7 +4357,7 @@ if (streamSessionActive) {
         }
       }
 
-      // Speak the assistant reply (if Live Avatar is connected).
+      // Phase 1: Speak the assistant reply (if Live Avatar is connected).
       // When Live Avatar is active, we delay the assistant's text from appearing until
       // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");
@@ -4371,7 +4410,7 @@ if (streamSessionActive) {
       const voiceId = ((companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey));
 
       const canLiveAvatarSpeak =
-        avatarStatus === "connected" && !!didConfig && !!didAgentMgrRef.current;
+        avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
 
       // Audio-only TTS is only played in hands-free STT mode (mic button enabled),
       // when Live Avatar is NOT speaking.
@@ -4621,7 +4660,7 @@ useEffect(() => {
   // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
   // ------------------------------------------------------------
   const liveAvatarActive =
-    liveProvider === "d-id" &&
+    liveProvider === "did" &&
     (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
 
   // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
@@ -6131,6 +6170,11 @@ const modePillControls = (
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
       <button
         onClick={() => {
+          // iOS: unlock audio playback for TTS on the same user gesture.
+          // (If the user never taps the mic, iOS may block autoplay later.)
+          try { if (isIOS) primeLocalTtsAudio(true); } catch (e) {}
+          try { ensureIphoneAudioContextUnlocked(); } catch (e) {}
+
           // Stream provider: Play = join/start. It must NOT toggle to Pause.
           // Leaving the session is done exclusively via Stop.
           if (liveProvider === "stream") {
