@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
 
 from filelock import FileLock  # type: ignore
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends
 from fastapi.responses import HTMLResponse, Response
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
@@ -43,6 +43,19 @@ STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
 app = FastAPI(title="Elaralo API")
+
+# ----------------------------
+# WIX FORM
+# ----------------------------
+WIX_API_KEY = (os.getenv("WIX_API_KEY", "") or "").strip()
+
+def require_wix_api_key(x_api_key: str | None = Header(default=None, alias="x-api-key")) -> None:
+    if not WIX_API_KEY:
+        # Env var not configured in Azure App Service
+        raise HTTPException(status_code=500, detail="WIX_API_KEY is not configured")
+    if not x_api_key or x_api_key != WIX_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 
 # ----------------------------
 # CORS
@@ -207,6 +220,12 @@ def health():
     remain reliable during partial outages.
     """
     return {"ok": True}
+
+@app.post("/wix-form")
+async def wix_form(payload: dict, _auth: None = Depends(require_wix_api_key)):
+    # process Wix payload
+    return {"ok": True}
+
 
 @app.post("/usage/credit")
 async def usage_credit(request: Request):
