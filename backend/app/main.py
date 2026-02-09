@@ -1761,11 +1761,17 @@ def _beestreamed_start_webrtc_sync(event_ref: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": str(e), "authMode": "basic"}
 def _beestreamed_stop_webrtc_sync(event_ref: str) -> Dict[str, Any]:
-    """Stop the BeeStreamed WebRTC stream.
+    """Stop the BeeStreamed WebRTC stream and fully end the event.
 
-    We authenticate server-side (never expose tokens to the browser).
-    Preferred auth is Basic (STREAM_TOKEN_ID/STREAM_SECRET_KEY).
-    As a defensive fallback, we also attempt legacy query-param auth if Basic fails.
+    IMPORTANT:
+      - The *Stop* action in our UI must end the live stream in BeeStreamed (no manual "End Live").
+      - We do this in two steps:
+          1) POST /events/{event_ref}/stopwebrtcstream
+          2) PATCH /events/{event_ref} with status = "done"
+
+    Auth:
+      - Server-side Basic auth using STREAM_TOKEN_ID / STREAM_SECRET_KEY.
+      - Tokens are never exposed to the browser.
     """
     import requests  # type: ignore
 
@@ -1776,59 +1782,40 @@ def _beestreamed_stop_webrtc_sync(event_ref: str) -> Dict[str, Any]:
     api_base = _beestreamed_api_base()
     headers = _beestreamed_auth_headers()
 
-    # 1) Try Basic auth first
+    # 1) Stop WebRTC stream
     try:
         r = requests.post(f"{api_base}/events/{ref}/stopwebrtcstream", headers=headers, timeout=20)
-        res: Dict[str, Any] = {
-            "ok": (r.status_code // 100 == 2),
-            "status_code": r.status_code,
-            "body": (r.text or ""),
-            "authMode": "basic",
-        }
     except Exception as e:
-        res = {"ok": False, "error": str(e), "authMode": "basic"}
+        return {"ok": False, "error": f"stopwebrtcstream request failed: {e!r}"}
 
-    # 2) Fallback: query-param auth (only if basic did not succeed)
-    if not res.get("ok"):
-        token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
-        secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
-        if token_id and secret_key:
-            try:
-                url = f"{api_base}/events/{ref}/stopwebrtcstream?tokenid={token_id}&secretkey={secret_key}"
-                r2 = requests.post(url, timeout=20)
-                res = {
-                    "ok": (r2.status_code // 100 == 2),
-                    "status_code": r2.status_code,
-                    "body": (r2.text or ""),
-                    "authMode": "query",
-                }
-            except Exception as e:
-                res = {"ok": False, "error": str(e), "authMode": "query"}
+    stop_ok = (r.status_code // 100 == 2)
+    res: Dict[str, Any] = {
+        "stop_ok": stop_ok,
+        "stop_status_code": r.status_code,
+        "stop_body": (r.text or "")[:1200],
+    }
+    if not stop_ok:
+        res["ok"] = False
+        return res
 
-    # 3) Best-effort: attempt to move the event to an Idle state so viewers stop seeing overlays.
-    if res.get("ok"):
-        try:
-            if res.get("authMode") == "query":
-                token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
-                secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
-                patch_url = f"{api_base}/events/{ref}?tokenid={token_id}&secretkey={secret_key}"
-                r3 = requests.patch(patch_url, json={"status": "Idle", "Status": "Idle"}, timeout=20)
-            else:
-                r3 = requests.patch(
-                    f"{api_base}/events/{ref}",
-                    headers=headers,
-                    json={"status": "Idle", "Status": "Idle"},
-                    timeout=20,
-                )
-
-            res["idle_ok"] = (r3.status_code // 100 == 2)
-            res["idle_status_code"] = r3.status_code
-            res["idle_body"] = (r3.text or "")
-        except Exception as e:
-            res["idle_ok"] = False
-            res["idle_error"] = str(e)
-
-    return res
+    # 2) Finalize/End the event (equivalent to BeeStreamed UI "End Live")
+    # NOTE: We use exact "done" (lowercase) and include both `status` and `Status` keys defensively.
+    payload = {"status": "done", "Status": "done"}
+    try:
+        r2 = requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload, timeout=20)
+        end_ok = (r2.status_code // 100 == 2)
+        res.update(
+            {
+                "end_ok": end_ok,
+                "end_status_code": r2.status_code,
+                "end_body": (r2.text or "")[:1200],
+            }
+        )
+        res["ok"] = bool(end_ok)
+        return res
+    except Exception as e:
+        res.update({"end_ok": False, "end_error": f"end-event patch failed: {e!r}", "ok": False})
+        return res
 def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str, Any]]) -> str:
     host = ""
     if mapping:
@@ -2729,7 +2716,11 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
                     minutes_allowed = 0
             else:
                 minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
-            allowed_seconds = (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0)
+            allowed_seconds = max(0.0, (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0))
+
+            # Hard stop: do not allow overage. Clamp used_seconds to allowed_seconds.
+            if used_seconds > allowed_seconds:
+                used_seconds = allowed_seconds
 
             # Persist record
             rec_out = {
@@ -3439,6 +3430,181 @@ def _tts_cache_peek_sync(voice_id: str, text: str) -> Optional[str]:
 
 
 
+
+# ----------------------------
+# FILE UPLOADS (Azure Blob)
+# ----------------------------
+#
+# Requirements:
+# - Uploads are NOT allowed during Shared Live (BeeStreamed) sessions.
+# - The frontend uploads raw bytes (no multipart) to avoid python-multipart dependency.
+# - We return a read-only SAS URL so the sender/receiver can open the attachment.
+# - Container name: "uploads" (override via UPLOADS_CONTAINER env var).
+# - Currently supports image/* uploads (rendered as image previews in the UI).
+# ----------------------------
+
+_UPLOADS_CONTAINER = (os.getenv("UPLOADS_CONTAINER", "uploads") or "uploads").strip() or "uploads"
+_UPLOAD_MAX_BYTES = int(os.getenv("UPLOAD_MAX_BYTES", "10485760") or 10485760)  # 10 MB
+_UPLOAD_SAS_DAYS = int(os.getenv("UPLOAD_SAS_DAYS", "30") or 30)  # SAS validity for attachments
+
+
+def _slugify_segment(s: str, *, default: str = "x") -> str:
+    s = (s or "").strip().lower()
+    if not s:
+        return default
+    # Keep alnum, dash, underscore; collapse whitespace to dashes
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-z0-9\-_]", "", s)
+    s = s.strip("-_")
+    return s[:64] or default
+
+
+def _safe_filename(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return "upload"
+    # Only keep the basename and strip dangerous characters.
+    n = os.path.basename(n)
+    n = re.sub(r"[\r\n\t]+", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    # Avoid extremely long filenames
+    return n[:120] or "upload"
+
+
+def _infer_image_ext(content_type: str, filename: str) -> str:
+    ext = (os.path.splitext(filename)[1] or "").lower()
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        return ".jpg" if ext == ".jpeg" else ext
+
+    ct = (content_type or "").lower().strip()
+    if ct == "image/png":
+        return ".png"
+    if ct in ("image/jpg", "image/jpeg"):
+        return ".jpg"
+    if ct == "image/webp":
+        return ".webp"
+    if ct == "image/gif":
+        return ".gif"
+    # Default
+    return ".png"
+
+
+def _azure_upload_bytes_and_get_sas_url(
+    *, container_name: str, blob_name: str, content_type: str, data: bytes
+) -> str:
+    from azure.storage.blob import BlobServiceClient, ContentSettings  # type: ignore
+    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
+
+    storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    if not storage_conn_str:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+
+    blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+    container_client = blob_service.get_container_client(container_name)
+
+    # Ensure container exists (best-effort).
+    try:
+        container_client.get_container_properties()
+    except Exception:
+        try:
+            container_client.create_container()
+        except Exception:
+            pass
+
+    blob_client = container_client.get_blob_client(blob_name)
+    blob_client.upload_blob(
+        data,
+        overwrite=True,
+        content_settings=ContentSettings(content_type=(content_type or "application/octet-stream")),
+    )
+
+    # Parse AccountName/AccountKey from connection string for SAS
+    parts: Dict[str, str] = {}
+    for seg in storage_conn_str.split(";"):
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            parts[k] = v
+    account_name = parts.get("AccountName") or getattr(blob_service, "account_name", None)
+    account_key = parts.get("AccountKey")
+    if not account_name or not account_key:
+        raise RuntimeError("Could not parse AccountName/AccountKey from AZURE_STORAGE_CONNECTION_STRING")
+
+    expiry = datetime.utcnow() + timedelta(days=max(1, min(_UPLOAD_SAS_DAYS, 365)))
+    sas = generate_blob_sas(
+        account_name=account_name,
+        container_name=container_name,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=expiry,
+    )
+    return f"{blob_client.url}?{sas}"
+
+
+@app.post("/files/upload")
+async def files_upload(request: Request) -> Dict[str, Any]:
+    """Upload an image and return a read-only SAS URL.
+
+    Client contract (no multipart):
+      - Body: raw bytes
+      - Headers:
+          Content-Type: image/*
+          X-Filename: original file name
+          X-Brand: brand (company) name (for gating against session_active)
+          X-Avatar: avatar name (for gating against session_active)
+          X-Member-Id: optional member id (for blob path organization)
+    """
+    filename = _safe_filename(request.headers.get("x-filename") or request.headers.get("X-Filename") or "")
+    brand = (request.headers.get("x-brand") or request.headers.get("X-Brand") or "").strip()
+    avatar = (request.headers.get("x-avatar") or request.headers.get("X-Avatar") or "").strip()
+    member_id = (request.headers.get("x-member-id") or request.headers.get("X-Member-Id") or "").strip()
+    content_type = (request.headers.get("content-type") or "application/octet-stream").strip()
+
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="X-Brand and X-Avatar headers are required")
+
+    # Hard rule: no attachments during shared live streaming.
+    if _is_session_active(brand, avatar):
+        raise HTTPException(status_code=403, detail="Attachments are disabled during shared live streaming")
+
+    # Only images for now (required by UI preview behavior).
+    if not content_type.lower().startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are supported (Content-Type must be image/*)")
+
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload body")
+    if len(data) > int(_UPLOAD_MAX_BYTES):
+        raise HTTPException(status_code=413, detail=f"Upload too large (max {_UPLOAD_MAX_BYTES} bytes)")
+
+    ext = _infer_image_ext(content_type, filename)
+    blob_name = (
+        f"{_slugify_segment(brand, default='core')}/"
+        f"{_slugify_segment(avatar, default='companion')}/"
+        f"{_slugify_segment(member_id, default='anon')}/"
+        f"{uuid.uuid4().hex}{ext}"
+    )
+
+    try:
+        url = await run_in_threadpool(
+            _azure_upload_bytes_and_get_sas_url,
+            container_name=_UPLOADS_CONTAINER,
+            blob_name=blob_name,
+            content_type=content_type,
+            data=data,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {type(e).__name__}: {e}")
+
+    return {
+        "ok": True,
+        "url": url,
+        "name": filename,
+        "size": len(data),
+        "contentType": content_type,
+        "container": _UPLOADS_CONTAINER,
+        "blobName": blob_name,
+    }
 
 # ----------------------------
 # CHAT (Optimized: optional audio_url in same response)
