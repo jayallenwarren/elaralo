@@ -68,6 +68,15 @@ type Role = "user" | "assistant";
 // It is never serialized to the backend /chat API.
 type Msg = { role: Role; content: string; meta?: any };
 
+type UploadedAttachment = {
+  url: string;
+  name: string;
+  size: number;
+  contentType: string;
+  container?: string;
+  blobName?: string;
+};
+
 type Mode = "friend" | "romantic" | "intimate";
 
 type LiveProvider = "d-id" | "stream";
@@ -79,10 +88,6 @@ type CompanionMappingRow = {
   avatar?: string;
 
   // DB columns
-  companion_type?: string; // "Human" | "AI"
-  companionType?: string;  // API alias (optional)
-
-  // DB columns
   channel_cap?: string; // "Video" | "Audio"
   channelCap?: string;  // API alias (optional)
   live?: string;        // "Stream" | "D-ID" | ""
@@ -91,7 +96,6 @@ type CompanionMappingRow = {
   didClientKey?: string;
   didAgentId?: string;
   elevenVoiceId?: string;
-  phonetic?: string;      // Phonetic pronunciation for TTS (DB column)
 };
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
@@ -380,15 +384,9 @@ type RebrandingKeyParts = {
 
 function stripRebrandingKeyLabel(part: string): string {
   const s = String(part || "").trim();
-  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon").
-  // IMPORTANT: Do not treat URL schemes like "https:" as a label prefix.
-  const m = s.match(/^([A-Za-z0-9_ ()+-]+)\s*[:=]\s*(.+)$/);
-  if (!m) return s;
-
-  const key = String(m[1] || "").trim().toLowerCase();
-  if (key === "http" || key === "https") return s;
-
-  return String(m[2] || "").trim();
+  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon")
+  const m = s.match(/^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$/);
+  return m ? String(m[1] || "").trim() : s;
 }
 
 function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
@@ -1356,18 +1354,27 @@ export default function Page() {
   const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
 
   const renderMsgContent = useCallback(
-    (m: Msg): React.ReactNode => {
-      // For user messages we keep plain text.
-      if (m.role !== "assistant") return m.content;
+  (m: Msg): React.ReactNode => {
+    const meta: any = (m as any)?.meta || {};
+    const att: any = meta?.attachment || null;
 
-      // For assistant messages, we render PayGo/Upgrade URLs as friendly links.
-      const stripScheme = (u: string) => (u || "").replace(/^https?:/i, "");
+    const attUrl = att?.url ? String(att.url) : "";
+    const attName = att?.name ? String(att.name) : "attachment";
+    const attType = att?.contentType ? String(att.contentType) : "";
 
-      const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
-      const upgradeKey = rebrandingInfo?.upgradeLink ? stripScheme(rebrandingInfo.upgradeLink).toLowerCase() : "";
+    const isImage =
+      Boolean(attUrl) &&
+      ((attType && attType.toLowerCase().startsWith("image/")) ||
+        /\.(png|jpe?g|webp|gif)(\?|#|$)/i.test(attUrl));
 
+    const stripScheme = (u: string) => (u || "").replace(/^https?:/i, "");
+
+    const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
+    const upgradeKey = rebrandingInfo?.upgradeLink ? stripScheme(rebrandingInfo.upgradeLink).toLowerCase() : "";
+
+    const renderTextWithLinks = (text: string, isAssistant: boolean): React.ReactNode => {
       const urlGlobal = /(https?:\/\/[^\s]+|\/\/[^\s]+)/g;
-      const parts = (m.content || "").split(urlGlobal);
+      const parts = (text || "").split(urlGlobal);
 
       return parts.map((part, idx) => {
         if (!part) return null;
@@ -1383,25 +1390,64 @@ export default function Page() {
         const comparable = stripScheme(urlRaw).toLowerCase();
 
         let label = urlRaw;
-        if (paygKey && comparable === paygKey) label = "Pay as you Go";
-        else if (upgradeKey && comparable === upgradeKey) label = "Upgrade";
+        if (isAssistant) {
+          if (paygKey && comparable === paygKey) label = "Pay as you Go";
+          else if (upgradeKey && comparable === upgradeKey) label = "Upgrade";
+        }
 
         const href = urlRaw.startsWith("//") ? `https:${urlRaw}` : urlRaw;
 
         return (
           <React.Fragment key={idx}>
-            <a href={href} target="_blank" rel="noopener noreferrer" className="underline">
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ textDecoration: "underline" }}
+            >
               {label}
             </a>
             {punct}
           </React.Fragment>
         );
       });
-    },
-    [rebrandingInfo]
-  );
+    };
 
-  const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), [rebrandingInfo]);
+    const textNode = renderTextWithLinks(m.content || "", m.role === "assistant");
+
+    const attachmentNode = attUrl ? (
+      <div style={{ marginTop: 6 }}>
+        <a href={attUrl} target="_blank" rel="noopener noreferrer">
+          {isImage ? (
+            <img
+              src={attUrl}
+              alt={attName}
+              style={{
+                maxWidth: 320,
+                maxHeight: 320,
+                borderRadius: 12,
+                border: "1px solid #e5e5e5",
+                display: "block",
+              }}
+            />
+          ) : (
+            <span style={{ textDecoration: "underline" }}>{attName || "Open attachment"}</span>
+          )}
+        </a>
+      </div>
+    ) : null;
+
+    return (
+      <>
+        {textNode}
+        {attachmentNode}
+      </>
+    );
+  },
+  [rebrandingInfo]
+);
+
+const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), [rebrandingInfo]);
   const rebrandingSlug = useMemo(() => normalizeRebrandingSlug(rebrandingName), [rebrandingName]);
 
   // For rebrands, show the rebranding site's plan label when Wix provides it (e.g., "Supreme").
@@ -1430,9 +1476,34 @@ export default function Page() {
 
   useEffect(() => {
     // Keep state in sync with localStorage as the user switches companions/brands.
+    // Fallback to sessionStorage if localStorage is blocked (common in some iframe/privacy modes).
     try {
       if (typeof window === "undefined") return;
-      const stored = String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+
+      let stored = "";
+      try {
+        stored = String((() => {
+          try {
+            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
+            if (v && String(v).trim()) return v;
+          } catch (e) {}
+          try {
+            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
+            if (v2 && String(v2).trim()) return v2;
+          } catch (e) {}
+          return "";
+        })() || "").trim();
+      } catch (e) {
+        stored = "";
+      }
+      if (!stored) {
+        try {
+          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+        } catch (e) {
+          stored = "";
+        }
+      }
+
       setViewerLiveChatName(stored);
     } catch (e) {
       setViewerLiveChatName("");
@@ -1445,7 +1516,29 @@ export default function Page() {
       const current = String(viewerLiveChatName || "").trim();
       if (current) return current;
 
-      const stored = String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+      let stored = "";
+      try {
+        stored = String((() => {
+          try {
+            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
+            if (v && String(v).trim()) return v;
+          } catch (e) {}
+          try {
+            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
+            if (v2 && String(v2).trim()) return v2;
+          } catch (e) {}
+          return "";
+        })() || "").trim();
+      } catch (e) {
+        stored = "";
+      }
+      if (!stored) {
+        try {
+          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+        } catch (e) {
+          stored = "";
+        }
+      }
       if (stored) {
         setViewerLiveChatName(stored);
         return stored;
@@ -1461,7 +1554,19 @@ export default function Page() {
 
       if (!cleaned) return "";
 
-      window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
+      try {
+        try {
+        window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
+      } catch (e) {
+        try {
+          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
+        } catch (e) {}
+      }
+      } catch (e) {
+        try {
+          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
+        } catch (e) {}
+      }
       setViewerLiveChatName(cleaned);
       return cleaned;
     } catch (e) {
@@ -1475,7 +1580,17 @@ export default function Page() {
       if (typeof window === "undefined") return;
       const existing =
         String(viewerLiveChatName || "").trim() ||
-        String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+        String((() => {
+          try {
+            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
+            if (v && String(v).trim()) return v;
+          } catch (e) {}
+          try {
+            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
+            if (v2 && String(v2).trim()) return v2;
+          } catch (e) {}
+          return "";
+        })() || "").trim();
 
       const raw =
         window.prompt("Change your username for the live session:", existing) || "";
@@ -1488,7 +1603,13 @@ export default function Page() {
 
       if (!cleaned) return;
 
-      window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
+      try {
+        window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
+      } catch (e) {
+        try {
+          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
+        } catch (e) {}
+      }
       setViewerLiveChatName(cleaned);
     } catch (e) {
       // ignore
@@ -1507,24 +1628,6 @@ useEffect(() => {
     async function load() {
       const brand = String(companyName || "").trim();
       const avatar = String(companionName || "").trim();
-
-      // IMPORTANT (Wix embed):
-      // The page boots with placeholder defaults (brand=Elaralo, avatar=Elara) until Wix posts the MEMBER_PLAN payload.
-      // Avoid calling the backend with placeholders; wait until we have the companionKeyRaw handoff.
-      let embedded = false;
-      try {
-        embedded = typeof window !== "undefined" && !!window.top && window.top !== window.self;
-      } catch (e) {
-        // Cross-origin access to window.top can throw; treat as embedded.
-        embedded = true;
-      }
-
-      const hasCompanionHandoff = Boolean(String(companionKeyRaw || "").trim());
-      if (embedded && !hasCompanionHandoff) {
-        setCompanionMapping(null);
-        setCompanionMappingError("");
-        return;
-      }
 
       // Strict: brand+avatar must be present (core brand defaults to Elaralo when rebrandingKey is empty).
       if (!brand || !avatar) {
@@ -1550,30 +1653,7 @@ useEffect(() => {
         if (cancelled) return;
 
         if (!res.ok) {
-          const rawDetail = (json as any)?.detail ?? (json as any)?.message ?? "";
-          let detail = "";
-          if (typeof rawDetail === "string") detail = rawDetail.trim();
-          else if (rawDetail && typeof rawDetail === "object") {
-            // Backend may return a structured {detail:{...}} object; format it so it’s human-readable.
-            const err = String((rawDetail as any).error || "").trim();
-            const b = String((rawDetail as any).brand || brand).trim();
-            const a = String((rawDetail as any).avatar || avatar).trim();
-            const src = String((rawDetail as any).source || "").trim();
-            const cnt = (rawDetail as any).count;
-            if (err) {
-              const extra =
-                src || typeof cnt !== "undefined"
-                  ? ` (loaded ${typeof cnt !== "undefined" ? String(cnt) : "?"} rows from ${src || "unknown source"})`
-                  : "";
-              detail = `${err} for brand='${b}' avatar='${a}'${extra}`;
-            } else {
-              try {
-                detail = JSON.stringify(rawDetail);
-              } catch (e) {
-                detail = "[Unserializable error detail]";
-              }
-            }
-          }
+          const detail = String(json?.detail || json?.message || "").trim();
           setCompanionMapping(null);
           setCompanionMappingError(
             detail || `Companion mapping request failed (${res.status} ${res.statusText}).`
@@ -1603,7 +1683,7 @@ useEffect(() => {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, companyName, companionName, companionKeyRaw]);
+  }, [API_BASE, companyName, companionName]);
 
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
@@ -1736,18 +1816,7 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
 
-const phase1AvatarMedia = useMemo<Phase1AvatarMedia | null>(() => {
-  // DB-driven D-ID config (replaces Phase 1 hardcoding).
-  // For D-ID companions we require: didAgentId + didClientKey + elevenVoiceId.
-  const didAgentId = String((companionMapping as any)?.didAgentId || "").trim();
-  const didClientKey = String((companionMapping as any)?.didClientKey || "").trim();
-  const elevenVoiceId = String((companionMapping as any)?.elevenVoiceId || "").trim();
-
-  if (!didAgentId || !didClientKey || !elevenVoiceId) return null;
-  return { didAgentId, didClientKey, elevenVoiceId };
-}, [companionMapping]);
-
-const phoneticName = useMemo(() => String((companionMapping as any)?.phonetic || "").trim(), [companionMapping]);
+const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
   // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
@@ -1761,14 +1830,15 @@ const channelCap: ChannelCap = useMemo(() => {
 }, [companionMapping]);
 
 const liveProvider: LiveProvider = useMemo(() => {
-  // Strict mapping: DB values are Stream or D-ID.
+  // Strict mapping: DB values are Stream, D-ID, or NULL.
+  // NOTE: "did" (no hyphen) is NOT accepted.
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
   if (liveRaw === "stream") return "stream";
   if (liveRaw === "d-id") return "d-id";
 
-  // If channel_cap=Video but live is empty, treat as misconfigured.
-  // Default to D-ID to avoid breaking the page, but surface an error.
+  // If channel_cap=Video but live is empty/invalid, treat as misconfigured.
+  // We default to "d-id" as a safe runtime fallback, but we also surface an error via companionMappingError.
   return "d-id";
 }, [companionMapping]);
 
@@ -1777,10 +1847,9 @@ const liveProvider: LiveProvider = useMemo(() => {
 useEffect(() => {
   if (channelCap === "video") {
     const liveRaw = String(companionMapping?.live || "").trim();
-    const liveLc = liveRaw.toLowerCase();
-    if (liveLc !== "stream" && liveLc !== "d-id") {
+    if (!liveRaw) {
       setCompanionMappingError(
-        `Invalid companion mapping: channel_cap=Video requires live=Stream or live=D-ID for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}' (got '${liveRaw || "NULL"}').`
+        `Invalid companion mapping: channel_cap=Video but live is NULL/empty for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`
       );
     }
   }
@@ -1804,7 +1873,20 @@ const liveEnabled = useMemo(() => {
 
   // UI layout
   const conversationHeight = 520;
-  const showAvatarFrame = (liveProvider === "stream" && !!streamEmbedUrl) || (Boolean(phase1AvatarMedia) && avatarStatus !== "idle");
+  // UI: show the video frame whenever the user is in a Live Video session.
+// For Stream (BeeStreamed): show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
+// so the click is never perceived as a no-op and the viewer can always press Stop to exit waiting.
+const streamUiActive =
+  liveProvider === "stream" &&
+  (avatarStatus === "connecting" ||
+    avatarStatus === "waiting" ||
+    avatarStatus === "connected" ||
+    avatarStatus === "reconnecting" ||
+    Boolean(streamEmbedUrl || streamEventRef));
+
+const showAvatarFrame =
+  (liveProvider === "stream" && streamUiActive) ||
+  (Boolean(phase1AvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
 
   // Viewer-only: treat any active BeeStreamed embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
@@ -2171,7 +2253,7 @@ setStreamEventRef(eventRef);
 
 if (!phase1AvatarMedia) {
   setAvatarStatus("error");
-  setAvatarError("Live Avatar is not enabled for this companion (missing D-ID config in DB mapping).");
+  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
   return;
 }
 
@@ -2742,25 +2824,6 @@ const playLocalTtsUrl = useCallback(
     }
   }, []);
 
-
-  // Apply phonetic pronunciation for the companion name in any text we send to TTS.
-  // Display names stay the same in the UI; only the spoken audio uses phonetic.
-  const applyPhoneticToTtsText = useCallback(
-    (text: string) => {
-      const t = String(text || "");
-      const phon = String(phoneticName || "").trim();
-      const display = String(companionName || "").trim();
-      if (!phon || !display) return t;
-
-      const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const esc = escapeRegExp(display);
-
-      // Require non-alphanumeric boundaries so e.g. "Dulce Moon" never matches "DulceMoon".
-      const re = new RegExp(`(^|[^A-Za-z0-9])(${esc})([^A-Za-z0-9]|$)`, "gi");
-      return t.replace(re, (_m, p1, _p2, p3) => `${p1}${phon}${p3}`);
-    },
-    [phoneticName, companionName],
-  );
   const speakLocalTtsReply = useCallback(
     async (replyText: string, voiceId: string, hooks?: SpeakAssistantHooks) => {
       const clean = (replyText || "").trim();
@@ -2777,7 +2840,7 @@ const playLocalTtsUrl = useCallback(
       const controller = new AbortController();
       localTtsAbortRef.current = controller;
 
-      const audioUrl = await getTtsAudioUrl(applyPhoneticToTtsText(clean), voiceId, controller.signal);
+      const audioUrl = await getTtsAudioUrl(clean, voiceId, controller.signal);
       if (controller.signal.aborted || localTtsEpochRef.current != epoch) {
         // Stop/Save/Clear happened while we were generating the audio URL.
         hooks?.onDidNotSpeak?.();
@@ -2796,7 +2859,7 @@ const playLocalTtsUrl = useCallback(
 
       await playLocalTtsUrl(audioUrl, hooks);
     },
-    [getTtsAudioUrl, playLocalTtsUrl, applyPhoneticToTtsText]
+    [getTtsAudioUrl, playLocalTtsUrl]
   );
 
 
@@ -2844,7 +2907,7 @@ const speakAssistantReply = useCallback(
       return;
     }
 
-    const audioUrl = await getTtsAudioUrl(applyPhoneticToTtsText(clean), phase1AvatarMedia.elevenVoiceId);
+    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
     if (!audioUrl) {
       callDidNotSpeak();
       return;
@@ -2954,7 +3017,7 @@ const speakAssistantReply = useCallback(
     const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
     await new Promise((r) => window.setTimeout(r, waitMs));
   },
-  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar, applyPhoneticToTtsText]
+  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
 );
 
   useEffect(() => {
@@ -2970,6 +3033,12 @@ const speakAssistantReply = useCallback(
 
   const [input, setInput] = useState("");
   const inputElRef = useRef<HTMLInputElement | null>(null);
+  // Attachments (image uploads to Azure Blob via backend)
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const [pendingAttachment, setPendingAttachment] = useState<UploadedAttachment | null>(null);
+  const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
+  const [uploadError, setUploadError] = useState<string>("");
+
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
@@ -3117,7 +3186,12 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   // Once a Viewer joins the live stream session (Play -> iframe open), disable the Play button
   // to prevent duplicate joins. Pressing Stop re-enables Play.
   const viewerHasJoinedStream =
-    liveProvider === "stream" && !streamCanStart && Boolean(streamEmbedUrl || streamEventRef);
+    liveProvider === "stream" &&
+    !streamCanStart &&
+    (avatarStatus === "connected" ||
+      avatarStatus === "waiting" ||
+      avatarStatus === "connecting" ||
+      avatarStatus === "reconnecting");
 
   // ---------------------------------------------------------------------------
   // BeeStreamed shared in-stream live chat (Host + joined Viewers)
@@ -3191,6 +3265,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
     // Once a user has joined the in-stream experience, they should remain connected to
     // shared chat until they explicitly press Stop.
     const inStreamUi =
+      Boolean(beestreamedSessionActive) &&
       Boolean(streamEmbedUrl || streamEventRef) &&
       !!eventRef;
 
@@ -3457,23 +3532,6 @@ useEffect(() => {
 //   as soon as the Host hits Play.
 // ---------------------------------------------------------------------------
 useEffect(() => {
-    // IMPORTANT (Wix embed):
-    // Avoid polling BeeStreamed status for placeholder defaults before Wix hands off the companionKey.
-    let embedded = false;
-    try {
-      embedded = typeof window !== "undefined" && !!window.top && window.top !== window.self;
-    } catch (e) {
-      embedded = true;
-    }
-
-    const hasCompanionHandoff = Boolean(String(companionKeyRaw || "").trim());
-    if (embedded && !hasCompanionHandoff) {
-      setBeestreamedHostMemberId("");
-      setBeestreamedSessionActive(false);
-      beestreamedStatusInactivePollsRef.current = 0;
-      return;
-    }
-
     if (!API_BASE || !companyName || !companionName) {
       setBeestreamedHostMemberId("");
       setBeestreamedSessionActive(false);
@@ -3541,7 +3599,7 @@ useEffect(() => {
         window.clearInterval(pollTimer);
       }
     };
-  }, [API_BASE, companyName, companionName, companionKeyRaw]);
+  }, [API_BASE, companyName, companionName]);
 
 // Viewer UX: if a viewer joined before the host activated the session, we initially show a
 // "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
@@ -3858,8 +3916,9 @@ useEffect(() => {
 
       // When RebrandingKey is present, use ElaraloPlanMap for capability gating
       // (Wix planName may be the rebrand site's plan names like "Supreme").
-      const mappedEntitlementPlan = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
-      const effectivePlan: PlanName = (mappedEntitlementPlan || incomingPlan || "Trial") as PlanName;
+      const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
+      const hasEntitledPlan = Boolean((mappedPlanFromKey || incomingPlan).trim());
+      const effectivePlan: PlanName = hasEntitledPlan ? (mappedPlanFromKey || incomingPlan) : "Trial";
       setPlanName(effectivePlan);
 
       // Display the rebranding site's plan label when provided (e.g., "Supreme"),
@@ -3903,13 +3962,12 @@ useEffect(() => {
 
       // Brand-default starting mode:
       // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
-      // - Fallback: choose the "highest" allowed mode for the current plan (intimate > romantic > friend).
+      // - Fallback: entitled plans default to Intimate, Trial/visitors default to Romantic.
+      const desiredStartMode: Mode =
+        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) || (hasEntitledPlan ? "intimate" : "romantic");
+
       const nextAllowed = allowedModesForPlan(effectivePlan);
       setAllowedModes(nextAllowed);
-
-      const desiredStartMode: Mode =
-        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) ||
-        (nextAllowed.includes("intimate") ? "intimate" : nextAllowed.includes("romantic") ? "romantic" : "friend");
 
       setSessionState((prev) => {
         let nextMode: Mode = prev.mode;
@@ -4084,7 +4142,119 @@ const rebrandingKeyForBackend = hasEntitledPlan
     return (await res.json()) as any;
   }
 
-  // This is the mode that drives the UI highlight:
+  // ---------------------------------------------------------------------
+// Attachments (Azure Blob via backend)
+// - Only image/* uploads are supported (rendered as image previews).
+// - Attachments are DISABLED during Shared Live (BeeStreamed sessionActive).
+// ---------------------------------------------------------------------
+const uploadsDisabled = Boolean(beestreamedSessionActive);
+
+const uploadAttachment = useCallback(
+  async (file: File): Promise<UploadedAttachment> => {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+
+    const brand = String(companyName || "").trim();
+    const avatar = String(companionName || "").trim();
+    const member = String(memberIdForLiveChat || "").trim();
+
+    if (!brand || !avatar) throw new Error("Missing brand/avatar for upload");
+    if (!file) throw new Error("No file selected");
+
+    const filename = String((file as any).name || "upload").trim() || "upload";
+    const contentType =
+      String((file as any).type || "").trim() || "application/octet-stream";
+    // Full file support (Option B): allow any file type.
+
+    const res = await fetch(`${API_BASE}/files/upload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        "X-Filename": filename,
+        "X-Brand": brand,
+        "X-Avatar": avatar,
+        "X-Member-Id": member,
+      },
+      body: file,
+    });
+
+    const rawText = await res.text().catch(() => "");
+    let json: any = null;
+    try {
+      json = rawText ? JSON.parse(rawText) : null;
+    } catch (e) {
+      json = null;
+    }
+
+    if (!res.ok) {
+      const detail = String(json?.detail || rawText || "").trim();
+      throw new Error(detail || `Upload failed (${res.status})`);
+    }
+
+    const url = String(json?.url || "").trim();
+    if (!url) throw new Error("Upload succeeded but no URL was returned");
+
+    return {
+      url,
+      name: String(json?.name || filename || "attachment"),
+      size: Number(json?.size || (file as any).size || 0),
+      contentType: String(json?.contentType || contentType || "application/octet-stream"),
+      container: json?.container,
+      blobName: json?.blobName,
+    };
+  },
+  [API_BASE, companyName, companionName, memberIdForLiveChat]
+);
+
+const openUploadPicker = useCallback(() => {
+  if (uploadsDisabled) {
+    try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
+    return;
+  }
+  if (uploadingAttachment) return;
+  try {
+    uploadInputRef.current?.click();
+  } catch (e) {
+    // ignore
+  }
+}, [uploadsDisabled, uploadingAttachment]);
+
+const onAttachmentSelected = useCallback(
+  async (ev: React.ChangeEvent<HTMLInputElement>) => {
+    const input = ev.target;
+    const file = input?.files && input.files.length ? input.files[0] : null;
+
+    // Allow selecting the same file twice in a row.
+    try { input.value = ""; } catch (e) {}
+
+    if (!file) return;
+
+    if (uploadsDisabled) {
+      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
+      return;
+    }
+
+    setUploadError("");
+    setUploadingAttachment(true);
+
+    try {
+      const uploaded = await uploadAttachment(file);
+      setPendingAttachment(uploaded);
+    } catch (e: any) {
+      setPendingAttachment(null);
+      setUploadError(String(e?.message || "Upload failed"));
+    } finally {
+      setUploadingAttachment(false);
+    }
+  },
+  [uploadsDisabled, uploadAttachment]
+);
+
+const clearPendingAttachment = useCallback(() => {
+  setPendingAttachment(null);
+  setUploadError("");
+}, []);
+
+// This is the mode that drives the UI highlight:
   // - If backend is asking for intimate consent, keep intimate pill highlighted
   const effectiveActiveMode: Mode =
     sessionState.pending_consent === "intimate" ? "intimate" : sessionState.mode;
@@ -4137,11 +4307,23 @@ const filterMessagesForBackend = (msgs: Msg[]): Msg[] => {
   });
 };
 
-  async function send(textOverride?: string, stateOverride?: Partial<SessionState>) {
+  
+async function send(textOverride?: string, stateOverride?: Partial<SessionState>) {
     if (loading) return;
 
+    // Attachments are uploaded ahead of time (pendingAttachment holds the SAS URL).
+    // Allow send() when either text OR an attachment is present.
+    const hasAttachment = Boolean(pendingAttachment);
     const rawText = (textOverride ?? input).trim();
-    if (!rawText) return;
+
+    if (uploadingAttachment) return;
+    if (!rawText && !hasAttachment) return;
+
+    // Hard rule: no attachments during Shared Live streaming.
+    if ((beestreamedSessionActive || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
+      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
+      return;
+    }
 
     // If the user clears messages mid-flight, we "invalidate" any in-progress send()
     // so the assistant reply doesn't append into a cleared chat.
@@ -4187,11 +4369,23 @@ const filterMessagesForBackend = (msgs: Msg[]): Msg[] => {
 
     // Build user message content:
     // If a [mode:*] token was present, we remove it from content (cleaned) to keep chat natural.
-    const outgoingText = detectedMode ? cleaned : rawText;
+    
+const outgoingText = (detectedMode ? cleaned : rawText).trim();
+    // If the user sends an attachment without text, still create a stable message for the backend/UI.
+    const finalUserContent = outgoingText || (hasAttachment ? "Sent an attachment." : "");
+
+    // Build the user message.
 
     // Build the user message. During BeeStreamed live sessions, this may also be
     // broadcast to the shared in-stream chat (without calling /chat).
-    let userMsg: Msg = { role: "user", content: outgoingText };
+    
+let userMsg: Msg = { role: "user", content: finalUserContent };
+    if (pendingAttachment) {
+      userMsg = {
+        ...userMsg,
+        meta: { ...(userMsg as any).meta, attachment: pendingAttachment },
+      };
+    }
     const nextMessages: Msg[] = [...messages, userMsg];
 
 
@@ -4287,6 +4481,7 @@ if (streamSessionActive) {
     // In-session members see their message immediately; no "live session" notice.
     setMessages(nextMessages);
     setInput("");
+    clearPendingAttachment();
     return;
   }
 
@@ -4325,6 +4520,7 @@ if (streamSessionActive) {
 
     setMessages(nextMessages);
     setInput("");
+    clearPendingAttachment();
     setLoading(true);
 
     try {
@@ -5627,7 +5823,10 @@ const speakGreetingIfNeeded = useCallback(
     // Viewer-only (Live Stream): enable Stop to close the embedded player even when mic/STT isn't running.
     // IMPORTANT: This must be synchronous on the user gesture on iOS to avoid breaking future TTS routing.
     // This does NOT affect the underlying stream session because ONLY the host calls stop_embed.
-    if (liveProvider === "stream" && !streamCanStart && (streamEmbedUrl || streamEventRef)) {
+    if (liveProvider === "stream" && !streamCanStart && (joinedStreamRef.current || avatarStatus !== "idle")) {
+      // Viewer stop:
+      // - Always allow leaving the waiting/connected UI, even if the host has not created an eventRef yet.
+      // - This MUST NOT stop the underlying live session (only the host can do that).
       try {
         setStreamEmbedUrl("");
         setStreamEventRef("");
@@ -5810,26 +6009,33 @@ const speakGreetingIfNeeded = useCallback(
 const viewerCanStopStream =
   liveProvider === "stream" &&
   !streamCanStart &&
-  Boolean(streamEmbedUrl || streamEventRef) &&
-  (avatarStatus === "connected" ||
+  // Allow Stop even before an eventRef/embedUrl exists (viewer waiting for host).
+  (Boolean(joinedStreamRef.current) ||
+    avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
-    avatarStatus === "reconnecting");
+    avatarStatus === "reconnecting" ||
+    avatarStatus === "error");
 
 // Host requirement: Stop must end the live session (and send the end-event signal to BeeStreamed).
 const hostCanStopStream =
   liveProvider === "stream" &&
   streamCanStart &&
-  Boolean(streamEmbedUrl || streamEventRef) &&
-  (avatarStatus === "connected" ||
+  (Boolean(streamEmbedUrl || streamEventRef) ||
+    avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
-    avatarStatus === "reconnecting");
+    avatarStatus === "reconnecting" ||
+    avatarStatus === "error");
 
 const hostInStreamUi =
   liveProvider === "stream" &&
   streamCanStart &&
-  Boolean(streamEmbedUrl || streamEventRef);
+  (Boolean(streamEmbedUrl || streamEventRef) ||
+    avatarStatus === "connected" ||
+    avatarStatus === "waiting" ||
+    avatarStatus === "connecting" ||
+    avatarStatus === "reconnecting");
 
 const viewerInStreamUi = viewerHasJoinedStream;
 
@@ -6207,15 +6413,10 @@ const modePillControls = (
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
       <button
         onClick={() => {
-          // iOS: unlock audio playback for TTS on the same user gesture.
-          // (If the user never taps the mic, iOS may block autoplay later.)
-          try { if (isIOS) primeLocalTtsAudio(true); } catch (e) {}
-          try { ensureIphoneAudioContextUnlocked(); } catch (e) {}
-
           // Stream provider: Play = join/start. It must NOT toggle to Pause.
           // Leaving the session is done exclusively via Stop.
           if (liveProvider === "stream") {
-            if (viewerHasJoinedStream || avatarStatus !== "idle") return;
+            if (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) return;
             void startLiveAvatar();
             return;
           }
@@ -6245,7 +6446,7 @@ const modePillControls = (
             })();
           }
         }}
-        disabled={liveProvider === "stream" ? viewerHasJoinedStream || avatarStatus !== "idle" : false}
+        disabled={liveProvider === "stream" ? (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) : false}
         style={{
           padding: "10px 14px",
           borderRadius: 10,
@@ -6253,11 +6454,11 @@ const modePillControls = (
           background: "#fff",
           color: "#111",
           cursor:
-            liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle")
+            liveProvider === "stream" && (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error"))
               ? "not-allowed"
               : "pointer",
           opacity:
-            liveProvider === "stream" && (viewerHasJoinedStream || avatarStatus !== "idle") ? 0.6 : 1,
+            liveProvider === "stream" && (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) ? 0.6 : 1,
           fontWeight: 700,
         }}
         aria-label={
@@ -6509,6 +6710,133 @@ const modePillControls = (
               </>
             ) : null}
 
+            {/* Attachment upload (images only) */}
+            <input
+              ref={uploadInputRef}
+              type="file"
+              accept="*/*"
+              style={{ display: "none" }}
+              onChange={onAttachmentSelected}
+            />
+            <button
+              onClick={openUploadPicker}
+              disabled={
+                loading ||
+                uploadingAttachment ||
+                uploadsDisabled ||
+                hostInStreamUi ||
+                viewerInStreamUi
+              }
+              title={
+                uploadsDisabled || hostInStreamUi || viewerInStreamUi
+                  ? "Attachments are disabled during Shared Live streaming."
+                  : "Attach a file"
+              }
+              className="rounded border border-gray-300 bg-white px-3 py-2 text-sm"
+              style={{ height: 44, minWidth: 44 }}
+              type="button"
+            >
+              {uploadingAttachment ? "⏳" : "📎"}
+            </button>
+
+            {pendingAttachment && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "4px 8px",
+                  border: "1px solid #e5e5e5",
+                  borderRadius: 9999,
+                  background: "#fff",
+                  maxWidth: 320,
+                }}
+                title={pendingAttachment?.name || "attachment"}
+              >
+                <a href={pendingAttachment.url} target="_blank" rel="noopener noreferrer">
+                  {pendingAttachment.contentType?.toLowerCase().startsWith("image/") ? (
+                  <img
+                    src={pendingAttachment.url}
+                    alt={pendingAttachment.name}
+                    style={{
+                      width: 28,
+                      height: 28,
+                      objectFit: "cover",
+                      borderRadius: 6,
+                    }}
+                  />
+                ) : (
+                  <div
+                    style={{
+                      width: 28,
+                      height: 28,
+                      borderRadius: 6,
+                      border: "1px solid #e5e7eb",
+                      background: "#f9fafb",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontSize: 16,
+                      lineHeight: "16px",
+                    }}
+                    title={pendingAttachment.contentType || "file"}
+                  >
+                    📎
+                  </div>
+                )}
+                </a>
+                <a
+                  href={pendingAttachment.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    fontSize: 12,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    maxWidth: 220,
+                    color: "#111827",
+                    textDecoration: "underline",
+                  }}
+                  title={pendingAttachment.url}
+                >
+                  {pendingAttachment.name}
+                </a>
+                <button
+                  onClick={clearPendingAttachment}
+                  type="button"
+                  style={{
+                    width: 22,
+                    height: 22,
+                    borderRadius: 9999,
+                    border: "1px solid #ddd",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    lineHeight: 1,
+                  }}
+                  aria-label="Remove attachment"
+                  title="Remove attachment"
+                >
+                  ×
+                </button>
+              </div>
+            ) : uploadError && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
+              <div
+                style={{
+                  fontSize: 12,
+                  color: "#b91c1c",
+                  maxWidth: 320,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+                title={uploadError}
+              >
+                {uploadError}
+              </div>
+            ) : null}
+
             <input
               ref={inputElRef}
               value={input}
@@ -6530,7 +6858,7 @@ const modePillControls = (
 
             <button
               onClick={() => send()}
-              disabled={loading}
+              disabled={loading || uploadingAttachment}
               style={{
                 padding: "10px 14px",
                 borderRadius: 10,
