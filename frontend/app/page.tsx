@@ -70,18 +70,28 @@ type Msg = { role: Role; content: string; meta?: any };
 
 type Mode = "friend" | "romantic" | "intimate";
 
-type LiveProvider = "did" | "stream";
+type LiveProvider = "d-id" | "stream";
 type ChannelCap = "audio" | "video" | "";
 
 type CompanionMappingRow = {
   found?: boolean;
   brand?: string;
   avatar?: string;
-  communication?: string; // "Audio" | "Video"
-  live?: string; // "D-ID" | "Stream"
+
+  // DB columns
+  companion_type?: string; // "Human" | "AI"
+  companionType?: string;  // API alias (optional)
+
+  // DB columns
+  channel_cap?: string; // "Video" | "Audio"
+  channelCap?: string;  // API alias (optional)
+  live?: string;        // "Stream" | "D-ID" | ""
+
+  // Provider-specific fields (optional)
   didClientKey?: string;
   didAgentId?: string;
   elevenVoiceId?: string;
+  phonetic?: string;      // Phonetic pronunciation for TTS (DB column)
 };
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
@@ -370,9 +380,15 @@ type RebrandingKeyParts = {
 
 function stripRebrandingKeyLabel(part: string): string {
   const s = String(part || "").trim();
-  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon")
-  const m = s.match(/^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$/);
-  return m ? String(m[1] || "").trim() : s;
+  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon").
+  // IMPORTANT: Do not treat URL schemes like "https:" as a label prefix.
+  const m = s.match(/^([A-Za-z0-9_ ()+-]+)\s*[:=]\s*(.+)$/);
+  if (!m) return s;
+
+  const key = String(m[1] || "").trim().toLowerCase();
+  if (key === "http" || key === "https") return s;
+
+  return String(m[2] || "").trim();
 }
 
 function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
@@ -422,22 +438,6 @@ function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
   };
 }
 
-
-
-function modeFromRebrandingKey(rawKey: string, parts: RebrandingKeyParts | null): Mode | null {
-  // Prefer explicit fields, but tolerate format changes by scanning.
-  const candidates: unknown[] = [
-    parts?.elaraloPlanMap,
-    parts?.plan,
-    rawKey,
-  ];
-
-  for (const c of candidates) {
-    const m = modeFromElaraloPlanMap(c);
-    if (m) return m;
-  }
-  return null;
-}
 function normalizeRebrandingSlug(rawBrand: string): string {
   const raw = String(rawBrand || "").trim();
   if (!raw) return "";
@@ -1499,19 +1499,43 @@ export default function Page() {
   // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
   const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
 
-  useEffect(() => {
+  
+  const [companionMappingError, setCompanionMappingError] = useState<string>("");
+useEffect(() => {
     let cancelled = false;
 
     async function load() {
       const brand = String(companyName || "").trim();
       const avatar = String(companionName || "").trim();
+
+      // IMPORTANT (Wix embed):
+      // The page boots with placeholder defaults (brand=Elaralo, avatar=Elara) until Wix posts the MEMBER_PLAN payload.
+      // Avoid calling the backend with placeholders; wait until we have the companionKeyRaw handoff.
+      let embedded = false;
+      try {
+        embedded = typeof window !== "undefined" && !!window.top && window.top !== window.self;
+      } catch (e) {
+        // Cross-origin access to window.top can throw; treat as embedded.
+        embedded = true;
+      }
+
+      const hasCompanionHandoff = Boolean(String(companionKeyRaw || "").trim());
+      if (embedded && !hasCompanionHandoff) {
+        setCompanionMapping(null);
+        setCompanionMappingError("");
+        return;
+      }
+
+      // Strict: brand+avatar must be present (core brand defaults to Elaralo when rebrandingKey is empty).
       if (!brand || !avatar) {
         setCompanionMapping(null);
+        setCompanionMappingError("Missing brand or avatar for companion mapping lookup.");
         return;
       }
 
       if (!API_BASE) {
         setCompanionMapping(null);
+        setCompanionMappingError("API_BASE is not configured; cannot load companion mapping.");
         return;
       }
 
@@ -1520,13 +1544,57 @@ export default function Page() {
           avatar
         )}`;
         const res = await fetch(url, { method: "GET" });
-        const json = (await res.json()) as CompanionMappingRow;
+
+        // Backend is strict and may return 404; surface its error message.
+        const json: any = await res.json().catch(() => ({}));
         if (cancelled) return;
 
-        if (res.ok && (json as any)?.found) setCompanionMapping(json);
-        else setCompanionMapping(null);
-      } catch (e) {
-        if (!cancelled) setCompanionMapping(null);
+        if (!res.ok) {
+          const rawDetail = (json as any)?.detail ?? (json as any)?.message ?? "";
+          let detail = "";
+          if (typeof rawDetail === "string") detail = rawDetail.trim();
+          else if (rawDetail && typeof rawDetail === "object") {
+            // Backend may return a structured {detail:{...}} object; format it so it’s human-readable.
+            const err = String((rawDetail as any).error || "").trim();
+            const b = String((rawDetail as any).brand || brand).trim();
+            const a = String((rawDetail as any).avatar || avatar).trim();
+            const src = String((rawDetail as any).source || "").trim();
+            const cnt = (rawDetail as any).count;
+            if (err) {
+              const extra =
+                src || typeof cnt !== "undefined"
+                  ? ` (loaded ${typeof cnt !== "undefined" ? String(cnt) : "?"} rows from ${src || "unknown source"})`
+                  : "";
+              detail = `${err} for brand='${b}' avatar='${a}'${extra}`;
+            } else {
+              try {
+                detail = JSON.stringify(rawDetail);
+              } catch (e) {
+                detail = "[Unserializable error detail]";
+              }
+            }
+          }
+          setCompanionMapping(null);
+          setCompanionMappingError(
+            detail || `Companion mapping request failed (${res.status} ${res.statusText}).`
+          );
+          return;
+        }
+
+        // Strict: mapping endpoint must return found=true
+        if (!(json as any)?.found) {
+          setCompanionMapping(null);
+          setCompanionMappingError(`Companion mapping not found for brand='${brand}' avatar='${avatar}'.`);
+          return;
+        }
+
+        setCompanionMapping(json as CompanionMappingRow);
+        setCompanionMappingError("");
+      } catch (e: any) {
+        if (!cancelled) {
+          setCompanionMapping(null);
+          setCompanionMappingError(String(e?.message || e || "Failed to load companion mapping."));
+        }
       }
     }
 
@@ -1535,7 +1603,7 @@ export default function Page() {
     return () => {
       cancelled = true;
     };
-  }, [companyName, companionName]);
+  }, [API_BASE, companyName, companionName, companionKeyRaw]);
 
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
@@ -1668,32 +1736,55 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
 
-const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
+const phase1AvatarMedia = useMemo<Phase1AvatarMedia | null>(() => {
+  // DB-driven D-ID config (replaces Phase 1 hardcoding).
+  // For D-ID companions we require: didAgentId + didClientKey + elevenVoiceId.
+  const didAgentId = String((companionMapping as any)?.didAgentId || "").trim();
+  const didClientKey = String((companionMapping as any)?.didClientKey || "").trim();
+  const elevenVoiceId = String((companionMapping as any)?.elevenVoiceId || "").trim();
+
+  if (!didAgentId || !didClientKey || !elevenVoiceId) return null;
+  return { didAgentId, didClientKey, elevenVoiceId };
+}, [companionMapping]);
+
+const phoneticName = useMemo(() => String((companionMapping as any)?.phonetic || "").trim(), [companionMapping]);
 
 const channelCap: ChannelCap = useMemo(() => {
-  const commFromDb = String(companionMapping?.communication || "").trim().toLowerCase();
-  if (commFromDb === "video") return "video";
-  if (commFromDb === "audio") return "audio";
+  // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
+  const capRaw = String((companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? "")
+    .trim()
+    .toLowerCase();
+
+  if (capRaw === "video") return "video";
+  if (capRaw === "audio") return "audio";
   return "";
 }, [companionMapping]);
 
 const liveProvider: LiveProvider = useMemo(() => {
-  // Prefer database mapping when present.
-  const liveFromDb = String(companionMapping?.live || "").trim().toLowerCase();
-	  // Be tolerant of values like "Stream", "Streamed", "BeeStreamed", or custom labels that include
-	  // these keywords (e.g., "Stream (BeeStreamed)").
-	  if (liveFromDb.includes("stream")) return "stream";
-	  if (liveFromDb.includes("d-id") || liveFromDb.includes("did") || liveFromDb.includes("d_id")) return "did";
+  // Strict mapping: DB values are Stream or D-ID.
+  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
-  // Backward compatibility: allow companionKey flags (older Wix payloads / test URLs)
-  const raw = String(companionKeyRaw || companionKey || "").trim();
-  const { flags } = splitCompanionKey(raw);
-  const v = String(flags["live"] || "").trim().toLowerCase();
-  if (v === "stream" || v === "web" || v === "conference" || v === "video") return "stream";
+  if (liveRaw === "stream") return "stream";
+  if (liveRaw === "d-id") return "d-id";
 
-  return "did";
-}, [companionMapping, companionKeyRaw, companionKey]);
+  // If channel_cap=Video but live is empty, treat as misconfigured.
+  // Default to D-ID to avoid breaking the page, but surface an error.
+  return "d-id";
+}, [companionMapping]);
 
+
+// Strict validation: Video companions must have a Live provider (Stream or D-ID).
+useEffect(() => {
+  if (channelCap === "video") {
+    const liveRaw = String(companionMapping?.live || "").trim();
+    const liveLc = liveRaw.toLowerCase();
+    if (liveLc !== "stream" && liveLc !== "d-id") {
+      setCompanionMappingError(
+        `Invalid companion mapping: channel_cap=Video requires live=Stream or live=D-ID for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}' (got '${liveRaw || "NULL"}').`
+      );
+    }
+  }
+}, [channelCap, companionMapping, companyName, companionName]);
 const streamUrl = useMemo(() => {
   const raw = String(companionKeyRaw || "").trim();
   const { flags } = splitCompanionKey(raw);
@@ -1701,28 +1792,13 @@ const streamUrl = useMemo(() => {
 }, [companionKeyRaw]);
 
 const liveEnabled = useMemo(() => {
-  // NOTE: The product requirement for showing the "video" control is driven by the
-  // SQLite "Live" column (values like "D-ID" or "Stream").
-  //
-  // Some rows also have a "communication" column (audio/video). In prior iterations we
-  // treated communication=audio as "no video" and hid the control — but that breaks the
-  // intended behavior for human companions (Live=Stream) and D-ID avatars (Live=D-ID)
-  // that may still be marked communication=audio.
-  //
-  // Therefore: if the mapping explicitly declares Live=Stream or Live=D-ID, we always
-  // enable the control regardless of communication.
+  // Product requirement (Video Icon next to the microphone):
+  // - Show when channel_cap === "Video" AND live is "Stream" or "D-ID"
+  // - Hide otherwise
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
-  const mappingSaysVideo =
-    liveRaw.includes("stream") || liveRaw.includes("d-id") || liveRaw.includes("did");
-  if (mappingSaysVideo) return true;
-
-  // If we *only* have a channel cap (and no Live mapping), honor it.
-  if (channelCap === "video") return true;
-  if (channelCap === "audio") return false;
-
-  // Final fallback: keep prior behavior when mapping is missing.
-  return liveProvider === "stream" || Boolean(phase1AvatarMedia);
-}, [companionMapping, channelCap, liveProvider, phase1AvatarMedia]);
+  const liveOk = liveRaw === "stream" || liveRaw === "d-id";
+  return channelCap === "video" && liveOk;
+}, [channelCap, companionMapping]);
 
 
 
@@ -1983,30 +2059,10 @@ const reconnectLiveAvatar = useCallback(async () => {
 }, []);
 
 const startLiveAvatar = useCallback(async () => {
-    setAvatarError(null);
+  setAvatarError(null);
   ensureIphoneAudioContextUnlocked();
 
 if (liveProvider === "stream") {
-  // Live stream sessions must disable AI STT/TTS to prevent echo/feedback loops.
-  // Frontend already disables the mic UI, but we also stop any in-flight STT and local TTS playback.
-  try {
-    stopLocalTtsPlayback();
-  } catch (e) {
-    // ignore
-  }
-  try {
-    sttEnabledRef.current = false;
-    setSttEnabled(false);
-    setSttRunning(false);
-    const rec: any = (sttRecRef as any)?.current;
-    if (rec && typeof rec.stop === "function") {
-      sttPausedRef.current = true;
-      rec.stop();
-    }
-  } catch (e) {
-    // ignore
-  }
-
   // BeeStreamed (Human companion) — start/ensure the event on the API, then embed inside the page.
   setAvatarError(null);
   setAvatarStatus("connecting");
@@ -2115,7 +2171,7 @@ setStreamEventRef(eventRef);
 
 if (!phase1AvatarMedia) {
   setAvatarStatus("error");
-  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
+  setAvatarError("Live Avatar is not enabled for this companion (missing D-ID config in DB mapping).");
   return;
 }
 
@@ -2281,8 +2337,6 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
       headers: { "Content-Type": "application/json" },
       signal,
       body: JSON.stringify({
-        brand: companyName,
-        avatar: companionName,
         session_id: sessionIdRef.current || "anon",
         voice_id: voiceId,
         text,
@@ -2301,7 +2355,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
     console.warn("TTS/audio-url error:", e);
     return null;
   }
-}, [API_BASE, companyName, companionName]);
+}, []);
 
   type SpeakAssistantHooks = {
     // Called right before we ask D-ID to speak.
@@ -2688,6 +2742,25 @@ const playLocalTtsUrl = useCallback(
     }
   }, []);
 
+
+  // Apply phonetic pronunciation for the companion name in any text we send to TTS.
+  // Display names stay the same in the UI; only the spoken audio uses phonetic.
+  const applyPhoneticToTtsText = useCallback(
+    (text: string) => {
+      const t = String(text || "");
+      const phon = String(phoneticName || "").trim();
+      const display = String(companionName || "").trim();
+      if (!phon || !display) return t;
+
+      const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const esc = escapeRegExp(display);
+
+      // Require non-alphanumeric boundaries so e.g. "Dulce Moon" never matches "DulceMoon".
+      const re = new RegExp(`(^|[^A-Za-z0-9])(${esc})([^A-Za-z0-9]|$)`, "gi");
+      return t.replace(re, (_m, p1, _p2, p3) => `${p1}${phon}${p3}`);
+    },
+    [phoneticName, companionName],
+  );
   const speakLocalTtsReply = useCallback(
     async (replyText: string, voiceId: string, hooks?: SpeakAssistantHooks) => {
       const clean = (replyText || "").trim();
@@ -2704,7 +2777,7 @@ const playLocalTtsUrl = useCallback(
       const controller = new AbortController();
       localTtsAbortRef.current = controller;
 
-      const audioUrl = await getTtsAudioUrl(clean, voiceId, controller.signal);
+      const audioUrl = await getTtsAudioUrl(applyPhoneticToTtsText(clean), voiceId, controller.signal);
       if (controller.signal.aborted || localTtsEpochRef.current != epoch) {
         // Stop/Save/Clear happened while we were generating the audio URL.
         hooks?.onDidNotSpeak?.();
@@ -2723,7 +2796,7 @@ const playLocalTtsUrl = useCallback(
 
       await playLocalTtsUrl(audioUrl, hooks);
     },
-    [getTtsAudioUrl, playLocalTtsUrl]
+    [getTtsAudioUrl, playLocalTtsUrl, applyPhoneticToTtsText]
   );
 
 
@@ -2771,7 +2844,7 @@ const speakAssistantReply = useCallback(
       return;
     }
 
-    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
+    const audioUrl = await getTtsAudioUrl(applyPhoneticToTtsText(clean), phase1AvatarMedia.elevenVoiceId);
     if (!audioUrl) {
       callDidNotSpeak();
       return;
@@ -2881,7 +2954,7 @@ const speakAssistantReply = useCallback(
     const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
     await new Promise((r) => window.setTimeout(r, waitMs));
   },
-  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
+  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar, applyPhoneticToTtsText]
 );
 
   useEffect(() => {
@@ -2926,7 +2999,7 @@ const speakAssistantReply = useCallback(
   // Stable member id used for live chat (Wix memberId when available, otherwise anon:...)
   const brandKeyForAnon = useMemo(() => {
     // `rebranding` is derived from RebrandingKey and is safe to use here.
-    const rawBrand = String(rebranding || "core").trim() || "core";
+    const rawBrand = String(rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
     return safeBrandKey(rawBrand);
   }, [rebranding]);
 
@@ -3118,7 +3191,6 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
     // Once a user has joined the in-stream experience, they should remain connected to
     // shared chat until they explicitly press Stop.
     const inStreamUi =
-      Boolean(beestreamedSessionActive) &&
       Boolean(streamEmbedUrl || streamEventRef) &&
       !!eventRef;
 
@@ -3385,6 +3457,23 @@ useEffect(() => {
 //   as soon as the Host hits Play.
 // ---------------------------------------------------------------------------
 useEffect(() => {
+    // IMPORTANT (Wix embed):
+    // Avoid polling BeeStreamed status for placeholder defaults before Wix hands off the companionKey.
+    let embedded = false;
+    try {
+      embedded = typeof window !== "undefined" && !!window.top && window.top !== window.self;
+    } catch (e) {
+      embedded = true;
+    }
+
+    const hasCompanionHandoff = Boolean(String(companionKeyRaw || "").trim());
+    if (embedded && !hasCompanionHandoff) {
+      setBeestreamedHostMemberId("");
+      setBeestreamedSessionActive(false);
+      beestreamedStatusInactivePollsRef.current = 0;
+      return;
+    }
+
     if (!API_BASE || !companyName || !companionName) {
       setBeestreamedHostMemberId("");
       setBeestreamedSessionActive(false);
@@ -3452,7 +3541,7 @@ useEffect(() => {
         window.clearInterval(pollTimer);
       }
     };
-  }, [API_BASE, companyName, companionName]);
+  }, [API_BASE, companyName, companionName, companionKeyRaw]);
 
 // Viewer UX: if a viewer joined before the host activated the session, we initially show a
 // "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
@@ -3769,17 +3858,9 @@ useEffect(() => {
 
       // When RebrandingKey is present, use ElaraloPlanMap for capability gating
       // (Wix planName may be the rebrand site's plan names like "Supreme").
-      //
-      // IMPORTANT: Trial users must remain Trial even if the key includes a mode like "Romantic".
-      const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
-      const isPaidMember =
-        Boolean(incomingMemberId) &&
-        incomingLoggedIn === true &&
-        Boolean(incomingPlan) &&
-        incomingPlan !== "Trial";
-      const effectivePlan: PlanName = isPaidMember ? (mappedPlanFromKey || incomingPlan) : "Trial";
+      const mappedEntitlementPlan = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
+      const effectivePlan: PlanName = (mappedEntitlementPlan || incomingPlan || "Trial") as PlanName;
       setPlanName(effectivePlan);
-
 
       // Display the rebranding site's plan label when provided (e.g., "Supreme"),
       // but only for logged-in members (Free Trial ignores plan labels by design).
@@ -3822,9 +3903,9 @@ useEffect(() => {
 
       // Brand-default starting mode:
       // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
-      // - Fallback: entitled plans default to Intimate, Trial/visitors default to Romantic.
+      // - Fallback: Intimate plan defaults to Intimate; otherwise default to Romantic (incl. Trial).
       const desiredStartMode: Mode =
-        modeFromRebrandingKey(rawRebrandingKey, rkParts) || (effectivePlan !== "Trial" ? "intimate" : "romantic");
+        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) || (effectivePlan === "Intimate" ? "intimate" : "romantic");
 
       const nextAllowed = allowedModesForPlan(effectivePlan);
       setAllowedModes(nextAllowed);
@@ -3873,7 +3954,7 @@ const companionForBackend =
 // NOTE:
 	// - `rebranding` (legacy) is not guaranteed to be present in this build.
 	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || "core").trim();
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -3952,7 +4033,7 @@ const rebrandingKeyForBackend = hasEntitledPlan
 // NOTE:
 	// - `rebranding` (legacy) is not guaranteed to be present in this build.
 	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || "core").trim();
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -4615,7 +4696,7 @@ useEffect(() => {
   // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
   // ------------------------------------------------------------
   const liveAvatarActive =
-    liveProvider === "did" &&
+    liveProvider === "d-id" &&
     (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
 
   // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
@@ -5283,15 +5364,10 @@ const speakGreetingIfNeeded = useCallback(
     const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
     // Local audio-only greeting must always use the companion's ElevenLabs voice.
     // (Live avatar uses its own configured voice via the DID agent.)
-    const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });    // Prefer DB-driven voice mapping when available (fixes rebrands like Dulce using the default voice).
-    // If mapping hasn't loaded yet, wait so we never fall back to the default voice for the greeting.
-    const mappingVoiceId = ((companionMapping?.elevenVoiceId || "").trim());
-    if (mode === "audio" && handoffReady && !mappingVoiceId) {
-      pendingGreetingModeRef.current = mode;
-      greetInFlightRef.current = false;
-      return;
-    }
-    const voiceId = (mappingVoiceId || getElevenVoiceIdForAvatar(safeCompanionKey));
+    const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
+
+      // Prefer DB-driven voice mapping when available (fixes rebrands like Dulce using the default voice).
+      const voiceId = ((companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey));
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
     const prevIgnore = sttIgnoreUntilRef.current;
@@ -6099,6 +6175,23 @@ const modePillControls = (
         </div>
       </header>
 
+{companionMappingError ? (
+  <div
+    style={{
+      margin: "10px 0",
+      padding: "10px 12px",
+      borderRadius: 10,
+      background: "#ffebee",
+      color: "#b71c1c",
+      fontSize: 13,
+      fontWeight: 700,
+      lineHeight: 1.35,
+    }}
+  >
+    {companionMappingError}
+  </div>
+) : null}
+
 {liveEnabled ? (
   <section
     style={{
@@ -6113,6 +6206,11 @@ const modePillControls = (
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
       <button
         onClick={() => {
+          // iOS: unlock audio playback for TTS on the same user gesture.
+          // (If the user never taps the mic, iOS may block autoplay later.)
+          try { if (isIOS) primeLocalTtsAudio(true); } catch (e) {}
+          try { ensureIphoneAudioContextUnlocked(); } catch (e) {}
+
           // Stream provider: Play = join/start. It must NOT toggle to Pause.
           // Leaving the session is done exclusively via Stop.
           if (liveProvider === "stream") {
