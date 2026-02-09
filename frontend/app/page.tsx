@@ -3903,12 +3903,13 @@ useEffect(() => {
 
       // Brand-default starting mode:
       // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
-      // - Fallback: Intimate plan defaults to Intimate; otherwise default to Romantic (incl. Trial).
-      const desiredStartMode: Mode =
-        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) || (effectivePlan === "Intimate" ? "intimate" : "romantic");
-
+      // - Fallback: choose the "highest" allowed mode for the current plan (intimate > romantic > friend).
       const nextAllowed = allowedModesForPlan(effectivePlan);
       setAllowedModes(nextAllowed);
+
+      const desiredStartMode: Mode =
+        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) ||
+        (nextAllowed.includes("intimate") ? "intimate" : nextAllowed.includes("romantic") ? "romantic" : "friend");
 
       setSessionState((prev) => {
         let nextMode: Mode = prev.mode;
