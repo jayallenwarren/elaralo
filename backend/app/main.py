@@ -2943,51 +2943,56 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
 
     return None
 def _is_minutes_balance_question(text: str) -> bool:
-    """Detect user questions about remaining/available plan minutes.
-
-    Examples we want to catch:
-      - "How many more minutes do I have on my plan?"
-      - "How many minutes are left?"
-      - "Minutes remaining?"
-      - "How long can I talk to you?"
-      - "What's my minutes balance / usage?"
-
-    We keep this intentionally conservative to avoid false triggers.
     """
-    t = (text or "").strip().lower()
-    if not t:
+    Return True when the user is asking about their remaining chat time/minutes.
+    This is intentionally broad because users phrase this many different ways.
+    """
+    if not text:
         return False
+    t = text.strip().lower()
 
-    # Avoid a common unrelated question.
-    if re.search(r"\bwhat time is it\b", t):
-        return False
-
-    # Strong patterns (explicit "how many/much" + minutes/time + left/remaining)
-    if re.search(r"\bhow\s+(many|much)\b.*\b(minutes?|time)\b.*\b(left|remaining|available)\b", t):
+    # Fast exact-ish contains (covers prior phrases)
+    needles = [
+        "minutes remaining",
+        "minutes left",
+        "remaining minutes",
+        "time remaining",
+        "time left",
+        "how many minutes",
+        "how much time",
+        "minutes balance",
+        "balance minutes",
+        "what is my balance",
+        "what's my balance",
+        "how many minutes remain",
+        "how many minutes are remaining",
+        "how many minutes for chat",
+        "chat minutes",
+        "minutes for chat",
+        "how many minutes do i have",
+        "how many minutes do i have left",
+        "how many minutes do i have remaining",
+        "how much time do i have left",
+        "how much time do i have remaining",
+        "how much time is left",
+        "how many minutes are left",
+        "minutes used",
+        "how many minutes have i used",
+        "how much have i used",
+        "usage minutes",
+    ]
+    if any(n in t for n in needles):
         return True
 
-    # "minutes remaining", "time left", etc with plan/usage keywords
-    if re.search(r"\b(minutes?|time)\b.*\b(left|remaining|available)\b", t) and re.search(
-        r"\b(plan|trial|subscription|membership|usage|balance|quota|included)\b", t
-    ):
+    # Regex fallback: any question containing "minute(s)" + remaining/left/balance/usage
+    if re.search(r"\bminute(s)?\b", t) and re.search(r"\b(remain|remaining|left|balance|used|usage)\b", t):
         return True
 
-    # Short forms: "minutes left?", "minutes available?"
-    if re.search(r"\bminutes?\b", t) and re.search(r"\b(left|remaining|available|balance|used)\b", t):
-        return True
-
-    # "How long can I talk/speak/chat?"
-    if re.search(r"\bhow\s+long\b.*\b(can|may)\s+i\b.*\b(talk|speak|chat)\b", t):
-        return True
-
-    # "check my usage" / "show my minutes"
-    if re.search(r"\b(check|show)\b.*\b(usage|minutes?|balance)\b", t):
+    # Or "time" + remaining/left/balance (but avoid generic "time" questions)
+    if re.search(r"\btime\b", t) and re.search(r"\b(remain|remaining|left|balance|used|usage)\b", t):
         return True
 
     return False
-
-
-
 
 def _looks_intimate(text: str) -> bool:
     t = (text or "").lower()
@@ -3317,25 +3322,79 @@ def _apply_phonetic_word_boundary(text: str, target: str, phonetic: str) -> str:
     return pattern.sub(phonetic, text)
 
 
-def _normalize_tts_text(text: str, *, brand: str = "", avatar: str = "", phonetic: str = "") -> str:
-    """Normalize TTS input text for consistent pronunciations across branding/plan/paywall flows."""
+def _normalize_tts_text(
+    text: str,
+    *,
+    brand: str,
+    avatar: str,
+    mapping_phonetic: str,
+    brand_phonetic: str | None = None,
+) -> str:
+    """
+    Normalize text before any TTS generation.
+
+    Goals:
+    - Avoid speaking raw URLs (common in paywall / upgrade messages) which can cause awkward
+      pronunciations like "DulceMoon" being read from "dulcemoon.net".
+    - Expand CamelCase brand strings ("DulceMoon" -> "Dulce Moon") when they appear in text.
+    - Apply companion phonetic pronunciation consistently (e.g., Dulce -> "DOOL-seh").
+    """
     if not text:
-        return text
+        return ""
 
-    # 1) Brand: split CamelCase occurrences (DulceMoon -> Dulce Moon) to avoid merged pronunciation.
+    s = str(text)
+
+    # 0) Replace markdown links: [Label](https://...) => "Label"
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1", s)
+
+    # 1) Replace bare URLs with a neutral token so we don't speak domains/paths.
+    #    (This is the main fix for paywall pronunciation issues.)
+    s = re.sub(r"https?://\S+", " link ", s, flags=re.IGNORECASE)
+
+    # 2) Replace www.* links without scheme.
+    s = re.sub(r"\bwww\.[^\s]+\b", " link ", s, flags=re.IGNORECASE)
+
+    # Collapse whitespace early.
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # 3) Brand normalization (CamelCase -> spaced) so phonetics can match word boundaries.
+    brand = (brand or "").strip()
     if brand:
-        spaced = _split_camel_case_words(brand)
-        if spaced and spaced != brand:
-            try:
-                text = re.sub(re.escape(brand), spaced, text, flags=re.IGNORECASE)
-            except re.error:
-                pass
+        spaced_brand = _split_camel_case_words(brand)
+        if spaced_brand != brand:
+            # Replace literal brand occurrences (case-insensitive)
+            s = re.sub(re.escape(brand), spaced_brand, s, flags=re.IGNORECASE)
 
-    # 2) Companion name phonetic substitution (only at token boundaries).
-    if avatar and phonetic:
-        text = _apply_phonetic_word_boundary(text, avatar, phonetic)
+        # Also handle compact brand tokens (punctuation-delimited), e.g. "dulcemoon" in text.
+        brand_compact = re.sub(r"[^A-Za-z0-9]", "", brand)
+        if brand_compact:
+            spaced_compact = _split_camel_case_words(brand_compact)
+            token_pat = re.compile(
+                rf"(?i)(?<![A-Za-z0-9]){re.escape(brand_compact)}(?![A-Za-z0-9])"
+            )
+            s = token_pat.sub(spaced_compact, s)
 
-    return text
+    # 4) Apply phonetic pronunciation for the companion name.
+    avatar = (avatar or "").strip()
+    mapping_phonetic = (mapping_phonetic or "").strip()
+    if avatar and mapping_phonetic:
+        # Handle CamelCase concatenations (e.g., "DulceMoon") by inserting a space.
+        s = re.sub(
+            rf"(?i)(?<![A-Za-z0-9]){re.escape(avatar)}(?=[A-Z])",
+            mapping_phonetic + " ",
+            s,
+        )
+        # Word-boundary replacement (normal case)
+        s = _apply_phonetic_word_boundary(s, avatar, mapping_phonetic)
+
+    # 5) Optional brand phonetic (future-proof; not currently required).
+    brand_phonetic = (brand_phonetic or "").strip()
+    if brand and brand_phonetic:
+        s = _apply_phonetic_word_boundary(s, brand, brand_phonetic)
+
+    # Final cleanup
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "") -> str:
     text = (text or "").strip()
