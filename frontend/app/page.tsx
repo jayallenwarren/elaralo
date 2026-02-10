@@ -4018,9 +4018,9 @@ const companionForBackend =
 
 
 // NOTE:
-  // - `rebranding` (legacy) is not guaranteed to be present in this build.
-  // - Use RebrandingKey as the single source of truth for brand identity.
-  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -4103,9 +4103,9 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
 
     
 // NOTE:
-  // - `rebranding` (legacy) is not guaranteed to be present in this build.
-  // - Use RebrandingKey as the single source of truth for brand identity.
-  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -6892,9 +6892,9 @@ const modePillControls = (
 
           </div>
 
-            {sttError ? (
-              <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-            ) : null}
+	          {sttError ? (
+	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+	          ) : null}
 
           {/* BeeStreamed Producer View overlay (Host-only) */}
           {showBroadcastButton && showBroadcasterOverlay ? (

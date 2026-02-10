@@ -9,6 +9,9 @@ import hashlib
 import base64
 import mimetypes
 import asyncio
+import shutil
+import subprocess
+import tempfile
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -3139,6 +3142,76 @@ _TTS_CACHE_PREFIX = (os.getenv("TTS_CACHE_PREFIX", "tts_cache") or "tts_cache").
 _TTS_CACHE_NORMALIZE_WS = (os.getenv("TTS_CACHE_NORMALIZE_WS", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
+
+# ----------------------------
+# TTS Pre-processing (iOS hidden-video stability + consistent loudness)
+# ----------------------------
+# The frontend plays audio-only TTS through a hidden <video> element for iOS stability.
+# On that path, HTMLMediaElement.volume is capped at 1.0 and WebAudio gain routing can be blocked by CORS.
+# To keep perceived loudness consistent across voices/devices, we optionally normalize the MP3 server-side
+# before uploading to Azure Blob (and we keep the existing leading-silence behavior to prevent iOS clipping).
+#
+# Controls (all optional):
+#   TTS_PREPROCESS_ENABLED=1|0          (default: 1)
+#   TTS_LOUDNORM_ENABLED=1|0            (default: 1; requires ffmpeg)
+#   TTS_LOUDNORM_I=-16                  (Integrated loudness target, LUFS; default: -16)
+#   TTS_LOUDNORM_TP=-1.5                (True peak limit, dBTP; default: -1.5)
+#   TTS_LOUDNORM_LRA=11                 (Loudness range, LU; default: 11)
+#   TTS_LOUDNORM_TIMEOUT_S=10           (default: 10s)
+#   TTS_LOUDNORM_MAX_BYTES=8000000      (default: 8MB safety cap)
+#   TTS_FFMPEG_BIN=ffmpeg               (default: "ffmpeg")
+#
+# IMPORTANT: The cache key includes these settings, so changing them will create new blobs.
+
+def _tts_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name, "")
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(str(v).strip())
+    except Exception:
+        return float(default)
+
+_TTS_PREPROCESS_ENABLED = (os.getenv("TTS_PREPROCESS_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+_TTS_LOUDNORM_ENABLED = (os.getenv("TTS_LOUDNORM_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+_TTS_LOUDNORM_I = _tts_env_float("TTS_LOUDNORM_I", -16.0)
+_TTS_LOUDNORM_TP = _tts_env_float("TTS_LOUDNORM_TP", -1.5)
+_TTS_LOUDNORM_LRA = _tts_env_float("TTS_LOUDNORM_LRA", 11.0)
+_TTS_LOUDNORM_TIMEOUT_S = _tts_env_float("TTS_LOUDNORM_TIMEOUT_S", 10.0)
+_TTS_LOUDNORM_MAX_BYTES = _env_int("TTS_LOUDNORM_MAX_BYTES", 8_000_000)
+_TTS_FFMPEG_BIN = (os.getenv("TTS_FFMPEG_BIN", "ffmpeg") or "ffmpeg").strip() or "ffmpeg"
+_TTS_PREPROCESS_VERSION = (os.getenv("TTS_PREPROCESS_VERSION", "v1") or "v1").strip() or "v1"
+
+def _tts_ffmpeg_available(ffmpeg_bin: str) -> bool:
+    try:
+        b = (ffmpeg_bin or "").strip()
+        if not b:
+            return False
+        if os.path.isabs(b) or "/" in b:
+            return os.path.exists(b) and os.access(b, os.X_OK)
+        return shutil.which(b) is not None
+    except Exception:
+        return False
+
+_TTS_FFMPEG_AVAILABLE = _tts_ffmpeg_available(_TTS_FFMPEG_BIN)
+
+def _tts_should_loudnorm() -> bool:
+    # Separate helper so the condition is used consistently in cache key + runtime behavior.
+    return bool(_TTS_PREPROCESS_ENABLED and _TTS_LOUDNORM_ENABLED and _TTS_FFMPEG_AVAILABLE)
+
+def _tts_preprocess_cache_key_part(output_format: str) -> str:
+    # Include only deterministic knobs that can change output bytes.
+    # Keep formatting stable to avoid accidental cache busting.
+    ln = "1" if _tts_should_loudnorm() else "0"
+    return (
+        f"pp={_TTS_PREPROCESS_VERSION}"
+        f",sil={_TTS_LEADING_SILENCE_COPIES}"
+        f",ln={ln}"
+        f",I={_TTS_LOUDNORM_I:.2f}"
+        f",TP={_TTS_LOUDNORM_TP:.2f}"
+        f",LRA={_TTS_LOUDNORM_LRA:.2f}"
+    )
+
 def _normalize_tts_text_for_cache(text: str) -> str:
     t = (text or "").strip()
     if _TTS_CACHE_NORMALIZE_WS:
@@ -3152,11 +3225,11 @@ def _tts_cache_blob_name(voice_id: str, text: str) -> str:
 
     model_id = (os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2") or "eleven_multilingual_v2").strip()
     output_format = (os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128") or "mp3_44100_128").strip()
-    silence = str(_TTS_LEADING_SILENCE_COPIES)
+    preproc = _tts_preprocess_cache_key_part(output_format)
 
     norm_text = _normalize_tts_text_for_cache(text)
     h = hashlib.sha256(
-        (safe_voice + "|" + model_id + "|" + output_format + "|" + silence + "|" + norm_text).encode("utf-8")
+        (safe_voice + "|" + model_id + "|" + output_format + "|" + preproc + "|" + norm_text).encode("utf-8")
     ).hexdigest()[:40]
 
     # Keep under a predictable prefix; safe_voice helps partition blobs for listing/debug.
@@ -3171,6 +3244,163 @@ def _tts_cache_blob_name(voice_id: str, text: str) -> str:
 _SILENT_MP3_PREFIX_B64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU5LjI3LjEwMAAAAAAAAAAAAAAA//tAwAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAJAAAEXgBBQUFBQUFBQUFBQVlZWVlZWVlZWVlZcXFxcXFxcXFxcXGIiIiIiIiIiIiIiKCgoKCgoKCgoKCguLi4uLi4uLi4uLjQ0NDQ0NDQ0NDQ0Ojo6Ojo6Ojo6Ojo//////////////8AAAAATGF2YzU5LjM3AAAAAAAAAAAAAAAAJAPMAAAAAAAABF6gwS6ZAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVf/7EMQpg8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVV//sQxFMDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVX/+xDEfIPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMSmA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxM+DwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/+xDE1gPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMTWA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxNYDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU="
 _SILENT_MP3_PREFIX_BYTES = base64.b64decode(_SILENT_MP3_PREFIX_B64)
 _TTS_LEADING_SILENCE_COPIES = max(0, int(os.getenv("TTS_LEADING_SILENCE_COPIES", "1") or "1"))
+
+
+# ----------------------------
+# TTS MP3 pre-processing (runs before upload / before returning any audio_url)
+# ----------------------------
+def _strip_id3v2_tag(mp3_bytes: bytes) -> bytes:
+    """Remove a leading ID3v2 tag if present.
+
+    We do this so that when we prepend our silent MP3 prefix (which includes its own ID3 header),
+    we don't end up with duplicate ID3 tags back-to-back.
+    """
+    try:
+        b = mp3_bytes or b""
+        if len(b) < 10:
+            return b
+        if b[0:3] != b"ID3":
+            return b
+        # ID3v2 header: 10 bytes; size is a 4-byte "synchsafe" integer at bytes 6..9.
+        size_bytes = b[6:10]
+        tag_size = (
+            ((size_bytes[0] & 0x7F) << 21)
+            | ((size_bytes[1] & 0x7F) << 14)
+            | ((size_bytes[2] & 0x7F) << 7)
+            | (size_bytes[3] & 0x7F)
+        )
+        total = 10 + int(tag_size)
+        if total > 0 and total < len(b):
+            return b[total:]
+        return b
+    except Exception:
+        return mp3_bytes
+
+def _parse_mp3_output_format(output_format: str) -> Tuple[Optional[int], Optional[int]]:
+    """Parse ElevenLabs output_format like 'mp3_44100_128' -> (44100, 128)."""
+    s = (output_format or "").strip().lower()
+    m = re.match(r"^mp3_(\d+)_(\d+)$", s)
+    if not m:
+        return None, None
+    try:
+        sr = int(m.group(1))
+        br = int(m.group(2))
+        return sr if sr > 0 else None, br if br > 0 else None
+    except Exception:
+        return None, None
+
+def _ffmpeg_loudnorm_mp3_bytes(mp3_bytes: bytes, *, output_format: str) -> Optional[bytes]:
+    """Normalize MP3 loudness via ffmpeg (EBU R128 loudnorm).
+
+    Returns:
+        Normalized MP3 bytes (without ID3v2 tag) on success, else None (fail-open).
+    """
+    if not _tts_should_loudnorm():
+        return None
+
+    b = mp3_bytes or b""
+    if len(b) < 64:
+        return None
+    if _TTS_LOUDNORM_MAX_BYTES and len(b) > int(_TTS_LOUDNORM_MAX_BYTES):
+        # Safety cap: skip unusually large inputs.
+        return None
+
+    sr, br = _parse_mp3_output_format(output_format)
+    # Best-effort: keep bitrate consistent with ElevenLabs output_format.
+    # If parsing fails, default to 128kbps.
+    br_k = br or 128
+
+    # ffmpeg loudnorm filter
+    af = f"loudnorm=I={_TTS_LOUDNORM_I}:TP={_TTS_LOUDNORM_TP}:LRA={_TTS_LOUDNORM_LRA}"
+
+    in_path = None
+    out_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            in_path = f.name
+            f.write(b)
+            f.flush()
+
+        out_path = in_path + ".norm.mp3"
+
+        cmd = [
+            _TTS_FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            in_path,
+            "-vn",
+            "-af",
+            af,
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            f"{int(br_k)}k",
+            "-write_id3v2",
+            "0",
+        ]
+        if sr:
+            cmd += ["-ar", str(int(sr))]
+        cmd += [out_path]
+
+        # Note: capture stderr so we can log failures without dumping ffmpeg output.
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(1.0, float(_TTS_LOUDNORM_TIMEOUT_S)),
+        )
+
+        with open(out_path, "rb") as _f:
+            norm_bytes = _f.read()
+        if not norm_bytes or len(norm_bytes) < 64:
+            return None
+        return norm_bytes
+    except Exception as e:
+        # Fail-open: return None; caller will use original bytes.
+        try:
+            print("[tts] loudnorm skipped/failed:", str(e)[:240])
+        except Exception:
+            pass
+        return None
+    finally:
+        for p in (in_path, out_path):
+            if not p:
+                continue
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+def _tts_preprocess_mp3_bytes(mp3_bytes: bytes, *, output_format: str) -> bytes:
+    """Backend pre-processing for TTS bytes.
+
+    1) (Optional) Loudness-normalize so iOS hidden-video playback has consistent perceived volume.
+    2) Add leading silence to prevent iOS/Safari from clipping the first ~200ms of audio.
+    """
+    out = mp3_bytes or b"\x00"
+
+    # Loudness normalize (fail-open)
+    try:
+        norm = _ffmpeg_loudnorm_mp3_bytes(out, output_format=output_format)
+        if norm:
+            out = norm
+    except Exception:
+        pass
+
+    # Leading silence (always applied when configured)
+    if _TTS_LEADING_SILENCE_COPIES:
+        try:
+            core = _strip_id3v2_tag(out)
+            out = (_SILENT_MP3_PREFIX_BYTES * _TTS_LEADING_SILENCE_COPIES) + core
+        except Exception:
+            out = (_SILENT_MP3_PREFIX_BYTES * _TTS_LEADING_SILENCE_COPIES) + out
+
+    return out
 
 def _tts_blob_name(session_id: str, voice_id: str, text: str) -> str:
     safe_session = re.sub(r"[^A-Za-z0-9_-]", "_", (session_id or "session"))[:64]
@@ -3206,8 +3436,10 @@ def _elevenlabs_tts_mp3_bytes(voice_id: str, text: str) -> bytes:
     if not r.content:
         raise RuntimeError("ElevenLabs returned empty audio")
     audio_bytes = r.content
-    if _TTS_LEADING_SILENCE_COPIES:
-        audio_bytes = (_SILENT_MP3_PREFIX_BYTES * _TTS_LEADING_SILENCE_COPIES) + audio_bytes
+    # Backend TTS pre-processing:
+    #   1) Loudness normalization (consistent perceived volume for iOS hidden-video playback)
+    #   2) Leading silence (prevents iOS/Safari from clipping the first ~200ms)
+    audio_bytes = _tts_preprocess_mp3_bytes(audio_bytes, output_format=output_format)
     return audio_bytes
 
 
