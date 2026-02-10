@@ -2428,6 +2428,8 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
       body: JSON.stringify({
         session_id: sessionIdRef.current || "anon",
         voice_id: voiceId,
+        brand: companyName,
+        avatar: companionName,
         text,
       }),
     });
@@ -3848,21 +3850,52 @@ useEffect(() => {
 
   // Receive plan + companion from Wix postMessage
   useEffect(() => {
+    // iOS/Safari can strip document.referrer, which can make strict origin checks flaky.
+    // We "learn" the parent origin from the first MEMBER_PLAN payload we accept, then lock to it.
+    let trustedParentOrigin: string | null = null;
+
+    const looksLikeMemberPlanPayload = (d: any) => {
+      return (
+        !!d &&
+        typeof d === "object" &&
+        (d as any).type === "MEMBER_PLAN" &&
+        typeof (d as any).brand === "string" &&
+        typeof (d as any).avatar === "string"
+      );
+    };
+
+    const isAllowedPostMessage = (origin: string, data: any) => {
+      if (origin === window.location.origin) return true;
+      if (trustedParentOrigin && origin === trustedParentOrigin) return true;
+
+      if (isAllowedOrigin(origin)) {
+        if (!trustedParentOrigin) trustedParentOrigin = origin;
+        return true;
+      }
+
+      // Safari/iOS sometimes provides an empty referrer; accept the first valid payload and lock to that origin.
+      if (!trustedParentOrigin && origin && origin.startsWith("https://") && looksLikeMemberPlanPayload(data)) {
+        trustedParentOrigin = origin;
+        return true;
+      }
+
+      return false;
+    };
+
     function onMessage(event: MessageEvent) {
-  if (!isAllowedOrigin(event.origin)) return;
+      // Wix HTML components sometimes deliver the payload as a JSON string.
+      // Accept both object and string forms.
+      let data: any = (event as any).data;
+      if (typeof data === "string") {
+        try {
+          data = JSON.parse(data);
+        } catch (e) {
+          return;
+        }
+      }
 
-  // Wix HTML components sometimes deliver the payload as a JSON string.
-  // Accept both object and string forms.
-  let data: any = (event as any).data;
-  if (typeof data === "string") {
-    try {
-      data = JSON.parse(data);
-    } catch (e) {
-      return;
-    }
-  }
-
-  if (!data || typeof data !== "object" || (data as any).type !== "MEMBER_PLAN") return;
+      if (!isAllowedPostMessage(event.origin, data)) return;
+      if (!data || typeof data !== "object" || (data as any).type !== "MEMBER_PLAN") return;
 
       // loggedIn must come from Wix; do NOT infer from memberId.
       const incomingLoggedIn = (data as any).loggedIn;
@@ -6319,8 +6352,14 @@ const modePillControls = (
     </div>
   );
 
+  const handleAnyUserGesture = useCallback(() => {
+    void primeLocalTtsAudio(true);
+    void nudgeAudioSession();
+    void ensureIphoneAudioContextUnlocked();
+  }, [primeLocalTtsAudio, nudgeAudioSession, ensureIphoneAudioContextUnlocked]);
+
   return (
-    <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
+    <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       {/* Hidden audio element for audio-only TTS (mic mode) */}
       <audio ref={localTtsAudioRef} style={{ display: "none" }} />
       {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
