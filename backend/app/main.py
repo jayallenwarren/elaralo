@@ -1065,6 +1065,26 @@ _WIX_WEBHOOK_EVENTS_TABLE = "wix_webhook_events"
 _WIX_WEBHOOK_CREDITS_TABLE = "wix_webhook_credits"
 
 
+# Session liveness/heartbeat:
+# `session_active` is authoritative, but it can get stuck "on" if a host closes a tab
+# or a stop call fails. To prevent UI regressions like "Live stream active" showing
+# before the host presses Play, we treat a session as stale if the host hasn't pinged
+# within `_SESSION_HEARTBEAT_TTL_SECONDS`.
+_SESSION_HEARTBEAT_TTL_SECONDS = int(os.getenv("SESSION_HEARTBEAT_TTL_SECONDS", "45"))
+
+def _is_session_state_stale(state: Optional[Dict[str, Any]]) -> bool:
+    if not state:
+        return True
+    try:
+        updated_at = int(state.get("updatedAt") or 0)
+    except Exception:
+        return True
+    if updated_at <= 0:
+        return True
+    return (int(time.time()) - updated_at) > _SESSION_HEARTBEAT_TTL_SECONDS
+
+
+
 def _runtime_mappings_db_path_sync() -> str:
     """Return the writable SQLite path used for companion_mappings + runtime state."""
     # Prefer the already loaded source (it is already the writable copy).
@@ -1216,6 +1236,25 @@ def _clear_session_state_sync(brand: str, avatar: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _touch_session_state_sync(brand: str, avatar: str) -> None:
+    """Heartbeat: update only the session state's `updated_at` timestamp."""
+    _ensure_session_state_tables_sync()
+    conn = sqlite3.connect(_runtime_mappings_db_path_sync())
+    try:
+        cur = conn.cursor()
+        b = _norm_key(brand) or "elaralo"
+        a = _norm_key(avatar)
+        now_ts = int(time.time())
+        cur.execute(
+            f"UPDATE {_SESSION_STATE_TABLE} SET updated_at=? WHERE brand_norm=? AND avatar_norm=?",
+            (now_ts, b, a),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 
 def _upsert_member_rebranding_sync(member_id: str, rebranding_key: str, *, pay_go_minutes: Optional[int], free_minutes: Optional[int], cycle_days: Optional[int], plan: str, plan_map: str) -> None:
@@ -2991,6 +3030,24 @@ async def beestreamed_status(brand: str, avatar: str):
     # session_kind/session_room are persisted in the session_state table.
     try:
         state = _get_session_state_sync(resolved_brand, resolved_avatar) or {}
+
+
+        # If the DB says a session is active but we haven't received a host heartbeat recently,
+        # treat it as stale and clear it. This prevents sessions from appearing active when
+        # the host never pressed Play (or closed the tab without stopping).
+        if active and _is_session_state_stale(state):
+            try:
+                _set_session_active(resolved_brand, resolved_avatar, active=False, event_ref="")
+            except Exception:
+                pass
+            try:
+                _clear_session_state_sync(resolved_brand, resolved_avatar)
+            except Exception:
+                pass
+            active = False
+            state = {}
+
+
     except Exception:
         state = {}
 
@@ -4185,6 +4242,34 @@ def _jitsi_room_name_for_companion(brand: str, avatar: str) -> str:
     if not base:
         base = "elaralo"
     return base[:120]
+
+
+class SessionPingBody(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str
+
+
+@app.post("/session/ping")
+async def session_ping(body: SessionPingBody):
+    """Host-only heartbeat to keep `session_active` from being auto-cleared as stale."""
+    brand = (body.brand or "").strip()
+    avatar = (body.avatar or "").strip()
+    member_id = (body.memberId or "").strip()
+
+    if not brand or not avatar or not member_id:
+        raise HTTPException(status_code=400, detail="brand, avatar, and memberId are required")
+
+    # Only the host can send heartbeats.
+    if not _session_is_host(brand, avatar, member_id):
+        raise HTTPException(status_code=403, detail="Only the host can ping the session")
+
+    if not _is_session_active(brand, avatar):
+        return {"ok": True, "sessionActive": False}
+
+    _touch_session_state_sync(brand, avatar)
+    return {"ok": True, "sessionActive": True, "updatedAt": int(time.time())}
+
 
 
 @app.post("/conference/jitsi/start")
