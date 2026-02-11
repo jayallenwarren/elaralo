@@ -1695,44 +1695,6 @@ useEffect(() => {
   }, [API_BASE, companyName, companionName]);
 
 
-// Host heartbeat: keep sessions from getting "stuck active" if a stop call fails or a tab closes.
-// The backend will auto-clear `session_active` if it doesn't receive these pings for a while.
-useEffect(() => {
-  if (!API_BASE || !companyName || !companionName) return;
-  if (!isBeeStreamedHost) return;
-  if (!memberId) return;
-  if (!beestreamedSessionActive) return;
-
-  // Only ping once the host has actually started/joined a live session in this browser.
-  // (Prevents a stale session from being kept alive just by opening the page.)
-  if (avatarStatus === "idle" || avatarStatus === "waiting") return;
-
-  let cancelled = false;
-
-  const ping = async () => {
-    try {
-      await fetch(`${API_BASE}/session/ping`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ brand: companyName, avatar: companionName, memberId }),
-      });
-    } catch (e) {
-      // swallow
-    }
-  };
-
-  void ping();
-  const t = window.setInterval(() => {
-    if (cancelled) return;
-    void ping();
-  }, 20000);
-
-  return () => {
-    cancelled = true;
-    window.clearInterval(t);
-  };
-}, [API_BASE, companyName, companionName, isBeeStreamedHost, memberId, beestreamedSessionActive, avatarStatus]);
 
 
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
@@ -3247,6 +3209,46 @@ const [jitsiError, setJitsiError] = useState<string>("");
     const hid = String(beestreamedHostMemberId || "").trim();
     return Boolean(mid && hid && mid === hid);
   }, [memberId, beestreamedHostMemberId]);
+
+// Host heartbeat: keep sessions from getting "stuck active" if a stop call fails or a tab closes.
+// The backend will auto-clear `session_active` if it doesn't receive these pings for a while.
+useEffect(() => {
+  if (!API_BASE || !companyName || !companionName) return;
+  if (!isBeeStreamedHost) return;
+  if (!memberId) return;
+  if (!beestreamedSessionActive) return;
+
+  // Only ping once the host has actually started/joined a live session in this browser.
+  // (Prevents a stale session from being kept alive just by opening the page.)
+  if (avatarStatus === "idle" || avatarStatus === "waiting") return;
+
+  let cancelled = false;
+
+  const ping = async () => {
+    try {
+      await fetch(`${API_BASE}/session/ping`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ brand: companyName, avatar: companionName, memberId }),
+      });
+    } catch (e) {
+      // swallow
+    }
+  };
+
+  void ping();
+  const t = window.setInterval(() => {
+    if (cancelled) return;
+    void ping();
+  }, 20000);
+
+  return () => {
+    cancelled = true;
+    window.clearInterval(t);
+  };
+}, [API_BASE, companyName, companionName, isBeeStreamedHost, memberId, beestreamedSessionActive, avatarStatus]);
+
   // Viewer-only: treat the companion's BeeStreamed session as "Live Streaming" when the HOST is live.
   // This is intentionally *global* (not tied to whether the viewer currently has the iframe open),
   // because we must block AI responses for everyone while the host is streaming.
