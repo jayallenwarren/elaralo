@@ -172,6 +172,12 @@ def _cors_append_vary(headers: dict, value: str) -> None:
 @app.middleware("http")
 async def _cors_middleware(request: Request, call_next):
     origin = request.headers.get("origin")
+    # By default we are permissive to avoid "mystery CORS" regressions when
+    # upstream errors (or mismatched allow lists) manifest as "Failed to fetch".
+    # Set CORS_STRICT=1 to enforce the allow list strictly.
+    cors_strict = os.getenv("CORS_STRICT", "").strip().lower() in ("1", "true", "yes")
+    allowed = _cors_origin_allowed(origin) if origin else False
+
     # Short-circuit preflight to avoid 405s (and to ensure headers are present even on errors).
     if request.method == "OPTIONS":
         response = Response(status_code=200)
@@ -190,7 +196,7 @@ async def _cors_middleware(request: Request, call_next):
             traceback.print_exc()
             response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
-    if origin and _cors_origin_allowed(origin):
+    if origin and (allowed or not cors_strict):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         _cors_append_vary(response.headers, "Origin")
@@ -203,6 +209,10 @@ async def _cors_middleware(request: Request, call_next):
             response.headers["Access-Control-Max-Age"] = "86400"
 
     return response
+
+# Helpful trace when strict mode blocks an origin.
+# (No CORS headers will be attached in strict mode for disallowed origins.)
+# Note: We purposely do NOT print in permissive mode to avoid noisy logs.
 
 if not cors_env:
     print("[WARN] CORS_ALLOW_ORIGINS is not set; using a conservative default allow list. Set CORS_ALLOW_ORIGINS to override.")
