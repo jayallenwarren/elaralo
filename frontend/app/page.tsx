@@ -3597,7 +3597,9 @@ const joinJitsiConference = useCallback(
       jitsiContainerRef.current.innerHTML = "";
 
       const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
-      const displayName = (username || "").trim() || (memberId ? "Member" : "Guest");
+      // Use the same username state used for Shared Live Chat.
+      // (Earlier iterations referenced a `username` variable that didn't exist.)
+      const displayName = String(viewerLiveChatName || "").trim() || (memberId ? "Member" : "Guest");
       const subject = `${companyName} • ${companionName}`.trim();
 
       const options: any = {
@@ -3670,7 +3672,7 @@ const joinJitsiConference = useCallback(
     isBeeStreamedHost,
     memberId,
     stopConferenceSession,
-    username,
+	  viewerLiveChatName,
   ]
 );
 
@@ -3693,12 +3695,12 @@ const startConferenceSession = useCallback(async () => {
     const resp = await fetch(`${API_BASE}/conference/jitsi/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        brand: companyName,
-        avatar: companionName,
-        memberId: memberId || "",
-        displayName: (username || "").trim(),
-      }),
+	      body: JSON.stringify({
+	        brand: companyName,
+	        avatar: companionName,
+	        memberId: memberId || "",
+	        displayName: String(viewerLiveChatName || "").trim(),
+	      }),
     });
 
     const data = await resp.json().catch(() => ({}));
@@ -3727,7 +3729,7 @@ const startConferenceSession = useCallback(async () => {
   joinJitsiConference,
   memberId,
   sanitizeRoomToken,
-  username,
+	  viewerLiveChatName,
 ]);
 
 
