@@ -3181,6 +3181,12 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   const [beestreamedSessionActive, setBeestreamedSessionActive] = useState<boolean>(false);
 
 const [sessionKind, setSessionKind] = useState<SessionKind>("");
+
+// Keep the latest sessionKind for polling logic without recreating intervals.
+const sessionKindRef = useRef<SessionKind>("");
+useEffect(() => {
+  sessionKindRef.current = sessionKind;
+}, [sessionKind]);
 const [sessionRoom, setSessionRoom] = useState<string>("");
 
 // Host-only Play modal (Stream vs Conference)
@@ -3851,10 +3857,23 @@ useEffect(() => {
         }
 
         const nextActive = Boolean(data.sessionActive);
+
+        // Backend may return sessionKind/sessionRoom (preferred). If not present yet,
+        // preserve conference locally if we're already joined (prevents stop() from missing conference teardown).
         const rawKind = String((data as any).sessionKind || "").trim().toLowerCase();
-        const nextKind: SessionKind =
-          rawKind === "conference" || rawKind === "stream" ? (rawKind as SessionKind) : nextActive ? "stream" : "";
-        const nextRoom = String((data as any).sessionRoom || "").trim();
+        const rawRoom = String((data as any).sessionRoom || (data as any).jitsiRoom || "").trim();
+
+        let nextKind: SessionKind = "";
+        if (rawKind === "conference" || rawKind === "stream") {
+          nextKind = rawKind as SessionKind;
+        } else if (nextActive) {
+          nextKind =
+            sessionKindRef.current === "conference" || Boolean(jitsiApiRef.current) ? "conference" : "stream";
+        } else {
+          nextKind = "";
+        }
+
+        const nextRoom = rawRoom;
 
         if (nextActive) {
           beestreamedStatusInactivePollsRef.current = 0;
@@ -4685,7 +4704,7 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     if (!rawText && !hasAttachment) return;
 
     // Hard rule: no attachments during Shared Live streaming.
-    if ((beestreamedSessionActive || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
+    if (sessionKind === "stream" && (beestreamedSessionActive || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
       try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
       return;
     }
@@ -6186,7 +6205,8 @@ const speakGreetingIfNeeded = useCallback(
     } catch (e) {}
 
     // Conference: Stop/leave Jitsi (host stops the session for everyone).
-    if (sessionKind === "conference") {
+    // Use either the sessionKind flag OR the presence of a mounted Jitsi iframe as the signal.
+    if (sessionKind === "conference" || Boolean(jitsiApiRef.current)) {
       void stopConferenceSession();
       return;
     }
@@ -6400,7 +6420,10 @@ const hostCanStopStream =
     avatarStatus === "reconnecting" ||
     avatarStatus === "error");
 
+// Stream vs Conference: we share a single session_active flag across both session kinds.
+// These derived flags must be *stream-only* so conference mode isn't treated like BeeStreamed UI.
 const hostInStreamUi =
+  sessionKind === "stream" &&
   liveProvider === "stream" &&
   streamCanStart &&
   (Boolean(streamEmbedUrl || streamEventRef) ||
@@ -6409,7 +6432,7 @@ const hostInStreamUi =
     avatarStatus === "connecting" ||
     avatarStatus === "reconnecting");
 
-const viewerInStreamUi = viewerHasJoinedStream;
+const viewerInStreamUi = sessionKind === "stream" && viewerHasJoinedStream;
 
 useEffect(() => {
   // Viewer STT must be disabled while in the BeeStreamed stream UI to avoid transcribing the host audio.
@@ -6694,7 +6717,7 @@ const modePillControls = (
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.55)",
+            background: "rgba(0,0,0,0.35)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -6706,11 +6729,12 @@ const modePillControls = (
           <div
             style={{
               width: "min(520px, 100%)",
-              background: "#0b0f19",
-              border: "1px solid rgba(255,255,255,0.12)",
+              background: "#ffffff",
+              color: "#0f172a",
+              border: "1px solid rgba(15,23,42,0.18)",
               borderRadius: 14,
               padding: 16,
-              boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+              boxShadow: "0 12px 40px rgba(0,0,0,0.25)",
             }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -6724,8 +6748,9 @@ const modePillControls = (
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid #0f172a",
+                  background: "#0f172a",
+                  color: "#ffffff",
                   cursor: "pointer",
                 }}
                 onClick={() => {
@@ -6740,8 +6765,9 @@ const modePillControls = (
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid #0f172a",
+                  background: "#0f172a",
+                  color: "#ffffff",
                   cursor: "pointer",
                 }}
                 onClick={() => {
@@ -6756,8 +6782,9 @@ const modePillControls = (
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  background: "transparent",
+                  border: "1px solid rgba(15,23,42,0.18)",
+                  background: "#f1f5f9",
+                  color: "#0f172a",
                   cursor: "pointer",
                 }}
                 onClick={() => setShowPlayChoiceModal(false)}
@@ -6767,7 +6794,7 @@ const modePillControls = (
             </div>
 
             {jitsiError ? (
-              <div style={{ marginTop: 12, color: "#ffb4b4", fontSize: 12 }}>{jitsiError}</div>
+              <div style={{ marginTop: 12, color: "#b00020", fontSize: 12 }}>{jitsiError}</div>
             ) : null}
           </div>
         </div>
@@ -7033,7 +7060,7 @@ const modePillControls = (
         }}
       >
         {showAvatarFrame ? (
-          <div style={{ flex: (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "2 1 0" : "1 1 0", minWidth: 260, height: conversationHeight }}>
+          <div style={{ flex: (sessionKind === "conference" && beestreamedSessionActive) ? "2 1 0" : (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "2 1 0" : "1 1 0", minWidth: 260, height: conversationHeight }}>
             <div
               style={{
                 border: "1px solid #e5e5e5",
@@ -7118,7 +7145,7 @@ const modePillControls = (
 
         <div
           style={{
-            flex: showAvatarFrame ? ((liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
+            flex: showAvatarFrame ? ((sessionKind === "conference" && beestreamedSessionActive) ? "1 1 0" : (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
             minWidth: 280,
             height: conversationHeight,
             display: "flex",
@@ -7831,7 +7858,7 @@ const modePillControls = (
               borderRadius: 10,
               padding: 8,
               background: "rgba(255,255,255,0.06)",
-              border: "1px solid rgba(255,255,255,0.12)",
+              border: "1px solid rgba(15,23,42,0.18)",
             }}
           >
             {debugLogs.length === 0 ? (
