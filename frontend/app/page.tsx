@@ -3181,12 +3181,6 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   const [beestreamedSessionActive, setBeestreamedSessionActive] = useState<boolean>(false);
 
 const [sessionKind, setSessionKind] = useState<SessionKind>("");
-
-// Keep the latest sessionKind for polling logic without recreating intervals.
-const sessionKindRef = useRef<SessionKind>("");
-useEffect(() => {
-  sessionKindRef.current = sessionKind;
-}, [sessionKind]);
 const [sessionRoom, setSessionRoom] = useState<string>("");
 
 // Host-only Play modal (Stream vs Conference)
@@ -3857,23 +3851,10 @@ useEffect(() => {
         }
 
         const nextActive = Boolean(data.sessionActive);
-
-        // Backend may return sessionKind/sessionRoom (preferred). If not present yet,
-        // preserve conference locally if we're already joined (prevents stop() from missing conference teardown).
         const rawKind = String((data as any).sessionKind || "").trim().toLowerCase();
-        const rawRoom = String((data as any).sessionRoom || (data as any).jitsiRoom || "").trim();
-
-        let nextKind: SessionKind = "";
-        if (rawKind === "conference" || rawKind === "stream") {
-          nextKind = rawKind as SessionKind;
-        } else if (nextActive) {
-          nextKind =
-            sessionKindRef.current === "conference" || Boolean(jitsiApiRef.current) ? "conference" : "stream";
-        } else {
-          nextKind = "";
-        }
-
-        const nextRoom = rawRoom;
+        const nextKind: SessionKind =
+          rawKind === "conference" || rawKind === "stream" ? (rawKind as SessionKind) : nextActive ? "stream" : "";
+        const nextRoom = String((data as any).sessionRoom || "").trim();
 
         if (nextActive) {
           beestreamedStatusInactivePollsRef.current = 0;
@@ -4704,7 +4685,7 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     if (!rawText && !hasAttachment) return;
 
     // Hard rule: no attachments during Shared Live streaming.
-    if (sessionKind === "stream" && (beestreamedSessionActive || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
+    if ((beestreamedSessionActive || hostInStreamUi || viewerInStreamUi) && sessionKind !== "conference" && hasAttachment) {
       try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
       return;
     }
@@ -4756,7 +4737,12 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     
 const outgoingText = (detectedMode ? cleaned : rawText).trim();
     // If the user sends an attachment without text, still create a stable message for the backend/UI.
-    const finalUserContent = outgoingText || (hasAttachment ? "Sent an attachment." : "");
+    const attachmentUrl = pendingAttachment?.url || "";
+    const attachmentLabel = pendingAttachment?.name ? `Attachment (${pendingAttachment.name})` : "Attachment";
+    const attachmentText = hasAttachment ? (attachmentUrl ? `${attachmentLabel}: ${attachmentUrl}` : "Sent an attachment.") : "";
+    const finalUserContent = outgoingText
+      ? (attachmentText ? `${outgoingText}\n\n${attachmentText}` : outgoingText)
+      : attachmentText;
 
     // Build the user message.
 
@@ -4860,7 +4846,7 @@ if (streamSessionActive) {
     rememberLiveChatId(clientMsgId);
 
     // Fire-and-forget: WS send (HTTP fallback inside helper).
-    void sendLiveChatMessage(outgoingText, clientMsgId);
+    void sendLiveChatMessage(finalUserContent, clientMsgId);
 
     // In-session members see their message immediately; no "live session" notice.
     setMessages(nextMessages);
@@ -6205,8 +6191,8 @@ const speakGreetingIfNeeded = useCallback(
     } catch (e) {}
 
     // Conference: Stop/leave Jitsi (host stops the session for everyone).
-    // Use either the sessionKind flag OR the presence of a mounted Jitsi iframe as the signal.
-    if (sessionKind === "conference" || Boolean(jitsiApiRef.current)) {
+    // Defensive: if the Jitsi iframe is mounted but sessionKind hasn't refreshed yet, still treat it as a conference.
+    if (sessionKind === "conference" || (!!jitsiApiRef.current && sessionKind !== "stream")) {
       void stopConferenceSession();
       return;
     }
@@ -6420,10 +6406,7 @@ const hostCanStopStream =
     avatarStatus === "reconnecting" ||
     avatarStatus === "error");
 
-// Stream vs Conference: we share a single session_active flag across both session kinds.
-// These derived flags must be *stream-only* so conference mode isn't treated like BeeStreamed UI.
 const hostInStreamUi =
-  sessionKind === "stream" &&
   liveProvider === "stream" &&
   streamCanStart &&
   (Boolean(streamEmbedUrl || streamEventRef) ||
@@ -6432,7 +6415,7 @@ const hostInStreamUi =
     avatarStatus === "connecting" ||
     avatarStatus === "reconnecting");
 
-const viewerInStreamUi = sessionKind === "stream" && viewerHasJoinedStream;
+const viewerInStreamUi = viewerHasJoinedStream;
 
 useEffect(() => {
   // Viewer STT must be disabled while in the BeeStreamed stream UI to avoid transcribing the host audio.
@@ -6730,8 +6713,7 @@ const modePillControls = (
             style={{
               width: "min(520px, 100%)",
               background: "#ffffff",
-              color: "#0f172a",
-              border: "1px solid rgba(15,23,42,0.18)",
+              border: "1px solid rgba(0,0,0,0.12)",
               borderRadius: 14,
               padding: 16,
               boxShadow: "0 12px 40px rgba(0,0,0,0.25)",
@@ -6748,9 +6730,8 @@ const modePillControls = (
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid #0f172a",
-                  background: "#0f172a",
-                  color: "#ffffff",
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  background: "rgba(0,0,0,0.05)",
                   cursor: "pointer",
                 }}
                 onClick={() => {
@@ -6765,9 +6746,8 @@ const modePillControls = (
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid #0f172a",
-                  background: "#0f172a",
-                  color: "#ffffff",
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  background: "rgba(0,0,0,0.05)",
                   cursor: "pointer",
                 }}
                 onClick={() => {
@@ -6782,9 +6762,8 @@ const modePillControls = (
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid rgba(15,23,42,0.18)",
-                  background: "#f1f5f9",
-                  color: "#0f172a",
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  background: "transparent",
                   cursor: "pointer",
                 }}
                 onClick={() => setShowPlayChoiceModal(false)}
@@ -7060,7 +7039,7 @@ const modePillControls = (
         }}
       >
         {showAvatarFrame ? (
-          <div style={{ flex: (sessionKind === "conference" && beestreamedSessionActive) ? "2 1 0" : (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "2 1 0" : "1 1 0", minWidth: 260, height: conversationHeight }}>
+          <div style={{ flex: sessionKind === "conference" ? "2 1 0" : ((liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "2 1 0" : "1 1 0"), minWidth: 260, height: conversationHeight }}>
             <div
               style={{
                 border: "1px solid #e5e5e5",
@@ -7145,7 +7124,7 @@ const modePillControls = (
 
         <div
           style={{
-            flex: showAvatarFrame ? ((sessionKind === "conference" && beestreamedSessionActive) ? "1 1 0" : (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
+            flex: showAvatarFrame ? (sessionKind === "conference" ? "1 1 0" : ((liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "1 1 0" : "2 1 0")) : "1 1 0",
             minWidth: 280,
             height: conversationHeight,
             display: "flex",
@@ -7858,7 +7837,7 @@ const modePillControls = (
               borderRadius: 10,
               padding: 8,
               background: "rgba(255,255,255,0.06)",
-              border: "1px solid rgba(15,23,42,0.18)",
+              border: "1px solid rgba(255,255,255,0.12)",
             }}
           >
             {debugLogs.length === 0 ? (
