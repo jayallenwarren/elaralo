@@ -3546,7 +3546,6 @@ const stopConferenceSession = useCallback(async () => {
     conferenceOptOutRef.current = true;
     disposeJitsi();
     setAvatarStatus("idle");
-    setShowAvatarFrame(false);
     return;
   }
 
@@ -3557,7 +3556,6 @@ const stopConferenceSession = useCallback(async () => {
   setSessionKind("");
   setSessionRoom("");
   setAvatarStatus("idle");
-  setShowAvatarFrame(false);
 
   try {
     await fetch(`${API_BASE}/conference/jitsi/stop`, {
@@ -3651,7 +3649,6 @@ const joinJitsiConference = useCallback(
 
         disposeJitsi();
         setAvatarStatus("idle");
-        setShowAvatarFrame(false);
 
         // Host hanging up should end the session for viewers as well.
         if (isBeeStreamedHost) {
@@ -3683,7 +3680,6 @@ const startConferenceSession = useCallback(async () => {
   // Viewers never start a session. They just wait until the host starts.
   if (!isBeeStreamedHost) {
     setStreamNotice("Waiting for host to start the conference…");
-    setShowAvatarFrame(true);
     setAvatarStatus("waiting");
     return;
   }
@@ -3691,7 +3687,6 @@ const startConferenceSession = useCallback(async () => {
   conferenceOptOutRef.current = false;
 
   setStreamNotice(null);
-  setShowAvatarFrame(true);
   setAvatarStatus("connecting");
 
   try {
@@ -3925,7 +3920,6 @@ useEffect(() => {
     const room = (sessionRoom || fallbackRoom).trim();
 
     // Ensure the avatar frame is visible
-    setShowAvatarFrame(true);
 
     void joinJitsiConference(room);
   }, [
@@ -6887,7 +6881,6 @@ const modePillControls = (
             // If a conference is active, Play joins it (no STT).
             if (beestreamedSessionActive && sessionKind === "conference") {
               conferenceOptOutRef.current = false;
-              setShowAvatarFrame(true);
 
               const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
               const room = (sessionRoom || fallbackRoom).trim();
