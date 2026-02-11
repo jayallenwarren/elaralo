@@ -2160,6 +2160,131 @@ def _set_session_active(brand: str, avatar: str, active: bool, event_ref: Option
 
 
 
+
+
+# =============================================================================
+# Session kind/room helpers (shared across workers via the DB)
+#
+# session_active (0/1) remains the truth source for "is a live session active?"
+# session_kind indicates WHAT kind of session is active: "stream" or "conference".
+# session_room is used for conference providers (Jitsi room name).
+# =============================================================================
+
+def _sanitize_room_token(raw: str, *, max_len: int = 128) -> str:
+  """Sanitize a string into a URL-safe token (lowercase, letters/digits/-)."""
+  s = (raw or "").strip().lower()
+  # Replace any non [a-z0-9] with hyphen
+  s = re.sub(r"[^a-z0-9]+", "-", s)
+  s = re.sub(r"-+", "-", s).strip("-")
+  if not s:
+    return "room"
+  return s[:max_len]
+
+
+def _read_session_kind_room(resolved_brand: str, resolved_avatar: str) -> tuple[str, str]:
+  """Read session_kind/session_room from DB. Returns (kind, room) or ("", "") if unavailable."""
+  try:
+    b = (resolved_brand or "").strip()
+    a = (resolved_avatar or "").strip()
+    if not b or not a:
+      return "", ""
+
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+      cur = conn.cursor()
+
+      # Columns may not exist yet in older DBs; detect safely.
+      cur.execute("PRAGMA table_info(companion_mappings)")
+      cols = {row[1].lower() for row in cur.fetchall()}
+
+      if "session_kind" not in cols and "session_room" not in cols:
+        return "", ""
+
+      sel_cols = []
+      if "session_kind" in cols:
+        sel_cols.append("COALESCE(session_kind, '') AS session_kind")
+      else:
+        sel_cols.append("'' AS session_kind")
+      if "session_room" in cols:
+        sel_cols.append("COALESCE(session_room, '') AS session_room")
+      else:
+        sel_cols.append("'' AS session_room")
+
+      cur.execute(
+        f"SELECT {', '.join(sel_cols)} FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)",
+        (b, a),
+      )
+      row = cur.fetchone()
+      if not row:
+        return "", ""
+      kind = (row["session_kind"] or "").strip().lower()
+      room = (row["session_room"] or "").strip()
+      return kind, room
+    finally:
+      conn.close()
+  except Exception:
+    return "", ""
+
+
+def _set_session_kind_room_best_effort(resolved_brand: str, resolved_avatar: str, *, kind: str | None = None, room: str | None = None) -> bool:
+  """Best-effort upsert/update of session_kind/session_room in companion_mappings."""
+  if kind is None and room is None:
+    return True
+
+  try:
+    b = (resolved_brand or "").strip()
+    a = (resolved_avatar or "").strip()
+    if not b or not a:
+      return False
+
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    conn = sqlite3.connect(db_path)
+    try:
+      cur = conn.cursor()
+
+      # Ensure columns exist
+      cur.execute("PRAGMA table_info(companion_mappings)")
+      cols = {row[1].lower() for row in cur.fetchall()}
+
+      if "session_kind" not in cols:
+        cur.execute("ALTER TABLE companion_mappings ADD COLUMN session_kind TEXT")
+        cols.add("session_kind")
+      if "session_room" not in cols:
+        cur.execute("ALTER TABLE companion_mappings ADD COLUMN session_room TEXT")
+        cols.add("session_room")
+
+      # Ensure row exists (INSERT OR IGNORE)
+      cur.execute(
+        "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+        (b, a),
+      )
+
+      # UPDATE only provided fields
+      sets = []
+      params = []
+      if kind is not None:
+        sets.append("session_kind = ?")
+        params.append((kind or "").strip().lower() or None)
+      if room is not None:
+        sets.append("session_room = ?")
+        params.append((room or "").strip() or None)
+
+      if sets:
+        params.extend([b, a])
+        cur.execute(
+          f"UPDATE companion_mappings SET {', '.join(sets)} WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)",
+          tuple(params),
+        )
+
+      conn.commit()
+      return True
+    finally:
+      conn.close()
+  except Exception:
+    return False
+
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
     avatar: str
@@ -2309,6 +2434,8 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
 
     _set_session_active(resolved_brand, resolved_avatar, active=True, event_ref=event_ref)
 
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room="")
+
     return {
         "ok": True,
         "status": "started",
@@ -2426,14 +2553,37 @@ async def beestreamed_status(brand: str, avatar: str):
     event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar)
     mapping["event_ref"] = event_ref
 
+    active = bool(_is_session_active(resolved_brand, resolved_avatar))
+
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+
+    # Back-compat: older DBs won't have session_kind; treat an active session as a stream.
+
+    if active and not session_kind:
+
+        session_kind = "stream"
+
+
     return {
+
         "ok": True,
+
         "eventRef": event_ref,
+
         "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
+
         "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
+
         "companionType": str(mapping.get("companion_type") or "").strip(),
+
         "live": str(mapping.get("live") or "").strip(),
-        "sessionActive": bool(_is_session_active(resolved_brand, resolved_avatar)),
+
+        "sessionActive": active,
+
+        "sessionKind": session_kind,
+
+        "sessionRoom": session_room,
+
     }
 @app.post("/stream/beestreamed/embed_url")
 async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
@@ -2491,6 +2641,8 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
     if not event_ref:
         # If the host tries to stop without an eventRef, mark the session inactive anyway.
         _set_session_active(resolved_brand, resolved_avatar, active=False)
+
+        _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
         return {
             "ok": True,
             "status": "no_event_ref",
@@ -2511,6 +2663,9 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
         raise HTTPException(status_code=502, detail=f"BeeStreamed stop failed: {stop_res}")
 
     _set_session_active(resolved_brand, resolved_avatar, active=False, event_ref=event_ref)
+
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
 
     # Best-effort: notify any connected shared-live-chat clients.
     if was_active:
@@ -2547,6 +2702,78 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
         "eventRef": event_ref,
         "message": "",
     }
+
+
+# =============================================================================
+# Jitsi Conference (one-on-one) session control
+#
+# The front-end embeds Jitsi Meet (External API) when session_active=1 AND
+# session_kind == "conference". Viewers never call /start (host-only).
+# =============================================================================
+
+class JitsiConferenceStartRequest(BaseModel):
+  brand: str
+  avatar: str
+  memberId: str = ""
+  displayName: str = ""
+
+
+class JitsiConferenceStopRequest(BaseModel):
+  brand: str
+  avatar: str
+  memberId: str = ""
+
+
+@app.post("/conference/jitsi/start")
+async def jitsi_conference_start(req: JitsiConferenceStartRequest):
+  resolved_brand = (req.brand or "").strip()
+  resolved_avatar = (req.avatar or "").strip()
+  if not resolved_brand or not resolved_avatar:
+    raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+  if not mapping:
+    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+  host_member_id = str(mapping.get("host_member_id") or "").strip()
+  caller_member_id = str(req.memberId or "").strip()
+
+  if not host_member_id or caller_member_id != host_member_id:
+    raise HTTPException(status_code=403, detail="Only the host can start the conference.")
+
+  # Stable, per-companion room name (shared across sessions)
+  room = _sanitize_room_token(f"{resolved_brand}-{resolved_avatar}")
+
+  # Persist state for multi-worker viewers
+  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
+  _set_session_active(resolved_brand, resolved_avatar, True, event_ref=None)
+
+  return {"ok": True, "sessionActive": True, "sessionKind": "conference", "sessionRoom": room}
+
+
+@app.post("/conference/jitsi/stop")
+async def jitsi_conference_stop(req: JitsiConferenceStopRequest):
+  resolved_brand = (req.brand or "").strip()
+  resolved_avatar = (req.avatar or "").strip()
+  if not resolved_brand or not resolved_avatar:
+    raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+  if not mapping:
+    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+  host_member_id = str(mapping.get("host_member_id") or "").strip()
+  caller_member_id = str(req.memberId or "").strip()
+
+  if not host_member_id or caller_member_id != host_member_id:
+    raise HTTPException(status_code=403, detail="Only the host can stop the conference.")
+
+  _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
+  # Clear kind/room so next Play click re-prompts host
+  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+  return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
+
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
     try:

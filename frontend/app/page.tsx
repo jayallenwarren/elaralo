@@ -80,6 +80,15 @@ type UploadedAttachment = {
 type Mode = "friend" | "romantic" | "intimate";
 
 type LiveProvider = "d-id" | "stream";
+
+type SessionKind = "stream" | "conference" | "";
+
+// Jitsi Meet External API is loaded at runtime (script tag).
+declare global {
+  interface Window {
+    JitsiMeetExternalAPI?: any;
+  }
+}
 type ChannelCap = "audio" | "video" | "";
 
 type CompanionMappingRow = {
@@ -2140,6 +2149,7 @@ const reconnectLiveAvatar = useCallback(async () => {
   }
 }, []);
 
+
 const startLiveAvatar = useCallback(async () => {
   setAvatarError(null);
   ensureIphoneAudioContextUnlocked();
@@ -3170,6 +3180,18 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   const [beestreamedHostMemberId, setBeestreamedHostMemberId] = useState<string>("");
   const [beestreamedSessionActive, setBeestreamedSessionActive] = useState<boolean>(false);
 
+const [sessionKind, setSessionKind] = useState<SessionKind>("");
+const [sessionRoom, setSessionRoom] = useState<string>("");
+
+// Host-only Play modal (Stream vs Conference)
+const [showPlayChoiceModal, setShowPlayChoiceModal] = useState<boolean>(false);
+
+// Jitsi (conference) embedding
+const jitsiContainerRef = useRef<HTMLDivElement | null>(null);
+const jitsiApiRef = useRef<any>(null);
+const conferenceOptOutRef = useRef<boolean>(false);
+const [jitsiError, setJitsiError] = useState<string>("");
+
   // BeeStreamed status polling can hit different backend instances; avoid flickering UI by
   // only changing sessionActive on confirmed status responses.
   const beestreamedStatusInactivePollsRef = useRef<number>(0);
@@ -3463,6 +3485,258 @@ const prevBeeStreamedSessionActiveRef = useRef<boolean>(false);
 // shared in-stream chat.
 const joinedStreamRef = useRef<boolean>(false);
 
+// ===============================
+// Jitsi (Conference) helpers
+// ===============================
+const sanitizeRoomToken = useCallback((raw: string, maxLen = 128) => {
+  const s = String(raw || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/(^-|-$)/g, "");
+  const out = s.length ? s : "room";
+  return out.slice(0, maxLen);
+}, []);
+
+const ensureJitsiExternalApiLoaded = useCallback(async (): Promise<void> => {
+  if (typeof window === "undefined") return;
+  if (window.JitsiMeetExternalAPI) return;
+
+  const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
+  const scriptUrl = `https://${domain}/external_api.js`;
+
+  await new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>('script[data-jitsi-external-api="1"]');
+    if (existing) {
+      if (window.JitsiMeetExternalAPI) return resolve();
+      existing.addEventListener("load", () => resolve());
+      existing.addEventListener("error", () => reject(new Error("Failed to load Jitsi External API")));
+      return;
+    }
+
+    const s = document.createElement("script");
+    s.src = scriptUrl;
+    s.async = true;
+    s.dataset.jitsiExternalApi = "1";
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("Failed to load Jitsi External API script"));
+    document.head.appendChild(s);
+  });
+}, []);
+
+const disposeJitsi = useCallback(() => {
+  try {
+    jitsiApiRef.current?.dispose?.();
+  } catch {
+    // ignore
+  }
+  jitsiApiRef.current = null;
+
+  if (jitsiContainerRef.current) {
+    jitsiContainerRef.current.innerHTML = "";
+  }
+
+  setJitsiError("");
+}, []);
+
+const stopConferenceSession = useCallback(async () => {
+  // Viewers leaving the conference should not stop the host session.
+  if (!isBeeStreamedHost) {
+    conferenceOptOutRef.current = true;
+    disposeJitsi();
+    setAvatarStatus("idle");
+    setShowAvatarFrame(false);
+    return;
+  }
+
+  // Optimistic close (prevents auto-rejoin while stop request is in-flight)
+  conferenceOptOutRef.current = true;
+  disposeJitsi();
+  setBeestreamedSessionActive(false);
+  setSessionKind("");
+  setSessionRoom("");
+  setAvatarStatus("idle");
+  setShowAvatarFrame(false);
+
+  try {
+    await fetch(`${API_BASE}/conference/jitsi/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ brand: companyName, avatar: companionName, memberId: memberId || "" }),
+    });
+  } catch {
+    // best effort
+  }
+}, [API_BASE, companyName, companionName, disposeJitsi, isBeeStreamedHost, memberId]);
+
+const joinJitsiConference = useCallback(
+  async (roomName: string) => {
+    const room = String(roomName || "").trim();
+    if (!room) return;
+
+    // Respect explicit "leave" by viewers while the session is still active
+    if (conferenceOptOutRef.current && !isBeeStreamedHost) return;
+
+    // Avoid recreating the iframe on every state poll
+    if (jitsiApiRef.current) return;
+
+    if (!jitsiContainerRef.current) {
+      setJitsiError("Conference container not ready.");
+      return;
+    }
+
+    setJitsiError("");
+    setAvatarStatus("connecting");
+
+    try {
+      await ensureJitsiExternalApiLoaded();
+      if (!window.JitsiMeetExternalAPI) {
+        throw new Error("JitsiMeetExternalAPI is not available.");
+      }
+
+      // Clear any previous iframe
+      jitsiContainerRef.current.innerHTML = "";
+
+      const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
+      const displayName = (username || "").trim() || (memberId ? "Member" : "Guest");
+      const subject = `${companyName} • ${companionName}`.trim();
+
+      const options: any = {
+        roomName: room,
+        parentNode: jitsiContainerRef.current,
+        width: "100%",
+        height: "100%",
+        userInfo: { displayName },
+        configOverwrite: {
+          prejoinPageEnabled: false,
+          disableDeepLinking: true,
+          subject,
+        },
+        interfaceConfigOverwrite: {
+          SHOW_JITSI_WATERMARK: false,
+          SHOW_WATERMARK_FOR_GUESTS: false,
+          SHOW_BRAND_WATERMARK: false,
+          SHOW_POWERED_BY: false,
+          DEFAULT_REMOTE_DISPLAY_NAME: "Guest",
+          TOOLBAR_BUTTONS: [
+            "microphone",
+            "camera",
+            "desktop",
+            "fullscreen",
+            "fodeviceselection",
+            "hangup",
+            "chat",
+            "settings",
+            "tileview",
+          ],
+        },
+      };
+
+      const api = new window.JitsiMeetExternalAPI(domain, options);
+      jitsiApiRef.current = api;
+
+      api.addListener?.("videoConferenceJoined", () => {
+        setAvatarStatus("connected");
+        try {
+          if (subject) api.executeCommand?.("subject", subject);
+        } catch {
+          // ignore
+        }
+      });
+
+      api.addListener?.("readyToClose", () => {
+        // If the user hangs up, prevent auto-rejoin while the host session is still active.
+        conferenceOptOutRef.current = true;
+
+        disposeJitsi();
+        setAvatarStatus("idle");
+        setShowAvatarFrame(false);
+
+        // Host hanging up should end the session for viewers as well.
+        if (isBeeStreamedHost) {
+          void stopConferenceSession();
+        }
+      });
+    } catch (err: any) {
+      const msg = err?.message || "Conference failed to start.";
+      setJitsiError(msg);
+      disposeJitsi();
+      setAvatarStatus("idle");
+    }
+  },
+  [
+    companyName,
+    companionName,
+    disposeJitsi,
+    ensureJitsiExternalApiLoaded,
+    isBeeStreamedHost,
+    memberId,
+    stopConferenceSession,
+    username,
+  ]
+);
+
+const startConferenceSession = useCallback(async () => {
+  setAvatarError(null);
+
+  // Viewers never start a session. They just wait until the host starts.
+  if (!isBeeStreamedHost) {
+    setStreamNotice("Waiting for host to start the conference…");
+    setShowAvatarFrame(true);
+    setAvatarStatus("waiting");
+    return;
+  }
+
+  conferenceOptOutRef.current = false;
+
+  setStreamNotice(null);
+  setShowAvatarFrame(true);
+  setAvatarStatus("connecting");
+
+  try {
+    const resp = await fetch(`${API_BASE}/conference/jitsi/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        brand: companyName,
+        avatar: companionName,
+        memberId: memberId || "",
+        displayName: (username || "").trim(),
+      }),
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data?.ok) {
+      const detail = String(data?.detail || data?.error || "Conference start failed.");
+      throw new Error(detail);
+    }
+
+    const room = String(data?.sessionRoom || data?.room || "").trim() || sanitizeRoomToken(`${companyName}-${companionName}`);
+
+    // Optimistic local state (status poll will confirm)
+    setBeestreamedSessionActive(true);
+    setSessionKind("conference");
+    setSessionRoom(room);
+
+    await joinJitsiConference(room);
+  } catch (err: any) {
+    setAvatarStatus("idle");
+    setAvatarError(err?.message || "Conference start failed.");
+  }
+}, [
+  API_BASE,
+  companyName,
+  companionName,
+  isBeeStreamedHost,
+  joinJitsiConference,
+  memberId,
+  sanitizeRoomToken,
+  username,
+]);
+
+
+
 // Keep refs to the latest state for async flush logic (avoids stale closures).
 const messagesRef = useRef<Msg[]>([]);
 useEffect(() => {
@@ -3580,18 +3854,29 @@ useEffect(() => {
         }
 
         const nextActive = Boolean(data.sessionActive);
+        const rawKind = String((data as any).sessionKind || "").trim().toLowerCase();
+        const nextKind: SessionKind =
+          rawKind === "conference" || rawKind === "stream" ? (rawKind as SessionKind) : nextActive ? "stream" : "";
+        const nextRoom = String((data as any).sessionRoom || "").trim();
+
         if (nextActive) {
           beestreamedStatusInactivePollsRef.current = 0;
           setBeestreamedSessionActive(true);
+          setSessionKind(nextKind);
+          setSessionRoom(nextRoom);
         } else {
           beestreamedStatusInactivePollsRef.current += 1;
-          // Require consecutive "inactive" polls before clearing. This prevents a 3s poll interval
-          // from causing the badge/message to blink when the backend returns transient errors.
+
+          // Only clear after 2 consecutive "inactive" polls to avoid flicker.
           if (beestreamedStatusInactivePollsRef.current >= 2) {
             setBeestreamedSessionActive(false);
+            setSessionKind("");
+            setSessionRoom("");
+            conferenceOptOutRef.current = false;
           }
         }
-      } catch (_e) {
+      }
+      catch (_e) {
         // Keep last known-good on fetch errors.
         return;
       }
@@ -3615,13 +3900,45 @@ useEffect(() => {
 // remove the waiting notice.
 useEffect(() => {
   if (!beestreamedSessionActive) return;
+    if (sessionKind === "conference") return;
   if (streamCanStart) return; // host
   if (!joinedStreamRef.current) return;
   if (avatarStatus !== "waiting") return;
 
   setStreamNotice("");
   setAvatarStatus("connected");
-}, [beestreamedSessionActive, streamCanStart, avatarStatus]);
+}, [beestreamedSessionActive, sessionKind, streamCanStart, avatarStatus]);
+
+  // Conference auto-join: when the host starts a Jitsi conference, viewers should wait
+  // until session_active is true, then the app embeds Jitsi in-page.
+  useEffect(() => {
+    if (!(beestreamedSessionActive && sessionKind === "conference")) {
+      if (jitsiApiRef.current) {
+        disposeJitsi();
+      }
+      return;
+    }
+
+    if (conferenceOptOutRef.current) return;
+
+    const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
+    const room = (sessionRoom || fallbackRoom).trim();
+
+    // Ensure the avatar frame is visible
+    setShowAvatarFrame(true);
+
+    void joinJitsiConference(room);
+  }, [
+    beestreamedSessionActive,
+    sessionKind,
+    sessionRoom,
+    companyName,
+    companionName,
+    sanitizeRoomToken,
+    joinJitsiConference,
+    disposeJitsi,
+  ]);
+
 
   // Reset broadcaster UI when switching companion / provider.
 useEffect(() => {
@@ -4199,7 +4516,7 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
 // - Only image/* uploads are supported (rendered as image previews).
 // - Attachments are DISABLED during Shared Live (BeeStreamed sessionActive).
 // ---------------------------------------------------------------------
-const uploadsDisabled = Boolean(beestreamedSessionActive);
+const uploadsDisabled = Boolean(beestreamedSessionActive && sessionKind === "stream");
 
 const uploadAttachment = useCallback(
   async (file: File): Promise<UploadedAttachment> => {
@@ -5872,6 +6189,13 @@ const speakGreetingIfNeeded = useCallback(
       stopHandsFreeSTT();
     } catch (e) {}
 
+    // Conference: Stop/leave Jitsi (host stops the session for everyone).
+    if (sessionKind === "conference") {
+      void stopConferenceSession();
+      return;
+    }
+
+
     // Viewer-only (Live Stream): enable Stop to close the embedded player even when mic/STT isn't running.
     // IMPORTANT: This must be synchronous on the user gesture on iOS to avoid breaking future TTS routing.
     // This does NOT affect the underlying stream session because ONLY the host calls stop_embed.
@@ -6369,6 +6693,90 @@ const modePillControls = (
         preload="auto"
         style={{ position: "fixed", left: 0, bottom: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none", zIndex: -1 }}
       />
+      {showPlayChoiceModal && isBeeStreamedHost ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+            padding: 16,
+          }}
+          onClick={() => setShowPlayChoiceModal(false)}
+        >
+          <div
+            style={{
+              width: "min(520px, 100%)",
+              background: "#0b0f19",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: 14,
+              padding: 16,
+              boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Start a session</div>
+            <div style={{ opacity: 0.85, fontSize: 13, marginBottom: 14 }}>
+              Choose <b>Stream</b> (BeeStreamed) or a 1:1 <b>Conference</b> (Jitsi). You can&apos;t run both at the same time.
+            </div>
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  background: "rgba(255,255,255,0.06)",
+                  cursor: "pointer",
+                }}
+                onClick={() => {
+                  setShowPlayChoiceModal(false);
+                  void startLiveAvatar();
+                }}
+              >
+                Stream (BeeStreamed)
+              </button>
+
+              <button
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  background: "rgba(255,255,255,0.06)",
+                  cursor: "pointer",
+                }}
+                onClick={() => {
+                  setShowPlayChoiceModal(false);
+                  void startConferenceSession();
+                }}
+              >
+                Conference (Jitsi)
+              </button>
+
+              <button
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  background: "transparent",
+                  cursor: "pointer",
+                }}
+                onClick={() => setShowPlayChoiceModal(false)}
+              >
+                Cancel
+              </button>
+            </div>
+
+            {jitsiError ? (
+              <div style={{ marginTop: 12, color: "#ffb4b4", fontSize: 12 }}>{jitsiError}</div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
           <img
@@ -6414,7 +6822,7 @@ const modePillControls = (
                     fontWeight: 700,
                   }}
                 >
-                  ● Live session active
+                  ● Live {sessionKind === "conference" ? "conference" : "stream"} active
                 </span>
               ) : null}
 
@@ -6475,6 +6883,24 @@ const modePillControls = (
           // Leaving the session is done exclusively via Stop.
           if (liveProvider === "stream") {
             if (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) return;
+
+            // If a conference is active, Play joins it (no STT).
+            if (beestreamedSessionActive && sessionKind === "conference") {
+              conferenceOptOutRef.current = false;
+              setShowAvatarFrame(true);
+
+              const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
+              const room = (sessionRoom || fallbackRoom).trim();
+              void joinJitsiConference(room);
+              return;
+            }
+
+            // Host-only: when idle, prompt for Stream vs Conference.
+            if (isBeeStreamedHost && !beestreamedSessionActive) {
+              setShowPlayChoiceModal(true);
+              return;
+            }
+
             void startLiveAvatar();
             return;
           }
@@ -6623,7 +7049,28 @@ const modePillControls = (
                 position: "relative",
               }}
             >
-                            {liveProvider === "stream" && streamEmbedUrl ? (
+                            {liveProvider === "stream" && beestreamedSessionActive && sessionKind === "conference" ? (
+                <div style={{ width: "100%", height: "100%", position: "relative" }}>
+                  <div ref={jitsiContainerRef} style={{ width: "100%", height: "100%" }} />
+                  {jitsiError ? (
+                    <div
+                      style={{
+                        position: "absolute",
+                        left: 12,
+                        right: 12,
+                        bottom: 12,
+                        padding: 10,
+                        borderRadius: 10,
+                        background: "rgba(0,0,0,0.6)",
+                        border: "1px solid rgba(255,255,255,0.14)",
+                        fontSize: 12,
+                      }}
+                    >
+                      {jitsiError}
+                    </div>
+                  ) : null}
+                </div>
+              ) : liveProvider === "stream" && streamEmbedUrl ? (
                 <iframe
                   src={streamEmbedUrl}
                   title="Live Stream"
