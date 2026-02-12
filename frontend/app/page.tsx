@@ -3569,10 +3569,11 @@ const disposeJitsi = useCallback(() => {
     jitsiContainerRef.current.innerHTML = "";
   }
 
-  setJitsiError("");
-}, []);
   setConferenceJoined(false);
   joinedStreamRef.current = false;
+
+  setJitsiError("");
+}, []);
 
 const stopConferenceSession = useCallback(async () => {
   // Viewers leaving the conference should not stop the host session.
