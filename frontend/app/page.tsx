@@ -6411,10 +6411,10 @@ const hostCanStopStream =
     avatarStatus === "error");
 
 const viewerCanStopConference =
-  streamSessionActive && sessionKind === "conference" && !isBeeStreamedHost && conferenceJoined;
+  beestreamedSessionActive && sessionKind === "conference" && !isBeeStreamedHost && conferenceJoined;
 
 const hostCanStopConference =
-  streamSessionActive && sessionKind === "conference" && isBeeStreamedHost;
+  beestreamedSessionActive && sessionKind === "conference" && isBeeStreamedHost;
 
 const hostInStreamUi =
   liveProvider === "stream" &&
