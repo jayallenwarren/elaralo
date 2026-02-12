@@ -1694,9 +1694,6 @@ useEffect(() => {
     };
   }, [API_BASE, companyName, companionName]);
 
-
-
-
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
   // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
@@ -1886,7 +1883,7 @@ const liveEnabled = useMemo(() => {
   // UI layout
   const conversationHeight = 520;
   // UI: show the video frame whenever the user is in a Live Video session.
-// For Stream: show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
+// For Stream (BeeStreamed): show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
 // so the click is never perceived as a no-op and the viewer can always press Stop to exit waiting.
 const streamUiActive =
   liveProvider === "stream" &&
@@ -3184,12 +3181,6 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   const [beestreamedSessionActive, setBeestreamedSessionActive] = useState<boolean>(false);
 
 const [sessionKind, setSessionKind] = useState<SessionKind>("");
-
-// Keep the latest sessionKind for polling logic without recreating intervals.
-const sessionKindRef = useRef<SessionKind>("");
-useEffect(() => {
-  sessionKindRef.current = sessionKind;
-}, [sessionKind]);
 const [sessionRoom, setSessionRoom] = useState<string>("");
 
 // Host-only Play modal (Stream vs Conference)
@@ -3199,6 +3190,10 @@ const [showPlayChoiceModal, setShowPlayChoiceModal] = useState<boolean>(false);
 const jitsiContainerRef = useRef<HTMLDivElement | null>(null);
 const jitsiApiRef = useRef<any>(null);
 const conferenceOptOutRef = useRef<boolean>(false);
+
+  // Conference join tracking (for shared live chat + UI gating)
+  const joinedConferenceRef = useRef<boolean>(false);
+  const [conferenceJoined, setConferenceJoined] = useState<boolean>(false);
 const [jitsiError, setJitsiError] = useState<string>("");
 
   // BeeStreamed status polling can hit different backend instances; avoid flickering UI by
@@ -3209,46 +3204,6 @@ const [jitsiError, setJitsiError] = useState<string>("");
     const hid = String(beestreamedHostMemberId || "").trim();
     return Boolean(mid && hid && mid === hid);
   }, [memberId, beestreamedHostMemberId]);
-
-// Host heartbeat: keep sessions from getting "stuck active" if a stop call fails or a tab closes.
-// The backend will auto-clear `session_active` if it doesn't receive these pings for a while.
-useEffect(() => {
-  if (!API_BASE || !companyName || !companionName) return;
-  if (!isBeeStreamedHost) return;
-  if (!memberId) return;
-  if (!beestreamedSessionActive) return;
-
-  // Only ping once the host has actually started/joined a live session in this browser.
-  // (Prevents a stale session from being kept alive just by opening the page.)
-  if (avatarStatus === "idle" || avatarStatus === "waiting") return;
-
-  let cancelled = false;
-
-  const ping = async () => {
-    try {
-      await fetch(`${API_BASE}/session/ping`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ brand: companyName, avatar: companionName, memberId }),
-      });
-    } catch (e) {
-      // swallow
-    }
-  };
-
-  void ping();
-  const t = window.setInterval(() => {
-    if (cancelled) return;
-    void ping();
-  }, 20000);
-
-  return () => {
-    cancelled = true;
-    window.clearInterval(t);
-  };
-}, [API_BASE, companyName, companionName, isBeeStreamedHost, memberId, beestreamedSessionActive, avatarStatus]);
-
   // Viewer-only: treat the companion's BeeStreamed session as "Live Streaming" when the HOST is live.
   // This is intentionally *global* (not tied to whether the viewer currently has the iframe open),
   // because we must block AI responses for everyone while the host is streaming.
@@ -3548,16 +3503,11 @@ const sanitizeRoomToken = useCallback((raw: string, maxLen = 128) => {
   return out.slice(0, maxLen);
 }, []);
 
-const ensureJitsiExternalApiLoaded = useCallback(async (domainOverride?: string): Promise<void> => {
+const ensureJitsiExternalApiLoaded = useCallback(async (): Promise<void> => {
   if (typeof window === "undefined") return;
   if (window.JitsiMeetExternalAPI) return;
 
-  const domain = String(
-    domainOverride ||
-      process.env.NEXT_PUBLIC_JAAS_DOMAIN ||
-      process.env.NEXT_PUBLIC_JITSI_DOMAIN ||
-      "meet.jit.si",
-  ).replace(/^https?:\/\//, "");
+  const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
   const scriptUrl = `https://${domain}/external_api.js`;
 
   await new Promise<void>((resolve, reject) => {
@@ -3580,6 +3530,9 @@ const ensureJitsiExternalApiLoaded = useCallback(async (domainOverride?: string)
 }, []);
 
 const disposeJitsi = useCallback(() => {
+    // Reset conference join flags
+    joinedConferenceRef.current = false;
+    setConferenceJoined(false);
   try {
     jitsiApiRef.current?.dispose?.();
   } catch {
@@ -3642,59 +3595,22 @@ const joinJitsiConference = useCallback(
     setAvatarStatus("connecting");
 
     try {
-      // Clear any previous iframe
-      jitsiContainerRef.current.innerHTML = "";
-
-      // Use the same username state used for Shared Live Chat.
-      const displayName =
-        (isBeeStreamedHost ? "Host" : viewerLiveChatName || "Viewer").trim() || "Viewer";
-      const subject = `Live Conference — ${companyName || "Brand"} / ${companionName || "Companion"}`;
-
-      // Default to community Jitsi; if backend is configured for Jitsi as a Service (JaaS)
-      // it will override the domain / roomName / jwt.
-      let domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(
-        /^https?:\/\//,
-        "",
-      );
-      let roomName = room;
-      let jwt: string | undefined = undefined;
-
-      try {
-        const jwtResp = await fetch(`${API_BASE}/conference/jitsi/jwt`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            brand: companyName,
-            avatar: companionName,
-            room,
-            memberId: memberId || "",
-            displayName,
-            isHost: Boolean(isBeeStreamedHost),
-          }),
-        });
-
-        const jwtData = jwtResp.ok ? await jwtResp.json().catch(() => null) : null;
-        if (jwtData && jwtData.ok && typeof jwtData.jwt === "string" && jwtData.jwt.trim()) {
-          jwt = jwtData.jwt;
-          if (typeof jwtData.domain === "string" && jwtData.domain.trim()) {
-            domain = String(jwtData.domain).replace(/^https?:\/\//, "");
-          }
-          if (typeof jwtData.roomName === "string" && jwtData.roomName.trim()) {
-            roomName = String(jwtData.roomName);
-          }
-        }
-      } catch {
-        // Ignore - we'll fall back to public Jitsi.
-      }
-
-      await ensureJitsiExternalApiLoaded(domain);
+      await ensureJitsiExternalApiLoaded();
       if (!window.JitsiMeetExternalAPI) {
         throw new Error("JitsiMeetExternalAPI is not available.");
       }
 
+      // Clear any previous iframe
+      jitsiContainerRef.current.innerHTML = "";
+
+      const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
+      // Use the same username state used for Shared Live Chat.
+      // (Earlier iterations referenced a `username` variable that didn't exist.)
+      const displayName = String(viewerLiveChatName || "").trim() || (memberId ? "Member" : "Guest");
+      const subject = `${companyName} • ${companionName}`.trim();
+
       const options: any = {
-        roomName,
-        jwt,
+        roomName: room,
         parentNode: jitsiContainerRef.current,
         width: "100%",
         height: "100%",
@@ -3729,6 +3645,9 @@ const joinJitsiConference = useCallback(
 
       api.addListener?.("videoConferenceJoined", () => {
         setAvatarStatus("connected");
+        joinedConferenceRef.current = true;
+        setConferenceJoined(true);
+        setStreamNotice("");
         try {
           if (subject) api.executeCommand?.("subject", subject);
         } catch {
@@ -3942,23 +3861,10 @@ useEffect(() => {
         }
 
         const nextActive = Boolean(data.sessionActive);
-
-        // Backend may return sessionKind/sessionRoom (preferred). If not present yet,
-        // preserve conference locally if we're already joined (prevents stop() from missing conference teardown).
         const rawKind = String((data as any).sessionKind || "").trim().toLowerCase();
-        const rawRoom = String((data as any).sessionRoom || (data as any).jitsiRoom || "").trim();
-
-        let nextKind: SessionKind = "";
-        if (rawKind === "conference" || rawKind === "stream") {
-          nextKind = rawKind as SessionKind;
-        } else if (nextActive) {
-          nextKind =
-            sessionKindRef.current === "conference" || Boolean(jitsiApiRef.current) ? "conference" : "stream";
-        } else {
-          nextKind = "";
-        }
-
-        const nextRoom = rawRoom;
+        const nextKind: SessionKind =
+          rawKind === "conference" || rawKind === "stream" ? (rawKind as SessionKind) : nextActive ? "stream" : "";
+        const nextRoom = String((data as any).sessionRoom || "").trim();
 
         if (nextActive) {
           beestreamedStatusInactivePollsRef.current = 0;
@@ -4789,7 +4695,7 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     if (!rawText && !hasAttachment) return;
 
     // Hard rule: no attachments during Shared Live streaming.
-    if (sessionKind === "stream" && (beestreamedSessionActive || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
+    if ((beestreamedSessionActive || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
       try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
       return;
     }
@@ -4875,7 +4781,7 @@ let streamSessionActive = Boolean(beestreamedSessionActive);
   // Whether THIS user is currently inside the shared in-stream experience.
   // (Important: this must NOT depend on the current UI mode selection; users can switch modes
   // and must still remain blocked from AI while the host is live until the stream ends.)
-  let userInStreamSession = Boolean(streamSessionActive);
+  const userInLiveSession = joinedStreamRef.current || joinedConferenceRef.current;
 
 // Avoid race with the polling loop:
 // right before deciding to call /chat, do a one-off status check.
@@ -4903,15 +4809,13 @@ if (!streamSessionActive && API_BASE && companyName && companionName) {
   }
 }
 
-userInStreamSession = Boolean(streamSessionActive);
-
 if (streamSessionActive) {
   const who = (companionName || "This companion").trim() || "This companion";
   const notice = `${who} is in a live session now but will respond once the session concludes.`;
 
   // In-stream members (host + joined viewers): this is a *shared live chat*.
   // Do NOT queue these messages for AI and do NOT send them to /chat later.
-  if (userInStreamSession) {
+  if (userInLiveSession) {
     const clientMsgId =
       (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
@@ -6292,8 +6196,7 @@ const speakGreetingIfNeeded = useCallback(
     } catch (e) {}
 
     // Conference: Stop/leave Jitsi (host stops the session for everyone).
-    // Use either the sessionKind flag OR the presence of a mounted Jitsi iframe as the signal.
-    if (sessionKind === "conference" || Boolean(jitsiApiRef.current)) {
+    if (sessionKind === "conference") {
       void stopConferenceSession();
       return;
     }
@@ -6335,7 +6238,7 @@ const speakGreetingIfNeeded = useCallback(
     try { void nudgeAudioSession(); } catch (e) {}
     try { primeLocalTtsAudio(true); } catch (e) {}
     try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, streamEmbedUrl, streamEventRef, beestreamedSessionActive, isBeeStreamedHost, sessionKind, stopConferenceSession, avatarStatus, stopLiveAvatar]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, streamEmbedUrl, streamEventRef, stopLiveAvatar]);
 
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
@@ -6498,22 +6401,22 @@ const viewerCanStopStream =
 
 // Host requirement: Stop must end the live session (and send the end-event signal to BeeStreamed).
 const hostCanStopStream =
-  (liveProvider === "stream" &&
-    streamCanStart &&
-    (Boolean(streamEmbedUrl || streamEventRef) ||
-      avatarStatus === "connected" ||
-      avatarStatus === "waiting" ||
-      avatarStatus === "connecting" ||
-      avatarStatus === "reconnecting" ||
-      avatarStatus === "error")) ||
-  (sessionKind === "conference" &&
-    Boolean(beestreamedSessionActive) &&
-    Boolean(isBeeStreamedHost));
+  liveProvider === "stream" &&
+  streamCanStart &&
+  (Boolean(streamEmbedUrl || streamEventRef) ||
+    avatarStatus === "connected" ||
+    avatarStatus === "waiting" ||
+    avatarStatus === "connecting" ||
+    avatarStatus === "reconnecting" ||
+    avatarStatus === "error");
 
-// Stream vs Conference: we share a single session_active flag across both session kinds.
-// These derived flags must be *stream-only* so conference mode isn't treated like BeeStreamed UI.
+const viewerCanStopConference =
+  streamSessionActive && sessionKind === "conference" && !isBeeStreamedHost && conferenceJoined;
+
+const hostCanStopConference =
+  streamSessionActive && sessionKind === "conference" && isBeeStreamedHost;
+
 const hostInStreamUi =
-  sessionKind === "stream" &&
   liveProvider === "stream" &&
   streamCanStart &&
   (Boolean(streamEmbedUrl || streamEventRef) ||
@@ -6522,7 +6425,7 @@ const hostInStreamUi =
     avatarStatus === "connecting" ||
     avatarStatus === "reconnecting");
 
-const viewerInStreamUi = sessionKind === "stream" && viewerHasJoinedStream;
+const viewerInStreamUi = viewerHasJoinedStream;
 
 useEffect(() => {
   // Viewer STT must be disabled while in the BeeStreamed stream UI to avoid transcribing the host audio.
@@ -6570,7 +6473,7 @@ const sttControls = (
       <button
         type="button"
         onClick={handleStopClick}
-        disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream)}
+        disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference)}
         title="Stop"
         style={{
           width: 44,
@@ -6807,7 +6710,7 @@ const modePillControls = (
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.35)",
+            background: "rgba(0,0,0,0.55)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -6819,18 +6722,17 @@ const modePillControls = (
           <div
             style={{
               width: "min(520px, 100%)",
-              background: "#ffffff",
-              color: "#0f172a",
-              border: "1px solid rgba(15,23,42,0.18)",
+              background: "#0b0f19",
+              border: "1px solid rgba(255,255,255,0.12)",
               borderRadius: 14,
               padding: 16,
-              boxShadow: "0 12px 40px rgba(0,0,0,0.25)",
+              boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
             }}
             onClick={(e) => e.stopPropagation()}
           >
             <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Start a session</div>
             <div style={{ opacity: 0.85, fontSize: 13, marginBottom: 14 }}>
-              Choose <b>Stream</b> or a 1:1 <b>Conference</b>. You can&apos;t run both at the same time.
+              Choose <b>Stream</b> (BeeStreamed) or a 1:1 <b>Conference</b> (Jitsi). You can&apos;t run both at the same time.
             </div>
 
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -6838,9 +6740,8 @@ const modePillControls = (
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid #0f172a",
-                  background: "#0f172a",
-                  color: "#ffffff",
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  background: "rgba(255,255,255,0.06)",
                   cursor: "pointer",
                 }}
                 onClick={() => {
@@ -6848,16 +6749,15 @@ const modePillControls = (
                   void startLiveAvatar();
                 }}
               >
-                Stream
+                Stream (BeeStreamed)
               </button>
 
               <button
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid #0f172a",
-                  background: "#0f172a",
-                  color: "#ffffff",
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  background: "rgba(255,255,255,0.06)",
                   cursor: "pointer",
                 }}
                 onClick={() => {
@@ -6865,16 +6765,15 @@ const modePillControls = (
                   void startConferenceSession();
                 }}
               >
-                Conference
+                Conference (Jitsi)
               </button>
 
               <button
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid rgba(15,23,42,0.18)",
-                  background: "#f1f5f9",
-                  color: "#0f172a",
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  background: "transparent",
                   cursor: "pointer",
                 }}
                 onClick={() => setShowPlayChoiceModal(false)}
@@ -6884,7 +6783,7 @@ const modePillControls = (
             </div>
 
             {jitsiError ? (
-              <div style={{ marginTop: 12, color: "#b00020", fontSize: 12 }}>{jitsiError}</div>
+              <div style={{ marginTop: 12, color: "#ffb4b4", fontSize: 12 }}>{jitsiError}</div>
             ) : null}
           </div>
         </div>
@@ -7150,7 +7049,7 @@ const modePillControls = (
         }}
       >
         {showAvatarFrame ? (
-          <div style={{ flex: (sessionKind === "conference" && beestreamedSessionActive) ? "2 1 0" : (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "2 1 0" : "1 1 0", minWidth: 260, height: conversationHeight }}>
+          <div style={{ flex: (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "2 1 0" : "1 1 0", minWidth: 260, height: conversationHeight }}>
             <div
               style={{
                 border: "1px solid #e5e5e5",
@@ -7202,10 +7101,7 @@ const modePillControls = (
                   muted={false}
                 />
               )}
-              {avatarStatus !== "connected" &&
-              avatarStatus !== "idle" &&
-              !(liveProvider === "stream" && Boolean(streamEmbedUrl)) &&
-              !(sessionKind === "conference" && Boolean(beestreamedSessionActive)) ? (
+              {avatarStatus !== "connected" ? (
                 <div
                   style={{
                     position: "absolute",
@@ -7221,7 +7117,17 @@ const modePillControls = (
                     pointerEvents: "none",
                   }}
                 >
-                  {avatarStatus === "connecting"
+                  {avatarStatus === "idle"
+                    ? beestreamedSessionActive &&
+                      !isBeeStreamedHost &&
+                      !viewerHasJoinedStream &&
+                      !conferenceJoined
+                      ? streamNotice ||
+                        (sessionKind === "conference"
+                          ? "A live conference is active. Press play to join."
+                          : "A live stream is active. Press play to join.")
+                      : null
+                    : avatarStatus === "connecting"
                     ? "Connecting…"
                     : avatarStatus === "reconnecting"
                     ? "Reconnecting…"
@@ -7238,7 +7144,7 @@ const modePillControls = (
 
         <div
           style={{
-            flex: showAvatarFrame ? ((sessionKind === "conference" && beestreamedSessionActive) ? "1 1 0" : (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
+            flex: showAvatarFrame ? ((liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
             minWidth: 280,
             height: conversationHeight,
             display: "flex",
@@ -7467,7 +7373,18 @@ const modePillControls = (
                   send();
                 }
               }}
-              placeholder={sttEnabled ? "Listening…" : "Type a message…"}
+              placeholder={
+                  sttEnabled
+                    ? "Listening…"
+                    : beestreamedSessionActive &&
+                      !isBeeStreamedHost &&
+                      !viewerHasJoinedStream &&
+                      !conferenceJoined
+                    ? sessionKind === "conference"
+                      ? "Live conference is active — press Play to join."
+                      : "Live stream is active — press Play to join."
+                    : "Type a message…"
+                }
               style={{
                 flex: 1,
                 padding: "10px 12px",
@@ -7951,7 +7868,7 @@ const modePillControls = (
               borderRadius: 10,
               padding: 8,
               background: "rgba(255,255,255,0.06)",
-              border: "1px solid rgba(15,23,42,0.18)",
+              border: "1px solid rgba(255,255,255,0.12)",
             }}
           >
             {debugLogs.length === 0 ? (
