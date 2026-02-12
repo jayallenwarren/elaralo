@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import jwt
 import re
 import uuid
 import json
@@ -4229,6 +4230,15 @@ class JitsiStopRequest(BaseModel):
     avatar: str
     memberId: str
 
+class JitsiJwtRequest(BaseModel):
+    brand: str
+    avatar: str
+    room: str
+    memberId: Optional[str] = ""
+    displayName: Optional[str] = ""
+    isHost: Optional[bool] = False
+
+
 
 def _jitsi_domain() -> str:
     d = (os.getenv("JITSI_DOMAIN") or "").strip()
@@ -4251,24 +4261,28 @@ class SessionPingBody(BaseModel):
 
 
 @app.post("/session/ping")
-async def session_ping(body: SessionPingBody):
-    """Host-only heartbeat to keep `session_active` from being auto-cleared as stale."""
-    brand = (body.brand or "").strip()
-    avatar = (body.avatar or "").strip()
-    member_id = (body.memberId or "").strip()
+async def session_ping(req: SessionPingRequest):
+    """Keep-alive for an active Stream/Conference session.
 
-    if not brand or not avatar or not member_id:
-        raise HTTPException(status_code=400, detail="brand, avatar, and memberId are required")
+    The frontend calls this periodically (HOST-only) to prevent server-side stale-session
+    cleanup from flipping an in-progress session to inactive.
+    """
 
-    # Only the host can send heartbeats.
-    if not _session_is_host(brand, avatar, member_id):
-        raise HTTPException(status_code=403, detail="Only the host can ping the session")
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
 
-    if not _is_session_active(brand, avatar):
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    brand_norm = _norm(brand)
+    avatar_norm = _norm(avatar)
+
+    state = _get_session_state_sync(brand_norm, avatar_norm)
+    if not state or not state.get("session_active"):
         return {"ok": True, "sessionActive": False}
 
-    _touch_session_state_sync(brand, avatar)
-    return {"ok": True, "sessionActive": True, "updatedAt": int(time.time())}
+    _touch_session_state_sync(brand_norm, avatar_norm)
+    return {"ok": True, "sessionActive": True}
 
 
 
@@ -4339,6 +4353,86 @@ async def jitsi_stop(req: JitsiStopRequest):
         pass
 
     return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
+
+
+def _get_jaas_signing_config() -> Optional[Tuple[str, str, str, str]]:
+    """Return (domain, kid, sub, private_key_pem) if JaaS is configured."""
+
+    domain = (os.getenv("JITSI_JAAS_DOMAIN", "8x8.vc") or "").strip() or "8x8.vc"
+
+    kid = (os.getenv("JITSI_JAAS_KID", "") or "").strip()
+    sub = (os.getenv("JITSI_JAAS_SUB", "") or "").strip()
+    if not sub and kid and "/" in kid:
+        sub = kid.split("/", 1)[0]
+
+    key_pem = (os.getenv("JITSI_JAAS_PRIVATE_KEY", "") or "").strip()
+    key_b64 = (os.getenv("JITSI_JAAS_PRIVATE_KEY_B64", "") or "").strip()
+
+    if key_b64 and not key_pem:
+        try:
+            key_pem = base64.b64decode(key_b64.encode("utf-8")).decode("utf-8", errors="ignore")
+        except Exception:
+            key_pem = ""
+
+    # Allow env values with literal \n sequences.
+    if "\\n" in key_pem:
+        key_pem = key_pem.replace("\\n", "\n")
+
+    if not (kid and sub and key_pem):
+        return None
+
+    return (domain, kid, sub, key_pem)
+
+
+@app.post("/conference/jitsi/jwt")
+async def conference_jitsi_jwt(req: JitsiJwtRequest):
+    """Return a signed JWT for Jitsi as a Service (JaaS), if configured.
+
+    Frontend will fall back to public Jitsi when this returns ok=false.
+    """
+
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
+    room = (req.room or "").strip()
+
+    if not brand or not avatar or not room:
+        raise HTTPException(status_code=400, detail="brand, avatar, and room are required")
+
+    cfg = _get_jaas_signing_config()
+    if not cfg:
+        return {"ok": False, "reason": "JaaS not configured"}
+
+    domain, kid, sub, key_pem = cfg
+
+    display_name = (req.displayName or "").strip() or ("Host" if req.isHost else "Viewer")
+    user_id = (req.memberId or "").strip() or display_name
+
+    now = int(time.time())
+    payload = {
+        "aud": "jitsi",
+        "iss": "chat",
+        "sub": sub,
+        # Using '*' avoids ambiguity around whether JaaS expects the raw room vs 'sub/room'.
+        "room": "*",
+        "nbf": now - 10,
+        "exp": now + 60 * 60,
+        "context": {
+            "user": {
+                "id": user_id,
+                "name": display_name,
+                "moderator": bool(req.isHost),
+            }
+        },
+    }
+
+    try:
+        token = jwt.encode(payload, key_pem, algorithm="RS256", headers={"kid": kid, "typ": "JWT"})
+    except Exception as e:
+        return {"ok": False, "reason": f"JWT signing failed: {e.__class__.__name__}"}
+
+    room_name = f"{sub}/{room}"
+    return {"ok": True, "jwt": token, "domain": domain, "roomName": room_name}
+
 
 
 @app.get("/session/status")
