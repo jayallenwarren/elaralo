@@ -26,19 +26,31 @@ from fastapi.responses import HTMLResponse, Response, JSONResponse
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
 
-from .settings import settings
-from .models import ChatResponse  # kept for compatibility with existing codebase
+# NOTE: This app is deployed in multiple layouts (sometimes as a package, sometimes as a single-file drop-in).
+# These import fallbacks prevent 503 "Service Unavailable" at the App Service layer when Python can't resolve
+# relative imports due to module/package context.
+try:
+    from .settings import settings  # type: ignore
+    from .models import ChatResponse  # type: ignore  # kept for compatibility with existing codebase
+except Exception:  # pragma: no cover
+    try:
+        from settings import settings  # type: ignore
+        from models import ChatResponse  # type: ignore
+    except Exception:
+        # Last-resort common package layout
+        from app.settings import settings  # type: ignore
+        from app.models import ChatResponse  # type: ignore
 
-
-# ----------------------------
-# Optional consent router
-# ----------------------------
 try:
     from .consent_routes import router as consent_router  # type: ignore
-except Exception:
-    consent_router = None
-
-
+except Exception:  # pragma: no cover
+    try:
+        from consent_routes import router as consent_router  # type: ignore
+    except Exception:
+        try:
+            from app.consent_routes import router as consent_router  # type: ignore
+        except Exception:
+            consent_router = None
 STATUS_SAFE = "safe"
 STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
@@ -246,269 +258,6 @@ async def wix_form(payload: dict, _auth: None = Depends(require_wix_api_key)):
     return {"ok": True}
 
 
-# ----------------------------
-# Wix App Webhooks (Payment Links)
-# ----------------------------
-
-def _wix_webhook_public_key() -> str:
-    """RSA public key for verifying Wix webhook JWTs (set WIX_WEBHOOK_PUBLIC_KEY)."""
-    key = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY") or "").strip()
-    if not key:
-        return ""
-    # Allow env var to be stored with literal \n
-    return key.replace("\\n", "\n").strip()
-
-
-
-
-def _b64url_decode(s: str) -> bytes:
-    import base64
-
-    s = (s or "").strip()
-    # Add required padding
-    pad = '=' * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-
-def _wix_decode_jwt_unverified(token: str) -> Dict[str, Any]:
-    parts = (token or "").split(".")
-    if len(parts) != 3:
-        raise ValueError("Invalid JWT format")
-    payload_b64 = parts[1]
-    payload_json = _b64url_decode(payload_b64).decode("utf-8", "ignore")
-    obj = json.loads(payload_json)
-    if not isinstance(obj, dict):
-        raise ValueError("JWT payload is not an object")
-    return obj
-
-
-def _wix_verify_jwt_rs256(token: str, public_key_pem: str) -> Dict[str, Any]:
-    """Verify RS256 signature using 'cryptography' (imported lazily).
-
-    This avoids adding a third-party JWT dependency (PyJWT), while still allowing
-    production-grade verification when 'cryptography' is available.
-    """
-    parts = (token or "").split(".")
-    if len(parts) != 3:
-        raise ValueError("Invalid JWT format")
-    header_b64, payload_b64, sig_b64 = parts
-
-    header_json = _b64url_decode(header_b64).decode("utf-8", "ignore")
-    header = json.loads(header_json)
-    if isinstance(header, dict):
-        alg = str(header.get("alg", "")).upper()
-        if alg and alg != "RS256":
-            raise ValueError(f"Unsupported alg: {alg}")
-
-    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-    signature = _b64url_decode(sig_b64)
-
-    # Lazy import so the app doesn't fail to start if cryptography isn't installed.
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
-    from cryptography.hazmat.primitives.serialization import load_pem_public_key
-
-    key = load_pem_public_key((public_key_pem or "").encode("utf-8"))
-    key.verify(signature, signing_input, padding.PKCS1v15(), hashes.SHA256())
-
-    return _wix_decode_jwt_unverified(token)
-
-
-def _wix_decode_webhook_jwt(token: str, public_key_pem: str) -> Dict[str, Any]:
-    """Decode a Wix webhook JWT.
-
-    We avoid third-party JWT libs (PyJWT) so the backend does not need extra dependencies.
-
-    Verification behavior:
-      - If WIX_WEBHOOK_PUBLIC_KEY is set, we *attempt* RS256 verification using `cryptography`.
-      - If `cryptography` is not available and WIX_WEBHOOK_REQUIRE_VERIFICATION is not truthy,
-        we fall back to an *unverified* decode (and mark payload with `_verified=False`).
-      - If WIX_WEBHOOK_REQUIRE_VERIFICATION is truthy, missing `cryptography` or failed
-        verification will raise.
-
-    SECURITY NOTE: Unverified decode is NOT secure. Use only in development.
-    """
-    token = (token or "").strip().strip('"')
-    if not token:
-        raise ValueError("Empty token")
-
-    require_verification = os.getenv("WIX_WEBHOOK_REQUIRE_VERIFICATION", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    )
-
-    if (public_key_pem or "").strip():
-        try:
-            payload = _wix_verify_jwt_rs256(token, public_key_pem)
-            if isinstance(payload, dict):
-                payload.setdefault("_verified", True)
-            return payload
-        except (ImportError, ModuleNotFoundError) as e:
-            if require_verification:
-                raise
-            logger.warning(
-                "cryptography not available (%s); accepting Wix webhook JWT without verification",
-                str(e),
-            )
-            payload = _wix_decode_jwt_unverified(token)
-            if isinstance(payload, dict):
-                payload.setdefault("_verified", False)
-            return payload
-
-    logger.warning("WIX_WEBHOOK_PUBLIC_KEY not set; decoding Wix webhook JWT without verification")
-    payload = _wix_decode_jwt_unverified(token)
-    if isinstance(payload, dict):
-        payload.setdefault("_verified", False)
-    return payload
-
-def _deep_find_first_str(obj: Any, keys: List[str]) -> Optional[str]:
-    """Search nested dict/list for the first string value whose key matches one of keys."""
-    keys_l = {k.lower() for k in keys}
-
-    def _walk(o: Any) -> Optional[str]:
-        if isinstance(o, dict):
-            for k, v in o.items():
-                if str(k).lower() in keys_l and isinstance(v, (str, int, float)):
-                    s = str(v).strip()
-                    if s:
-                        return s
-                found = _walk(v)
-                if found:
-                    return found
-        elif isinstance(o, list):
-            for it in o:
-                found = _walk(it)
-                if found:
-                    return found
-        return None
-
-    return _walk(obj)
-
-
-def _wix_store_event_sync(event_id: str, event_type: str, entity_id: str, payload: Dict[str, Any]) -> None:
-    try:
-        _ensure_session_state_tables_sync()
-        db_path = _runtime_mappings_db_path_sync()
-        conn = sqlite3.connect(db_path)
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                f"INSERT OR REPLACE INTO {_WIX_WEBHOOK_EVENTS_TABLE}(event_id, event_type, entity_id, received_at, payload_json) VALUES(?,?,?,?,?)",
-                (
-                    event_id,
-                    event_type or "",
-                    entity_id or "",
-                    int(time.time()),
-                    json.dumps(payload, ensure_ascii=False),
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception:
-        # Never break the webhook caller.
-        pass
-
-
-def _wix_mark_credited_sync(event_id: str, member_id: str, minutes: int) -> bool:
-    """Idempotency guard. Returns True if this is the first time we see event_id."""
-    try:
-        _ensure_session_state_tables_sync()
-        db_path = _runtime_mappings_db_path_sync()
-        conn = sqlite3.connect(db_path)
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                f"INSERT INTO {_WIX_WEBHOOK_CREDITS_TABLE}(event_id, member_id, minutes, credited_at) VALUES(?,?,?,?)",
-                (event_id, member_id, int(minutes), int(time.time())),
-            )
-            conn.commit()
-            return True
-        except Exception:
-            return False
-        finally:
-            conn.close()
-    except Exception:
-        return False
-
-
-@app.post("/webhooks/wix/payment-link-payment-updated")
-async def wix_payment_link_payment_updated(request: Request):
-    """Receive Wix App Webhook events for payment link payments (JWT body).
-
-    This endpoint is designed to:
-    - Verify JWT when WIX_WEBHOOK_PUBLIC_KEY is configured.
-    - Store the event for audit/debug.
-    - Credit minutes when we can reliably extract memberId + a successful status.
-    """
-    raw = (await request.body()) or b""
-    token = raw.decode("utf-8", "ignore").strip().strip('"')
-    if not token:
-        raise HTTPException(status_code=400, detail="Empty webhook body")
-
-    pub_key = _wix_webhook_public_key()
-    payload: Dict[str, Any]
-    try:
-        payload = _wix_decode_webhook_jwt(token, pub_key)
-    except Exception as e:
-        # Still return 200 to avoid Wix retry storms; store minimal diagnostic.
-        _wix_store_event_sync(
-            event_id=hashlib.sha256(token.encode("utf-8", "ignore")).hexdigest(),
-            event_type="decode_error",
-            entity_id="",
-            payload={"error": str(e)},
-        )
-        return {"ok": True, "credited": False, "reason": "decode_failed"}
-
-    # Extract IDs and metadata.
-    event_type = (
-        (payload.get("eventType") or payload.get("event_type") or "")
-        if isinstance(payload, dict)
-        else ""
-    )
-    entity_id = _deep_find_first_str(payload, ["entityId", "entity_id", "paymentLinkPaymentId", "paymentId", "id"]) or ""
-    event_id = _deep_find_first_str(payload, ["eventId", "event_id", "id"]) or ""
-    if not event_id:
-        event_id = hashlib.sha256(token.encode("utf-8", "ignore")).hexdigest()
-
-    _wix_store_event_sync(event_id=event_id, event_type=event_type, entity_id=entity_id, payload=payload)
-
-    # Only credit on "successful" states.
-    status = (_deep_find_first_str(payload, ["status", "paymentStatus", "state"]) or "").upper()
-    successful_statuses = {"APPROVED", "PAID", "SUCCESS", "SUCCEEDED", "COMPLETED", "CONFIRMED"}
-    if status and status not in successful_statuses:
-        return {"ok": True, "credited": False, "reason": f"status={status}"}
-
-    member_id = _deep_find_first_str(payload, ["memberId", "siteMemberId", "member_id"]) or ""
-    if not member_id:
-        return {"ok": True, "credited": False, "reason": "memberId_not_found"}
-
-    # Minutes: prefer explicit field in payload, else last-known pay_go_minutes from member's rebranding key.
-    minutes_str = _deep_find_first_str(payload, ["minutes", "payGoMinutes", "pay_go_minutes"])
-    minutes: Optional[int] = _safe_int(minutes_str) if minutes_str is not None else None
-    if minutes is None:
-        minutes = _get_member_rebranding_minutes_sync(member_id)
-
-    if minutes is None or minutes <= 0:
-        return {"ok": True, "credited": False, "memberId": member_id, "reason": "minutes_not_found"}
-
-    # Idempotency: only credit once per webhook event id.
-    if not _wix_mark_credited_sync(event_id, member_id, minutes):
-        return {"ok": True, "credited": False, "memberId": member_id, "minutes": minutes, "reason": "duplicate_event"}
-
-    # Apply credit.
-    identity_key = f"member::{member_id}"
-    try:
-        _usage_credit_minutes_sync(identity_key, minutes)
-        return {"ok": True, "credited": True, "memberId": member_id, "minutes": minutes}
-    except Exception as e:
-        return {"ok": True, "credited": False, "memberId": member_id, "minutes": minutes, "reason": f"credit_failed: {e}"}
-
-
-
 @app.post("/usage/credit")
 async def usage_credit(request: Request):
     """Credit purchased minutes to a member.
@@ -547,52 +296,6 @@ async def usage_credit(request: Request):
     identity_key = f"member::{member_id}"
     result = await run_in_threadpool(_usage_credit_minutes_sync, identity_key, minutes_i)
     return result
-
-
-class UsageStatusRequest(BaseModel):
-    memberId: str
-    planName: Optional[str] = None
-    rebrandingKey: Optional[str] = None
-
-
-@app.post("/usage/status")
-async def usage_status(req: UsageStatusRequest):
-    """Polling-friendly usage status (no additional charging)."""
-    member_id = (req.memberId or "").strip()
-    if not member_id:
-        raise HTTPException(status_code=422, detail="memberId required")
-
-    plan_name = (req.planName or "").strip()
-    is_trial = _is_trial_plan(plan_name)
-
-    rk_raw = _extract_rebranding_key(req.rebrandingKey or "")
-    rk = _strip_rebranding_key_label(rk_raw)
-    rk_parts = _parse_rebranding_key(rk) if rk else None
-
-    plan_map = _norm_plan_map((rk_parts.get("elaralo_plan_map") if rk_parts else "") or "")
-    pay_go_minutes = _safe_int((rk_parts.get("pay_go_minutes") if rk_parts else None))
-    free_minutes = _safe_int((rk_parts.get("free_minutes") if rk_parts else None))
-    cycle_days = _safe_int((rk_parts.get("cycle_days") if rk_parts else None))
-
-    minutes_allowed_override: Optional[int] = None
-    if pay_go_minutes is not None:
-        minutes_allowed_override = pay_go_minutes
-    elif free_minutes is not None:
-        minutes_allowed_override = free_minutes
-    elif plan_map:
-        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
-
-    effective_plan = plan_map or plan_name or "friend"
-    identity_key = f"member::{member_id}"
-
-    return _usage_get_status_sync(
-        identity_key,
-        is_trial=is_trial,
-        plan_name=effective_plan,
-        minutes_allowed_override=minutes_allowed_override,
-        cycle_days_override=cycle_days,
-    )
-
 
 
 @app.get("/ready")
@@ -851,8 +554,6 @@ _COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _COMPANION_MAPPINGS_LOADED_AT: float | None = None
 _COMPANION_MAPPINGS_SOURCE: str = ""
 _COMPANION_MAPPINGS_TABLE: str = ""
-_VOICE_ID_INDEX: Dict[str, Dict[str, Any]] = {}
-
 
 
 def _norm_key(s: str) -> str:
@@ -1055,275 +756,6 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
         print(f"[mappings] WARNING: Failed to create writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
         return src_db_path
 
-# ----------------------------
-# RUNTIME SESSION STATE (DB-backed)
-# ----------------------------
-
-_SESSION_STATE_TABLE = "companion_session_state"
-_MEMBER_REBRANDING_TABLE = "member_rebranding"
-_WIX_WEBHOOK_EVENTS_TABLE = "wix_webhook_events"
-_WIX_WEBHOOK_CREDITS_TABLE = "wix_webhook_credits"
-
-
-# Session liveness/heartbeat:
-# `session_active` is authoritative, but it can get stuck "on" if a host closes a tab
-# or a stop call fails. To prevent UI regressions like "Live stream active" showing
-# before the host presses Play, we treat a session as stale if the host hasn't pinged
-# within `_SESSION_HEARTBEAT_TTL_SECONDS`.
-_SESSION_HEARTBEAT_TTL_SECONDS = int(os.getenv("SESSION_HEARTBEAT_TTL_SECONDS", "45"))
-
-def _is_session_state_stale(state: Optional[Dict[str, Any]]) -> bool:
-    if not state:
-        return True
-    try:
-        updated_at = int(state.get("updatedAt") or 0)
-    except Exception:
-        return True
-    if updated_at <= 0:
-        return True
-    return (int(time.time()) - updated_at) > _SESSION_HEARTBEAT_TTL_SECONDS
-
-
-
-def _runtime_mappings_db_path_sync() -> str:
-    """Return the writable SQLite path used for companion_mappings + runtime state."""
-    # Prefer the already loaded source (it is already the writable copy).
-    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
-    if not db_path:
-        # Fallback: pick the first existing candidate and ensure it's writable.
-        for p in _candidate_mapping_db_paths():
-            if p and os.path.exists(p):
-                db_path = p
-                break
-        if not db_path:
-            raise RuntimeError("voice/video mappings DB not found (VOICE_VIDEO_DB_PATH)")
-        db_path = _ensure_writable_db_copy(db_path)
-    return db_path
-
-
-def _ensure_session_state_tables_sync() -> None:
-    """Create tables used for multi-worker shared state if missing."""
-    db_path = _runtime_mappings_db_path_sync()
-    conn = sqlite3.connect(db_path)
-    try:
-        cur = conn.cursor()
-
-        # Session kind + per-session runtime values (conference room / stream event_ref).
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_SESSION_STATE_TABLE} (
-              brand_norm TEXT NOT NULL,
-              avatar_norm TEXT NOT NULL,
-              session_kind TEXT NOT NULL,
-              event_ref TEXT,
-              jitsi_room TEXT,
-              updated_at INTEGER,
-              PRIMARY KEY (brand_norm, avatar_norm)
-            )
-            """
-        )
-
-        # Remember the last known rebranding key per member to support payment top-ups.
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_MEMBER_REBRANDING_TABLE} (
-              member_id TEXT PRIMARY KEY,
-              rebranding_key TEXT,
-              pay_go_minutes INTEGER,
-              free_minutes INTEGER,
-              cycle_days INTEGER,
-              plan TEXT,
-              plan_map TEXT,
-              updated_at INTEGER
-            )
-            """
-        )
-
-        # Store raw webhook events (debug / audit).
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_WIX_WEBHOOK_EVENTS_TABLE} (
-              event_id TEXT PRIMARY KEY,
-              event_type TEXT,
-              entity_id TEXT,
-              received_at INTEGER,
-              payload_json TEXT
-            )
-            """
-        )
-
-        # Idempotent credits from Wix webhooks.
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_WIX_WEBHOOK_CREDITS_TABLE} (
-              event_id TEXT PRIMARY KEY,
-              member_id TEXT,
-              minutes INTEGER,
-              credited_at INTEGER
-            )
-            """
-        )
-
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _get_session_state_sync(brand: str, avatar: str) -> Dict[str, Any]:
-    _ensure_session_state_tables_sync()
-    db_path = _runtime_mappings_db_path_sync()
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        cur = conn.cursor()
-        b = _norm_key(brand) or "elaralo"
-        a = _norm_key(avatar)
-        cur.execute(
-            f"SELECT session_kind, event_ref, jitsi_room, updated_at FROM {_SESSION_STATE_TABLE} WHERE brand_norm=? AND avatar_norm=?",
-            (b, a),
-        )
-        row = cur.fetchone()
-        if not row:
-            return {"sessionKind": "", "eventRef": "", "jitsiRoom": "", "updatedAt": None}
-        return {
-            "sessionKind": str(row["session_kind"] or ""),
-            "eventRef": str(row["event_ref"] or ""),
-            "jitsiRoom": str(row["jitsi_room"] or ""),
-            "updatedAt": int(row["updated_at"]) if row["updated_at"] is not None else None,
-        }
-    finally:
-        conn.close()
-
-
-def _set_session_state_sync(brand: str, avatar: str, session_kind: str, *, event_ref: str = "", jitsi_room: str = "") -> None:
-    _ensure_session_state_tables_sync()
-    db_path = _runtime_mappings_db_path_sync()
-    conn = sqlite3.connect(db_path)
-    try:
-        cur = conn.cursor()
-        b = _norm_key(brand) or "elaralo"
-        a = _norm_key(avatar)
-        now = int(time.time())
-        cur.execute(
-            f"""
-            INSERT INTO {_SESSION_STATE_TABLE}(brand_norm, avatar_norm, session_kind, event_ref, jitsi_room, updated_at)
-            VALUES(?,?,?,?,?,?)
-            ON CONFLICT(brand_norm, avatar_norm) DO UPDATE SET
-              session_kind=excluded.session_kind,
-              event_ref=excluded.event_ref,
-              jitsi_room=excluded.jitsi_room,
-              updated_at=excluded.updated_at
-            """,
-            (b, a, (session_kind or ""), (event_ref or ""), (jitsi_room or ""), now),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _clear_session_state_sync(brand: str, avatar: str) -> None:
-    _ensure_session_state_tables_sync()
-    db_path = _runtime_mappings_db_path_sync()
-    conn = sqlite3.connect(db_path)
-    try:
-        cur = conn.cursor()
-        b = _norm_key(brand) or "elaralo"
-        a = _norm_key(avatar)
-        cur.execute(
-            f"DELETE FROM {_SESSION_STATE_TABLE} WHERE brand_norm=? AND avatar_norm=?",
-            (b, a),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _touch_session_state_sync(brand: str, avatar: str) -> None:
-    """Heartbeat: update only the session state's `updated_at` timestamp."""
-    _ensure_session_state_tables_sync()
-    conn = sqlite3.connect(_runtime_mappings_db_path_sync())
-    try:
-        cur = conn.cursor()
-        b = _norm_key(brand) or "elaralo"
-        a = _norm_key(avatar)
-        now_ts = int(time.time())
-        cur.execute(
-            f"UPDATE {_SESSION_STATE_TABLE} SET updated_at=? WHERE brand_norm=? AND avatar_norm=?",
-            (now_ts, b, a),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-
-def _upsert_member_rebranding_sync(member_id: str, rebranding_key: str, *, pay_go_minutes: Optional[int], free_minutes: Optional[int], cycle_days: Optional[int], plan: str, plan_map: str) -> None:
-    """Persist last-known rebranding key for this member (best-effort)."""
-    if not member_id:
-        return
-    _ensure_session_state_tables_sync()
-    db_path = _runtime_mappings_db_path_sync()
-    conn = sqlite3.connect(db_path)
-    try:
-        cur = conn.cursor()
-        now = int(time.time())
-        cur.execute(
-            f"""
-            INSERT INTO {_MEMBER_REBRANDING_TABLE}(member_id, rebranding_key, pay_go_minutes, free_minutes, cycle_days, plan, plan_map, updated_at)
-            VALUES(?,?,?,?,?,?,?,?)
-            ON CONFLICT(member_id) DO UPDATE SET
-              rebranding_key=excluded.rebranding_key,
-              pay_go_minutes=excluded.pay_go_minutes,
-              free_minutes=excluded.free_minutes,
-              cycle_days=excluded.cycle_days,
-              plan=excluded.plan,
-              plan_map=excluded.plan_map,
-              updated_at=excluded.updated_at
-            """,
-            (
-                member_id,
-                rebranding_key or "",
-                int(pay_go_minutes) if pay_go_minutes is not None else None,
-                int(free_minutes) if free_minutes is not None else None,
-                int(cycle_days) if cycle_days is not None else None,
-                plan or "",
-                plan_map or "",
-                now,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _get_member_rebranding_minutes_sync(member_id: str) -> Optional[int]:
-    """Return the last-known pay_go_minutes for a member, if available."""
-    if not member_id:
-        return None
-    _ensure_session_state_tables_sync()
-    db_path = _runtime_mappings_db_path_sync()
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT pay_go_minutes FROM {_MEMBER_REBRANDING_TABLE} WHERE member_id=?",
-            (member_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        v = row["pay_go_minutes"]
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except Exception:
-            return None
-    finally:
-        conn.close()
-
-
 
 def _load_companion_mappings_sync() -> None:
     global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
@@ -1460,18 +892,6 @@ def _load_companion_mappings_sync() -> None:
     _COMPANION_MAPPINGS_LOADED_AT = time.time()
     _COMPANION_MAPPINGS_SOURCE = db_path
     _COMPANION_MAPPINGS_TABLE = table_name_for_source
-    # Build a fast lookup by ElevenLabs voice_id.
-    # Note: voice_id values are treated as exact (case-sensitive) IDs.
-    global _VOICE_ID_INDEX
-    try:
-        vid_index: Dict[str, Dict[str, Any]] = {}
-        for (_b, _a), row in _COMPANION_MAPPINGS.items():
-            vid = str(row.get("eleven_voice_id") or row.get("ElevenVoiceId") or "").strip()
-            if vid:
-                vid_index[vid] = row
-        _VOICE_ID_INDEX = vid_index
-    except Exception:
-        _VOICE_ID_INDEX = {}
     print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path} (table={table_name_for_source})")
 
 
@@ -2752,6 +2172,131 @@ def _set_session_active(brand: str, avatar: str, active: bool, event_ref: Option
 
 
 
+
+
+# =============================================================================
+# Session kind/room helpers (shared across workers via the DB)
+#
+# session_active (0/1) remains the truth source for "is a live session active?"
+# session_kind indicates WHAT kind of session is active: "stream" or "conference".
+# session_room is used for conference providers (Jitsi room name).
+# =============================================================================
+
+def _sanitize_room_token(raw: str, *, max_len: int = 128) -> str:
+  """Sanitize a string into a URL-safe token (lowercase, letters/digits/-)."""
+  s = (raw or "").strip().lower()
+  # Replace any non [a-z0-9] with hyphen
+  s = re.sub(r"[^a-z0-9]+", "-", s)
+  s = re.sub(r"-+", "-", s).strip("-")
+  if not s:
+    return "room"
+  return s[:max_len]
+
+
+def _read_session_kind_room(resolved_brand: str, resolved_avatar: str) -> tuple[str, str]:
+  """Read session_kind/session_room from DB. Returns (kind, room) or ("", "") if unavailable."""
+  try:
+    b = (resolved_brand or "").strip()
+    a = (resolved_avatar or "").strip()
+    if not b or not a:
+      return "", ""
+
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+      cur = conn.cursor()
+
+      # Columns may not exist yet in older DBs; detect safely.
+      cur.execute("PRAGMA table_info(companion_mappings)")
+      cols = {row[1].lower() for row in cur.fetchall()}
+
+      if "session_kind" not in cols and "session_room" not in cols:
+        return "", ""
+
+      sel_cols = []
+      if "session_kind" in cols:
+        sel_cols.append("COALESCE(session_kind, '') AS session_kind")
+      else:
+        sel_cols.append("'' AS session_kind")
+      if "session_room" in cols:
+        sel_cols.append("COALESCE(session_room, '') AS session_room")
+      else:
+        sel_cols.append("'' AS session_room")
+
+      cur.execute(
+        f"SELECT {', '.join(sel_cols)} FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)",
+        (b, a),
+      )
+      row = cur.fetchone()
+      if not row:
+        return "", ""
+      kind = (row["session_kind"] or "").strip().lower()
+      room = (row["session_room"] or "").strip()
+      return kind, room
+    finally:
+      conn.close()
+  except Exception:
+    return "", ""
+
+
+def _set_session_kind_room_best_effort(resolved_brand: str, resolved_avatar: str, *, kind: str | None = None, room: str | None = None) -> bool:
+  """Best-effort upsert/update of session_kind/session_room in companion_mappings."""
+  if kind is None and room is None:
+    return True
+
+  try:
+    b = (resolved_brand or "").strip()
+    a = (resolved_avatar or "").strip()
+    if not b or not a:
+      return False
+
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    conn = sqlite3.connect(db_path)
+    try:
+      cur = conn.cursor()
+
+      # Ensure columns exist
+      cur.execute("PRAGMA table_info(companion_mappings)")
+      cols = {row[1].lower() for row in cur.fetchall()}
+
+      if "session_kind" not in cols:
+        cur.execute("ALTER TABLE companion_mappings ADD COLUMN session_kind TEXT")
+        cols.add("session_kind")
+      if "session_room" not in cols:
+        cur.execute("ALTER TABLE companion_mappings ADD COLUMN session_room TEXT")
+        cols.add("session_room")
+
+      # Ensure row exists (INSERT OR IGNORE)
+      cur.execute(
+        "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+        (b, a),
+      )
+
+      # UPDATE only provided fields
+      sets = []
+      params = []
+      if kind is not None:
+        sets.append("session_kind = ?")
+        params.append((kind or "").strip().lower() or None)
+      if room is not None:
+        sets.append("session_room = ?")
+        params.append((room or "").strip() or None)
+
+      if sets:
+        params.extend([b, a])
+        cur.execute(
+          f"UPDATE companion_mappings SET {', '.join(sets)} WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)",
+          tuple(params),
+        )
+
+      conn.commit()
+      return True
+    finally:
+      conn.close()
+  except Exception:
+    return False
+
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
     avatar: str
@@ -2900,11 +2445,8 @@ async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
             _dlog("Failed clearing livechat history (ignored)", {"event_ref": event_ref, "err": str(e)})
 
     _set_session_active(resolved_brand, resolved_avatar, active=True, event_ref=event_ref)
-    # Multi-worker: remember which kind of live session is active.
-    try:
-        _set_session_state_sync(resolved_brand, resolved_avatar, "stream", event_ref=event_ref)
-    except Exception:
-        pass
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room="")
 
     return {
         "ok": True,
@@ -3025,59 +2567,35 @@ async def beestreamed_status(brand: str, avatar: str):
 
     active = bool(_is_session_active(resolved_brand, resolved_avatar))
 
-    # Session kind/room are used by the frontend to distinguish Stream vs Conference.
-    # Conference sessions use the same session_active flag in companion_mappings, but the
-    # session_kind/session_room are persisted in the session_state table.
-    try:
-        state = _get_session_state_sync(resolved_brand, resolved_avatar) or {}
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
 
+    # Back-compat: older DBs won't have session_kind; treat an active session as a stream.
 
-        # If the DB says a session is active but we haven't received a host heartbeat recently,
-        # treat it as stale and clear it. This prevents sessions from appearing active when
-        # the host never pressed Play (or closed the tab without stopping).
-        if active and _is_session_state_stale(state):
-            try:
-                _set_session_active(resolved_brand, resolved_avatar, active=False, event_ref="")
-            except Exception:
-                pass
-            try:
-                _clear_session_state_sync(resolved_brand, resolved_avatar)
-            except Exception:
-                pass
-            active = False
-            state = {}
+    if active and not session_kind:
 
+        session_kind = "stream"
 
-    except Exception:
-        state = {}
-
-    raw_kind = str(state.get("sessionKind") or "").strip().lower()
-    session_kind = ""
-    session_room = ""
-
-    if active:
-        if raw_kind == "conference":
-            session_kind = "conference"
-            session_room = (
-                str(state.get("jitsiRoom") or "").strip()
-                or _jitsi_room_name_for_companion(resolved_brand, resolved_avatar)
-            )
-        else:
-            # Backward-compatible: if active but kind missing/unknown, treat it as Stream.
-            session_kind = "stream"
 
     return {
+
         "ok": True,
+
         "eventRef": event_ref,
+
         "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
+
         "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
+
         "companionType": str(mapping.get("companion_type") or "").strip(),
+
         "live": str(mapping.get("live") or "").strip(),
+
         "sessionActive": active,
+
         "sessionKind": session_kind,
+
         "sessionRoom": session_room,
-        # Alias (older frontend iterations referenced jitsiRoom directly)
-        "jitsiRoom": session_room,
+
     }
 @app.post("/stream/beestreamed/embed_url")
 async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
@@ -3135,10 +2653,8 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
     if not event_ref:
         # If the host tries to stop without an eventRef, mark the session inactive anyway.
         _set_session_active(resolved_brand, resolved_avatar, active=False)
-        try:
-            _clear_session_state_sync(resolved_brand, resolved_avatar)
-        except Exception:
-            pass
+
+        _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
         return {
             "ok": True,
             "status": "no_event_ref",
@@ -3159,6 +2675,9 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
         raise HTTPException(status_code=502, detail=f"BeeStreamed stop failed: {stop_res}")
 
     _set_session_active(resolved_brand, resolved_avatar, active=False, event_ref=event_ref)
+
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
 
     # Best-effort: notify any connected shared-live-chat clients.
     if was_active:
@@ -3195,6 +2714,78 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
         "eventRef": event_ref,
         "message": "",
     }
+
+
+# =============================================================================
+# Jitsi Conference (one-on-one) session control
+#
+# The front-end embeds Jitsi Meet (External API) when session_active=1 AND
+# session_kind == "conference". Viewers never call /start (host-only).
+# =============================================================================
+
+class JitsiConferenceStartRequest(BaseModel):
+  brand: str
+  avatar: str
+  memberId: str = ""
+  displayName: str = ""
+
+
+class JitsiConferenceStopRequest(BaseModel):
+  brand: str
+  avatar: str
+  memberId: str = ""
+
+
+@app.post("/conference/jitsi/start")
+async def jitsi_conference_start(req: JitsiConferenceStartRequest):
+  resolved_brand = (req.brand or "").strip()
+  resolved_avatar = (req.avatar or "").strip()
+  if not resolved_brand or not resolved_avatar:
+    raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+  if not mapping:
+    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+  host_member_id = str(mapping.get("host_member_id") or "").strip()
+  caller_member_id = str(req.memberId or "").strip()
+
+  if not host_member_id or caller_member_id != host_member_id:
+    raise HTTPException(status_code=403, detail="Only the host can start the conference.")
+
+  # Stable, per-companion room name (shared across sessions)
+  room = _sanitize_room_token(f"{resolved_brand}-{resolved_avatar}")
+
+  # Persist state for multi-worker viewers
+  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
+  _set_session_active(resolved_brand, resolved_avatar, True, event_ref=None)
+
+  return {"ok": True, "sessionActive": True, "sessionKind": "conference", "sessionRoom": room}
+
+
+@app.post("/conference/jitsi/stop")
+async def jitsi_conference_stop(req: JitsiConferenceStopRequest):
+  resolved_brand = (req.brand or "").strip()
+  resolved_avatar = (req.avatar or "").strip()
+  if not resolved_brand or not resolved_avatar:
+    raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+  if not mapping:
+    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+  host_member_id = str(mapping.get("host_member_id") or "").strip()
+  caller_member_id = str(req.memberId or "").strip()
+
+  if not host_member_id or caller_member_id != host_member_id:
+    raise HTTPException(status_code=403, detail="Only the host can stop the conference.")
+
+  _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
+  # Clear kind/room so next Play click re-prompts host
+  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+  return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
+
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
     try:
@@ -3392,70 +2983,6 @@ def _usage_status_message(
 
     return " ".join([ln.strip() for ln in lines if ln.strip()])
 
-
-
-
-def _usage_get_status_sync(
-    identity_key: str,
-    *,
-    is_trial: bool,
-    plan_name: str,
-    minutes_allowed_override: Optional[int],
-    cycle_days_override: Optional[int],
-) -> Dict[str, Any]:
-    """Read usage without charging additional seconds (safe for polling)."""
-    store = _load_usage_store()
-    now = int(time.time())
-
-    cycle_days = int(cycle_days_override or DEFAULT_CYCLE_DAYS or 30)
-    if cycle_days < 1:
-        cycle_days = 30
-
-    # Initialize record if missing.
-    rec = store["identities"].get(identity_key)
-    if not rec:
-        rec = {
-            "used_seconds": 0,
-            "purchased_seconds": 0,
-            "cycle_start": now,
-            "last_seen": None,
-            "plan": plan_name or "",
-        }
-        store["identities"][identity_key] = rec
-
-    cycle_start = int(rec.get("cycle_start") or now)
-    cycle_len = cycle_days * 86400
-    if now - cycle_start >= cycle_len:
-        # New cycle: reset used seconds, keep purchased seconds at 0 (purchased are applied per cycle).
-        rec["used_seconds"] = 0
-        rec["purchased_seconds"] = 0
-        rec["cycle_start"] = now
-        rec["last_seen"] = None
-        rec["plan"] = plan_name or ""
-
-    used_seconds = int(rec.get("used_seconds") or 0)
-    purchased_seconds = int(rec.get("purchased_seconds") or 0)
-
-    minutes_allowed = int(minutes_allowed_override) if minutes_allowed_override is not None else (int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name)))
-    allowed_seconds = max(0, minutes_allowed * 60 + purchased_seconds)
-
-    remaining_seconds = max(0, allowed_seconds - used_seconds)
-
-    # Persist any cycle reset.
-    _save_usage_store(store)
-
-    return {
-        "ok": True,
-        "identityKey": identity_key,
-        "planName": plan_name,
-        "cycleDays": cycle_days,
-        "minutesAllowed": minutes_allowed,
-        "usedSeconds": used_seconds,
-        "purchasedSeconds": purchased_seconds,
-        "allowedSeconds": allowed_seconds,
-        "remainingSeconds": remaining_seconds,
-        "exhausted": remaining_seconds <= 0,
-    }
 
 def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str, minutes_allowed_override: Optional[int] = None, cycle_days_override: Optional[int] = None) -> Tuple[bool, Dict[str, Any]]:
     """Charge usage time and determine whether the identity still has minutes.
@@ -3655,51 +3182,56 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
 
     return None
 def _is_minutes_balance_question(text: str) -> bool:
-    """Detect user questions about remaining/available plan minutes.
-
-    Examples we want to catch:
-      - "How many more minutes do I have on my plan?"
-      - "How many minutes are left?"
-      - "Minutes remaining?"
-      - "How long can I talk to you?"
-      - "What's my minutes balance / usage?"
-
-    We keep this intentionally conservative to avoid false triggers.
     """
-    t = (text or "").strip().lower()
-    if not t:
+    Return True when the user is asking about their remaining chat time/minutes.
+    This is intentionally broad because users phrase this many different ways.
+    """
+    if not text:
         return False
+    t = text.strip().lower()
 
-    # Avoid a common unrelated question.
-    if re.search(r"\bwhat time is it\b", t):
-        return False
-
-    # Strong patterns (explicit "how many/much" + minutes/time + left/remaining)
-    if re.search(r"\bhow\s+(many|much)\b.*\b(minutes?|time)\b.*\b(left|remaining|available)\b", t):
+    # Fast exact-ish contains (covers prior phrases)
+    needles = [
+        "minutes remaining",
+        "minutes left",
+        "remaining minutes",
+        "time remaining",
+        "time left",
+        "how many minutes",
+        "how much time",
+        "minutes balance",
+        "balance minutes",
+        "what is my balance",
+        "what's my balance",
+        "how many minutes remain",
+        "how many minutes are remaining",
+        "how many minutes for chat",
+        "chat minutes",
+        "minutes for chat",
+        "how many minutes do i have",
+        "how many minutes do i have left",
+        "how many minutes do i have remaining",
+        "how much time do i have left",
+        "how much time do i have remaining",
+        "how much time is left",
+        "how many minutes are left",
+        "minutes used",
+        "how many minutes have i used",
+        "how much have i used",
+        "usage minutes",
+    ]
+    if any(n in t for n in needles):
         return True
 
-    # "minutes remaining", "time left", etc with plan/usage keywords
-    if re.search(r"\b(minutes?|time)\b.*\b(left|remaining|available)\b", t) and re.search(
-        r"\b(plan|trial|subscription|membership|usage|balance|quota|included)\b", t
-    ):
+    # Regex fallback: any question containing "minute(s)" + remaining/left/balance/usage
+    if re.search(r"\bminute(s)?\b", t) and re.search(r"\b(remain|remaining|left|balance|used|usage)\b", t):
         return True
 
-    # Short forms: "minutes left?", "minutes available?"
-    if re.search(r"\bminutes?\b", t) and re.search(r"\b(left|remaining|available|balance|used)\b", t):
-        return True
-
-    # "How long can I talk/speak/chat?"
-    if re.search(r"\bhow\s+long\b.*\b(can|may)\s+i\b.*\b(talk|speak|chat)\b", t):
-        return True
-
-    # "check my usage" / "show my minutes"
-    if re.search(r"\b(check|show)\b.*\b(usage|minutes?|balance)\b", t):
+    # Or "time" + remaining/left/balance (but avoid generic "time" questions)
+    if re.search(r"\btime\b", t) and re.search(r"\b(remain|remaining|left|balance|used|usage)\b", t):
         return True
 
     return False
-
-
-
 
 def _looks_intimate(text: str) -> bool:
     t = (text or "").lower()
@@ -3893,80 +3425,8 @@ def _tts_blob_name(session_id: str, voice_id: str, text: str) -> str:
     return f"{_TTS_BLOB_PREFIX}/{safe_session}/{ts_ms}-{h}-{uuid.uuid4().hex}.mp3"
 
 
-# ----------------------------
-# TTS PRE-PROCESSING (phonetics + brand humanization)
-# ----------------------------
-
-_URL_TOKEN_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
-_CAMEL_SPLIT_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
-
-
-def _apply_outside_urls(text: str, fn) -> str:
-    if not text:
-        return text
-    out: List[str] = []
-    last = 0
-    for m in _URL_TOKEN_RE.finditer(text):
-        out.append(fn(text[last:m.start()]))
-        out.append(text[m.start():m.end()])
-        last = m.end()
-    out.append(fn(text[last:]))
-    return "".join(out)
-
-
-def _humanize_brand_for_tts(brand: str) -> str:
-    brand = (brand or "").strip()
-    if not brand:
-        return brand
-    # Split CamelCase only; do not create spaces in already spaced names.
-    if " " in brand:
-        return brand
-    return _CAMEL_SPLIT_RE.sub(" ", brand).strip()
-
-
-def _prepare_tts_text_for_voice_id(voice_id: str, raw_text: str) -> str:
-    """Always run before any TTS audio generation.
-
-    - Inserts spaces in CamelCase brand tokens (e.g., "DulceMoon" -> "Dulce Moon") outside of URLs.
-    - Replaces the companion display name with its phonetic pronunciation (DB column: phonetic), outside of URLs.
-    """
-    text = (raw_text or "").strip()
-    if not text:
-        return text
-
-    voice_id = (voice_id or "").strip()
-    row = _VOICE_ID_INDEX.get(voice_id) if voice_id else None
-    if not row:
-        return text
-
-    brand = str(row.get("brand") or "").strip() or "Elaralo"
-    avatar_name = str(row.get("avatar") or "").strip()
-    phonetic = str(row.get("phonetic") or "").strip()
-
-    # 1) Humanize brand mentions (CamelCase -> spaced) outside URLs.
-    spoken_brand = _humanize_brand_for_tts(brand)
-    if spoken_brand and spoken_brand != brand:
-        # Case-insensitive exact token replacement (do NOT replace inside alphanum words).
-        pat = re.compile(rf"(?i)(?<![A-Za-z0-9]){re.escape(brand)}(?![A-Za-z0-9])")
-        def _brand_fn(seg: str) -> str:
-            return pat.sub(spoken_brand, seg)
-        text = _apply_outside_urls(text, _brand_fn)
-
-    # 2) Replace companion name with phonetic pronunciation outside URLs.
-    if avatar_name and phonetic:
-        # Boundary-aware: won't match inside "DulceMoon" but will match "Dulce" and "Dulce:" etc.
-        pat2 = re.compile(rf"(?i)(?<![A-Za-z0-9]){re.escape(avatar_name)}(?![A-Za-z0-9])")
-        def _phon_fn(seg: str) -> str:
-            return pat2.sub(phonetic, seg)
-        text = _apply_outside_urls(text, _phon_fn)
-
-    return text
-
 def _elevenlabs_tts_mp3_bytes(voice_id: str, text: str) -> bytes:
     import requests  # type: ignore
-
-    # Always apply phonetic + brand normalization before generating audio.
-    text = _prepare_tts_text_for_voice_id(voice_id, text)
 
     xi_api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     if not xi_api_key:
@@ -4081,14 +3541,122 @@ def _azure_upload_mp3_and_get_sas_url(blob_name: str, mp3_bytes: bytes) -> str:
     return f"{blob_client.url}?{sas}"
 
 
-def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
+def _split_camel_case_words(s: str) -> str:
+    """Insert spaces in CamelCase identifiers to improve pronunciation (e.g., DulceMoon -> Dulce Moon)."""
+    if not s:
+        return s
+    if " " in s:
+        return s
+    s2 = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s)
+    s2 = re.sub(r"(?<=[A-Za-z])(?=[0-9])", " ", s2)
+    s2 = re.sub(r"(?<=[0-9])(?=[A-Za-z])", " ", s2)
+    return s2
+
+
+def _apply_phonetic_word_boundary(text: str, target: str, phonetic: str) -> str:
+    """Case-insensitive replace of target as a standalone token (no alnum adjacent)."""
+    if not text or not target or not phonetic:
+        return text
+    pattern = re.compile(rf"(?i)(?<![A-Za-z0-9]){re.escape(target)}(?![A-Za-z0-9])")
+    return pattern.sub(phonetic, text)
+
+
+def _normalize_tts_text(
+    text: str,
+    *,
+    brand: str,
+    avatar: str,
+    mapping_phonetic: str,
+    brand_phonetic: str | None = None,
+) -> str:
+    """
+    Normalize text before any TTS generation.
+
+    Goals:
+    - Avoid speaking raw URLs (common in paywall / upgrade messages) which can cause awkward
+      pronunciations like "DulceMoon" being read from "dulcemoon.net".
+    - Expand CamelCase brand strings ("DulceMoon" -> "Dulce Moon") when they appear in text.
+    - Apply companion phonetic pronunciation consistently (e.g., Dulce -> "DOOL-seh").
+    """
+    if not text:
+        return ""
+
+    s = str(text)
+
+    # 0) Replace markdown links: [Label](https://...) => "Label"
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1", s)
+
+    # 1) Replace bare URLs with a neutral token so we don't speak domains/paths.
+    #    (This is the main fix for paywall pronunciation issues.)
+    s = re.sub(r"https?://\S+", " link ", s, flags=re.IGNORECASE)
+
+    # 2) Replace www.* links without scheme.
+    s = re.sub(r"\bwww\.[^\s]+\b", " link ", s, flags=re.IGNORECASE)
+
+    # Collapse whitespace early.
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # 3) Brand normalization (CamelCase -> spaced) so phonetics can match word boundaries.
+    brand = (brand or "").strip()
+    if brand:
+        spaced_brand = _split_camel_case_words(brand)
+        if spaced_brand != brand:
+            # Replace literal brand occurrences (case-insensitive)
+            s = re.sub(re.escape(brand), spaced_brand, s, flags=re.IGNORECASE)
+
+        # Also handle compact brand tokens (punctuation-delimited), e.g. "dulcemoon" in text.
+        brand_compact = re.sub(r"[^A-Za-z0-9]", "", brand)
+        if brand_compact:
+            spaced_compact = _split_camel_case_words(brand_compact)
+            token_pat = re.compile(
+                rf"(?i)(?<![A-Za-z0-9]){re.escape(brand_compact)}(?![A-Za-z0-9])"
+            )
+            s = token_pat.sub(spaced_compact, s)
+
+    # 4) Apply phonetic pronunciation for the companion name.
+    avatar = (avatar or "").strip()
+    mapping_phonetic = (mapping_phonetic or "").strip()
+    if avatar and mapping_phonetic:
+        # Handle CamelCase concatenations (e.g., "DulceMoon") by inserting a space.
+        s = re.sub(
+            rf"(?i)(?<![A-Za-z0-9]){re.escape(avatar)}(?=[A-Z])",
+            mapping_phonetic + " ",
+            s,
+        )
+        # Word-boundary replacement (normal case)
+        s = _apply_phonetic_word_boundary(s, avatar, mapping_phonetic)
+
+    # 5) Optional brand phonetic (future-proof; not currently required).
+    brand_phonetic = (brand_phonetic or "").strip()
+    if brand and brand_phonetic:
+        s = _apply_phonetic_word_boundary(s, brand, brand_phonetic)
+
+    # Final cleanup
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "") -> str:
     text = (text or "").strip()
+
+    # Pronunciation normalization (runs before caching / audio generation).
+    # - Splits CamelCase brand tokens (e.g., DulceMoon -> Dulce Moon)
+    # - Applies companion phonetic name (DB mapping) at token boundaries
+    try:
+        if brand:
+            phon = ""
+            if avatar:
+                m = _lookup_companion_mapping(brand, avatar) or {}
+                phon = (m.get("phonetic") or "").strip()
+            text = _normalize_tts_text(text, brand=brand, avatar=avatar, phonetic=phon)
+    except Exception:
+        # Never fail TTS due to normalization
+        pass
     if not text:
         raise RuntimeError("TTS text is empty")
 
     # Cache path: deterministic blob name, cross-session.
     if _TTS_CACHE_ENABLED:
-        cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=tts_text)
+        cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
         try:
             from azure.storage.blob import BlobServiceClient  # type: ignore
 
@@ -4120,7 +3688,7 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
 
 
             _touch_inflight_marker(cache_blob)
-            mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=tts_text)
+            mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
 
             # Upload without overwrite to avoid clobbering a concurrent writer.
             try:
@@ -4140,8 +3708,8 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
             pass
 
     # Legacy path: per-session unique blob (no caching).
-    blob_name = _tts_blob_name(session_id=session_id, voice_id=voice_id, text=tts_text)
-    mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=tts_text)
+    blob_name = _tts_blob_name(session_id=session_id, voice_id=voice_id, text=text)
+    mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
     return _azure_upload_mp3_and_get_sas_url(blob_name=blob_name, mp3_bytes=mp3_bytes)
 
 # ----------------------------
@@ -4212,343 +3780,6 @@ async def _tts_prewarm_task() -> None:
         except Exception:
             # fail-open: ignore
             continue
-
-# ----------------------------
-# JITSI CONFERENCE (1:1) SUPPORT
-# ----------------------------
-
-class JitsiStartRequest(BaseModel):
-    brand: str
-    avatar: str
-    memberId: str
-    displayName: Optional[str] = None
-
-
-class JitsiStopRequest(BaseModel):
-    brand: str
-    avatar: str
-    memberId: str
-
-class JitsiJwtRequest(BaseModel):
-    brand: str
-    avatar: str
-    room: str
-    memberId: Optional[str] = ""
-    displayName: Optional[str] = ""
-    isHost: Optional[bool] = False
-
-
-
-def _jitsi_domain() -> str:
-    d = (os.getenv("JITSI_DOMAIN") or "").strip()
-    return d or "meet.jit.si"
-
-
-def _jitsi_room_name_for_companion(brand: str, avatar: str) -> str:
-    base = f"{brand}-{avatar}".strip()
-    # Jitsi room names are URL-ish; keep it simple + deterministic.
-    base = re.sub(r"[^A-Za-z0-9_-]+", "-", base).strip("-")
-    if not base:
-        base = "elaralo"
-    return base[:120]
-
-
-class SessionPingBody(BaseModel):
-    brand: str
-    avatar: str
-    memberId: str
-
-
-@app.post("/session/ping")
-async def session_ping(req: SessionPingRequest):
-    """Keep-alive for an active Stream/Conference session.
-
-    The frontend calls this periodically (HOST-only) to prevent server-side stale-session
-    cleanup from flipping an in-progress session to inactive.
-    """
-
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-
-    if not brand or not avatar:
-        raise HTTPException(status_code=400, detail="brand and avatar are required")
-
-    brand_norm = _norm(brand)
-    avatar_norm = _norm(avatar)
-
-    state = _get_session_state_sync(brand_norm, avatar_norm)
-    if not state or not state.get("session_active"):
-        return {"ok": True, "sessionActive": False}
-
-    _touch_session_state_sync(brand_norm, avatar_norm)
-    return {"ok": True, "sessionActive": True}
-
-
-
-@app.post("/conference/jitsi/start")
-async def jitsi_start(req: JitsiStartRequest):
-    """Host-only. Marks the session active and returns a deterministic room name per companion."""
-    resolved_brand = (req.brand or "").strip() or "Elaralo"
-    resolved_avatar = (req.avatar or "").strip()
-    member_id = (req.memberId or "").strip()
-    if not resolved_avatar or not member_id:
-        raise HTTPException(status_code=422, detail="brand, avatar, memberId required")
-
-    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    host_member_id = str(mapping.get("host_member_id") or "").strip()
-    if not host_member_id or host_member_id.lower() != member_id.lower():
-        raise HTTPException(status_code=403, detail="Only the host can start a conference")
-
-    if _is_session_active(resolved_brand, resolved_avatar):
-        # Already active (stream or conference).
-        state = _get_session_state_sync(resolved_brand, resolved_avatar)
-        raise HTTPException(status_code=409, detail=f"Session already active ({state.get('sessionKind') or 'unknown'})")
-
-    room = _jitsi_room_name_for_companion(resolved_brand, resolved_avatar)
-    domain = _jitsi_domain()
-
-    # Mark active in DB (truth) and persist session kind.
-    _set_session_active(resolved_brand, resolved_avatar, active=True)
-    try:
-        _set_session_state_sync(resolved_brand, resolved_avatar, "conference", jitsi_room=room)
-    except Exception:
-        pass
-
-    return {
-        "ok": True,
-        "sessionActive": True,
-        "sessionKind": "conference",
-        "jitsiDomain": domain,
-        "jitsiRoom": room,
-        "sessionRoom": room,
-        "jitsiUrl": f"https://{domain}/{room}",
-    }
-
-
-@app.post("/conference/jitsi/stop")
-async def jitsi_stop(req: JitsiStopRequest):
-    """Host-only. Ends the conference session."""
-    resolved_brand = (req.brand or "").strip() or "Elaralo"
-    resolved_avatar = (req.avatar or "").strip()
-    member_id = (req.memberId or "").strip()
-    if not resolved_avatar or not member_id:
-        raise HTTPException(status_code=422, detail="brand, avatar, memberId required")
-
-    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
-    if not mapping:
-        raise HTTPException(status_code=404, detail="Companion mapping not found")
-
-    host_member_id = str(mapping.get("host_member_id") or "").strip()
-    if not host_member_id or host_member_id.lower() != member_id.lower():
-        raise HTTPException(status_code=403, detail="Only the host can stop a conference")
-
-    _set_session_active(resolved_brand, resolved_avatar, active=False)
-    try:
-        _clear_session_state_sync(resolved_brand, resolved_avatar)
-    except Exception:
-        pass
-
-    return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
-
-
-def _get_jaas_signing_config() -> Optional[Tuple[str, str, str, str]]:
-    """Return (domain, kid, sub, private_key_pem) if JaaS is configured."""
-
-    domain = (os.getenv("JITSI_JAAS_DOMAIN", "8x8.vc") or "").strip() or "8x8.vc"
-
-    kid = (os.getenv("JITSI_JAAS_KID", "") or "").strip()
-    sub = (os.getenv("JITSI_JAAS_SUB", "") or "").strip()
-    if not sub and kid and "/" in kid:
-        sub = kid.split("/", 1)[0]
-
-    key_pem = (os.getenv("JITSI_JAAS_PRIVATE_KEY", "") or "").strip()
-    key_b64 = (os.getenv("JITSI_JAAS_PRIVATE_KEY_B64", "") or "").strip()
-
-    if key_b64 and not key_pem:
-        try:
-            key_pem = base64.b64decode(key_b64.encode("utf-8")).decode("utf-8", errors="ignore")
-        except Exception:
-            key_pem = ""
-
-    # Allow env values with literal \n sequences.
-    if "\\n" in key_pem:
-        key_pem = key_pem.replace("\\n", "\n")
-
-    if not (kid and sub and key_pem):
-        return None
-
-    return (domain, kid, sub, key_pem)
-
-
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-
-def _jwt_rs256_encode(payload: Dict[str, Any], *, kid: str = "", private_key_pem: str) -> str:
-    """Minimal RS256 JWT encoder with no external dependencies.
-
-    Uses `cryptography` if available (imported lazily). Returns a compact JWS: header.payload.signature
-    """
-    header: Dict[str, Any] = {"alg": "RS256", "typ": "JWT"}
-    if kid:
-        header["kid"] = kid
-
-    header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-
-    try:
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-    except Exception as e:
-        raise RuntimeError("cryptography is required to sign JaaS JWTs") from e
-
-    try:
-        key = load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
-        signature = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
-    except Exception as e:
-        raise RuntimeError(f"Failed to sign JaaS JWT: {e}") from e
-
-    sig_b64 = _b64url(signature)
-    return f"{header_b64}.{payload_b64}.{sig_b64}"
-
-
-@app.post("/conference/jitsi/jwt")
-async def conference_jitsi_jwt(req: JitsiJwtRequest):
-    """Return a signed JWT for Jitsi as a Service (JaaS), if configured.
-
-    This endpoint is intentionally *non-fatal*: if JaaS isn't configured (or signing fails),
-    it returns ok=true with an empty token so the frontend can still embed public Jitsi.
-    """
-
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    room = (req.room or "").strip()
-
-    if not brand or not avatar or not room:
-        raise HTTPException(status_code=400, detail="brand, avatar, and room are required")
-
-    mapping = await _lookup_companion_mapping(brand=brand, avatar=avatar)
-    company_name = (mapping.get("companyName") or brand).strip()
-    companion_name = (mapping.get("companionName") or avatar).strip()
-
-    display_name = (req.displayName or "").strip()
-    if not display_name:
-        display_name = companion_name if req.isHost else ("Member" if req.memberId else "Guest")
-
-    cfg = _get_jaas_signing_config()
-    if not cfg:
-        return JSONResponse(
-            {
-                "ok": True,
-                "token": "",
-                "jwt": "",
-                "domain": "",
-                "roomName": room,
-                "isJaas": False,
-                "reason": "JaaS not configured",
-                "companyName": company_name,
-                "companionName": companion_name,
-            }
-        )
-
-    domain, kid, sub, key_pem = cfg
-
-    now = int(time.time())
-    exp = now + 60 * 15  # 15 minutes
-
-    # Keep `room` as "*" to avoid mismatches when embedding uses a namespaced room (<sub>/<room>).
-    payload: Dict[str, Any] = {
-        "aud": "jitsi",
-        "iss": sub,
-        "sub": sub,
-        "room": "*",
-        "exp": exp,
-        "nbf": now - 5,
-        "context": {
-            "user": {
-                "name": display_name,
-            },
-        },
-    }
-
-    try:
-        token = _jwt_rs256_encode(payload, kid=kid, private_key_pem=key_pem)
-    except Exception as e:
-        return JSONResponse(
-            {
-                "ok": True,
-                "token": "",
-                "jwt": "",
-                "domain": "",
-                "roomName": room,
-                "isJaas": False,
-                "reason": str(e),
-                "companyName": company_name,
-                "companionName": companion_name,
-            }
-        )
-
-    # JaaS roomName is typically namespaced as "<sub>/<room>" when using the 8x8.vc domain.
-    room_name = f"{sub}/{room}".strip("/")
-
-    return JSONResponse(
-        {
-            "ok": True,
-            "token": token,
-            "jwt": token,
-            "domain": domain,
-            "roomName": room_name,
-            "isJaas": True,
-            "companyName": company_name,
-            "companionName": companion_name,
-        }
-    )
-
-@app.get("/session/status")
-async def session_status(brand: str, avatar: str):
-    """Unified status for both BeeStreamed (stream) and Jitsi (conference)."""
-    resolved_brand = (brand or "").strip() or "Elaralo"
-    resolved_avatar = (avatar or "").strip()
-    if not resolved_avatar:
-        raise HTTPException(status_code=422, detail="avatar required")
-
-    active = _is_session_active(resolved_brand, resolved_avatar)
-    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar) or {}
-
-    state = _get_session_state_sync(resolved_brand, resolved_avatar)
-    kind = (state.get("sessionKind") or "").strip()
-
-    # If active but kind not present yet, treat it as stream (backward-compatible).
-    if active and not kind:
-        kind = "stream"
-
-    if not active:
-        kind = ""
-
-    resp: Dict[str, Any] = {
-        "ok": True,
-        "sessionActive": bool(active),
-        "sessionKind": kind,
-        "hostMemberId": str(mapping.get("host_member_id") or ""),
-        "eventRef": str(mapping.get("event_ref") or ""),
-    }
-
-    if kind == "conference":
-        resp.update(
-            {
-                "jitsiDomain": _jitsi_domain(),
-                "jitsiRoom": state.get("jitsiRoom") or _jitsi_room_name_for_companion(resolved_brand, resolved_avatar),
-            }
-        )
-
-    return resp
-
-
 
 @app.on_event("startup")
 async def _startup_tts_prewarm() -> None:
@@ -4903,30 +4134,12 @@ async def chat(request: Request):
     free_minutes = _safe_int(free_minutes_raw)
     cycle_days = _safe_int(cycle_days_raw)
 
-    # Persist last-known rebranding info for this member (enables Wix paylink top-ups).
-    try:
-        _upsert_member_rebranding_sync(
-            member_id,
-            rebranding_key,
-            pay_go_minutes=pay_go_minutes,
-            free_minutes=free_minutes,
-            cycle_days=cycle_days,
-            plan=plan_name,
-            plan_map=plan_map,
-        )
-    except Exception:
-        pass
-
     is_trial = not bool(member_id)
     identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
 
-    # White-label minutes override: RebrandingKey minutes override any Elaralo plan minutes.
-    # NOTE: The rebrandingKey field name is historically called pay_go_minutes, but for white-label
-    # it is treated as the plan minutes override. If absent, we fall back to free_minutes.
+    # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
     minutes_allowed_override: Optional[int] = None
-    if pay_go_minutes is not None:
-        minutes_allowed_override = pay_go_minutes
-    elif free_minutes is not None:
+    if free_minutes is not None:
         minutes_allowed_override = free_minutes
     elif plan_map:
         minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
@@ -5039,7 +4252,7 @@ async def chat(request: Request):
                 if _TTS_CHAT_CACHE_FIRST and _TTS_CACHE_ENABLED:
                     audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, reply)
                 if audio_url is None:
-                    audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply)
+                    audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply, session_state.get("brand", ""), session_state.get("avatar", ""))
             except Exception as e:
                 # Fail-open: never break chat because TTS failed
                 _dbg(debug, "TTS generation failed:", repr(e))
@@ -5515,15 +4728,12 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
     if not voice_id or not text:
         raise HTTPException(status_code=422, detail="voice_id and text are required")
 
-    # Ensure consistent pronunciation for brand + companion names.
-    tts_text = _prepare_tts_text_for_voice_id(voice_id, text)
-
     try:
         # STEP B: if another worker/request is already generating the same cached blob, wait briefly.
         audio_url: Optional[str] = None
         if _TTS_CACHE_ENABLED and voice_id and text:
             try:
-                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=tts_text)
+                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
                 if _inflight_marker_is_fresh(cache_blob):
                     waited = 0
                     while waited < _TTS_INFLIGHT_WAIT_MS:
@@ -5536,7 +4746,12 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
             except Exception:
                 pass
         if audio_url is None:
-            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text)
+
+            brand = (body.get("brand") or "").strip()
+
+            avatar = (body.get("avatar") or "").strip()
+
+            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text, brand, avatar)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
 
