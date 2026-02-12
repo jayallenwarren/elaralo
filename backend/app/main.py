@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import time
-import jwt
 import re
 import uuid
 import json
@@ -4384,11 +4383,46 @@ def _get_jaas_signing_config() -> Optional[Tuple[str, str, str, str]]:
     return (domain, kid, sub, key_pem)
 
 
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def _jwt_rs256_encode(payload: Dict[str, Any], *, kid: str = "", private_key_pem: str) -> str:
+    """Minimal RS256 JWT encoder with no external dependencies.
+
+    Uses `cryptography` if available (imported lazily). Returns a compact JWS: header.payload.signature
+    """
+    header: Dict[str, Any] = {"alg": "RS256", "typ": "JWT"}
+    if kid:
+        header["kid"] = kid
+
+    header_b64 = _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    except Exception as e:
+        raise RuntimeError("cryptography is required to sign JaaS JWTs") from e
+
+    try:
+        key = load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+        signature = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    except Exception as e:
+        raise RuntimeError(f"Failed to sign JaaS JWT: {e}") from e
+
+    sig_b64 = _b64url(signature)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+
 @app.post("/conference/jitsi/jwt")
 async def conference_jitsi_jwt(req: JitsiJwtRequest):
     """Return a signed JWT for Jitsi as a Service (JaaS), if configured.
 
-    Frontend will fall back to public Jitsi when this returns ok=false.
+    This endpoint is intentionally *non-fatal*: if JaaS isn't configured (or signing fails),
+    it returns ok=true with an empty token so the frontend can still embed public Jitsi.
     """
 
     brand = (req.brand or "").strip()
@@ -4398,42 +4432,82 @@ async def conference_jitsi_jwt(req: JitsiJwtRequest):
     if not brand or not avatar or not room:
         raise HTTPException(status_code=400, detail="brand, avatar, and room are required")
 
+    mapping = await _lookup_companion_mapping(brand=brand, avatar=avatar)
+    company_name = (mapping.get("companyName") or brand).strip()
+    companion_name = (mapping.get("companionName") or avatar).strip()
+
+    display_name = (req.displayName or "").strip()
+    if not display_name:
+        display_name = companion_name if req.isHost else ("Member" if req.memberId else "Guest")
+
     cfg = _get_jaas_signing_config()
     if not cfg:
-        return {"ok": False, "reason": "JaaS not configured"}
+        return JSONResponse(
+            {
+                "ok": True,
+                "token": "",
+                "jwt": "",
+                "domain": "",
+                "roomName": room,
+                "isJaas": False,
+                "reason": "JaaS not configured",
+                "companyName": company_name,
+                "companionName": companion_name,
+            }
+        )
 
     domain, kid, sub, key_pem = cfg
 
-    display_name = (req.displayName or "").strip() or ("Host" if req.isHost else "Viewer")
-    user_id = (req.memberId or "").strip() or display_name
-
     now = int(time.time())
-    payload = {
+    exp = now + 60 * 15  # 15 minutes
+
+    # Keep `room` as "*" to avoid mismatches when embedding uses a namespaced room (<sub>/<room>).
+    payload: Dict[str, Any] = {
         "aud": "jitsi",
-        "iss": "chat",
+        "iss": sub,
         "sub": sub,
-        # Using '*' avoids ambiguity around whether JaaS expects the raw room vs 'sub/room'.
         "room": "*",
-        "nbf": now - 10,
-        "exp": now + 60 * 60,
+        "exp": exp,
+        "nbf": now - 5,
         "context": {
             "user": {
-                "id": user_id,
                 "name": display_name,
-                "moderator": bool(req.isHost),
-            }
+            },
         },
     }
 
     try:
-        token = jwt.encode(payload, key_pem, algorithm="RS256", headers={"kid": kid, "typ": "JWT"})
+        token = _jwt_rs256_encode(payload, kid=kid, private_key_pem=key_pem)
     except Exception as e:
-        return {"ok": False, "reason": f"JWT signing failed: {e.__class__.__name__}"}
+        return JSONResponse(
+            {
+                "ok": True,
+                "token": "",
+                "jwt": "",
+                "domain": "",
+                "roomName": room,
+                "isJaas": False,
+                "reason": str(e),
+                "companyName": company_name,
+                "companionName": companion_name,
+            }
+        )
 
-    room_name = f"{sub}/{room}"
-    return {"ok": True, "jwt": token, "domain": domain, "roomName": room_name}
+    # JaaS roomName is typically namespaced as "<sub>/<room>" when using the 8x8.vc domain.
+    room_name = f"{sub}/{room}".strip("/")
 
-
+    return JSONResponse(
+        {
+            "ok": True,
+            "token": token,
+            "jwt": token,
+            "domain": domain,
+            "roomName": room_name,
+            "isJaas": True,
+            "companyName": company_name,
+            "companionName": companion_name,
+        }
+    )
 
 @app.get("/session/status")
 async def session_status(brand: str, avatar: str):
