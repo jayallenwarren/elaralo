@@ -6381,7 +6381,7 @@ setStreamEventRef("");
 
     // Host (Live Stream): ensure Stop always ends the session even if mic/STT isn't running.
     // (This is idempotent; stopLiveAvatar has its own in-flight guard.)
-    if (liveProvider === "stream" && streamCanStart && ("" || streamEventRef)) {
+    if (liveProvider === "stream" && streamCanStart && (streamEventRef)) {
       try {
         void stopLiveAvatar();
       } catch (e) {}
