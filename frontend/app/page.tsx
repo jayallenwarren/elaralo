@@ -7307,7 +7307,6 @@ const modePillControls = (
               ) : null}
             </div>
           </div>
-        ) : null}
 
         <div
           style={{
