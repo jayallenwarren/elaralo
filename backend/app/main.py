@@ -5003,6 +5003,10 @@ except Exception:  # pragma: no cover
 _LIVEKIT_JOIN_LOCK = threading.Lock()
 # requestId -> request dict
 _LIVEKIT_JOIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
+# Track active egress jobs per room so STOP can deterministically end recording/broadcast.
+# NOTE: This is in-memory. If you run multiple workers, use a shared store (Redis/DB) for production.
+_LIVEKIT_ACTIVE_EGRESS: Dict[str, Dict[str, str]] = {}  # roomName -> {"record": egressId, "hls": egressId}
+
 
 def _livekit_env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip()
@@ -5109,6 +5113,77 @@ def _livekit_storage_s3_config() -> Optional[Dict[str, Any]]:
         cfg["endpoint"] = endpoint
     return cfg
 
+
+def _livekit_storage_azure_config() -> Optional[Dict[str, Any]]:
+    account_name = _livekit_env("LIVEKIT_AZURE_ACCOUNT_NAME")
+    account_key = _livekit_env("LIVEKIT_AZURE_ACCOUNT_KEY")
+    container_name = _livekit_env("LIVEKIT_AZURE_CONTAINER_NAME")
+    if not (account_name and account_key and container_name):
+        return None
+    return {"account_name": account_name, "account_key": account_key, "container_name": container_name}
+
+def _livekit_start_recording_egress(room_name: str) -> Dict[str, Any]:
+    """
+    Start an MP4 room-composite recording using LiveKit Egress.
+
+    Storage options:
+      - Azure Blob: set LIVEKIT_AZURE_ACCOUNT_NAME/KEY/CONTAINER_NAME
+      - S3: set LIVEKIT_S3_* (same as HLS)
+    Optional:
+      - LIVEKIT_RECORDING_PUBLIC_BASE_URL (if you serve recordings via CDN/public URL)
+    """
+    azure = _livekit_storage_azure_config()
+    s3 = _livekit_storage_s3_config()
+    if not azure and not s3:
+        return {"ok": False, "error": "Recording storage env not configured (LIVEKIT_AZURE_* or LIVEKIT_S3_*)"}
+
+    ts = int(time.time())
+    # Do not include file extension in directory portion; LiveKit will store the file at this key/path.
+    filepath = f"recordings/{room_name}/{ts}.mp4"
+
+    out: Dict[str, Any] = {"filepath": filepath}
+    if azure:
+        out["azure"] = azure
+    else:
+        out["s3"] = s3
+
+    req = {
+        "room_name": room_name,
+        "layout": "grid",
+        "preset": "H264_720P_30",
+        "audio_only": False,
+        "file_outputs": [out],
+    }
+    info = _twirp_post_json("/twirp/livekit.Egress/StartRoomCompositeEgress", req)
+
+    pub_base = _livekit_env("LIVEKIT_RECORDING_PUBLIC_BASE_URL").rstrip("/")
+    recording_url = f"{pub_base}/{filepath}" if pub_base else ""
+    return {"ok": True, "egress": info, "recordingUrl": recording_url, "filepath": filepath}
+
+def _livekit_stop_egress(egress_id: str) -> None:
+    if not egress_id:
+        return
+    try:
+        _twirp_post_json("/twirp/livekit.Egress/StopEgress", {"egress_id": egress_id})
+    except Exception:
+        # Best-effort; stopping a non-existent/ended egress should not break STOP.
+        pass
+
+def _livekit_kick_all(room_name: str) -> None:
+    try:
+        resp = _twirp_post_json("/twirp/livekit.RoomService/ListParticipants", {"room": room_name})
+        parts = resp.get("participants") or []
+        for p in parts:
+            ident = str(p.get("identity") or "").strip()
+            if not ident:
+                continue
+            try:
+                _twirp_post_json("/twirp/livekit.RoomService/RemoveParticipant", {"room": room_name, "identity": ident})
+            except Exception:
+                continue
+    except Exception:
+        return
+
 def _livekit_start_hls_egress(room_name: str) -> Dict[str, Any]:
     s3 = _livekit_storage_s3_config()
     if not s3:
@@ -5199,6 +5274,85 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
     # Viewer: do not issue token yet (Pattern A).
     return {"ok": True, "canStart": False, "role": "viewer", "roomName": room, "sessionActive": session_active}
 
+
+class LiveKitStartBroadcastRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+    embedDomain: str = ""
+
+@app.post("/stream/livekit/start_broadcast")
+async def livekit_stream_start_broadcast(req: LiveKitStartBroadcastRequest):
+    """Host-only: start the reusable LiveKit broadcast session and return a host token.
+
+    This endpoint is designed for your existing "Broadcast" host button.
+    It:
+      - sets sessionActive=true and sessionKind='stream'
+      - starts recording egress (MP4) if storage is configured
+      - starts HLS egress (optional) if LIVEKIT_AUTO_HLS=1 and storage is configured
+      - returns {roomName, token, hlsUrl}
+    """
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    is_host = bool(host_member_id) and bool(caller_member_id) and (host_member_id.lower() == caller_member_id.lower())
+    if not is_host:
+        return {"ok": True, "isHost": False}
+
+    room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+    if not _read_event_ref_from_db(resolved_brand, resolved_avatar):
+        _set_session_active(resolved_brand, resolved_avatar, bool(_is_session_active(resolved_brand, resolved_avatar)), event_ref=room)
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room=room)
+    _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+
+    # Start/ensure egress jobs (best-effort). Store ids for deterministic stop.
+    hls_url = ""
+    with _LIVEKIT_JOIN_LOCK:
+        _LIVEKIT_ACTIVE_EGRESS.setdefault(room, {})
+
+    if _livekit_env("LIVEKIT_RECORDING_ENABLED", "1") in ("1", "true", "True", "yes", "YES"):
+        try:
+            rec = _livekit_start_recording_egress(room)
+            if rec.get("ok"):
+                egress_id = str((rec.get("egress") or {}).get("egress_id") or (rec.get("egress") or {}).get("egressId") or "").strip()
+                if egress_id:
+                    with _LIVEKIT_JOIN_LOCK:
+                        _LIVEKIT_ACTIVE_EGRESS[room]["record"] = egress_id
+        except Exception:
+            pass
+
+    if _livekit_env("LIVEKIT_AUTO_HLS", "0") in ("1", "true", "True", "yes", "YES"):
+        try:
+            e = _livekit_start_hls_egress(room)
+            if e.get("ok"):
+                hls_url = str(e.get("hlsUrl") or "")
+                hls_egress_id = str((e.get("egress") or {}).get("egress_id") or (e.get("egress") or {}).get("egressId") or "").strip()
+                if hls_egress_id:
+                    with _LIVEKIT_JOIN_LOCK:
+                        _LIVEKIT_ACTIVE_EGRESS[room]["hls"] = hls_egress_id
+        except Exception:
+            pass
+
+    token = _livekit_participant_token(
+        room,
+        identity=f"host:{caller_member_id or 'host'}",
+        name="Host",
+        can_publish=True,
+        can_subscribe=True,
+        room_admin=True,
+    )
+    return {"ok": True, "isHost": True, "roomName": room, "token": token, "hlsUrl": hls_url, "sessionActive": True}
+
+
 class LiveKitStopRequest(BaseModel):
     brand: str
     avatar: str
@@ -5220,7 +5374,18 @@ async def livekit_stream_stop(req: LiveKitStopRequest):
     if not host_member_id or caller_member_id != host_member_id:
         return {"ok": True, "status": "not_host", "sessionActive": bool(_is_session_active(resolved_brand, resolved_avatar))}
 
-    # Mark inactive (clients will disconnect when token expires / onDisconnected)
+    room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+
+    # Stop any active egress jobs (recording/HLS) and kick participants to force-end the session.
+    with _LIVEKIT_JOIN_LOCK:
+        e = dict(_LIVEKIT_ACTIVE_EGRESS.get(room) or {})
+        _LIVEKIT_ACTIVE_EGRESS.pop(room, None)
+
+    _livekit_stop_egress(str(e.get("record") or ""))
+    _livekit_stop_egress(str(e.get("hls") or ""))
+    _livekit_kick_all(room)
+
+    # Reset session state in DB.
     _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
     _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
 
@@ -5231,6 +5396,7 @@ async def livekit_stream_stop(req: LiveKitStopRequest):
             _LIVEKIT_JOIN_REQUESTS.pop(rid, None)
 
     return {"ok": True, "status": "stopped", "sessionActive": False}
+
 
 # ---- Conference session control (same room, different kind flag) -----------------
 

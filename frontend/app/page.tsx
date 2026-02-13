@@ -3217,7 +3217,7 @@ const speakAssistantReply = useCallback(
     const poll = () => {
       const embedDomain = (typeof window !== "undefined" && window.location) ? window.location.hostname : "";
 
-      fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
+      fetch(`${API_BASE}/stream/livekit/start_embed`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -4115,25 +4115,40 @@ useEffect(() => {
   const toggleBroadcastOverlay = useCallback(async () => {
     if (!showBroadcastButton) return;
 
-    // Toggle off
+    // Toggle OFF: stop the LiveKit stream session (server-side) and close overlay.
     if (showBroadcasterOverlay) {
-      setShowBroadcasterOverlay(false);
+      setBroadcastError("");
+      setBroadcastPreparing(true);
+      try {
+        await fetch(`${API_BASE}/stream/livekit/stop`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            brand: companyName,
+            avatar: companionName,
+            memberId: memberIdRef.current || "",
+          }),
+        }).catch(() => {});
+      } finally {
+        setBroadcastPreparing(false);
+        setShowBroadcasterOverlay(false);
+        // Disconnect LiveKit UI (if connected via overlay)
+        setLivekitToken("");
+        setLivekitRoomName("");
+        setLivekitHlsUrl("");
+      }
       return;
     }
 
-    // Toggle on
+    // Toggle ON: start/ensure session is live + get host token.
     setShowBroadcasterOverlay(true);
     setBroadcastError("");
-
-    // If we already have a resolved URL, do not re-request.
-    if (broadcasterOverlayUrl) return;
-
     setBroadcastPreparing(true);
 
     try {
       const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
 
-      const res = await fetch(`${API_BASE}/stream/beestreamed/start_broadcast`, {
+      const res = await fetch(`${API_BASE}/stream/livekit/start_broadcast`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -4152,24 +4167,32 @@ useEffect(() => {
         throw new Error("Broadcast is only available for the host account.");
       }
 
-      let url = String(data?.broadcasterUrl || "").trim();
-      if (!url) throw new Error("BeeStreamed did not return a broadcasterUrl.");
-      if (url.startsWith("/")) url = `${API_BASE}${url}`;
+      const roomName = String(data?.roomName || "").trim();
+      const token = String(data?.token || "").trim();
+      const hlsUrl = String(data?.hlsUrl || "").trim();
 
-      setBroadcasterOverlayUrl(url);
+      if (!roomName || !token) throw new Error("LiveKit did not return a roomName/token.");
+
+      setLivekitRoomName(roomName);
+      setLivekitRole("host");
+      setLivekitToken(token);
+      setLivekitHlsUrl(hlsUrl);
+
+      // Mark locally active (used elsewhere for gating)
+      setBeestreamedSessionActive(true);
+      setSessionKind("stream");
+      setSessionRoom(roomName);
     } catch (err: any) {
-      console.error("BeeStreamed start_broadcast failed:", err);
+      console.error("LiveKit start_broadcast failed:", err);
       setBroadcastError(err?.message ? String(err.message) : String(err));
-      // NOTE: Keep the overlay open so the host can see the error and can hide it via the Broadcast button.
+      // Keep overlay open so the host can see the error and close it via the Broadcast button.
     } finally {
       setBroadcastPreparing(false);
     }
   }, [
     API_BASE,
-    broadcasterOverlayUrl,
     companyName,
     companionName,
-    memberId,
     showBroadcastButton,
     showBroadcasterOverlay,
   ]);
@@ -7562,7 +7585,7 @@ const modePillControls = (
 	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
 	          ) : null}
 
-          {/* BeeStreamed Producer View overlay (Host-only) */}
+          {/* LiveKit Broadcast overlay (Host-only) */}
           {showBroadcastButton && showBroadcasterOverlay ? (
             <div
               style={{
@@ -7571,42 +7594,121 @@ const modePillControls = (
                 zIndex: 50,
                 borderRadius: 12,
                 overflow: "hidden",
-                background: "#fff",
+                background: "#0b0b0b",
                 border: "1px solid #e5e5e5",
+                display: "flex",
+                flexDirection: "column",
               }}
             >
-              {broadcasterOverlayUrl ? (
-                <iframe
-                  src={broadcasterOverlayUrl}
-                  title="BeeStreamed Producer View"
-                  style={{ width: "100%", height: "100%", border: 0, background: "#fff" }}
-                  // Keep navigation inside the frame; BeeStreamed UI needs scripts + camera/mic.
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
-                  referrerPolicy="no-referrer-when-downgrade"
-                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; display-capture"
-                  allowFullScreen
-                />
-              ) : (
-                <div
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    padding: 16,
-                    textAlign: "center",
-                    color: broadcastError ? "#b00020" : "#111",
-                    background: "#fff",
-                  }}
-                >
-                  {broadcastPreparing
-                    ? "Preparing broadcast…"
-                    : broadcastError
-                    ? `Broadcast unavailable: ${broadcastError}`
-                    : "Preparing broadcast…"}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  padding: "10px 12px",
+                  background: "#111",
+                  color: "#fff",
+                  borderBottom: "1px solid rgba(255,255,255,0.12)",
+                }}
+              >
+                <div style={{ fontWeight: 800, fontSize: 13 }}>Broadcast (LiveKit)</div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  {livekitHlsUrl ? (
+                    <span style={{ fontSize: 12, opacity: 0.85 }} title={livekitHlsUrl}>
+                      HLS enabled
+                    </span>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    onClick={() => void toggleBroadcastOverlay()}
+                    style={{
+                      padding: "8px 12px",
+                      borderRadius: 10,
+                      border: "1px solid #fff",
+                      background: "transparent",
+                      color: "#fff",
+                      cursor: "pointer",
+                      fontWeight: 800,
+                      fontSize: 12,
+                    }}
+                    title="Stop broadcast"
+                  >
+                    Stop
+                  </button>
                 </div>
-              )}
+              </div>
+
+              <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
+                {broadcastPreparing ? (
+                  <div
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      padding: 16,
+                      textAlign: "center",
+                      color: "#fff",
+                    }}
+                  >
+                    Preparing broadcast…
+                  </div>
+                ) : broadcastError ? (
+                  <div
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      padding: 16,
+                      textAlign: "center",
+                      color: "#ffb4b4",
+                    }}
+                  >
+                    Broadcast unavailable: {broadcastError}
+                  </div>
+                ) : livekitToken && livekitRoomName ? (
+                  <LiveKitRoom
+                    token={livekitToken}
+                    serverUrl={LIVEKIT_URL}
+                    connect={true}
+                    audio={true}
+                    video={true}
+                    style={{ width: "100%", height: "100%" }}
+                    onDisconnected={() => {
+                      // If the backend stops the session, close the overlay UI.
+                      setLivekitToken("");
+                      setShowBroadcasterOverlay(false);
+                      setBeestreamedSessionActive(false);
+                      setSessionKind("");
+                      setSessionRoom("");
+                      setAvatarStatus("idle");
+                    }}
+                  >
+                    <VideoConference />
+                  </LiveKitRoom>
+                ) : (
+                  <div
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      padding: 16,
+                      textAlign: "center",
+                      color: "#fff",
+                    }}
+                  >
+                    No host token available. Click Broadcast again to retry.
+                  </div>
+                )}
+              </div>
             </div>
           ) : null}
         </div>
