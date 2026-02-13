@@ -6598,7 +6598,7 @@ const sttControls = (
           if (liveProvider === "stream") {
                       if (
                         streamCanStart &&
-                        !!"" &&
+                        Boolean(streamEventRef) &&
                         (avatarStatus === "connected" || avatarStatus === "waiting")
                       )
                         return;
@@ -6607,7 +6607,7 @@ const sttControls = (
                     }
           void toggleSpeechToText();
         }}
-        disabled={(liveProvider === "stream" && streamCanStart && !!"" && (avatarStatus === "connected" || avatarStatus === "waiting")) ||
+        disabled={(liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ||
                     viewerInStreamUi || (!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
         title="Audio"
         style={{
@@ -6615,10 +6615,10 @@ const sttControls = (
           minWidth: 44,
           borderRadius: 10,
           border: "1px solid #111",
-          background: (liveProvider === "stream" && streamCanStart && !!"" && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
+          background: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
           color: sttEnabled ? "#fff" : "#111",
-          cursor: (liveProvider === "stream" && streamCanStart && !!"" && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-          opacity: (liveProvider === "stream" && streamCanStart && !!"" && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
+          cursor: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
+          opacity: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
           fontWeight: 700,
         }}
       >
@@ -7301,7 +7301,7 @@ const modePillControls = (
 
         <div
           style={{
-            flex: showAvatarFrame ? ((liveProvider === "stream" && !!"" && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
+            flex: showAvatarFrame ? ((liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
             minWidth: 280,
             height: conversationHeight,
             display: "flex",
