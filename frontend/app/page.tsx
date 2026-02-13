@@ -1872,6 +1872,10 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
   const [livekitRoomName, setLivekitRoomName] = useState<string>("");
   const [livekitRole, setLivekitRole] = useState<"host" | "attendee" | "viewer">("viewer");
+  // LiveKit session state (replaces BeeStreamed/Jitsi session flags)
+  const [sessionActive, setSessionActive] = useState<boolean>(false);
+  const [sessionKind, setSessionKind] = useState<SessionKind>("");
+  const [sessionRoom, setSessionRoom] = useState<string>("");
   // Treat "host" as the LiveKit host role (LegacyStream host semantics are deprecated).
   const isHost = livekitRole === "host";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
@@ -3282,11 +3286,6 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   // - "host" is determined by comparing the current Wix memberId to the LegacyStream host_member_id
   //   stored in voice_video_mappings.sqlite3 (exposed via /stream/livekit/status).
   const [livekitHostMemberId, setLivekitHostMemberId] = useState<string>("");
-  const [sessionActive, setSessionActive] = useState<boolean>(false);
-
-const [sessionKind, setSessionKind] = useState<SessionKind>("");
-const [sessionRoom, setSessionRoom] = useState<string>("");
-
 // Host-only Play modal (Stream vs Conference)
 const [showPlayChoiceModal, setShowPlayChoiceModal] = useState<boolean>(false);
 
