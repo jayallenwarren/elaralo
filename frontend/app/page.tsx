@@ -3241,6 +3241,10 @@ useEffect(() => {
   // ---------------------------------------------------------------------------
   const liveChatWsRef = useRef<WebSocket | null>(null);
   const liveChatIdentityRef = useRef<string>("");
+  const liveChatWsClosingRef = useRef<boolean>(false);
+  const liveChatMemberIdRef = useRef<string>("");
+  const liveChatRoleRef = useRef<string>("");
+  const liveChatNameRef = useRef<string>("");
   const liveChatEventRefRef = useRef<string>("");
   const [, setLiveChatConnected] = useState<boolean>(false);
 
