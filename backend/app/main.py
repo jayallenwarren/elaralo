@@ -4970,3 +4970,464 @@ async def journal_append(request: Request):
 # @app.post("/journal/summarize", response_model=None)
 # async def journal_summarize(request: Request):
 #     ...
+
+# =============================================================================
+# LiveKit (replaces BeeStreamed + Jitsi for stream + conference)
+#
+# Supports:
+# - Persistent roomName per (brand, avatar) (stored in the existing event_ref column when present)
+# - Host-controlled start/stop via API (start sets session_active + session_kind + room)
+# - Pattern A lobby: viewers create join_request; host admits/denies; token issued on admit
+# - Recording / broadcast prep via LiveKit Egress (optional; requires storage env vars)
+#
+# Environment:
+#   NEXT_PUBLIC_LIVEKIT_URL (frontend)
+#   LIVEKIT_URL (backend, e.g. https://<project>.livekit.cloud)
+#   LIVEKIT_API_KEY / LIVEKIT_API_SECRET
+#
+# Optional (HLS segments to S3-compatible storage):
+#   LIVEKIT_S3_BUCKET
+#   LIVEKIT_S3_ACCESS_KEY
+#   LIVEKIT_S3_SECRET
+#   LIVEKIT_S3_REGION
+#   LIVEKIT_S3_ENDPOINT (optional)
+#   LIVEKIT_S3_FORCE_PATH_STYLE ("1"|"0", optional)
+#   LIVEKIT_HLS_PUBLIC_BASE_URL (public base for serving playlists; e.g. https://cdn.example.com/livekit)
+# =============================================================================
+
+try:
+    import jwt  # PyJWT
+except Exception:  # pragma: no cover
+    jwt = None  # type: ignore
+
+_LIVEKIT_JOIN_LOCK = threading.Lock()
+# requestId -> request dict
+_LIVEKIT_JOIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
+
+def _livekit_env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
+
+def _livekit_url() -> str:
+    return _livekit_env("LIVEKIT_URL", _livekit_env("NEXT_PUBLIC_LIVEKIT_URL", "")).rstrip("/")
+
+def _livekit_api_key() -> str:
+    return _livekit_env("LIVEKIT_API_KEY")
+
+def _livekit_api_secret() -> str:
+    return _livekit_env("LIVEKIT_API_SECRET")
+
+def _livekit_twirp_headers() -> Dict[str, str]:
+    # LiveKit server API auth is also JWT-based, but for simplicity we sign with API secret in bearer token.
+    # Twirp endpoints accept "Authorization: Bearer <jwt>" with claim "video": {"roomCreate":true, ...} for service tokens.
+    # In practice, LiveKit server SDKs use a "service token". We implement minimal bearer token here.
+    if jwt is None:
+        raise HTTPException(status_code=500, detail="PyJWT is required for LiveKit integration (pip install PyJWT).")
+    key = _livekit_api_key()
+    secret = _livekit_api_secret()
+    if not key or not secret:
+        raise HTTPException(status_code=500, detail="LIVEKIT_API_KEY / LIVEKIT_API_SECRET are not configured")
+
+    now = int(time.time())
+    payload = {
+        "iss": key,
+        "sub": "service",
+        "nbf": now - 5,
+        "exp": now + 60,
+        "video": {"roomCreate": True, "roomList": True, "roomRecord": True, "roomAdmin": True},
+    }
+    token = jwt.encode(payload, secret, algorithm="HS256")
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def _livekit_participant_token(room: str, identity: str, name: str, *, can_publish: bool, can_subscribe: bool, room_admin: bool=False) -> str:
+    if jwt is None:
+        raise HTTPException(status_code=500, detail="PyJWT is required for LiveKit integration (pip install PyJWT).")
+    key = _livekit_api_key()
+    secret = _livekit_api_secret()
+    if not key or not secret:
+        raise HTTPException(status_code=500, detail="LIVEKIT_API_KEY / LIVEKIT_API_SECRET are not configured")
+
+    now = int(time.time())
+    video_grant: Dict[str, Any] = {
+        "room": room,
+        "roomJoin": True,
+        "canPublish": bool(can_publish),
+        "canSubscribe": bool(can_subscribe),
+        "canPublishData": bool(can_publish),
+    }
+    if room_admin:
+        video_grant["roomAdmin"] = True
+
+    payload = {
+        "iss": key,
+        "sub": identity,
+        "name": name or identity,
+        "nbf": now - 5,
+        "exp": now + 60 * 60,  # 1 hour
+        "video": video_grant,
+        "metadata": "",
+    }
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+def _twirp_post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    import requests  # type: ignore
+    base = _livekit_url()
+    if not base:
+        raise HTTPException(status_code=500, detail="LIVEKIT_URL is not configured")
+    url = f"{base}{path}"
+    try:
+        r = requests.post(url, headers=_livekit_twirp_headers(), json=payload, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LiveKit API call failed: {e!r}")
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=f"LiveKit API error {r.status_code}: {(r.text or '')[:500]}")
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": (r.text or "").strip()}
+
+def _livekit_room_name_for_companion(brand: str, avatar: str) -> str:
+    # Reuse your existing stable token helper for rooms.
+    return _sanitize_room_token(f"{(brand or '').strip()}-{(avatar or '').strip()}")
+
+def _livekit_storage_s3_config() -> Optional[Dict[str, Any]]:
+    bucket = _livekit_env("LIVEKIT_S3_BUCKET")
+    access_key = _livekit_env("LIVEKIT_S3_ACCESS_KEY")
+    secret = _livekit_env("LIVEKIT_S3_SECRET")
+    region = _livekit_env("LIVEKIT_S3_REGION")
+    endpoint = _livekit_env("LIVEKIT_S3_ENDPOINT")
+    force_path = _livekit_env("LIVEKIT_S3_FORCE_PATH_STYLE", "1")
+    if not bucket or not access_key or not secret:
+        return None
+    cfg: Dict[str, Any] = {
+        "access_key": access_key,
+        "secret": secret,
+        "bucket": bucket,
+        "region": region,
+        "force_path_style": str(force_path).strip() in ("1", "true", "True", "yes", "YES"),
+    }
+    if endpoint:
+        cfg["endpoint"] = endpoint
+    return cfg
+
+def _livekit_start_hls_egress(room_name: str) -> Dict[str, Any]:
+    s3 = _livekit_storage_s3_config()
+    if not s3:
+        return {"ok": False, "error": "S3 storage env not configured for HLS egress"}
+
+    # Use a predictable prefix so the playback URL is reusable.
+    prefix = f"hls/{room_name}"
+    playlist = "playlist.m3u8"
+    live_playlist = "live.m3u8"
+
+    req = {
+        "room_name": room_name,
+        "layout": "grid",
+        "preset": "H264_720P_30",
+        "audio_only": False,
+        "segment_outputs": [
+            {
+                "filename_prefix": prefix,
+                "playlist_name": playlist,
+                "live_playlist_name": live_playlist,
+                "segment_duration": 2,
+                "s3": s3,
+            }
+        ],
+    }
+    info = _twirp_post_json("/twirp/livekit.Egress/StartRoomCompositeEgress", req)
+    base = _livekit_env("LIVEKIT_HLS_PUBLIC_BASE_URL").rstrip("/")
+    hls_url = f"{base}/{prefix}/{live_playlist}" if base else ""
+    return {"ok": True, "egress": info, "hlsUrl": hls_url, "prefix": prefix, "livePlaylist": live_playlist}
+
+class LiveKitStartEmbedRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+    embedDomain: str = ""
+
+@app.post("/stream/livekit/start_embed")
+async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
+    """
+    Start or join a LiveKit 'stream' session (host-controlled).
+    - Host gets an immediate token.
+    - Viewer gets roomName + canStart=false and must go through join_request/admit.
+    """
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+
+    is_host = bool(host_member_id) and bool(caller_member_id) and (host_member_id.lower() == caller_member_id.lower())
+
+    # Stable room (reuse event_ref storage)
+    room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+    if not _read_event_ref_from_db(resolved_brand, resolved_avatar):
+        _set_session_active(resolved_brand, resolved_avatar, bool(_is_session_active(resolved_brand, resolved_avatar)), event_ref=room)
+
+    session_active = bool(_is_session_active(resolved_brand, resolved_avatar))
+    if is_host:
+        # Start session
+        _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room=room)
+        _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+
+        # Optional: start HLS egress for scale (does not affect WebRTC viewers)
+        hls_url = ""
+        if _livekit_env("LIVEKIT_AUTO_HLS", "0") in ("1", "true", "True", "yes", "YES"):
+            try:
+                e = _livekit_start_hls_egress(room)
+                hls_url = str(e.get("hlsUrl") or "")
+            except Exception:
+                pass
+
+        token = _livekit_participant_token(
+            room,
+            identity=f"host:{caller_member_id or 'host'}",
+            name="Host",
+            can_publish=True,
+            can_subscribe=True,
+            room_admin=True,
+        )
+        return {"ok": True, "canStart": True, "role": "host", "roomName": room, "token": token, "sessionActive": True, "hlsUrl": hls_url}
+
+    # Viewer: do not issue token yet (Pattern A).
+    return {"ok": True, "canStart": False, "role": "viewer", "roomName": room, "sessionActive": session_active}
+
+class LiveKitStopRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+
+@app.post("/stream/livekit/stop")
+async def livekit_stream_stop(req: LiveKitStopRequest):
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    if not host_member_id or caller_member_id != host_member_id:
+        return {"ok": True, "status": "not_host", "sessionActive": bool(_is_session_active(resolved_brand, resolved_avatar))}
+
+    # Mark inactive (clients will disconnect when token expires / onDisconnected)
+    _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+    # Clear any pending join requests for this companion
+    with _LIVEKIT_JOIN_LOCK:
+        to_del = [rid for rid, r in _LIVEKIT_JOIN_REQUESTS.items() if (r.get("brand")==resolved_brand and r.get("avatar")==resolved_avatar)]
+        for rid in to_del:
+            _LIVEKIT_JOIN_REQUESTS.pop(rid, None)
+
+    return {"ok": True, "status": "stopped", "sessionActive": False}
+
+# ---- Conference session control (same room, different kind flag) -----------------
+
+class LiveKitConferenceStartRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+    displayName: str = ""
+
+class LiveKitConferenceStopRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+
+@app.post("/conference/livekit/start")
+async def livekit_conference_start(req: LiveKitConferenceStartRequest):
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+
+    if not host_member_id or caller_member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Only the host can start the conference.")
+
+    room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+    if not _read_event_ref_from_db(resolved_brand, resolved_avatar):
+        _set_session_active(resolved_brand, resolved_avatar, bool(_is_session_active(resolved_brand, resolved_avatar)), event_ref=room)
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
+    _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+
+    token = _livekit_participant_token(
+        room,
+        identity=f"host:{caller_member_id or 'host'}",
+        name=str(req.displayName or "Host").strip() or "Host",
+        can_publish=True,
+        can_subscribe=True,
+        room_admin=True,
+    )
+
+    return {"ok": True, "sessionActive": True, "sessionKind": "conference", "sessionRoom": room, "token": token}
+
+@app.post("/conference/livekit/stop")
+async def livekit_conference_stop(req: LiveKitConferenceStopRequest):
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    if not host_member_id or caller_member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Only the host can stop the conference.")
+
+    _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+    # Clear pending join requests
+    with _LIVEKIT_JOIN_LOCK:
+        to_del = [rid for rid, r in _LIVEKIT_JOIN_REQUESTS.items() if (r.get("brand")==resolved_brand and r.get("avatar")==resolved_avatar)]
+        for rid in to_del:
+            _LIVEKIT_JOIN_REQUESTS.pop(rid, None)
+
+    return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
+
+# ---- Pattern A Lobby ------------------------------------------------------------
+
+class LiveKitJoinRequestCreate(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str
+    name: str = ""
+    roomName: str = ""
+
+@app.post("/livekit/join_request")
+async def livekit_join_request(req: LiveKitJoinRequestCreate):
+    b = (req.brand or "").strip()
+    a = (req.avatar or "").strip()
+    if not b or not a:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+    rid = str(uuid.uuid4())
+    with _LIVEKIT_JOIN_LOCK:
+        _LIVEKIT_JOIN_REQUESTS[rid] = {
+            "requestId": rid,
+            "brand": b,
+            "avatar": a,
+            "roomName": (req.roomName or "").strip() or _livekit_room_name_for_companion(b, a),
+            "memberId": (req.memberId or "").strip(),
+            "name": (req.name or "").strip(),
+            "status": "PENDING",
+            "createdAt": int(time.time()),
+            "token": "",
+        }
+    return {"ok": True, "requestId": rid, "status": "PENDING"}
+
+@app.get("/livekit/join_requests")
+async def livekit_join_requests(brand: str, avatar: str):
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    with _LIVEKIT_JOIN_LOCK:
+        reqs = [r for r in _LIVEKIT_JOIN_REQUESTS.values() if r.get("brand")==b and r.get("avatar")==a and r.get("status")=="PENDING"]
+    # Most recent first
+    reqs.sort(key=lambda r: int(r.get("createdAt") or 0), reverse=True)
+    return {"ok": True, "requests": reqs[:50]}
+
+class LiveKitJoinDecision(BaseModel):
+    requestId: str
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+
+@app.post("/livekit/admit")
+async def livekit_admit(req: LiveKitJoinDecision):
+    rid = (req.requestId or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="requestId is required")
+
+    # Host authorization (use brand/avatar of the request if not provided)
+    with _LIVEKIT_JOIN_LOCK:
+        r = _LIVEKIT_JOIN_REQUESTS.get(rid)
+    if not r:
+        raise HTTPException(status_code=404, detail="join request not found")
+
+    b = (r.get("brand") or req.brand or "").strip()
+    a = (r.get("avatar") or req.avatar or "").strip()
+    mapping = _lookup_companion_mapping(b, a)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    if not host_member_id or caller_member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Only host can admit participants.")
+
+    room = str(r.get("roomName") or "").strip() or _livekit_room_name_for_companion(b, a)
+    identity = f"user:{str(r.get('memberId') or '').strip() or rid}"
+    name = str(r.get("name") or "").strip() or "Guest"
+
+    token = _livekit_participant_token(room, identity=identity, name=name, can_publish=False, can_subscribe=True)
+
+    with _LIVEKIT_JOIN_LOCK:
+        rr = _LIVEKIT_JOIN_REQUESTS.get(rid)
+        if rr:
+            rr["status"] = "ADMITTED"
+            rr["token"] = token
+            rr["decidedAt"] = int(time.time())
+
+    return {"ok": True, "status": "ADMITTED"}
+
+@app.post("/livekit/deny")
+async def livekit_deny(req: LiveKitJoinDecision):
+    rid = (req.requestId or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="requestId is required")
+
+    with _LIVEKIT_JOIN_LOCK:
+        r = _LIVEKIT_JOIN_REQUESTS.get(rid)
+    if not r:
+        raise HTTPException(status_code=404, detail="join request not found")
+
+    b = (r.get("brand") or req.brand or "").strip()
+    a = (r.get("avatar") or req.avatar or "").strip()
+    mapping = _lookup_companion_mapping(b, a)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    if not host_member_id or caller_member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Only host can deny participants.")
+
+    with _LIVEKIT_JOIN_LOCK:
+        rr = _LIVEKIT_JOIN_REQUESTS.get(rid)
+        if rr:
+            rr["status"] = "DENIED"
+            rr["token"] = ""
+            rr["decidedAt"] = int(time.time())
+
+    return {"ok": True, "status": "DENIED"}
+
+@app.get("/livekit/join_request_status")
+async def livekit_join_request_status(requestId: str):
+    rid = (requestId or "").strip()
+    with _LIVEKIT_JOIN_LOCK:
+        r = _LIVEKIT_JOIN_REQUESTS.get(rid)
+    if not r:
+        return {"ok": True, "status": "MISSING"}
+    return {"ok": True, "status": r.get("status"), "token": r.get("token") or ""}
+

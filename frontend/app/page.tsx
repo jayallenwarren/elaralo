@@ -4,6 +4,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import elaraLogo from "../public/elaralo-logo.png";
 
 
+import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks } from "@livekit/components-react";
+import "@livekit/components-styles";
+import Hls from "hls.js";
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
   <svg
     width={size}
@@ -63,6 +66,50 @@ const SaveIcon = ({ size = 18 }: { size?: number }) => (
     />
   </svg>
 );
+
+function LiveKitHlsPlayer({ src }: { src: string }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+
+    // Native HLS (Safari) fallback
+    const canNative = v.canPlayType("application/vnd.apple.mpegurl");
+    if (canNative) {
+      v.src = src;
+      v.play().catch(() => {});
+      return;
+    }
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({ lowLatencyMode: true });
+      hls.loadSource(src);
+      hls.attachMedia(v);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        v.play().catch(() => {});
+      });
+      return () => {
+        try { hls.destroy(); } catch {}
+      };
+    } else {
+      v.src = src;
+      v.play().catch(() => {});
+    }
+  }, [src]);
+
+  return (
+    <video
+      ref={videoRef}
+      style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
+      controls
+      playsInline
+      autoPlay
+      muted={false}
+    />
+  );
+}
+
 type Role = "user" | "assistant";
 // `meta` is used for UI-only bookkeeping (e.g., in-stream live chat sender ids).
 // It is never serialized to the backend /chat API.
@@ -1821,6 +1868,61 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 
   // BeeStreamed (Human companion) embed state
   const [streamEmbedUrl, setStreamEmbedUrl] = useState<string>("");
+
+  // LiveKit (replaces BeeStreamed + Jitsi)
+  const LIVEKIT_URL = useMemo(() => String((process.env.NEXT_PUBLIC_LIVEKIT_URL || "")).trim(), []);
+  const [livekitToken, setLivekitToken] = useState<string>("");
+  const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
+  const [livekitRoomName, setLivekitRoomName] = useState<string>("");
+  const [livekitRole, setLivekitRole] = useState<"host" | "attendee" | "viewer">("viewer");
+  const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
+
+  const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
+
+  // Host: poll join requests while a LiveKit session is active.
+  useEffect(() => {
+    if (!isBeeStreamedHost) return;
+    if (!beestreamedSessionActive) return;
+    let cancelled = false;
+
+    const tick = async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/livekit/join_requests?brand=${encodeURIComponent(companyName)}&avatar=${encodeURIComponent(companionName)}`);
+        const data: any = await resp.json().catch(() => ({}));
+        if (!cancelled) setLivekitPending(Array.isArray(data?.requests) ? data.requests : []);
+      } catch {
+        if (!cancelled) setLivekitPending([]);
+      }
+    };
+
+    const id = window.setInterval(tick, 1200);
+    void tick();
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [API_BASE, companyName, companionName, isBeeStreamedHost, beestreamedSessionActive]);
+
+  const admitLivekit = useCallback(async (requestId: string) => {
+    const rid = String(requestId || "").trim();
+    if (!rid) return;
+    await fetch(`${API_BASE}/livekit/admit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requestId: rid, brand: companyName, avatar: companionName, memberId: memberIdRef.current || "" }),
+    }).catch(() => {});
+  }, [API_BASE, companyName, companionName]);
+
+  const denyLivekit = useCallback(async (requestId: string) => {
+    const rid = String(requestId || "").trim();
+    if (!rid) return;
+    await fetch(`${API_BASE}/livekit/deny`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requestId: rid, brand: companyName, avatar: companionName, memberId: memberIdRef.current || "" }),
+    }).catch(() => {});
+  }, [API_BASE, companyName, companionName]);
+
   const [streamEventRef, setStreamEventRef] = useState<string>("");
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
   const [streamNotice, setStreamNotice] = useState<string>("");
@@ -2030,7 +2132,7 @@ const stopLiveAvatar = useCallback(async () => {
       // Only the host can stop the underlying BeeStreamed event.
       // Viewers can close their local iframe without affecting the event.
       if (hostStopping) {
-        const res = await fetch(`${API_BASE}/stream/beestreamed/stop_embed`, {
+        const res = await fetch(`${API_BASE}/stream/livekit/stop`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -2155,25 +2257,20 @@ const startLiveAvatar = useCallback(async () => {
   ensureIphoneAudioContextUnlocked();
 
 if (liveProvider === "stream") {
-  // BeeStreamed (Human companion) — start/ensure the event on the API, then embed inside the page.
+  // LiveKit (Human companion) — conference + broadcast, with Pattern A lobby.
   setAvatarError(null);
   setAvatarStatus("connecting");
 
-    // Starting (or joining) a new shared-live session: clear any prior live-chat transcript so we don't
-    // display messages from the previous session when reusing the same event_ref.
-    setMessages((prev) => prev.filter((m) => !m.meta?.liveChat));
-    liveChatSeenIdsRef.current = new Set();
-    liveChatSeenOrderRef.current = [];
-
+  // Clear any prior in-stream chat transcript (your chat/auth are handled internally).
+  setMessages((prev) => prev.filter((m) => !m.meta?.liveChat));
+  liveChatSeenIdsRef.current = new Set();
+  liveChatSeenOrderRef.current = [];
 
   try {
     const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
 
-    // Ask the app server to:
-    //  - resolve/create an event_ref for this (brand, avatar)
-    //  - start the WebRTC stream for that event
-    //  - return an embed URL
-    const res = await fetch(`${API_BASE}/stream/beestreamed/start_embed`, {
+    // Ask server to resolve room + determine host vs viewer.
+    const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2189,83 +2286,92 @@ if (liveProvider === "stream") {
       throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
     }
 
-    const eventRef = String(data?.eventRef || "").trim();
+    const canStart = !!data?.canStart;
+    const roomName = String(data?.roomName || data?.sessionRoom || "").trim();
+    const token = String(data?.token || "").trim();
+    const role = String(data?.role || (canStart ? "host" : "viewer")).trim().toLowerCase();
+    const hlsUrl = String(data?.hlsUrl || "").trim();
 
-// IMPORTANT: Always use our internal wrapper so the experience stays within the iframe.
-// The API may return a relative path like "/stream/beestreamed/embed/{eventRef}".
-let embedUrl = String(data?.embedUrl || "").trim();
-if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
+    setLivekitRoomName(roomName);
+    setLivekitHlsUrl(hlsUrl);
+    setLivekitRole(role === "host" ? "host" : role === "attendee" ? "attendee" : "viewer");
 
-// If the host hasn't created the event yet, non-host users may legitimately have no embedUrl/eventRef.
-const canStart = !!data?.canStart;
-
-// Viewer: ask for a display name the first time they join the live session.
-// Stored locally so it persists across reloads.
-if (!canStart) {
-  const uname = ensureViewerLiveChatName();
-  if (!uname) {
-    // User cancelled / empty name: do not join the stream.
-    setStreamNotice("");
-    setAvatarStatus("idle");
-    setAvatarError(null);
-    return;
-  }
-}
-
-
-if (!embedUrl && eventRef) {
-  // Fallback to wrapper path (never direct beestreamed.com) if API returned eventRef only.
-  embedUrl = `${API_BASE}/stream/beestreamed/embed/${encodeURIComponent(eventRef)}`;
-}
-if (!embedUrl && canStart) {
-  throw new Error("BeeStreamed did not return an embedUrl/eventRef.");
-}
-// Viewer UX: use BeeStreamed's player-only embed to avoid interactive UI issues (cookies/consent) in iframes.
-// We pass this hint to our *wrapper* page, which then appends &embed=player to the BeeStreamed URL.
-if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
-  embedUrl += (embedUrl.includes("?") ? "&" : "?") + "embed=player";
-}
-
-setStreamEventRef(eventRef);
-    setStreamEmbedUrl(embedUrl);
-
-    setStreamCanStart(canStart);
-
-    // This client has now explicitly joined the in-stream experience (until Stop is pressed).
-    joinedStreamRef.current = true;
-
-    // Host started a BeeStreamed session -> mark global session active immediately (poll will also confirm)
-    if (canStart) setBeestreamedSessionActive(true);
-
-    if (!canStart) {
-      // If the host session is already active, the viewer shouldn't stay in the "waiting" UX.
-      // They can watch immediately and participate in the shared in-stream chat.
-      const sessionIsActive = Boolean(data?.sessionActive);
-      if (sessionIsActive) {
-        setStreamNotice("");
-        setAvatarStatus("connected");
-      } else {
-        setStreamNotice(`Waiting on ${companionName || "the host"} to start event`);
-        setAvatarStatus("waiting");
-      }
-    } else if (String(data?.status || "").trim() === "start_failed") {
-      setStreamNotice("");
-      setAvatarStatus("error");
-      setAvatarError("Streaming failed to start. Please try again.");
-    } else {
+    if (canStart) {
+      // Host: connect immediately.
+      setLivekitToken(token);
+      setBeestreamedSessionActive(true);
+      setSessionKind("stream");
       setStreamNotice("");
       setAvatarStatus("connected");
+      joinedStreamRef.current = true;
+      return;
     }
-  } catch (err: any) {
-    console.error("BeeStreamed start_embed failed:", err);
-    setAvatarStatus("error");
-    setAvatarError(
-      `Streaming failed to start. ${err?.message ? String(err.message) : String(err)}`,
-    );
 
-    // BeeStreamed: do not open external popups; stay in-page.
+    // Viewer: Pattern A lobby (no token until admitted).
+    const uname = ensureViewerLiveChatName();
+    if (!uname) {
+      setStreamNotice("");
+      setAvatarStatus("idle");
+      setAvatarError(null);
+      return;
+    }
+
+    // Create a join request.
+    const jr = await fetch(`${API_BASE}/livekit/join_request`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        brand: companyName,
+        avatar: companionName,
+        memberId: memberIdRef.current || "",
+        name: uname,
+        roomName,
+      }),
+    });
+    const jrData: any = await jr.json().catch(() => ({}));
+    if (!jr.ok || !jrData?.ok) throw new Error(String(jrData?.detail || jrData?.error || "Join request failed."));
+    const requestId = String(jrData?.requestId || "").trim();
+    setLivekitJoinRequestId(requestId);
+
+    // Poll for admission.
+    setStreamNotice("Waiting for host approval…");
+    setAvatarStatus("waiting");
+
+    const pollStart = Date.now();
+    const poll = async () => {
+      const resp = await fetch(`${API_BASE}/livekit/join_request_status?requestId=${encodeURIComponent(requestId)}`);
+      const st: any = await resp.json().catch(() => ({}));
+      if (st?.status === "ADMITTED" && st?.token) {
+        setLivekitToken(String(st.token));
+        setBeestreamedSessionActive(true);
+        setSessionKind("stream");
+        setStreamNotice("");
+        setAvatarStatus("connected");
+        joinedStreamRef.current = true;
+        return;
+      }
+      if (st?.status === "DENIED") {
+        setStreamNotice("");
+        setAvatarStatus("idle");
+        setAvatarError("Host denied your request to join.");
+        return;
+      }
+      if (Date.now() - pollStart > 120000) {
+        setStreamNotice("");
+        setAvatarStatus("idle");
+        setAvatarError("Timed out waiting for host approval.");
+        return;
+      }
+      window.setTimeout(poll, 1200);
+    };
+    window.setTimeout(poll, 800);
+    return;
+  } catch (err: any) {
+    console.error("LiveKit start failed:", err);
+    setAvatarStatus("error");
+    setAvatarError(`Live session failed to start. ${err?.message ? String(err.message) : String(err)}`);
+    return;
   }
-  return;
 }
 
 if (!phase1AvatarMedia) {
@@ -3579,21 +3685,21 @@ const stopConferenceSession = useCallback(async () => {
   // Viewers leaving the conference should not stop the host session.
   if (!isBeeStreamedHost) {
     conferenceOptOutRef.current = true;
-    disposeJitsi();
+    setLivekitToken("");
     setAvatarStatus("idle");
     return;
   }
 
   // Optimistic close (prevents auto-rejoin while stop request is in-flight)
   conferenceOptOutRef.current = true;
-  disposeJitsi();
+  setLivekitToken("");
   setBeestreamedSessionActive(false);
   setSessionKind("");
   setSessionRoom("");
   setAvatarStatus("idle");
 
   try {
-    await fetch(`${API_BASE}/conference/jitsi/stop`, {
+    await fetch(`${API_BASE}/conference/livekit/stop`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ brand: companyName, avatar: companionName, memberId: memberId || "" }),
@@ -3734,7 +3840,7 @@ const startConferenceSession = useCallback(async () => {
   setAvatarStatus("connecting");
 
   try {
-    const resp = await fetch(`${API_BASE}/conference/jitsi/start`, {
+    const resp = await fetch(`${API_BASE}/conference/livekit/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
 	      body: JSON.stringify({
@@ -3758,8 +3864,10 @@ const startConferenceSession = useCallback(async () => {
     setSessionKind("conference");
     setSessionRoom(room);
 
-    await joinJitsiConference(room);
-  } catch (err: any) {
+    setLivekitRoomName(room);
+    setLivekitRole("host");
+    setLivekitToken(String(data?.token || ""));
+} catch (err: any) {
     setAvatarStatus("idle");
     setAvatarError(err?.message || "Private session start failed.");
   }
@@ -7062,53 +7170,70 @@ const modePillControls = (
       {sttControls}
 
       <div style={{ fontSize: 12, color: "#666" }}>
-        Live Avatar: <b>{avatarStatus}</b>
-        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
-      </div>
-    </div>
-
-    {/* Right-justified Mode controls */}
-    {modePillControls}
-  </section>
-)}
-
-
-
-      {/* Conversation area (Avatar + Chat) */}
-      <section
-        style={{
-          display: "flex",
-          gap: 12,
-          alignItems: "stretch",
-          flexWrap: "wrap",
-          marginBottom: 12,
-        }}
-      >
-        {showAvatarFrame ? (
-          <div style={{ flex: (liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "2 1 0" : "1 1 0", minWidth: 260, height: conversationHeight }}>
-            <div
-              style={{
-                border: "1px solid #e5e5e5",
-                borderRadius: 12,
-                overflow: "hidden",
-                background: "#000",
-                height: "100%",
-                position: "relative",
-              }}
-            >
-                            {liveProvider === "stream" && beestreamedSessionActive && sessionKind === "conference" ? (
+     {liveProvider === "stream" && livekitToken ? (
                 <div style={{ width: "100%", height: "100%", position: "relative" }}>
-                  <div ref={jitsiContainerRef} style={{ width: "100%", height: "100%" }} />
-                  {jitsiError ? (
-                    <div
-                      style={{
-                        position: "absolute",
-                        left: 12,
-                        right: 12,
-                        bottom: 12,
-                        padding: 10,
-                        borderRadius: 10,
-                        background: "rgba(0,0,0,0.6)",
+                  {/* Conference + small-audience live stream via WebRTC */}
+                  <LiveKitRoom
+                    token={livekitToken}
+                    serverUrl={LIVEKIT_URL}
+                    connect={true}
+                    audio={true}
+                    video={true}
+                    style={{ width: "100%", height: "100%" }}
+                    onDisconnected={() => {
+                      // If disconnected (e.g. host stopped), return to idle.
+                      setLivekitToken("");
+                      setBeestreamedSessionActive(false);
+                      setSessionKind("");
+                      setAvatarStatus("idle");
+                    }}
+                  >
+                    <VideoConference />
+
+                    {isBeeStreamedHost && livekitPending.length ? (
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: 10,
+                          right: 10,
+                          width: 260,
+                          maxHeight: "70%",
+                          overflowY: "auto",
+                          background: "rgba(0,0,0,0.65)",
+                          border: "1px solid rgba(255,255,255,0.18)",
+                          borderRadius: 12,
+                          padding: 10,
+                          color: "#fff",
+                          fontSize: 12,
+                          zIndex: 5,
+                        }}
+                      >
+                        <div style={{ fontWeight: 700, marginBottom: 8 }}>Lobby</div>
+                        {livekitPending.map((r: any) => (
+                          <div key={String(r.requestId)} style={{ marginBottom: 10, paddingBottom: 10, borderBottom: "1px solid rgba(255,255,255,0.12)" }}>
+                            <div style={{ marginBottom: 6 }}>
+                              <div style={{ fontWeight: 600 }}>{String(r.name || "Guest")}</div>
+                              <div style={{ opacity: 0.85 }}>{String(r.memberId || "")}</div>
+                            </div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button onClick={() => admitLivekit(String(r.requestId))} style={{ padding: "6px 10px", borderRadius: 10, border: "0", cursor: "pointer" }}>
+                                Admit
+                              </button>
+                              <button onClick={() => denyLivekit(String(r.requestId))} style={{ padding: "6px 10px", borderRadius: 10, border: "0", cursor: "pointer" }}>
+                                Deny
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+
+                  </LiveKitRoom>
+                </div>
+              ) : liveProvider === "stream" && livekitHlsUrl ? (
+                <LiveKitHlsPlayer src={livekitHlsUrl} />
+              ) : (
+                ,0.6)",
                         border: "1px solid rgba(255,255,255,0.14)",
                         fontSize: 12,
                       }}
