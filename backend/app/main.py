@@ -2703,6 +2703,8 @@ async def beestreamed_status(brand: str, avatar: str):
         "sessionKind": session_kind,
 
         "sessionRoom": session_room,
+    }
+
 
     
 
@@ -2807,7 +2809,6 @@ async def livekit_livechat_ws(websocket: WebSocket, event_ref: str):
     """Alias LiveKit chat websocket to the existing livechat pipeline."""
     return await beestreamed_livechat_ws(websocket, event_ref)
 
-}
 @app.post("/stream/beestreamed/embed_url")
 async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
     """Return an embeddable URL that *cannot* pop out of the iframe.
