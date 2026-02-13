@@ -7177,7 +7177,7 @@ const modePillControls = (
     {/* Right-justified Mode controls */}
     {modePillControls}
   </section>
-) : (
+) : (<>
   <section
     style={{
       display: "flex",
@@ -7705,6 +7705,8 @@ const modePillControls = (
           ) : null}
         </div>
       </section>
+</>)
+}
 
       {/* Save Chat Summary confirmation overlay */}
       {showSaveSummaryConfirm && (
