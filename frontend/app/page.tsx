@@ -1996,7 +1996,7 @@ const streamUiActive =
     avatarStatus === "waiting" ||
     avatarStatus === "connected" ||
     avatarStatus === "reconnecting" ||
-    Boolean("" || streamEventRef));
+    Boolean(streamEventRef));
 
 const showAvatarFrame =
   (liveProvider === "stream" && streamUiActive) ||
@@ -3314,7 +3314,7 @@ useEffect(() => {
     liveProvider === "stream" &&
     !streamCanStart &&
     (sessionActive ||
-      (Boolean("" || streamEventRef) &&
+      (Boolean(streamEventRef) &&
         (avatarStatus === "connected" ||
           avatarStatus === "waiting" ||
           avatarStatus === "connecting" ||
@@ -3422,7 +3422,7 @@ useEffect(() => {
     const inStreamUi =
       Boolean(sessionActive) &&
       kind !== "conference" &&
-      Boolean("" || streamEventRef) &&
+      Boolean(streamEventRef) &&
       !!String(streamEventRef || "").trim() &&
       !!eventRef;
 
@@ -6564,7 +6564,7 @@ const hostCanStopConference = sessionKind === "conference" && isHost;
 const hostCanStopStream =
   liveProvider === "stream" &&
   streamCanStart &&
-  (Boolean("" || streamEventRef) ||
+  (Boolean(streamEventRef) ||
     avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
@@ -6574,7 +6574,7 @@ const hostCanStopStream =
 const hostInStreamUi =
   liveProvider === "stream" &&
   streamCanStart &&
-  (Boolean("" || streamEventRef) ||
+  (Boolean(streamEventRef) ||
     avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
