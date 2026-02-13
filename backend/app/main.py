@@ -2297,6 +2297,114 @@ def _set_session_kind_room_best_effort(resolved_brand: str, resolved_avatar: str
   except Exception:
     return False
 
+
+
+# =============================================================================
+# LiveKit DB columns (non-destructive migrations)
+# =============================================================================
+def _ensure_livekit_columns_best_effort() -> None:
+    """Ensure LiveKit-specific columns exist in companion_mappings.
+
+    This is NON-DESTRUCTIVE: it only adds columns if missing and never drops any
+    existing (including BeeStreamed) columns.
+    """
+    try:
+        db_path = _get_companion_mappings_db_path(for_write=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(companion_mappings)")
+            cols = {row[1].lower() for row in cur.fetchall()}
+
+            # Keep event_ref as the reusable identifier (we store LiveKit roomName there for now).
+            # Add additional LiveKit operational fields.
+            to_add = []
+            if "livekit_room_name" not in cols:
+                to_add.append(("livekit_room_name", "TEXT"))
+            if "livekit_record_egress_id" not in cols:
+                to_add.append(("livekit_record_egress_id", "TEXT"))
+            if "livekit_hls_egress_id" not in cols:
+                to_add.append(("livekit_hls_egress_id", "TEXT"))
+            if "livekit_hls_url" not in cols:
+                to_add.append(("livekit_hls_url", "TEXT"))
+            if "livekit_last_started_at" not in cols:
+                to_add.append(("livekit_last_started_at", "INTEGER"))
+
+            for name, typ in to_add:
+                try:
+                    cur.execute(f"ALTER TABLE companion_mappings ADD COLUMN {name} {typ}")
+                except Exception:
+                    pass
+
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        # Best-effort: DB may be read-only in some environments.
+        return
+
+
+def _set_livekit_fields_best_effort(
+    resolved_brand: str,
+    resolved_avatar: str,
+    *,
+    room_name: str | None = None,
+    record_egress_id: str | None = None,
+    hls_egress_id: str | None = None,
+    hls_url: str | None = None,
+    last_started_at_ms: int | None = None,
+) -> bool:
+    """Best-effort update of LiveKit-specific columns for a (brand, avatar)."""
+    if all(v is None for v in (room_name, record_egress_id, hls_egress_id, hls_url, last_started_at_ms)):
+        return True
+    try:
+        b = (resolved_brand or "").strip()
+        a = (resolved_avatar or "").strip()
+        if not b or not a:
+            return False
+
+        db_path = _get_companion_mappings_db_path(for_write=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            _ensure_livekit_columns_best_effort()
+
+            cur.execute(
+                "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+                (b, a),
+            )
+
+            sets = []
+            params = []
+            if room_name is not None:
+                sets.append("livekit_room_name = ?")
+                params.append((room_name or "").strip() or None)
+            if record_egress_id is not None:
+                sets.append("livekit_record_egress_id = ?")
+                params.append((record_egress_id or "").strip() or None)
+            if hls_egress_id is not None:
+                sets.append("livekit_hls_egress_id = ?")
+                params.append((hls_egress_id or "").strip() or None)
+            if hls_url is not None:
+                sets.append("livekit_hls_url = ?")
+                params.append((hls_url or "").strip() or None)
+            if last_started_at_ms is not None:
+                sets.append("livekit_last_started_at = ?")
+                params.append(int(last_started_at_ms))
+
+            if sets:
+                params.extend([b, a])
+                cur.execute(
+                    f"UPDATE companion_mappings SET {', '.join(sets)} WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)",
+                    tuple(params),
+                )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
 class BeeStreamedStartEmbedRequest(BaseModel):
     brand: str
     avatar: str
@@ -2655,6 +2763,7 @@ async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
         _set_session_active(resolved_brand, resolved_avatar, active=False)
 
         _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+        _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, record_egress_id=None, hls_egress_id=None, hls_url=None)
         return {
             "ok": True,
             "status": "no_event_ref",
@@ -5251,6 +5360,7 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
         # Start session
         _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room=room)
         _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+        _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, room_name=room, last_started_at_ms=int(time.time()*1000))
 
         # Optional: start HLS egress for scale (does not affect WebRTC viewers)
         hls_url = ""
@@ -5313,6 +5423,7 @@ async def livekit_stream_start_broadcast(req: LiveKitStartBroadcastRequest):
 
     _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room=room)
     _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+    _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, room_name=room, last_started_at_ms=int(time.time()*1000))
 
     # Start/ensure egress jobs (best-effort). Store ids for deterministic stop.
     hls_url = ""
@@ -5327,6 +5438,7 @@ async def livekit_stream_start_broadcast(req: LiveKitStartBroadcastRequest):
                 if egress_id:
                     with _LIVEKIT_JOIN_LOCK:
                         _LIVEKIT_ACTIVE_EGRESS[room]["record"] = egress_id
+                    _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, record_egress_id=egress_id)
         except Exception:
             pass
 
@@ -5339,6 +5451,7 @@ async def livekit_stream_start_broadcast(req: LiveKitStartBroadcastRequest):
                 if hls_egress_id:
                     with _LIVEKIT_JOIN_LOCK:
                         _LIVEKIT_ACTIVE_EGRESS[room]["hls"] = hls_egress_id
+                    _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, hls_egress_id=hls_egress_id, hls_url=hls_url)
         except Exception:
             pass
 
@@ -5596,4 +5709,3 @@ async def livekit_join_request_status(requestId: str):
     if not r:
         return {"ok": True, "status": "MISSING"}
     return {"ok": True, "status": r.get("status"), "token": r.get("token") or ""}
-

@@ -1525,7 +1525,7 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   const liveChatUsernameStorageKey = useMemo(() => {
     const b = safeBrandKey(String(companyName || "").trim() || "core") || "core";
     const a = safeBrandKey(String(companionName || "").trim() || "companion") || "companion";
-    return `beestreamed_livechat_username:${b}:${a}`;
+    return `livekit_livechat_username:${b}:${a}`;
   }, [companyName, companionName]);
 
   const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
@@ -1865,26 +1865,23 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
   "idle"
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
-
-  // BeeStreamed (Human companion) embed state
-  const [streamEmbedUrl, setStreamEmbedUrl] = useState<string>("");
-
-  // LiveKit (replaces BeeStreamed + Jitsi)
+  // Live stream embed URL (deprecated; LiveKit uses room tokens)
+  // LiveKit (replaces LegacyStream + Jitsi)
   const LIVEKIT_URL = useMemo(() => String((process.env.NEXT_PUBLIC_LIVEKIT_URL || "")).trim(), []);
   const [livekitToken, setLivekitToken] = useState<string>("");
   const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
   const [livekitRoomName, setLivekitRoomName] = useState<string>("");
   const [livekitRole, setLivekitRole] = useState<"host" | "attendee" | "viewer">("viewer");
-  // Treat "host" as the LiveKit host role (BeeStreamed host semantics are deprecated).
-  const isBeeStreamedHost = livekitRole === "host";
+  // Treat "host" as the LiveKit host role (LegacyStream host semantics are deprecated).
+  const isHost = livekitRole === "host";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
 
   // Host: poll join requests while a LiveKit session is active.
   useEffect(() => {
-    if (!isBeeStreamedHost) return;
-    if (!beestreamedSessionActive) return;
+    if (!isHost) return;
+    if (!sessionActive) return;
     let cancelled = false;
 
     const tick = async () => {
@@ -1903,7 +1900,7 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [API_BASE, companyName, companionName, isBeeStreamedHost, beestreamedSessionActive]);
+  }, [API_BASE, companyName, companionName, isHost, sessionActive]);
 
   const admitLivekit = useCallback(async (requestId: string) => {
     const rid = String(requestId || "").trim();
@@ -1987,7 +1984,7 @@ const liveEnabled = useMemo(() => {
   // UI layout
   const conversationHeight = 520;
   // UI: show the video frame whenever the user is in a Live Video session.
-// For Stream (BeeStreamed): show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
+// For Stream (LegacyStream): show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
 // so the click is never perceived as a no-op and the viewer can always press Stop to exit waiting.
 const streamUiActive =
   liveProvider === "stream" &&
@@ -1995,13 +1992,13 @@ const streamUiActive =
     avatarStatus === "waiting" ||
     avatarStatus === "connected" ||
     avatarStatus === "reconnecting" ||
-    Boolean(streamEmbedUrl || streamEventRef));
+    Boolean("" || streamEventRef));
 
 const showAvatarFrame =
   (liveProvider === "stream" && streamUiActive) ||
   (Boolean(phase1AvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
 
-  // Viewer-only: treat any active BeeStreamed embed as "Live Streaming".
+  // Viewer-only: treat any active LegacyStream embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
 
 const cleanupIphoneLiveAvatarAudio = useCallback(() => {
@@ -2125,13 +2122,13 @@ const stopLiveAvatar = useCallback(async () => {
   // Always clean up iPhone audio boost routing first
   cleanupIphoneLiveAvatarAudio();
 
-  // BeeStreamed (Human companion) — stop the stream and clear the embed.
-  if (streamEmbedUrl || streamEventRef) {
+  // LegacyStream (Human companion) — stop the stream and clear the embed.
+  if (streamEventRef) {
     const hostStopping = Boolean(streamCanStart);
     let stopSucceeded = false;
 
     try {
-      // Only the host can stop the underlying BeeStreamed event.
+      // Only the host can stop the underlying LegacyStream event.
       // Viewers can close their local iframe without affecting the event.
       if (hostStopping) {
         const res = await fetch(`${API_BASE}/stream/livekit/stop`, {
@@ -2154,7 +2151,7 @@ const stopLiveAvatar = useCallback(async () => {
       stopSucceeded = true;
     } catch (e) {
       const err = e as any;
-      console.warn("BeeStreamed stop_embed failed:", err);
+      console.warn("LegacyStream stop_embed failed:", err);
 
       // Keep the host in-session so they can retry Stop (avoids a mismatch where the event is live but the UI is torn down).
       if (hostStopping) {
@@ -2167,8 +2164,7 @@ const stopLiveAvatar = useCallback(async () => {
       // Always allow viewers to disconnect locally.
       // For the host, only tear down the embed if the stop call succeeded.
       if (!hostStopping || stopSucceeded) {
-        setStreamEmbedUrl("");
-        setStreamEventRef("");
+setStreamEventRef("");
         setStreamCanStart(false);
         setStreamNotice("");
 
@@ -2177,7 +2173,7 @@ const stopLiveAvatar = useCallback(async () => {
       }
 
       // Host stop -> mark global session inactive immediately (poll will also confirm)
-      if (hostStopping && stopSucceeded) setBeestreamedSessionActive(false);
+      if (hostStopping && stopSucceeded) setSessionActive(false);
     }
   }
 
@@ -2225,7 +2221,7 @@ const stopLiveAvatar = useCallback(async () => {
     setAvatarStatus("idle");
     setAvatarError(null);
   }
-}, [cleanupIphoneLiveAvatarAudio, streamEmbedUrl, streamEventRef, streamCanStart, API_BASE, companyName, companionName]);
+}, [cleanupIphoneLiveAvatarAudio, "", streamEventRef, streamCanStart, API_BASE, companyName, companionName]);
 
 const reconnectLiveAvatar = useCallback(async () => {
   const mgr = didAgentMgrRef.current;
@@ -2301,7 +2297,7 @@ if (liveProvider === "stream") {
     if (canStart) {
       // Host: connect immediately.
       setLivekitToken(token);
-      setBeestreamedSessionActive(true);
+      setSessionActive(true);
       setSessionKind("stream");
       setStreamNotice("");
       setAvatarStatus("connected");
@@ -2345,7 +2341,7 @@ if (liveProvider === "stream") {
       const st: any = await resp.json().catch(() => ({}));
       if (st?.status === "ADMITTED" && st?.token) {
         setLivekitToken(String(st.token));
-        setBeestreamedSessionActive(true);
+        setSessionActive(true);
         setSessionKind("stream");
         setStreamNotice("");
         setAvatarStatus("connected");
@@ -3211,7 +3207,7 @@ const speakAssistantReply = useCallback(
   useEffect(() => {
     // Only poll while we are explicitly waiting and we don't yet have an embed URL.
     if (avatarStatus !== "waiting") return;
-    if (streamEmbedUrl) return;
+    if (streamEventRef) return;
 
     let cancelled = false;
     const intervalMs = 3000;
@@ -3247,7 +3243,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
           // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
           if (embedUrl) {
             setStreamEventRef(eventRef);
-            setStreamEmbedUrl(embedUrl);
+            /*setStreamEmbedUrl*/(embedUrl);
 
             // Viewers can never "start", so we keep waiting state (and message) until the stream is live.
             // This is purely to allow the iframe to appear without requiring a hard refresh.
@@ -3271,7 +3267,7 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
       cancelled = true;
       window.clearInterval(t);
     };
-  }, [avatarStatus, streamEmbedUrl, API_BASE, companyName, companionName, memberId]);
+  }, [avatarStatus, "", API_BASE, companyName, companionName, memberId]);
 
   const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
@@ -3282,11 +3278,11 @@ if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
-  // BeeStreamed broadcaster (host-only) overlay
-  // - "host" is determined by comparing the current Wix memberId to the BeeStreamed host_member_id
-  //   stored in voice_video_mappings.sqlite3 (exposed via /stream/beestreamed/status).
-  const [beestreamedHostMemberId, setBeestreamedHostMemberId] = useState<string>("");
-  const [beestreamedSessionActive, setBeestreamedSessionActive] = useState<boolean>(false);
+  // LegacyStream broadcaster (host-only) overlay
+  // - "host" is determined by comparing the current Wix memberId to the LegacyStream host_member_id
+  //   stored in voice_video_mappings.sqlite3 (exposed via /stream/livekit/status).
+  const [livekitHostMemberId, setLivekitHostMemberId] = useState<string>("");
+  const [sessionActive, setSessionActive] = useState<boolean>(false);
 
 const [sessionKind, setSessionKind] = useState<SessionKind>("");
 const [sessionRoom, setSessionRoom] = useState<string>("");
@@ -3309,17 +3305,17 @@ useEffect(() => {
   conferenceJoinedRef.current = conferenceJoined;
 }, [conferenceJoined]);
 
-  // BeeStreamed status polling can hit different backend instances; avoid flickering UI by
+  // LegacyStream status polling can hit different backend instances; avoid flickering UI by
   // only changing sessionActive on confirmed status responses.
-  const beestreamedStatusInactivePollsRef = useRef<number>(0);
-  // Viewer-only: treat the companion's BeeStreamed session as "Live Streaming" when the HOST is live.
+  const livekitStatusInactivePollsRef = useRef<number>(0);
+  // Viewer-only: treat the companion's LegacyStream session as "Live Streaming" when the HOST is live.
   // This is intentionally *global* (not tied to whether the viewer currently has the iframe open),
   // because we must block AI responses for everyone while the host is streaming.
   const viewerLiveStreaming =
     liveProvider === "stream" &&
     !streamCanStart &&
-    (beestreamedSessionActive ||
-      (Boolean(streamEmbedUrl || streamEventRef) &&
+    (sessionActive ||
+      (Boolean("" || streamEventRef) &&
         (avatarStatus === "connected" ||
           avatarStatus === "waiting" ||
           avatarStatus === "connecting" ||
@@ -3337,7 +3333,7 @@ useEffect(() => {
       avatarStatus === "reconnecting");
 
   // ---------------------------------------------------------------------------
-  // BeeStreamed shared in-stream live chat (Host + joined Viewers)
+  // LegacyStream shared in-stream live chat (Host + joined Viewers)
   // - Only participants who have joined the stream UI (Play) connect.
   // - Messages are broadcast via WebSocket (HTTP fallback if WS not ready).
   // - Out-of-session visitors/members do NOT connect (so they cannot see the chat).
@@ -3425,14 +3421,14 @@ useEffect(() => {
     // Once a user has joined a live experience, they should remain connected to shared chat
     // until they explicitly press Stop (host) or opt-out (viewer, private session only).
     const inStreamUi =
-      Boolean(beestreamedSessionActive) &&
+      Boolean(sessionActive) &&
       kind !== "conference" &&
-      Boolean(streamEmbedUrl || streamEventRef) &&
+      Boolean("" || streamEventRef) &&
       !!String(streamEventRef || "").trim() &&
       !!eventRef;
 
     const inConferenceUi =
-      Boolean(beestreamedSessionActive) &&
+      Boolean(sessionActive) &&
       kind === "conference" &&
       !!eventRef &&
       (conferenceJoined || Boolean(jitsiApiRef.current));
@@ -3453,7 +3449,7 @@ useEffect(() => {
       return;
     }
 
-    const role = isBeeStreamedHost ? "host" : "viewer";
+    const role = isHost ? "host" : "viewer";
     const name =
       role === "host" ? String(companionName || "Host") : String(viewerLiveChatName || "").trim() || "Viewer";
     const memberIdForWs = String(memberIdForLiveChat || "").trim();
@@ -3475,7 +3471,7 @@ useEffect(() => {
     liveChatWsRef.current = null;
     liveChatWsClosingRef.current = false;
 
-    const wsUrl = `${API_BASE.replace(/^http/, "ws")}/stream/beestreamed/livechat/${encodeURIComponent(
+    const wsUrl = `${API_BASE.replace(/^http/, "ws")}/stream/livekit/livechat/${encodeURIComponent(
       eventRef
     )}?senderId=${encodeURIComponent(memberIdForWs || "")}&senderRole=${encodeURIComponent(role)}&name=${encodeURIComponent(
       name
@@ -3522,10 +3518,10 @@ useEffect(() => {
     };
   }, [
     API_BASE,
-    beestreamedSessionActive,
-    streamEmbedUrl,
+    sessionActive,
+    "",
     streamEventRef,
-    isBeeStreamedHost,
+    isHost,
     memberIdForLiveChat,
     companionName,
     viewerLiveChatName,
@@ -3554,7 +3550,7 @@ useEffect(() => {
       const clean = String(text || '').trim();
       if (!clean) return;
 
-      const role = isBeeStreamedHost ? 'host' : 'viewer';
+      const role = isHost ? 'host' : 'viewer';
       const name =
         role === 'host'
           ? (String(companionName || 'Host').trim() || 'Host')
@@ -3578,7 +3574,7 @@ useEffect(() => {
 
       // HTTP fallback (stores message in room history + broadcasts to any connected sockets)
       try {
-        await fetch(`${API_BASE}/stream/beestreamed/livechat/send`, {
+        await fetch(`${API_BASE}/stream/livekit/livechat/send`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -3595,7 +3591,7 @@ useEffect(() => {
         // ignore
       }
     },
-    [API_BASE, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, sessionKind, sessionRoom, companyName],
+    [API_BASE, streamEventRef, isHost, memberIdForLiveChat, companionName, viewerLiveChatName, sessionKind, sessionRoom, companyName],
   );
 
   const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
@@ -3604,17 +3600,17 @@ useEffect(() => {
   const [broadcastError, setBroadcastError] = useState<string>("");
 
 
-// BeeStreamed "live session" gating (global per companion)
+// LegacyStream "live session" gating (global per companion)
 // - While the host is streaming, we must NOT generate AI responses for anyone.
 // - We queue user messages locally and flush them once the host stops streaming.
 const streamDeferredQueueRef = useRef<Array<{ text: string; state: SessionState; queuedAt: number; noticeIndex: number }>>([]);
 const streamDeferredFlushInFlightRef = useRef<boolean>(false);
 const streamPreSessionHistoryRef = useRef<Msg[] | null>(null);
-const prevBeeStreamedSessionActiveRef = useRef<boolean>(false);
+const prevSessionActiveRef = useRef<boolean>(false);
 
 // True when THIS browser session has explicitly joined the in-stream experience
 // (Play pressed and not yet stopped). This is intentionally independent from the
-// global beestreamedSessionActive flag, because that flag indicates that *someone*
+// global sessionActive flag, because that flag indicates that *someone*
 // (the Host) is streaming, while this ref indicates whether *this user* is in the
 // shared in-stream chat.
 const joinedStreamRef = useRef<boolean>(false);
@@ -3680,7 +3676,7 @@ const disposeJitsi = useCallback(() => {
 
 const stopConferenceSession = useCallback(async () => {
   // Viewers leaving the conference should not stop the host session.
-  if (!isBeeStreamedHost) {
+  if (!isHost) {
     conferenceOptOutRef.current = true;
     setLivekitToken("");
     setAvatarStatus("idle");
@@ -3690,7 +3686,7 @@ const stopConferenceSession = useCallback(async () => {
   // Optimistic close (prevents auto-rejoin while stop request is in-flight)
   conferenceOptOutRef.current = true;
   setLivekitToken("");
-  setBeestreamedSessionActive(false);
+  setSessionActive(false);
   setSessionKind("");
   setSessionRoom("");
   setAvatarStatus("idle");
@@ -3704,7 +3700,7 @@ const stopConferenceSession = useCallback(async () => {
   } catch {
     // best effort
   }
-}, [API_BASE, companyName, companionName, disposeJitsi, isBeeStreamedHost, memberId]);
+}, [API_BASE, companyName, companionName, disposeJitsi, isHost, memberId]);
 
 const joinJitsiConference = useCallback(
   async (roomName: string) => {
@@ -3712,7 +3708,7 @@ const joinJitsiConference = useCallback(
     if (!room) return;
 
     // Respect explicit "leave" by viewers while the session is still active
-    if (conferenceOptOutRef.current && !isBeeStreamedHost) return;
+    if (conferenceOptOutRef.current && !isHost) return;
 
     // Avoid recreating the iframe on every state poll
     if (jitsiApiRef.current) return;
@@ -3737,7 +3733,7 @@ const joinJitsiConference = useCallback(
       const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
       // Use the same username state used for Shared Live Chat.
       // Host should present as the companion name (e.g., "Dulce") inside the Jitsi UI.
-      const displayName = isBeeStreamedHost
+      const displayName = isHost
         ? (String(companionName || "Host").trim() || "Host")
         : (String(viewerLiveChatName || "").trim() || (memberId ? "Member" : "Guest"));
       const subject = `${companyName} • ${companionName}`.trim();
@@ -3798,7 +3794,7 @@ const joinJitsiConference = useCallback(
         setAvatarStatus("idle");
 
         // Host hanging up should end the session for viewers as well.
-        if (isBeeStreamedHost) {
+        if (isHost) {
           void stopConferenceSession();
         }
       });
@@ -3814,7 +3810,7 @@ const joinJitsiConference = useCallback(
     companionName,
     disposeJitsi,
     ensureJitsiExternalApiLoaded,
-    isBeeStreamedHost,
+    isHost,
     memberId,
     stopConferenceSession,
 	  viewerLiveChatName,
@@ -3825,7 +3821,7 @@ const startConferenceSession = useCallback(async () => {
   setAvatarError(null);
 
   // Viewers never start a session. They just wait until the host starts.
-  if (!isBeeStreamedHost) {
+  if (!isHost) {
     setStreamNotice("Waiting for host to start the private session…");
     setAvatarStatus("waiting");
     return;
@@ -3857,7 +3853,7 @@ const startConferenceSession = useCallback(async () => {
     const room = String(data?.sessionRoom || data?.room || "").trim() || sanitizeRoomToken(`${companyName}-${companionName}`);
 
     // Optimistic local state (status poll will confirm)
-    setBeestreamedSessionActive(true);
+    setSessionActive(true);
     setSessionKind("conference");
     setSessionRoom(room);
 
@@ -3872,7 +3868,7 @@ const startConferenceSession = useCallback(async () => {
   API_BASE,
   companyName,
   companionName,
-  isBeeStreamedHost,
+  isHost,
   joinJitsiConference,
   memberId,
   sanitizeRoomToken,
@@ -3894,8 +3890,8 @@ useEffect(() => {
 
 
   const showBroadcastButton = useMemo(() => {
-    return liveProvider === "stream" && isBeeStreamedHost;
-  }, [liveProvider, isBeeStreamedHost]);
+    return liveProvider === "stream" && isHost;
+  }, [liveProvider, isHost]);
 
 
   const goToMyElaralo = useCallback(() => {
@@ -3953,16 +3949,16 @@ useEffect(() => {
 
 
 // ---------------------------------------------------------------------------
-// BeeStreamed broadcaster overlay (Host-only) + session status (Host + Viewer)
+// LegacyStream broadcaster overlay (Host-only) + session status (Host + Viewer)
 // - Fetch the host_member_id + current sessionActive flag for the current companion.
 // - Polls so *all* visitors/members (even when not in Stream mode) can immediately gate AI replies
 //   as soon as the Host hits Play.
 // ---------------------------------------------------------------------------
 useEffect(() => {
     if (!API_BASE || !companyName || !companionName) {
-      setBeestreamedHostMemberId("");
-      setBeestreamedSessionActive(false);
-      beestreamedStatusInactivePollsRef.current = 0;
+      setLivekitHostMemberId("");
+      setSessionActive(false);
+      livekitStatusInactivePollsRef.current = 0;
       return;
     }
 
@@ -3971,7 +3967,7 @@ useEffect(() => {
 
     const fetchStatus = async () => {
       try {
-        const url = `${API_BASE}/stream/beestreamed/status?brand=${encodeURIComponent(
+        const url = `${API_BASE}/stream/livekit/status?brand=${encodeURIComponent(
           companyName,
         )}&avatar=${encodeURIComponent(companionName)}`;
         const res = await fetch(url, { cache: "no-store" });
@@ -3994,7 +3990,7 @@ useEffect(() => {
 
         const nextHostId = String(data.hostMemberId || "").trim();
         if (nextHostId) {
-          setBeestreamedHostMemberId(nextHostId);
+          setLivekitHostMemberId(nextHostId);
         }
 
         const nextActive = Boolean(data.sessionActive);
@@ -4004,16 +4000,16 @@ useEffect(() => {
         const nextRoom = String((data as any).sessionRoom || "").trim();
 
         if (nextActive) {
-          beestreamedStatusInactivePollsRef.current = 0;
-          setBeestreamedSessionActive(true);
+          livekitStatusInactivePollsRef.current = 0;
+          setSessionActive(true);
           setSessionKind(nextKind);
           setSessionRoom(nextRoom);
         } else {
-          beestreamedStatusInactivePollsRef.current += 1;
+          livekitStatusInactivePollsRef.current += 1;
 
           // Only clear after 2 consecutive "inactive" polls to avoid flicker.
-          if (beestreamedStatusInactivePollsRef.current >= 2) {
-            setBeestreamedSessionActive(false);
+          if (livekitStatusInactivePollsRef.current >= 2) {
+            setSessionActive(false);
             setSessionKind("");
             setSessionRoom("");
             conferenceOptOutRef.current = false;
@@ -4043,7 +4039,7 @@ useEffect(() => {
 // "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
 // remove the waiting notice.
 useEffect(() => {
-  if (!beestreamedSessionActive) return;
+  if (!sessionActive) return;
     if (sessionKind === "conference") return;
   if (streamCanStart) return; // host
   if (!joinedStreamRef.current) return;
@@ -4051,12 +4047,12 @@ useEffect(() => {
 
   setStreamNotice("");
   setAvatarStatus("connected");
-}, [beestreamedSessionActive, sessionKind, streamCanStart, avatarStatus]);
+}, [sessionActive, sessionKind, streamCanStart, avatarStatus]);
 
   // Conference auto-join: when the host starts a Jitsi conference, viewers should wait
   // until session_active is true, then the app embeds Jitsi in-page.
   useEffect(() => {
-    if (!(beestreamedSessionActive && sessionKind === "conference")) {
+    if (!(sessionActive && sessionKind === "conference")) {
       if (jitsiApiRef.current) {
         disposeJitsi();
       }
@@ -4072,7 +4068,7 @@ useEffect(() => {
 
     void joinJitsiConference(room);
   }, [
-    beestreamedSessionActive,
+    sessionActive,
     sessionKind,
     sessionRoom,
     companyName,
@@ -4097,11 +4093,11 @@ useEffect(() => {
 useEffect(() => {
   streamDeferredQueueRef.current = [];
   streamPreSessionHistoryRef.current = null;
-  prevBeeStreamedSessionActiveRef.current = false;
+  prevSessionActiveRef.current = false;
   joinedStreamRef.current = false;
 
-  setBeestreamedHostMemberId("");
-  setBeestreamedSessionActive(false);
+  setLivekitHostMemberId("");
+  setSessionActive(false);
 }, [companyName, companionName]);
 
   // If host-eligibility changes (e.g., user logs out), force-hide the overlay.
@@ -4176,7 +4172,7 @@ useEffect(() => {
       setLivekitHlsUrl(hlsUrl);
 
       // Mark locally active (used elsewhere for gating)
-      setBeestreamedSessionActive(true);
+      setSessionActive(true);
       setSessionKind("stream");
       setSessionRoom(roomName);
     } catch (err: any) {
@@ -4680,9 +4676,9 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   // ---------------------------------------------------------------------
 // Attachments (Azure Blob via backend)
 // - Only image/* uploads are supported (rendered as image previews).
-// - Attachments are DISABLED during Shared Live (BeeStreamed sessionActive).
+// - Attachments are DISABLED during Shared Live (LegacyStream sessionActive).
 // ---------------------------------------------------------------------
-const uploadsDisabled = Boolean(beestreamedSessionActive && sessionKind === "stream");
+const uploadsDisabled = Boolean(sessionActive && sessionKind === "stream");
 
 const uploadAttachment = useCallback(
   async (file: File): Promise<UploadedAttachment> => {
@@ -4911,7 +4907,7 @@ const outgoingText = (detectedMode ? cleaned : rawText).trim();
 
     // Build the user message.
 
-    // Build the user message. During BeeStreamed live sessions, this may also be
+    // Build the user message. During LegacyStream live sessions, this may also be
     // broadcast to the shared in-stream chat (without calling /chat).
     
 let userMsg: Msg = { role: "user", content: finalUserContent };
@@ -4925,8 +4921,8 @@ let userMsg: Msg = { role: "user", content: finalUserContent };
 
 
 // ---------------------------------------------------------------------
-// Live Stream rule (BeeStreamed):
-// As soon as the HOST hits Play, BeeStreamed sessionActive becomes true.
+// Live Stream rule (LegacyStream):
+// As soon as the HOST hits Play, LegacyStream sessionActive becomes true.
 // While sessionActive is true, the AI companion must NOT generate responses.
 //
 // Behavior:
@@ -4937,7 +4933,7 @@ let userMsg: Msg = { role: "user", content: finalUserContent };
 //       allow them to type freely (no notice), but still queue messages.
 //   - When the host stops streaming (sessionActive -> false): flush queued messages.
 // ---------------------------------------------------------------------
-let streamSessionActive = Boolean(beestreamedSessionActive);
+let streamSessionActive = Boolean(sessionActive);
   // Whether THIS user is currently inside the shared in-stream experience.
   // (Important: this must NOT depend on the current UI mode selection; users can switch modes
   // and must still remain blocked from AI while the host is live until the stream ends.)
@@ -4948,7 +4944,7 @@ let streamSessionActive = Boolean(beestreamedSessionActive);
 // This ensures the moment the Host hits Play (sessionActive flips) we immediately gate messages.
 if (!streamSessionActive && API_BASE && companyName && companionName) {
   try {
-    const url = new URL(`${API_BASE}/stream/beestreamed/status`);
+    const url = new URL(`${API_BASE}/stream/livekit/status`);
     url.searchParams.set("brand", companyName);
     url.searchParams.set("avatar", companionName);
 
@@ -4959,8 +4955,8 @@ if (!streamSessionActive && API_BASE && companyName && companionName) {
       const hostId = String(data?.hostMemberId || "").trim();
 
       // Keep UI state in sync (poller will also keep updating).
-      if (active !== Boolean(beestreamedSessionActive)) setBeestreamedSessionActive(active);
-      if (hostId && hostId !== beestreamedHostMemberId) setBeestreamedHostMemberId(hostId);
+      if (active !== Boolean(sessionActive)) setSessionActive(active);
+      if (hostId && hostId !== livekitHostMemberId) setLivekitHostMemberId(hostId);
 
       streamSessionActive = active;
     }
@@ -4981,7 +4977,7 @@ if (streamSessionActive) {
       (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     // Mark this message as a live-chat line (used for dedupe + UI labeling).
-    const senderRole = isBeeStreamedHost ? "host" : "viewer";
+    const senderRole = isHost ? "host" : "viewer";
     const senderName =
       senderRole === "host"
         ? (String(companionName || "Host").trim() || "Host")
@@ -5352,10 +5348,10 @@ const flushQueuedStreamMessages = useCallback(async () => {
   }
 }, [callChat]);
 
-// Detect BeeStreamed session start/stop to capture history + flush queue.
+// Detect LegacyStream session start/stop to capture history + flush queue.
 useEffect(() => {
-  const prev = prevBeeStreamedSessionActiveRef.current;
-  const cur = Boolean(beestreamedSessionActive);
+  const prev = prevSessionActiveRef.current;
+  const cur = Boolean(sessionActive);
 
   // When the stream starts (host begins live session), snapshot the current chat history for the flush.
   if (!prev && cur) {
@@ -5367,8 +5363,8 @@ useEffect(() => {
     void flushQueuedStreamMessages();
   }
 
-  prevBeeStreamedSessionActiveRef.current = cur;
-}, [beestreamedSessionActive, flushQueuedStreamMessages]);
+  prevSessionActiveRef.current = cur;
+}, [sessionActive, flushQueuedStreamMessages]);
 
   function clearSttSilenceTimer() {
     if (sttSilenceTimerRef.current) {
@@ -5789,7 +5785,7 @@ const pauseSpeechToText = useCallback(() => {
       // NOTE:
       // We intentionally do NOT pause STT here.
       // - send() already pauses/resumes STT as needed for normal (non-stream) interactions to prevent feedback.
-      // - During BeeStreamed live sessions, send() will *not* call the backend and will *not* pause STT,
+      // - During LegacyStream live sessions, send() will *not* call the backend and will *not* pause STT,
       //   which keeps iOS/Safari stable and lets members keep speaking/typing freely.
       sttFinalRef.current = "";
       sttInterimRef.current = "";
@@ -6371,8 +6367,7 @@ const speakGreetingIfNeeded = useCallback(
       // - Always allow leaving the waiting/connected UI, even if the host has not created an eventRef yet.
       // - This MUST NOT stop the underlying live session (only the host can do that).
       try {
-        setStreamEmbedUrl("");
-        setStreamEventRef("");
+setStreamEventRef("");
         setStreamCanStart(false);
         setStreamNotice("");
 
@@ -6387,7 +6382,7 @@ const speakGreetingIfNeeded = useCallback(
 
     // Host (Live Stream): ensure Stop always ends the session even if mic/STT isn't running.
     // (This is idempotent; stopLiveAvatar has its own in-flight guard.)
-    if (liveProvider === "stream" && streamCanStart && (streamEmbedUrl || streamEventRef)) {
+    if (liveProvider === "stream" && streamCanStart && ("" || streamEventRef)) {
       try {
         void stopLiveAvatar();
       } catch (e) {}
@@ -6399,7 +6394,7 @@ const speakGreetingIfNeeded = useCallback(
     try { void nudgeAudioSession(); } catch (e) {}
     try { primeLocalTtsAudio(true); } catch (e) {}
     try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, streamEmbedUrl, streamEventRef, stopLiveAvatar]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, "", streamEventRef, stopLiveAvatar]);
 
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
@@ -6563,14 +6558,14 @@ const viewerCanStopStream =
 // Private session (Jitsi) stop rules.
 // Viewer can only opt-out after they\'ve actually joined.
 // Host can always stop the private session when it is active (host-only).
-const viewerCanStopConference = sessionKind === "conference" && !isBeeStreamedHost && conferenceJoined;
-const hostCanStopConference = sessionKind === "conference" && isBeeStreamedHost;
+const viewerCanStopConference = sessionKind === "conference" && !isHost && conferenceJoined;
+const hostCanStopConference = sessionKind === "conference" && isHost;
 
-// Host requirement: Stop must end the live session (and send the end-event signal to BeeStreamed).
+// Host requirement: Stop must end the live session (and send the end-event signal to LegacyStream).
 const hostCanStopStream =
   liveProvider === "stream" &&
   streamCanStart &&
-  (Boolean(streamEmbedUrl || streamEventRef) ||
+  (Boolean("" || streamEventRef) ||
     avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
@@ -6580,7 +6575,7 @@ const hostCanStopStream =
 const hostInStreamUi =
   liveProvider === "stream" &&
   streamCanStart &&
-  (Boolean(streamEmbedUrl || streamEventRef) ||
+  (Boolean("" || streamEventRef) ||
     avatarStatus === "connected" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connecting" ||
@@ -6589,7 +6584,7 @@ const hostInStreamUi =
 const viewerInStreamUi = viewerHasJoinedStream;
 
 useEffect(() => {
-  // Viewer STT must be disabled while in the BeeStreamed stream UI to avoid transcribing the host audio.
+  // Viewer STT must be disabled while in the LegacyStream stream UI to avoid transcribing the host audio.
   if (!viewerInStreamUi) return;
   if (!sttEnabledRef.current) return;
   void stopSpeechToText();
@@ -6604,7 +6599,7 @@ const sttControls = (
           if (liveProvider === "stream") {
                       if (
                         streamCanStart &&
-                        !!streamEmbedUrl &&
+                        !!"" &&
                         (avatarStatus === "connected" || avatarStatus === "waiting")
                       )
                         return;
@@ -6613,7 +6608,7 @@ const sttControls = (
                     }
           void toggleSpeechToText();
         }}
-        disabled={(liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ||
+        disabled={(liveProvider === "stream" && streamCanStart && !!"" && (avatarStatus === "connected" || avatarStatus === "waiting")) ||
                     viewerInStreamUi || (!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
         title="Audio"
         style={{
@@ -6621,10 +6616,10 @@ const sttControls = (
           minWidth: 44,
           borderRadius: 10,
           border: "1px solid #111",
-          background: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
+          background: (liveProvider === "stream" && streamCanStart && !!"" && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
           color: sttEnabled ? "#fff" : "#111",
-          cursor: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-          opacity: (liveProvider === "stream" && streamCanStart && !!streamEmbedUrl && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
+          cursor: (liveProvider === "stream" && streamCanStart && !!"" && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
+          opacity: (liveProvider === "stream" && streamCanStart && !!"" && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
           fontWeight: 700,
         }}
       >
@@ -6667,14 +6662,14 @@ const sttControls = (
 }, [allowedModes]);
 
 
-// Hide "Set Mode" while the BeeStreamed live session UI is active (host + viewer).
+// Hide "Set Mode" while the LegacyStream live session UI is active (host + viewer).
 // Requirement: "Please hide the Set Mode button when in live stream."
 //
 // IMPORTANT: this is a *global* gate — if the host is currently streaming, Set Mode is hidden
 // even if a viewer has closed the iframe locally.
 const hideSetModeInStream =
   liveProvider === "stream" &&
-  (beestreamedSessionActive ||
+  (sessionActive ||
     avatarStatus === "connecting" ||
     avatarStatus === "connected" ||
     avatarStatus === "reconnecting" ||
@@ -6866,7 +6861,7 @@ const modePillControls = (
         preload="auto"
         style={{ position: "fixed", left: 0, bottom: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none", zIndex: -1 }}
       />
-      {showPlayChoiceModal && isBeeStreamedHost ? (
+      {showPlayChoiceModal && isHost ? (
         <div
           style={{
             position: "fixed",
@@ -6984,7 +6979,7 @@ const modePillControls = (
           </div>
           {liveProvider === "stream" ? (
             <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {beestreamedSessionActive && !hostInStreamUi && !viewerInStreamUi ? (
+              {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
                 <span
                   style={{
                     display: "inline-flex",
@@ -7061,7 +7056,7 @@ const modePillControls = (
             if (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) return;
 
             // If a conference is active, Play joins it (no STT).
-            if (beestreamedSessionActive && sessionKind === "conference") {
+            if (sessionActive && sessionKind === "conference") {
               conferenceOptOutRef.current = false;
 
               const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
@@ -7071,7 +7066,7 @@ const modePillControls = (
             }
 
             // Host-only: when idle, prompt for Stream vs Conference.
-            if (isBeeStreamedHost && !beestreamedSessionActive) {
+            if (isHost && !sessionActive) {
               setShowPlayChoiceModal(true);
               return;
             }
@@ -7143,7 +7138,7 @@ const modePillControls = (
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
       {sttControls}
 
-      {liveProvider === "stream" && !isBeeStreamedHost ? (
+      {liveProvider === "stream" && !isHost ? (
         <button
           type="button"
           onClick={changeViewerLiveChatName}
@@ -7203,14 +7198,14 @@ const modePillControls = (
                     onDisconnected={() => {
                       // If disconnected (e.g. host stopped), return to idle.
                       setLivekitToken("");
-                      setBeestreamedSessionActive(false);
+                      setSessionActive(false);
                       setSessionKind("");
                       setAvatarStatus("idle");
                     }}
                   >
                     <VideoConference />
 
-                    {isBeeStreamedHost && livekitPending.length ? (
+                    {isHost && livekitPending.length ? (
                       <div
                         style={{
                           position: "absolute",
@@ -7307,7 +7302,7 @@ const modePillControls = (
 
         <div
           style={{
-            flex: showAvatarFrame ? ((liveProvider === "stream" && !!streamEmbedUrl && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
+            flex: showAvatarFrame ? ((liveProvider === "stream" && !!"" && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
             minWidth: 280,
             height: conversationHeight,
             display: "flex",
@@ -7539,9 +7534,9 @@ const modePillControls = (
               placeholder={
                 sttEnabled
                   ? "Listening…"
-                  : !isBeeStreamedHost && beestreamedSessionActive && sessionKind === "conference" && !conferenceJoined
+                  : !isHost && sessionActive && sessionKind === "conference" && !conferenceJoined
                   ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
-                  : !isBeeStreamedHost && beestreamedSessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
+                  : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
                   ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
                   : "Type a message…"
               }
@@ -7673,7 +7668,7 @@ const modePillControls = (
                       // If the backend stops the session, close the overlay UI.
                       setLivekitToken("");
                       setShowBroadcasterOverlay(false);
-                      setBeestreamedSessionActive(false);
+                      setSessionActive(false);
                       setSessionKind("");
                       setSessionRoom("");
                       setAvatarStatus("idle");
@@ -7892,7 +7887,7 @@ const modePillControls = (
                   // Clear UI + any queued (live-session) messages.
                   streamDeferredQueueRef.current = [];
                   streamPreSessionHistoryRef.current = null;
-                  prevBeeStreamedSessionActiveRef.current = false;
+                  prevSessionActiveRef.current = false;
 
                   setMessages([]);
                   setInput("");
