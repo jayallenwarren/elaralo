@@ -3430,7 +3430,6 @@ useEffect(() => {
     sessionKind,
     sessionRoom,
     companyName,
-    sanitizeRoomToken,
     conferenceJoined,
   ]);
 
@@ -3493,7 +3492,7 @@ useEffect(() => {
         // ignore
       }
     },
-    [API_BASE, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, sessionKind, sessionRoom, companyName, sanitizeRoomToken],
+    [API_BASE, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, sessionKind, sessionRoom, companyName],
   );
 
   const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
