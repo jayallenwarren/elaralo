@@ -7253,29 +7253,22 @@ const modePillControls = (
 
                   </LiveKitRoom>
                 </div>
-              ) : liveProvider === "stream" && livekitHlsUrl ? (
-                <LiveKitHlsPlayer src={livekitHlsUrl} />
-              ) : (
-                ,0.6)",
-                        border: "1px solid rgba(255,255,255,0.14)",
-                        fontSize: 12,
-                      }}
-                    >
-                      {jitsiError}
-                    </div>
-                  ) : null}
-                </div>
-              ) : liveProvider === "stream" && streamEmbedUrl ? (
-                <iframe
-                  src={streamEmbedUrl}
-                  title="Live Stream"
-                  style={{ width: "100%", height: "100%", border: 0 }}
-                  // Keep all navigation inside the frame (block popout/new-window behavior)
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-storage-access-by-user-activation"
-                  referrerPolicy="no-referrer-when-downgrade"
-                  allow="autoplay; fullscreen; picture-in-picture; microphone; camera; storage-access"
-                  allowFullScreen
-                />
+              ) : liveProvider === "stream" ? (
+                livekitHlsUrl ? (
+                  <LiveKitHlsPlayer src={livekitHlsUrl} />
+                ) : (
+                  <div
+                    style={{
+                      padding: 16,
+                      borderRadius: 12,
+                      background: "rgba(0,0,0,0.6)",
+                      border: "1px solid rgba(255,255,255,0.14)",
+                      fontSize: 12,
+                    }}
+                  >
+                    Broadcast is starting… If this persists, confirm server-side HLS is enabled and LIVEKIT_HLS_PUBLIC_BASE_URL is set.
+                  </div>
+                )
               ) : (
                 <video
                   ref={avatarVideoRef}
