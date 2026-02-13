@@ -2704,7 +2704,110 @@ async def beestreamed_status(brand: str, avatar: str):
 
         "sessionRoom": session_room,
 
+    
+
+
+
+@app.get("/stream/livekit/status")
+async def livekit_status(brand: str, avatar: str):
+    """Return current LiveKit mapping state for a companion (does not start anything).
+
+    Mirrors /stream/beestreamed/status but sources LiveKit-specific fields from DB.
+    """
+    brand = (brand or "").strip()
+    avatar = (avatar or "").strip()
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
+
+    resolved_brand = mapping.get("brand") or brand
+    resolved_avatar = mapping.get("avatar") or avatar
+
+    # Canonical durable reference for the session in this app is event_ref (now used as room name for LiveKit).
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar)
+    mapping["event_ref"] = event_ref
+
+    active = bool(_is_session_active(resolved_brand, resolved_avatar))
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    if active and not session_kind:
+        session_kind = "stream"
+
+    # LiveKit fields (best-effort; columns may not exist on older DBs)
+    livekit_room_name = ""
+    livekit_hls_url = ""
+    livekit_record_egress_id = ""
+    livekit_hls_egress_id = ""
+    livekit_last_started_at = 0
+    try:
+        db_path = _get_companion_mappings_db_path(for_write=False)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT livekit_room_name, livekit_hls_url, livekit_record_egress_id, livekit_hls_egress_id, livekit_last_started_at
+                FROM companion_mappings
+                WHERE brand = ? AND avatar = ?
+                LIMIT 1
+                """,
+                (resolved_brand, resolved_avatar),
+            )
+            row = cur.fetchone()
+            if row:
+                livekit_room_name = str(row[0] or "").strip()
+                livekit_hls_url = str(row[1] or "").strip()
+                livekit_record_egress_id = str(row[2] or "").strip()
+                livekit_hls_egress_id = str(row[3] or "").strip()
+                try:
+                    livekit_last_started_at = int(row[4] or 0)
+                except Exception:
+                    livekit_last_started_at = 0
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        # ignore; return base fields only
+        pass
+
+    # Normalize: prefer session_room, then livekit_room_name, then event_ref
+    room = (session_room or "").strip() or livekit_room_name or event_ref
+
+    return {
+        "ok": True,
+        "eventRef": room,  # frontend uses this as its durable room reference
+        "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
+        "companionType": str(mapping.get("companion_type") or "").strip(),
+        "live": str(mapping.get("live") or "").strip(),
+        "sessionActive": active,
+        "sessionKind": session_kind,
+        "sessionRoom": room,
+        "livekit": {
+            "roomName": livekit_room_name or room,
+            "hlsUrl": livekit_hls_url,
+            "recordEgressId": livekit_record_egress_id,
+            "hlsEgressId": livekit_hls_egress_id,
+            "lastStartedAt": livekit_last_started_at,
+        },
     }
+
+
+@app.post("/stream/livekit/livechat/send")
+async def livekit_livechat_send(req: LiveChatSendRequest):
+    """Alias LiveKit chat send to the existing livechat pipeline (room is eventRef)."""
+    return await beestreamed_livechat_send(req)
+
+
+@app.websocket("/stream/livekit/livechat/{event_ref}")
+async def livekit_livechat_ws(websocket: WebSocket, event_ref: str):
+    """Alias LiveKit chat websocket to the existing livechat pipeline."""
+    return await beestreamed_livechat_ws(websocket, event_ref)
+
+}
 @app.post("/stream/beestreamed/embed_url")
 async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
     """Return an embeddable URL that *cannot* pop out of the iframe.
