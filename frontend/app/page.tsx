@@ -2621,10 +2621,13 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
             } catch (e) {}
           })
           .catch((e) => {
+            const nm = (e as any)?.name;
+            // AbortError is common when the browser interrupts autoplay/prime attempts; it is not actionable.
+            if (nm === "AbortError") return;
             console.warn("Failed to prime local TTS", {
-            mediaTag: m.tagName,
+              mediaTag: m.tagName,
               err: String(e),
-              name: (e as any)?.name,
+              name: nm,
               message: (e as any)?.message,
             });
           });
@@ -7345,11 +7348,9 @@ const modePillControls = (
             {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
           </div>
 
-          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>
             {/** Input line with mode pills moved to the right (layout-only). */}
-            {!viewerInStreamUi ? (
-              <>
-                <button
+            <button
                   type="button"
                   onClick={requestSaveChatSummary}
                   title="Save"
@@ -7390,8 +7391,6 @@ const modePillControls = (
                 >
                   <TrashIcon size={18} />
                 </button>
-              </>
-            ) : null}
 
             {/* Attachment upload (images only) */}
             <input
