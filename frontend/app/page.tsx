@@ -1875,6 +1875,8 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
   const [livekitRoomName, setLivekitRoomName] = useState<string>("");
   const [livekitRole, setLivekitRole] = useState<"host" | "attendee" | "viewer">("viewer");
+  // Treat "host" as the LiveKit host role (BeeStreamed host semantics are deprecated).
+  const isBeeStreamedHost = livekitRole === "host";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
@@ -3310,11 +3312,6 @@ useEffect(() => {
   // BeeStreamed status polling can hit different backend instances; avoid flickering UI by
   // only changing sessionActive on confirmed status responses.
   const beestreamedStatusInactivePollsRef = useRef<number>(0);
-  const isBeeStreamedHost = useMemo(() => {
-    const mid = String(memberId || "").trim();
-    const hid = String(beestreamedHostMemberId || "").trim();
-    return Boolean(mid && hid && mid === hid);
-  }, [memberId, beestreamedHostMemberId]);
   // Viewer-only: treat the companion's BeeStreamed session as "Live Streaming" when the HOST is live.
   // This is intentionally *global* (not tied to whether the viewer currently has the iframe open),
   // because we must block AI responses for everyone while the host is streaming.
