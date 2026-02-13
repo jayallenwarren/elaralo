@@ -55,6 +55,7 @@ jsonschema-specifications==2025.9.1
 kubernetes==34.1.0
 langchain-openai>=0.2.0
 langchain-community>=0.3.0
+livekit-api
 llama-cloud==0.1.35
 llama-cloud-services==0.6.54
 llama-index==0.14.10
@@ -105,6 +106,7 @@ pybase64==1.4.3
 pydantic==2.12.5
 pydantic-core==2.41.5
 pygments==2.19.2
+PyJWT==2.11.0
 pypdf==6.4.1
 pypika==0.48.9
 pyproject-hooks==1.2.0
