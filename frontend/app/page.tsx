@@ -3191,8 +3191,15 @@ const jitsiContainerRef = useRef<HTMLDivElement | null>(null);
 const jitsiApiRef = useRef<any>(null);
 const conferenceOptOutRef = useRef<boolean>(false);
 const [jitsiError, setJitsiError] = useState<string>("");
-const [conferenceJoined, setConferenceJoined] = useState<boolean>(false);
 
+// Track whether THIS client has actually joined the private (Jitsi) session.
+// We use both state (for UI) and a ref (for send() gating without stale closures).
+const [conferenceJoined, setConferenceJoined] = useState<boolean>(false);
+const conferenceJoinedRef = useRef<boolean>(false);
+
+useEffect(() => {
+  conferenceJoinedRef.current = conferenceJoined;
+}, [conferenceJoined]);
 
   // BeeStreamed status polling can hit different backend instances; avoid flickering UI by
   // only changing sessionActive on confirmed status responses.
@@ -3225,19 +3232,6 @@ const [conferenceJoined, setConferenceJoined] = useState<boolean>(false);
       avatarStatus === "waiting" ||
       avatarStatus === "connecting" ||
       avatarStatus === "reconnecting");
-
-  // Shared Live chat room token normalization (used for both Stream and Conference).
-  // NOTE: We intentionally do NOT enforce exact room naming here; both sides derive the same token.
-  const normalizeSharedChatRoomToken = useCallback((raw: string): string => {
-    return String(raw || "")
-      .trim()
-      .toLowerCase()
-      .replace(/^https?:\/\//, "")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-+|-+$/g, "");
-  }, []);
-
 
   // ---------------------------------------------------------------------------
   // BeeStreamed shared in-stream live chat (Host + joined Viewers)
@@ -3305,149 +3299,151 @@ const [conferenceJoined, setConferenceJoined] = useState<boolean>(false);
   );
 
   // Connect/disconnect the live chat websocket as the viewer/host joins/leaves the stream UI.
-  // Connect/disconnect the live chat websocket as the user joins/leaves a Shared Live session.
   useEffect(() => {
-    const streamEventRefRaw = String(streamEventRef || "").trim();
+    const kind = String(sessionKind || "").trim().toLowerCase();
 
-    // For Conference, we reuse the same DB-backed livechat relay by deriving a stable "eventRef"
-    // from the sessionRoom (shared by Host + Viewers).
-    const confRoomToken = normalizeSharedChatRoomToken(
-      String(sessionRoom || `${companyName}-${companionName}` || "").trim()
-    );
-    const conferenceEventRef = confRoomToken ? `conf-${confRoomToken}` : "";
+    const computeLiveChatEventRef = () => {
+      if (kind === "conference") {
+        const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
+        const room = String(sessionRoom || fallbackRoom).trim();
+        const cleanRoom = sanitizeRoomToken(room, 96);
+        return cleanRoom ? `conf-${cleanRoom}` : "";
+      }
+      return String(streamEventRef || "").trim();
+    };
 
-    const eventRef = sessionKind === "conference" ? conferenceEventRef : streamEventRefRaw;
+    const eventRef = computeLiveChatEventRef();
 
-    // IMPORTANT: independent from UI mode (liveProvider).
-    // We only connect while THIS browser is actually in the live UI:
-    // - Stream: embed open (Play pressed)
-    // - Conference: joined Jitsi (conferenceJoined)
-    const inLiveUi =
+    // IMPORTANT: this must be independent from the current UI mode (liveProvider).
+    // Once a user has joined a live experience, they should remain connected to shared chat
+    // until they explicitly press Stop (host) or opt-out (viewer, private session only).
+    const inStreamUi =
       Boolean(beestreamedSessionActive) &&
-      !!eventRef &&
-      (sessionKind === "conference"
-        ? conferenceJoined
-        : Boolean(streamEmbedUrl || streamEventRefRaw));
+      kind !== "conference" &&
+      Boolean(streamEmbedUrl || streamEventRef) &&
+      !!String(streamEventRef || "").trim() &&
+      !!eventRef;
 
-    // Always close if not in the live UI.
-    if (!inLiveUi || !API_BASE) {
+    const inConferenceUi =
+      Boolean(beestreamedSessionActive) &&
+      kind === "conference" &&
+      !!eventRef &&
+      (conferenceJoined || Boolean(jitsiApiRef.current));
+
+    const inLiveChatUi = inStreamUi || inConferenceUi;
+
+    // Always close if not in a live UI.
+    if (!inLiveChatUi || !API_BASE) {
       try {
         liveChatWsRef.current?.close?.();
-      } catch {
-        // ignore
-      }
+      } catch {}
       liveChatWsRef.current = null;
-      liveChatIdentityRef.current = "";
+      liveChatWsClosingRef.current = true;
       liveChatEventRefRef.current = "";
-      setLiveChatConnected(false);
+      liveChatMemberIdRef.current = "";
+      liveChatRoleRef.current = "";
+      liveChatNameRef.current = "";
       return;
     }
 
-    // Identity changes require a reconnect so the server labels messages correctly.
     const role = isBeeStreamedHost ? "host" : "viewer";
-    const sid = String(memberIdForLiveChat || "").trim() || "anon";
-    const displayName = isBeeStreamedHost
-      ? (String(companionName || "Host").trim() || "Host")
-      : (String(viewerLiveChatName || "").trim() || "Viewer");
-    const identity = `${role}|${sid}|${displayName}`;
+    const name =
+      role === "host" ? String(companionName || "Host") : String(viewerLiveChatName || "").trim() || "Viewer";
+    const memberIdForWs = String(memberIdForLiveChat || "").trim();
 
-    // If already connected for the same identity+event, keep it.
-    const alreadySame =
-      liveChatIdentityRef.current === identity &&
-      liveChatEventRefRef.current === eventRef &&
+    if (
       liveChatWsRef.current &&
-      (liveChatWsRef.current.readyState === WebSocket.CONNECTING || liveChatWsRef.current.readyState === WebSocket.OPEN);
-    if (alreadySame) return;
+      liveChatWsRef.current.readyState === WebSocket.OPEN &&
+      liveChatEventRefRef.current === eventRef &&
+      liveChatMemberIdRef.current === memberIdForWs &&
+      liveChatRoleRef.current === role &&
+      liveChatNameRef.current === name
+    ) {
+      return;
+    }
 
-    // Close any prior socket before opening a new one.
     try {
       liveChatWsRef.current?.close?.();
-    } catch {
-      // ignore
-    }
+    } catch {}
     liveChatWsRef.current = null;
-    setLiveChatConnected(false);
+    liveChatWsClosingRef.current = false;
 
-    liveChatIdentityRef.current = identity;
-    liveChatEventRefRef.current = eventRef;
-
-    const wsUrl = buildWsUrl(API_BASE, `/stream/beestreamed/livechat/${encodeURIComponent(eventRef)}`, {
-      role,
-      memberId: sid,
-      name: displayName,
-      brand: companyName,
-      avatar: companionName,
-    });
+    const wsUrl = `${API_BASE.replace(/^http/, "ws")}/stream/beestreamed/livechat/${encodeURIComponent(
+      eventRef
+    )}?senderId=${encodeURIComponent(memberIdForWs || "")}&senderRole=${encodeURIComponent(role)}&name=${encodeURIComponent(
+      name
+    )}`;
 
     const ws = new WebSocket(wsUrl);
     liveChatWsRef.current = ws;
-
-    ws.onopen = () => {
-      setLiveChatConnected(true);
-    };
-
-    ws.onclose = () => {
-      setLiveChatConnected(false);
-    };
-
-    ws.onerror = () => {
-      // Let close handler run
-    };
+    liveChatEventRefRef.current = eventRef;
+    liveChatMemberIdRef.current = memberIdForWs;
+    liveChatRoleRef.current = role;
+    liveChatNameRef.current = name;
 
     ws.onmessage = (evt) => {
       try {
-        const data = JSON.parse(String(evt?.data || "{}"));
-        if (data?.type === "history" && Array.isArray(data?.messages)) {
-          data.messages.forEach((m: any) => appendLiveChatMessage(m));
+        const payload = JSON.parse(evt.data);
+        if (payload?.type === "history" && Array.isArray(payload.messages)) {
+          for (const m of payload.messages) appendLiveChatMessage(m);
           return;
         }
-        if (data?.type === "chat") {
-          appendLiveChatMessage(data);
+        if (payload?.type === "message") {
+          appendLiveChatMessage(payload.message || payload);
           return;
         }
-        if (data?.type === "session_ended") {
-          // Backend is signaling end-of-session; local UI will also transition via polling.
-          return;
-        }
+        // ignore other message types
       } catch {
-        // ignore
+        // ignore parse errors
       }
+    };
+
+    ws.onclose = () => {
+      if (liveChatWsRef.current === ws) {
+        liveChatWsRef.current = null;
+      }
+    };
+
+    ws.onerror = () => {
+      // Let HTTP fallback handle sends if WS fails.
     };
 
     return () => {
       try {
         ws.close();
-      } catch {
-        // ignore
-      }
+      } catch {}
     };
   }, [
     API_BASE,
-    appendLiveChatMessage,
     beestreamedSessionActive,
-    companyName,
-    companionName,
-    conferenceJoined,
-    isBeeStreamedHost,
-    memberIdForLiveChat,
-    normalizeSharedChatRoomToken,
-    sessionKind,
-    sessionRoom,
     streamEmbedUrl,
     streamEventRef,
+    isBeeStreamedHost,
+    memberIdForLiveChat,
+    companionName,
     viewerLiveChatName,
+    appendLiveChatMessage,
+    sessionKind,
+    sessionRoom,
+    companyName,
+    sanitizeRoomToken,
+    conferenceJoined,
   ]);
+
 
   const sendLiveChatMessage = useCallback(
     async (text: string, clientMsgId: string) => {
-      const streamEventRefRaw = String(streamEventRef || "").trim();
+      const kind = String(sessionKind || "").trim().toLowerCase();
+      let eventRef = "";
+      if (kind === "conference") {
+        const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
+        const room = String(sessionRoom || fallbackRoom).trim();
+        const cleanRoom = sanitizeRoomToken(room, 96);
+        eventRef = cleanRoom ? `conf-${cleanRoom}` : "";
+      } else {
+        eventRef = String(streamEventRef || "").trim();
+      }
 
-      const confRoomToken = normalizeSharedChatRoomToken(
-        String(sessionRoom || `${companyName}-${companionName}` || "").trim()
-      );
-      const conferenceEventRef = confRoomToken ? `conf-${confRoomToken}` : "";
-
-      const eventRef = sessionKind === "conference" ? conferenceEventRef : streamEventRefRaw;
       if (!API_BASE || !eventRef) return;
       const clean = String(text || '').trim();
       if (!clean) return;
@@ -3493,7 +3489,7 @@ const [conferenceJoined, setConferenceJoined] = useState<boolean>(false);
         // ignore
       }
     },
-    [API_BASE, streamEventRef, sessionKind, sessionRoom, companyName, companionName, normalizeSharedChatRoomToken, isBeeStreamedHost, memberIdForLiveChat, viewerLiveChatName],
+    [API_BASE, streamEventRef, isBeeStreamedHost, memberIdForLiveChat, companionName, viewerLiveChatName, sessionKind, sessionRoom, companyName, sanitizeRoomToken],
   );
 
   const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
@@ -3569,8 +3565,9 @@ const disposeJitsi = useCallback(() => {
     jitsiContainerRef.current.innerHTML = "";
   }
 
+  // Leaving the private session should immediately reflect in UI + chat gating.
+  conferenceJoinedRef.current = false;
   setConferenceJoined(false);
-  joinedStreamRef.current = false;
 
   setJitsiError("");
 }, []);
@@ -3633,8 +3630,10 @@ const joinJitsiConference = useCallback(
 
       const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
       // Use the same username state used for Shared Live Chat.
-      // (Earlier iterations referenced a `username` variable that didn't exist.)
-      const displayName = String(viewerLiveChatName || "").trim() || (memberId ? "Member" : "Guest");
+      // Host should present as the companion name (e.g., "Dulce") inside the Jitsi UI.
+      const displayName = isBeeStreamedHost
+        ? (String(companionName || "Host").trim() || "Host")
+        : (String(viewerLiveChatName || "").trim() || (memberId ? "Member" : "Guest"));
       const subject = `${companyName} • ${companionName}`.trim();
 
       const options: any = {
@@ -3672,9 +3671,9 @@ const joinJitsiConference = useCallback(
       jitsiApiRef.current = api;
 
       api.addListener?.("videoConferenceJoined", () => {
-        setAvatarStatus("connected");
+        conferenceJoinedRef.current = true;
         setConferenceJoined(true);
-        joinedStreamRef.current = true;
+        setAvatarStatus("connected");
         try {
           if (subject) api.executeCommand?.("subject", subject);
         } catch {
@@ -3685,6 +3684,9 @@ const joinJitsiConference = useCallback(
       api.addListener?.("readyToClose", () => {
         // If the user hangs up, prevent auto-rejoin while the host session is still active.
         conferenceOptOutRef.current = true;
+
+        conferenceJoinedRef.current = false;
+        setConferenceJoined(false);
 
         disposeJitsi();
         setAvatarStatus("idle");
@@ -3718,7 +3720,7 @@ const startConferenceSession = useCallback(async () => {
 
   // Viewers never start a session. They just wait until the host starts.
   if (!isBeeStreamedHost) {
-    setStreamNotice("Waiting for host to start the conference…");
+    setStreamNotice("Waiting for host to start the private session…");
     setAvatarStatus("waiting");
     return;
   }
@@ -3742,7 +3744,7 @@ const startConferenceSession = useCallback(async () => {
 
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok || !data?.ok) {
-      const detail = String(data?.detail || data?.error || "Conference start failed.");
+      const detail = String(data?.detail || data?.error || "Private session start failed.");
       throw new Error(detail);
     }
 
@@ -3756,7 +3758,7 @@ const startConferenceSession = useCallback(async () => {
     await joinJitsiConference(room);
   } catch (err: any) {
     setAvatarStatus("idle");
-    setAvatarError(err?.message || "Conference start failed.");
+    setAvatarError(err?.message || "Private session start failed.");
   }
 }, [
   API_BASE,
@@ -4547,23 +4549,9 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   // ---------------------------------------------------------------------
 // Attachments (Azure Blob via backend)
 // - Only image/* uploads are supported (rendered as image previews).
-// - Attachments are DISABLED during Shared Live STREAMING (BeeStreamed sessionActive + stream).
+// - Attachments are DISABLED during Shared Live (BeeStreamed sessionActive).
 // ---------------------------------------------------------------------
 const uploadsDisabled = Boolean(beestreamedSessionActive && sessionKind === "stream");
-
-const viewerNeedsPlayToJoinLive = useMemo(() => {
-  if (isBeeStreamedHost) return false;
-  if (!beestreamedSessionActive) return false;
-
-  if (sessionKind === "conference") return !conferenceJoined;
-  if (sessionKind === "stream") return !viewerHasJoinedStream;
-  return false;
-}, [isBeeStreamedHost, beestreamedSessionActive, sessionKind, conferenceJoined, viewerHasJoinedStream]);
-
-const inputPlaceholderText = useMemo(() => {
-  if (!viewerNeedsPlayToJoinLive) return "Type a message...";
-  return sessionKind === "conference" ? "Live conference active — press Play to join." : "Live stream active — press Play to join.";
-}, [viewerNeedsPlayToJoinLive, sessionKind]);
 
 const uploadAttachment = useCallback(
   async (file: File): Promise<UploadedAttachment> => {
@@ -4736,8 +4724,7 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     if (!rawText && !hasAttachment) return;
 
     // Hard rule: no attachments during Shared Live streaming.
-    const inSharedLiveStream = Boolean(sessionKind === "stream" && (beestreamedSessionActive || hostInStreamUi || viewerInStreamUi));
-    if (inSharedLiveStream && hasAttachment) {
+    if ((uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
       try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
       return;
     }
@@ -4823,7 +4810,7 @@ let streamSessionActive = Boolean(beestreamedSessionActive);
   // Whether THIS user is currently inside the shared in-stream experience.
   // (Important: this must NOT depend on the current UI mode selection; users can switch modes
   // and must still remain blocked from AI while the host is live until the stream ends.)
-  const userInStreamSession = joinedStreamRef.current;
+  const userInStreamSession = sessionKind === "conference" ? conferenceJoinedRef.current : joinedStreamRef.current;
 
 // Avoid race with the polling loop:
 // right before deciding to call /chat, do a one-off status check.
@@ -4853,7 +4840,8 @@ if (!streamSessionActive && API_BASE && companyName && companionName) {
 
 if (streamSessionActive) {
   const who = (companionName || "This companion").trim() || "This companion";
-  const notice = `${who} is in a live session now but will respond once the session concludes.`;
+  const sessionLabel = sessionKind === "conference" ? "private session" : "live stream";
+  const notice = `${who} is in a ${sessionLabel} now but will respond once the ${sessionLabel} concludes.`;
 
   // In-stream members (host + joined viewers): this is a *shared live chat*.
   // Do NOT queue these messages for AI and do NOT send them to /chat later.
@@ -6441,6 +6429,12 @@ const viewerCanStopStream =
     avatarStatus === "reconnecting" ||
     avatarStatus === "error");
 
+// Private session (Jitsi) stop rules.
+// Viewer can only opt-out after they\'ve actually joined.
+// Host can always stop the private session when it is active (host-only).
+const viewerCanStopConference = sessionKind === "conference" && !isBeeStreamedHost && conferenceJoined;
+const hostCanStopConference = sessionKind === "conference" && isBeeStreamedHost;
+
 // Host requirement: Stop must end the live session (and send the end-event signal to BeeStreamed).
 const hostCanStopStream =
   liveProvider === "stream" &&
@@ -6451,13 +6445,6 @@ const hostCanStopStream =
     avatarStatus === "connecting" ||
     avatarStatus === "reconnecting" ||
     avatarStatus === "error");
-
-const viewerCanStopConference =
-  Boolean(beestreamedSessionActive) && sessionKind === "conference" && !isBeeStreamedHost && conferenceJoined;
-
-const hostCanStopConference =
-  Boolean(beestreamedSessionActive) && sessionKind === "conference" && isBeeStreamedHost;
-
 
 const hostInStreamUi =
   liveProvider === "stream" &&
@@ -6765,7 +6752,8 @@ const modePillControls = (
           <div
             style={{
               width: "min(520px, 100%)",
-              background: "#0b0f19",
+              background: "#111827",
+              color: "#ffffff",
               border: "1px solid rgba(255,255,255,0.12)",
               borderRadius: 14,
               padding: 16,
@@ -6775,7 +6763,7 @@ const modePillControls = (
           >
             <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Start a session</div>
             <div style={{ opacity: 0.85, fontSize: 13, marginBottom: 14 }}>
-              Choose <b>Stream</b> (BeeStreamed) or a 1:1 <b>Conference</b> (Jitsi). You can&apos;t run both at the same time.
+              Choose <b>Stream</b> or <b>Private</b>. You can&apos;t run both at the same time.
             </div>
 
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -6784,6 +6772,7 @@ const modePillControls = (
                   padding: "10px 12px",
                   borderRadius: 10,
                   border: "1px solid rgba(255,255,255,0.18)",
+                  color: "#ffffff",
                   background: "rgba(255,255,255,0.06)",
                   cursor: "pointer",
                 }}
@@ -6792,7 +6781,7 @@ const modePillControls = (
                   void startLiveAvatar();
                 }}
               >
-                Stream (BeeStreamed)
+                Stream
               </button>
 
               <button
@@ -6808,7 +6797,7 @@ const modePillControls = (
                   void startConferenceSession();
                 }}
               >
-                Conference (Jitsi)
+                Private
               </button>
 
               <button
@@ -6816,6 +6805,7 @@ const modePillControls = (
                   padding: "10px 12px",
                   borderRadius: 10,
                   border: "1px solid rgba(255,255,255,0.18)",
+                  color: "#ffffff",
                   background: "transparent",
                   cursor: "pointer",
                 }}
@@ -6877,7 +6867,7 @@ const modePillControls = (
                     fontWeight: 700,
                   }}
                 >
-                  ● Live {sessionKind === "conference" ? "conference" : "stream"} active
+                  ● Live {sessionKind === "conference" ? "private" : "stream"} active
                 </span>
               ) : null}
 
@@ -7406,7 +7396,15 @@ const modePillControls = (
                   send();
                 }
               }}
-                placeholder={sttEnabled ? "Listening…" : inputPlaceholderText}
+              placeholder={
+                sttEnabled
+                  ? "Listening…"
+                  : !isBeeStreamedHost && beestreamedSessionActive && sessionKind === "conference" && !conferenceJoined
+                  ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
+                  : !isBeeStreamedHost && beestreamedSessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
+                  ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
+                  : "Type a message…"
+              }
               style={{
                 flex: 1,
                 padding: "10px 12px",
