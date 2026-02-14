@@ -1743,26 +1743,6 @@ useEffect(() => {
   }, [API_BASE, companyName, companionName]);
 
   // Auto-join active LiveKit stream as a viewer (subscribe-only)
-  useEffect(() => {
-    if (liveProvider !== "stream") {
-      autoJoinStreamRef.current = false;
-      return;
-    }
-    if (!(sessionActive && sessionKind === "stream")) {
-      autoJoinStreamRef.current = false;
-      return;
-    }
-
-    const isHost = Boolean(memberId) && memberId === livekitHostMemberId;
-    if (isHost) return;
-    if (livekitToken) return;
-    if (avatarStatus === "waiting" || avatarStatus === "connected") return;
-    if (autoJoinStreamRef.current) return;
-
-    autoJoinStreamRef.current = true;
-    setAvatarStatus("waiting");
-  }, [liveProvider, sessionActive, sessionKind, memberId, livekitHostMemberId, livekitToken, avatarStatus]);
-
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
   // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
@@ -1903,6 +1883,23 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
+
+
+  // Auto-join LiveKit stream for viewers (subscribe-only) when the host is live.
+  useEffect(() => {
+    if (!(sessionActive && sessionKind === "stream")) {
+      autoJoinStreamRef.current = false;
+      return;
+    }
+
+    if (isHost) return;
+    if (livekitToken) return;
+    if (avatarStatus === "waiting" || avatarStatus === "connected") return;
+    if (autoJoinStreamRef.current) return;
+
+    autoJoinStreamRef.current = true;
+    setAvatarStatus("waiting");
+  }, [sessionActive, sessionKind, isHost, livekitToken, avatarStatus]);
 
   // Host: poll join requests while a LiveKit session is active.
   useEffect(() => {
