@@ -1068,6 +1068,7 @@ export default function Page() {
   // This avoids TypeScript/TDZ issues where a callback dependency array would otherwise
   // reference `memberId` before its declaration.
   const memberIdRef = useRef<string>("");
+const autoJoinStreamRef = useRef<boolean>(false);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
@@ -1741,6 +1742,27 @@ useEffect(() => {
     };
   }, [API_BASE, companyName, companionName]);
 
+  // Auto-join active LiveKit stream as a viewer (subscribe-only)
+  useEffect(() => {
+    if (liveProvider !== "stream") {
+      autoJoinStreamRef.current = false;
+      return;
+    }
+    if (!(sessionActive && sessionKind === "stream")) {
+      autoJoinStreamRef.current = false;
+      return;
+    }
+
+    const isHost = Boolean(memberId) && memberId === livekitHostMemberId;
+    if (isHost) return;
+    if (livekitToken) return;
+    if (avatarStatus === "waiting" || avatarStatus === "connected") return;
+    if (autoJoinStreamRef.current) return;
+
+    autoJoinStreamRef.current = true;
+    setAvatarStatus("waiting");
+  }, [liveProvider, sessionActive, sessionKind, memberId, livekitHostMemberId, livekitToken, avatarStatus]);
+
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
   // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
@@ -2280,6 +2302,7 @@ if (liveProvider === "stream") {
         avatar: companionName,
         embedDomain,
         memberId: memberIdRef.current || "",
+        displayName: (viewerLiveChatName || "").trim(),
       }),
     });
 
@@ -2303,70 +2326,33 @@ if (liveProvider === "stream") {
       setLivekitToken(token);
       setSessionActive(true);
       setSessionKind("stream");
+      setSessionRoom(roomName);
+      setStreamEventRef(roomName);
       setStreamNotice("");
       setAvatarStatus("connected");
       joinedStreamRef.current = true;
       return;
     }
 
-    // Viewer: Pattern A lobby (no token until admitted).
-    const uname = ensureViewerLiveChatName();
-    if (!uname) {
+    // Viewer: auto-join when the stream is active (subscribe-only token).
+    if (token) {
+      setLivekitRole("viewer");
+      setLivekitRoomName(roomName);
+      setLivekitToken(String(token));
+      setSessionActive(true);
+      setSessionKind("stream");
+      setSessionRoom(roomName);
+      setStreamEventRef(roomName);
       setStreamNotice("");
-      setAvatarStatus("idle");
-      setAvatarError(null);
+      setAvatarStatus("connected");
+      joinedStreamRef.current = true;
       return;
     }
 
-    // Create a join request.
-    const jr = await fetch(`${API_BASE}/livekit/join_request`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        brand: companyName,
-        avatar: companionName,
-        memberId: memberIdRef.current || "",
-        name: uname,
-        roomName,
-      }),
-    });
-    const jrData: any = await jr.json().catch(() => ({}));
-    if (!jr.ok || !jrData?.ok) throw new Error(String(jrData?.detail || jrData?.error || "Join request failed."));
-    const requestId = String(jrData?.requestId || "").trim();
-    setLivekitJoinRequestId(requestId);
-
-    // Poll for admission.
-    setStreamNotice("Waiting for host approval…");
+    setStreamNotice(
+      sessionActive ? "Live stream is active. Connecting…" : "Waiting for host to start stream…"
+    );
     setAvatarStatus("waiting");
-
-    const pollStart = Date.now();
-    const poll = async () => {
-      const resp = await fetch(`${API_BASE}/livekit/join_request_status?requestId=${encodeURIComponent(requestId)}`);
-      const st: any = await resp.json().catch(() => ({}));
-      if (st?.status === "ADMITTED" && st?.token) {
-        setLivekitToken(String(st.token));
-        setSessionActive(true);
-        setSessionKind("stream");
-        setStreamNotice("");
-        setAvatarStatus("connected");
-        joinedStreamRef.current = true;
-        return;
-      }
-      if (st?.status === "DENIED") {
-        setStreamNotice("");
-        setAvatarStatus("idle");
-        setAvatarError("Host denied your request to join.");
-        return;
-      }
-      if (Date.now() - pollStart > 120000) {
-        setStreamNotice("");
-        setAvatarStatus("idle");
-        setAvatarError("Timed out waiting for host approval.");
-        return;
-      }
-      window.setTimeout(poll, 1200);
-    };
-    window.setTimeout(poll, 800);
     return;
   } catch (err: any) {
     console.error("LiveKit start failed:", err);
@@ -3229,6 +3215,7 @@ const speakAssistantReply = useCallback(
           brand: companyName,
           avatar: companionName,
           memberId: memberIdRef.current || "",
+          displayName: (viewerLiveChatName || "").trim(),
           embedDomain,
         }),
       })
@@ -3236,30 +3223,30 @@ const speakAssistantReply = useCallback(
         .then((data: any) => {
           if (!data || cancelled) return;
 
-          const eventRef = String(data?.eventRef || "").trim();
-          let embedUrl = String(data?.embedUrl || "").trim();
-          if (embedUrl && embedUrl.startsWith("/")) embedUrl = `${API_BASE}${embedUrl}`;
-const canStart = !!data?.canStart;
+          const roomName = String(data?.roomName || "").trim();
+          const token = String(data?.token || "").trim();
+          const isActive = Boolean(data?.sessionActive);
 
-// Viewer UX: prefer player-only embed inside iframes.
-if (embedUrl && !canStart && !/[?&]embed=/.test(embedUrl)) {
-  embedUrl += (embedUrl.includes("?") ? "&" : "?") + "embed=player";
-}
-
-
-          // Once the host creates the event_ref, the backend will begin returning embedUrl to viewers.
-          if (embedUrl) {
-            setStreamEventRef(eventRef);
-            /*setStreamEmbedUrl*/(embedUrl);
-
-            // Viewers can never "start", so we keep waiting state (and message) until the stream is live.
-            // This is purely to allow the iframe to appear without requiring a hard refresh.
-            setStreamCanStart(false);
-
-            if (data?.message) setStreamNotice(String(data.message));
-          } else if (data?.message) {
-            setStreamNotice(String(data.message));
+          if (token && roomName) {
+            joinedStreamRef.current = true;
+            setLivekitRole("viewer");
+            setLivekitRoomName(roomName);
+            setLivekitToken(token);
+            setSessionActive(true);
+            setSessionKind("stream");
+            setSessionRoom(roomName);
+            setStreamEventRef(roomName);
+            setAvatarStatus("connected");
+            setStreamNotice("");
+            return;
           }
+
+          if (data?.message) {
+            setStreamNotice(String(data.message));
+          } else {
+            setStreamNotice(isActive ? "Live stream is active. Connecting…" : "Waiting for host to start stream…");
+          }
+
         })
         .catch((_e) => {
           // Ignore transient failures; keep polling.
@@ -7171,7 +7158,8 @@ const modePillControls = (
     {/* Right-justified Mode controls */}
     {modePillControls}
   </section>
-) : (
+) : null}
+
   <section
     style={{
       display: "flex",
@@ -7187,11 +7175,10 @@ const modePillControls = (
       {sttControls}
 
       <div style={{ fontSize: 12, color: "#666" }}>
-     {liveProvider === "stream" ? (
+     {liveProvider === "stream" && livekitToken ? (
                 <div style={{ width: "100%", height: "100%", position: "relative" }}>
                   {/* Conference + small-audience live stream via WebRTC */}
-                  {livekitToken ? (
-<LiveKitRoom
+                  <LiveKitRoom
                     token={livekitToken}
                     serverUrl={LIVEKIT_URL}
                     connect={true}
@@ -7247,12 +7234,6 @@ const modePillControls = (
                     ) : null}
 
                   </LiveKitRoom>
-) : (
-  <div style={{ padding: 16, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, background: "#fff" }}>
-    <div style={{ fontWeight: 700, marginBottom: 6 }}>Live session not started</div>
-    <div style={{ fontSize: 12, color: "#666" }}>Host must press Play to start the session.</div>
-  </div>
-)}
                 </div>
               ) : liveProvider === "stream" ? (
                 livekitHlsUrl ? (
@@ -7702,7 +7683,6 @@ const modePillControls = (
           ) : null}
         </div>
       </section>
-)}
 
       {/* Save Chat Summary confirmation overlay */}
       {showSaveSummaryConfirm && (

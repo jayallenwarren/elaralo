@@ -5431,6 +5431,7 @@ class LiveKitStartEmbedRequest(BaseModel):
     brand: str
     avatar: str
     memberId: str = ""
+    displayName: str = ""
     embedDomain: str = ""
 
 @app.post("/stream/livekit/start_embed")
@@ -5438,7 +5439,7 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
     """
     Start or join a LiveKit 'stream' session (host-controlled).
     - Host gets an immediate token.
-    - Viewer gets roomName + canStart=false and must go through join_request/admit.
+    - Viewer automatically gets a subscribe-only token when the stream is active.
     """
     resolved_brand = (req.brand or "").strip()
     resolved_avatar = (req.avatar or "").strip()
@@ -5475,18 +5476,33 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
             except Exception:
                 pass
 
+        host_name = resolved_avatar or "Host"
+
         token = _livekit_participant_token(
             room,
             identity=f"host:{caller_member_id or 'host'}",
-            name="Host",
+            name=host_name,
             can_publish=True,
             can_subscribe=True,
             room_admin=True,
         )
         return {"ok": True, "canStart": True, "role": "host", "roomName": room, "token": token, "sessionActive": True, "hlsUrl": hls_url}
 
-    # Viewer: do not issue token yet (Pattern A).
-    return {"ok": True, "canStart": False, "role": "viewer", "roomName": room, "sessionActive": session_active}
+    # Viewer: auto-join when active (subscribe-only).
+    if session_active:
+        viewer_name = (req.displayName or "").strip() or "Viewer"
+        viewer_id = caller_member_id or f"guest-{uuid4().hex[:10]}"
+        token = _livekit_participant_token(
+            room,
+            identity=f"viewer:{viewer_id}",
+            name=viewer_name,
+            can_publish=False,
+            can_subscribe=True,
+            room_admin=False,
+        )
+        return {"ok": True, "canStart": False, "role": "viewer", "roomName": room, "token": token, "sessionActive": True}
+
+    return {"ok": True, "canStart": False, "role": "viewer", "roomName": room, "sessionActive": False}
 
 
 class LiveKitStartBroadcastRequest(BaseModel):
@@ -5562,7 +5578,7 @@ async def livekit_stream_start_broadcast(req: LiveKitStartBroadcastRequest):
     token = _livekit_participant_token(
         room,
         identity=f"host:{caller_member_id or 'host'}",
-        name="Host",
+        name=(resolved_avatar or "Host"),
         can_publish=True,
         can_subscribe=True,
         room_admin=True,
@@ -5750,6 +5766,8 @@ async def livekit_admit(req: LiveKitJoinDecision):
 
     b = (r.get("brand") or req.brand or "").strip()
     a = (r.get("avatar") or req.avatar or "").strip()
+    kind, _room = _read_session_kind_room(b, a)
+    can_publish = True if kind == "conference" else False
     mapping = _lookup_companion_mapping(b, a)
     if not mapping:
         raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
@@ -5763,7 +5781,7 @@ async def livekit_admit(req: LiveKitJoinDecision):
     identity = f"user:{str(r.get('memberId') or '').strip() or rid}"
     name = str(r.get("name") or "").strip() or "Guest"
 
-    token = _livekit_participant_token(room, identity=identity, name=name, can_publish=False, can_subscribe=True)
+    token = _livekit_participant_token(room, identity=identity, name=name, can_publish=can_publish, can_subscribe=True)
 
     with _LIVEKIT_JOIN_LOCK:
         rr = _LIVEKIT_JOIN_REQUESTS.get(rid)
