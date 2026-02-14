@@ -5491,7 +5491,11 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
     is_host = bool(host_member_id) and bool(caller_member_id) and (host_member_id.lower() == caller_member_id.lower())
 
     # Stable room (reuse event_ref storage)
-    room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    session_kind = (session_kind or "").strip()
+    session_room = (session_room or "").strip()
+    hls_url = ""
+    room = session_room or (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
     if not _read_event_ref_from_db(resolved_brand, resolved_avatar):
         _set_session_active(resolved_brand, resolved_avatar, bool(_is_session_active(resolved_brand, resolved_avatar)), event_ref=room)
 
