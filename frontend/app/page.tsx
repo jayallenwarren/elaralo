@@ -7187,10 +7187,11 @@ const modePillControls = (
       {sttControls}
 
       <div style={{ fontSize: 12, color: "#666" }}>
-     {liveProvider === "stream" && livekitToken ? (
+     {liveProvider === "stream" ? (
                 <div style={{ width: "100%", height: "100%", position: "relative" }}>
                   {/* Conference + small-audience live stream via WebRTC */}
-                  <LiveKitRoom
+                  {livekitToken ? (
+<LiveKitRoom
                     token={livekitToken}
                     serverUrl={LIVEKIT_URL}
                     connect={true}
@@ -7246,6 +7247,12 @@ const modePillControls = (
                     ) : null}
 
                   </LiveKitRoom>
+) : (
+  <div style={{ padding: 16, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, background: "#fff" }}>
+    <div style={{ fontWeight: 700, marginBottom: 6 }}>Live session not started</div>
+    <div style={{ fontSize: 12, color: "#666" }}>Host must press Play to start the session.</div>
+  </div>
+)}
                 </div>
               ) : liveProvider === "stream" ? (
                 livekitHlsUrl ? (
