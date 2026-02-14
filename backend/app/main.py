@@ -1016,6 +1016,8 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "found": True,
         "brand": str(m.get("brand") or b),
         "avatar": str(m.get("avatar") or a),
+        "hostMemberId": str(m.get("host_member_id") or ""),
+        "host_member_id": str(m.get("host_member_id") or ""),
         "companionType": ctype_out,
         "companion_type": ctype_out,
         "channel_cap": cap_out,
@@ -2048,7 +2050,12 @@ def _get_companion_mappings_db_path(for_write: bool = False) -> str:
 
 
 def _is_session_active(brand: str, avatar: str) -> bool:
-    """Read session_active from SQLite (fallback to False if missing)."""
+    """Read session_active from SQLite (fallback to False if missing).
+
+    Defensive: treat a session as active only when it has a non-empty kind and room/ref
+    (when those columns exist). This prevents "phantom" active sessions when a flag
+    is left true but the room/ref is blank.
+    """
     b = (brand or "").strip()
     a = (avatar or "").strip()
     if not b or not a:
@@ -2072,16 +2079,46 @@ def _is_session_active(brand: str, avatar: str) -> bool:
         if "session_active" not in cols:
             return False
 
+        has_kind = "session_kind" in cols
+        has_ref = "session_event_ref" in cols
+
+        select_cols = ["session_active"]
+        if has_kind:
+            select_cols.append("session_kind")
+        if has_ref:
+            select_cols.append("session_event_ref")
+
         cur.execute(
-            f"SELECT session_active FROM {table_name} "
+            f"SELECT {', '.join(select_cols)} FROM {table_name} "
             f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
             (b, a),
         )
         row = cur.fetchone()
+        if not row:
+            return False
+
+        active_raw = row[0]
         try:
-            return bool(int(row[0])) if row and row[0] is not None else False
+            active = bool(int(active_raw)) if active_raw is not None else False
         except Exception:
-            return bool(row[0]) if row else False
+            active = bool(active_raw)
+
+        if not active:
+            return False
+
+        idx = 1
+        if has_kind:
+            kind = str(row[idx] or "").strip()
+            idx += 1
+            if not kind:
+                return False
+
+        if has_ref:
+            ref = str(row[idx] or "").strip()
+            if not ref:
+                return False
+
+        return True
     except Exception:
         return False
     finally:
@@ -2090,8 +2127,6 @@ def _is_session_active(brand: str, avatar: str) -> bool:
                 conn.close()
         except Exception:
             pass
-
-
 def _set_session_active(brand: str, avatar: str, active: bool, event_ref: Optional[str] = None) -> bool:
     """Persist session_active (and optionally event_ref if currently empty) to SQLite.
 
@@ -5500,7 +5535,7 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
 
     # Viewer: issue a subscribe-only token automatically for livestreams (no approval).
     viewer_token = ""
-    if active and session_kind == "stream":
+    if session_active and session_kind == "stream" and room:
         viewer_identity = f"viewer:{caller_member_id}" if caller_member_id else f"viewer:{uuid.uuid4().hex[:10]}"
         viewer_name = (req.displayName or "").strip() or "Viewer"
         viewer_token = _livekit_participant_token(
@@ -5518,11 +5553,11 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
         "room": room,
         "roomName": room,
         "sessionRoom": room,
-        "sessionActive": active,
+        "sessionActive": session_active,
         "sessionKind": session_kind,
         "hostMemberId": host_member_id,
         "token": viewer_token,
-        "hlsUrl": hls_url if active else "",
+        "hlsUrl": hls_url if session_active else "",
     }
 
 

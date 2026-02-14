@@ -128,7 +128,7 @@ type Mode = "friend" | "romantic" | "intimate";
 
 type LiveProvider = "d-id" | "stream";
 
-type SessionKind = "stream" | "conference" | "";
+type SessionKind = "stream" | "private" | "conference" | "";
 
 // Jitsi Meet External API is loaded at runtime (script tag).
 declare global {
@@ -1873,13 +1873,14 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [livekitToken, setLivekitToken] = useState<string>("");
   const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
   const [livekitRoomName, setLivekitRoomName] = useState<string>("");
-  const [livekitRole, setLivekitRole] = useState<"host" | "attendee" | "viewer">("viewer");
+  const [livekitRole, setLivekitRole] = useState<"unknown" | "host" | "attendee" | "viewer">("unknown");
   // LiveKit session state (replaces BeeStreamed/Jitsi session flags)
   const [sessionActive, setSessionActive] = useState<boolean>(false);
   const [sessionKind, setSessionKind] = useState<SessionKind>("");
   const [sessionRoom, setSessionRoom] = useState<string>("");
   // Treat "host" as the LiveKit host role (LegacyStream host semantics are deprecated).
   const isHost = livekitRole === "host";
+  const livekitRoleKnown = livekitRole !== "unknown";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
@@ -1892,14 +1893,17 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
       return;
     }
 
+    if (!livekitRoleKnown) return;
+    if (livekitRole !== "viewer") return;
+
     if (isHost) return;
     if (livekitToken) return;
     if (avatarStatus === "waiting" || avatarStatus === "connected") return;
     if (autoJoinStreamRef.current) return;
 
+    // Viewers must click Play to join; do not auto-join.
     autoJoinStreamRef.current = true;
-    setAvatarStatus("waiting");
-  }, [sessionActive, sessionKind, isHost, livekitToken, avatarStatus]);
+  }, [sessionActive, sessionKind, isHost, livekitRole, livekitRoleKnown, livekitToken, avatarStatus]);
 
   // Host: poll join requests while a LiveKit session is active.
   useEffect(() => {
@@ -1947,6 +1951,25 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 
   const [streamEventRef, setStreamEventRef] = useState<string>("");
   const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
+
+  const mappedHostMemberId = useMemo(() => {
+    const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
+    return String(v || "");
+  }, [companionMapping]);
+
+  useEffect(() => {
+    if (!memberId) return;
+    if (!mappedHostMemberId) return;
+
+    if (memberId === mappedHostMemberId) {
+      setStreamCanStart(true);
+      setLivekitRole("host");
+    } else {
+      setStreamCanStart(false);
+      setLivekitRole((prev) => (prev === "unknown" ? "viewer" : prev));
+    }
+  }, [memberId, mappedHostMemberId]);
+
   const [streamNotice, setStreamNotice] = useState<string>("");
 
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
@@ -3955,7 +3978,9 @@ useEffect(() => {
       try {
         const url = `${API_BASE}/stream/livekit/status?brand=${encodeURIComponent(
           companyName,
-        )}&avatar=${encodeURIComponent(companionName)}`;
+        )}&avatar=${encodeURIComponent(companionName)}&memberId=${encodeURIComponent(
+          memberIdRef.current || "",
+        )}`;
         const res = await fetch(url, { cache: "no-store" });
 
         if (cancelled) return;
@@ -3983,7 +4008,25 @@ useEffect(() => {
         const rawKind = String((data as any).sessionKind || "").trim().toLowerCase();
         const nextKind: SessionKind =
           rawKind === "conference" || rawKind === "stream" ? (rawKind as SessionKind) : nextActive ? "stream" : "";
-        const nextRoom = String((data as any).sessionRoom || "").trim();
+        const nextRoom = String(
+          (data as any).room ||
+            (data as any).sessionRoom ||
+            (data as any).roomName ||
+            ""
+        ).trim();
+
+        const effectiveMemberId = String(memberIdRef.current || "").trim();
+
+        const nextCanStart =
+          effectiveMemberId && typeof (data as any).canStart === "boolean"
+            ? Boolean((data as any).canStart)
+            : null;
+
+        if (nextCanStart !== null) {
+          setStreamCanStart(nextCanStart);
+          if (nextCanStart) setLivekitRole("host");
+          else setLivekitRole((prev) => (prev === "unknown" ? "viewer" : prev));
+        }
 
         if (nextActive) {
           livekitStatusInactivePollsRef.current = 0;
@@ -6576,7 +6619,27 @@ useEffect(() => {
   void stopSpeechToText();
 }, [viewerInStreamUi, stopSpeechToText]);
 
-const sttControls = (
+const sttControls =
+    liveProvider === "stream" && livekitToken
+      ? isHost
+        ? (
+            <button
+              onClick={handleStopClick}
+              title="End live session"
+              style={{
+                border: "1px solid #ccc",
+                borderRadius: 8,
+                padding: "8px 10px",
+                background: "#fff",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              ■
+            </button>
+          )
+        : null
+      : (
 
     <>
       <button
@@ -6983,7 +7046,7 @@ const modePillControls = (
                 </span>
               ) : null}
 
-              {hostInStreamUi || viewerInStreamUi ? (
+              {!!livekitToken ? (
                 <span
                   style={{
                     display: "inline-flex",
