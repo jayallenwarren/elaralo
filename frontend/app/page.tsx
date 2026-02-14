@@ -1068,7 +1068,12 @@ export default function Page() {
   // This avoids TypeScript/TDZ issues where a callback dependency array would otherwise
   // reference `memberId` before its declaration.
   const memberIdRef = useRef<string>("");
-const autoJoinStreamRef = useRef<boolean>(false);
+
+  // Wix member id (empty for visitors). Declared early so it can be referenced
+  // safely in dependency arrays above (prevents TS "used before its declaration").
+  const [memberId, setMemberId] = useState<string>("");
+
+  const autoJoinStreamRef = useRef<boolean>(false);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
@@ -3194,7 +3199,6 @@ const speakAssistantReply = useCallback(
   });
 
   const [planName, setPlanName] = useState<PlanName>(null);
-  const [memberId, setMemberId] = useState<string>("");
 
   // Sync memberId into a ref so callbacks defined above can always access the latest value.
   useEffect(() => {
