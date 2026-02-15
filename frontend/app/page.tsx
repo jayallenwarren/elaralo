@@ -2054,6 +2054,21 @@ const liveEnabled = useMemo(() => {
 }, [channelCap, companionMapping]);
 
 
+  // Wix templates (and some site themes) may apply a gray page background.
+  // The Companion UI should always render on a white canvas.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const prevHtmlBg = document.documentElement.style.backgroundColor;
+    const prevBodyBg = document.body.style.backgroundColor;
+    document.documentElement.style.backgroundColor = "#fff";
+    document.body.style.backgroundColor = "#fff";
+    return () => {
+      document.documentElement.style.backgroundColor = prevHtmlBg;
+      document.body.style.backgroundColor = prevBodyBg;
+    };
+  }, []);
+
+
 
   // UI layout
   const conversationHeight = 520;
@@ -7247,529 +7262,646 @@ const modePillControls = (
   </section>
 ) : null}
 
-  <section
-    style={{
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 12,
-      marginBottom: 12,
-      flexWrap: "wrap",
-    }}
-  >
-    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-      {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
-      {sttControls}
-
-      <div style={{ fontSize: 12, color: "#666" }}>
-     {liveProvider === "stream" && livekitToken ? (
-                <div style={{ width: "100%", height: "100%", position: "relative" }}>
-                  {/* Conference + small-audience live stream via WebRTC */}
+      <section style={{ marginTop: 18 }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 18,
+            marginTop: 18,
+            flexWrap: "wrap",
+            alignItems: "flex-start",
+          }}
+        >
+          {showAvatarFrame ? (
+            <div style={{ flex: "0 0 360px", minWidth: 280, maxWidth: "100%" }}>
+              <div
+                style={{
+                  width: "100%",
+                  height: 440,
+                  background: "#000",
+                  border: "1px solid #e5e5e5",
+                  borderRadius: 12,
+                  overflow: "hidden",
+                  position: "relative",
+                }}
+              >
+                {liveProvider === "stream" && livekitToken ? (
                   <LiveKitRoom
                     token={livekitToken}
                     serverUrl={LIVEKIT_URL}
                     connect={true}
-                    audio={true}
-                    video={true}
-                    style={{ width: "100%", height: "100%" }}
-                    onDisconnected={() => {
-                      // If disconnected (e.g. host stopped), return to idle.
-                      setLivekitToken("");
-                      setSessionActive(false);
-                      setSessionKind("");
-                      setAvatarStatus("idle");
+                    audio={livekitRole !== "viewer"}
+                    video={livekitRole !== "viewer"}
+                    onConnected={() => {
+                      // Host: once connected we treat the session as active.
+                      if (livekitRole === "host") setSessionActive(true);
+                      // Conference: track that we've joined the room.
+                      if (sessionKind === "conference") setConferenceJoined(true);
                     }}
+                    onDisconnected={() => {
+                      setConferenceJoined(false);
+                      setLivekitToken(null);
+                      setLivekitRole(null);
+                      // Viewer disconnect should not mark the session inactive globally;
+                      // the status poller will reflect whether the host is still live.
+                      if (isHost) setSessionActive(false);
+                    }}
+                    style={{ width: "100%", height: "100%" }}
                   >
-                    <VideoConference />
+                    <VideoConference
+                      chatMessageFormatter={undefined as any}
+                      onError={(e: any) => {
+                        console.warn("LiveKit UI error", e);
+                      }}
+                    />
 
-                    {isHost && livekitPending.length ? (
+                    {livekitRole === "host" && livekitPending.length > 0 ? (
                       <div
                         style={{
                           position: "absolute",
-                          top: 10,
-                          right: 10,
-                          width: 260,
-                          maxHeight: "70%",
-                          overflowY: "auto",
-                          background: "rgba(0,0,0,0.65)",
-                          border: "1px solid rgba(255,255,255,0.18)",
-                          borderRadius: 12,
-                          padding: 10,
-                          color: "#fff",
-                          fontSize: 12,
-                          zIndex: 5,
+                          inset: 0,
+                          pointerEvents: "none",
+                          display: "flex",
+                          alignItems: "flex-end",
+                          justifyContent: "center",
+                          padding: 12,
                         }}
                       >
-                        <div style={{ fontWeight: 700, marginBottom: 8 }}>Lobby</div>
-                        {livekitPending.map((r: any) => (
-                          <div key={String(r.requestId)} style={{ marginBottom: 10, paddingBottom: 10, borderBottom: "1px solid rgba(255,255,255,0.12)" }}>
-                            <div style={{ marginBottom: 6 }}>
-                              <div style={{ fontWeight: 600 }}>{String(r.name || "Guest")}</div>
-                              <div style={{ opacity: 0.85 }}>{String(r.memberId || "")}</div>
-                            </div>
-                            <div style={{ display: "flex", gap: 8 }}>
-                              <button onClick={() => admitLivekit(String(r.requestId))} style={{ padding: "6px 10px", borderRadius: 10, border: "0", cursor: "pointer" }}>
-                                Admit
-                              </button>
-                              <button onClick={() => denyLivekit(String(r.requestId))} style={{ padding: "6px 10px", borderRadius: 10, border: "0", cursor: "pointer" }}>
-                                Deny
-                              </button>
-                            </div>
+                        <div
+                          style={{
+                            background: "rgba(0,0,0,0.65)",
+                            border: "1px solid rgba(255,255,255,0.15)",
+                            borderRadius: 12,
+                            padding: 14,
+                            maxWidth: 340,
+                            width: "100%",
+                            pointerEvents: "auto",
+                          }}
+                        >
+                          <div style={{ fontWeight: 700, marginBottom: 8 }}>Join Requests</div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                            {livekitPending.map((req) => (
+                              <div
+                                key={req.requestId}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  gap: 10,
+                                }}
+                              >
+                                <div style={{ minWidth: 0 }}>
+                                  <div
+                                    style={{
+                                      fontWeight: 600,
+                                      overflow: "hidden",
+                                      textOverflow: "ellipsis",
+                                      whiteSpace: "nowrap",
+                                    }}
+                                  >
+                                    {req.viewerLabel || "Viewer"}
+                                  </div>
+                                  <div
+                                    style={{
+                                      fontSize: 12,
+                                      opacity: 0.85,
+                                      overflow: "hidden",
+                                      textOverflow: "ellipsis",
+                                      whiteSpace: "nowrap",
+                                    }}
+                                  >
+                                    {req.identity}
+                                  </div>
+                                </div>
+                                <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                                  <button
+                                    onClick={() => {
+                                      void denyLivekit(req.requestId);
+                                      setLivekitPending((p) => p.filter((x) => x.requestId !== req.requestId));
+                                    }}
+                                    style={{
+                                      padding: "6px 10px",
+                                      borderRadius: 10,
+                                      border: "1px solid rgba(255,255,255,0.25)",
+                                      background: "transparent",
+                                      color: "#fff",
+                                      cursor: "pointer",
+                                      fontWeight: 700,
+                                    }}
+                                  >
+                                    Deny
+                                  </button>
+                                  <button
+                                    onClick={() => {
+                                      void admitLivekit(req.requestId);
+                                      setLivekitPending((p) => p.filter((x) => x.requestId !== req.requestId));
+                                    }}
+                                    style={{
+                                      padding: "6px 10px",
+                                      borderRadius: 10,
+                                      border: "1px solid rgba(255,255,255,0.25)",
+                                      background: "#fff",
+                                      color: "#111",
+                                      cursor: "pointer",
+                                      fontWeight: 800,
+                                    }}
+                                  >
+                                    Admit
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
                           </div>
-                        ))}
+                        </div>
                       </div>
                     ) : null}
 
+                    {(livekitRole === "viewer" && sessionKind === "conference" && !conferenceJoined) ||
+                    (livekitRole === "viewer" && sessionKind === "conference" && livekitJoinRequestId) ? (
+                      <div
+                        style={{
+                          position: "absolute",
+                          inset: 0,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          padding: 16,
+                          textAlign: "center",
+                        }}
+                      >
+                        <div
+                          style={{
+                            background: "rgba(0,0,0,0.65)",
+                            border: "1px solid rgba(255,255,255,0.15)",
+                            borderRadius: 12,
+                            padding: 14,
+                            maxWidth: 340,
+                            color: "#fff",
+                          }}
+                        >
+                          <div style={{ fontWeight: 800, marginBottom: 6 }}>
+                            {livekitJoinRequestId ? "Request sent" : "Private session"}
+                          </div>
+                          <div style={{ fontSize: 12, opacity: 0.9 }}>
+                            {livekitJoinRequestId
+                              ? "Waiting for the host to admit you…"
+                              : "Press Play to request to join."}
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
                   </LiveKitRoom>
-                </div>
-              ) : liveProvider === "stream" ? (
-                livekitHlsUrl ? (
-                  <LiveKitHlsPlayer src={livekitHlsUrl} />
-                ) : (
+                ) : liveProvider === "stream" ? (
+                  livekitHlsUrl ? (
+                    <LiveKitHlsPlayer src={livekitHlsUrl} />
+                  ) : (
+                    <div
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "#fff",
+                        padding: 16,
+                        textAlign: "center",
+                        background: "rgba(0,0,0,0.6)",
+                      }}
+                    >
+                      {sessionActive
+                        ? "Waiting for the broadcast…"
+                        : isHost
+                        ? "Press Play to start a session."
+                        : "Host is offline."}
+                    </div>
+                  )
+                ) : null}
+
+                {avatarStatus !== "connected" ? (
                   <div
                     style={{
-                      padding: 16,
-                      borderRadius: 12,
-                      background: "rgba(0,0,0,0.6)",
-                      border: "1px solid rgba(255,255,255,0.14)",
-                      fontSize: 12,
-                    }}
-                  >
-                    Broadcast is starting… If this persists, confirm server-side HLS is enabled and LIVEKIT_HLS_PUBLIC_BASE_URL is set.
-                  </div>
-                )
-              ) : (
-                <video
-                  ref={avatarVideoRef}
-                  style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                  playsInline
-                  autoPlay
-                  muted={false}
-                />
-              )}
-              {avatarStatus !== "connected" ? (
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    color: "#fff",
-                    fontSize: 14,
-                    background: "rgba(0,0,0,0.25)",
-                    padding: 12,
-                    textAlign: "center",
-                    pointerEvents: "none",
-                  }}
-                >
-                  {avatarStatus === "connecting"
-                    ? "Connecting…"
-                    : avatarStatus === "reconnecting"
-                    ? "Reconnecting…"
-                    : avatarStatus === "waiting"
-                    ? streamNotice || "Waiting for the host to start…"
-                    : avatarStatus === "error"
-                    ? "Avatar error"
-                    : null}
-                </div>
-              ) : null}
-            </div>
-          </div>
-
-        <div
-          style={{
-            flex: showAvatarFrame ? ((liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
-            minWidth: 280,
-            height: conversationHeight,
-            display: "flex",
-            flexDirection: "column",
-            position: "relative",
-          }}
-        >
-          <div
-            ref={messagesBoxRef}
-            style={{
-              flex: "1 1 auto",
-              border: "1px solid #e5e5e5",
-              borderRadius: 12,
-              padding: 12,
-              overflowY: "auto",
-              background: "#fff",
-            }}
-          >
-            {messages.map((m, i) => {
-              const meta: any = (m as any).meta;
-              const displayName =
-                meta?.liveChat && meta?.name
-                  ? String(meta.name)
-                  : m.role === "assistant"
-                  ? (companionName || DEFAULT_COMPANION_NAME)
-                  : "You";
-
-              return (
-                <div
-                  key={i}
-                  style={{
-                    marginBottom: 10,
-                    whiteSpace: "pre-wrap",
-                    color: m.role === "assistant" ? "#111" : "#333",
-                  }}
-                >
-                  <b>{displayName}:</b> {renderMsgContent(m)}
-                </div>
-              );
-            })}
-            {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
-          </div>
-
-          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>
-            {/** Input line with mode pills moved to the right (layout-only). */}
-            <button
-                  type="button"
-                  onClick={requestSaveChatSummary}
-                  title="Save"
-                  aria-label="Save"
-                  style={{
-                    width: 44,
-                    height: 44,
-                    borderRadius: 10,
-                    border: "1px solid #bbb",
-                    background: "#fff",
-                    cursor: "pointer",
-                    opacity: 1,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
-                >
-                  <SaveIcon size={18} />
-                </button>
-
-                <button
-                  type="button"
-                  onClick={requestClearMessages}
-                  title="Clear"
-                  aria-label="Delete"
-                  style={{
-                    width: 44,
-                    height: 44,
-                    borderRadius: 10,
-                    border: "1px solid #bbb",
-                    background: "#fff",
-                    cursor: "pointer",
-                    opacity: 1,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
-                >
-                  <TrashIcon size={18} />
-                </button>
-
-            {/* Attachment upload (images only) */}
-            <input
-              ref={uploadInputRef}
-              type="file"
-              accept="*/*"
-              style={{ display: "none" }}
-              onChange={onAttachmentSelected}
-            />
-            <button
-              onClick={openUploadPicker}
-              disabled={
-                loading ||
-                uploadingAttachment ||
-                uploadsDisabled ||
-                hostInStreamUi ||
-                viewerInStreamUi
-              }
-              title={
-                uploadsDisabled || hostInStreamUi || viewerInStreamUi
-                  ? "Attachments are disabled during Shared Live streaming."
-                  : "Attach a file"
-              }
-              className="rounded border border-gray-300 bg-white px-3 py-2 text-sm"
-              style={{ height: 44, minWidth: 44 }}
-              type="button"
-            >
-              {uploadingAttachment ? "⏳" : "📎"}
-            </button>
-
-            {pendingAttachment && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  padding: "4px 8px",
-                  border: "1px solid #e5e5e5",
-                  borderRadius: 9999,
-                  background: "#fff",
-                  maxWidth: 320,
-                }}
-                title={pendingAttachment?.name || "attachment"}
-              >
-                <a href={pendingAttachment.url} target="_blank" rel="noopener noreferrer">
-                  {pendingAttachment.contentType?.toLowerCase().startsWith("image/") ? (
-                  <img
-                    src={pendingAttachment.url}
-                    alt={pendingAttachment.name}
-                    style={{
-                      width: 28,
-                      height: 28,
-                      objectFit: "cover",
-                      borderRadius: 6,
-                    }}
-                  />
-                ) : (
-                  <div
-                    style={{
-                      width: 28,
-                      height: 28,
-                      borderRadius: 6,
-                      border: "1px solid #e5e7eb",
-                      background: "#f9fafb",
+                      position: "absolute",
+                      inset: 0,
+                      background: "rgba(0,0,0,0.35)",
                       display: "flex",
                       alignItems: "center",
                       justifyContent: "center",
-                      fontSize: 16,
-                      lineHeight: "16px",
-                    }}
-                    title={pendingAttachment.contentType || "file"}
-                  >
-                    📎
-                  </div>
-                )}
-                </a>
-                <a
-                  href={pendingAttachment.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={{
-                    fontSize: 12,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                    maxWidth: 220,
-                    color: "#111827",
-                    textDecoration: "underline",
-                  }}
-                  title={pendingAttachment.url}
-                >
-                  {pendingAttachment.name}
-                </a>
-                <button
-                  onClick={clearPendingAttachment}
-                  type="button"
-                  style={{
-                    width: 22,
-                    height: 22,
-                    borderRadius: 9999,
-                    border: "1px solid #ddd",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    lineHeight: 1,
-                  }}
-                  aria-label="Remove attachment"
-                  title="Remove attachment"
-                >
-                  ×
-                </button>
-              </div>
-            ) : uploadError && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
-              <div
-                style={{
-                  fontSize: 12,
-                  color: "#b91c1c",
-                  maxWidth: 320,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-                title={uploadError}
-              >
-                {uploadError}
-              </div>
-            ) : null}
-
-            <input
-              ref={inputElRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-              placeholder={
-                sttEnabled
-                  ? "Listening…"
-                  : !isHost && sessionActive && sessionKind === "conference" && !conferenceJoined
-                  ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
-                  : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
-                  ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
-                  : "Type a message…"
-              }
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: "1px solid #ddd",
-              }}
-            />
-
-            <button
-              onClick={() => send()}
-              disabled={loading || uploadingAttachment}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: "#111",
-                color: "#fff",
-                cursor: "pointer",
-              }}
-            >
-              Send
-            </button>
-
-          </div>
-
-	          {sttError ? (
-	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-	          ) : null}
-
-          {/* LiveKit Broadcast overlay (Host-only) */}
-          {showBroadcastButton && showBroadcasterOverlay ? (
-            <div
-              style={{
-                position: "absolute",
-                inset: 0,
-                zIndex: 50,
-                borderRadius: 12,
-                overflow: "hidden",
-                background: "#0b0b0b",
-                border: "1px solid #e5e5e5",
-                display: "flex",
-                flexDirection: "column",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 10,
-                  padding: "10px 12px",
-                  background: "#111",
-                  color: "#fff",
-                  borderBottom: "1px solid rgba(255,255,255,0.12)",
-                }}
-              >
-                <div style={{ fontWeight: 800, fontSize: 13 }}>Broadcast (LiveKit)</div>
-
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  {livekitHlsUrl ? (
-                    <span style={{ fontSize: 12, opacity: 0.85 }} title={livekitHlsUrl}>
-                      HLS enabled
-                    </span>
-                  ) : null}
-
-                  <button
-                    type="button"
-                    onClick={() => void toggleBroadcastOverlay()}
-                    style={{
-                      padding: "8px 12px",
-                      borderRadius: 10,
-                      border: "1px solid #fff",
-                      background: "transparent",
                       color: "#fff",
-                      cursor: "pointer",
-                      fontWeight: 800,
-                      fontSize: 12,
-                    }}
-                    title="Stop broadcast"
-                  >
-                    Stop
-                  </button>
-                </div>
-              </div>
-
-              <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
-                {broadcastPreparing ? (
-                  <div
-                    style={{
-                      width: "100%",
-                      height: "100%",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
+                      fontWeight: 600,
                       padding: 16,
                       textAlign: "center",
-                      color: "#fff",
                     }}
                   >
-                    Preparing broadcast…
+                    {avatarStatus === "connecting"
+                      ? "Starting live session…"
+                      : avatarStatus === "waiting"
+                      ? "Waiting for host…"
+                      : avatarStatus === "reconnecting"
+                      ? "Reconnecting…"
+                      : "Live session ended"}
                   </div>
-                ) : broadcastError ? (
-                  <div
-                    style={{
-                      width: "100%",
-                      height: "100%",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      padding: 16,
-                      textAlign: "center",
-                      color: "#ffb4b4",
-                    }}
-                  >
-                    Broadcast unavailable: {broadcastError}
-                  </div>
-                ) : livekitToken && livekitRoomName ? (
-                  <LiveKitRoom
-                    token={livekitToken}
-                    serverUrl={LIVEKIT_URL}
-                    connect={true}
-                    audio={true}
-                    video={true}
-                    style={{ width: "100%", height: "100%" }}
-                    onDisconnected={() => {
-                      // If the backend stops the session, close the overlay UI.
-                      setLivekitToken("");
-                      setShowBroadcasterOverlay(false);
-                      setSessionActive(false);
-                      setSessionKind("");
-                      setSessionRoom("");
-                      setAvatarStatus("idle");
-                    }}
-                  >
-                    <VideoConference />
-                  </LiveKitRoom>
-                ) : (
-                  <div
-                    style={{
-                      width: "100%",
-                      height: "100%",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      padding: 16,
-                      textAlign: "center",
-                      color: "#fff",
-                    }}
-                  >
-                    No host token available. Click Broadcast again to retry.
-                  </div>
-                )}
+                ) : null}
               </div>
             </div>
           ) : null}
+
+          <div
+                    style={{
+                      flex: showAvatarFrame ? ((liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
+                      minWidth: 280,
+                      height: conversationHeight,
+                      display: "flex",
+                      flexDirection: "column",
+                      position: "relative",
+                    }}
+                  >
+                    <div
+                      ref={messagesBoxRef}
+                      style={{
+                        flex: "1 1 auto",
+                        border: "1px solid #e5e5e5",
+                        borderRadius: 12,
+                        padding: 12,
+                        overflowY: "auto",
+                        background: "#fff",
+                      }}
+                    >
+                      {messages.map((m, i) => {
+                        const meta: any = (m as any).meta;
+                        const displayName =
+                          meta?.liveChat && meta?.name
+                            ? String(meta.name)
+                            : m.role === "assistant"
+                            ? (companionName || DEFAULT_COMPANION_NAME)
+                            : "You";
+
+                        return (
+                          <div
+                            key={i}
+                            style={{
+                              marginBottom: 10,
+                              whiteSpace: "pre-wrap",
+                              color: m.role === "assistant" ? "#111" : "#333",
+                            }}
+                          >
+                            <b>{displayName}:</b> {renderMsgContent(m)}
+                          </div>
+                        );
+                      })}
+                      {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>
+                      {/** Input line with mode pills moved to the right (layout-only). */}
+                      <button
+                            type="button"
+                            onClick={requestSaveChatSummary}
+                            title="Save"
+                            aria-label="Save"
+                            style={{
+                              width: 44,
+                              height: 44,
+                              borderRadius: 10,
+                              border: "1px solid #bbb",
+                              background: "#fff",
+                              cursor: "pointer",
+                              opacity: 1,
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            <SaveIcon size={18} />
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={requestClearMessages}
+                            title="Clear"
+                            aria-label="Delete"
+                            style={{
+                              width: 44,
+                              height: 44,
+                              borderRadius: 10,
+                              border: "1px solid #bbb",
+                              background: "#fff",
+                              cursor: "pointer",
+                              opacity: 1,
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            <TrashIcon size={18} />
+                          </button>
+
+                      {/* Attachment upload (images only) */}
+                      <input
+                        ref={uploadInputRef}
+                        type="file"
+                        accept="*/*"
+                        style={{ display: "none" }}
+                        onChange={onAttachmentSelected}
+                      />
+                      <button
+                        onClick={openUploadPicker}
+                        disabled={
+                          loading ||
+                          uploadingAttachment ||
+                          uploadsDisabled ||
+                          hostInStreamUi ||
+                          viewerInStreamUi
+                        }
+                        title={
+                          uploadsDisabled || hostInStreamUi || viewerInStreamUi
+                            ? "Attachments are disabled during Shared Live streaming."
+                            : "Attach a file"
+                        }
+                        className="rounded border border-gray-300 bg-white px-3 py-2 text-sm"
+                        style={{ height: 44, minWidth: 44 }}
+                        type="button"
+                      >
+                        {uploadingAttachment ? "⏳" : "📎"}
+                      </button>
+
+                      {pendingAttachment && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                            padding: "4px 8px",
+                            border: "1px solid #e5e5e5",
+                            borderRadius: 9999,
+                            background: "#fff",
+                            maxWidth: 320,
+                          }}
+                          title={pendingAttachment?.name || "attachment"}
+                        >
+                          <a href={pendingAttachment.url} target="_blank" rel="noopener noreferrer">
+                            {pendingAttachment.contentType?.toLowerCase().startsWith("image/") ? (
+                            <img
+                              src={pendingAttachment.url}
+                              alt={pendingAttachment.name}
+                              style={{
+                                width: 28,
+                                height: 28,
+                                objectFit: "cover",
+                                borderRadius: 6,
+                              }}
+                            />
+                          ) : (
+                            <div
+                              style={{
+                                width: 28,
+                                height: 28,
+                                borderRadius: 6,
+                                border: "1px solid #e5e7eb",
+                                background: "#fff",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                fontSize: 16,
+                                lineHeight: "16px",
+                              }}
+                              title={pendingAttachment.contentType || "file"}
+                            >
+                              📎
+                            </div>
+                          )}
+                          </a>
+                          <a
+                            href={pendingAttachment.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            style={{
+                              fontSize: 12,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              maxWidth: 220,
+                              color: "#111827",
+                              textDecoration: "underline",
+                            }}
+                            title={pendingAttachment.url}
+                          >
+                            {pendingAttachment.name}
+                          </a>
+                          <button
+                            onClick={clearPendingAttachment}
+                            type="button"
+                            style={{
+                              width: 22,
+                              height: 22,
+                              borderRadius: 9999,
+                              border: "1px solid #ddd",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              lineHeight: 1,
+                            }}
+                            aria-label="Remove attachment"
+                            title="Remove attachment"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ) : uploadError && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
+                        <div
+                          style={{
+                            fontSize: 12,
+                            color: "#b91c1c",
+                            maxWidth: 320,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                          title={uploadError}
+                        >
+                          {uploadError}
+                        </div>
+                      ) : null}
+
+                      <input
+                        ref={inputElRef}
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            send();
+                          }
+                        }}
+                        placeholder={
+                          sttEnabled
+                            ? "Listening…"
+                            : !isHost && sessionActive && sessionKind === "conference" && !conferenceJoined
+                            ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
+                            : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
+                            ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
+                            : "Type a message…"
+                        }
+                        style={{
+                          flex: 1,
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: "1px solid #ddd",
+                        }}
+                      />
+
+                      <button
+                        onClick={() => send()}
+                        disabled={loading || uploadingAttachment}
+                        style={{
+                          padding: "10px 14px",
+                          borderRadius: 10,
+                          border: "1px solid #111",
+                          background: "#111",
+                          color: "#fff",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Send
+                      </button>
+
+                    </div>
+
+          	          {sttError ? (
+          	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+          	          ) : null}
+
+                    {/* LiveKit Broadcast overlay (Host-only) */}
+                    {showBroadcastButton && showBroadcasterOverlay ? (
+                      <div
+                        style={{
+                          position: "absolute",
+                          inset: 0,
+                          zIndex: 50,
+                          borderRadius: 12,
+                          overflow: "hidden",
+                          background: "#0b0b0b",
+                          border: "1px solid #e5e5e5",
+                          display: "flex",
+                          flexDirection: "column",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 10,
+                            padding: "10px 12px",
+                            background: "#111",
+                            color: "#fff",
+                            borderBottom: "1px solid rgba(255,255,255,0.12)",
+                          }}
+                        >
+                          <div style={{ fontWeight: 800, fontSize: 13 }}>Broadcast (LiveKit)</div>
+
+                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                            {livekitHlsUrl ? (
+                              <span style={{ fontSize: 12, opacity: 0.85 }} title={livekitHlsUrl}>
+                                HLS enabled
+                              </span>
+                            ) : null}
+
+                            <button
+                              type="button"
+                              onClick={() => void toggleBroadcastOverlay()}
+                              style={{
+                                padding: "8px 12px",
+                                borderRadius: 10,
+                                border: "1px solid #fff",
+                                background: "transparent",
+                                color: "#fff",
+                                cursor: "pointer",
+                                fontWeight: 800,
+                                fontSize: 12,
+                              }}
+                              title="Stop broadcast"
+                            >
+                              Stop
+                            </button>
+                          </div>
+                        </div>
+
+                        <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
+                          {broadcastPreparing ? (
+                            <div
+                              style={{
+                                width: "100%",
+                                height: "100%",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                padding: 16,
+                                textAlign: "center",
+                                color: "#fff",
+                              }}
+                            >
+                              Preparing broadcast…
+                            </div>
+                          ) : broadcastError ? (
+                            <div
+                              style={{
+                                width: "100%",
+                                height: "100%",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                padding: 16,
+                                textAlign: "center",
+                                color: "#ffb4b4",
+                              }}
+                            >
+                              Broadcast unavailable: {broadcastError}
+                            </div>
+                          ) : livekitToken && livekitRoomName ? (
+                            <LiveKitRoom
+                              token={livekitToken}
+                              serverUrl={LIVEKIT_URL}
+                              connect={true}
+                              audio={true}
+                              video={true}
+                              style={{ width: "100%", height: "100%" }}
+                              onDisconnected={() => {
+                                // If the backend stops the session, close the overlay UI.
+                                setLivekitToken("");
+                                setShowBroadcasterOverlay(false);
+                                setSessionActive(false);
+                                setSessionKind("");
+                                setSessionRoom("");
+                                setAvatarStatus("idle");
+                              }}
+                            >
+                              <VideoConference />
+                            </LiveKitRoom>
+                          ) : (
+                            <div
+                              style={{
+                                width: "100%",
+                                height: "100%",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                padding: 16,
+                                textAlign: "center",
+                                color: "#fff",
+                              }}
+                            >
+                              No host token available. Click Broadcast again to retry.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+      
         </div>
       </section>
+
+
 
       {/* Save Chat Summary confirmation overlay */}
       {showSaveSummaryConfirm && (
