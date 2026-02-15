@@ -138,12 +138,7 @@ type LiveProvider = "d-id" | "stream";
 
 type SessionKind = "stream" | "private" | "conference" | "";
 
-// Jitsi Meet External API is loaded at runtime (script tag).
-declare global {
-  interface Window {
-    JitsiMeetExternalAPI?: any;
-  }
-}
+// LiveKit is the sole live-session provider.
 type ChannelCap = "audio" | "video" | "";
 
 type CompanionMappingRow = {
@@ -1065,6 +1060,7 @@ function LiveKitStreamViewerStage() {
   return (
     <div style={{ width: "100%", height: "100%" }}>
       <RoomAudioRenderer />
+      <StartAudio label="Click to enable audio" />
 
       {tracksToShow.length ? (
         <GridLayout tracks={tracksToShow} style={{ height: "100%" }}>
@@ -1941,14 +1937,14 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
   // Live stream embed URL (deprecated; LiveKit uses room tokens)
-  // LiveKit (replaces LegacyStream + Jitsi)
+  // LiveKit provider
   const LIVEKIT_URL = useMemo(() => normalizeLivekitWsUrl(String((process.env.NEXT_PUBLIC_LIVEKIT_URL || process.env.LIVEKIT_URL || "")).trim()), [normalizeLivekitWsUrl]);
   const [livekitToken, setLivekitToken] = useState<string>("");
   const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
   const [livekitRoomName, setLivekitRoomName] = useState<string>("");
   const [livekitRole, setLivekitRole] = useState<"unknown" | "host" | "attendee" | "viewer">("unknown");
   const [livekitServerUrl, setLivekitServerUrl] = useState<string>(String(LIVEKIT_URL || "").trim());
-  // LiveKit session state (replaces BeeStreamed/Jitsi session flags)
+  // LiveKit session state
   const [sessionActive, setSessionActive] = useState<boolean>(false);
   const [sessionKind, setSessionKind] = useState<SessionKind>("");
   const [sessionRoom, setSessionRoom] = useState<string>("");
@@ -2180,16 +2176,22 @@ const liveEnabled = useMemo(() => {
   // UI: show the video frame whenever the user is in a Live Video session.
 // For Stream (LegacyStream): show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
 // so the click is never perceived as a no-op and the viewer can always press Stop to exit waiting.
-const streamUiActive =
+// LiveKit sessions (Stream + Private): keep the session frame visible whenever a session is active,
+// so refreshes don't hide the live session UI.
+const livekitUiActive =
   liveProvider === "stream" &&
-  (avatarStatus === "connecting" ||
+  ((sessionActive && isHost) ||
+    Boolean(livekitToken) ||
+    livekitJoinStatus === "pending" ||
+    avatarStatus === "connecting" ||
     avatarStatus === "waiting" ||
     avatarStatus === "connected" ||
     avatarStatus === "reconnecting" ||
-    Boolean(streamEventRef));
+    Boolean(streamEventRef) ||
+    Boolean(conferenceEventRef));
 
 const showAvatarFrame =
-  (liveProvider === "stream" && streamUiActive) ||
+  (liveProvider === "stream" && livekitUiActive) ||
   (Boolean(phase1AvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
 
   // Viewer-only: treat any active LegacyStream embed as "Live Streaming".
@@ -2313,109 +2315,70 @@ const applyIphoneLiveAvatarAudioBoost = useCallback(
 
 
 const stopLiveAvatar = useCallback(async () => {
-  // Always clean up iPhone audio boost routing first
-  cleanupIphoneLiveAvatarAudio();
-
-  // LegacyStream (Human companion) — stop the stream and clear the embed.
-  if (streamEventRef) {
-    const hostStopping = Boolean(streamCanStart);
-    let stopSucceeded = false;
-
-    try {
-      // Only the host can stop the underlying LegacyStream event.
-      // Viewers can close their local iframe without affecting the event.
-      if (hostStopping) {
-        const res = await fetch(`${API_BASE}/stream/livekit/stop`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            brand: companyName,
-            avatar: companionName,
-            memberId: memberIdRef.current || "",
-            eventRef: streamEventRef || undefined,
-          }),
-        });
-
-        const data: any = await res.json().catch(() => ({}));
-        if (!res.ok || !data?.ok) {
-          throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
-        }
-      }
-
-      stopSucceeded = true;
-    } catch (e) {
-      const err = e as any;
-      console.warn("LegacyStream stop_embed failed:", err);
-
-      // Keep the host in-session so they can retry Stop (avoids a mismatch where the event is live but the UI is torn down).
-      if (hostStopping) {
-        setAvatarError(
-          `Failed to end the live stream. ${err?.message ? String(err.message) : String(err)}`,
-        );
-        return;
-      }
-    } finally {
-      // Always allow viewers to disconnect locally.
-      // For the host, only tear down the embed if the stop call succeeded.
-      if (!hostStopping || stopSucceeded) {
-setStreamEventRef("");
-        setStreamCanStart(false);
-        setStreamNotice("");
-
-        // Leaving the in-stream experience (Stop pressed).
-        joinedStreamRef.current = false;
-      }
-
-      // Host stop -> mark global session inactive immediately (poll will also confirm)
-      if (hostStopping && stopSucceeded) setSessionActive(false);
-    }
-  }
+  if (stopInProgressRef.current) return;
+  stopInProgressRef.current = true;
+  setStreamNotice(null);
 
   try {
-    const mgr = didAgentMgrRef.current;
-    didAgentMgrRef.current = null;
+    // Always tear down local media + UI state so the user can recover from a stuck session.
+    cleanupIphoneLiveAvatarAudio();
 
-    // Stop any remembered MediaStream (important if we were showing idle_video and vid.srcObject is null)
-    const remembered = didSrcObjectRef.current;
-    didSrcObjectRef.current = null;
-
-    if (mgr) {
-      await mgr.disconnect();
-    }
-
-    try {
-      if (remembered && typeof remembered.getTracks === "function") {
-        remembered.getTracks().forEach((t: any) => t?.stop?.());
-      }
-    } catch (e) {
-      // ignore
-    }
-
-    const vid = avatarVideoRef.current;
-    if (vid) {
-      const srcObj = vid.srcObject as MediaStream | null;
-      if (srcObj && typeof srcObj.getTracks === "function") {
-        srcObj.getTracks().forEach((t) => t.stop());
-      }
-      vid.srcObject = null;
-
-      // If we were displaying the presenter's idle_video, clear it too.
-      try {
-        vid.pause();
-        vid.removeAttribute("src");
-        (vid as any).src = "";
-        vid.load?.();
-      } catch (e) {
-        // ignore
-      }
-    }
-  } catch (e) {
-    // ignore
-  } finally {
+    setLivekitToken("");
+    setLivekitRoomName("");
+    setLivekitHlsUrl("");
+    setStreamJoined(false);
+    setConferenceJoined(false);
     setAvatarStatus("idle");
-    setAvatarError(null);
+    setStreamEventRef("");
+    setConferenceEventRef("");
+    setConferenceRoomName("");
+    setLivekitJoinRequestId("");
+    setLivekitJoinStatus("idle");
+    setLivekitPending([]);
+    setMessages([]);
+    setLiveSharingNotice(null);
+
+    // Viewers leaving should NOT stop the live session for everyone.
+    if (!isHost) {
+      return;
+    }
+
+    // Host: stop *any* active session (stream OR private) to prevent stale/stuck state.
+    const payload = {
+      brand: companyName,
+      avatar: companionName,
+      memberId: memberIdRef.current || "",
+    };
+
+    // Stop both kinds defensively (backend is idempotent).
+    await fetch(`${API_BASE}/stream/livekit/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => null);
+
+    await fetch(`${API_BASE}/conference/livekit/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => null);
+
+    // Local session reset for host (poller will reconcile too).
+    setSessionActive(false);
+    setSessionKind("");
+    sessionActiveRef.current = false;
+    streamOptOutRef.current = false;
+    conferenceOptOutRef.current = false;
+    setStreamCanStart(false);
+
+    setStreamNotice("Stopped.");
+  } catch (err) {
+    console.error("stopLiveAvatar failed", err);
+    setStreamNotice("Stop failed. Please refresh and try again.");
+  } finally {
+    stopInProgressRef.current = false;
   }
-}, [cleanupIphoneLiveAvatarAudio, "", streamEventRef, streamCanStart, API_BASE, companyName, companionName]);
+}, [API_BASE, companyName, companionName, cleanupIphoneLiveAvatarAudio, isHost]);
 
 const reconnectLiveAvatar = useCallback(async () => {
   const mgr = didAgentMgrRef.current;
@@ -3412,13 +3375,10 @@ const speakAssistantReply = useCallback(
 // Host-only Play modal (Stream vs Conference)
 const [showPlayChoiceModal, setShowPlayChoiceModal] = useState<boolean>(false);
 
-// Jitsi (conference) embedding
-const jitsiContainerRef = useRef<HTMLDivElement | null>(null);
-const jitsiApiRef = useRef<any>(null);
+// Conference intent flag (prevents auto-rejoin when a user explicitly leaves).
 const conferenceOptOutRef = useRef<boolean>(false);
-const [jitsiError, setJitsiError] = useState<string>("");
 
-// Track whether THIS client has actually joined the private (Jitsi) session.
+// Track whether THIS client has actually joined the private session.
 // We use both state (for UI) and a ref (for send() gating without stale closures).
 const [conferenceJoined, setConferenceJoined] = useState<boolean>(false);
 const conferenceJoinedRef = useRef<boolean>(false);
@@ -3556,8 +3516,7 @@ useEffect(() => {
       !!eventRef &&
       (conferenceJoined ||
         streamCanStart ||
-        Boolean(livekitToken) ||
-        Boolean(jitsiApiRef.current));
+        Boolean(livekitToken));
 
     const inLiveChatUi = inStreamUi || inConferenceUi;
 
@@ -3742,7 +3701,7 @@ const prevSessionActiveRef = useRef<boolean>(false);
 const joinedStreamRef = useRef<boolean>(false);
 
 // ===============================
-// Jitsi (Conference) helpers
+// Conference helpers
 // ===============================
 const sanitizeRoomToken = useCallback((raw: string, maxLen = 128) => {
   const s = String(raw || "")
@@ -3755,195 +3714,7 @@ const sanitizeRoomToken = useCallback((raw: string, maxLen = 128) => {
   return out.slice(0, maxLen);
 }, []);
 
-const ensureJitsiExternalApiLoaded = useCallback(async (): Promise<void> => {
-  if (typeof window === "undefined") return;
-  if (window.JitsiMeetExternalAPI) return;
-
-  const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
-  const scriptUrl = `https://${domain}/external_api.js`;
-
-  await new Promise<void>((resolve, reject) => {
-    const existing = document.querySelector<HTMLScriptElement>('script[data-jitsi-external-api="1"]');
-    if (existing) {
-      if (window.JitsiMeetExternalAPI) return resolve();
-      existing.addEventListener("load", () => resolve());
-      existing.addEventListener("error", () => reject(new Error("Failed to load Jitsi External API")));
-      return;
-    }
-
-    const s = document.createElement("script");
-    s.src = scriptUrl;
-    s.async = true;
-    s.dataset.jitsiExternalApi = "1";
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error("Failed to load Jitsi External API script"));
-    document.head.appendChild(s);
-  });
-}, []);
-
-const disposeJitsi = useCallback(() => {
-  try {
-    jitsiApiRef.current?.dispose?.();
-  } catch {
-    // ignore
-  }
-  jitsiApiRef.current = null;
-
-  if (jitsiContainerRef.current) {
-    jitsiContainerRef.current.innerHTML = "";
-  }
-
-  // Leaving the private session should immediately reflect in UI + chat gating.
-  conferenceJoinedRef.current = false;
-  setConferenceJoined(false);
-
-  setJitsiError("");
-}, []);
-
-const stopConferenceSession = useCallback(async () => {
-  // Viewers leaving the conference should not stop the host session.
-  if (!isHost) {
-    conferenceOptOutRef.current = true;
-    setLivekitToken("");
-    setAvatarStatus("idle");
-    return;
-  }
-
-  // Optimistic close (prevents auto-rejoin while stop request is in-flight)
-  conferenceOptOutRef.current = true;
-  setLivekitToken("");
-  setSessionActive(false);
-  setSessionKind("");
-  setSessionRoom("");
-  setAvatarStatus("idle");
-
-  try {
-    await fetch(`${API_BASE}/conference/livekit/stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand: companyName, avatar: companionName, memberId: memberId || "" }),
-    });
-  } catch {
-    // best effort
-  }
-}, [API_BASE, companyName, companionName, disposeJitsi, isHost, memberId]);
-
-const joinJitsiConference = useCallback(
-  async (roomName: string) => {
-    const room = String(roomName || "").trim();
-    if (!room) return;
-
-    // Respect explicit "leave" by viewers while the session is still active
-    if (conferenceOptOutRef.current && !isHost) return;
-
-    // Avoid recreating the iframe on every state poll
-    if (jitsiApiRef.current) return;
-
-    if (!jitsiContainerRef.current) {
-      setJitsiError("Conference container not ready.");
-      return;
-    }
-
-    setJitsiError("");
-    setAvatarStatus("connecting");
-
-    try {
-      await ensureJitsiExternalApiLoaded();
-      if (!window.JitsiMeetExternalAPI) {
-        throw new Error("JitsiMeetExternalAPI is not available.");
-      }
-
-      // Clear any previous iframe
-      jitsiContainerRef.current.innerHTML = "";
-
-      const domain = String(process.env.NEXT_PUBLIC_JITSI_DOMAIN || "meet.jit.si").replace(/^https?:\/\//, "");
-      // Use the same username state used for Shared Live Chat.
-      // Host should present as the companion name (e.g., "Dulce") inside the Jitsi UI.
-      const displayName = isHost
-        ? (String(companionName || "Host").trim() || "Host")
-        : (String(viewerLiveChatName || "").trim() || (memberId ? "Member" : "Guest"));
-      const subject = `${companyName} • ${companionName}`.trim();
-
-      const options: any = {
-        roomName: room,
-        parentNode: jitsiContainerRef.current,
-        width: "100%",
-        height: "100%",
-        userInfo: { displayName },
-        configOverwrite: {
-          prejoinPageEnabled: false,
-          disableDeepLinking: true,
-          subject,
-        },
-        interfaceConfigOverwrite: {
-          SHOW_JITSI_WATERMARK: false,
-          SHOW_WATERMARK_FOR_GUESTS: false,
-          SHOW_BRAND_WATERMARK: false,
-          SHOW_POWERED_BY: false,
-          DEFAULT_REMOTE_DISPLAY_NAME: "Guest",
-          TOOLBAR_BUTTONS: [
-            "microphone",
-            "camera",
-            "desktop",
-            "fullscreen",
-            "fodeviceselection",
-            "hangup",
-            "chat",
-            "settings",
-            "tileview",
-          ],
-        },
-      };
-
-      const api = new window.JitsiMeetExternalAPI(domain, options);
-      jitsiApiRef.current = api;
-
-      api.addListener?.("videoConferenceJoined", () => {
-        conferenceJoinedRef.current = true;
-        setConferenceJoined(true);
-        setAvatarStatus("connected");
-        try {
-          if (subject) api.executeCommand?.("subject", subject);
-        } catch {
-          // ignore
-        }
-      });
-
-      api.addListener?.("readyToClose", () => {
-        // If the user hangs up, prevent auto-rejoin while the host session is still active.
-        conferenceOptOutRef.current = true;
-
-        conferenceJoinedRef.current = false;
-        setConferenceJoined(false);
-
-        disposeJitsi();
-        setAvatarStatus("idle");
-
-        // Host hanging up should end the session for viewers as well.
-        if (isHost) {
-          void stopConferenceSession();
-        }
-      });
-    } catch (err: any) {
-      const msg = err?.message || "Conference failed to start.";
-      setJitsiError(msg);
-      disposeJitsi();
-      setAvatarStatus("idle");
-    }
-  },
-  [
-    companyName,
-    companionName,
-    disposeJitsi,
-    ensureJitsiExternalApiLoaded,
-    isHost,
-    memberId,
-    stopConferenceSession,
-	  viewerLiveChatName,
-  ]
-);
-
-  const startConferenceSession = useCallback(async () => {
+const startConferenceSession = useCallback(async () => {
     setAvatarError(null);
 
     // Viewers request to join a private session. The host must admit them.
@@ -4085,6 +3856,69 @@ const messagesRef = useRef<Msg[]>([]);
 useEffect(() => {
   messagesRef.current = messages;
 }, [messages]);
+
+const stopConferenceSession = useCallback(async () => {
+  if (stopInProgressRef.current) return;
+  stopInProgressRef.current = true;
+  setStreamNotice(null);
+
+  try {
+    // Always tear down local media + UI state (lets the user recover from a stuck session).
+    cleanupIphoneLiveAvatarAudio();
+
+    setLivekitToken("");
+    setLivekitRoomName("");
+    setLivekitHlsUrl("");
+    setConferenceJoined(false);
+    setAvatarStatus("idle");
+    setConferenceEventRef("");
+    setConferenceRoomName("");
+    setLivekitJoinRequestId("");
+    setLivekitJoinStatus("idle");
+    setLivekitPending([]);
+    setMessages([]);
+    setLiveSharingNotice(null);
+
+    // Viewer leaving should NOT stop the private session for everyone.
+    if (!isHost) {
+      conferenceOptOutRef.current = true;
+      return;
+    }
+
+    // Host: stop *any* active session (private OR stream) to prevent stale/stuck state.
+    const payload = {
+      brand: companyName,
+      avatar: companionName,
+      memberId: memberIdRef.current || "",
+    };
+
+    await fetch(`${API_BASE}/conference/livekit/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => null);
+
+    await fetch(`${API_BASE}/stream/livekit/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => null);
+
+    setSessionActive(false);
+    setSessionKind("");
+    sessionActiveRef.current = false;
+    streamOptOutRef.current = false;
+    conferenceOptOutRef.current = false;
+    setStreamCanStart(false);
+
+    setStreamNotice("Stopped.");
+  } catch (err) {
+    console.error("stopConferenceSession failed", err);
+    setStreamNotice("Stop failed. Please refresh and try again.");
+  } finally {
+    stopInProgressRef.current = false;
+  }
+}, [API_BASE, companyName, companionName, cleanupIphoneLiveAvatarAudio, isHost]);
 
 const sessionStateRef = useRef<SessionState>(sessionState);
 useEffect(() => {
@@ -4273,34 +4107,9 @@ useEffect(() => {
   setAvatarStatus("connected");
 }, [sessionActive, sessionKind, streamCanStart, avatarStatus]);
 
-  // Conference auto-join: when the host starts a Jitsi conference, viewers should wait
-  // until session_active is true, then the app embeds Jitsi in-page.
-  useEffect(() => {
-    if (!(sessionActive && sessionKind === "conference")) {
-      if (jitsiApiRef.current) {
-        disposeJitsi();
-      }
-      return;
-    }
+  // Conference join is mediated via LiveKit join requests (viewer requests → host admits).
 
-    if (conferenceOptOutRef.current) return;
-
-    const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
-    const room = (sessionRoom || fallbackRoom).trim();
-
-    // Ensure the avatar frame is visible
-
-    void joinJitsiConference(room);
-  }, [
-    sessionActive,
-    sessionKind,
-    sessionRoom,
-    companyName,
-    companionName,
-    sanitizeRoomToken,
-    joinJitsiConference,
-    disposeJitsi,
-  ]);
+  
 
 
   // Reset broadcaster UI when switching companion / provider.
@@ -6576,7 +6385,7 @@ const speakGreetingIfNeeded = useCallback(
       stopHandsFreeSTT();
     } catch (e) {}
 
-    // Conference: Stop/leave Jitsi (host stops the session for everyone).
+    // Conference: Stop/leave (host stops the session for everyone).
     if (sessionKind === "conference") {
       void stopConferenceSession();
       return;
@@ -6779,7 +6588,7 @@ const viewerCanStopStream =
     avatarStatus === "reconnecting" ||
     avatarStatus === "error");
 
-// Private session (Jitsi) stop rules.
+// Private session stop rules.
 // Viewer can only opt-out after they\'ve actually joined.
 // Host can always stop the private session when it is active (host-only).
 const viewerCanStopConference = sessionKind === "conference" && !isHost && conferenceJoined;
@@ -7170,9 +6979,6 @@ const modePillControls = (
               </button>
             </div>
 
-            {jitsiError ? (
-              <div style={{ marginTop: 12, color: "#ffb4b4", fontSize: 12 }}>{jitsiError}</div>
-            ) : null}
           </div>
         </div>
       ) : null}
@@ -7287,15 +7093,15 @@ const modePillControls = (
             // If a conference is active, Play joins it (no STT).
             if (sessionActive && sessionKind === "conference") {
               conferenceOptOutRef.current = false;
-
-              const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
-              const room = (sessionRoom || fallbackRoom).trim();
-              void joinJitsiConference(room);
+              void startConferenceSession();
               return;
             }
 
             // Host-only: when idle, prompt for Stream vs Conference.
             if (isHost && !sessionActive) {
+              // New live session: clear any leftover live-sharing UI from the prior run.
+              setMessages([]);
+              setLiveSharingNotice(null);
               setShowPlayChoiceModal(true);
               return;
             }
@@ -7488,7 +7294,7 @@ const modePillControls = (
                       />
                     )}
 
-                    <StartAudio label="Enable audio" />
+                    {sessionKind === "stream" && livekitRole === "viewer" ? null : <StartAudio label="Enable audio" />}
 
                     {livekitRole === "host" && livekitPending.length > 0 ? (
                       <div
@@ -7627,7 +7433,7 @@ const modePillControls = (
                     ) : null}
                   </LiveKitRoom>
                 ) : liveProvider === "stream" ? (
-                  livekitHlsUrl ? (
+                  sessionKind === "stream" && livekitHlsUrl ? (
                     <LiveKitHlsPlayer src={livekitHlsUrl} />
                   ) : (
                     <div
@@ -7644,7 +7450,13 @@ const modePillControls = (
                       }}
                     >
                       {sessionActive
-                        ? "Waiting for the broadcast…"
+                        ? isHost
+                          ? sessionKind === "conference"
+                            ? "Press Play to re-join your Private session."
+                            : "Press Play to re-join your live stream."
+                          : sessionKind === "conference"
+                            ? "Press Play to request access to Private."
+                            : "Press Play to join the live stream."
                         : isHost
                         ? "Press Play to start a session."
                         : "Host is offline."}
@@ -7652,7 +7464,7 @@ const modePillControls = (
                   )
                 ) : null}
 
-                {avatarStatus !== "connected" ? (
+                {avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting" ? (
                   <div
                     style={{
                       position: "absolute",
