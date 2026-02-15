@@ -2332,8 +2332,7 @@ const stopLiveAvatar = useCallback(async () => {
             brand: companyName,
             avatar: companionName,
             memberId: memberIdRef.current || "",
-            displayName: String(viewerLiveChatName || "").trim(),
-            embedDomain,
+            eventRef: streamEventRef || undefined,
           }),
         });
 
@@ -3390,6 +3389,27 @@ const speakAssistantReply = useCallback(
 
     const poll = () => {
       const embedDomain = (typeof window !== "undefined" && window.location) ? window.location.hostname : "";
+
+      // NOTE: This polling request must NOT prompt the user. We derive a best-effort
+      // display name from state/storage, falling back to a deterministic guest name.
+      const displayNameForToken = (() => {
+        try {
+          const explicit = String(viewerLiveChatName || "").trim();
+          if (explicit) return explicit;
+
+          if (typeof window !== "undefined") {
+            const stored =
+              String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim() ||
+              String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+            if (stored) return stored;
+          }
+        } catch {
+          // ignore
+        }
+
+        const suffix = String(memberIdForLiveChat || memberIdRef.current || "viewer").slice(0, 6);
+        return `viewer-${suffix || "guest"}`;
+      })();
 
       fetch(`${API_BASE}/stream/livekit/start_embed`, {
         method: "POST",
