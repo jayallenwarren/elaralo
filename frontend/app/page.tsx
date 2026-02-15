@@ -1959,7 +1959,6 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
           if (!token) return;
 
           setLivekitToken(token);
-          setLivekitServerUrl(String(LIVEKIT_URL || "").trim());
           setConferenceJoined(true);
           setAvatarStatus("connected");
           setStreamNotice(null);
@@ -3915,7 +3914,7 @@ const joinJitsiConference = useCallback(
     isHost,
     memberId,
     stopConferenceSession,
-	  viewerLiveChatName,
+    viewerLiveChatName,
   ]
 );
 
@@ -3932,7 +3931,6 @@ const joinJitsiConference = useCallback(
       setLivekitJoinRequestId("");
       setLivekitToken("");
       setLivekitRole("viewer");
-      setLivekitServerUrl(String(LIVEKIT_URL || "").trim());
 
       // Mark intent so the "waiting to be admitted" overlay can render.
       setSessionKind("conference");
@@ -4040,7 +4038,6 @@ const joinJitsiConference = useCallback(
       setLivekitRoomName(room);
       setLivekitRole("host");
       setLivekitToken(token);
-      setLivekitServerUrl(serverUrl);
       setConferenceJoined(true);
       setAvatarStatus("connected");
     } catch (err: any) {
@@ -4718,9 +4715,9 @@ const companionForBackend =
 
 
 // NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+  // - `rebranding` (legacy) is not guaranteed to be present in this build.
+  // - Use RebrandingKey as the single source of truth for brand identity.
+  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -4803,9 +4800,9 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
 
     
 // NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+  // - `rebranding` (legacy) is not guaranteed to be present in this build.
+  // - Use RebrandingKey as the single source of truth for brand identity.
+  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -7885,9 +7882,9 @@ const modePillControls = (
 
                     </div>
 
-          	          {sttError ? (
-          	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-          	          ) : null}
+                      {sttError ? (
+                        <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+                      ) : null}
 
                     {/* LiveKit Broadcast overlay (Host-only) */}
                     {showBroadcastButton && showBroadcasterOverlay ? (
