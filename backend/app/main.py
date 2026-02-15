@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover
 
 from filelock import FileLock  # type: ignore
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends, Body
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
