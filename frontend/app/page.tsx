@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import elaraLogo from "../public/elaralo-logo.png";
 
 
-import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer } from "@livekit/components-react";
+import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio } from "@livekit/components-react";
 import { Track } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
@@ -2532,9 +2532,23 @@ const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       return;
     }
 
-    setStreamNotice(
-      sessionActive ? "Live stream is active. Connecting…" : "Waiting for host to start stream…"
-    );
+    // Viewer attempted to join, but no token was issued.
+    // If the host is not actively streaming, treat this as "no stream" (do not enter a waiting state),
+    // and optionally allow the viewer to request a private session instead.
+    if (!canStart && !sessionActive) {
+      setStreamNotice("No live stream is active right now.");
+      setAvatarStatus("idle");
+      const wantsPrivate = window.confirm(
+        "No live stream is active right now.\n\nWould you like to request a private session instead?"
+      );
+      if (wantsPrivate) {
+        setLiveProvider("conference");
+        await startConferenceSession();
+      }
+      return;
+    }
+
+    setStreamNotice("Live stream is active. Connecting…");
     setAvatarStatus("waiting");
     return;
   } catch (err: any) {
@@ -3379,92 +3393,9 @@ const speakAssistantReply = useCallback(
 
     // Lightweight viewer auto-refresh: if you are not the host, keep polling until the host creates/starts the event.
   // This avoids requiring manual page refresh for viewers waiting on the host.
-  useEffect(() => {
-    // Only poll while we are explicitly waiting and we don't yet have an embed URL.
-    if (avatarStatus !== "waiting") return;
-    if (streamEventRef) return;
+  
 
-    let cancelled = false;
-    const intervalMs = 3000;
 
-    const poll = () => {
-      const embedDomain = (typeof window !== "undefined" && window.location) ? window.location.hostname : "";
-
-      // NOTE: This polling request must NOT prompt the user. We derive a best-effort
-      // display name from state/storage, falling back to a deterministic guest name.
-      const displayNameForToken = (() => {
-        try {
-          const explicit = String(viewerLiveChatName || "").trim();
-          if (explicit) return explicit;
-
-          if (typeof window !== "undefined") {
-            const stored =
-              String(window.localStorage.getItem(liveChatUsernameStorageKey) || "").trim() ||
-              String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
-            if (stored) return stored;
-          }
-        } catch {
-          // ignore
-        }
-
-        const suffix = String(memberIdForLiveChat || memberIdRef.current || "viewer").slice(0, 6);
-        return `viewer-${suffix || "guest"}`;
-      })();
-
-      fetch(`${API_BASE}/stream/livekit/start_embed`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brand: companyName,
-          avatar: companionName,
-          memberId: memberIdRef.current || "",
-          displayName: displayNameForToken,
-          embedDomain,
-        }),
-      })
-        .then((res) => (res && res.ok ? res.json() : null))
-        .then((data: any) => {
-          if (!data || cancelled) return;
-
-          const roomName = String(data?.roomName || "").trim();
-          const token = String(data?.token || "").trim();
-          const isActive = Boolean(data?.sessionActive);
-
-          if (token && roomName) {
-            joinedStreamRef.current = true;
-            setLivekitRole("viewer");
-            setLivekitRoomName(roomName);
-            setLivekitToken(token);
-            setSessionActive(true);
-            setSessionKind("stream");
-            setSessionRoom(roomName);
-            setStreamEventRef(roomName);
-            setAvatarStatus("connected");
-            setStreamNotice("");
-            return;
-          }
-
-          if (data?.message) {
-            setStreamNotice(String(data.message));
-          } else {
-            setStreamNotice(isActive ? "Live stream is active. Connecting…" : "Waiting for host to start stream…");
-          }
-
-        })
-        .catch((_e) => {
-          // Ignore transient failures; keep polling.
-        });
-    };
-
-    // Kick once immediately, then interval.
-    poll();
-    const t = window.setInterval(poll, intervalMs);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(t);
-    };
-  }, [avatarStatus, "", API_BASE, companyName, companionName, memberId]);
 
   const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
@@ -3617,13 +3548,17 @@ useEffect(() => {
       kind !== "conference" &&
       Boolean(streamEventRef) &&
       !!String(streamEventRef || "").trim() &&
-      !!eventRef;
+      !!eventRef &&
+      (streamCanStart || Boolean(livekitToken));
 
     const inConferenceUi =
       Boolean(sessionActive) &&
       kind === "conference" &&
       !!eventRef &&
-      (conferenceJoined || Boolean(jitsiApiRef.current));
+      (conferenceJoined ||
+        streamCanStart ||
+        Boolean(livekitToken) ||
+        Boolean(jitsiApiRef.current));
 
     const inLiveChatUi = inStreamUi || inConferenceUi;
 
@@ -4045,7 +3980,7 @@ const joinJitsiConference = useCallback(
             avatar: companionName,
             roomName: requestedRoom,
             memberId: memberId || "",
-            displayName: String(viewerLiveChatName || "Viewer").trim(),
+            displayName: String(ensureViewerLiveChatName() || viewerLiveChatName || "Viewer").trim(),
           }),
         });
 
@@ -7430,7 +7365,10 @@ const modePillControls = (
         )}
       </button>
 
-      {liveProvider === "stream" && ((isHost && sessionActive) || (!isHost && viewerHasJoinedStream)) ? (
+      
+      {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
+      {sttControls}
+{liveProvider === "stream" && ((isHost && sessionActive) || (!isHost && viewerHasJoinedStream)) ? (
         <button
           type="button"
           onClick={() => {
@@ -7454,9 +7392,6 @@ const modePillControls = (
           <StopIcon />
         </button>
       ) : null}
-
-      {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
-      {sttControls}
 
       {liveProvider === "stream" && !isHost ? (
         <button
@@ -7520,7 +7455,7 @@ const modePillControls = (
                   position: "relative",
                 }}
               >
-                {liveProvider === "stream" && livekitToken ? (
+                {livekitToken ? (
                   <LiveKitRoom
                     token={livekitToken}
                     serverUrl={livekitServerUrl || LIVEKIT_URL}
@@ -7553,6 +7488,8 @@ const modePillControls = (
                         }}
                       />
                     )}
+
+                    <StartAudio label="Enable audio" />
 
                     {livekitRole === "host" && livekitPending.length > 0 ? (
                       <div
