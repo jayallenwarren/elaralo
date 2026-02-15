@@ -2332,7 +2332,8 @@ const stopLiveAvatar = useCallback(async () => {
             brand: companyName,
             avatar: companionName,
             memberId: memberIdRef.current || "",
-            eventRef: streamEventRef || undefined,
+            displayName: String(viewerLiveChatName || "").trim(),
+            embedDomain,
           }),
         });
 
