@@ -2465,7 +2465,7 @@ if (liveProvider === "stream") {
     // Viewer: auto-join when the stream is active (subscribe-only token).
     if (token) {
       // Prompt for a viewer username if one doesn't exist locally.
-      ensureViewerLiveChatName(memberIdForLiveChat);
+      ensureViewerLiveChatName();
       setLivekitRole("viewer");
       setLivekitRoomName(roomName);
       setLivekitToken(String(token));
