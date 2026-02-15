@@ -3914,7 +3914,7 @@ const joinJitsiConference = useCallback(
     isHost,
     memberId,
     stopConferenceSession,
-    viewerLiveChatName,
+	  viewerLiveChatName,
   ]
 );
 
@@ -4715,9 +4715,9 @@ const companionForBackend =
 
 
 // NOTE:
-  // - `rebranding` (legacy) is not guaranteed to be present in this build.
-  // - Use RebrandingKey as the single source of truth for brand identity.
-  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -4800,9 +4800,9 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
 
     
 // NOTE:
-  // - `rebranding` (legacy) is not guaranteed to be present in this build.
-  // - Use RebrandingKey as the single source of truth for brand identity.
-  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -7105,7 +7105,6 @@ const modePillControls = (
                   border: "1px solid rgba(255,255,255,0.18)",
                   color: "#ffffff",
                   background: "rgba(255,255,255,0.06)",
-                  color: "#ffffff",
                   cursor: "pointer",
                 }}
                 onClick={() => {
@@ -7882,9 +7881,9 @@ const modePillControls = (
 
                     </div>
 
-                      {sttError ? (
-                        <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-                      ) : null}
+          	          {sttError ? (
+          	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+          	          ) : null}
 
                     {/* LiveKit Broadcast overlay (Host-only) */}
                     {showBroadcastButton && showBroadcasterOverlay ? (
