@@ -4,7 +4,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import elaraLogo from "../public/elaralo-logo.png";
 
 
-import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks } from "@livekit/components-react";
+import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer } from "@livekit/components-react";
+import { Track } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
@@ -1040,6 +1041,56 @@ function normalizeMode(raw: any): Mode | null {
   if (t === "intimate" || t === "explicit" || t === "adult" || t === "18+" || t === "18") return "intimate";
 
   return null;
+}
+
+
+
+/**
+ * Stream viewer stage (subscribe-only): shows the host's LiveKit video full-size.
+ * We avoid the full VideoConference UI for viewers in "stream" sessions to keep the UX simple
+ * and to prevent viewer-side publish controls from appearing.
+ */
+function LiveKitStreamViewerStage() {
+  const allTracks = useTracks([Track.Source.Camera, Track.Source.ScreenShare], {
+    onlySubscribed: false,
+  });
+
+  const remoteTracks = allTracks.filter((t) => !t.participant.isLocal);
+  const hostTracks = remoteTracks.filter((t) =>
+    String((t.participant as any)?.identity || "").startsWith("host:")
+  );
+
+  const tracksToShow = hostTracks.length ? hostTracks : remoteTracks;
+
+  return (
+    <div style={{ width: "100%", height: "100%" }}>
+      <RoomAudioRenderer />
+
+      {tracksToShow.length ? (
+        <GridLayout tracks={tracksToShow} style={{ height: "100%" }}>
+          <ParticipantTile />
+        </GridLayout>
+      ) : (
+        <div
+          style={{
+            width: "100%",
+            height: "100%",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "#fff",
+            background: "rgba(0,0,0,0.6)",
+            borderRadius: 18,
+            padding: 24,
+            textAlign: "center",
+            fontWeight: 600,
+          }}
+        >
+          Waiting for the host video…
+        </div>
+      )}
+    </div>
+  );
 }
 
 
@@ -2411,7 +2462,11 @@ if (liveProvider === "stream") {
     const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
 
     // Ask server to resolve room + determine host vs viewer.
-    const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
+        const displayNameForToken = isHost
+      ? String(companionName || "Host").trim()
+      : String(ensureViewerLiveChatName() || viewerLiveChatName || "").trim();
+
+const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2419,7 +2474,7 @@ if (liveProvider === "stream") {
         avatar: companionName,
         embedDomain,
         memberId: memberIdRef.current || "",
-        displayName: (isHost ? String(companionName || "Host").trim() : (viewerLiveChatName || "").trim()),
+        displayName: displayNameForToken,
       }),
     });
 
@@ -2464,8 +2519,6 @@ if (liveProvider === "stream") {
 
     // Viewer: auto-join when the stream is active (subscribe-only token).
     if (token) {
-      // Prompt for a viewer username if one doesn't exist locally.
-      ensureViewerLiveChatName();
       setLivekitRole("viewer");
       setLivekitRoomName(roomName);
       setLivekitToken(String(token));
@@ -3344,7 +3397,7 @@ const speakAssistantReply = useCallback(
           brand: companyName,
           avatar: companionName,
           memberId: memberIdRef.current || "",
-          displayName: (isHost ? String(companionName || "Host").trim() : (viewerLiveChatName || "").trim()),
+          displayName: displayNameForToken,
           embedDomain,
         }),
       })
@@ -6808,24 +6861,7 @@ useEffect(() => {
 
 const sttControls =
     liveProvider === "stream" && livekitToken
-      ? isHost
-        ? (
-            <button
-              onClick={handleStopClick}
-              title="End live session"
-              style={{
-                border: "1px solid #ccc",
-                borderRadius: 8,
-                padding: "8px 10px",
-                background: "#fff",
-                cursor: "pointer",
-                fontWeight: 700,
-              }}
-            >
-              ■
-            </button>
-          )
-        : null
+      ? null
       : (
 
     <>
@@ -6862,25 +6898,26 @@ const sttControls =
         🎤
       </button>
 
-      <button
-        type="button"
-        onClick={handleStopClick}
-        disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference)}
-        title="Stop"
-        style={{
-          width: 44,
-          minWidth: 44,
-          borderRadius: 10,
-          border: "1px solid #111",
-          background: "#fff",
-          color: "#111",
-          cursor: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? "pointer" : "not-allowed",
-          opacity: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? 1 : 0.45,
-          fontWeight: 700,
-        }}
-      >
-        ■
-      </button>
+      {liveProvider !== "stream" && (
+        <button
+          type="button"
+          onClick={handleStopClick}
+          disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference)}
+          style={{
+            border: "1px solid rgba(255,255,255,0.35)",
+            background: "transparent",
+            color: "#fff",
+            width: 44,
+            height: 44,
+            borderRadius: 12,
+            cursor: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? "pointer" : "not-allowed",
+            opacity: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? 1 : 0.45,
+            fontWeight: 700,
+          }}
+        >
+          ■
+        </button>
+      )}
 </>
   );
 
@@ -7485,12 +7522,16 @@ const modePillControls = (
                     }}
                     style={{ width: "100%", height: "100%" }}
                   >
-                    <VideoConference
-                      chatMessageFormatter={undefined as any}
-                      onError={(e: any) => {
-                        console.warn("LiveKit UI error", e);
-                      }}
-                    />
+                    {sessionKind === "stream" && livekitRole === "viewer" ? (
+                      <LiveKitStreamViewerStage />
+                    ) : (
+                      <VideoConference
+                        chatMessageFormatter={undefined as any}
+                        onError={(e: any) => {
+                          console.warn("LiveKit UI error", e);
+                        }}
+                      />
+                    )}
 
                     {livekitRole === "host" && livekitPending.length > 0 ? (
                       <div
@@ -8052,7 +8093,11 @@ const modePillControls = (
                                 setAvatarStatus("idle");
                               }}
                             >
-                              <VideoConference />
+                              {sessionKind === "stream" && livekitRole === "viewer" ? (
+              <LiveKitStreamViewerStage />
+            ) : (
+              <VideoConference />
+            )}
                             </LiveKitRoom>
                           ) : (
                             <div
