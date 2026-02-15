@@ -5259,8 +5259,53 @@ _LIVEKIT_ACTIVE_EGRESS: Dict[str, Dict[str, str]] = {}  # roomName -> {"record":
 def _livekit_env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip()
 
-def _livekit_url() -> str:
-    return _livekit_env("LIVEKIT_URL", _livekit_env("NEXT_PUBLIC_LIVEKIT_URL", "")).rstrip("/")
+def _livekit_http_url() -> str:
+    """Base URL for LiveKit *server* APIs (Twirp/egress).
+
+    LiveKit server APIs are HTTPS endpoints. Many deployments accidentally set
+    LIVEKIT_URL / NEXT_PUBLIC_LIVEKIT_URL to a websocket URL (wss://...). We
+    accept that and normalize it for server-side calls.
+    """
+
+    raw = _livekit_env("LIVEKIT_URL", _livekit_env("NEXT_PUBLIC_LIVEKIT_URL", ""))
+    url = str(raw).strip().rstrip("/")
+    if not url:
+        return ""
+
+    # Convert websocket scheme -> http(s) for server API calls.
+    if url.startswith("wss://"):
+        url = "https://" + url[len("wss://") :]
+    elif url.startswith("ws://"):
+        url = "http://" + url[len("ws://") :]
+
+    # If scheme omitted, assume https.
+    if "://" not in url:
+        url = "https://" + url
+
+    return url
+
+
+def _livekit_client_ws_url() -> str:
+    """Base URL for LiveKit *client* signaling (Room.connect).
+
+    LiveKit JS expects a websocket URL (ws:// or wss://). If the configured URL
+    is https://..., convert it to wss://... for the browser.
+    """
+
+    raw = _livekit_env("NEXT_PUBLIC_LIVEKIT_URL", _livekit_env("LIVEKIT_URL", ""))
+    url = str(raw).strip().rstrip("/")
+    if not url:
+        return ""
+
+    if url.startswith("https://"):
+        url = "wss://" + url[len("https://") :]
+    elif url.startswith("http://"):
+        url = "ws://" + url[len("http://") :]
+
+    if "://" not in url:
+        url = "wss://" + url
+
+    return url
 
 def _livekit_api_key() -> str:
     return _livekit_env("LIVEKIT_API_KEY")
@@ -5322,7 +5367,7 @@ def _livekit_participant_token(room: str, identity: str, name: str, *, can_publi
 
 def _twirp_post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     import requests  # type: ignore
-    base = _livekit_url()
+    base = _livekit_http_url()
     if not base:
         raise HTTPException(status_code=500, detail="LIVEKIT_URL is not configured")
     url = f"{base}{path}"
@@ -5543,6 +5588,8 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
             "sessionActive": True,
             "sessionKind": "stream",
             "hostMemberId": host_member_id,
+            # LiveKit JS expects ws(s):// for signaling.
+            "serverUrl": _livekit_client_ws_url(),
             "token": token,
             "hlsUrl": hls_url,
         }
@@ -5570,8 +5617,93 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
         "sessionActive": session_active,
         "sessionKind": session_kind,
         "hostMemberId": host_member_id,
+        "serverUrl": _livekit_client_ws_url(),
         "token": viewer_token,
         "hlsUrl": hls_url if session_active else "",
+    }
+
+
+@app.get("/stream/livekit/status")
+def livekit_stream_status(brand: str = "", avatar: str = "") -> Dict[str, Any]:
+    """Lightweight stream status for the Companion page.
+
+    IMPORTANT: This endpoint **does not** mint tokens.
+    """
+
+    resolved_brand = (brand or "").strip()
+    resolved_avatar = (avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    session_kind = (session_kind or "").strip()
+    session_room = (session_room or "").strip()
+
+    is_active = bool(session_room) and (session_kind.lower() == "stream") and bool(_is_session_active(resolved_brand, resolved_avatar))
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar) or {}
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    hls_url = str(mapping.get("livekit_hls_url") or "").strip() or str(mapping.get("hls_url") or "").strip()
+
+    return {
+        "ok": True,
+        "sessionActive": bool(is_active),
+        "sessionKind": "stream" if is_active else session_kind,
+        "roomName": session_room,
+        # Frontend historically uses streamEventRef for its livechat websocket.
+        "streamEventRef": session_room,
+        "hostMemberId": host_member_id,
+        "hlsUrl": hls_url,
+        "serverUrl": _livekit_client_ws_url(),
+    }
+
+
+@app.post("/stream/livekit/join")
+def livekit_stream_join(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """Issue a **viewer** token for an active stream."""
+
+    brand = str(body.get("brand") or body.get("companionName") or "").strip()
+    avatar = str(body.get("avatar") or "").strip()
+    member_id = str(body.get("memberId") or "").strip()
+    username = str(body.get("username") or body.get("displayName") or "").strip()
+
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    session_kind, session_room = _read_session_kind_room(brand, avatar)
+    session_kind = (session_kind or "").strip()
+    session_room = (session_room or "").strip()
+
+    if not (session_kind.lower() == "stream" and session_room and bool(_is_session_active(brand, avatar))):
+        return {
+            "ok": True,
+            "sessionActive": False,
+            "sessionKind": session_kind,
+            "roomName": session_room,
+            "role": "viewer",
+            "serverUrl": _livekit_client_ws_url(),
+        }
+
+    display_name = username or f"Viewer-{uuid.uuid4().hex[:4]}"
+    identity = member_id or f"viewer_{uuid.uuid4().hex[:12]}"
+
+    token = _livekit_participant_token(
+        session_room,
+        identity=identity,
+        name=display_name,
+        can_publish=False,
+        can_subscribe=True,
+        room_admin=False,
+    )
+
+    return {
+        "ok": True,
+        "sessionActive": True,
+        "sessionKind": "stream",
+        "role": "viewer",
+        "roomName": session_room,
+        "token": token,
+        "serverUrl": _livekit_client_ws_url(),
     }
 
 
@@ -5653,7 +5785,15 @@ async def livekit_stream_start_broadcast(req: LiveKitStartBroadcastRequest):
         can_subscribe=True,
         room_admin=True,
     )
-    return {"ok": True, "isHost": True, "roomName": room, "token": token, "hlsUrl": hls_url, "sessionActive": True}
+    return {
+        "ok": True,
+        "isHost": True,
+        "roomName": room,
+        "token": token,
+        "hlsUrl": hls_url,
+        "sessionActive": True,
+        "serverUrl": _livekit_client_ws_url(),
+    }
 
 
 class LiveKitStopRequest(BaseModel):
@@ -5731,6 +5871,13 @@ async def livekit_conference_start(req: LiveKitConferenceStartRequest):
     if not host_member_id or caller_member_id != host_member_id:
         raise HTTPException(status_code=403, detail="Only the host can start the conference.")
 
+    # Determine whether a conference is already active (used to decide whether
+    # we should clear prior live-chat transcript).
+    prev_kind, prev_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    prev_kind = (prev_kind or "").strip()
+    prev_room = (prev_room or "").strip()
+    prev_active = bool(prev_room) and bool(_is_session_active(resolved_brand, resolved_avatar))
+
     room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
     if not _read_event_ref_from_db(resolved_brand, resolved_avatar):
         _set_session_active(resolved_brand, resolved_avatar, bool(_is_session_active(resolved_brand, resolved_avatar)), event_ref=room)
@@ -5755,7 +5902,14 @@ async def livekit_conference_start(req: LiveKitConferenceStartRequest):
         room_admin=True,
     )
 
-    return {"ok": True, "sessionActive": True, "sessionKind": "conference", "sessionRoom": room, "token": token}
+    return {
+        "ok": True,
+        "sessionActive": True,
+        "sessionKind": "conference",
+        "sessionRoom": room,
+        "token": token,
+        "serverUrl": _livekit_client_ws_url(),
+    }
 
 @app.post("/conference/livekit/stop")
 async def livekit_conference_stop(req: LiveKitConferenceStopRequest):
@@ -5907,5 +6061,10 @@ async def livekit_join_request_status(requestId: str):
     with _LIVEKIT_JOIN_LOCK:
         r = _LIVEKIT_JOIN_REQUESTS.get(rid)
     if not r:
-        return {"ok": True, "status": "MISSING"}
-    return {"ok": True, "status": r.get("status"), "token": r.get("token") or ""}
+        return {"ok": True, "status": "MISSING", "serverUrl": _livekit_client_ws_url()}
+    return {
+        "ok": True,
+        "status": r.get("status"),
+        "token": r.get("token") or "",
+        "serverUrl": _livekit_client_ws_url(),
+    }

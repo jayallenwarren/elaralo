@@ -1745,7 +1745,7 @@ useEffect(() => {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, companyName, companionName]);
+  }, [API_BASE, companyName, companionName, normalizeLivekitWsUrl]);
 
   // Auto-join active LiveKit stream as a viewer (subscribe-only)
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
@@ -1874,7 +1874,22 @@ const didIphoneBoostActiveRef = useRef<boolean>(false);
 const [avatarError, setAvatarError] = useState<string | null>(null);
   // Live stream embed URL (deprecated; LiveKit uses room tokens)
   // LiveKit (replaces LegacyStream + Jitsi)
-  const LIVEKIT_URL = useMemo(() => String((process.env.NEXT_PUBLIC_LIVEKIT_URL || "")).trim(), []);
+  const normalizeLivekitWsUrl = (raw: string): string => {
+    const u0 = String(raw || "").trim().replace(/\/+$/, "");
+    if (!u0) return "";
+    if (u0.startsWith("wss://") || u0.startsWith("ws://")) return u0;
+    if (u0.startsWith("https://")) return "wss://" + u0.slice("https://".length);
+    if (u0.startsWith("http://")) return "ws://" + u0.slice("http://".length);
+    // If scheme omitted, assume secure signaling.
+    return "wss://" + u0;
+  };
+
+  // Prefer runtime-provided serverUrl from the API, but keep an env fallback.
+  const LIVEKIT_URL = useMemo(
+    () => normalizeLivekitWsUrl(String(process.env.NEXT_PUBLIC_LIVEKIT_URL || "").trim()),
+    [],
+  );
+  const [livekitServerUrl, setLivekitServerUrl] = useState<string>(() => LIVEKIT_URL);
   const [livekitToken, setLivekitToken] = useState<string>("");
   const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
   const [livekitRoomName, setLivekitRoomName] = useState<string>("");
@@ -1891,25 +1906,9 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
 
 
-  // Auto-join LiveKit stream for viewers (subscribe-only) when the host is live.
-  useEffect(() => {
-    if (!(sessionActive && sessionKind === "stream")) {
-      autoJoinStreamRef.current = false;
-      return;
-    }
-
-    if (!livekitRoleKnown) return;
-    if (livekitRole !== "viewer") return;
-
-    if (isHost) return;
-    if (livekitToken) return;
-    if (avatarStatus === "connected" || avatarStatus === "connecting") return;
-    if (autoJoinStreamRef.current) return;
-
-    // Auto-join stream viewers (subscribe-only) when the host is live.
-    autoJoinStreamRef.current = true;
-    void startLiveAvatar();
-  }, [sessionActive, sessionKind, isHost, livekitRole, livekitRoleKnown, livekitToken, avatarStatus]);
+  // NOTE: Viewers must explicitly press Play to join a stream.
+  // We intentionally do NOT auto-join here because browsers will block prompts
+  // (username, audio/video permissions) when not initiated by a user gesture.
 
   // Host: poll join requests while a LiveKit session is active.
   useEffect(() => {
@@ -1958,6 +1957,11 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
           const token = String((data as any)?.token || "").trim();
           if (!token) return;
 
+	        const serverUrl = normalizeLivekitWsUrl(
+	          String((data as any)?.serverUrl || (data as any)?.server_url || "").trim(),
+	        );
+	        if (serverUrl) setLivekitServerUrl(serverUrl);
+
           setLivekitToken(token);
           setConferenceJoined(true);
           setAvatarStatus("connected");
@@ -1980,7 +1984,7 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [API_BASE, LIVEKIT_URL, isHost, livekitJoinRequestId]);
+  }, [API_BASE, LIVEKIT_URL, isHost, livekitJoinRequestId, normalizeLivekitWsUrl]);
 
 
 
@@ -2393,87 +2397,120 @@ const startLiveAvatar = useCallback(async () => {
   setAvatarError(null);
   ensureIphoneAudioContextUnlocked();
 
-if (liveProvider === "stream") {
-  // LiveKit (Human companion) — conference + broadcast, with Pattern A lobby.
-  setAvatarError(null);
-  setAvatarStatus("connecting");
+	if (liveProvider === "stream") {
+	  // LiveKit (Human companion) — Stream mode.
+	  setAvatarError(null);
+	  setAvatarStatus("connecting");
 
-  // Clear any prior in-stream chat transcript (your chat/auth are handled internally).
-  setMessages((prev) => prev.filter((m) => !m.meta?.liveChat));
-  liveChatSeenIdsRef.current = new Set();
-  liveChatSeenOrderRef.current = [];
+	  // Host: clear any prior in-stream chat transcript when starting a new session.
+	  // (Viewer joins should not wipe the transcript.)
+	  if (isHost && !sessionActive) {
+	    setMessages((prev) => prev.filter((m) => !m.meta?.liveChat));
+	    liveChatSeenIdsRef.current = new Set();
+	    liveChatSeenOrderRef.current = [];
+	  }
 
-  try {
-    const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
+	  try {
+	    const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
 
-    // Ask server to resolve room + determine host vs viewer.
-    const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        brand: companyName,
-        avatar: companionName,
-        embedDomain,
-        memberId: memberIdRef.current || "",
-        displayName: (isHost ? String(companionName || "Host").trim() : (viewerLiveChatName || "").trim()),
-      }),
-    });
+	    if (isHost) {
+	      // Host starts the stream session (and receives a publish token).
+	      const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
+	        method: "POST",
+	        headers: { "Content-Type": "application/json" },
+	        body: JSON.stringify({
+	          brand: companyName,
+	          avatar: companionName,
+	          embedDomain,
+	          memberId: memberIdRef.current || "",
+	          displayName: String(companionName || "Host").trim(),
+	        }),
+	      });
 
-    const data: any = await res.json().catch(() => ({}));
-    if (!res.ok || !data?.ok) {
-      throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
-    }
+	      const data: any = await res.json().catch(() => ({}));
+	      if (!res.ok || !data?.ok) {
+	        throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
+	      }
 
-    const canStart = !!data?.canStart;
-    const roomName = String(data?.roomName || data?.sessionRoom || "").trim();
-    const token = String(data?.token || "").trim();
-    const role = String(data?.role || (canStart ? "host" : "viewer")).trim().toLowerCase();
-    const hlsUrl = String(data?.hlsUrl || "").trim();
+	      const roomName = String(data?.roomName || data?.sessionRoom || "").trim();
+	      const token = String(data?.token || "").trim();
+	      const hlsUrl = String(data?.hlsUrl || "").trim();
+	      const serverUrl = normalizeLivekitWsUrl(String(data?.serverUrl || data?.server_url || LIVEKIT_URL || "").trim());
+	      if (serverUrl) setLivekitServerUrl(serverUrl);
 
-    setLivekitRoomName(roomName);
-    setLivekitHlsUrl(hlsUrl);
-    setLivekitRole(role === "host" ? "host" : role === "attendee" ? "attendee" : "viewer");
+	      if (!token) {
+	        throw new Error("Missing LiveKit token from /stream/livekit/start_embed");
+	      }
 
-    if (canStart) {
-      // Host: connect immediately.
-      setLivekitToken(token);
-      setSessionActive(true);
-      setSessionKind("stream");
-      setSessionRoom(roomName);
-      setStreamEventRef(roomName);
-      setStreamNotice("");
-      setAvatarStatus("connected");
-      joinedStreamRef.current = true;
-      return;
-    }
+	      setLivekitRoomName(roomName);
+	      setLivekitHlsUrl(hlsUrl);
+	      setLivekitRole("host");
+	      setLivekitToken(token);
+	      setSessionActive(true);
+	      setSessionKind("stream");
+	      setSessionRoom(roomName);
+	      setStreamEventRef(roomName);
+	      setStreamCanStart(true);
+	      setStreamNotice("");
+	      setAvatarStatus("connected");
+	      joinedStreamRef.current = true;
+	      return;
+	    }
 
-    // Viewer: auto-join when the stream is active (subscribe-only token).
-    if (token) {
-      setLivekitRole("viewer");
-      setLivekitRoomName(roomName);
-      setLivekitToken(String(token));
-      setSessionActive(true);
-      setSessionKind("stream");
-      setSessionRoom(roomName);
-      setStreamEventRef(roomName);
-      setStreamNotice("");
-      setAvatarStatus("connected");
-      joinedStreamRef.current = true;
-      return;
-    }
+	    // Viewer: must explicitly press Play to join (subscribe-only token).
+	    const displayName = await ensureViewerUsername();
+	    const joinRes = await fetch(`${API_BASE}/stream/livekit/join`, {
+	      method: "POST",
+	      headers: { "Content-Type": "application/json" },
+	      body: JSON.stringify({
+	        brand: companyName,
+	        avatar: companionName,
+	        memberId: memberIdRef.current || "",
+	        username: String(displayName || "").trim(),
+	        embedDomain,
+	      }),
+	    });
 
-    setStreamNotice(
-      sessionActive ? "Live stream is active. Connecting…" : "Waiting for host to start stream…"
-    );
-    setAvatarStatus("waiting");
-    return;
-  } catch (err: any) {
-    console.error("LiveKit start failed:", err);
-    setAvatarStatus("error");
-    setAvatarError(`Live session failed to start. ${err?.message ? String(err.message) : String(err)}`);
-    return;
-  }
-}
+	    const joinData: any = await joinRes.json().catch(() => ({}));
+	    if (!joinRes.ok || !joinData?.ok) {
+	      throw new Error(String(joinData?.detail || joinData?.error || `HTTP ${joinRes.status}`));
+	    }
+
+	    const isActive = !!joinData?.sessionActive;
+	    const roomName = String(joinData?.roomName || joinData?.room || "").trim();
+	    const token = String(joinData?.token || "").trim();
+	    const serverUrl = normalizeLivekitWsUrl(
+	      String(joinData?.serverUrl || joinData?.server_url || LIVEKIT_URL || "").trim(),
+	    );
+	    if (serverUrl) setLivekitServerUrl(serverUrl);
+
+	    setLivekitRole("viewer");
+	    setLivekitRoomName(roomName);
+
+	    if (isActive && token) {
+	      setLivekitToken(token);
+	      setSessionActive(true);
+	      setSessionKind("stream");
+	      setSessionRoom(roomName);
+	      setStreamEventRef(roomName);
+	      setStreamCanStart(false);
+	      setStreamNotice("");
+	      setAvatarStatus("connected");
+	      joinedStreamRef.current = true;
+	      return;
+	    }
+
+	    setStreamCanStart(false);
+	    setStreamNotice("Waiting for host to start stream…");
+	    setAvatarStatus("waiting");
+	    return;
+	  } catch (err: any) {
+	    console.error("LiveKit stream start/join failed:", err);
+	    setAvatarStatus("error");
+	    setAvatarError(`Live session failed. ${err?.message ? String(err.message) : String(err)}`);
+	    return;
+	  }
+	}
 
 if (!phase1AvatarMedia) {
   setAvatarStatus("error");
@@ -2629,7 +2666,24 @@ if (!phase1AvatarMedia) {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
+}, [
+  phase1AvatarMedia,
+  avatarStatus,
+  liveProvider,
+  streamUrl,
+  companyName,
+  companionName,
+  isHost,
+  sessionActive,
+  API_BASE,
+  LIVEKIT_URL,
+  viewerLiveChatName,
+  ensureViewerUsername,
+  normalizeLivekitWsUrl,
+  reconnectLiveAvatar,
+  ensureIphoneAudioContextUnlocked,
+  applyIphoneLiveAvatarAudioBoost,
+]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -3523,10 +3577,12 @@ useEffect(() => {
     // until they explicitly press Stop (host) or opt-out (viewer, private session only).
     const inStreamUi =
       Boolean(sessionActive) &&
-      kind !== "conference" &&
+      kind === "stream" &&
       Boolean(streamEventRef) &&
       !!String(streamEventRef || "").trim() &&
-      !!eventRef;
+      !!eventRef &&
+      // Host always joins when starting; viewers must explicitly press Play.
+      (isHost || viewerHasJoinedStream);
 
     const inConferenceUi =
       Boolean(sessionActive) &&
@@ -4018,11 +4074,13 @@ const joinJitsiConference = useCallback(
           sanitizeRoomToken(`${companyName}-${companionName}`)
       ).trim();
       const token = String((data as any)?.token || "").trim();
-      const serverUrl = String(
-        (data as any)?.serverUrl || (data as any)?.server_url || LIVEKIT_URL || ""
-      ).trim();
+	      const serverUrlRaw = String(
+	        (data as any)?.serverUrl || (data as any)?.server_url || LIVEKIT_URL || ""
+	      ).trim();
+	      const serverUrl = normalizeLivekitWsUrl(serverUrlRaw);
+	      if (serverUrl) setLivekitServerUrl(serverUrl);
 
-      if (!room || !token || !serverUrl) {
+	      if (!room || !token || !serverUrl) {
         setAvatarError("Private session did not return room/token/serverUrl.");
         setAvatarStatus("idle");
         return;
@@ -4044,7 +4102,7 @@ const joinJitsiConference = useCallback(
       setAvatarError(err?.message || "Network error starting private session.");
       setAvatarStatus("idle");
     }
-  }, [API_BASE, companyName, companionName, isHost, memberId, sanitizeRoomToken, viewerLiveChatName]);
+	  }, [API_BASE, companyName, companionName, isHost, memberId, sanitizeRoomToken, viewerLiveChatName, normalizeLivekitWsUrl]);
 
 // Keep refs to the latest state for async flush logic (avoids stale closures).
 const messagesRef = useRef<Msg[]>([]);
@@ -4154,6 +4212,11 @@ useEffect(() => {
           // Keep last known-good; do not flicker sessionActive on transient poll failures.
           return;
         }
+
+	      const nextServerUrl = normalizeLivekitWsUrl(
+	        String((data as any).serverUrl || (data as any).server_url || "").trim(),
+	      );
+	      if (nextServerUrl) setLivekitServerUrl(nextServerUrl);
 
         const nextHostId = String(data.hostMemberId || "").trim();
         if (nextHostId) {
@@ -6543,31 +6606,12 @@ const speakGreetingIfNeeded = useCallback(
       return;
     }
 
-
-    // Viewer-only (Live Stream): enable Stop to close the embedded player even when mic/STT isn't running.
-    // IMPORTANT: This must be synchronous on the user gesture on iOS to avoid breaking future TTS routing.
-    // This does NOT affect the underlying stream session because ONLY the host calls stop_embed.
-    if (liveProvider === "stream" && !streamCanStart && (joinedStreamRef.current || avatarStatus !== "idle")) {
-      // Viewer stop:
-      // - Always allow leaving the waiting/connected UI, even if the host has not created an eventRef yet.
-      // - This MUST NOT stop the underlying live session (only the host can do that).
-      try {
-setStreamEventRef("");
-        setStreamCanStart(false);
-        setStreamNotice("");
-
-        // Viewer explicitly left the in-stream experience.
-        joinedStreamRef.current = false;
-      } catch (e) {}
-      try {
-        setAvatarStatus("idle");
-        setAvatarError(null);
-      } catch (e) {}
-    }
-
-    // Host (Live Stream): ensure Stop always ends the session even if mic/STT isn't running.
-    // (This is idempotent; stopLiveAvatar has its own in-flight guard.)
-    if (liveProvider === "stream" && streamCanStart && (streamEventRef)) {
+    // Live Stream: Stop leaves the stream for viewers, and ends it for hosts.
+    // stopLiveAvatar is role-aware (only the host calls the stop endpoint).
+    if (
+      liveProvider === "stream" &&
+      (Boolean(streamEventRef) || Boolean(livekitToken) || joinedStreamRef.current || avatarStatus !== "idle")
+    ) {
       try {
         void stopLiveAvatar();
       } catch (e) {}
@@ -6579,7 +6623,20 @@ setStreamEventRef("");
     try { void nudgeAudioSession(); } catch (e) {}
     try { primeLocalTtsAudio(true); } catch (e) {}
     try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, "", streamEventRef, stopLiveAvatar]);
+  }, [
+    stopHandsFreeSTT,
+    sessionKind,
+    stopConferenceSession,
+    liveProvider,
+    streamEventRef,
+    livekitToken,
+    avatarStatus,
+    stopLiveAvatar,
+    boostAllTtsVolumes,
+    nudgeAudioSession,
+    primeLocalTtsAudio,
+    ensureIphoneAudioContextUnlocked,
+  ]);
 
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
@@ -6775,27 +6832,25 @@ useEffect(() => {
   void stopSpeechToText();
 }, [viewerInStreamUi, stopSpeechToText]);
 
-const sttControls =
-    liveProvider === "stream" && livekitToken
-      ? isHost
-        ? (
-            <button
-              onClick={handleStopClick}
-              title="End live session"
-              style={{
-                border: "1px solid #ccc",
-                borderRadius: 8,
-                padding: "8px 10px",
-                background: "#fff",
-                cursor: "pointer",
-                fontWeight: 700,
-              }}
-            >
-              ■
-            </button>
-          )
-        : null
-      : (
+	const sttControls =
+	    liveProvider === "stream" && livekitToken
+	      ? (
+	          <button
+	            onClick={handleStopClick}
+	            title={isHost ? "End live session" : "Leave live session"}
+	            style={{
+	              border: "1px solid #ccc",
+	              borderRadius: 8,
+	              padding: "8px 10px",
+	              background: "#fff",
+	              cursor: "pointer",
+	              fontWeight: 700,
+	            }}
+	          >
+	            ■
+	          </button>
+	        )
+	      : (
 
     <>
       <button
@@ -7094,7 +7149,7 @@ const modePillControls = (
           >
             <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Start a session</div>
             <div style={{ opacity: 0.85, fontSize: 13, marginBottom: 14 }}>
-              Choose <b>Stream</b> or <b>Private</b>. You can&apos;t run both at the same time.
+			  Choose <b style={{ color: "#fff" }}>Stream</b> or <b style={{ color: "#fff" }}>Private</b>. You can&apos;t run both at the same time.
             </div>
 
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -7387,8 +7442,15 @@ const modePillControls = (
             alignItems: "flex-start",
           }}
         >
-          {showAvatarFrame ? (
-            <div style={{ flex: "0 0 360px", minWidth: 280, maxWidth: "100%" }}>
+		  {showAvatarFrame ? (
+			<div
+				style={{
+					// For stream viewers, prioritize the video area over the message box.
+					flex: liveProvider === "stream" && !isHost ? "2 1 0" : "0 0 360px",
+					minWidth: 280,
+					maxWidth: "100%",
+				}}
+			>
               <div
                 style={{
                   width: "100%",
@@ -7403,7 +7465,7 @@ const modePillControls = (
                 {liveProvider === "stream" && livekitToken ? (
                   <LiveKitRoom
                     token={livekitToken}
-                    serverUrl={LIVEKIT_URL}
+					serverUrl={livekitServerUrl || LIVEKIT_URL}
                     connect={true}
                     audio={livekitRole !== "viewer"}
                     video={livekitRole !== "viewer"}
@@ -7622,7 +7684,7 @@ const modePillControls = (
 
           <div
                     style={{
-                      flex: showAvatarFrame ? ((liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
+						flex: showAvatarFrame ? (liveProvider === "stream" && !isHost ? "1 1 0" : "2 1 0") : "1 1 0",
                       minWidth: 280,
                       height: conversationHeight,
                       display: "flex",
@@ -7975,7 +8037,7 @@ const modePillControls = (
                           ) : livekitToken && livekitRoomName ? (
                             <LiveKitRoom
                               token={livekitToken}
-                              serverUrl={LIVEKIT_URL}
+							serverUrl={livekitServerUrl || LIVEKIT_URL}
                               connect={true}
                               audio={true}
                               video={true}
@@ -8340,19 +8402,38 @@ const modePillControls = (
         >
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
             <div style={{ fontWeight: 700, fontSize: 13 }}>Debug Logs ({debugLogs.length})</div>
-            <button
-              onClick={() => {
-                try {
-                  const text = debugLogs.join("\n");
-                  if (navigator.clipboard?.writeText) {
-                    navigator.clipboard.writeText(text);
-                  } else {
-                    // Fallback for older browsers
-                    // eslint-disable-next-line no-alert
-                    alert(text);
-                  }
-                } catch (e) {}
-              }}
+	            <button
+	              onClick={async () => {
+	                const text = debugLogs.join("\n");
+	                try {
+	                  if (navigator.clipboard?.writeText) {
+	                    await navigator.clipboard.writeText(text);
+	                    return;
+	                  }
+	                  throw new Error("Clipboard API not available");
+	                } catch (err) {
+	                  // Fallback when Clipboard API is blocked by permissions policy.
+	                  try {
+	                    const ta = document.createElement("textarea");
+	                    ta.value = text;
+	                    ta.setAttribute("readonly", "true");
+	                    ta.style.position = "fixed";
+	                    ta.style.left = "-9999px";
+	                    ta.style.top = "0";
+	                    document.body.appendChild(ta);
+	                    ta.focus();
+	                    ta.select();
+	                    const ok = document.execCommand("copy");
+	                    document.body.removeChild(ta);
+	                    if (ok) return;
+	                    throw new Error("execCommand(copy) failed");
+	                  } catch (e) {
+	                    // Last resort: show logs so they can be manually copied.
+	                    // eslint-disable-next-line no-alert
+	                    alert(text);
+	                  }
+	                }
+	              }}
               style={{
                 marginLeft: "auto",
                 padding: "6px 10px",
