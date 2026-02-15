@@ -2542,7 +2542,6 @@ const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
         "No live stream is active right now.\n\nWould you like to request a private session instead?"
       );
       if (wantsPrivate) {
-        setLiveProvider("conference");
         await startConferenceSession();
       }
       return;
