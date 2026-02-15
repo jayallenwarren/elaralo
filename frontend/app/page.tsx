@@ -1975,6 +1975,29 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
     }
   }, [memberId, mappedHostMemberId]);
 
+  // Priority #2 (default companion view): if there is no active live session, clear any stale
+  // LiveKit + live-session UI artifacts so a fresh page load (F5) reliably lands on the default UI.
+  useEffect(() => {
+    if (sessionActive) return;
+    if (avatarStatus !== "idle") return;
+
+    // Stream artifacts
+    joinedStreamRef.current = false;
+    setStreamEventRef("");
+    setLivekitToken("");
+    setLivekitRoomName("");
+    setLivekitHlsUrl("");
+    setLivekitJoinRequestId("");
+
+    // Conference artifacts (legacy)
+    setConferenceJoined(false);
+
+    // Host broadcast overlay artifacts
+    setShowBroadcasterOverlay(false);
+    setBroadcastPreparing(false);
+    setBroadcastError("");
+  }, [sessionActive, avatarStatus]);
+
   const [streamNotice, setStreamNotice] = useState<string>("");
 
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
@@ -6669,7 +6692,7 @@ const sttControls =
           minWidth: 44,
           borderRadius: 10,
           border: "1px solid #111",
-          background: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "#f3f3f3" : (sttEnabled ? "#b00020" : "#fff"),
+          background: sttEnabled ? "#b00020" : "#fff",
           color: sttEnabled ? "#fff" : "#111",
           cursor: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
           opacity: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
