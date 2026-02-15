@@ -1903,11 +1903,12 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 
     if (isHost) return;
     if (livekitToken) return;
-    if (avatarStatus === "waiting" || avatarStatus === "connected") return;
+    if (avatarStatus === "connected" || avatarStatus === "connecting") return;
     if (autoJoinStreamRef.current) return;
 
-    // Viewers must click Play to join; do not auto-join.
+    // Auto-join stream viewers (subscribe-only) when the host is live.
     autoJoinStreamRef.current = true;
+    void startLiveAvatar();
   }, [sessionActive, sessionKind, isHost, livekitRole, livekitRoleKnown, livekitToken, avatarStatus]);
 
   // Host: poll join requests while a LiveKit session is active.
@@ -1933,6 +1934,56 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
       window.clearInterval(id);
     };
   }, [API_BASE, companyName, companionName, isHost, sessionActive]);
+
+  // Viewer: poll join-request status until admitted/denied.
+  useEffect(() => {
+    if (isHost) return;
+    if (!livekitJoinRequestId) return;
+
+    let cancelled = false;
+
+    const poll = async () => {
+      if (cancelled) return;
+
+      try {
+        const resp = await fetch(
+          `${API_BASE}/livekit/join_request_status?requestId=${encodeURIComponent(livekitJoinRequestId)}`
+        );
+        const data = await resp.json().catch(() => ({} as any));
+
+        if (!resp.ok || !data?.ok) return;
+
+        const status = String((data as any)?.status || "").toLowerCase();
+        if (status === "admitted") {
+          const token = String((data as any)?.token || "").trim();
+          if (!token) return;
+
+          setLivekitToken(token);
+          setLivekitServerUrl(String(LIVEKIT_URL || "").trim());
+          setConferenceJoined(true);
+          setAvatarStatus("connected");
+          setStreamNotice(null);
+          setLivekitJoinRequestId("");
+        } else if (status === "denied" || status === "expired") {
+          setStreamNotice(status === "denied" ? "Join request denied." : "Join request expired.");
+          setLivekitJoinRequestId("");
+          setAvatarStatus("waiting");
+        }
+      } catch (_err) {
+        // Ignore transient errors; we will retry.
+      }
+    };
+
+    const timer = window.setInterval(poll, 1000);
+    void poll();
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [API_BASE, LIVEKIT_URL, isHost, livekitJoinRequestId]);
+
+
 
   const admitLivekit = useCallback(async (requestId: string) => {
     const rid = String(requestId || "").trim();
@@ -2365,7 +2416,7 @@ if (liveProvider === "stream") {
         avatar: companionName,
         embedDomain,
         memberId: memberIdRef.current || "",
-        displayName: (viewerLiveChatName || "").trim(),
+        displayName: (isHost ? String(companionName || "Host").trim() : (viewerLiveChatName || "").trim()),
       }),
     });
 
@@ -3277,7 +3328,7 @@ const speakAssistantReply = useCallback(
           brand: companyName,
           avatar: companionName,
           memberId: memberIdRef.current || "",
-          displayName: (viewerLiveChatName || "").trim(),
+          displayName: (isHost ? String(companionName || "Host").trim() : (viewerLiveChatName || "").trim()),
           embedDomain,
         }),
       })
@@ -3461,7 +3512,7 @@ useEffect(() => {
         const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
         const room = String(sessionRoom || fallbackRoom).trim();
         const cleanRoom = sanitizeRoomToken(room, 96);
-        return cleanRoom ? `conf-${cleanRoom}` : "";
+        return cleanRoom || "";
       }
       return String(streamEventRef || "").trim();
     };
@@ -3524,7 +3575,7 @@ useEffect(() => {
 
     const wsUrl = `${API_BASE.replace(/^http/, "ws")}/stream/livekit/livechat/${encodeURIComponent(
       eventRef
-    )}?senderId=${encodeURIComponent(memberIdForWs || "")}&senderRole=${encodeURIComponent(role)}&name=${encodeURIComponent(
+    )}?memberId=${encodeURIComponent(memberIdForWs || "")}&role=${encodeURIComponent(role)}&name=${encodeURIComponent(
       name
     )}`;
 
@@ -3592,7 +3643,7 @@ useEffect(() => {
         const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
         const room = String(sessionRoom || fallbackRoom).trim();
         const cleanRoom = sanitizeRoomToken(room, 96);
-        eventRef = cleanRoom ? `conf-${cleanRoom}` : "";
+        eventRef = cleanRoom || "";
       } else {
         eventRef = String(streamEventRef || "").trim();
       }
@@ -3868,65 +3919,135 @@ const joinJitsiConference = useCallback(
   ]
 );
 
-const startConferenceSession = useCallback(async () => {
-  setAvatarError(null);
+  const startConferenceSession = useCallback(async () => {
+    setAvatarError(null);
 
-  // Viewers never start a session. They just wait until the host starts.
-  if (!isHost) {
-    setStreamNotice("Waiting for host to start the private session…");
-    setAvatarStatus("waiting");
-    return;
-  }
+    // Viewers request to join a private session. The host must admit them.
+    if (!isHost) {
+      setStreamNotice(null);
+      setAvatarStatus("waiting");
 
-  conferenceOptOutRef.current = false;
+      // Reset any prior join attempt / token.
+      setConferenceJoined(false);
+      setLivekitJoinRequestId("");
+      setLivekitToken("");
+      setLivekitRole("viewer");
+      setLivekitServerUrl(String(LIVEKIT_URL || "").trim());
 
-  setStreamNotice(null);
-  setAvatarStatus("connecting");
+      // Mark intent so the "waiting to be admitted" overlay can render.
+      setSessionKind("conference");
 
-  try {
-    const resp = await fetch(`${API_BASE}/conference/livekit/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-	      body: JSON.stringify({
-	        brand: companyName,
-	        avatar: companionName,
-	        memberId: memberId || "",
-	        displayName: String(viewerLiveChatName || "").trim(),
-	      }),
-    });
+      const requestedRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
+      if (requestedRoom) {
+        setSessionRoom(requestedRoom);
+        setLivekitRoomName(requestedRoom);
+      }
 
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok || !data?.ok) {
-      const detail = String(data?.detail || data?.error || "Private session start failed.");
-      throw new Error(detail);
+      // Clear any prior live-chat transcript for a clean join.
+      setMessages((prev) => prev.filter((m) => !m?.meta?.liveChat));
+      liveChatSeenIdsRef.current = new Set();
+
+      try {
+        const resp = await fetch(`${API_BASE}/livekit/join_request`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            brand: companyName,
+            avatar: companionName,
+            roomName: requestedRoom,
+            memberId: memberId || "",
+            displayName: String(viewerLiveChatName || "Viewer").trim(),
+          }),
+        });
+
+        const data = await resp.json().catch(() => ({} as any));
+
+        if (!resp.ok || !data?.ok || !(data as any)?.requestId) {
+          const msg =
+            (data as any)?.detail ||
+            (data as any)?.error ||
+            `Unable to request private session (HTTP ${resp.status})`;
+          setStreamNotice(String(msg));
+          setAvatarStatus("waiting");
+          return;
+        }
+
+        setLivekitJoinRequestId(String((data as any).requestId));
+        setStreamNotice("Join request sent. Waiting for host approval…");
+        return;
+      } catch (err: any) {
+        setStreamNotice(err?.message || "Unable to request private session.");
+        setAvatarStatus("waiting");
+        return;
+      }
     }
 
-    const room = String(data?.sessionRoom || data?.room || "").trim() || sanitizeRoomToken(`${companyName}-${companionName}`);
+    // Host starts (or resumes) the private session.
+    conferenceOptOutRef.current = false;
+    setStreamNotice(null);
+    setAvatarStatus("connecting");
+    setConferenceJoined(false);
+    setLivekitJoinRequestId("");
 
-    // Optimistic local state (status poll will confirm)
-    setSessionActive(true);
-    setSessionKind("conference");
-    setSessionRoom(room);
+    try {
+      const resp = await fetch(`${API_BASE}/conference/livekit/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          brand: companyName,
+          avatar: companionName,
+          memberId: memberId || "",
+          displayName: String(companionName || "Host").trim(),
+        }),
+      });
 
-    setLivekitRoomName(room);
-    setLivekitRole("host");
-    setLivekitToken(String(data?.token || ""));
-} catch (err: any) {
-    setAvatarStatus("idle");
-    setAvatarError(err?.message || "Private session start failed.");
-  }
-}, [
-  API_BASE,
-  companyName,
-  companionName,
-  isHost,
-  joinJitsiConference,
-  memberId,
-  sanitizeRoomToken,
-	  viewerLiveChatName,
-]);
+      const data = await resp.json().catch(() => ({} as any));
 
+      if (!resp.ok || !data?.ok) {
+        const msg =
+          (data as any)?.detail ||
+          (data as any)?.error ||
+          `Failed to start private session (HTTP ${resp.status})`;
+        setAvatarError(String(msg));
+        setAvatarStatus("idle");
+        return;
+      }
 
+      const room = String(
+        (data as any)?.sessionRoom ||
+          (data as any)?.room ||
+          (data as any)?.roomName ||
+          sanitizeRoomToken(`${companyName}-${companionName}`)
+      ).trim();
+      const token = String((data as any)?.token || "").trim();
+      const serverUrl = String(
+        (data as any)?.serverUrl || (data as any)?.server_url || LIVEKIT_URL || ""
+      ).trim();
+
+      if (!room || !token || !serverUrl) {
+        setAvatarError("Private session did not return room/token/serverUrl.");
+        setAvatarStatus("idle");
+        return;
+      }
+
+      // Clear prior live-chat transcript for a clean session start.
+      setMessages((prev) => prev.filter((m) => !m?.meta?.liveChat));
+      liveChatSeenIdsRef.current = new Set();
+
+      setSessionKind("conference");
+      setSessionActive(true);
+      setSessionRoom(room);
+      setLivekitRoomName(room);
+      setLivekitRole("host");
+      setLivekitToken(token);
+      setLivekitServerUrl(serverUrl);
+      setConferenceJoined(true);
+      setAvatarStatus("connected");
+    } catch (err: any) {
+      setAvatarError(err?.message || "Network error starting private session.");
+      setAvatarStatus("idle");
+    }
+  }, [API_BASE, companyName, companionName, isHost, memberId, sanitizeRoomToken, viewerLiveChatName]);
 
 // Keep refs to the latest state for async flush logic (avoids stale closures).
 const messagesRef = useRef<Msg[]>([]);
@@ -3940,12 +4061,8 @@ useEffect(() => {
 }, [sessionState]);
 
 
-  const showBroadcastButton = useMemo(() => {
-    return liveProvider === "stream" && isHost;
-  }, [liveProvider, isHost]);
-
-
-  const goToMyElaralo = useCallback(() => {
+  const showBroadcastButton = false; // Disabled: Broadcast overlay reserved for future HLS/egress. Use Play/Stop for WebRTC LiveKit.
+const goToMyElaralo = useCallback(() => {
     const url = "https://www.elaralo.com/myelaralo";
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
@@ -6991,6 +7108,7 @@ const modePillControls = (
                   border: "1px solid rgba(255,255,255,0.18)",
                   color: "#ffffff",
                   background: "rgba(255,255,255,0.06)",
+                  color: "#ffffff",
                   cursor: "pointer",
                 }}
                 onClick={() => {
@@ -7007,6 +7125,7 @@ const modePillControls = (
                   borderRadius: 10,
                   border: "1px solid rgba(255,255,255,0.18)",
                   background: "rgba(255,255,255,0.06)",
+                  color: "#ffffff",
                   cursor: "pointer",
                 }}
                 onClick={() => {

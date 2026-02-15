@@ -5488,6 +5488,7 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
     host_member_id = str(mapping.get("host_member_id") or "").strip()
     caller_member_id = str(req.memberId or "").strip()
 
+
     is_host = bool(host_member_id) and bool(caller_member_id) and (host_member_id.lower() == caller_member_id.lower())
 
     # Stable room (reuse event_ref storage)
@@ -5501,19 +5502,28 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
 
     session_active = bool(_is_session_active(resolved_brand, resolved_avatar))
     if is_host:
-        # Start session
+        # Start session and persist session state.
         _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room=room)
         _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
         _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, room_name=room, last_started_at_ms=int(time.time()*1000))
 
-        # Optional: start HLS egress for scale (does not affect WebRTC viewers)
-        hls_url = ""
-        if _livekit_env("LIVEKIT_AUTO_HLS", "0") in ("1", "true", "True", "yes", "YES"):
+        # Clear prior live-chat transcript when starting a *new* stream session.
+        # (Avoid clearing on host refresh while the session is already active.)
+        if (not session_active) or (session_kind != "stream"):
             try:
-                e = _livekit_start_hls_egress(room)
-                hls_url = str(e.get("hlsUrl") or "")
+                _livechat_db_clear_event_sync(room)
             except Exception:
                 pass
+
+        # Optionally start HLS egress immediately on host start.
+        try:
+            autohls = str(_livekit_env("LIVEKIT_AUTO_HLS", "0")).strip().lower() in ("1", "true", "yes")
+            if autohls:
+                e = await _livekit_start_hls_egress(room)
+                hls_url = (e.get("hlsUrl") or "").strip()
+        except Exception:
+            pass
+
 
         token = _livekit_participant_token(
             room,
@@ -5727,6 +5737,14 @@ async def livekit_conference_start(req: LiveKitConferenceStartRequest):
 
     _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
     _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+
+    # Clear prior live-chat transcript when starting a *new* private session.
+    # (Avoid clearing on host refresh while the session is already active.)
+    if (not prev_active) or (prev_kind != "conference"):
+        try:
+            _livechat_db_clear_event_sync(room)
+        except Exception:
+            pass
 
     token = _livekit_participant_token(
         room,
