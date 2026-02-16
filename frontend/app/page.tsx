@@ -1141,6 +1141,8 @@ export default function Page() {
 	// Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
 	const stopInProgressRef = useRef<boolean>(false);
 	const sessionActiveRef = useRef<boolean>(false);
+  const streamOptOutRef = useRef<boolean>(false);
+  const conferenceOptOutRef = useRef<boolean>(false);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
@@ -3392,7 +3394,6 @@ const speakAssistantReply = useCallback(
 const [showPlayChoiceModal, setShowPlayChoiceModal] = useState<boolean>(false);
 
 // Conference intent flag (prevents auto-rejoin when a user explicitly leaves).
-const conferenceOptOutRef = useRef<boolean>(false);
 
 // Track whether THIS client has actually joined the private session.
 // We use both state (for UI) and a ref (for send() gating without stale closures).
