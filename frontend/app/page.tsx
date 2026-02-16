@@ -1138,6 +1138,8 @@ export default function Page() {
   const [memberId, setMemberId] = useState<string>("");
 
   const autoJoinStreamRef = useRef<boolean>(false);
+	// Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
+	const stopInProgressRef = useRef<boolean>(false);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
