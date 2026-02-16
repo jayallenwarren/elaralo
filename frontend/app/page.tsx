@@ -1647,11 +1647,13 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
       setViewerLiveChatName("");
     }
   }, [liveChatUsernameStorageKey]);
-  const ensureViewerLiveChatName = useCallback((): string => {
-    // The host should never be prompted for a username. The host display name is always `companionName`.
-    if (livekitRole === "host") {
-      return String(companionName || "").trim() || "Host";
-    }
+	// NOTE: Only viewers need a username prompt. Hosts should always use `companionName`.
+	// We accept an optional `roleHint` so call-sites can force host behavior even before
+	// LiveKit role state is derived (prevents accidental host prompts).
+	const ensureViewerLiveChatName = useCallback((roleHint: "host" | "viewer" = "viewer"): string => {
+	  if (roleHint === "host") {
+	    return String(companionName || "").trim() || "Host";
+	  }
 
     // If we've already got a viewer name in state, use it.
     const existing = (viewerLiveChatName || "").trim();
@@ -1687,7 +1689,7 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
 
     // If user cancels, fall back to a neutral label; some flows will enforce a non-empty username.
     return "Viewer";
-  }, [viewerLiveChatName, liveChatUsernameStorageKey, livekitRole, companionName]);
+	}, [viewerLiveChatName, liveChatUsernameStorageKey, companionName]);
 
 
 
