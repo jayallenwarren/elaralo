@@ -5648,7 +5648,7 @@ def livekit_stream_status(brand: str = "", avatar: str = "") -> Dict[str, Any]:
     return {
         "ok": True,
         "sessionActive": bool(is_active),
-        "sessionKind": "stream" if is_active else session_kind,
+        "sessionKind": session_kind,
         "roomName": session_room,
         # Frontend historically uses streamEventRef for its livechat websocket.
         "streamEventRef": session_room,
