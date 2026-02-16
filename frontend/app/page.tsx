@@ -2105,6 +2105,10 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 
   const [streamNotice, setStreamNotice] = useState<string>("");
 
+
+  // Notice for Live Sharing (websocket chat)
+  const [liveSharingNotice, setLiveSharingNotice] = useState<string | null>(null);
+
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
