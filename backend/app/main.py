@@ -6078,4 +6078,9 @@ async def livekit_join_request_status(requestId: str):
         "status": r.get("status"),
         "token": r.get("token") or "",
         "serverUrl": _livekit_client_ws_url(),
+        "roomName": r.get("room") or "",
+        "sessionKind": r.get("session_kind") or "",
+        "identity": r.get("identity") or "",
+        "name": r.get("name") or "",
+        "memberId": r.get("memberId") or "",
     }
