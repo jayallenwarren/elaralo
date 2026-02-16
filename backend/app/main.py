@@ -2745,7 +2745,7 @@ async def beestreamed_status(brand: str, avatar: str):
 
 
 
-@app.get("/stream/livekit/status")
+@app.get("/stream/livekit/status_legacy")
 async def livekit_status(brand: str, avatar: str):
     """Return current LiveKit mapping state for a companion (does not start anything).
 
@@ -5624,7 +5624,7 @@ async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
 
 
 @app.get("/stream/livekit/status")
-def livekit_stream_status(brand: str = "", avatar: str = "") -> Dict[str, Any]:
+def livekit_stream_status(brand: str = "", avatar: str = "", memberId: str = "") -> Dict[str, Any]:
     """Lightweight stream status for the Companion page.
 
     IMPORTANT: This endpoint **does not** mint tokens.
@@ -5639,20 +5639,31 @@ def livekit_stream_status(brand: str = "", avatar: str = "") -> Dict[str, Any]:
     session_kind = (session_kind or "").strip()
     session_room = (session_room or "").strip()
 
-    is_active = bool(session_room) and (session_kind.lower() == "stream") and bool(_is_session_active(resolved_brand, resolved_avatar))
+    session_kind_lower = (session_kind or "").strip().lower()
+
+    # Treat both Stream and Private Conference as "active" for the companion status API.
+    # (Front-end needs to know the session is live in order to join the correct room.)
+    is_active = bool(session_room) and (session_kind_lower in ("stream", "conference")) and bool(
+        _is_session_active(resolved_brand, resolved_avatar)
+    )
 
     mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar) or {}
     host_member_id = str(mapping.get("host_member_id") or "").strip()
+    resolved_member_id = str(memberId or "").strip()
+    can_start = bool(resolved_member_id and host_member_id and (resolved_member_id == host_member_id))
     hls_url = str(mapping.get("livekit_hls_url") or "").strip() or str(mapping.get("hls_url") or "").strip()
 
     return {
         "ok": True,
         "sessionActive": bool(is_active),
-        "sessionKind": session_kind,
+        "sessionKind": session_kind_lower or session_kind,
         "roomName": session_room,
+        "sessionRoom": session_room,
+        "room": session_room,
         # Frontend historically uses streamEventRef for its livechat websocket.
         "streamEventRef": session_room,
         "hostMemberId": host_member_id,
+        "canStart": bool(can_start),
         "hlsUrl": hls_url,
         "serverUrl": _livekit_client_ws_url(),
     }
