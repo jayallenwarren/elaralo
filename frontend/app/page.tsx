@@ -1943,6 +1943,8 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
   const [livekitRoomName, setLivekitRoomName] = useState<string>("");
   const [livekitRole, setLivekitRole] = useState<"unknown" | "host" | "attendee" | "viewer">("unknown");
+  
+  const [livekitJoinStatus, setLivekitJoinStatus] = useState<"idle" | "pending" | "joined" | "error">("idle");
   const [livekitServerUrl, setLivekitServerUrl] = useState<string>(String(LIVEKIT_URL || "").trim());
   // LiveKit session state
   const [sessionActive, setSessionActive] = useState<boolean>(false);
@@ -1952,8 +1954,6 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const isHost = livekitRole === "host";
   const livekitRoleKnown = livekitRole !== "unknown";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
-  // Tracks viewer admission flow for Private sessions (viewer requests admission; host admits/denies).
-  const [livekitJoinStatus, setLivekitJoinStatus] = useState<"idle" | "pending" | "joined">("idle");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
   // Viewers must press Play to join live streams.
@@ -1993,9 +1993,6 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
     if (isHost) return;
     if (!livekitJoinRequestId) return;
 
-    // Viewer is waiting for Host admission.
-    setLivekitJoinStatus("pending");
-
     let cancelled = false;
 
     const poll = async () => {
@@ -2015,14 +2012,12 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
           if (!token) return;
 
           setLivekitToken(token);
-          setLivekitJoinStatus("joined");
           setConferenceJoined(true);
           setAvatarStatus("connected");
           setStreamNotice(null);
           setLivekitJoinRequestId("");
         } else if (status === "denied" || status === "expired") {
           setStreamNotice(status === "denied" ? "Join request denied." : "Join request expired.");
-          setLivekitJoinStatus("idle");
           setLivekitJoinRequestId("");
           setAvatarStatus("waiting");
         }
@@ -2194,8 +2189,7 @@ const livekitUiActive =
     avatarStatus === "waiting" ||
     avatarStatus === "connected" ||
     avatarStatus === "reconnecting" ||
-    Boolean(streamEventRef) ||
-    Boolean(conferenceEventRef));
+    Boolean(streamEventRef) );
 
 const showAvatarFrame =
   (liveProvider === "stream" && livekitUiActive) ||
@@ -2333,12 +2327,16 @@ const stopLiveAvatar = useCallback(async () => {
     setLivekitToken("");
     setLivekitRoomName("");
     setLivekitHlsUrl("");
+
+      // Always clear any broadcast overlay/UI state to avoid stale sessions when switching modes.
+      setShowBroadcasterOverlay(false);
+      setBroadcasterOverlayUrl("");
+      setBroadcastPreparing(false);
+      setBroadcastError(null);
     setStreamJoined(false);
     setConferenceJoined(false);
     setAvatarStatus("idle");
     setStreamEventRef("");
-    setConferenceEventRef("");
-    setConferenceRoomName("");
     setLivekitJoinRequestId("");
     setLivekitJoinStatus("idle");
     setLivekitPending([]);
@@ -2477,7 +2475,6 @@ const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       setMessages((prev) => prev.filter((m) => !(m as any)?.meta?.liveChat));
       // Host: connect immediately.
       setLivekitToken(token);
-          setLivekitJoinStatus("joined");
       setSessionActive(true);
       setSessionKind("stream");
       setSessionRoom(roomName);
@@ -3728,6 +3725,7 @@ const startConferenceSession = useCallback(async () => {
     // Viewers request to join a private session. The host must admit them.
     if (!isHost) {
       setStreamNotice(null);
+      setLivekitJoinStatus("pending");
       setAvatarStatus("waiting");
 
       // Reset any prior join attempt / token.
@@ -3787,6 +3785,7 @@ const startConferenceSession = useCallback(async () => {
     // Host starts (or resumes) the private session.
     conferenceOptOutRef.current = false;
     setStreamNotice(null);
+      setLivekitJoinStatus("pending");
     setAvatarStatus("connecting");
     setConferenceJoined(false);
     setLivekitJoinRequestId("");
@@ -3851,7 +3850,6 @@ const startConferenceSession = useCallback(async () => {
       setLivekitRoomName(room);
       setLivekitRole("host");
       setLivekitToken(token);
-          setLivekitJoinStatus("joined");
       setConferenceJoined(true);
       setAvatarStatus("connected");
     } catch (err: any) {
@@ -3879,9 +3877,12 @@ const stopConferenceSession = useCallback(async () => {
     setLivekitRoomName("");
     setLivekitHlsUrl("");
     setConferenceJoined(false);
+      setShowBroadcasterOverlay(false);
+      setBroadcasterOverlayUrl("");
+      setBroadcastPreparing(false);
+      setBroadcastError(null);
+
     setAvatarStatus("idle");
-    setConferenceEventRef("");
-    setConferenceRoomName("");
     setLivekitJoinRequestId("");
     setLivekitJoinStatus("idle");
     setLivekitPending([]);
@@ -4211,7 +4212,6 @@ useEffect(() => {
       setLivekitRoomName(roomName);
       setLivekitRole("host");
       setLivekitToken(token);
-          setLivekitJoinStatus("joined");
       setLivekitHlsUrl(hlsUrl);
 
       // Mark locally active (used elsewhere for gating)
@@ -6425,7 +6425,7 @@ setStreamEventRef("");
 
     // Host (Live Stream): ensure Stop always ends the session even if mic/STT isn't running.
     // (This is idempotent; stopLiveAvatar has its own in-flight guard.)
-    if (liveProvider === "stream" && streamCanStart && (streamEventRef)) {
+    if (liveProvider === "stream" && streamCanStart) {
       try {
         void stopLiveAvatar();
       } catch (e) {}
