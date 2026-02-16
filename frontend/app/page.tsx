@@ -1952,6 +1952,8 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const isHost = livekitRole === "host";
   const livekitRoleKnown = livekitRole !== "unknown";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
+  // Tracks viewer admission flow for Private sessions (viewer requests admission; host admits/denies).
+  const [livekitJoinStatus, setLivekitJoinStatus] = useState<"idle" | "pending" | "joined">("idle");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
   // Viewers must press Play to join live streams.
@@ -1991,6 +1993,9 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
     if (isHost) return;
     if (!livekitJoinRequestId) return;
 
+    // Viewer is waiting for Host admission.
+    setLivekitJoinStatus("pending");
+
     let cancelled = false;
 
     const poll = async () => {
@@ -2010,12 +2015,14 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
           if (!token) return;
 
           setLivekitToken(token);
+          setLivekitJoinStatus("joined");
           setConferenceJoined(true);
           setAvatarStatus("connected");
           setStreamNotice(null);
           setLivekitJoinRequestId("");
         } else if (status === "denied" || status === "expired") {
           setStreamNotice(status === "denied" ? "Join request denied." : "Join request expired.");
+          setLivekitJoinStatus("idle");
           setLivekitJoinRequestId("");
           setAvatarStatus("waiting");
         }
@@ -2470,6 +2477,7 @@ const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       setMessages((prev) => prev.filter((m) => !(m as any)?.meta?.liveChat));
       // Host: connect immediately.
       setLivekitToken(token);
+          setLivekitJoinStatus("joined");
       setSessionActive(true);
       setSessionKind("stream");
       setSessionRoom(roomName);
@@ -3843,6 +3851,7 @@ const startConferenceSession = useCallback(async () => {
       setLivekitRoomName(room);
       setLivekitRole("host");
       setLivekitToken(token);
+          setLivekitJoinStatus("joined");
       setConferenceJoined(true);
       setAvatarStatus("connected");
     } catch (err: any) {
@@ -4202,6 +4211,7 @@ useEffect(() => {
       setLivekitRoomName(roomName);
       setLivekitRole("host");
       setLivekitToken(token);
+          setLivekitJoinStatus("joined");
       setLivekitHlsUrl(hlsUrl);
 
       // Mark locally active (used elsewhere for gating)
