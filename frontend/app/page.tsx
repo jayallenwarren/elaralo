@@ -3960,7 +3960,7 @@ const startConferenceSession = useCallback(async () => {
       }
 
       // Viewers must join with mic + camera (they can switch to listen-only after joining).
-      const granted = await requestLivekitAvPermissions({ audio: true, video: true });
+      const granted = await requestLivekitAvPermissions({ audio: true, video: true, reason: "joining the private conference" });
       if (!granted) {
         setLivekitJoinStatus("idle");
         setAvatarStatus("idle");
@@ -7425,6 +7425,7 @@ const modePillControls = (
 	                const ok = await requestLivekitAvPermissions({
 	                  audio: true,
 	                  video: sessionKind === "conference",
+	                  reason: "enabling microphone/camera",
 	                });
 	                if (!ok) return;
 	              }
