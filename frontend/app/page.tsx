@@ -151,6 +151,10 @@ type CompanionMappingRow = {
   channelCap?: string;  // API alias (optional)
   live?: string;        // "Stream" | "D-ID" | ""
 
+  // Companion classification (DB)
+  companion_type?: string; // e.g. "Human" | "Avatar" | ""
+  companionType?: string;  // API alias (optional)
+
   // Provider-specific fields (optional)
   didClientKey?: string;
   didAgentId?: string;
@@ -2020,6 +2024,9 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
           if (!token) return;
 
           setLivekitToken(token);
+
+          const serverUrl = String((data as any)?.serverUrl || (data as any)?.server_url || "").trim();
+          if (serverUrl) setLivekitServerUrl(serverUrl);
           setConferenceJoined(true);
           setAvatarStatus("connected");
           setStreamNotice(null);
@@ -3589,14 +3596,22 @@ useEffect(() => {
     ws.onmessage = (evt) => {
       try {
         const payload = JSON.parse(evt.data);
+
+        if (payload?.type === "connected") {
+          setLiveSharingNotice("Live sharing connected");
+          return;
+        }
+
         if (payload?.type === "history" && Array.isArray(payload.messages)) {
           for (const m of payload.messages) appendLiveChatMessage(m);
           return;
         }
-        if (payload?.type === "message") {
+
+        if (payload?.type === "chat" || payload?.type === "message") {
           appendLiveChatMessage(payload.message || payload);
           return;
         }
+
         // ignore other message types
       } catch {
         // ignore parse errors
@@ -6909,6 +6924,17 @@ const modePillControls = (
     void ensureIphoneAudioContextUnlocked();
   }, [primeLocalTtsAudio, nudgeAudioSession, ensureIphoneAudioContextUnlocked]);
 
+  const companionTypeFromDb = String(
+    (companionMapping as any)?.companion_type ||
+      (companionMapping as any)?.companionType ||
+      ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const liveAvatarLabel =
+    companionTypeFromDb === "human" ? "Live Companion:" : "Live Avatar:";
+
   return (
     <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       {/* Hidden audio element for audio-only TTS (mic mode) */}
@@ -7243,7 +7269,7 @@ const modePillControls = (
       ) : null}
 
       <div style={{ fontSize: 12, color: "#666" }}>
-        Live Avatar: <b>{avatarStatus}</b>
+        {liveAvatarLabel} <b>{avatarStatus}</b>
         {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
       </div>
     </div>
