@@ -1140,6 +1140,7 @@ export default function Page() {
   const autoJoinStreamRef = useRef<boolean>(false);
 	// Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
 	const stopInProgressRef = useRef<boolean>(false);
+	const sessionActiveRef = useRef<boolean>(false);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
@@ -1952,6 +1953,9 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [sessionActive, setSessionActive] = useState<boolean>(false);
   const [sessionKind, setSessionKind] = useState<SessionKind>("");
   const [sessionRoom, setSessionRoom] = useState<string>("");
+  useEffect(() => {
+    sessionActiveRef.current = sessionActive;
+  }, [sessionActive]);
   // Treat "host" as the LiveKit host role (LegacyStream host semantics are deprecated).
   const isHost = livekitRole === "host";
   const livekitRoleKnown = livekitRole !== "unknown";
