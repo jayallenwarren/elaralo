@@ -2335,7 +2335,8 @@ const stopLiveAvatar = useCallback(async () => {
       setBroadcasterOverlayUrl("");
       setBroadcastPreparing(false);
       setBroadcastError(null);
-    setStreamJoined(false);
+    // Note: we no longer track a dedicated `streamJoined` flag.
+    // The UI derives join state from `livekitUiActive`, `livekitToken`, and `avatarStatus`.
     setConferenceJoined(false);
     setAvatarStatus("idle");
     setStreamEventRef("");
