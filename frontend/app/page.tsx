@@ -1056,6 +1056,7 @@ function LiveKitStreamViewerStage() {
 
   const remoteTracks = allTracks.filter((t) => !t.participant.isLocal);
   const hostTracks = remoteTracks.filter((t) =>
+    String((t.participant as any)?.identity || "").startsWith("host-") ||
     String((t.participant as any)?.identity || "").startsWith("host:")
   );
 
@@ -1064,7 +1065,9 @@ function LiveKitStreamViewerStage() {
   return (
     <div style={{ width: "100%", height: "100%" }}>
       <RoomAudioRenderer />
-      <StartAudio label="Click to enable audio" />
+      <div style={{ position: "absolute", left: 12, bottom: 12, zIndex: 20 }}>
+        <StartAudio label="Enable audio" />
+      </div>
 
       {tracksToShow.length ? (
         <GridLayout tracks={tracksToShow} style={{ height: "100%" }}>
@@ -1644,70 +1647,48 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
       setViewerLiveChatName("");
     }
   }, [liveChatUsernameStorageKey]);
-
   const ensureViewerLiveChatName = useCallback((): string => {
-    try {
-      if (typeof window === "undefined") return "";
-      const current = String(viewerLiveChatName || "").trim();
-      if (current) return current;
-
-      let stored = "";
-      try {
-        stored = String((() => {
-          try {
-            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
-            if (v && String(v).trim()) return v;
-          } catch (e) {}
-          try {
-            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
-            if (v2 && String(v2).trim()) return v2;
-          } catch (e) {}
-          return "";
-        })() || "").trim();
-      } catch (e) {
-        stored = "";
-      }
-      if (!stored) {
-        try {
-          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
-        } catch (e) {
-          stored = "";
-        }
-      }
-      if (stored) {
-        setViewerLiveChatName(stored);
-        return stored;
-      }
-
-      // Prompt only when Viewer explicitly joins the live stream (Play).
-      const raw = window.prompt("Choose a username to display during the live session:", "") || "";
-      const cleaned = raw
-        .replace(/[\r\n\t]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 32);
-
-      if (!cleaned) return "";
-
-      try {
-        try {
-        window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
-      } catch (e) {
-        try {
-          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
-        } catch (e) {}
-      }
-      } catch (e) {
-        try {
-          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
-        } catch (e) {}
-      }
-      setViewerLiveChatName(cleaned);
-      return cleaned;
-    } catch (e) {
-      return "";
+    // The host should never be prompted for a username. The host display name is always `companionName`.
+    if (livekitRole === "host") {
+      return String(companionName || "").trim() || "Host";
     }
-  }, [viewerLiveChatName, liveChatUsernameStorageKey]);
+
+    // If we've already got a viewer name in state, use it.
+    const existing = (viewerLiveChatName || "").trim();
+    if (existing) return existing;
+
+    // Try localStorage next.
+    try {
+      const fromStorage = (localStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+      if (fromStorage) {
+        setViewerLiveChatName(fromStorage);
+        return fromStorage;
+      }
+    } catch {
+      // ignore
+    }
+
+    // Viewer: prompt only if we truly don't have one.
+    const input = prompt(
+      "Choose a username to display during the live session:",
+      ""
+    );
+    const finalName = (input || "").trim();
+
+    if (finalName) {
+      setViewerLiveChatName(finalName);
+      try {
+        localStorage.setItem(liveChatUsernameStorageKey, finalName);
+      } catch {
+        // ignore
+      }
+      return finalName;
+    }
+
+    // If user cancels, fall back to a neutral label; some flows will enforce a non-empty username.
+    return "Viewer";
+  }, [viewerLiveChatName, liveChatUsernameStorageKey, livekitRole, companionName]);
+
 
 
   const changeViewerLiveChatName = useCallback(() => {
@@ -2432,7 +2413,7 @@ const reconnectLiveAvatar = useCallback(async () => {
 }, []);
 
 
-const startLiveAvatar = useCallback(async () => {
+const startLiveAvatar = async () => {
   setAvatarError(null);
   ensureIphoneAudioContextUnlocked();
 
@@ -2440,19 +2421,22 @@ if (liveProvider === "stream") {
   // LiveKit (Human companion) — conference + broadcast, with Pattern A lobby.
   setAvatarError(null);
   setAvatarStatus("connecting");
-
-  // Clear any prior in-stream chat transcript (your chat/auth are handled internally).
-  setMessages((prev) => prev.filter((m) => !m.meta?.liveChat));
-  liveChatSeenIdsRef.current = new Set();
-  liveChatSeenOrderRef.current = [];
+      // Starting/joining a live session: start with a blank chat history and input.
+      setMessages([]);
+      setInput("");
+      clearPendingAttachment();
+      liveChatSeenIdsRef.current = new Set();
+      liveChatSeenOrderRef.current = [];
 
   try {
     const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
-
-    // Ask server to resolve room + determine host vs viewer.
-        const displayNameForToken = isHost
-      ? String(companionName || "Host").trim()
-      : String(ensureViewerLiveChatName() || viewerLiveChatName || "").trim();
+      // Ask server to resolve room + determine host vs viewer.
+      const isHostByMemberId =
+        Boolean(mappedHostMemberId) &&
+        String(memberIdRef.current || "").trim() === String(mappedHostMemberId || "").trim();
+      const displayNameForToken = (isHost || isHostByMemberId)
+        ? String(companionName || "Host").trim()
+        : String(ensureViewerLiveChatName() || viewerLiveChatName || "").trim();
 
 const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       method: "POST",
@@ -2491,8 +2475,10 @@ const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
 
 
     if (canStart) {
-      // Clear any prior live-chat messages from previous sessions in the UI.
-      setMessages((prev) => prev.filter((m) => !(m as any)?.meta?.liveChat));
+      // New live Stream session: start with a blank chat history and input.
+      setMessages([]);
+      setInput("");
+      clearPendingAttachment();
       // Host: connect immediately.
       setLivekitToken(token);
       setSessionActive(true);
@@ -2507,6 +2493,10 @@ const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
 
     // Viewer: auto-join when the stream is active (subscribe-only token).
     if (token) {
+      // Joining a live Stream session: start with a blank chat history and input.
+      setMessages([]);
+      setInput("");
+      clearPendingAttachment();
       setLivekitRole("viewer");
       setLivekitRoomName(roomName);
       setLivekitToken(String(token));
@@ -2700,7 +2690,7 @@ if (!phase1AvatarMedia) {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost]);
+  };
 
 useEffect(() => {
   // Stop when switching companions
@@ -7149,6 +7139,8 @@ const modePillControls = (
             if (isHost && !sessionActive) {
               // New live session: clear any leftover live-sharing UI from the prior run.
               setMessages([]);
+              setInput("");
+              clearPendingAttachment();
               setLiveSharingNotice(null);
               setShowPlayChoiceModal(true);
               return;
@@ -7313,8 +7305,8 @@ const modePillControls = (
                     token={livekitToken}
                     serverUrl={livekitServerUrl || LIVEKIT_URL}
                     connect={true}
-                    audio={livekitRole !== "viewer"}
-                    video={livekitRole !== "viewer"}
+                    audio={livekitRole !== "viewer" || (sessionKind === "conference" && conferenceJoined)}
+                    video={livekitRole !== "viewer" || (sessionKind === "conference" && conferenceJoined)}
                     onConnected={() => {
                       // Host: once connected we treat the session as active.
                       if (livekitRole === "host") setSessionActive(true);
@@ -7331,7 +7323,7 @@ const modePillControls = (
                     }}
                     style={{ width: "100%", height: "100%" }}
                   >
-                    {sessionKind === "stream" && livekitRole === "viewer" ? (
+                    {livekitRole === "viewer" ? (
                       <LiveKitStreamViewerStage />
                     ) : (
                       <VideoConference
@@ -7342,7 +7334,7 @@ const modePillControls = (
                       />
                     )}
 
-                    {sessionKind === "stream" && livekitRole === "viewer" ? null : <StartAudio label="Enable audio" />}
+                    {livekitRole === "viewer" ? null : <StartAudio label="Enable audio" />}
 
                     {livekitRole === "host" && livekitPending.length > 0 ? (
                       <div
@@ -7388,7 +7380,7 @@ const modePillControls = (
                                       whiteSpace: "nowrap",
                                     }}
                                   >
-                                    {req.viewerLabel || "Viewer"}
+                                    {req.viewerLabel || req.identity || "Viewer"}
                                   </div>
                                   <div
                                     style={{
@@ -7512,7 +7504,7 @@ const modePillControls = (
                   )
                 ) : null}
 
-                {avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting" ? (
+                {(avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && !livekitToken) ? (
                   <div
                     style={{
                       position: "absolute",
