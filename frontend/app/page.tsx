@@ -187,6 +187,11 @@ type CompanionMappingRow = {
   didClientKey?: string;
   didAgentId?: string;
   elevenVoiceId?: string;
+
+  // Optional DB column used for UI labeling.
+  // Expected values: "Human" | "AI" (case-insensitive), but treated as a free-form string.
+  companion_type?: string | null;
+  companionType?: string | null; // optional API alias
 };
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
@@ -7432,7 +7437,7 @@ const modePillControls = (
       ) : null}
 
       <div style={{ fontSize: 12, color: "#666" }}>
-        {String(companionType || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}:{" "}
+        {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}:{" "}
         <b>{avatarStatus}</b>
         {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
       </div>
