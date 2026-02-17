@@ -3852,18 +3852,19 @@ useEffect(() => {
           ? (String(companionName || 'Host').trim() || 'Host')
           : (String(viewerLiveChatName || '').trim() || (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer'));
       // IMPORTANT:
-      // - Backend websocket expects: { role, from, text, userId, clientId }
-      // - Backend HTTP endpoint is POST /stream/livekit/livechat/{event_ref}
-      // - Backend expects `clientId` (NOT `clientMsgId`). We keep the caller-provided
-      //   `clientMsgId` value but transmit it as `clientId` so local dedupe works.
+      // - The server expects a stable `clientMsgId` so clients can de-dupe websocket echo/history.
+      // - We also include `clientId` for back-compat with older builds.
+      const stableClientMsgId =
+        String(clientMsgId || '').trim() ||
+        ((crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
       const payload = {
         role,
         from: name,
         text: clean,
         userId: String(memberIdForLiveChat || '').trim(),
-        clientId:
-          String(clientMsgId || '').trim() ||
-          ((crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+        clientMsgId: stableClientMsgId,
+        clientId: stableClientMsgId,
       } as any;
 
       const ws = liveChatWsRef.current;
@@ -3880,6 +3881,7 @@ useEffect(() => {
       try {
         const httpPayload = {
           eventRef,
+          clientMsgId: payload.clientMsgId,
           name: payload.from,
           text: payload.text,
           role: payload.role,

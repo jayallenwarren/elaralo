@@ -1443,7 +1443,17 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
             if not text_val:
                 continue
 
-            client_msg_id = str(incoming.get("clientMsgId") or incoming.get("client_msg_id") or "").strip() or str(uuid.uuid4())
+            # Accept both clientMsgId (preferred) and legacy clientId fields.
+            client_msg_id = (
+                str(
+                    incoming.get("clientMsgId")
+                    or incoming.get("client_msg_id")
+                    or incoming.get("clientId")
+                    or incoming.get("client_id")
+                    or ""
+                ).strip()
+                or str(uuid.uuid4())
+            )
 
             ts_in = incoming.get("ts")
             try:
@@ -5908,13 +5918,12 @@ async def livekit_conference_start(req: LiveKitConferenceStartRequest):
     _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
     _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
 
-    # Clear prior live-chat transcript when starting a *new* private session.
-    # (Avoid clearing on host refresh while the session is already active.)
-    if (not prev_active) or (prev_kind != "conference"):
-        try:
-            _livechat_db_clear_event_sync(room)
-        except Exception:
-            pass
+    # Always start a host-entered private conference with a clean live-chat transcript.
+    # (The room name is stable across sessions, so without this you'll see old message history.)
+    try:
+        _livechat_db_clear_event_sync(room)
+    except Exception:
+        pass
 
     token = _livekit_participant_token(
         room,
