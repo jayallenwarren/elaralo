@@ -2105,7 +2105,7 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
         const data: any = await resp.json().catch(() => ({}));
         const requests = Array.isArray(data?.requests) ? data.requests : [];
         const annotated = requests.map((r: any) => {
-          const viewerLabel = String(r?.name || r?.viewerName || r?.username || r?.memberId || "Viewer")
+          const viewerLabel = String((r as any)?.viewer_name || r?.name || r?.viewerName || r?.username || r?.memberId || "Viewer")
             .trim()
             .slice(0, 32);
           const identity = String(r?.memberId || r?.identity || r?.requestId || "").trim();
@@ -2146,10 +2146,26 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
         const status = String((data as any)?.status || "").toLowerCase();
         if (status === "admitted") {
           const token = String((data as any)?.token || "").trim();
+          const roomName = String((data as any)?.roomName || (data as any)?.room || "").trim();
+          const serverUrl = String((data as any)?.serverUrl || "").trim();
           if (!token) return;
 
+          if (serverUrl) setLivekitServerUrl(serverUrl);
+          if (roomName) {
+            setLivekitRoomName(roomName);
+            setSessionRoom(roomName);
+            // Keep streamEventRef aligned with the active room so Live Sharing can mirror correctly.
+            setStreamEventRef(roomName);
+          }
+
           setLivekitToken(token);
+          setLivekitRole("viewer");
+          setSessionKind("conference");
+          setSessionActive(true);
           setConferenceJoined(true);
+          setLivekitJoinStatus("joined");
+          setLivekitMicEnabled(true);
+          setLivekitCameraEnabled(true);
           setAvatarStatus("connected");
           setStreamNotice(null);
           setLivekitJoinRequestId("");
@@ -3680,7 +3696,8 @@ useEffect(() => {
         const cleanRoom = sanitizeRoomToken(room, 96);
         return cleanRoom || "";
       }
-      return String(streamEventRef || "").trim();
+      // Livestream viewers may only learn the room/eventRef from status polling (sessionRoom).
+      return String(streamEventRef || sessionRoom || "").trim();
     };
 
     const eventRef = computeLiveChatEventRef();
@@ -3689,20 +3706,10 @@ useEffect(() => {
     // Once a user has joined a live experience, they should remain connected to shared chat
     // until they explicitly press Stop (host) or opt-out (viewer, private session only).
     const inStreamUi =
-      Boolean(sessionActive) &&
-      kind !== "conference" &&
-      Boolean(streamEventRef) &&
-      !!String(streamEventRef || "").trim() &&
-      !!eventRef &&
-      (streamCanStart || Boolean(livekitToken));
+      Boolean(sessionActive) && kind !== "conference" && !!eventRef;
 
     const inConferenceUi =
-      Boolean(sessionActive) &&
-      kind === "conference" &&
-      !!eventRef &&
-      (conferenceJoined ||
-        streamCanStart ||
-        Boolean(livekitToken));
+      (Boolean(sessionActive) || Boolean(conferenceJoined)) && kind === "conference" && !!eventRef;
 
     const inLiveChatUi = inStreamUi || inConferenceUi;
 
@@ -3814,7 +3821,9 @@ useEffect(() => {
         const cleanRoom = sanitizeRoomToken(room, 96);
         eventRef = cleanRoom || "";
       } else {
-        eventRef = String(streamEventRef || "").trim();
+        // Livestream viewers may only learn the active room via status polling (sessionRoom)
+        // until they explicitly join.
+        eventRef = String(streamEventRef || sessionRoom || "").trim();
       }
 
       if (!API_BASE || !eventRef) return;
@@ -3861,7 +3870,8 @@ useEffect(() => {
           memberId: payload.userId,
         };
 
-        await fetch(`${API_BASE}/stream/livekit/livechat/send`, {
+        const httpUrl = kind === 'conference' ? `${API_BASE}/conference/livekit/livechat/send` : `${API_BASE}/stream/livekit/livechat/send`;
+        await fetch(httpUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(httpPayload),

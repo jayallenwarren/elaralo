@@ -2844,6 +2844,18 @@ async def livekit_livechat_ws(websocket: WebSocket, event_ref: str):
     """Alias LiveKit chat websocket to the existing livechat pipeline."""
     return await beestreamed_livechat_ws(websocket, event_ref)
 
+
+@app.post("/conference/livekit/livechat/send")
+async def conference_livekit_livechat_send(req: LiveChatSendRequest):
+    """Conference LiveKit chat send (same pipeline as stream)."""
+    return await beestreamed_livechat_send(req)
+
+
+@app.websocket("/conference/livekit/livechat/{event_ref}")
+async def conference_livekit_livechat_ws(websocket: WebSocket, event_ref: str):
+    """Conference LiveKit chat websocket (same pipeline as stream)."""
+    return await beestreamed_livechat_ws(websocket, event_ref)
+
 @app.post("/stream/beestreamed/embed_url")
 async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
     """Return an embeddable URL that *cannot* pop out of the iframe.
