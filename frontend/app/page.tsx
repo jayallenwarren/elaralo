@@ -1126,6 +1126,53 @@ function LiveKitStreamViewerStage() {
   );
 }
 
+/**
+ * Private conference stage (interactive):
+ *  - split: show both participants side-by-side
+ *  - focus: show only the *other* participant full-frame
+ */
+function LiveKitPrivateConferenceStage(props: { viewMode: "split" | "focus" }) {
+  const cameraTracks = useTracks(
+    [{ source: Track.Source.Camera, withPlaceholder: true }],
+    { onlySubscribed: false },
+  );
+
+  const remoteCameraTracks = cameraTracks.filter((t) => !t.participant.isLocal);
+
+  const tracksToShow =
+    props.viewMode === "focus" ? (remoteCameraTracks.length ? [remoteCameraTracks[0]] : []) : cameraTracks;
+
+  return (
+    <div style={{ width: "100%", height: "100%" }}>
+      <RoomAudioRenderer />
+
+      {tracksToShow.length ? (
+        <GridLayout tracks={tracksToShow} style={{ height: "100%" }}>
+          <ParticipantTile />
+        </GridLayout>
+      ) : (
+        <div
+          style={{
+            width: "100%",
+            height: "100%",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "#fff",
+            background: "rgba(0,0,0,0.6)",
+            borderRadius: 18,
+            padding: 24,
+            textAlign: "center",
+            fontWeight: 600,
+          }}
+        >
+          Waiting for the other participant video…
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 function LiveKitAutoPublish(props: {
   enabled: boolean;
@@ -1731,7 +1778,30 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     }
   }, [liveChatUsernameStorageKey]);
 
-  const ensureViewerLiveChatName = useCallback((): string => {
+  // LiveKit identity conventions used by the backend:
+  //   - user:<memberId> when memberId is available
+  //   - anon:<random> otherwise
+  // We also use this as the fallback display name when the viewer does not enter a name.
+  const getLivekitSystemIdentity = useCallback((): string => {
+    try {
+      const mid = String(memberId || "").trim();
+      if (mid) return `user:${mid}`;
+
+      const k = "dm_livekit_anon_id_v1";
+      const existing = String(window?.localStorage?.getItem(k) || "").trim();
+      if (existing) return existing;
+
+      const rnd = Math.random().toString(36).slice(2, 10);
+      const anon = `anon:${Date.now().toString(36)}_${rnd}`;
+      window?.localStorage?.setItem(k, anon);
+      return anon;
+    } catch {
+      const rnd = Math.random().toString(36).slice(2, 10);
+      return `anon:${Date.now().toString(36)}_${rnd}`;
+    }
+  }, [memberId]);
+
+  const ensureViewerLiveChatName = useCallback((opts?: { promptText?: string }): string => {
     if (typeof window === "undefined") return "";
 
     const current = String(viewerLiveChatName || "").trim();
@@ -1876,13 +1946,24 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     }
 
     const suggested = "Viewer";
-    const name = window.prompt("Choose a username to display during the live session:", suggested);
-    const cleaned = String(name ?? "").trim().slice(0, 50) || "Viewer";
+    const promptText =
+      opts?.promptText || "Choose a username to display during the live session:";
+    const name = window.prompt(promptText, suggested);
+
+    // Requirement: if the viewer does not enter a name (blank or cancel), use a LiveKit system identifier.
+    const systemId = getLivekitSystemIdentity();
+
+    const cleaned =
+      String(name ?? "")
+        .replace(/[\r\n\t]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 50) || systemId;
 
     setViewerLiveChatName(cleaned);
     storeEverywhere(cleaned);
     return cleaned;
-  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey]);
+  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, getLivekitSystemIdentity]);
 
 
   const changeViewerLiveChatName = useCallback(() => {
@@ -2131,6 +2212,16 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const [livekitJoinStatus, setLivekitJoinStatus] = useState<"idle" | "pending" | "joined" | "error">("idle");
   const [livekitMicEnabled, setLivekitMicEnabled] = useState<boolean>(true);
   const [livekitCameraEnabled, setLivekitCameraEnabled] = useState<boolean>(true);
+
+  // Private conference view mode:
+  //  - split: show both participants side-by-side
+  //  - focus: show only the *other* participant full-frame
+  const [conferenceViewMode, setConferenceViewMode] = useState<"split" | "focus">("split");
+  useEffect(() => {
+    // Always reset when leaving private conference.
+    if (sessionKind !== "conference") setConferenceViewMode("split");
+  }, [sessionKind]);
+
   const [livekitServerUrl, setLivekitServerUrl] = useState<string>(String(LIVEKIT_URL || "").trim());
   // LiveKit session state
   const [sessionActive, setSessionActive] = useState<boolean>(false);
@@ -4110,10 +4201,14 @@ const startConferenceSession = useCallback(async () => {
       setMessages((prev) => prev.filter((m) => !m?.meta?.liveChat));
       liveChatSeenIdsRef.current = new Set();
 
-      try {
-        const requestedDisplayName = String(
-          ensureViewerLiveChatName() || viewerLiveChatName || "Viewer",
-        ).trim();
+	      try {
+	        const requestedDisplayName = String(
+	          ensureViewerLiveChatName({
+	            promptText: "Please enter your name to enter the the session",
+	          }) ||
+	            viewerLiveChatName ||
+	            "",
+	        ).trim();
 
         const resp = await fetch(`${API_BASE}/livekit/join_request`, {
           method: "POST",
@@ -7035,6 +7130,8 @@ const hostInStreamUi =
     avatarStatus === "reconnecting");
 
 const viewerInStreamUi = viewerHasJoinedStream;
+	const attachmentButtonDisabled =
+	  loading || uploadingAttachment || uploadsDisabled || hostInStreamUi || viewerInStreamUi;
 
 useEffect(() => {
   // Viewer STT must be disabled while in the LegacyStream stream UI to avoid transcribing the host audio.
@@ -7624,6 +7721,27 @@ const modePillControls = (
 	            🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
 	          </button>
 	        ) : null}
+
+	      {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
+	        <button
+	          type="button"
+	          onClick={() => {
+	            setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
+	          }}
+	          style={{
+	            ...smallBtn,
+	            background: conferenceViewMode === "focus" ? "#111" : "#eee",
+	            color: conferenceViewMode === "focus" ? "#fff" : "#222",
+	          }}
+	          title={
+	            conferenceViewMode === "focus"
+	              ? "Show split view (both participants)"
+	              : "Show full view (other participant only)"
+	          }
+	        >
+	          {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
+	        </button>
+	      ) : null}
 {liveProvider === "stream" &&
         ((isHost && sessionActive) ||
           (!isHost &&
@@ -7690,8 +7808,13 @@ const modePillControls = (
         >
           {showAvatarFrame ? (
             <div
-              style={{
-                flex: liveProvider === "stream" && !isHost ? "2 1 0" : "0 0 360px",
+	              style={{
+	                flex:
+	                  liveProvider === "stream" && sessionKind === "conference"
+	                    ? "2 1 0"
+	                    : liveProvider === "stream" && !isHost
+	                      ? "2 1 0"
+	                      : "0 0 360px",
                 minWidth: liveProvider === "stream" && !isHost ? 320 : 280,
                 maxWidth: "100%",
               }}
@@ -7743,16 +7866,18 @@ const modePillControls = (
                       cameraEnabled={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                       onError={(msg) => setStreamNotice(msg)}
                     />
-                    {livekitRole === "viewer" && (sessionKind === "stream" || sessionKind === "conference") ? (
-                      <LiveKitStreamViewerStage />
-                    ) : (
-                      <VideoConference
-                        chatMessageFormatter={undefined as any}
-                        onError={(e: any) => {
-                          console.warn("LiveKit UI error", e);
-                        }}
-                      />
-                    )}
+	                    {sessionKind === "conference" ? (
+	                      <LiveKitPrivateConferenceStage viewMode={conferenceViewMode} />
+	                    ) : livekitRole === "viewer" && sessionKind === "stream" ? (
+	                      <LiveKitStreamViewerStage />
+	                    ) : (
+	                      <VideoConference
+	                        chatMessageFormatter={undefined as any}
+	                        onError={(e: any) => {
+	                          console.warn("LiveKit UI error", e);
+	                        }}
+	                      />
+	                    )}
 
                     {livekitRole === "viewer" && (sessionKind === "stream" || sessionKind === "conference") ? null : <StartAudio label="Enable audio" />}
 
@@ -7964,7 +8089,13 @@ const modePillControls = (
 
           <div
                     style={{
-                      flex: showAvatarFrame ? ((liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart) ? "1 1 0" : "2 1 0") : "1 1 0",
+	                    flex: showAvatarFrame
+	                      ? (liveProvider === "stream" && sessionKind === "conference"
+	                          ? "1 1 0"
+	                          : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
+	                            ? "1 1 0"
+	                            : "2 1 0")
+	                      : "1 1 0",
                       minWidth: 280,
                       height: conversationHeight,
                       display: "flex",
@@ -8065,22 +8196,20 @@ const modePillControls = (
                         style={{ display: "none" }}
                         onChange={onAttachmentSelected}
                       />
-                      <button
-                        onClick={openUploadPicker}
-                        disabled={
-                          loading ||
-                          uploadingAttachment ||
-                          uploadsDisabled ||
-                          hostInStreamUi ||
-                          viewerInStreamUi
-                        }
+	                  <button
+	                    onClick={openUploadPicker}
+	                    disabled={attachmentButtonDisabled}
                         title={
                           uploadsDisabled || hostInStreamUi || viewerInStreamUi
                             ? "Attachments are disabled during Shared Live streaming."
                             : "Attach a file"
                         }
-                        className="rounded border border-gray-300 bg-white px-3 py-2 text-sm"
-                        style={{ height: 44, minWidth: 44 }}
+	                    className="rounded border border-gray-300 px-3 py-2 text-sm"
+	                    style={{
+	                      height: 44,
+	                      minWidth: 44,
+	                      background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
+	                    }}
                         type="button"
                       >
                         {uploadingAttachment ? "⏳" : "📎"}

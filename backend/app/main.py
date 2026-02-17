@@ -5986,14 +5986,25 @@ async def livekit_join_request(req: LiveKitJoinRequestCreate):
     if not b or not a:
         raise HTTPException(status_code=400, detail="brand and avatar are required")
     rid = str(uuid.uuid4())
+
+    member_id = (req.memberId or "").strip()
+    # LiveKit identity convention (must match what we mint into the token on admit):
+    #   - user:<memberId> when memberId is available
+    #   - user:<rid> otherwise
+    identity = f"user:{member_id}" if member_id else f"user:{rid}"
+
+    # Requirement: if the viewer/attendee does not enter a name, use a LiveKit system identifier.
+    name = (req.name or "").strip()[:64] or identity
+
     with _LIVEKIT_JOIN_LOCK:
         _LIVEKIT_JOIN_REQUESTS[rid] = {
             "requestId": rid,
             "brand": b,
             "avatar": a,
             "roomName": (req.roomName or "").strip() or _livekit_room_name_for_companion(b, a),
-            "memberId": (req.memberId or "").strip(),
-            "name": (req.name or "").strip(),
+            "memberId": member_id,
+            "identity": identity,
+            "name": name,
             "status": "PENDING",
             "createdAt": int(time.time()),
             "token": "",
