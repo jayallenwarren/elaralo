@@ -1766,9 +1766,16 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
       }
     };
 
+    // Per-device, we want to prompt *once*, even if brand/companion identifiers change
+    // (common during rebrand flows or when companionName loads asynchronously).
+    const GLOBAL_LIVECHAT_KEY = "dm_livechat_username";
+
     const keysToTry = (() => {
       const keys: string[] = [];
       if (liveChatUsernameStorageKey) keys.push(liveChatUsernameStorageKey);
+
+      // Global fallback (per-device) so we don't keep re-prompting in restrictive iframe contexts.
+      keys.push(GLOBAL_LIVECHAT_KEY);
 
       // Legacy (older builds may have used a key without companionKey)
       const legacyBase = `${safeBrandKey(companyName)}_${safeBrandKey(companionName)}_livechat_username`;
@@ -1801,18 +1808,27 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
 
       // Always write back to the primary key (current build)
       try {
-        window.localStorage.setItem(liveChatUsernameStorageKey, v);
+        if (liveChatUsernameStorageKey) {
+          window.localStorage.setItem(liveChatUsernameStorageKey, v);
+        }
+        window.localStorage.setItem(GLOBAL_LIVECHAT_KEY, v);
       } catch {
         // ignore
       }
       try {
-        window.sessionStorage.setItem(liveChatUsernameStorageKey, v);
+        if (liveChatUsernameStorageKey) {
+          window.sessionStorage.setItem(liveChatUsernameStorageKey, v);
+        }
+        window.sessionStorage.setItem(GLOBAL_LIVECHAT_KEY, v);
       } catch {
         // ignore
       }
       try {
         const kv = readWindowNameKV();
-        kv[liveChatUsernameStorageKey] = v;
+        if (liveChatUsernameStorageKey) {
+          kv[liveChatUsernameStorageKey] = v;
+        }
+        kv[GLOBAL_LIVECHAT_KEY] = v;
         writeWindowNameKV(kv);
       } catch {
         // ignore
@@ -2588,7 +2604,11 @@ const stopLiveAvatar = useCallback(async () => {
     setLivekitJoinRequestId("");
     setLivekitJoinStatus("idle");
     setLivekitPending([]);
-    setMessages([]);
+    // Do NOT wipe AI chat transcripts here. We want queued AI messages/responses to remain visible
+    // after leaving a LiveKit session; only live-sharing chat should be suppressed outside a session.
+    setMessages((prev: any[]) =>
+      (prev || []).filter((m: any) => !Boolean(m?.meta?.liveChat))
+    );
     setLiveSharingNotice(null);
 
     // Viewers leaving should NOT stop the live session for everyone.
@@ -4235,7 +4255,10 @@ const stopConferenceSession = useCallback(async () => {
     setLivekitJoinRequestId("");
     setLivekitJoinStatus("idle");
     setLivekitPending([]);
-    setMessages([]);
+    // Preserve AI chat history on stop; remove only live-sharing chat messages.
+    setMessages((prev: any[]) =>
+      (prev || []).filter((m: any) => !Boolean(m?.meta?.liveChat))
+    );
     setLiveSharingNotice(null);
 
     // Viewer leaving should NOT stop the private session for everyone.
@@ -4457,6 +4480,38 @@ useEffect(() => {
       }
     };
   }, [API_BASE, companyName, companionName]);
+
+  // If the host ends a session, ensure viewers fully exit (equivalent to pressing Stop).
+  // This is a safety net in addition to LiveKit's kick/disconnect behavior.
+  useEffect(() => {
+    if (isHost) return;
+    if (sessionActive) return;
+
+    const viewerWasInLiveUi =
+      Boolean(livekitToken) ||
+      Boolean(conferenceJoined) ||
+      Boolean(viewerHasJoinedStream) ||
+      Boolean(streamEventRef) ||
+      Boolean(sessionRoom) ||
+      livekitJoinStatus !== "idle" ||
+      Boolean(livekitJoinRequestId);
+
+    if (!viewerWasInLiveUi) return;
+    if (stopInProgressRef.current) return;
+
+    void stopConferenceSession();
+  }, [
+    isHost,
+    sessionActive,
+    livekitToken,
+    conferenceJoined,
+    viewerHasJoinedStream,
+    streamEventRef,
+    sessionRoom,
+    livekitJoinStatus,
+    livekitJoinRequestId,
+    stopConferenceSession,
+  ]);
 
 // Viewer UX: if a viewer joined before the host activated the session, we initially show a
 // "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
@@ -7666,6 +7721,13 @@ const modePillControls = (
                       if (sessionKind === "conference") setConferenceJoined(true);
                     }}
                     onDisconnected={() => {
+                      // If the host ends the session, viewers are kicked from the room.
+                      // Mirror the Stop button behavior so the viewer UI fully exits.
+                      if (!stopInProgressRef.current && !isHost) {
+                        void stopConferenceSession();
+                        return;
+                      }
+
                       setConferenceJoined(false);
                       setLivekitToken(null);
                       setLivekitRole(null);
@@ -7833,7 +7895,15 @@ const modePillControls = (
                 ) : liveProvider === "stream" ? (
                   sessionKind === "stream" && livekitHlsUrl ? (
                     <LiveKitHlsPlayer src={livekitHlsUrl} />
-                  ) : (
+                  ) : !(
+                      avatarStatus === "connecting" ||
+                      avatarStatus === "reconnecting" ||
+                      (avatarStatus === "waiting" &&
+                        !(liveProvider === "stream" &&
+                          sessionKind === "conference" &&
+                          livekitRole === "viewer" &&
+                          Boolean(livekitJoinRequestId)))
+                    ) ? (
                     <div
                       style={{
                         position: "absolute",
@@ -7861,7 +7931,7 @@ const modePillControls = (
                         ? "Press Play to start a session."
                         : "Host is offline."}
                     </div>
-                  )
+                  ) : null
                 ) : null}
 
 				{showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
@@ -7913,7 +7983,10 @@ const modePillControls = (
                         background: "#fff",
                       }}
                     >
-                      {messages.map((m, i) => {
+                      {(livekitUiActive
+                        ? messages.filter((x: any) => Boolean((x as any)?.meta?.liveChat))
+                        : messages.filter((x: any) => !Boolean((x as any)?.meta?.liveChat))
+                      ).map((m, i) => {
                         const meta: any = (m as any).meta;
                         const displayName =
                           meta?.liveChat && meta?.name
@@ -7935,7 +8008,9 @@ const modePillControls = (
                           </div>
                         );
                       })}
-                      {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
+                      {!livekitUiActive && loading ? (
+                        <div style={{ color: "#666" }}>Thinking…</div>
+                      ) : null}
                     </div>
 
                     <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>

@@ -6043,7 +6043,13 @@ async def livekit_admit(req: LiveKitJoinDecision):
     identity = f"user:{str(r.get('memberId') or '').strip() or rid}"
     name = str(r.get("name") or "").strip() or "Guest"
 
-    session_kind = str(mapping.get("session_kind") or "").strip().lower()
+    # IMPORTANT: Do NOT rely on _lookup_companion_mapping() for session_kind.
+    # That mapping is loaded once at startup; session_kind/session_room are updated in SQLite
+    # via _set_session_kind_room_best_effort(). For conference, viewers must be allowed to publish.
+    db_kind, _db_room = _read_session_kind_room(b, a)
+    session_kind = (db_kind or str(mapping.get("session_kind") or "")).strip().lower()
+    if session_kind not in ("conference", "stream"):
+        session_kind = "stream"
     can_publish = session_kind == "conference"
     token = _livekit_participant_token(room, identity=identity, name=name, can_publish=can_publish, can_subscribe=True)
 
@@ -6094,13 +6100,19 @@ async def livekit_join_request_status(requestId: str):
         r = _LIVEKIT_JOIN_REQUESTS.get(rid)
     if not r:
         return {"ok": True, "status": "MISSING", "serverUrl": _livekit_client_ws_url()}
+
+    # Derive the current session kind from the authoritative SQLite mapping table.
+    # (The in-memory mapping cache may be stale.)
+    b = (r.get("brand") or "").strip()
+    a = (r.get("avatar") or "").strip()
+    db_kind, _db_room = _read_session_kind_room(b, a)
     return {
         "ok": True,
         "status": r.get("status"),
         "token": r.get("token") or "",
         "serverUrl": _livekit_client_ws_url(),
         "roomName": r.get("roomName") or r.get("room") or "",
-        "sessionKind": r.get("session_kind") or "",
+        "sessionKind": (db_kind or r.get("session_kind") or ""),
         "identity": r.get("identity") or "",
         "name": r.get("name") or "",
         "displayName": r.get("name") or "",
