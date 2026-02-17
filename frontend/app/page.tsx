@@ -1164,6 +1164,20 @@ function LiveKitAutoPublish(props: {
 }
 
 
+// Shared button style used by the small Mic/Stop controls in the LiveKit section.
+const smallBtn: React.CSSProperties = {
+  borderRadius: 10,
+  padding: "8px 12px",
+  fontSize: 13,
+  fontWeight: 600,
+  lineHeight: "16px",
+  border: "1px solid rgba(0,0,0,0.18)",
+  cursor: "pointer",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
+};
 export default function Page() {
   // iOS detection (includes iPadOS 13+ which reports itself as "Macintosh")
   const isIOS = useMemo(() => {
