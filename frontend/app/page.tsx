@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import elaraLogo from "../public/elaralo-logo.png";
 
 
-import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio } from "@livekit/components-react";
+import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
@@ -1127,6 +1127,57 @@ function LiveKitStreamViewerStage() {
 }
 
 
+function LiveKitAutoPublish(props: {
+  enabled: boolean;
+  micEnabled: boolean;
+  cameraEnabled: boolean;
+  onError?: (msg: string) => void;
+}) {
+  const room = useRoomContext();
+  const lastRef = useRef<{ mic?: boolean; cam?: boolean }>({});
+
+  useEffect(() => {
+    if (!props.enabled) return;
+    const lp: any = (room as any)?.localParticipant;
+    if (!lp) return;
+    const desiredMic = Boolean(props.micEnabled);
+    if (lastRef.current.mic === desiredMic) return;
+    lastRef.current.mic = desiredMic;
+    Promise.resolve(lp.setMicrophoneEnabled(desiredMic)).catch((err: any) => {
+      props.onError?.(`Microphone error: ${String(err?.message || err)}`);
+    });
+  }, [room, props.enabled, props.micEnabled, props.onError]);
+
+  useEffect(() => {
+    if (!props.enabled) return;
+    const lp: any = (room as any)?.localParticipant;
+    if (!lp) return;
+    const desiredCam = Boolean(props.cameraEnabled);
+    if (lastRef.current.cam === desiredCam) return;
+    lastRef.current.cam = desiredCam;
+    Promise.resolve(lp.setCameraEnabled(desiredCam)).catch((err: any) => {
+      props.onError?.(`Camera error: ${String(err?.message || err)}`);
+    });
+  }, [room, props.enabled, props.cameraEnabled, props.onError]);
+
+  return null;
+}
+
+
+// Shared button style used by the small Mic/Stop controls in the LiveKit section.
+const smallBtn: React.CSSProperties = {
+  borderRadius: 10,
+  padding: "8px 12px",
+  fontSize: 13,
+  fontWeight: 600,
+  lineHeight: "16px",
+  border: "1px solid rgba(0,0,0,0.18)",
+  cursor: "pointer",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
+};
 export default function Page() {
   // iOS detection (includes iPadOS 13+ which reports itself as "Macintosh")
   const isIOS = useMemo(() => {
@@ -1997,6 +2048,7 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   
   const [livekitJoinStatus, setLivekitJoinStatus] = useState<"idle" | "pending" | "joined" | "error">("idle");
   const [livekitMicEnabled, setLivekitMicEnabled] = useState<boolean>(true);
+  const [livekitCameraEnabled, setLivekitCameraEnabled] = useState<boolean>(true);
   const [livekitServerUrl, setLivekitServerUrl] = useState<string>(String(LIVEKIT_URL || "").trim());
   // LiveKit session state
   const [sessionActive, setSessionActive] = useState<boolean>(false);
@@ -2540,6 +2592,7 @@ if (liveProvider === "stream") {
   setMessages([]);
   setLiveSharingNotice(null);
   setLivekitMicEnabled(true);
+  setLivekitCameraEnabled(true);
   liveChatSeenIdsRef.current = new Set();
   liveChatSeenOrderRef.current = [];
 
@@ -3800,10 +3853,18 @@ useEffect(() => {
 
       // HTTP fallback (stores message in room history + broadcasts to any connected sockets)
       try {
-        await fetch(`${API_BASE}/stream/livekit/livechat/${encodeURIComponent(eventRef)}`, {
+        const httpPayload = {
+          eventRef,
+          name: payload.from,
+          text: payload.text,
+          role: payload.role,
+          memberId: payload.userId,
+        };
+
+        await fetch(`${API_BASE}/stream/livekit/livechat/send`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(httpPayload),
         });
       } catch (e) {
         // ignore
@@ -3852,6 +3913,7 @@ const sanitizeRoomToken = useCallback((raw: string, maxLen = 128) => {
 const startConferenceSession = useCallback(async () => {
     setAvatarError(null);
     setLivekitMicEnabled(true);
+  setLivekitCameraEnabled(true);
 
 	    // Host: prime A/V permissions on the Play click (iOS/Safari requirement).
 	    // Viewers are subscribe-only for now, so we do NOT require mic/cam permissions to request access.
@@ -3908,6 +3970,15 @@ const startConferenceSession = useCallback(async () => {
       if (requestedRoom) {
         setSessionRoom(requestedRoom);
         setLivekitRoomName(requestedRoom);
+        setStreamEventRef(requestedRoom);
+      }
+
+      // Viewers must join with mic + camera (they can switch to listen-only after joining).
+      const granted = await requestLivekitAvPermissions({ audio: true, video: true, reason: "joining the private conference" });
+      if (!granted) {
+        setLivekitJoinStatus("idle");
+        setAvatarStatus("idle");
+        return;
       }
 
       // Clear any prior live-chat transcript for a clean join.
@@ -4015,6 +4086,7 @@ const startConferenceSession = useCallback(async () => {
       setSessionActive(true);
       setSessionRoom(room);
       setLivekitRoomName(room);
+      setStreamEventRef(room);
       setLivekitRole("host");
       setLivekitToken(token);
       setConferenceJoined(true);
@@ -7356,59 +7428,51 @@ const modePillControls = (
       
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
       {sttControls}
-	      {liveProvider === "stream" && isHost && sessionActive ? (
-	        <button
-	          type="button"
-	          onClick={() => {
-	            const next = !livekitMicEnabled;
-	            setLivekitMicEnabled(next);
-	            if (next) {
-	              // Ensure we have mic permission (Safari/iOS gating).
-	              void requestLivekitAvPermissions({
-	                audio: true,
-	                video: false,
-	                reason: "enabling the microphone",
-	              });
-	            }
-	          }}
-	          style={{
-	            width: 36,
-	            height: 36,
-	            borderRadius: 10,
-	            border: "1px solid #ddd",
-	            background: "#fff",
-	            color: "#111",
-	            display: "grid",
-	            placeItems: "center",
-	            cursor: "pointer",
-	            fontWeight: 700,
-	          }}
-	          aria-label={livekitMicEnabled ? "Mute microphone" : "Unmute microphone"}
-	          title={livekitMicEnabled ? "Mute microphone" : "Unmute microphone"}
-	        >
-	          {livekitMicEnabled ? <MicOnIcon /> : <MicOffIcon />}
-	        </button>
-	      ) : null}
-{liveProvider === "stream" && ((isHost && sessionActive) || (!isHost && viewerHasJoinedStream)) ? (
+	      {liveProvider === "stream" &&
+	        ((sessionKind === "conference" && Boolean(livekitToken)) ||
+	          (sessionKind === "stream" && isHost && sessionActive)) ? (
+	          <button
+	            type="button"
+	            onClick={async () => {
+	              const next = !livekitMicEnabled;
+	              if (next) {
+	                const ok = await requestLivekitAvPermissions({
+	                  audio: true,
+	                  video: sessionKind === "conference",
+	                  reason: "enabling microphone/camera",
+	                });
+	                if (!ok) return;
+	              }
+	              setLivekitMicEnabled(next);
+	              if (sessionKind === "conference") {
+	                setLivekitCameraEnabled(next);
+	              }
+	            }}
+	            style={{
+	              ...smallBtn,
+	              background: livekitMicEnabled ? "#1b5e20" : "#eee",
+	              color: livekitMicEnabled ? "#fff" : "#222",
+	            }}
+	            title={livekitMicEnabled ? "Mute Mic" : "Unmute Mic"}
+	          >
+	            🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
+	          </button>
+	        ) : null}
+{liveProvider === "stream" &&
+        ((isHost && sessionActive) ||
+          (!isHost &&
+            (viewerHasJoinedStream || conferenceJoined || livekitJoinStatus === "pending"))) ? (
         <button
           type="button"
           onClick={() => {
-            void stopLiveAvatar();
+            stopLiveAvatar();
           }}
           style={{
-            width: 36,
-            height: 36,
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            background: "#fff",
-            color: "#111",
-            display: "grid",
-            placeItems: "center",
-            cursor: "pointer",
-            fontWeight: 700,
+            ...smallBtn,
+            background: "#b00020",
+            color: "#fff",
           }}
-          aria-label={isHost ? "Stop live stream" : "Leave live stream"}
-          title={isHost ? "Stop live stream" : "Leave live stream"}
+          title={isHost ? "Stop live session" : "Leave session"}
         >
           <StopIcon />
         </button>
@@ -7481,9 +7545,9 @@ const modePillControls = (
                   <LiveKitRoom
                     token={livekitToken}
                     serverUrl={livekitServerUrl || LIVEKIT_URL}
-                    connect={true}
-	                    audio={isHost && livekitMicEnabled}
-	                    video={isHost}
+                    connect={Boolean(livekitToken)}
+	                    audio={sessionKind === "conference" ? livekitMicEnabled : isHost && livekitMicEnabled}
+	                    video={sessionKind === "conference" ? livekitCameraEnabled : isHost}
                     onConnected={() => {
 	                      // Host: once connected we treat the session as active.
 	                      if (isHost) setSessionActive(true);
@@ -7500,6 +7564,12 @@ const modePillControls = (
                     }}
                     style={{ width: "100%", height: "100%" }}
                   >
+                    <LiveKitAutoPublish
+                      enabled={sessionKind === "conference" || isHost}
+                      micEnabled={sessionKind === "conference" ? livekitMicEnabled : isHost && livekitMicEnabled}
+                      cameraEnabled={sessionKind === "conference" ? livekitCameraEnabled : isHost}
+                      onError={(msg) => setStreamNotice(msg)}
+                    />
                     {sessionKind === "stream" && livekitRole === "viewer" ? (
                       <LiveKitStreamViewerStage />
                     ) : (
@@ -8067,7 +8137,7 @@ const modePillControls = (
                             <LiveKitRoom
                               token={livekitToken}
                               serverUrl={livekitServerUrl || LIVEKIT_URL}
-                              connect={true}
+                              connect={Boolean(livekitToken)}
                               audio={true}
                               video={true}
                               style={{ width: "100%", height: "100%" }}
