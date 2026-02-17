@@ -3700,6 +3700,7 @@ useEffect(() => {
   // Dedup incoming chat messages (we echo-send to self).
   const liveChatSeenIdsRef = useRef<Set<string>>(new Set());
   const liveChatSeenOrderRef = useRef<string[]>([]);
+  const liveChatSkipNextHistoryRef = useRef<boolean>(false);
 
   const rememberLiveChatId = useCallback((id: string) => {
     const msgId = String(id || '').trim();
@@ -3835,6 +3836,11 @@ useEffect(() => {
 
         // History payload: { type: "history", messages: [...] }
         if (t === "history" && Array.isArray(payload?.messages)) {
+          if (liveChatSkipNextHistoryRef.current) {
+            // Keep the Live Sharing box blank when entering a session (Host clears history on entry).
+            liveChatSkipNextHistoryRef.current = false;
+            return;
+          }
           for (const m of payload.messages) appendLiveChatMessage(m);
           return;
         }
@@ -4007,6 +4013,9 @@ const sanitizeRoomToken = useCallback((raw: string, maxLen = 128) => {
 const startConferenceSession = useCallback(async () => {
     setAvatarError(null);
     setMessages([]); // Clear Live Sharing history on entry
+    liveChatSeenIdsRef.current = new Set();
+    liveChatSeenOrderRef.current = [];
+    liveChatSkipNextHistoryRef.current = true;
 
     setLivekitMicEnabled(true);
   setLivekitCameraEnabled(true);
@@ -7530,10 +7539,10 @@ const modePillControls = (
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
       {sttControls}
 	      {liveProvider === "stream" &&
-	        isHost &&
-	        ((sessionKind === "conference" && Boolean(livekitToken)) ||
-	          (sessionKind === "stream" && sessionActive)) ? (
-	          <button
+	        ((isHost &&
+	          ((sessionKind === "conference" && Boolean(livekitToken)) ||
+	            (sessionKind === "stream" && sessionActive))) ||
+	          (!isHost && sessionKind === "conference" && Boolean(livekitToken))) ? (	          <button
 	            type="button"
 	            onClick={async () => {
 	              const next = !livekitMicEnabled;
@@ -7648,8 +7657,8 @@ const modePillControls = (
                     token={livekitToken}
                     serverUrl={livekitServerUrl || LIVEKIT_URL}
                     connect={Boolean(livekitToken)}
-	                    audio={isHost && livekitMicEnabled}
-	                    video={isHost && (sessionKind === "conference" ? livekitCameraEnabled : true)}
+	                    audio={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
+	                    video={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                     onConnected={() => {
 	                      // Host: once connected we treat the session as active.
 	                      if (isHost) setSessionActive(true);
@@ -7667,9 +7676,9 @@ const modePillControls = (
                     style={{ width: "100%", height: "100%" }}
                   >
                     <LiveKitAutoPublish
-                      enabled={isHost}
-                      micEnabled={isHost && livekitMicEnabled}
-                      cameraEnabled={isHost && (sessionKind === "conference" ? livekitCameraEnabled : true)}
+                      enabled={sessionKind === "conference" ? true : isHost}
+                      micEnabled={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
+                      cameraEnabled={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                       onError={(msg) => setStreamNotice(msg)}
                     />
                     {livekitRole === "viewer" && (sessionKind === "stream" || sessionKind === "conference") ? (
