@@ -5,7 +5,7 @@ import elaraLogo from "../public/elaralo-logo.png";
 
 
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
-import { Track } from "livekit-client";
+import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
@@ -1181,31 +1181,78 @@ function LiveKitAutoPublish(props: {
   onError?: (msg: string) => void;
 }) {
   const room = useRoomContext();
+  const [roomConnected, setRoomConnected] = useState<boolean>(false);
   const lastRef = useRef<{ mic?: boolean; cam?: boolean }>({});
+
+  // Track connection state so mic/camera toggles reliably apply on the FIRST session.
+  // In some iframe/browser combos, calling setMicrophoneEnabled/setCameraEnabled before the
+  // Room is connected can throw, and if we "remember" the desired state too early we won't retry.
+  useEffect(() => {
+    const isConnectedNow = () => String((room as any)?.state ?? "").toLowerCase() === "connected";
+
+    const handleConnected = () => {
+      // Force a re-apply of mic/cam on every connect/reconnect.
+      lastRef.current = {};
+      setRoomConnected(true);
+    };
+    const handleDisconnected = () => {
+      setRoomConnected(false);
+    };
+
+    setRoomConnected(isConnectedNow());
+
+    try {
+      (room as any).on?.(RoomEvent.Connected, handleConnected);
+      (room as any).on?.(RoomEvent.Disconnected, handleDisconnected);
+      (room as any).on?.(RoomEvent.Reconnecting, handleDisconnected);
+      (room as any).on?.(RoomEvent.Reconnected, handleConnected);
+    } catch {
+      // no-op
+    }
+
+    return () => {
+      try {
+        (room as any).off?.(RoomEvent.Connected, handleConnected);
+        (room as any).off?.(RoomEvent.Disconnected, handleDisconnected);
+        (room as any).off?.(RoomEvent.Reconnecting, handleDisconnected);
+        (room as any).off?.(RoomEvent.Reconnected, handleConnected);
+      } catch {
+        // no-op
+      }
+    };
+  }, [room]);
 
   useEffect(() => {
     if (!props.enabled) return;
+    if (!roomConnected) return;
     const lp: any = (room as any)?.localParticipant;
     if (!lp) return;
     const desiredMic = Boolean(props.micEnabled);
     if (lastRef.current.mic === desiredMic) return;
-    lastRef.current.mic = desiredMic;
-    Promise.resolve(lp.setMicrophoneEnabled(desiredMic)).catch((err: any) => {
-      props.onError?.(`Microphone error: ${String(err?.message || err)}`);
-    });
-  }, [room, props.enabled, props.micEnabled, props.onError]);
+    Promise.resolve(lp.setMicrophoneEnabled(desiredMic))
+      .then(() => {
+        lastRef.current.mic = desiredMic;
+      })
+      .catch((err: any) => {
+        props.onError?.(`Microphone error: ${String(err?.message || err)}`);
+      });
+  }, [room, roomConnected, props.enabled, props.micEnabled, props.onError]);
 
   useEffect(() => {
     if (!props.enabled) return;
+    if (!roomConnected) return;
     const lp: any = (room as any)?.localParticipant;
     if (!lp) return;
     const desiredCam = Boolean(props.cameraEnabled);
     if (lastRef.current.cam === desiredCam) return;
-    lastRef.current.cam = desiredCam;
-    Promise.resolve(lp.setCameraEnabled(desiredCam)).catch((err: any) => {
-      props.onError?.(`Camera error: ${String(err?.message || err)}`);
-    });
-  }, [room, props.enabled, props.cameraEnabled, props.onError]);
+    Promise.resolve(lp.setCameraEnabled(desiredCam))
+      .then(() => {
+        lastRef.current.cam = desiredCam;
+      })
+      .catch((err: any) => {
+        props.onError?.(`Camera error: ${String(err?.message || err)}`);
+      });
+  }, [room, roomConnected, props.enabled, props.cameraEnabled, props.onError]);
 
   return null;
 }
@@ -3949,6 +3996,13 @@ useEffect(() => {
 
         // History payload: { type: "history", messages: [...] }
         if (t === "history" && Array.isArray(payload?.messages)) {
+          // For Live Private Conference we always start with a blank Live Sharing box.
+          // Do not replay persisted history when a participant is admitted or reconnects.
+          if (sessionKind === "conference") {
+            liveChatSkipNextHistoryRef.current = false;
+            return;
+          }
+
           if (liveChatSkipNextHistoryRef.current) {
             // Keep the Live Sharing box blank when entering a session (Host clears history on entry).
             liveChatSkipNextHistoryRef.current = false;
@@ -5400,11 +5454,11 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     if (uploadingAttachment) return;
     if (!rawText && !hasAttachment) return;
 
-    // Hard rule: no attachments during Shared Live streaming.
-    if ((uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
-      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
-      return;
-    }
+	    // Hard rule: no attachments during Live Stream sessions.
+	    if (sessionKind === "stream" && (uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
+	      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
+	      return;
+	    }
 
     // If the user clears messages mid-flight, we "invalidate" any in-progress send()
     // so the assistant reply doesn't append into a cleared chat.
@@ -7132,8 +7186,12 @@ const hostInStreamUi =
     avatarStatus === "reconnecting");
 
 const viewerInStreamUi = viewerHasJoinedStream;
-	const attachmentButtonDisabled =
-	  loading || uploadingAttachment || uploadsDisabled || hostInStreamUi || viewerInStreamUi;
+		// Attachments are disabled during Live Stream sessions, but should remain enabled for Live Private Conference.
+		const attachmentButtonDisabled =
+		  loading ||
+		  uploadingAttachment ||
+		  uploadsDisabled ||
+		  (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
 
 useEffect(() => {
   // Viewer STT must be disabled while in the LegacyStream stream UI to avoid transcribing the host audio.
