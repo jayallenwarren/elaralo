@@ -2217,15 +2217,17 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   //  - split: show both participants side-by-side
   //  - focus: show only the *other* participant full-frame
   const [conferenceViewMode, setConferenceViewMode] = useState<"split" | "focus">("split");
-  useEffect(() => {
-    // Always reset when leaving private conference.
-    if (sessionKind !== "conference") setConferenceViewMode("split");
-  }, [sessionKind]);
 
   const [livekitServerUrl, setLivekitServerUrl] = useState<string>(String(LIVEKIT_URL || "").trim());
   // LiveKit session state
   const [sessionActive, setSessionActive] = useState<boolean>(false);
   const [sessionKind, setSessionKind] = useState<SessionKind>("");
+
+  useEffect(() => {
+    // Always reset when leaving private conference.
+    if (sessionKind !== "conference") setConferenceViewMode("split");
+  }, [sessionKind]);
+
   const [sessionRoom, setSessionRoom] = useState<string>("");
   useEffect(() => {
     sessionActiveRef.current = sessionActive;
