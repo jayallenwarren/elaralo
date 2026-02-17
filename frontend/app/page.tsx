@@ -3764,21 +3764,37 @@ useEffect(() => {
 
     ws.onmessage = (evt) => {
       try {
-        const payload = JSON.parse(evt.data);
-        if (payload?.type === "history" && Array.isArray(payload.messages)) {
+        const payload: any = JSON.parse(String((evt as any).data || "{}"));
+        const t = String(payload?.type || "").toLowerCase();
+
+        // History payload: { type: "history", messages: [...] }
+        if (t === "history" && Array.isArray(payload?.messages)) {
           for (const m of payload.messages) appendLiveChatMessage(m);
           return;
         }
-        if (payload?.type === "message") {
-          appendLiveChatMessage(payload.message || payload);
+
+        // Individual message payloads are typically { type: "chat", ... }.
+        // Some legacy senders may use { type: "message", message: {...} }.
+        if (t === "chat" || t === "message" || t === "") {
+          const inner: any =
+            t === "message" && payload?.message && typeof payload.message === "object" ? payload.message : payload;
+
+          const textVal =
+            inner && typeof inner === "object" ? inner.text ?? inner.message ?? inner.content : undefined;
+
+          if (textVal != null && String(textVal).trim()) {
+            appendLiveChatMessage(
+              inner && typeof inner === "object" ? { ...inner, text: String(textVal) } : { text: String(textVal) }
+            );
+          }
           return;
         }
+
         // ignore other message types
       } catch {
         // ignore parse errors
       }
     };
-
     ws.onclose = () => {
       if (liveChatWsRef.current === ws) {
         liveChatWsRef.current = null;
