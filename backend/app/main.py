@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 
 from filelock import FileLock  # type: ignore
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends, Body
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends, Body, Query
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
@@ -68,7 +68,12 @@ app = FastAPI(title="Elaralo API")
 # You can override via environment variables:
 #   COMPANION_MAPPINGS_SOURCE=/path/to/sqlite.db
 #   COMPANION_MAPPINGS_TABLE=companion_mappings
-_COMPANION_MAPPINGS_SOURCE = (os.getenv("COMPANION_MAPPINGS_SOURCE") or "/home/site/voice_video_mappings.sqlite").strip()
+_COMPANION_MAPPINGS_SOURCE = (
+    os.getenv("COMPANION_MAPPINGS_SOURCE")
+    or os.getenv("VOICE_VIDEO_DB_PATH")
+    or os.getenv("VOICE_VIDEO_MAPPINGS_DB_PATH")
+    or "/home/site/voice_video_mappings.sqlite"
+).strip()
 _COMPANION_MAPPINGS_TABLE = (os.getenv("COMPANION_MAPPINGS_TABLE") or "companion_mappings").strip() or "companion_mappings"
 
 # Optional in-memory overrides (highest priority). Supports either nested dict:
@@ -1914,6 +1919,34 @@ def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str,
         if (brand or "").strip().lower() == "dulcemoon" and (avatar or "").strip().lower().startswith("dulce"):
             host = DULCE_HOST_MEMBER_ID_FALLBACK
     return host
+
+
+# -------- Companion mapping API (frontend compatibility) --------
+@app.get("/mappings/companion")
+def get_companion_mapping(brand: str = Query(..., min_length=1), avatar: str = Query(..., min_length=1)):
+    """Return the resolved companion mapping used by the /companion page.
+
+    This endpoint intentionally returns HTTP 200 for both found and not-found cases.
+    The frontend relies on the `found` boolean instead of HTTP status for UX.
+    """
+    try:
+        mapping = _lookup_companion_mapping(brand, avatar) or {}
+    except Exception:
+        mapping = {}
+
+    # Normalize to the shape expected by page.tsx.
+    out = dict(mapping) if isinstance(mapping, dict) else {}
+    out.update({
+        "found": bool(mapping),
+        "brand": str(brand),
+        "avatar": str(avatar),
+        # Common fields the frontend reads directly
+        "channel_cap": str((mapping or {}).get("channel_cap") or (mapping or {}).get("channelCap") or ""),
+        "live": str((mapping or {}).get("live") or (mapping or {}).get("live_url") or (mapping or {}).get("liveUrl") or ""),
+        "didClientKey": str((mapping or {}).get("did_client_key") or (mapping or {}).get("didClientKey") or ""),
+        "companion_type": str((mapping or {}).get("companion_type") or (mapping or {}).get("companionType") or ""),
+    })
+    return out
 
 def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> bool:
     """Try to persist event_ref into the companion_mappings SQLite DB (if writable). Always updates in-memory mapping."""
