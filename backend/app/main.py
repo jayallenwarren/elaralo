@@ -11,7 +11,7 @@ import mimetypes
 import asyncio
 import threading
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set, Mapping
 
 # Pydantic (v1/v2 compatibility)
 try:
@@ -61,6 +61,9 @@ app = FastAPI(title="Elaralo API")
 # WIX FORM
 # ----------------------------
 WIX_API_KEY = (os.getenv("WIX_API_KEY", "") or "").strip()
+WIX_WEBHOOK_PUBLIC_KEY = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY", "") or "").strip()
+WIX_WEBHOOK_REQUIRE_SIGNATURE = ((os.getenv("WIX_WEBHOOK_REQUIRE_SIGNATURE", "true") or "true").strip().lower() in ("1","true","yes","y"))
+
 
 def require_wix_api_key(x_api_key: str | None = Header(default=None, alias="x-api-key")) -> None:
     if not WIX_API_KEY:
@@ -252,11 +255,471 @@ import logging
 logger = logging.getLogger("wix")
 logger.setLevel(logging.INFO)
 
-@app.post("/wix-form")
-async def wix_form(payload: dict, _auth: None = Depends(require_wix_api_key)):
-    logger.info("RAW WIX PAYLOAD:\n%s", json.dumps(payload, indent=2))
-    return {"ok": True}
+def _as_pem_public_key(maybe_pem_or_b64: str) -> str:
+    """
+    Wix supplies an RSA public key. In env vars, we may store either:
+      - a PEM string with BEGIN/END lines, OR
+      - a base64 DER string without PEM armor.
 
+    This normalizes to PEM for PyJWT.
+    """
+    key = (maybe_pem_or_b64 or "").strip()
+    if not key:
+        return ""
+    if "BEGIN PUBLIC KEY" in key:
+        return key
+    # Remove whitespace/newlines and wrap at 64 chars.
+    compact = re.sub(r"\s+", "", key)
+    lines = [compact[i : i + 64] for i in range(0, len(compact), 64)]
+    return "-----BEGIN PUBLIC KEY-----\n" + "\n".join(lines) + "\n-----END PUBLIC KEY-----\n"
+
+
+def _verify_wix_webhook_digest(headers: Mapping[str, str], raw_body: bytes) -> Optional[dict]:
+    """
+    Verify Wix request authenticity using the `digest` header.
+
+    Wix sends:
+      - HTTP header `digest`: a JWT signed with Wix's private key
+      - JWT payload contains data.SHA256 of the raw request body
+    """
+    if not WIX_WEBHOOK_PUBLIC_KEY:
+        return None
+
+    if jwt is None:
+        raise HTTPException(status_code=500, detail="PyJWT is required to verify Wix webhooks (missing dependency).")
+
+    token = headers.get("digest") or headers.get("Digest") or headers.get("x-wix-digest") or headers.get("X-Wix-Digest")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing Wix digest header")
+
+    # Some environments prepend a scheme (e.g., "JWT <token>"); keep the last token-looking chunk.
+    token = (token or "").strip().split()[-1]
+
+    public_key_pem = _as_pem_public_key(WIX_WEBHOOK_PUBLIC_KEY)
+
+    try:
+        decoded = jwt.decode(
+            token,
+            public_key_pem,
+            algorithms=["RS256"],
+            options={"verify_aud": False},
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Wix digest signature")
+
+    expected_hash = None
+    if isinstance(decoded, dict):
+        data = decoded.get("data") if isinstance(decoded.get("data"), dict) else {}
+        expected_hash = data.get("SHA256") or data.get("sha256")
+
+    if expected_hash:
+        actual_hash = hashlib.sha256(raw_body or b"").hexdigest()
+        if str(actual_hash).lower() != str(expected_hash).lower():
+            raise HTTPException(status_code=401, detail="Webhook body hash mismatch")
+
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _safe_wix_summary(payload: Any) -> str:
+    """
+    Return a compact summary string for logs that avoids dumping the full webhook.
+    """
+    try:
+        # Best-effort extraction of a few useful fields.
+        payment_id = _deep_find_first_key(payload, {"paymentid", "linkpaymentid", "transactionid", "chargeid", "id"})
+        status = _deep_find_first_key(payload, {"paymentstatus", "status", "state"})
+        email = _deep_find_first_key(payload, {"email", "buyeremail", "customeremail", "payeremail"})
+        member_id = _deep_find_first_key(payload, {"memberid", "member_id"})
+        return f"payment_id={payment_id} status={status} email={email} memberId={member_id}"
+    except Exception:
+        return "unavailable"
+
+
+def _deep_find_first_key(obj: Any, keys_lower: set) -> Optional[Any]:
+    """
+    Recursively search dict/list for the first occurrence of any key in `keys_lower` (case-insensitive).
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            try:
+                if str(k).lower() in keys_lower:
+                    # Ignore empty strings
+                    if isinstance(v, str) and not v.strip():
+                        continue
+                    return v
+            except Exception:
+                pass
+            found = _deep_find_first_key(v, keys_lower)
+            if found is not None:
+                return found
+    if isinstance(obj, list):
+        for item in obj:
+            found = _deep_find_first_key(item, keys_lower)
+            if found is not None:
+                return found
+    return None
+
+
+def _extract_paid_status(payload: Any) -> Optional[str]:
+    # Prefer paymentStatus if present.
+    v = _deep_find_first_key(payload, {"paymentstatus", "payment_status"})
+    if v is None:
+        v = _deep_find_first_key(payload, {"status"})
+    if v is None:
+        v = _deep_find_first_key(payload, {"state"})
+    if v is None:
+        return None
+    return str(v)
+
+
+def _is_paid_status(status: Optional[str]) -> bool:
+    if not status:
+        return False
+    s = str(status).strip().upper()
+    return s in {
+        "PAID",
+        "SUCCESS",
+        "SUCCESSFUL",
+        "SUCCEEDED",
+        "COMPLETED",
+        "COMPLETE",
+        "APPROVED",
+        "CAPTURED",
+        "CONFIRMED",
+        "SETTLED",
+    }
+
+
+def _extract_payment_id(payload: Any) -> Optional[str]:
+    # Prefer explicit payment identifiers.
+    for keys in [
+        {"paymentid", "payment_id"},
+        {"linkpaymentid", "link_payment_id"},
+        {"transactionid", "transaction_id"},
+        {"chargeid", "charge_id"},
+        {"entityid", "entity_id"},
+    ]:
+        v = _deep_find_first_key(payload, keys)
+        if v is not None:
+            return str(v)
+    # Fall back to a generic id (last resort).
+    v = _deep_find_first_key(payload, {"id"})
+    return str(v) if v is not None else None
+
+
+def _extract_member_id(payload: Any) -> Optional[str]:
+    v = _deep_find_first_key(payload, {"memberid", "member_id"})
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _extract_email(payload: Any) -> Optional[str]:
+    v = _deep_find_first_key(payload, {"email", "buyeremail", "customeremail", "payeremail"})
+    if v is None:
+        return None
+    s = str(v).strip()
+    if "@" not in s:
+        return None
+    return s
+
+
+def _paygo_intent_register(email: str, identity_key: str, member_id: str, brand_key: str = "") -> None:
+    email_lc = (email or "").strip().lower()
+    if not email_lc:
+        return
+
+    path = PAYG_INTENTS_PATH
+    now_ts = time.time()
+
+    with FileLock(path + ".lock"):
+        data = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+
+        by_email = data.get("by_email") if isinstance(data.get("by_email"), dict) else {}
+        # Prune expired
+        ttl_seconds = max(1, int(PAYG_INTENT_TTL_HOURS)) * 3600
+        pruned = {}
+        for k, rec in by_email.items():
+            try:
+                ts = float(rec.get("ts", 0))
+                if now_ts - ts <= ttl_seconds:
+                    pruned[k] = rec
+            except Exception:
+                continue
+
+        pruned[email_lc] = {
+            "identity_key": identity_key,
+            "member_id": member_id,
+            "brand_key": brand_key,
+            "ts": now_ts,
+        }
+
+        data["by_email"] = pruned
+        data["updated_at"] = now_ts
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+
+def _paygo_intent_lookup(email: str) -> Optional[dict]:
+    email_lc = (email or "").strip().lower()
+    if not email_lc:
+        return None
+
+    path = PAYG_INTENTS_PATH
+    now_ts = time.time()
+
+    with FileLock(path + ".lock"):
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except Exception:
+            return None
+
+        by_email = data.get("by_email") if isinstance(data.get("by_email"), dict) else {}
+        rec = by_email.get(email_lc)
+        if not rec:
+            return None
+
+        # TTL check
+        ttl_seconds = max(1, int(PAYG_INTENT_TTL_HOURS)) * 3600
+        try:
+            ts = float(rec.get("ts", 0))
+            if now_ts - ts > ttl_seconds:
+                # expired
+                by_email.pop(email_lc, None)
+                data["by_email"] = by_email
+                data["updated_at"] = now_ts
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                return None
+        except Exception:
+            return None
+
+        return rec
+
+
+def _paygo_processed_is_seen(payment_id: str) -> bool:
+    pid = (payment_id or "").strip()
+    if not pid:
+        return False
+
+    path = PAYG_PROCESSED_PAYMENTS_PATH
+    with FileLock(path + ".lock"):
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except Exception:
+            return False
+
+        seen = data.get("seen") if isinstance(data.get("seen"), dict) else {}
+        return pid in seen
+
+
+def _paygo_processed_mark(payment_id: str, identity_key: str, status: str, meta: Optional[dict] = None) -> None:
+    pid = (payment_id or "").strip()
+    if not pid:
+        return
+
+    path = PAYG_PROCESSED_PAYMENTS_PATH
+    now_ts = time.time()
+
+    with FileLock(path + ".lock"):
+        data = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+
+        seen = data.get("seen") if isinstance(data.get("seen"), dict) else {}
+        seen[pid] = {
+            "identity_key": identity_key,
+            "status": status,
+            "ts": now_ts,
+            **(meta or {}),
+        }
+        data["seen"] = seen
+        data["updated_at"] = now_ts
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+
+def _process_wix_paygo_webhook(payload: Any) -> dict:
+    """
+    Best-effort crediting:
+      1) Identify whether the webhook indicates a successful payment.
+      2) Resolve identity_key:
+          - Prefer explicit memberId in the webhook (members).
+          - Else use payer email to look up a previously registered PayGo intent (non-members).
+      3) Idempotently credit minutes (avoid duplicates).
+    """
+    status = _extract_paid_status(payload)
+    if not _is_paid_status(status):
+        return {"credited": False, "reason": "not_paid", "status": status}
+
+    payment_id = _extract_payment_id(payload) or ""
+    if payment_id and _paygo_processed_is_seen(payment_id):
+        return {"credited": False, "reason": "already_processed", "payment_id": payment_id, "status": status}
+
+    member_id = _extract_member_id(payload)
+    email = None
+    identity_key = None
+    resolved_via = None
+
+    if member_id:
+        identity_key = f"member::{member_id}"
+        resolved_via = "memberId"
+    else:
+        email = _extract_email(payload)
+        if email:
+            rec = _paygo_intent_lookup(email)
+            if rec and rec.get("identity_key"):
+                identity_key = str(rec["identity_key"])
+                resolved_via = "email_intent"
+                member_id = str(rec.get("member_id") or "") or None
+
+    if not identity_key:
+        return {
+            "credited": False,
+            "reason": "no_identity",
+            "payment_id": payment_id,
+            "status": status,
+            "email": email,
+            "member_id": member_id,
+        }
+
+    minutes = float(PAYG_INCREMENT_MINUTES)
+
+    # Credit minutes (synchronous, uses usage store file lock internally).
+    _usage_credit_minutes_sync(identity_key=identity_key, minutes=minutes, reason="paygo_topup", source="wix_webhook")
+
+    if payment_id:
+        _paygo_processed_mark(payment_id=payment_id, identity_key=identity_key, status=str(status), meta={"resolved_via": resolved_via})
+
+    return {
+        "credited": True,
+        "minutes": minutes,
+        "identity_key": identity_key,
+        "payment_id": payment_id,
+        "status": status,
+        "resolved_via": resolved_via,
+    }
+
+
+@app.post("/wix-form")
+async def wix_form(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+):
+    """
+    Wix webhook receiver (Get Paid / Payment Links).
+
+    - Verifies request authenticity using Wix `digest` header + your `WIX_WEBHOOK_PUBLIC_KEY` (recommended).
+    - Falls back to legacy `X-Api-Key: WIX_API_KEY` auth if signature is missing/disabled.
+
+    Primary purpose: recognize successful PayGo payments and credit minutes immediately.
+    """
+    raw = await request.body()
+
+    # 1) Verify Wix signature (preferred) OR legacy API key (fallback for manual testing).
+    sig_verified = False
+    sig_error: Optional[str] = None
+
+    digest_present = bool(
+        request.headers.get("digest")
+        or request.headers.get("Digest")
+        or request.headers.get("x-wix-digest")
+        or request.headers.get("X-Wix-Digest")
+    )
+
+    if WIX_WEBHOOK_PUBLIC_KEY and digest_present:
+        try:
+            _verify_wix_webhook_digest(request.headers, raw)
+            sig_verified = True
+        except HTTPException as e:
+            sig_error = str(e.detail)
+            sig_verified = False
+
+    if not sig_verified:
+        # If signature is required, do NOT allow API-key fallback when a digest was present but invalid.
+        if WIX_WEBHOOK_PUBLIC_KEY and WIX_WEBHOOK_REQUIRE_SIGNATURE:
+            raise HTTPException(status_code=401, detail=f"Webhook not authenticated ({sig_error or 'missing/invalid signature'})")
+
+        # Legacy fallback for manual testing only (no Wix digest provided).
+        if WIX_API_KEY:
+            require_wix_api_key(x_api_key)
+        else:
+            raise HTTPException(status_code=401, detail="Webhook not authenticated (no signature and no api key)")
+
+    # 2) Parse JSON body.
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:
+        payload = {}
+
+    logger.info("WIX WEBHOOK received (sig=%s): %s", "ok" if sig_verified else "api-key/none", _safe_wix_summary(payload))
+
+    # 3) Attempt to credit minutes for paid events (idempotent).
+    result = _process_wix_paygo_webhook(payload)
+
+    # Keep a small breadcrumb for troubleshooting (no PII beyond what Wix already sends).
+    try:
+        logger.info("WIX PAYGO result: %s", result)
+    except Exception:
+        pass
+
+    return {"ok": True, **result}
+
+
+class PayGoIntentIn(BaseModel):
+    email: Optional[str] = None
+    memberId: Optional[str] = None
+    brandKey: Optional[str] = None
+
+
+@app.post("/paygo/intent")
+async def paygo_intent(payload: PayGoIntentIn):
+    """
+    Register a short-lived "intent" so we can map a Wix Pay Link payment (by payer email)
+    back to the correct identity_key in our usage store.
+
+    Use case:
+      - Members: usually credited via memberId found in webhook payload.
+      - Non-members: ask for email once, then store mapping email -> member::{anon_member_id}.
+
+    This endpoint does NOT credit minutes. Credit happens only after a verified Wix webhook arrives.
+    """
+    email = (payload.email or "").strip()
+    member_id = (payload.memberId or "").strip()
+    brand_key = (payload.brandKey or "").strip()
+
+    if not member_id:
+        return {"ok": True, "saved": False, "reason": "missing_memberId"}
+
+    identity_key = f"member::{member_id}"
+
+    if not email:
+        return {"ok": True, "saved": False, "reason": "missing_email", "identity_key": identity_key}
+
+    _paygo_intent_register(email=email, identity_key=identity_key, member_id=member_id, brand_key=brand_key)
+
+    return {"ok": True, "saved": True, "identity_key": identity_key}
 
 @app.post("/usage/credit")
 async def usage_credit(request: Request):
@@ -362,7 +825,11 @@ USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PE
 # Pay links (shown to the user when minutes are exhausted)
 UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
 PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
-PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 60)
+PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", _env_int("WIX_PAYLINK_TOPUP_MINUTES", 60))  # alias
+PAYG_INTENT_TTL_HOURS = _env_int("PAYG_INTENT_TTL_HOURS", 24)
+PAYG_INTENTS_PATH = (os.getenv("PAYG_INTENTS_PATH", "/home/elaralo_paygo_intents.json") or "/home/elaralo_paygo_intents.json").strip()
+PAYG_PROCESSED_PAYMENTS_PATH = (os.getenv("PAYG_PROCESSED_PAYMENTS_PATH", "/home/elaralo_paygo_processed_payments.json") or "/home/elaralo_paygo_processed_payments.json").strip()
+
 
 # Base Pay-As-You-Go price (e.g., "$4.99"). If PAYG_PRICE_TEXT is not set, we derive it as:
 #   "<PAYG_PRICE> per <PAYG_INCREMENT_MINUTES> minutes"

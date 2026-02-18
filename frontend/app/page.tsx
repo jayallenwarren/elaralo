@@ -1687,7 +1687,67 @@ export default function Page() {
     const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
     const upgradeKey = rebrandingInfo?.upgradeLink ? stripScheme(rebrandingInfo.upgradeLink).toLowerCase() : "";
 
-    const renderTextWithLinks = (text: string, isAssistant: boolean): React.ReactNode => {
+        // PayGo: register a short-lived email -> identity mapping so Wix webhooks can credit minutes immediately.
+    const registerPayGoIntent = async (payerEmail: string) => {
+      const email = (payerEmail || "").trim();
+      if (!email) return;
+
+      try {
+        if (!API_BASE) return;
+
+        await fetch(`${API_BASE}/paygo/intent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email,
+            memberId: memberIdForLiveChat,
+            brandKey: brandKeyForAnon,
+          }),
+        });
+      } catch (err) {
+        console.warn("PayGo intent registration failed:", err);
+      }
+    };
+
+    const handlePayGoLinkClick = async (href: string) => {
+      const isSiteMember = Boolean(memberId) && !isAnonMemberId(memberIdForLiveChat);
+
+      if (!isSiteMember) {
+        const storageKey = `paygo_email::${brandKeyForAnon || "default"}`;
+        let email = "";
+
+        try {
+          email = (localStorage.getItem(storageKey) || "").trim();
+        } catch {
+          // ignore
+        }
+
+        if (!email) {
+          const entered = window.prompt("Please enter your email to receive your top-up minutes instantly after payment.") || "";
+          email = entered.trim();
+          if (email) {
+            try {
+              localStorage.setItem(storageKey, email);
+            } catch {
+              // ignore
+            }
+          }
+        }
+
+        if (email) {
+          await registerPayGoIntent(email);
+        } else {
+          const proceed = window.confirm(
+            "Without an email, we may not be able to automatically apply PayGo minutes. Continue to payment?"
+          );
+          if (!proceed) return;
+        }
+      }
+
+      window.open(href, "_blank", "noopener,noreferrer");
+    };
+
+const renderTextWithLinks = (text: string, isAssistant: boolean): React.ReactNode => {
       const urlGlobal = /(https?:\/\/[^\s]+|\/\/[^\s]+)/g;
       const parts = (text || "").split(urlGlobal);
 
@@ -1718,6 +1778,14 @@ export default function Page() {
               href={href}
               target="_blank"
               rel="noopener noreferrer"
+              onClick={
+                normalizedUrl === payGoLink
+                  ? (e) => {
+                      e.preventDefault();
+                      void handlePayGoLinkClick(href);
+                    }
+                  : undefined
+              }
               style={{ textDecoration: "underline" }}
             >
               {label}
