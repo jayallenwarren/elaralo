@@ -1,10 +1,6 @@
-# main_V33_2026-02-18.py
-# Drop-in backend code for elaralo-api-01 (FastAPI)
-
 from __future__ import annotations
 
 import os
-import shutil
 import time
 import re
 import uuid
@@ -19,13 +15,13 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 # Pydantic (v1/v2 compatibility)
 try:
-    from pydantic import BaseModel, validator, Field  # type: ignore
+    from pydantic import BaseModel, validator  # type: ignore
 except Exception:  # pragma: no cover
-    from pydantic.v1 import BaseModel, validator, Field  # type: ignore
+    from pydantic.v1 import BaseModel, validator  # type: ignore
 
 from filelock import FileLock  # type: ignore
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends, Body, Query
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends, Body
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
@@ -60,140 +56,33 @@ STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
 app = FastAPI(title="Elaralo API")
-# ---------------------------------------------------------------------------
-# Companion mappings (brand/avatar -> companion_id)
-# ---------------------------------------------------------------------------
-# The companion mapping database is expected to be present on the filesystem.
-# Default path matches the deployed DB location used by ops (/home/site/voice_video_mappings.sqlite).
-# You can override via environment variables:
-#   COMPANION_MAPPINGS_SOURCE=/path/to/sqlite.db
-#   COMPANION_MAPPINGS_TABLE=companion_mappings
-_COMPANION_MAPPINGS_SOURCE = (
-    os.getenv("COMPANION_MAPPINGS_SOURCE")
-    or os.getenv("VOICE_VIDEO_DB_PATH")
-    or os.getenv("VOICE_VIDEO_MAPPINGS_DB_PATH")
-    or "/home/site/voice_video_mappings.sqlite"
-).strip()
-_COMPANION_MAPPINGS_TABLE = (os.getenv("COMPANION_MAPPINGS_TABLE") or "companion_mappings").strip() or "companion_mappings"
-
-# Optional in-memory overrides (highest priority). Supports either nested dict:
-#   {brand: {avatar: companion_id}}
-# or flat dict with "brand:avatar" keys.
-_COMPANION_MAPPINGS: dict = {}
-
-def _ensure_writable_db_copy(src_path: str) -> str:
-    """Ensure we have a writable copy of the sqlite DB.
-
-    Azure App Service builds typically live under /home/site/wwwroot (read-only at runtime).
-    If the DB lives there, copy it to /tmp and use that path for connections.
-    """
-    if not src_path:
-        return src_path
-    src_path = str(src_path)
-    try:
-        if not os.path.exists(src_path):
-            return src_path
-        # Only copy if source is likely read-only.
-        if not src_path.startswith("/home/site/wwwroot"):
-            return src_path
-        dst_path = os.path.join("/tmp", os.path.basename(src_path))
-        try:
-            src_mtime = os.path.getmtime(src_path)
-            dst_mtime = os.path.getmtime(dst_path) if os.path.exists(dst_path) else -1
-            if dst_mtime >= src_mtime:
-                return dst_path
-        except Exception:
-            # If stat fails, just attempt a copy.
-            pass
-        shutil.copy2(src_path, dst_path)
-        return dst_path
-    except Exception:
-        # Fall back to original path; sqlite open will raise if it truly cannot.
-        return src_path
-
 
 # ----------------------------
 # WIX FORM
 # ----------------------------
 WIX_API_KEY = (os.getenv("WIX_API_KEY", "") or "").strip()
-WIX_APP_ID = (os.getenv("WIX_APP_ID", "") or "").strip()
-WIX_APP_SECRET = (os.getenv("WIX_APP_SECRET", "") or "").strip()
-WIX_WEBHOOK_PUBLIC_KEY = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY", "") or "").strip()
 
-
-async def require_wix_api_key(
-    request: Request,
-    x_api_key: str | None = Header(default=None, alias="x-api-key"),
-    digest: str | None = Header(default=None, alias="digest"),
-    authorization: str | None = Header(default=None, alias="authorization"),
-) -> None:
-    """Auth guard for Wix -> backend webhooks.
-
-    Accepts either:
-      1) A shared `x-api-key` header (configure this in the Wix webhook subscription), OR
-      2) A Wix-signed JWT (RS256) found in:
-         - `digest` header (some Wix webhook setups),
-         - `Authorization` header, or
-         - request JSON body field `data` (standard Wix REST webhook format).
-
-    On success, sets:
-      - request.state.wix_verified = True
-      - request.state.wix_auth_method = "x-api-key" | "jwt"
-    """
-
-    request.state.wix_verified = False
-    request.state.wix_auth_method = None
-
-    expected = (os.getenv("WIX_API_KEY") or "").strip()
-    if expected and x_api_key and x_api_key == expected:
-        request.state.wix_verified = True
-        request.state.wix_auth_method = "x-api-key"
-        return
-
-    pub_raw = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY") or "").strip()
-    if not pub_raw:
+def require_wix_api_key(x_api_key: str | None = Header(default=None, alias="x-api-key")) -> None:
+    if not WIX_API_KEY:
+        # Env var not configured in Azure App Service
+        raise HTTPException(status_code=500, detail="WIX_API_KEY is not configured")
+    if not x_api_key or x_api_key != WIX_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Build PEM if needed.
-    if "-----BEGIN" not in pub_raw:
-        pub_pem = "-----BEGIN PUBLIC KEY-----\n" + pub_raw.strip() + "\n-----END PUBLIC KEY-----\n"
-    else:
-        pub_pem = pub_raw
 
-    candidates: list[str] = []
-    for v in (digest, authorization):
-        if not v:
-            continue
-        vv = v.strip()
-        if vv.lower().startswith("bearer "):
-            vv = vv[7:].strip()
-        candidates.append(vv)
+# ----------------------------
+# CORS
+# ----------------------------
+# CORS_ALLOW_ORIGINS can be:
+#   - comma-separated list of exact origins (e.g. https://elaralo.com,https://www.elaralo.com)
+#   - entries with wildcards (e.g. https://*.azurestaticapps.net)
+#   - or a single "*" to allow all (NOT recommended for production)
+cors_env = (
+    os.getenv("CORS_ALLOW_ORIGINS", "")
+    or getattr(settings, "CORS_ALLOW_ORIGINS", None)
+    or ""
+).strip()
 
-    # Try to pull JWT from JSON body (common Wix webhook format: {"data": "<jwt>"}).
-    try:
-        body = await request.body()
-        if body:
-            parsed = json.loads(body.decode("utf-8"))
-            if isinstance(parsed, dict):
-                data = parsed.get("data")
-                if isinstance(data, str):
-                    candidates.append(data.strip())
-    except Exception:
-        # Ignore parse errors; we’ll fall back to headers.
-        pass
-
-    for token in candidates:
-        if not token or token.count(".") < 2:
-            continue
-        try:
-            jwt.decode(token, pub_pem, algorithms=["RS256"], options={"verify_aud": False})
-            request.state.wix_verified = True
-            request.state.wix_auth_method = "jwt"
-            return
-        except Exception:
-            continue
-
-    raise HTTPException(status_code=401, detail="Unauthorized")
 def _split_cors_origins(raw: str) -> list[str]:
     """Split + normalize CORS origins from an env var.
 
@@ -229,8 +118,6 @@ def _wildcard_to_regex(pattern: str) -> str:
     escaped = re.escape(pattern).replace(r"\*", "[^/]+")  # '*' matches up to the next '/'
     return "^" + escaped + "$"
 
-
-cors_env = os.getenv("CORS_ALLOW_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS") or os.getenv("CORS_ORIGINS") or ""
 
 _cors_tokens = _split_cors_origins(cors_env)
 
@@ -365,105 +252,10 @@ import logging
 logger = logging.getLogger("wix")
 logger.setLevel(logging.INFO)
 
-def _decode_wix_jwt(token: str) -> dict | None:
-    """Decode a Wix webhook JWT (RS256) using WIX_WEBHOOK_PUBLIC_KEY.
-
-    Wix REST webhooks commonly deliver event data as a JWT in the request body (often under `data`).
-    This helper is intentionally tolerant: it returns None if decoding isn't possible.
-    """
-    token = (token or "").strip()
-    if token.count(".") < 2:
-        return None
-
-    key = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY") or "").strip()
-    if not key:
-        return None
-
-    if "BEGIN PUBLIC KEY" not in key:
-        key = "-----BEGIN PUBLIC KEY-----\n" + key + "\n-----END PUBLIC KEY-----\n"
-
-    try:
-        import jwt  # PyJWT
-        decoded = jwt.decode(
-            token,
-            key,
-            algorithms=["RS256"],
-            options={"verify_aud": False},
-        )
-        return decoded if isinstance(decoded, dict) else None
-    except Exception:
-        return None
-
-
-def _normalize_wix_webhook_payload(payload: dict) -> dict:
-    """Normalize Wix webhook payloads across formats.
-
-    Wix can send:
-    - A plain JSON envelope where `data` is already a dict.
-    - A JSON envelope where `data` is a JWT string (REST webhook style).
-    After normalization, `payload["data"]` and `payload["identity"]` will be dicts when possible.
-    """
-    if not isinstance(payload, dict):
-        return {}
-
-    # Case 1: outer envelope contains `data` as a JWT string -> decode it into the canonical envelope.
-    outer_data = payload.get("data")
-    if isinstance(outer_data, str):
-        decoded_outer = _decode_wix_jwt(outer_data)
-        if decoded_outer:
-            payload = decoded_outer
-
-    # Case 2: decoded payload contains `data` and/or `identity` as JSON strings -> parse to dict.
-    inner_data = payload.get("data")
-    if isinstance(inner_data, str):
-        try:
-            payload["data"] = json.loads(inner_data)
-        except Exception:
-            # Keep original string if it's not JSON.
-            pass
-
-    inner_identity = payload.get("identity")
-    if isinstance(inner_identity, str):
-        try:
-            payload["identity"] = json.loads(inner_identity)
-        except Exception:
-            pass
-
-    return payload
-
 @app.post("/wix-form")
-async def wix_form(request: Request, payload: dict, _auth: None = Depends(require_wix_api_key)):
-    """Receives Wix callbacks.
-
-    - For Wix webhooks: Wix includes a signed `digest` header. We verify it in `require_wix_api_key`
-      and then process PayGo top-up events here.
-    - For manual testing: you can post here with `x-api-key: $WIX_API_KEY` (no crediting occurs).
-    """
+async def wix_form(payload: dict, _auth: None = Depends(require_wix_api_key)):
     logger.info("RAW WIX PAYLOAD:\n%s", json.dumps(payload, indent=2))
-
-    if getattr(request.state, "wix_verified", False):
-        normalized = _normalize_wix_webhook_payload(payload)
-        try:
-            meta = {
-                "eventType": normalized.get("eventType"),
-                "entityFqdn": normalized.get("entityFqdn"),
-                "instanceId": normalized.get("instanceId"),
-            }
-            print("WIX WEBHOOK META:", json.dumps(meta, indent=2))
-            if os.getenv("WIX_WEBHOOK_DEBUG_LOG", "").strip() == "1":
-                print("WIX WEBHOOK DECODED (TRUNC):", json.dumps(normalized, indent=2)[:5000])
-        except Exception:
-            pass
-        processed = _paygo_process_wix_webhook(normalized)
-        return {"ok": True, "processed": processed}
-
-    return {"ok": True, "processed": False}
-
-
-@app.post("/wix/webhook")
-async def wix_webhook(request: Request, payload: dict, _auth: None = Depends(require_wix_api_key)):
-    """Alias for Wix webhooks (same handler as /wix-form)."""
-    return await wix_form(request, payload, _auth)
+    return {"ok": True}
 
 
 @app.post("/usage/credit")
@@ -506,535 +298,746 @@ async def usage_credit(request: Request):
     return result
 
 
-
-# ============================
-# PayGo: Wix Payment Links top-up
-# ============================
-
-class PayGoIntentRequest(BaseModel):
+@app.get("/ready")
+def ready():
     """
-    Client-side "intent" registration used to correlate a PayGo payment to an identity.
+    Readiness probe.
 
-    - Members: send memberId (Wix memberId). No email prompt required.
-    - Visitors: send email (used at Wix checkout) and a stable anon memberId (generated client-side and stored locally).
+    If you want a stricter readiness check (e.g., verify required env vars),
+    add lightweight checks here. For now it mirrors liveness.
     """
-    email: str | None = Field(
-        default=None,
-        description="Email address used at Wix checkout (required for visitors; optional for members if memberId is present).",
-    )
-    memberId: str | None = Field(
-        default=None,
-        description="Identity to credit (Wix memberId for members; anon id for visitors).",
-        max_length=200,
-    )
-    sessionId: str | None = Field(
-        default=None,
-        description="Optional session id (fallback identity if no memberId).",
-        max_length=200,
-    )
-    minutes: int | None = Field(
-        default=None,
-        ge=1,
-        le=10_000,
-        description="Optional override for top-up minutes. Defaults to PAYG_INCREMENT_MINUTES / WIX_PAYLINK_TOPUP_MINUTES.",
-    )
-    rebrandingKey: str | None = Field(
-        default=None,
-        description="Optional rebranding key which may contain pay_go_minutes override.",
-    )
-
-class PayGoIntentResponse(BaseModel):
-    ok: bool = True
-    identityKey: str
-    minutes: int
-    expiresAt: str
-    email: str | None = None
-    memberId: str | None = None
-
-def _paygo_intents_get(store: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], float]:
-    """Return (by_email, by_member_id, last_prune_at) and normalize legacy storage.
-
-    Storage lives inside the usage store so it survives restarts.
-
-    Legacy (older) format:
-        store["__paygo_intents__"] = { "email@example.com": { ... } }
-
-    Current format:
-        store["__paygo_intents__"] = {
-            "byEmail": { "email@example.com": { ... } },
-            "byMemberId": { "<memberId>": { ... } },
-            "lastPruneAt": 0.0
-        }
-    """
-    raw = store.get("__paygo_intents__", {}) or {}
-    by_email: Dict[str, Any] = {}
-    by_member: Dict[str, Any] = {}
-    last_prune_at = 0.0
-
-    if isinstance(raw, dict):
-        if "byEmail" in raw or "byMemberId" in raw:
-            be = raw.get("byEmail", {}) or {}
-            bm = raw.get("byMemberId", {}) or {}
-            by_email = be if isinstance(be, dict) else {}
-            by_member = bm if isinstance(bm, dict) else {}
-            try:
-                last_prune_at = float(raw.get("lastPruneAt", 0) or 0)
-            except Exception:
-                last_prune_at = 0.0
-        else:
-            # Legacy: treat dict as by-email map.
-            by_email = raw
-    else:
-        by_email = {}
-
-    store["__paygo_intents__"] = {"byEmail": by_email, "byMemberId": by_member, "lastPruneAt": last_prune_at}
-    return by_email, by_member, last_prune_at
+    return {"ok": True}
+# ----------------------------
+# Helpers
+# ----------------------------
+def _dbg(enabled: bool, *args: Any) -> None:
+    if enabled:
+        print(*args)
 
 
-def _paygo_intents_set(store: Dict[str, Any], by_email: Dict[str, Any], by_member: Dict[str, Any], last_prune_at: float) -> None:
-    store["__paygo_intents__"] = {"byEmail": by_email, "byMemberId": by_member, "lastPruneAt": float(last_prune_at or 0.0)}
+def _now_ts() -> int:
+    return int(time.time())
 
 
-def _paygo_prune_store(store: Dict[str, Any]) -> None:
-    """Prune old PayGo intents + processed-event ids."""
-    now_ts = time.time()
-    by_email, by_member, last_prune_at = _paygo_intents_get(store)
+# ----------------------------
+# Usage / Minutes limits (Trial + plan quotas)
+# ----------------------------
+# This feature enforces time budgets for:
+# - Visitors without a memberId (Free Trial) using client IP address as identity
+# - Members with a memberId (subscription plan minutes + optional purchased minutes)
+#
+# Storage strategy:
+# - A single JSON file on the App Service Linux shared filesystem (/home) so that it survives restarts.
+# - A file lock to coordinate writes across gunicorn workers.
+#
+# NOTE: This is intentionally simple and fail-open (it will not crash the API).
+#       If the usage file is unavailable, the system will allow access rather than block.
+_USAGE_STORE_PATH = (os.getenv("USAGE_STORE_PATH", "/home/elaralo_usage.json") or "").strip() or "/home/elaralo_usage.json"
+_USAGE_LOCK_PATH = _USAGE_STORE_PATH + ".lock"
+_USAGE_LOCK = FileLock(_USAGE_LOCK_PATH)
 
-    # Don't prune on every request (this endpoint can be hit frequently).
-    if now_ts - last_prune_at < 30:
-        return
-
-    cutoff_intents = now_ts - float(PAYGO_INTENT_TTL_SECONDS or 0)
-    if cutoff_intents > 0:
-        for mapping in (by_email, by_member):
-            stale_keys = [
-                k
-                for k, rec in list(mapping.items())
-                if float((rec or {}).get("createdAt", 0) or 0) < cutoff_intents
-            ]
-            for k in stale_keys:
-                mapping.pop(k, None)
-
-    cutoff_events = now_ts - float(PAYGO_EVENT_TTL_SECONDS or 0)
-    events = store.get("__paygo_events__", {}) or {}
-    if isinstance(events, dict) and cutoff_events > 0:
-        stale_eids = [
-            eid
-            for eid, rec in list(events.items())
-            if float((rec or {}).get("ts", 0) or 0) < cutoff_events
-        ]
-        for eid in stale_eids:
-            events.pop(eid, None)
-        store["__paygo_events__"] = events
-
-    _paygo_intents_set(store, by_email, by_member, now_ts)
-
-def _usage_credit_minutes_in_store(store: Dict[str, Any], identity_key: str, minutes: float, reason: str) -> Dict[str, Any]:
-    rec = store.get(identity_key) or {}
-    rec.setdefault("minutes_total", 0.0)
-    rec.setdefault("seconds_total", 0.0)
-    rec.setdefault("seconds_used", 0.0)
-    rec.setdefault("paid_minutes_total", 0.0)
-    rec.setdefault("paid_seconds_total", 0.0)
-    rec.setdefault("last_plan", "")
-    rec.setdefault("last_update_ts", 0.0)
-    rec.setdefault("last_charge_ts", 0.0)
-    rec.setdefault("last_credit_ts", 0.0)
-    rec.setdefault("last_credit_reason", "")
-    rec.setdefault("last_seen_ip", "")
-
-    delta_sec = float(minutes) * 60.0
-    rec["paid_minutes_total"] = float(rec.get("paid_minutes_total", 0.0)) + float(minutes)
-    rec["paid_seconds_total"] = float(rec.get("paid_seconds_total", 0.0)) + delta_sec
-    rec["minutes_total"] = float(rec.get("minutes_total", 0.0)) + float(minutes)
-    rec["seconds_total"] = float(rec.get("seconds_total", 0.0)) + delta_sec
-    rec["last_credit_ts"] = time.time()
-    rec["last_credit_reason"] = str(reason)[:200]
-    store[identity_key] = rec
-    return rec
-
-def _find_email_in_obj(obj: Any) -> str:
-    # Prefer explicit keys
-    if isinstance(obj, dict):
-        for key in ("email", "buyerEmail", "payerEmail", "customerEmail", "contactEmail"):
-            v = obj.get(key)
-            if isinstance(v, str) and _is_probably_email(v):
-                return _normalize_email(v)
-        for v in obj.values():
-            e = _find_email_in_obj(v)
-            if e:
-                return e
-    elif isinstance(obj, list):
-        for it in obj:
-            e = _find_email_in_obj(it)
-            if e:
-                return e
-    elif isinstance(obj, str):
-        if _is_probably_email(obj):
-            return _normalize_email(obj)
-    return ""
-
-def _extract_payment_entity(envelope: Any) -> Dict[str, Any] | None:
-    if not isinstance(envelope, dict):
-        return None
-
-    # Some envelopes wrap the entity
-    for key in ("entity", "paymentLinkPayment", "payment_link_payment", "payment"):
-        v = envelope.get(key)
-        if isinstance(v, dict):
-            return v
-
-    data = envelope.get("data")
-    if isinstance(data, dict):
-        for key in ("entity", "paymentLinkPayment", "payment_link_payment", "payment"):
-            v = data.get(key)
-            if isinstance(v, dict):
-                return v
-        # Sometimes "data" IS the entity
-        if "paymentLinkId" in data or "extendedFields" in data or "extended_fields" in data:
-            return data
-
-        # Sometimes nested again
-        data2 = data.get("data")
-        if isinstance(data2, dict):
-            for key in ("entity", "paymentLinkPayment"):
-                v = data2.get(key)
-                if isinstance(v, dict):
-                    return v
-            if "paymentLinkId" in data2 or "extendedFields" in data2:
-                return data2
-
-    # Envelope itself might be the entity
-    if "paymentLinkId" in envelope or "extendedFields" in envelope:
-        return envelope
-
-    return None
-
-def _extract_member_id(payment: Dict[str, Any]) -> str:
-    if not isinstance(payment, dict):
-        return ""
-    ext = payment.get("extendedFields") or payment.get("extended_fields") or {}
-    if isinstance(ext, dict):
-        for k in ("memberId", "memberID", "member_id"):
-            v = ext.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    # fallback if stored directly on payment
-    for k in ("memberId", "member_id"):
-        v = payment.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
-
-def _extract_payment_id(envelope: Dict[str, Any], payment: Dict[str, Any]) -> str:
-    for k in ("id", "_id", "paymentId", "payment_id", "paymentLinkPaymentId"):
-        v = payment.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    for k in ("eventId", "id", "_id"):
-        v = envelope.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    # deterministic hash fallback
+def _env_int(name: str, default: int) -> int:
     try:
-        blob = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return "sha256:" + hashlib.sha256(blob).hexdigest()
+        v = os.getenv(name, "")
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(str(v).strip())
     except Exception:
-        return "sha256:" + hashlib.sha256(str(envelope).encode("utf-8")).hexdigest()
+        return int(default)
 
-def _deep_find_first_str(obj: Any, keys: set[str], max_depth: int = 6, _depth: int = 0) -> str | None:
-    """Best-effort nested lookup for a string value by key name.
+# Minutes for visitors without a memberId
+TRIAL_MINUTES = _env_int("TRIAL_MINUTES", 15)
 
-    We keep this conservative (max_depth) to avoid surprises.
-    """
-    if _depth > max_depth:
-        return None
-    if isinstance(obj, dict):
-        for k in keys:
-            v = obj.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        for v in obj.values():
-            found = _deep_find_first_str(v, keys, max_depth=max_depth, _depth=_depth + 1)
-            if found:
-                return found
-    elif isinstance(obj, list):
-        for it in obj:
-            found = _deep_find_first_str(it, keys, max_depth=max_depth, _depth=_depth + 1)
-            if found:
-                return found
-    return None
+# Included minutes per subscription plan (set these in App Service Configuration)
+INCLUDED_MINUTES_FRIEND = _env_int("INCLUDED_MINUTES_FRIEND", 0)
+INCLUDED_MINUTES_ROMANTIC = _env_int("INCLUDED_MINUTES_ROMANTIC", 0)
+INCLUDED_MINUTES_INTIMATE = _env_int("INCLUDED_MINUTES_INTIMATE", 0)
+INCLUDED_MINUTES_PAYG = _env_int("INCLUDED_MINUTES_PAYG", 0)
+
+# Billing/usage tuning (optional)
+USAGE_CYCLE_DAYS = _env_int("USAGE_CYCLE_DAYS", 30)  # member usage resets every N days (subscription cycle)
+USAGE_IDLE_GRACE_SECONDS = _env_int("USAGE_IDLE_GRACE_SECONDS", 600)  # gaps bigger than this are not charged
+USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST", 120)  # cap per chat call
+
+# Pay links (shown to the user when minutes are exhausted)
+UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
+PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
+PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 60)
+
+# Base Pay-As-You-Go price (e.g., "$4.99"). If PAYG_PRICE_TEXT is not set, we derive it as:
+#   "<PAYG_PRICE> per <PAYG_INCREMENT_MINUTES> minutes"
+PAYG_PRICE = (os.getenv("PAYG_PRICE", "") or "").strip()
+PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
+if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
+    PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
 
 
-def _paygo_process_wix_webhook(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Process Wix Payment Link webhooks to credit PayGo minutes.
+# Admin token for server-side minute credits (payment webhook can call this)
+USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
 
-    This handler is intentionally defensive:
-      - Idempotent per paymentId.
-      - Tries to resolve identity via (1) extended field memberId, else (2) pre-registered intent by buyer email.
-    """
-    # Wix webhooks arrive as a JWT envelope; the decoded payload usually has { eventType, data }.
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
-        data = payload if isinstance(payload, dict) else {}
-
-    event_type = (
-        str(payload.get("eventType") or payload.get("event_type") or data.get("eventType") or data.get("event_type") or "")
-        .strip()
-        .lower()
+def _extract_plan_name(session_state: Dict[str, Any]) -> str:
+    plan = (
+        session_state.get("planName")
+        or session_state.get("plan_name")
+        or session_state.get("plan")
+        or ""
     )
+    return str(plan).strip() if plan is not None else ""
 
-    # Only handle Payment Link payment events.
-    if "payment_link" not in event_type or "payment" not in event_type:
-        return {"ok": True, "ignored": True, "reason": "not_payment_link_payment", "eventType": event_type}
 
-    payment_id = str(data.get("paymentId") or data.get("payment_id") or data.get("id") or "").strip()
-    paylink_id = str(data.get("paymentLinkId") or data.get("payment_link_id") or data.get("paymentLink_id") or "").strip()
+def _extract_rebranding_key(session_state: Dict[str, Any]) -> str:
+    """Extract the Wix-provided RebrandingKey (preferred) or legacy rebranding string."""
+    rk = (
+        session_state.get("rebrandingKey")
+        or session_state.get("rebranding_key")
+        or session_state.get("RebrandingKey")
+        or session_state.get("rebranding")  # legacy: brand name only
+        or ""
+    )
+    return str(rk).strip() if rk is not None else ""
 
-    buyer_email = None
-    for k in ("buyerEmail", "buyer_email", "email"):
-        v = data.get(k)
-        if isinstance(v, str) and v.strip():
-            buyer_email = v.strip()
+def _strip_rebranding_key_label(part: str) -> str:
+    """Accept either raw values or labeled values like 'PayGoMinutes: 60'."""
+    s = (part or "").strip()
+    m = re.match(r"^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$", s)
+    return m.group(1).strip() if m else s
+
+def _parse_rebranding_key(raw: str) -> Dict[str, str]:
+    """Parse a '|' separated RebrandingKey.
+
+    Expected order:
+      Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+    """
+    v = (raw or "").strip()
+    if not v:
+        return {}
+
+    # Legacy support: no delimiter -> only brand name
+    if "|" not in v:
+        return {
+            "rebranding": _strip_rebranding_key_label(v),
+            "upgrade_link": "",
+            "pay_go_link": "",
+            "pay_go_price": "",
+            "pay_go_minutes": "",
+            "plan": "",
+            "elaralo_plan_map": "",
+            "free_minutes": "",
+            "cycle_days": "",
+        }
+
+    parts = [_strip_rebranding_key_label(p) for p in v.split("|")]
+    parts += [""] * (9 - len(parts))
+
+    (
+        rebranding,
+        upgrade_link,
+        pay_go_link,
+        pay_go_price,
+        pay_go_minutes,
+        plan,
+        elaralo_plan_map,
+        free_minutes,
+        cycle_days,
+    ) = parts[:9]
+
+    return {
+        "rebranding": str(rebranding or "").strip(),
+        "upgrade_link": str(upgrade_link or "").strip(),
+        "pay_go_link": str(pay_go_link or "").strip(),
+        "pay_go_price": str(pay_go_price or "").strip(),
+        "pay_go_minutes": str(pay_go_minutes or "").strip(),
+        "plan": str(plan or "").strip(),
+        "elaralo_plan_map": str(elaralo_plan_map or "").strip(),
+        "free_minutes": str(free_minutes or "").strip(),
+        "cycle_days": str(cycle_days or "").strip(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# RebrandingKey validation
+# ---------------------------------------------------------------------------
+# IMPORTANT: RebrandingKey format/field validation is performed upstream in Wix (Velo).
+# The API intentionally accepts the RebrandingKey as-is to avoid breaking Wix flows.
+#
+# If you remove Wix-side validation in the future, you can enable the server-side
+# validator below by uncommenting it AND the call site in /chat.
+#
+# def _validate_rebranding_key_server_side(raw: str) -> Tuple[bool, str]:
+#     """Server-side validator for RebrandingKey.
+#
+#     Expected order:
+#       Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+#     """
+#     v = (raw or "").strip()
+#     if not v:
+#         return True, ""
+#
+#     # Guardrail: prevent extremely large payloads
+#     if len(v) > 2048:
+#         return False, "too long"
+#
+#     # Legacy support: no delimiter => brand name only
+#     if "|" not in v:
+#         return True, ""
+#
+#     parts = v.split("|")
+#     if len(parts) != 9:
+#         return False, f"expected 9 parts, got {len(parts)}"
+#
+#     rebranding = parts[0].strip()
+#     if not rebranding:
+#         return False, "missing Rebranding"
+#
+#     # Validate URLs (when present)
+#     def _is_http_url(s: str) -> bool:
+#         s = (s or "").strip()
+#         if not s:
+#             return True
+#         return bool(re.match(r"^https?://", s, re.IGNORECASE))
+#
+#     if not _is_http_url(parts[1]):
+#         return False, "UpgradeLink must be http(s) URL"
+#     if not _is_http_url(parts[2]):
+#         return False, "PayGoLink must be http(s) URL"
+#
+#     # Validate integers (when present)
+#     for name, val in [
+#         ("PayGoMinutes", parts[4]),
+#         ("FreeMinutes", parts[7]),
+#         ("CycleDays", parts[8]),
+#     ]:
+#         s = (val or "").strip()
+#         if not s:
+#             continue
+#         if not re.fullmatch(r"-?\d+", s):
+#             return False, f"{name} must be an integer"
+#
+#     # Basic price sanity (allow "$5.99", "5.99", "USD 5.99")
+#     price = (parts[3] or "").strip()
+#     if price and len(price) > 32:
+#         return False, "PayGoPrice too long"
+#
+#     # Basic length checks (defense-in-depth)
+#     for i, p in enumerate(parts):
+#         if len((p or "").strip()) > 512:
+#             return False, f"part {i} too long"
+#
+#     return True, ""
+
+
+
+
+# ---------------------------------------------------------------------------
+# Voice/Video companion capability mappings (SQLite -> in-memory)
+# ---------------------------------------------------------------------------
+# This database is generated from the Excel mapping sheet ("Voice and Video Mappings - Elaralo.xlsx")
+# and shipped alongside the API so the frontend can query companion capabilities at runtime:
+#   - which companions are Audio-only vs Video+Audio
+#   - which Live provider to use (D-ID vs Stream)
+#   - ElevenLabs voice IDs (TTS voice selection)
+#   - D-ID Agent IDs / Client Keys (for the D-ID browser SDK)
+#
+# Design choice:
+#   - We load the full table into memory at startup (fast lookups, no per-request DB IO).
+#   - The DB is treated as read-only config; updates are made by regenerating the SQLite file
+#     and redeploying (or by mounting a new file and restarting).
+#
+# Default lookup key is (brand, avatar), case-insensitive.
+
+import sqlite3
+import shutil
+import tempfile
+from urllib.parse import urlparse, parse_qs
+
+_COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_COMPANION_MAPPINGS_LOADED_AT: float | None = None
+_COMPANION_MAPPINGS_SOURCE: str = ""
+_COMPANION_MAPPINGS_TABLE: str = ""
+
+
+def _norm_key(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _candidate_mapping_db_paths() -> List[str]:
+    base_dir = os.path.dirname(__file__)
+    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    candidates = [
+        env_path,
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+    ]
+    # keep unique, preserve order
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in candidates:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+def _ensure_writable_db_copy(src_db_path: str) -> str:
+    """Return a DB path we can safely write to.
+
+    Azure App Service commonly runs the deployed package from a read-only mount
+    (e.g. WEBSITE_RUN_FROM_PACKAGE=1). In that mode, writes to files shipped with
+    the app (including SQLite DBs) can fail.
+
+    Strategy:
+      - Prefer a stable writable path (env VOICE_VIDEO_DB_RW_PATH if set).
+      - Otherwise prefer /home/site (persisted) when available.
+      - Fall back to /tmp (ephemeral but writable).
+      - If the writable copy already exists, use it (do NOT overwrite).
+      - If it doesn't exist, copy from the packaged DB.
+
+    This keeps runtime state (like BeeStreamed event_ref) consistent across
+    multiple Uvicorn workers and across restarts (when /home is used).
+    """
+
+    src_db_path = (src_db_path or "").strip()
+    if not src_db_path:
+        return src_db_path
+
+    # Explicit override for the *writable* DB path.
+    rw_path = (os.getenv("VOICE_VIDEO_DB_RW_PATH", "") or "").strip()
+
+    # If not explicitly set, prefer /home/site for persistence.
+    if not rw_path:
+        home_site = "/home/site"
+        if os.path.isdir(home_site) and os.access(home_site, os.W_OK):
+            rw_path = os.path.join(home_site, os.path.basename(src_db_path))
+        else:
+            rw_path = os.path.join(tempfile.gettempdir(), os.path.basename(src_db_path))
+
+    # If the source already IS the writable path, we're done.
+    try:
+        if os.path.abspath(rw_path) == os.path.abspath(src_db_path):
+            return src_db_path
+    except Exception:
+        pass
+
+    # If a writable copy already exists, prefer it — but refresh it when the packaged DB changes.
+    #
+    # Why:
+    # - We often copy the packaged DB into /home/site on first boot so we can persist runtime state (e.g., event_ref).
+    # - If we later deploy a NEW packaged DB (new mappings/rows), the persisted copy would otherwise stay stale
+    #   forever and strict lookups like ("DulceMoon","Dulce") will 404 even though they exist in the repo DB.
+    #
+    # Refresh behavior:
+    # - We track the SHA256 of the packaged DB in a sidecar file <rw_path>.packaged.sha256.
+    # - If that hash changes, we overwrite the writable copy with the new packaged DB and then migrate runtime-only
+    #   columns (currently: event_ref) from the old copy into the refreshed DB when possible.
+    if os.path.exists(rw_path):
+        lock_path = rw_path + ".lock"
+        marker_path = rw_path + ".packaged.sha256"
+        try:
+            with FileLock(lock_path):
+                def _sha256_file(path: str) -> str:
+                    h = hashlib.sha256()
+                    with open(path, "rb") as f:
+                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                            h.update(chunk)
+                    return h.hexdigest()
+
+                try:
+                    src_hash = _sha256_file(src_db_path)
+                except Exception:
+                    return rw_path
+
+                prev_hash = ""
+                try:
+                    prev_hash = str(open(marker_path, "r", encoding="utf-8").read() or "").strip()
+                except Exception:
+                    prev_hash = ""
+
+                # If the packaged DB hasn't changed since the last refresh, keep the existing writable DB
+                # (which may have updated runtime fields like event_ref).
+                if prev_hash and prev_hash == src_hash:
+                    return rw_path
+
+                # Backup old writable DB, then refresh from packaged DB.
+                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                backup_path = f"{rw_path}.bak.{ts}"
+                try:
+                    shutil.copy2(rw_path, backup_path)
+                except Exception:
+                    backup_path = ""
+
+                try:
+                    parent = os.path.dirname(rw_path) or "."
+                    os.makedirs(parent, exist_ok=True)
+                    shutil.copy2(src_db_path, rw_path)
+                    try:
+                        with open(marker_path, "w", encoding="utf-8") as f:
+                            f.write(src_hash)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"[mappings] WARNING: Failed to refresh writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
+                    return rw_path
+
+                # Best-effort: migrate runtime event_ref from the previous writable copy into the refreshed DB.
+                try:
+                    if backup_path and os.path.exists(backup_path):
+                        def _pick_table(conn: sqlite3.Connection) -> str:
+                            cur = conn.cursor()
+                            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                            names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+                            lc = {n.lower(): n for n in names}
+                            for cand in ("companion_mappings", "voice_video_mappings", "voice_video_mapping", "mappings"):
+                                if cand in lc:
+                                    return lc[cand]
+                            return names[0] if names else ""
+
+                        def _colset(conn: sqlite3.Connection, table: str) -> set[str]:
+                            cur = conn.cursor()
+                            cur.execute(f'PRAGMA table_info("{table}")')
+                            return {str(r[1]).lower() for r in cur.fetchall() if r and len(r) > 1}
+
+                        old_conn = sqlite3.connect(backup_path)
+                        old_conn.row_factory = sqlite3.Row
+                        new_conn = sqlite3.connect(rw_path)
+                        new_conn.row_factory = sqlite3.Row
+                        try:
+                            old_table = _pick_table(old_conn)
+                            new_table = _pick_table(new_conn)
+                            if old_table and new_table:
+                                old_cols = _colset(old_conn, old_table)
+                                new_cols = _colset(new_conn, new_table)
+                                if {"brand", "avatar", "event_ref"}.issubset(old_cols) and {"brand", "avatar", "event_ref"}.issubset(new_cols):
+                                    cur_old = old_conn.cursor()
+                                    cur_old.execute(f'SELECT brand, avatar, event_ref FROM "{old_table}" WHERE event_ref IS NOT NULL AND trim(event_ref) != ""')
+                                    rows = cur_old.fetchall()
+                                    cur_new = new_conn.cursor()
+                                    for r in rows:
+                                        b = str(r["brand"] or "").strip()
+                                        a = str(r["avatar"] or "").strip()
+                                        ev = str(r["event_ref"] or "").strip()
+                                        if not b or not a or not ev:
+                                            continue
+                                        cur_new.execute(
+                                            f'UPDATE "{new_table}" SET event_ref=? WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) AND (event_ref IS NULL OR trim(event_ref) = "")',
+                                            (ev, b, a),
+                                        )
+                                    new_conn.commit()
+                        finally:
+                            old_conn.close()
+                            new_conn.close()
+                except Exception as e:
+                    print(f"[mappings] WARNING: failed migrating event_ref after DB refresh: {e}")
+
+                print(f"[mappings] Refreshed writable mapping DB at {rw_path} from packaged DB {src_db_path}")
+                return rw_path
+        except Exception:
+            return rw_path
+
+    # Create parent dir, then copy.
+    try:
+        parent = os.path.dirname(rw_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        shutil.copy2(src_db_path, rw_path)
+        # Record packaged DB fingerprint so future startups can detect when the packaged DB changes.
+        try:
+            h = hashlib.sha256()
+            with open(src_db_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            with open(rw_path + ".packaged.sha256", "w", encoding="utf-8") as f:
+                f.write(h.hexdigest())
+        except Exception:
+            pass
+        return rw_path
+    except Exception as e:
+        print(f"[mappings] WARNING: Failed to create writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
+        return src_db_path
+
+
+def _load_companion_mappings_sync() -> None:
+    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
+
+    db_path = ""
+    for p in _candidate_mapping_db_paths():
+        if os.path.exists(p):
+            db_path = p
             break
 
-    buyer_email_norm = (buyer_email or "").strip().lower()
+    if not db_path:
+        print("[mappings] WARNING: voice/video mappings DB not found. Video/audio capabilities will fall back to frontend defaults.")
+        _COMPANION_MAPPINGS = {}
+        _COMPANION_MAPPINGS_LOADED_AT = time.time()
+        _COMPANION_MAPPINGS_SOURCE = ""
+        return
 
-    # Attempt to read memberId from extended fields (if present in this event payload).
-    member_id_field = None
-    extended_fields = data.get("extendedFields") or data.get("extended_fields") or []
-    if isinstance(extended_fields, list):
-        for ef in extended_fields:
-            if not isinstance(ef, dict):
-                continue
-            field_key = str(ef.get("key") or ef.get("fieldKey") or ef.get("field_key") or "").strip()
-            name = str(ef.get("name") or ef.get("title") or "").strip().lower()
-            label = str(ef.get("label") or "").strip().lower()
-            if "memberid" in field_key.lower() or name == "member id" or label == "member id":
-                candidate = ef.get("value") or ef.get("stringValue") or ef.get("string_value")
-                if isinstance(candidate, str) and candidate.strip():
-                    member_id_field = candidate.strip()
-                    break
+    # Ensure we can persist runtime state (e.g. event_ref) even when the deployed
+    # package is mounted read-only (common on Azure App Service).
+    db_path = _ensure_writable_db_copy(db_path)
 
-    if not payment_id:
-        return {
-            "ok": False,
-            "credited": False,
-            "reason": "missing_payment_id",
-            "eventType": event_type,
-            "paylinkId": paylink_id,
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+
+        # The mapping table name differs between environments.
+        # Prefer the canonical names, but fall back to any table present.
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+        tables_lc = {t.lower(): t for t in table_names}
+
+        preferred = [
+            "companion_mappings",
+            "voice_video_mappings",
+            "voice_video_mapping",
+            "mappings",
+        ]
+        table = ""
+        for cand in preferred:
+            if cand.lower() in tables_lc:
+                table = tables_lc[cand.lower()]
+                break
+
+        # If none of the preferred names exist, pick the first available table.
+        if not table and table_names:
+            table = table_names[0]
+
+        if not table:
+            print(f"[mappings] WARNING: mapping DB found at {db_path} but contains no tables.")
+            _COMPANION_MAPPINGS = {}
+            _COMPANION_MAPPINGS_LOADED_AT = time.time()
+            _COMPANION_MAPPINGS_SOURCE = db_path
+            _COMPANION_MAPPINGS_TABLE = ""
+            return
+
+        # Quote the table name to safely handle names with special characters.
+        cur.execute(f'SELECT * FROM "{table}"')
+        rows = cur.fetchall()
+        table_name_for_source = str(table or "")
+    finally:
+        conn.close()
+
+    d: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        # sqlite3.Row keys preserve the column names from the DB. Different environments may
+        # have different capitalization (e.g., Live vs live) or legacy names (e.g., Companion).
+        keys_lc = {str(k).lower(): k for k in r.keys()}
+
+        def get_col(*candidates: str, default: Any = "") -> Any:
+            for cand in candidates:
+                k = keys_lc.get(str(cand).lower())
+                if k is not None:
+                    return r[k]
+            return default
+
+        brand = str(
+            get_col(
+                "brand",
+                "rebranding",
+                "company",
+                "brand_id",
+                "Brand",
+                default="",
+           )
+            or ""
+       ).strip()
+
+        # Core brand behavior:
+        # - Wix sends rebrandingKey="" (or NULL) when there is NO white label.
+        # - An empty/NULL brand is therefore treated as the core brand: "Elaralo".
+        if not brand:
+            brand = "Elaralo"
+
+        avatar = str(
+            get_col(
+                "avatar",
+                "companion",
+                "Companion",
+                "companion_name",
+                "companionName",
+                "first_name",
+                "firstname",
+                default="",
+           )
+            or ""
+       ).strip()
+        if not brand or not avatar:
+            continue
+
+        key = (_norm_key(brand), _norm_key(avatar))
+
+        d[key] = {
+            "brand": brand,
+            "avatar": avatar,
+            "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
+            # UI uses channel_cap to decide whether to show the video/play controls.
+            "channel_cap": str(get_col("channel_cap", "channelCap", "chanel_cap", "channel_capability", default="") or "").strip(),
+            "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
+            "live": str(get_col("live", "Live", default="") or "").strip(),
+            "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
+            "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
+            "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
+            "phonetic": str(get_col("phonetic", "Phonetic", default="") or "").strip(),
+            "did_embed_code": str(get_col("did_embed_code", "DID_EMBED_CODE", default="") or ""),
+            "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
+            "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
+            "did_client_key": str(get_col("did_client_key", "DID_CLIENT_KEY", default="") or ""),
+            # Preserve common extra fields when present (helps debugging / future UIs).
+            "companion_id": str(get_col("companion_id", "Companion_ID", "CompanionId", default="") or ""),
         }
 
-    now_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    _COMPANION_MAPPINGS = d
+    _COMPANION_MAPPINGS_LOADED_AT = time.time()
+    _COMPANION_MAPPINGS_SOURCE = db_path
+    _COMPANION_MAPPINGS_TABLE = table_name_for_source
+    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path} (table={table_name_for_source})")
 
-    # Single critical section to keep idempotency + credit atomic against the JSON store.
-    with _USAGE_LOCK:
-        store = _load_usage_store()
 
-        paygo_events = _paygo_events_get(store)
-        prev = paygo_events.get(payment_id) or {}
-        if isinstance(prev, dict) and prev.get("credited") is True:
-            return {
-                "ok": True,
-                "credited": True,
-                "alreadyCredited": True,
-                "paymentId": payment_id,
-                "paylinkId": paylink_id,
-                "identityKey": prev.get("identityKey"),
-                "minutes": prev.get("minutes"),
-            }
+def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
+    # Strict: exact (brand, avatar) match required (case-insensitive via _norm_key).
+    # Core brand: empty brand is treated as Elaralo.
+    b = _norm_key(brand) or "elaralo"
+    a = _norm_key(avatar)
+    if not a:
+        return None
 
-        by_email, by_member, _ = _paygo_intents_get(store)
+    return _COMPANION_MAPPINGS.get((b, a))
 
-        intent_rec: Dict[str, Any] | None = None
-        identity_key: str | None = None
-        matched_via: str | None = None
 
-        if member_id_field:
-            identity_key = f"member::{member_id_field}"
-            matched_via = "memberIdExtendedField"
-            intent_rec = by_member.get(member_id_field) if isinstance(by_member, dict) else None
+@app.on_event("startup")
+async def _startup_load_companion_mappings() -> None:
+    # Load once at startup; do not block on errors.
+    try:
+        await run_in_threadpool(_load_companion_mappings_sync)
+    except Exception as e:
+        print(f"[mappings] ERROR loading companion mappings: {e!r}")
 
-        if not identity_key and buyer_email_norm and isinstance(by_email, dict):
-            intent_candidate = by_email.get(buyer_email_norm)
-            if isinstance(intent_candidate, dict):
-                ik = intent_candidate.get("identityKey")
-                if isinstance(ik, str) and ik.strip():
-                    intent_rec = intent_candidate
-                    identity_key = ik.strip()
-                    matched_via = "intentByEmail"
 
-        if not identity_key:
-            # Record the event as seen for troubleshooting, but do not credit.
-            paygo_events[payment_id] = {
-                "credited": False,
-                "seenAt": now_iso,
-                "eventType": event_type,
-                "paylinkId": paylink_id,
-                "buyerEmail": buyer_email,
-                "buyerEmailNorm": buyer_email_norm,
-                "memberIdField": member_id_field,
-                "reason": "no_identity_match",
-            }
-            _save_usage_store(store)
-            return {
-                "ok": True,
-                "credited": False,
-                "paymentId": payment_id,
-                "paylinkId": paylink_id,
-                "reason": "no_identity_match",
-            }
+@app.get("/mappings/companion")
+async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
+    """Lookup a companion mapping row by (brand, avatar).
 
-        minutes_to_credit = int(PAYG_INCREMENT_MINUTES)
-        if intent_rec and isinstance(intent_rec, dict):
-            override = intent_rec.get("minutes")
-            if override is None:
-                override = intent_rec.get("minutesToCredit")
-            try:
-                if override is not None:
-                    override_int = int(override)
-                    if override_int > 0:
-                        minutes_to_credit = override_int
-            except Exception:
-                pass
+    This endpoint is intentionally STRICT:
+      - exact (brand, avatar) match required (case-insensitive via lower/strip normalization)
+      - errors out when a mapping is missing, so configuration issues are visible during development
 
-        # Apply credit inside this store transaction (avoid deadlock by not calling _usage_credit_minutes_sync here).
-        _usage_credit_minutes_in_store(
-            store,
-            identity_key,
-            minutes_to_credit,
-            meta={
-                "source": "wix_paylink",
-                "paymentId": payment_id,
-                "paymentLinkId": paylink_id,
-                "buyerEmail": buyer_email,
-                "memberIdField": member_id_field,
-                "eventType": event_type,
-                "matchedVia": matched_via,
-                "creditedAt": now_iso,
+    Query params:
+      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
+      - avatar: Avatar first name (e.g., "Jennifer")
+
+    Response (200):
+      {
+        found: true,
+        brand: str,
+        avatar: str,
+        companionType: "Human"|"AI",
+        channel_cap: "Video"|"Audio" ,
+        channelCap: "Video"|"Audio" ,   # alias for convenience
+        live: "D-ID"|"Stream" ,
+        elevenVoiceId: str,
+        elevenVoiceName: str,
+        didAgentId: str,
+        didClientKey: str,
+        didAgentLink: str,
+        didEmbedCode: str,
+        loadedAt: <unix seconds> | null,
+        source: <db path> | ""
+      }
+    """
+    b_in = (brand or "").strip()
+    a = (avatar or "").strip()
+
+    if not a:
+        raise HTTPException(status_code=400, detail="avatar is required")
+
+    # Core brand default: empty brand => Elaralo
+    b = b_in or "Elaralo"
+
+    m = _lookup_companion_mapping(b, a)
+    if not m:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "Companion mapping not found",
+                "brand": b,
+                "avatar": a,
+                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+                "source": _COMPANION_MAPPINGS_SOURCE,
+                "table": _COMPANION_MAPPINGS_TABLE,
+                "count": len(_COMPANION_MAPPINGS),
             },
         )
 
-        paygo_events[payment_id] = {
-            "credited": True,
-            "creditedAt": now_iso,
-            "eventType": event_type,
-            "paylinkId": paylink_id,
-            "buyerEmail": buyer_email,
-            "buyerEmailNorm": buyer_email_norm,
-            "memberIdField": member_id_field,
-            "identityKey": identity_key,
-            "minutes": minutes_to_credit,
-            "matchedVia": matched_via,
-        }
+    cap_raw = str(m.get("channel_cap") or "").strip()
+    live_raw = str(m.get("live") or "").strip()
+    ctype_raw = str(m.get("companion_type") or "").strip()
 
-        # Best-effort cleanup so old intents don't leak across sessions.
-        if buyer_email_norm and isinstance(by_email, dict):
-            rec = by_email.get(buyer_email_norm)
-            if isinstance(rec, dict) and str(rec.get("identityKey") or "").strip() == identity_key:
-                by_email.pop(buyer_email_norm, None)
+    # Strict validation (config contract)
+    cap_lc = cap_raw.lower()
+    if cap_lc not in ("video", "audio"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
+        )
 
-        if member_id_field and isinstance(by_member, dict):
-            rec = by_member.get(member_id_field)
-            if isinstance(rec, dict) and str(rec.get("identityKey") or "").strip() == identity_key:
-                by_member.pop(member_id_field, None)
+    live_lc = live_raw.lower()
+    if live_lc not in ("stream", "d-id"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
+        )
 
-        _save_usage_store(store)
+    ctype_lc = ctype_raw.lower()
+    if ctype_lc not in ("human", "ai"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
+        )
+
+    # Business rule: AI companions must use D-ID. Human companions must use Stream.
+    if ctype_lc == "human" and live_lc != "stream":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
+        )
+    if ctype_lc == "ai" and live_lc != "d-id":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
+        )
+
+    cap_out = "Video" if cap_lc == "video" else "Audio"
+    live_out = "Stream" if live_lc == "stream" else "D-ID"
+    ctype_out = "Human" if ctype_lc == "human" else "AI"
 
     return {
-        "ok": True,
-        "credited": True,
-        "paymentId": payment_id,
-        "paylinkId": paylink_id,
-        "buyerEmail": buyer_email,
-        "identityKey": identity_key,
-        "minutes": minutes_to_credit,
-        "matchedVia": matched_via,
+        "found": True,
+        "brand": str(m.get("brand") or b),
+        "avatar": str(m.get("avatar") or a),
+        "hostMemberId": str(m.get("host_member_id") or ""),
+        "host_member_id": str(m.get("host_member_id") or ""),
+        "companionType": ctype_out,
+        "companion_type": ctype_out,
+        "channel_cap": cap_out,
+        "channelCap": cap_out,
+        "live": live_out,
+        "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
+        "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
+        "didAgentId": str(m.get("did_agent_id") or ""),
+        "didClientKey": str(m.get("did_client_key") or ""),
+        "didAgentLink": str(m.get("did_agent_link") or ""),
+        "didEmbedCode": str(m.get("did_embed_code") or ""),
+        "phonetic": str(m.get("phonetic") or ""),
+        "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+        "source": _COMPANION_MAPPINGS_SOURCE,
+        "table": _COMPANION_MAPPINGS_TABLE,
     }
 
-@app.post("/paygo/intent", response_model=PayGoIntentResponse)
-def paygo_create_intent(req: PayGoIntentRequest):
-    """
-    Register a correlation intent for an upcoming PayGo purchase.
 
-    The intent is stored server-side for a limited time, so that when the Wix webhook
-    arrives we can resolve which identity to credit.
-    """
-    email = (req.email or "").strip()
-    email_norm = email.lower() if email else None
-    member_id = (req.memberId or "").strip() or None
-    session_id = (req.sessionId or "").strip() or None
-
-    if not member_id and not session_id and not email_norm:
-        raise HTTPException(status_code=400, detail="Provide memberId, sessionId, or email.")
-
-    # Determine identity key (priority: memberId > sessionId > email).
-    if member_id:
-        identity_key = f"member::{member_id}"
-    elif session_id:
-        identity_key = f"session::{session_id}"
-    else:
-        identity_key = f"email::{email_norm}"
-
-    # Default minutes from env; allow override via rebrandingKey or explicit minutes.
-    minutes = int(PAYG_INCREMENT_MINUTES)
-    if req.rebrandingKey:
-        try:
-            cfg = _parse_rebranding_key(req.rebrandingKey)
-            rb_minutes = cfg.get("pay_go_minutes")
-            if rb_minutes:
-                minutes = int(rb_minutes)
-        except Exception:
-            pass
-    if req.minutes is not None:
-        # pydantic validates bounds; still coerce.
-        try:
-            minutes = int(req.minutes)
-        except Exception:
-            pass
-    if minutes < 1:
-        minutes = int(PAYG_INCREMENT_MINUTES)
-
-    now = datetime.utcnow().replace(microsecond=0)
-    expires_at = now + timedelta(seconds=int(PAYGO_INTENT_TTL_SECONDS))
-    now_iso = now.isoformat() + "Z"
-    expires_iso = expires_at.isoformat() + "Z"
-
-    record: Dict[str, Any] = {
-        "identityKey": identity_key,
-        "minutes": minutes,
-        "createdAt": now_iso,
-        "expiresAt": expires_iso,
-    }
-    if email_norm:
-        record["email"] = email
-        record["emailNorm"] = email_norm
-    if member_id:
-        record["memberId"] = member_id
-    if session_id:
-        record["sessionId"] = session_id
-
-    with _USAGE_LOCK:
-        store = _load_usage_store()
-        by_email, by_member, _ = _paygo_intents_get(store)
-
-        if email_norm:
-            by_email[email_norm] = dict(record)
-        if member_id:
-            by_member[member_id] = dict(record)
-
-        _save_usage_store(store)
-
-    return PayGoIntentResponse(
-        ok=True,
-        identityKey=identity_key,
-        minutes=minutes,
-        expiresAt=expires_iso,
-        email=email if email else None,
-        memberId=member_id,
-    )
-
+# ---------------------------------------------------------------------------
+# BeeStreamed: Start WebRTC streams (Live=Stream companions)
 # -----------------------------------------------------------------------------
 # BeeStreamed in-memory session state + shared live chat hub
 # -----------------------------------------------------------------------------
@@ -1920,34 +1923,6 @@ def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str,
             host = DULCE_HOST_MEMBER_ID_FALLBACK
     return host
 
-
-# -------- Companion mapping API (frontend compatibility) --------
-@app.get("/mappings/companion")
-def get_companion_mapping(brand: str = Query(..., min_length=1), avatar: str = Query(..., min_length=1)):
-    """Return the resolved companion mapping used by the /companion page.
-
-    This endpoint intentionally returns HTTP 200 for both found and not-found cases.
-    The frontend relies on the `found` boolean instead of HTTP status for UX.
-    """
-    try:
-        mapping = _lookup_companion_mapping(brand, avatar) or {}
-    except Exception:
-        mapping = {}
-
-    # Normalize to the shape expected by page.tsx.
-    out = dict(mapping) if isinstance(mapping, dict) else {}
-    out.update({
-        "found": bool(mapping),
-        "brand": str(brand),
-        "avatar": str(avatar),
-        # Common fields the frontend reads directly
-        "channel_cap": str((mapping or {}).get("channel_cap") or (mapping or {}).get("channelCap") or ""),
-        "live": str((mapping or {}).get("live") or (mapping or {}).get("live_url") or (mapping or {}).get("liveUrl") or ""),
-        "didClientKey": str((mapping or {}).get("did_client_key") or (mapping or {}).get("didClientKey") or ""),
-        "companion_type": str((mapping or {}).get("companion_type") or (mapping or {}).get("companionType") or ""),
-    })
-    return out
-
 def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> bool:
     """Try to persist event_ref into the companion_mappings SQLite DB (if writable). Always updates in-memory mapping."""
     b = (brand or "").strip()
@@ -2058,62 +2033,6 @@ def _read_event_ref_from_db(brand: str, avatar: str) -> str:
             pass
 
 
-
-
-
-# ---------------------------------------------------------------------------
-# Companion mapping helpers
-#
-# Some endpoints (e.g., LiveKit/BeeStreamed status) expect a helper named
-# `_lookup_companion_mapping(brand, avatar)` that returns the row from the
-# companion_mappings SQLite table. In some deployments this helper can be
-# missing (causing NameError) even though the DB exists.
-#
-# These helpers are intentionally DB-backed (not in-memory) to remain safe
-# across multiple Gunicorn/Uvicorn workers.
-# ---------------------------------------------------------------------------
-
-def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
-    """Lookup a companion mapping row from SQLite by (brand, avatar).
-
-    Returns:
-        A dict of column->value for the matching row, or None if not found / unavailable.
-    """
-    b = (brand or "").strip()
-    a = (avatar or "").strip()
-    if not b or not a:
-        return None
-
-    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
-    if not db_path or not os.path.exists(db_path):
-        return None
-
-    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
-    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
-        table_name = "companion_mappings"
-
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT * FROM {table_name} WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
-            (b, a),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        # sqlite3.Row supports dict(row), but be explicit to avoid surprises.
-        return {k: row[k] for k in row.keys()}
-    except Exception:
-        return None
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
 
 
 def _get_companion_mappings_db_path(for_write: bool = False) -> str:
