@@ -1723,8 +1723,14 @@ const registerPayGoIntentIfNeeded = async (): Promise<void> => {
   const apiBase = (API_BASE || "").trim();
   if (!apiBase) return;
 
+  // Brand scoping for per-device PayGo storage keys.
+  const parsedRebranding = parseRebrandingKey(rebrandingKey);
+  const brandKeyLocal = safeBrandKey(
+    String((parsedRebranding?.rebranding || companionName || DEFAULT_COMPANY_NAME) ?? "").trim(),
+  );
+
   // Prompt once per device (stored locally).
-  let email = getStoredPaygoEmail(brandKey);
+  let email = getStoredPaygoEmail(brandKeyLocal);
   if (!email) {
     const entered = window.prompt(
       "Please enter your email so we can credit your Pay‑as‑you‑Go minutes immediately after payment:"
@@ -1736,10 +1742,10 @@ const registerPayGoIntentIfNeeded = async (): Promise<void> => {
       return;
     }
     email = trimmed;
-    setStoredPaygoEmail(brandKey, email);
+    setStoredPaygoEmail(brandKeyLocal, email);
   }
 
-  const memberIdForBackend = getOrCreateAnonMemberId(brandKey);
+  const memberIdForBackend = getOrCreateAnonMemberId(brandKeyLocal);
 
   try {
     await fetch(`${apiBase}/paygo/intent`, {
