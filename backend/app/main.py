@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 import re
 import uuid
@@ -56,6 +57,52 @@ STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
 app = FastAPI(title="Elaralo API")
+# ---------------------------------------------------------------------------
+# Companion mappings (brand/avatar -> companion_id)
+# ---------------------------------------------------------------------------
+# The companion mapping database is expected to be present on the filesystem.
+# Default path matches the deployed DB location used by ops (/home/site/voice_video_mappings.sqlite).
+# You can override via environment variables:
+#   COMPANION_MAPPINGS_SOURCE=/path/to/sqlite.db
+#   COMPANION_MAPPINGS_TABLE=companion_mappings
+_COMPANION_MAPPINGS_SOURCE = (os.getenv("COMPANION_MAPPINGS_SOURCE") or "/home/site/voice_video_mappings.sqlite").strip()
+_COMPANION_MAPPINGS_TABLE = (os.getenv("COMPANION_MAPPINGS_TABLE") or "companion_mappings").strip() or "companion_mappings"
+
+# Optional in-memory overrides (highest priority). Supports either nested dict:
+#   {brand: {avatar: companion_id}}
+# or flat dict with "brand:avatar" keys.
+_COMPANION_MAPPINGS: dict = {}
+
+def _ensure_writable_db_copy(src_path: str) -> str:
+    """Ensure we have a writable copy of the sqlite DB.
+
+    Azure App Service builds typically live under /home/site/wwwroot (read-only at runtime).
+    If the DB lives there, copy it to /tmp and use that path for connections.
+    """
+    if not src_path:
+        return src_path
+    src_path = str(src_path)
+    try:
+        if not os.path.exists(src_path):
+            return src_path
+        # Only copy if source is likely read-only.
+        if not src_path.startswith("/home/site/wwwroot"):
+            return src_path
+        dst_path = os.path.join("/tmp", os.path.basename(src_path))
+        try:
+            src_mtime = os.path.getmtime(src_path)
+            dst_mtime = os.path.getmtime(dst_path) if os.path.exists(dst_path) else -1
+            if dst_mtime >= src_mtime:
+                return dst_path
+        except Exception:
+            # If stat fails, just attempt a copy.
+            pass
+        shutil.copy2(src_path, dst_path)
+        return dst_path
+    except Exception:
+        # Fall back to original path; sqlite open will raise if it truly cannot.
+        return src_path
+
 
 # ----------------------------
 # WIX FORM
@@ -64,19 +111,6 @@ WIX_API_KEY = (os.getenv("WIX_API_KEY", "") or "").strip()
 WIX_APP_ID = (os.getenv("WIX_APP_ID", "") or "").strip()
 WIX_APP_SECRET = (os.getenv("WIX_APP_SECRET", "") or "").strip()
 WIX_WEBHOOK_PUBLIC_KEY = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY", "") or "").strip()
-
-# ----------------------------
-# COMPANION MAPPINGS (SQLite)
-# ----------------------------
-# Deployed DB lives under /home/site (persisted on Azure App Service).
-# These are read by helper functions like _lookup_companion_mapping / _read_event_ref_from_db.
-_COMPANION_MAPPINGS_SOURCE = (
-    os.getenv("COMPANION_MAPPINGS_SOURCE")
-    or os.getenv("COMPANION_MAPPINGS_DB")
-    or "/home/site/voice_video_mappings.sqlite"
-).strip()
-
-_COMPANION_MAPPINGS_TABLE = (os.getenv("COMPANION_MAPPINGS_TABLE") or "companion_mappings").strip() or "companion_mappings"
 
 
 async def require_wix_api_key(
@@ -1988,6 +2022,62 @@ def _read_event_ref_from_db(brand: str, avatar: str) -> str:
             pass
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# Companion mapping helpers
+#
+# Some endpoints (e.g., LiveKit/BeeStreamed status) expect a helper named
+# `_lookup_companion_mapping(brand, avatar)` that returns the row from the
+# companion_mappings SQLite table. In some deployments this helper can be
+# missing (causing NameError) even though the DB exists.
+#
+# These helpers are intentionally DB-backed (not in-memory) to remain safe
+# across multiple Gunicorn/Uvicorn workers.
+# ---------------------------------------------------------------------------
+
+def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
+    """Lookup a companion mapping row from SQLite by (brand, avatar).
+
+    Returns:
+        A dict of column->value for the matching row, or None if not found / unavailable.
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return None
+
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    if not db_path or not os.path.exists(db_path):
+        return None
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT * FROM {table_name} WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
+            (b, a),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        # sqlite3.Row supports dict(row), but be explicit to avoid surprises.
+        return {k: row[k] for k in row.keys()}
+    except Exception:
+        return None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 
 def _get_companion_mappings_db_path(for_write: bool = False) -> str:
