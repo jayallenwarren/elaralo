@@ -1977,6 +1977,62 @@ def _read_event_ref_from_db(brand: str, avatar: str) -> str:
 
 
 
+
+# ---------------------------------------------------------------------------
+# Companion mapping helpers
+#
+# Some endpoints (e.g., LiveKit/BeeStreamed status) expect a helper named
+# `_lookup_companion_mapping(brand, avatar)` that returns the row from the
+# companion_mappings SQLite table. In some deployments this helper can be
+# missing (causing NameError) even though the DB exists.
+#
+# These helpers are intentionally DB-backed (not in-memory) to remain safe
+# across multiple Gunicorn/Uvicorn workers.
+# ---------------------------------------------------------------------------
+
+def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
+    """Lookup a companion mapping row from SQLite by (brand, avatar).
+
+    Returns:
+        A dict of column->value for the matching row, or None if not found / unavailable.
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return None
+
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    if not db_path or not os.path.exists(db_path):
+        return None
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT * FROM {table_name} WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
+            (b, a),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        # sqlite3.Row supports dict(row), but be explicit to avoid surprises.
+        return {k: row[k] for k in row.keys()}
+    except Exception:
+        return None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
 def _get_companion_mappings_db_path(for_write: bool = False) -> str:
     """Return the SQLite path to use for companion_mappings reads/writes.
 
