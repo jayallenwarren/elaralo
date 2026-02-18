@@ -1751,14 +1751,7 @@ const registerPayGoIntentIfNeeded = async (): Promise<void> => {
     await fetch(`${apiBase}/paygo/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-              email,
-              memberId: memberIdForBackend,
-              rebrandingKey:
-                typeof rebrandingKey === "string" && rebrandingKey
-                  ? rebrandingKey
-                  : undefined,
-            }),
+      body: JSON.stringify({ email, memberId: memberIdForBackend }),
       // keepalive helps ensure the request completes even if the browser navigates.
       keepalive: true,
     });
