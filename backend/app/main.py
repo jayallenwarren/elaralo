@@ -1,3 +1,6 @@
+# main_V33_2026-02-18.py
+# Drop-in backend code for elaralo-api-01 (FastAPI)
+
 from __future__ import annotations
 
 import os
