@@ -1,9092 +1,6727 @@
-"use client";
-
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import elaraLogo from "../public/elaralo-logo.png";
-
-
-import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
-import { Track, RoomEvent } from "livekit-client";
-import "@livekit/components-styles";
-import Hls from "hls.js";
-const PlayIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path d="M8 5v14l11-7z" fill="currentColor" />
-  </svg>
-);
-
-const PauseIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path d="M6 5h4v14H6zM14 5h4v14h-4z" fill="currentColor" />
-  </svg>
-);
-
-
-const StopIcon = ({ size = 18 }: { size?: number }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M6 6h12v12H6z" fill="currentColor" />
-  </svg>
-);
-
-const MicOnIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path
-      d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"
-      fill="currentColor"
-    />
-  </svg>
-);
-
-const MicOffIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path
-      d="M19 11a7 7 0 0 1-1.62 4.5l-1.43-1.43A5 5 0 0 0 17 11h2zM12 14a3 3 0 0 0 3-3V8.41l-6 6A3 3 0 0 0 12 14zm7-9.19L4.81 19 3.39 17.58 7.17 13.8A5 5 0 0 1 7 12V11h2v1c0 .36.06.7.17 1.02l1.6-1.6A3 3 0 0 1 9 11V5a3 3 0 0 1 5.12-2.12L17.59 1.4 19 2.81 15.41 6.4V11c0 .36-.06.7-.17 1.02l3.76 3.76A7 7 0 0 0 19 11zm-7 13.89V21h-2v-2.08A7 7 0 0 1 5 11h2a5 5 0 0 0 4.29 4.92l.71-.71A3 3 0 0 1 11 14.7z"
-      fill="currentColor"
-    />
-  </svg>
-);
-
-
-
-const TrashIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path
-      d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v10h-2V9zm4 0h2v10h-2V9zM6 9h2v10H6V9z"
-      fill="currentColor"
-    />
-  </svg>
-);
-
-const SaveIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path
-      d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h11v5H7v2h10V4.41L19 6.41V19z"
-      fill="currentColor"
-    />
-  </svg>
-);
-
-function LiveKitHlsPlayer({ src }: { src: string }) {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-
-    // Native HLS (Safari) fallback
-    const canNative = v.canPlayType("application/vnd.apple.mpegurl");
-    if (canNative) {
-      v.src = src;
-      v.play().catch(() => {});
-      return;
-    }
-
-    if (Hls.isSupported()) {
-      const hls = new Hls({ lowLatencyMode: true });
-      hls.loadSource(src);
-      hls.attachMedia(v);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        v.play().catch(() => {});
-      });
-      return () => {
-        try { hls.destroy(); } catch {}
-      };
-    } else {
-      v.src = src;
-      v.play().catch(() => {});
-    }
-  }, [src]);
-
-  return (
-    <video
-      ref={videoRef}
-      style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
-      controls
-      playsInline
-      autoPlay
-      muted={false}
-    />
-  );
-}
-
-type Role = "user" | "assistant";
-// `meta` is used for UI-only bookkeeping (e.g., in-stream live chat sender ids).
-// It is never serialized to the backend /chat API.
-type Msg = { role: Role; content: string; meta?: any };
-
-type UploadedAttachment = {
-  url: string;
-  name: string;
-  size: number;
-  contentType: string;
-  container?: string;
-  blobName?: string;
-};
-
-type Mode = "friend" | "romantic" | "intimate";
-
-type LiveProvider = "d-id" | "stream";
-
-type SessionKind = "stream" | "private" | "conference" | "";
-
-// LiveKit is the sole live-session provider.
-type ChannelCap = "audio" | "video" | "";
-
-type CompanionMappingRow = {
-  found?: boolean;
-  brand?: string;
-  avatar?: string;
-
-  // DB columns
-  channel_cap?: string; // "Video" | "Audio"
-  channelCap?: string;  // API alias (optional)
-  live?: string;        // "Stream" | "D-ID" | ""
-
-  // Provider-specific fields (optional)
-  didClientKey?: string;
-  didAgentId?: string;
-  elevenVoiceId?: string;
-
-  // Optional DB column used for UI labeling.
-  // Expected values: "Human" | "AI" (case-insensitive), but treated as a free-form string.
-  companion_type?: string | null;
-  companionType?: string | null; // optional API alias
-};
-
-type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
-
-type SessionState = {
-  mode: Mode;
-  adult_verified: boolean;
-  romance_consented: boolean;
-  explicit_consented: boolean;
-  pending_consent: "intimate" | null;
-  model: string;
-  // optional extras tolerated
-  [k: string]: any;
-};
-
-type ChatApiResponse = {
-  reply: string;
-  mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
-  session_state?: Partial<SessionState>;
-};
-
-type PlanName =
-  | "Trial"
-  | "Friend"
-  | "Romantic"
-  | "Intimate (18+)"
-  | "Pay as You Go"
-  | "Test - Friend"
-  | "Test - Romantic"
-  | "Test - Intimate (18+)"
-  | "Test - Pay as You Go"
-  | null;
-
-// -----------------------------------------------------------------------------
-// Visitor identity (anon) helpers
-// - We store a per-brand anon id in localStorage so visitors without a Wix memberId
-//   can still be consistently identified for freeMinutes usage tracking.
-// - IMPORTANT: localStorage is scoped to the iframe origin (azurestaticapps.net),
-//   so we namespace by brand to avoid cross-site collisions across white-label embeds.
-// -----------------------------------------------------------------------------
-const ANON_ID_PREFIX = "anon:";
-const ANON_ID_STORAGE_KEY_PREFIX = "ELARALO_ANON_ID::";
-
-function safeBrandKey(raw: string): string {
-  const s = (raw || "").trim().toLowerCase();
-  if (!s) return "core";
-  const cleaned = s.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
-  return cleaned || "core";
-}
-
-function getAnonIdStorageKey(brand: string): string {
-  return `${ANON_ID_STORAGE_KEY_PREFIX}${safeBrandKey(brand)}`;
-}
-
-function generateAnonId(): string {
-  try {
-    // @ts-ignore
-    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-      // @ts-ignore
-      return crypto.randomUUID();
-    }
-  } catch (e) {}
-  // Fallback: 32-hex chars
-  const rand32 = () =>
-    Math.floor(Math.random() * 0xffffffff)
-      .toString(16)
-      .padStart(8, "0");
-  return `${rand32()}${rand32()}${rand32()}${rand32()}`;
-}
-
-function getOrCreateAnonMemberId(brand: string): string {
-  if (typeof window === "undefined") return "";
-  const storageKey = getAnonIdStorageKey(brand);
-
-  // Primary: localStorage (sticky across sessions)
-  try {
-    const existing = window.localStorage.getItem(storageKey);
-    if (existing && existing.trim()) return `${ANON_ID_PREFIX}${existing.trim()}`;
-    const id = generateAnonId();
-    window.localStorage.setItem(storageKey, id);
-    return `${ANON_ID_PREFIX}${id}`;
-  } catch (e) {
-    // Some browsers/settings can block localStorage in a third-party iframe context.
-    // Secondary: sessionStorage (sticky for the tab session).
-    try {
-      const ssKey = `ELARALO_SESSION_ANON_ID::${safeBrandKey(brand)}`;
-      const existing = window.sessionStorage.getItem(ssKey);
-      if (existing && existing.trim()) return `${ANON_ID_PREFIX}${existing.trim()}`;
-      const id = generateAnonId();
-      window.sessionStorage.setItem(ssKey, id);
-      return `${ANON_ID_PREFIX}${id}`;
-    } catch (e) {
-      return "";
-    }
-  }
-}
-
-// ---- PayGo (Pay-as-you-Go) helpers ----
-const PAYGO_EMAIL_STORAGE_PREFIX = "elaralo_paygo_email:";
-
-function getStoredPaygoEmail(brandKey: string): string {
-  try {
-    return (localStorage.getItem(`${PAYGO_EMAIL_STORAGE_PREFIX}${brandKey}`) || "").trim();
-  } catch {
-    return "";
-  }
-}
-
-function setStoredPaygoEmail(brandKey: string, email: string) {
-  try {
-    localStorage.setItem(`${PAYGO_EMAIL_STORAGE_PREFIX}${brandKey}`, email.trim());
-  } catch {
-    // ignore
-  }
-}
-
-function isProbablyEmail(s: string): boolean {
-  const t = (s || "").trim();
-  // Very lightweight validation; backend re-validates.
-  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t);
-}
-
-
-function isAnonMemberId(memberId: string): boolean {
-  return (memberId || "").trim().toLowerCase().startsWith(ANON_ID_PREFIX);
-}
-
-
-
-// --- Plan and companion helpers (no UI changes beyond required labels) ---
-function normalizePlanName(raw: any): PlanName {
-  const s = String(raw ?? "").trim();
-  if (!s) return null;
-  const key = s.toLowerCase();
-
-  switch (key) {
-    case "trial":
-      return "Trial";
-    case "friend":
-      return "Friend";
-    case "romantic":
-      return "Romantic";
-    case "intimate (18+)":
-      return "Intimate (18+)";
-    case "pay as you go":
-      return "Pay as You Go";
-    case "test - friend":
-      return "Test - Friend";
-    case "test - romantic":
-      return "Test - Romantic";
-    case "test - intimate (18+)":
-      return "Test - Intimate (18+)";
-    case "test - pay as you go":
-      return "Test - Pay as You Go";
-    default:
-      return null;
-  }
-}
-
-function stripTrialControlsFromRebrandingKey(key: string): string {
-  const p = parseRebrandingKey(key);
-  if (!p) return key;
-
-  // IMPORTANT:
-  // Historically some backend paths read the *plan* segment (6th field) from the rebrandingKey to decide
-  // included minutes. For white-label sites, the 6th field may be the white-label plan label (e.g. "Test - Exclusive")
-  // and the Elaralo entitlement plan is carried in `elaraloPlanMap` (e.g. "Intimate (18+)").
-  //
-  // To ensure quota/minutes are computed from the mapped Elaralo plan, we copy `elaraloPlanMap` into the plan slot
-  // when it's present.
-  const entitlementPlan = (p.elaraloPlanMap || "").trim() || (p.plan || "").trim();
-  // Keep format stable (9 segments).
-  // Blank-out FreeMinutes + CycleDays so the backend can fall back to plan defaults
-  // when the user is entitled (i.e., has an active plan).
-  return [
-    p.rebranding,
-    p.upgradeLink,
-    p.payGoLink,
-    p.payGoPrice,
-    p.payGoMinutes,
-    entitlementPlan,
-    p.elaraloPlanMap,
-    "",
-    "",
-  ].join("|");
-}
-
-function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverride?: string): string {
-  const hasMemberId = Boolean((memberId || "").trim());
-
-  // Requirement: If we do not have a memberId, the visitor is on Trial, shown as "Free Trial".
-  if (!hasMemberId) return "Free Trial";
-
-  // White-label: show the rebranding site's plan label when provided (e.g., "Supreme"),
-  // while still using ElaraloPlanMap for capability gating.
-  const override = String(planLabelOverride || "").trim();
-  if (override) return override;
-
-  // Requirement: Unknown / Not Provided only when the plan information for a member is not provided.
-  if (!planName) return "Unknown / Not Provided";
-
-  return planName;
-}
-
-type CompanionKeySplit = {
-  baseKey: string;
-  flags: Record<string, string>;
-};
-
-/**
- * Companion keys can include optional metadata after a pipe.
- * Example:
- *   "Elara-Female-Caucasian-GenZ|live=stream"
- *
- * The baseKey is used for parsing/display and file lookups.
- * Flags are used for live behavior (D-ID vs streaming/web conference).
- */
-function splitCompanionKey(raw: string): CompanionKeySplit {
-  const s = String(raw ?? "").trim();
-  if (!s) return { baseKey: "", flags: {} };
-
-  const parts = s.split("|").map((p) => p.trim()).filter(Boolean);
-  const baseKey = parts[0] || "";
-  const flags: Record<string, string> = {};
-
-  for (let i = 1; i < parts.length; i++) {
-    const piece = parts[i] || "";
-    const eq = piece.indexOf("=");
-    if (eq === -1) {
-      flags[piece.toLowerCase()] = "1";
-      continue;
-    }
-    const k = piece.slice(0, eq).trim().toLowerCase();
-    const v = piece.slice(eq + 1).trim();
-    if (k) flags[k] = v;
-  }
-
-  return { baseKey, flags };
-}
-
-function modeFromElaraloPlanMap(raw: unknown): Mode | null {
-  const s = String(raw ?? "").trim().toLowerCase();
-  if (!s) return null;
-  if (s.includes("intimate")) return "intimate";
-  if (s.includes("romantic")) return "romantic";
-  if (s.includes("friend")) return "friend";
-  return null;
-}
-
-type CompanionMeta = {
-  first: string;
-  gender: string;
-  ethnicity: string;
-  generation: string;
-  key: string;
-};
-
-const DEFAULT_COMPANION_NAME = "Elara";
-
-// Step C (Latency): limit how much chat history we send to /chat.
-// 20 turns ~= 40 messages (user+assistant). System prompt (if present) is always preserved.
-const MAX_MESSAGES_TO_SEND = 40;
-
-function trimMessagesForChat<T extends { role: string; content: any }>(messages: T[]): T[] {
-  if (!Array.isArray(messages) || messages.length <= MAX_MESSAGES_TO_SEND) return messages;
-
-  const first = messages[0];
-  const hasSystem = first && first.role === "system";
-
-  const body = hasSystem ? messages.slice(1) : messages.slice();
-
-  const trimmedBody = body.slice(Math.max(0, body.length - MAX_MESSAGES_TO_SEND));
-
-  return hasSystem ? ([first, ...trimmedBody] as T[]) : (trimmedBody as T[]);
-}
-
-const HEADSHOT_DIR = "/companion/headshot";
-
-// Resolve companion key/name for backend requests and TTS voice selection.
-// This must be browser-safe and never rely on DOM parsing.
-function resolveCompanionForBackend(opts: { companionKey?: string; companionName?: string }): string {
-  const ck = (opts.companionKey || '').trim();
-  if (ck) return ck;
-  const cn = (opts.companionName || '').trim();
-  if (cn) return cn;
-  return DEFAULT_COMPANION_NAME;
-}
-
-const GREET_ONCE_KEY = "ELARALO_GREETED";
-const DEFAULT_AVATAR = elaraLogo.src;
-const DEFAULT_COMPANY_NAME = "Elaralo";
-// Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
-const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
-
-// Back-compat: older embeds/tests may still pass ?rebranding=BrandName
-const LEGACY_REBRANDING_QUERY_PARAM = "rebranding";
-
-// Public asset root for white-label rebrands
-const REBRANDING_PUBLIC_DIR = "/rebranding";
-
-type RebrandingKeyParts = {
-  rebranding: string;
-  upgradeLink: string;
-  payGoLink: string;
-  payGoPrice: string;
-  payGoMinutes: string;
-  plan: string;
-  elaraloPlanMap: string;
-  freeMinutes: string;
-  cycleDays: string;
-};
-
-function stripRebrandingKeyLabel(part: string): string {
-  const s = String(part || "").trim();
-  // Accept either raw values ("DulceMoon") or labeled values ("Rebranding: DulceMoon")
-  const m = s.match(/^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$/);
-  return m ? String(m[1] || "").trim() : s;
-}
-
-function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
-  const v = String(raw || "").trim();
-  if (!v) return null;
-
-  // Legacy support: if there is no "|" delimiter, treat this as just the brand name.
-  if (!v.includes("|")) {
-    const brand = stripRebrandingKeyLabel(v);
-    return {
-      rebranding: brand,
-      upgradeLink: "",
-      payGoLink: "",
-      payGoPrice: "",
-      payGoMinutes: "",
-      plan: "",
-      elaraloPlanMap: "",
-      freeMinutes: "",
-      cycleDays: "",
-    };
-  }
-
-  const parts = v.split("|").map((p) => stripRebrandingKeyLabel(p));
-
-  const [
-    rebranding = "",
-    upgradeLink = "",
-    payGoLink = "",
-    payGoPrice = "",
-    payGoMinutes = "",
-    plan = "",
-    elaraloPlanMap = "",
-    freeMinutes = "",
-    cycleDays = "",
-  ] = parts;
-
-  return {
-    rebranding: String(rebranding || "").trim(),
-    upgradeLink: String(upgradeLink || "").trim(),
-    payGoLink: String(payGoLink || "").trim(),
-    payGoPrice: String(payGoPrice || "").trim(),
-    payGoMinutes: String(payGoMinutes || "").trim(),
-    plan: String(plan || "").trim(),
-    elaraloPlanMap: String(elaraloPlanMap || "").trim(),
-    freeMinutes: String(freeMinutes || "").trim(),
-    cycleDays: String(cycleDays || "").trim(),
-  };
-}
-
-function normalizeRebrandingSlug(rawBrand: string): string {
-  const raw = String(rawBrand || "").trim();
-  if (!raw) return "";
-
-  // Match the prior logo normalization rules so:
-  // - "Dulce Moon" and "DulceMoon" both -> "dulcemoon"
-  // - also works if someone includes an extension or "-logo" suffix
-  const normalizedBase = raw
-    .replace(/\.(png|jpg|jpeg|webp)$/i, "")
-    .replace(/-logo$/i, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
-
-  return normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
-
-function getAppBasePathFromAsset(assetPath: string): string {
-  const p = String(assetPath || "");
-  const idx = p.indexOf("/_next/");
-  // If Next.js is configured with a basePath, imported assets will include it (e.g., "/foo/_next/...").
-  // We want to prefix rebrand logos with the same basePath so they resolve correctly in all deployments.
-  if (idx > 0) return p.slice(0, idx);
-  return "";
-}
-
-function joinUrlPrefix(prefix: string, path: string): string {
-  const pre = String(prefix || "").trim();
-  const p = String(path || "");
-  if (!pre) return p;
-  if (pre.endsWith("/") && p.startsWith("/")) return pre.slice(0, -1) + p;
-  if (!pre.endsWith("/") && !p.startsWith("/")) return pre + "/" + p;
-  return pre + p;
-}
-
-const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-
-function toWsBaseUrl(httpBase: string): string {
-  const raw = String(httpBase || '').trim();
-  if (!raw) return '';
-  try {
-    const u = new URL(raw);
-    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Ensure no trailing slash so path joins are predictable.
-    return u.toString().replace(/\/$/, '');
-  } catch (e) {
-    // Fallback for relative/incomplete bases
-    if (raw.startsWith('https://')) return 'wss://' + raw.slice('https://'.length).replace(/\/$/, '');
-    if (raw.startsWith('http://')) return 'ws://' + raw.slice('http://'.length).replace(/\/$/, '');
-    return raw.replace(/\/$/, '');
-  }
-}
-
-function buildWsUrl(httpBase: string, path: string, query: Record<string, string>): string {
-  const base = toWsBaseUrl(httpBase);
-  const p = String(path || '').startsWith('/') ? String(path || '') : '/' + String(path || '');
-  const u = new URL(base + p);
-  Object.entries(query || {}).forEach(([k, v]) => {
-    const vv = String(v ?? '').trim();
-    if (vv) u.searchParams.set(k, vv);
-  });
-  return u.toString();
-}
-
-type Phase1AvatarMedia = {
-  didAgentId: string;
-  didClientKey: string;
-  elevenVoiceId: string;
-};
-
-const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
-  "Jennifer": {
-    "didAgentId": "v2_agt_n7itFF6f",
-    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    "elevenVoiceId": "19STyYD15bswVz51nqLf"
-  },
-  "Jason": {
-    "didAgentId": "v2_agt_WpC1hOBQ",
-    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    "elevenVoiceId": "j0jBf06B5YHDbCWVmlmr"
-  },
-  "Tonya": {
-    "didAgentId": "v2_agt_2lL6f5YY",
-    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    "elevenVoiceId": "Hybl6rg76ZOcgqZqN5WN"
-  }
-} as any;
-
-const ELEVEN_VOICE_ID_BY_AVATAR: Record<string, string> = {
-  "Jennifer": "19STyYD15bswVz51nqLf",
-  "Jason": "j0jBf06B5YHDbCWVmlmr",
-  "Tonya": "Hybl6rg76ZOcgqZqN5WN",
-  "Darnell": "gYr8yTP0q4RkX1HnzQfX",
-  "Michelle": "ui11Rd52NKH2DbWlcbvw",
-  "Daniel": "tcO8jJ1XXzdQ4pzViV9c",
-  "Veronica": "GDzHdQOi6jjf8zaXhCYD",
-  "Ricardo": "l1zE9xgNpUTaQCZzpNJa",
-  "Linda": "flHkNRp1BlvT73UL6gyz",
-  "Robert": "uA0L9FxeLpzlG615Ueay",
-  "Patricia": "zwbQ2XUiIlOKD6b3JWXd",
-  "Clarence": "CXAc4DNZL6wonQQNlNgZ",
-  "Mei": "bQQWtYx9EodAqMdkrNAc",
-  "Minh": "cALE2CwoMM2QxiEdDEhv",
-  "Maria": "WLjZnm4PkNmYtNCyiCq8",
-  "Jose": "IP2syKL31S2JthzSSfZH",
-  "Ashley": "GbDIo39THauInuigCmPM",
-  "Ryan": "qIT7IrVUa21IEiKE1lug",
-  "Latoya": "BZgkqPqms7Kj9ulSkVzn",
-  "Jamal": "3w1kUvxu1LioQcLgp1KY",
-  "Tiffany": "XeomjLZoU5rr4yNIg16w",
-  "Kevin": "69Na567Zr0bPvmBYuGdc",
-  "Adriana": "FGLJyeekUzxl8M3CTG9M",
-  "Miguel": "dlGxemPxFMTY7iXagmOj",
-  "Elara": "rJ9XoWu8gbUhVKZnKY8X",
-};
-
-function getElevenVoiceIdForAvatar(avatarName: string | null | undefined): string {
-  const raw = (avatarName || "").trim();
-  if (raw && ELEVEN_VOICE_ID_BY_AVATAR[raw]) return ELEVEN_VOICE_ID_BY_AVATAR[raw];
-
-  // Many companions arrive from Wix as a descriptive key like:
-  //   "Ashley-Female-Caucasian-Millennials"
-  // while our ElevenLabs map is keyed by the first name ("Ashley").
-  // Normalize to reduce accidental fallback to Elara for the greeting.
-  const firstToken = raw.split("-")[0]?.trim() || "";
-  if (firstToken && ELEVEN_VOICE_ID_BY_AVATAR[firstToken]) return ELEVEN_VOICE_ID_BY_AVATAR[firstToken];
-
-  // Case-insensitive match as a final attempt.
-  const ciKey = Object.keys(ELEVEN_VOICE_ID_BY_AVATAR).find(
-    (k) => k.toLowerCase() === raw.toLowerCase() || (firstToken && k.toLowerCase() === firstToken.toLowerCase())
-  );
-  if (ciKey) return ELEVEN_VOICE_ID_BY_AVATAR[ciKey];
-
-  // Fallback to Elara so audio-only TTS always has a voice.
-  return ELEVEN_VOICE_ID_BY_AVATAR["Elara"] || "";
-}
-function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
-  if (!avatarName) return null;
-
-  const direct = PHASE1_AVATAR_MEDIA[avatarName];
-  if (direct) return direct;
-
-  const key = Object.keys(PHASE1_AVATAR_MEDIA).find(
-    (k) => k.toLowerCase() === avatarName.toLowerCase()
-  );
-  return key ? PHASE1_AVATAR_MEDIA[key] : null;
-}
-
-function isDidSessionError(err: any): boolean {
-  const kind = typeof err?.kind === "string" ? err.kind : "";
-  const description = typeof err?.description === "string" ? err.description : "";
-  const message = typeof err?.message === "string" ? err.message : "";
-
-  // The SDK sometimes uses { kind, description } and sometimes uses message strings.
-  return (
-    kind === "SessionError" ||
-    description.toLowerCase().includes("session_id") ||
-    message.toLowerCase().includes("session_id")
-  );
-}
-
-function formatDidError(err: any): string {
-  if (!err) return "Unknown error";
-  if (typeof err === "string") return err;
-  if (typeof err?.message === "string") return err.message;
-
-  const kind = typeof err?.kind === "string" ? err.kind : undefined;
-  const description = typeof err?.description === "string" ? err.description : undefined;
-
-  if (kind || description) {
-    return JSON.stringify({ kind, description });
-  }
-
-  try {
-    return JSON.stringify(err);
-  } catch (e) {
-    return String(err);
-  }
-}
-
-const UPGRADE_URL = process.env.NEXT_PUBLIC_UPGRADE_URL || "https://www.elaralo.com/pricing-plans/list";
-const STREAM_URL = process.env.NEXT_PUBLIC_STREAM_URL || "";
-
-const MODE_LABELS: Record<Mode, string> = {
-  friend: "Friend",
-  romantic: "Romantic",
-  intimate: "Intimate (18+)",
-};
-
-// Plan → mode availability mapping (UI pills)
-// Requirements:
-// - Friend or Test - Friend Plan: Friend only
-// - Romantic or Test - Romantic Plan: Friend + Romantic
-// - Intimate (18+) or Test - Intimate (18+) Plan: Friend + Romantic + Intimate (18+)
-const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
-  "Trial",
-  "Romantic",
-  "Intimate (18+)",
-  "Pay as You Go",
-  "Test - Romantic",
-  "Test - Intimate (18+)",
-  "Test - Pay as You Go",
-];
-
-
-function allowedModesForPlan(planName: PlanName): Mode[] {
-  const modes: Mode[] = ["friend"];
-  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (
-    planName === "Intimate (18+)" ||
-    planName === "Test - Intimate (18+)" ||
-    planName === "Pay as You Go" ||
-    planName === "Test - Pay as You Go"
-  )
-    modes.push("intimate");
-  return modes;
-}
-
-function stripExt(s: string) {
-  return (s || "").replace(/\.(png|jpg|jpeg|webp)$/i, "");
-}
-
-function normalizeKeyForFile(raw: string) {
-  return (raw || "").trim().replace(/\s+/g, "-");
-}
-
-// Some Wix implementations append a member UUID to the companion key for uniqueness.
-// Example: "dulce-female-black-millennials-ebf0bfb2-11b4-4638-ad3c-4909c6f810e6"
-// For static asset lookup (headshots), we should strip that UUID suffix.
-function stripTrailingUuid(raw: string): string {
-  const s = String(raw || "").trim();
-  return s.replace(
-    /-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
-    "",
-  );
-}
-
-function titleCaseToken(token: string): string {
-  const lower = String(token || "").toLowerCase();
-  // Common generation tokens found in your asset naming convention.
-  if (lower === "genz") return "GenZ";
-  if (lower === "genx") return "GenX";
-  if (lower === "geny") return "GenY";
-  if (lower === "genalpha") return "GenAlpha";
-  if (!lower) return "";
-  return lower.charAt(0).toUpperCase() + lower.slice(1);
-}
-
-function toTitleCaseHyphenated(s: string): string {
-  return String(s || "")
-    .split("-")
-    .map((t) => titleCaseToken(t))
-    .join("-");
-}
-
-function uniqueStrings(items: string[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const v of items) {
-    const s = String(v || "").trim();
-    if (!s) continue;
-    if (seen.has(s)) continue;
-    seen.add(s);
-    out.push(s);
-  }
-  return out;
-}
-
-function parseCompanionMeta(raw: string): CompanionMeta {
-  const cleaned = stripExt(raw || "");
-  const parts = cleaned
-    .split("-")
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-  if (parts.length < 4) {
-    return {
-      first: cleaned || DEFAULT_COMPANION_NAME,
-      gender: "",
-      ethnicity: "",
-      generation: "",
-      key: cleaned || DEFAULT_COMPANION_NAME,
-    };
-  }
-
-  const [first, gender, ethnicity, ...rest] = parts;
-  const generation = rest.join("-");
-
-  return {
-    first: first || DEFAULT_COMPANION_NAME,
-    gender: gender || "",
-    ethnicity: ethnicity || "",
-    generation: generation || "",
-    key: cleaned,
-  };
-}
-
-function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: string) {
-  const raw = stripExt(String(companionKeyOrName || "").trim());
-  if (!raw) return [DEFAULT_AVATAR];
-
-  // Build multiple name variants so headshot lookup remains robust even when:
-  // - companion keys are lower-cased by Wix
-  // - a member UUID suffix is appended
-  const baseInputs = Array.from(
-    new Set([raw, stripTrailingUuid(raw)].map((v) => String(v || "").trim()).filter(Boolean))
-  );
-
-  const encVariants: string[] = [];
-  const seenEnc = new Set<string>();
-
-  for (const baseInput of baseInputs) {
-    const normalized = normalizeKeyForFile(baseInput);
-    const lower = normalized.toLowerCase();
-    const title = toTitleCaseHyphenated(lower);
-
-    for (const v of [normalized, title, lower]) {
-      const trimmed = String(v || "").trim();
-      if (!trimmed) continue;
-      const enc = encodeURIComponent(trimmed);
-      if (!seenEnc.has(enc)) {
-        seenEnc.add(enc);
-        encVariants.push(enc);
-      }
-    }
-  }
-
-  const slug = String(rebrandingSlug || "").trim();
-  const slugEnc = slug ? encodeURIComponent(slug) : "";
-
-  const candidates: string[] = [];
-  // Some repos store images with uppercase extensions on Windows (e.g. ".JPG"),
-  // and the exported static output can be case-sensitive.
-  const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
-  for (const enc of encVariants) {
-    // Rebrand-specific headshots (preferred when RebrandingKey is present):
-    //   /rebranding/<brand>/companion/headshot/<CompanionName>[.<ext>]
-    if (slugEnc) {
-      const rebrandBase = joinUrlPrefix(
-        APP_BASE_PATH,
-        `${REBRANDING_PUBLIC_DIR}/${slugEnc}${HEADSHOT_DIR}/${enc}`
-      );
-
-      // Allow extension-less filenames too (Windows may hide extensions, or assets may be committed without one).
-      candidates.push(rebrandBase);
-
-      for (const ext of exts) candidates.push(`${rebrandBase}.${ext}`);
-    }
-
-    // Default (non-rebranded) headshots:
-    //   /companion/headshot/<CompanionName>[.<ext>]
-    const base = joinUrlPrefix(APP_BASE_PATH, `${HEADSHOT_DIR}/${enc}`);
-
-    // Allow extension-less filenames too.
-    candidates.push(base);
-
-    for (const ext of exts) candidates.push(`${base}.${ext}`);
-  }
-
-  candidates.push(DEFAULT_AVATAR);
-  return candidates;
-}
-
-async function pickFirstExisting(urls: string[]) {
-  for (const url of urls) {
-    if (url === DEFAULT_AVATAR) return url;
-    try {
-      const res = await fetch(url, { method: "HEAD", cache: "no-store" });
-      if (res.ok) return url;
-    } catch (e) {
-      // ignore
-    }
-  }
-  return DEFAULT_AVATAR;
-}
-
-// Like pickFirstExisting (HEAD probe), but validates by actually loading the image in the browser.
-// This avoids false positives on platforms that rewrite missing assets to index.html (HTTP 200).
-function pickFirstLoadableImage(urls: string[]): Promise<string> {
-  return new Promise((resolve) => {
-    let i = 0;
-
-    const tryNext = () => {
-      if (i >= urls.length) return resolve(DEFAULT_AVATAR);
-
-      const url = String(urls[i++] || "").trim();
-      if (!url) return tryNext();
-      if (url === DEFAULT_AVATAR) return resolve(DEFAULT_AVATAR);
-
-      const img = new Image();
-
-      img.onload = () => {
-        // Some hosting stacks rewrite missing assets to HTML (200) which can still trigger load.
-        // Ensure the browser actually decoded an image.
-        if ((img.naturalWidth || 0) > 0 && (img.naturalHeight || 0) > 0) return resolve(url);
-        return tryNext();
-      };
-      img.onerror = () => tryNext();
-
-      // Cache-busting probe so newly-added logos are discovered immediately after deployment.
-      const bust = `__probe=${Date.now()}_${Math.random().toString(16).slice(2)}`;
-      const probeUrl = url.includes("?") ? `${url}&${bust}` : `${url}?${bust}`;
-      img.src = probeUrl;
-    };
-
-    tryNext();
-  });
-}
-
-function greetingFor(name: string) {
-  const n = (name || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
-  return `Hi, ${n} here. 😊 What's on your mind?`;
-}
-
-function isAllowedOrigin(origin: string) {
-  try {
-    const u = new URL(origin);
-    const hostRaw = u.hostname.toLowerCase();
-    const host = hostRaw.startsWith("www.") ? hostRaw.slice(4) : hostRaw;
-
-    // First-party + Wix domains (Editor/Studio/Preview).
-    if (host.endsWith("elaralo.com")) return true;
-    if (host.endsWith("wix.com")) return true;
-    if (host.endsWith("wixsite.com")) return true;
-
-    // White-label custom domains:
-    // In an iframe, Wix will postMessage from the parent page origin (e.g. https://www.dulcemoon.net).
-    // Allow the *embedding page* origin by matching document.referrer (and tolerating www vs non-www).
-    try {
-      const ref = typeof document !== "undefined" ? document.referrer : "";
-      if (ref) {
-        const refHostRaw = new URL(ref).hostname.toLowerCase();
-        const refHost = refHostRaw.startsWith("www.") ? refHostRaw.slice(4) : refHostRaw;
-
-        if (host === refHost) return true;
-        if (host.endsWith("." + refHost)) return true; // subdomain match
-        if (refHost.endsWith("." + host)) return true; // inverse (defensive)
-      }
-    } catch (e) {
-      // ignore referrer parse issues
-    }
-
-    // Chrome-only fallback (helps in some embedded contexts)
-    try {
-      const ancestorOrigins = (typeof window !== "undefined" ? (window.location as any).ancestorOrigins : null) as
-        | { length: number; [idx: number]: string }
-        | null;
-      if (ancestorOrigins && typeof ancestorOrigins.length === "number") {
-        for (let i = 0; i < ancestorOrigins.length; i++) {
-          try {
-            const aHostRaw = new URL(ancestorOrigins[i]).hostname.toLowerCase();
-            const aHost = aHostRaw.startsWith("www.") ? aHostRaw.slice(4) : aHostRaw;
-            if (host === aHost) return true;
-            if (host.endsWith("." + aHost)) return true;
-            if (aHost.endsWith("." + host)) return true;
-          } catch (e) {
-            // ignore per-origin parse issues
-          }
-        }
-      }
-    } catch (e) {
-      // ignore ancestorOrigins issues
-    }
-
-    return false;
-  } catch (e) {
-    return false;
-  }
-}
-
-/**
- * Detects a mode switch request in *user text* and returns:
- * - mode: desired mode
- * - cleaned: text with explicit [mode:*] removed (so it won't pollute the chat)
- *
- * Supports:
- * - [mode:romantic], mode:romantic
- * - "switch to romantic", "romantic mode", "set mode to romantic", etc.
- */
-function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: string } {
-  const raw = text || "";
-  const t = raw.toLowerCase();
-
-  // explicit tokens
-  // NOTE: allow "romance" token from older builds as a synonym for "romantic"
-  const tokenRe =
-    /\[mode:(friend|romantic|romance|intimate|explicit)\]|mode:(friend|romantic|romance|intimate|explicit)/gi;
-
-  let tokenMode: Mode | null = null;
-  let cleaned = raw.replace(tokenRe, (m) => {
-    const mm = m.toLowerCase();
-    if (mm.includes("friend")) tokenMode = "friend";
-    else if (mm.includes("romantic") || mm.includes("romance")) tokenMode = "romantic";
-    else if (mm.includes("intimate") || mm.includes("explicit")) tokenMode = "intimate";
-    return "";
-  });
-
-  cleaned = cleaned.trim();
-
-  if (tokenMode) return { mode: tokenMode, cleaned };
-
-  // soft phrasing (covers friend->romantic and intimate->romantic)
-  const soft = t.trim();
-
-  const wantsFriend =
-    /\b(switch|set|turn|go|back)\b.*\bfriend\b/.test(soft) || /\bfriend mode\b/.test(soft);
-
-  const wantsRomantic =
-    // "romantic mode" / "romance mode"
-    /\b(romantic|romance) mode\b/.test(soft) ||
-    // switch/set/back/go/turn ... romantic
-    /\b(switch|set|turn|go|back)\b.*\b(romantic|romance)\b/.test(soft) ||
-    // natural phrasing users actually type
-    /\b(let['’]?s|lets)\b.*\b(romantic|romance)\b/.test(soft) ||
-    /\b(be|being|try|trying|have|having)\b.*\b(romantic|romance)\b/.test(soft) ||
-    /\bromantic conversation\b/.test(soft) ||
-    /\bromance again\b/.test(soft) ||
-    /\btry romance again\b/.test(soft);
-
-  const wantsIntimate =
-    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
-    /\b(intimate|explicit) mode\b/.test(soft);
-
-  if (wantsFriend) return { mode: "friend", cleaned: raw };
-  if (wantsRomantic) return { mode: "romantic", cleaned: raw };
-  if (wantsIntimate) return { mode: "intimate", cleaned: raw };
-
-  return { mode: null, cleaned: raw.trim() };
-}
-
-function normalizeMode(raw: any): Mode | null {
-  const t = String(raw ?? "").trim().toLowerCase();
-  if (!t) return null;
-
-  if (t === "friend") return "friend";
-  if (t === "romantic" || t === "romance") return "romantic";
-  if (t === "intimate" || t === "explicit" || t === "adult" || t === "18+" || t === "18") return "intimate";
-
-  return null;
-}
-
-
-
-/**
- * Stream viewer stage (subscribe-only): shows the host's LiveKit video full-size.
- * We avoid the full VideoConference UI for viewers in "stream" sessions to keep the UX simple
- * and to prevent viewer-side publish controls from appearing.
- */
-function LiveKitStreamViewerStage() {
-  const allTracks = useTracks([Track.Source.Camera, Track.Source.ScreenShare], {
-    onlySubscribed: false,
-  });
-
-  const remoteTracks = allTracks.filter((t) => !t.participant.isLocal);
-  const hostTracks = remoteTracks.filter((t) =>
-    String((t.participant as any)?.identity || "").startsWith("host:")
-  );
-
-  const tracksToShow = hostTracks.length ? hostTracks : remoteTracks;
-
-  return (
-    <div style={{ width: "100%", height: "100%" }}>
-      <RoomAudioRenderer />
-      <StartAudio label="Click to enable audio" />
-
-      {tracksToShow.length ? (
-        <GridLayout tracks={tracksToShow} style={{ height: "100%" }}>
-          <ParticipantTile />
-        </GridLayout>
-      ) : (
-        <div
-          style={{
-            width: "100%",
-            height: "100%",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "#fff",
-            background: "rgba(0,0,0,0.6)",
-            borderRadius: 18,
-            padding: 24,
-            textAlign: "center",
-            fontWeight: 600,
-          }}
-        >
-          Waiting for the host video…
-        </div>
-      )}
-    </div>
-  );
-}
-
-/**
- * Private conference stage (interactive):
- *  - split: show both participants side-by-side
- *  - focus: show only the *other* participant full-frame
- */
-function LiveKitPrivateConferenceStage(props: { viewMode: "split" | "focus" }) {
-  const cameraTracks = useTracks(
-    [{ source: Track.Source.Camera, withPlaceholder: true }],
-    { onlySubscribed: false },
-  );
-
-  const remoteCameraTracks = cameraTracks.filter((t) => !t.participant.isLocal);
-
-  const tracksToShow =
-    props.viewMode === "focus" ? (remoteCameraTracks.length ? [remoteCameraTracks[0]] : []) : cameraTracks;
-
-  return (
-    <div style={{ width: "100%", height: "100%" }}>
-      <RoomAudioRenderer />
-
-      {tracksToShow.length ? (
-        <GridLayout tracks={tracksToShow} style={{ height: "100%" }}>
-          <ParticipantTile />
-        </GridLayout>
-      ) : (
-        <div
-          style={{
-            width: "100%",
-            height: "100%",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "#fff",
-            background: "rgba(0,0,0,0.6)",
-            borderRadius: 18,
-            padding: 24,
-            textAlign: "center",
-            fontWeight: 600,
-          }}
-        >
-          Waiting for the other participant video…
-        </div>
-      )}
-    </div>
-  );
-}
-
-
-function LiveKitAutoPublish(props: {
-  enabled: boolean;
-  micEnabled: boolean;
-  cameraEnabled: boolean;
-  onError?: (msg: string) => void;
-}) {
-  const room = useRoomContext();
-  const [roomConnected, setRoomConnected] = useState<boolean>(false);
-  const lastRef = useRef<{ mic?: boolean; cam?: boolean }>({});
-
-  // Track connection state so mic/camera toggles reliably apply on the FIRST session.
-  // In some iframe/browser combos, calling setMicrophoneEnabled/setCameraEnabled before the
-  // Room is connected can throw, and if we "remember" the desired state too early we won't retry.
-  useEffect(() => {
-    const isConnectedNow = () => String((room as any)?.state ?? "").toLowerCase() === "connected";
-
-    const handleConnected = () => {
-      // Force a re-apply of mic/cam on every connect/reconnect.
-      lastRef.current = {};
-      setRoomConnected(true);
-    };
-    const handleDisconnected = () => {
-      setRoomConnected(false);
-    };
-
-    setRoomConnected(isConnectedNow());
-
-    try {
-      (room as any).on?.(RoomEvent.Connected, handleConnected);
-      (room as any).on?.(RoomEvent.Disconnected, handleDisconnected);
-      (room as any).on?.(RoomEvent.Reconnecting, handleDisconnected);
-      (room as any).on?.(RoomEvent.Reconnected, handleConnected);
-    } catch {
-      // no-op
-    }
-
-    return () => {
-      try {
-        (room as any).off?.(RoomEvent.Connected, handleConnected);
-        (room as any).off?.(RoomEvent.Disconnected, handleDisconnected);
-        (room as any).off?.(RoomEvent.Reconnecting, handleDisconnected);
-        (room as any).off?.(RoomEvent.Reconnected, handleConnected);
-      } catch {
-        // no-op
-      }
-    };
-  }, [room]);
-
-  useEffect(() => {
-    if (!props.enabled) return;
-    if (!roomConnected) return;
-    const lp: any = (room as any)?.localParticipant;
-    if (!lp) return;
-    const desiredMic = Boolean(props.micEnabled);
-    if (lastRef.current.mic === desiredMic) return;
-    Promise.resolve(lp.setMicrophoneEnabled(desiredMic))
-      .then(() => {
-        lastRef.current.mic = desiredMic;
-      })
-      .catch((err: any) => {
-        props.onError?.(`Microphone error: ${String(err?.message || err)}`);
-      });
-  }, [room, roomConnected, props.enabled, props.micEnabled, props.onError]);
-
-  useEffect(() => {
-    if (!props.enabled) return;
-    if (!roomConnected) return;
-    const lp: any = (room as any)?.localParticipant;
-    if (!lp) return;
-    const desiredCam = Boolean(props.cameraEnabled);
-    if (lastRef.current.cam === desiredCam) return;
-    Promise.resolve(lp.setCameraEnabled(desiredCam))
-      .then(() => {
-        lastRef.current.cam = desiredCam;
-      })
-      .catch((err: any) => {
-        props.onError?.(`Camera error: ${String(err?.message || err)}`);
-      });
-  }, [room, roomConnected, props.enabled, props.cameraEnabled, props.onError]);
-
-  return null;
-}
-
-
-// Shared button style used by the small Mic/Stop controls in the LiveKit section.
-const smallBtn: React.CSSProperties = {
-  borderRadius: 10,
-  padding: "8px 12px",
-  fontSize: 13,
-  fontWeight: 600,
-  lineHeight: "16px",
-  border: "1px solid rgba(0,0,0,0.18)",
-  cursor: "pointer",
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  gap: 6,
-};
-export default function Page() {
-  // iOS detection (includes iPadOS 13+ which reports itself as "Macintosh")
-  const isIOS = useMemo(() => {
-    if (typeof navigator === "undefined") return false;
-    const ua = navigator.userAgent || "";
-    const iOS = /iPad|iPhone|iPod/i.test(ua);
-    const iPadOS13 = /Macintosh/i.test(ua) && typeof document !== "undefined" && "ontouchend" in document;
-    return iOS || iPadOS13;
-  }, []);
-
-  const isIphone = useMemo(() => {
-    if (typeof navigator === "undefined") return false;
-    return /iPhone|iPod/i.test(navigator.userAgent || "");
-  }, []);
-
-  const isEmbedded = useMemo(() => {
-    if (typeof window === "undefined") return false;
-    try {
-      return window.self !== window.top;
-    } catch (e) {
-      // Cross-origin access to window.top can throw; assume embedded.
-      return true;
-    }
-  }, []);
-
-  // Normalize LiveKit server URL into ws/wss (client expects a websocket scheme)
-  const normalizeLivekitWsUrl = useCallback((input: string): string => {
-    const raw = String(input || "").trim();
-    if (!raw) return "";
-    if (raw.startsWith("wss://") || raw.startsWith("ws://")) return raw;
-    if (raw.startsWith("https://")) return "wss://" + raw.slice("https://".length);
-    if (raw.startsWith("http://")) return "ws://" + raw.slice("http://".length);
-    return raw;
-  }, []);
-
-
-  const sessionIdRef = useRef<string | null>(null);
-
-  // Keep the latest Wix memberId available for callbacks defined earlier in this file.
-  // This avoids TypeScript/TDZ issues where a callback dependency array would otherwise
-  // reference `memberId` before its declaration.
-  const memberIdRef = useRef<string>("");
-	  // Keep the latest host memberId available for early callbacks (prevents TDZ issues).
-	  const hostMemberIdRef = useRef<string>("");
-
-  // Wix member id (empty for visitors). Declared early so it can be referenced
-  // safely in dependency arrays above (prevents TS "used before its declaration").
-  const [memberId, setMemberId] = useState<string>("");
-
-  const autoJoinStreamRef = useRef<boolean>(false);
-	// Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
-	const stopInProgressRef = useRef<boolean>(false);
-	const sessionActiveRef = useRef<boolean>(false);
-  const streamOptOutRef = useRef<boolean>(false);
-  const conferenceOptOutRef = useRef<boolean>(false);
-
-  // -----------------------
-  // Debug overlay (mobile-friendly)
-  // Enable with ?debug=1 OR tap the avatar image 5 times quickly.
-  // -----------------------
-  const DEBUG_KEY = "ELARALO_DEBUG_OVERLAY";
-  const [debugEnabled, setDebugEnabled] = useState(false);
-  const [debugOpen, setDebugOpen] = useState(false);
-  const [debugLogs, setDebugLogs] = useState<string[]>([]);
-  const debugEnabledRef = useRef(false);
-  const debugTapCountRef = useRef(0);
-  const debugTapTimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const qs = new URLSearchParams(window.location.search);
-      const fromQuery = qs.get("debug") === "1";
-      const fromStorage = window.localStorage.getItem(DEBUG_KEY) === "1";
-
-      // Never auto-open the overlay (it can cover important UI). Allow it to open only
-      // if explicitly requested via ?debugOpen=1, otherwise require the 5-tap gesture.
-      if (fromQuery || fromStorage) {
-        setDebugEnabled(true);
-        setDebugOpen(qs.get("debugOpen") === "1");
-      }
-    } catch (e) {
-      // ignore
-    }
-  }, []);
-
-  useEffect(() => {
-    debugEnabledRef.current = debugEnabled;
-    if (typeof window === "undefined") return;
-    try {
-      if (debugEnabled) window.localStorage.setItem(DEBUG_KEY, "1");
-      else window.localStorage.removeItem(DEBUG_KEY);
-    } catch (e) {
-      // ignore
-    }
-  }, [debugEnabled]);
-
-  const pushDebug = useCallback((level: "log" | "warn" | "error", ...args: any[]) => {
-    if (!debugEnabledRef.current) return;
-    try {
-      const ts = new Date().toISOString().replace("T", " ").replace("Z", "");
-      const text = args
-        .map((a) => {
-          if (typeof a === "string") return a;
-          try {
-            return JSON.stringify(a);
-          } catch (e) {
-            return String(a);
-          }
-        })
-        .join(" ");
-      const line = `[${ts}] ${level.toUpperCase()}: ${text}`;
-      setDebugLogs((prev) => {
-        const next = [...prev, line];
-        return next.length > 250 ? next.slice(next.length - 250) : next;
-      });
-    } catch (e) {
-      // ignore
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!debugEnabled) return;
-
-    const origLog = console.log;
-    const origWarn = console.warn;
-    const origError = console.error;
-
-    console.log = (...args: any[]) => {
-      origLog(...args);
-      pushDebug("log", ...args);
-    };
-    console.warn = (...args: any[]) => {
-      origWarn(...args);
-      pushDebug("warn", ...args);
-    };
-    console.error = (...args: any[]) => {
-      origError(...args);
-      pushDebug("error", ...args);
-    };
-
-    const onError = (e: any) => {
-      pushDebug("error", "window.error", e?.message ?? e);
-    };
-    const onRejection = (e: any) => {
-      pushDebug("error", "unhandledrejection", e?.reason ?? e);
-    };
-
-    window.addEventListener("error", onError);
-    window.addEventListener("unhandledrejection", onRejection);
-
-    try {
-      pushDebug("log", "Debug enabled", {
-        href: window.location.href,
-        embedded: isEmbedded,
-        ua: navigator.userAgent,
-        apiBase: API_BASE,
-      });
-      console.log("[ELARALO] API_BASE =", API_BASE);
-    } catch (e) {
-      // ignore
-    }
-
-    return () => {
-      console.log = origLog;
-      console.warn = origWarn;
-      console.error = origError;
-      window.removeEventListener("error", onError);
-      window.removeEventListener("unhandledrejection", onRejection);
-    };
-  }, [debugEnabled, isEmbedded, pushDebug]);
-
-  const secretDebugTap = useCallback(() => {
-    if (typeof window === "undefined") return;
-
-    debugTapCountRef.current += 1;
-
-    if (debugTapTimerRef.current) window.clearTimeout(debugTapTimerRef.current);
-    debugTapTimerRef.current = window.setTimeout(() => {
-      debugTapCountRef.current = 0;
-      debugTapTimerRef.current = null;
-    }, 1400);
-
-    if (debugTapCountRef.current >= 5) {
-      debugTapCountRef.current = 0;
-
-      if (!debugEnabledRef.current) {
-        debugEnabledRef.current = true;
-        setDebugEnabled(true);
-      }
-      setDebugOpen((v) => !v);
-    }
-  }, []);
-
-
-
-  // Local audio-only TTS element (used when Live Avatar is not active/available)
-  const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
-  const localTtsVideoRef = useRef<HTMLVideoElement | null>(null);
-  const localTtsUnlockedRef = useRef(false);
-  const localTtsStopFnRef = useRef<(() => void) | null>(null);
-  // Guards to cancel/ignore in-flight local TTS work when user stops communications mid-stream.
-  const localTtsEpochRef = useRef(0);
-  const localTtsAbortRef = useRef<AbortController | null>(null);
-
-  // Live Avatar element ref is declared early so it can be used by the global TTS volume booster.
-  const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
-
-  // ----------------------------
-  // Global TTS volume boost
-  // ----------------------------
-  // HTMLMediaElement.volume tops out at 1.0. To reliably boost perceived loudness—especially
-  // on iOS after an audio-capture session—we route TTS playback through WebAudio GainNodes.
-  // This applies to:
-  // - Local TTS <audio>/<video> playback (hands-free STT mode)
-  // - Live Avatar <video> element playback (non-iPhone)
-  // iPhone Live Avatar already routes MediaStream audio through WebAudio (see applyIphoneLiveAvatarAudioBoost).
-  // Volume boost for audio-only TTS and non-iPhone Live Avatar.
-  // Note: We intentionally use WebAudio gain to exceed HTMLMediaElement.volume (max 1.0).
-  const TTS_GAIN = 12.0;
-  const ttsAudioCtxRef = useRef<AudioContext | null>(null);
-  const ttsAudioMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const ttsAudioGainRef = useRef<GainNode | null>(null);
-  const ttsAudioBoundElRef = useRef<HTMLMediaElement | null>(null);
-  const ttsVideoMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const ttsVideoGainRef = useRef<GainNode | null>(null);
-  const ttsVideoBoundElRef = useRef<HTMLMediaElement | null>(null);
-  const avatarVideoMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const avatarVideoGainRef = useRef<GainNode | null>(null);
-  const avatarVideoBoundElRef = useRef<HTMLMediaElement | null>(null);
-
-  const ensureTtsAudioContext = useCallback((): AudioContext | null => {
-    if (typeof window === "undefined") return null;
-    try {
-      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return null;
-      if (!ttsAudioCtxRef.current) ttsAudioCtxRef.current = new AudioCtx();
-      const ctx = ttsAudioCtxRef.current;
-      if (ctx?.state === "suspended" && ctx.resume) {
-        ctx.resume().catch(() => {});
-      }
-      return ctx;
-    } catch (e) {
-      return null;
-    }
-  }, []);
-
-  // "Audio session nudge" (runs on a user gesture):
-  // iOS Safari can remain in a low/communications-volume route after mic capture or modal dialogs.
-  // A short, low-frequency, low-amplitude burst through WebAudio helps re-establish the normal
-  // playback route so subsequent audio-only TTS (hidden VIDEO path) is not silent/feeble.
-  //
-  // NOTE: This is intentionally slightly stronger than "inaudible" because the user's report
-  // indicates iOS can otherwise remain stuck after the Clear Messages modal.
-  const nudgeAudioSession = useCallback(async () => {
-    const ctx = ensureTtsAudioContext();
-    if (!ctx) return;
-    try {
-      if (ctx.state === "suspended") {
-        await ctx.resume();
-      }
-
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      g.gain.value = 0.04;
-      osc.frequency.value = 40;
-      osc.connect(g);
-      g.connect(ctx.destination);
-      const stopAt = ctx.currentTime + 0.16;
-      osc.start();
-      osc.stop(stopAt);
-
-      window.setTimeout(() => {
-        try { osc.disconnect(); } catch (e) {}
-        try { g.disconnect(); } catch (e) {}
-      }, 220);
-    } catch (e) {
-      // ignore
-    }
-  }, [ensureTtsAudioContext]);
-
-  // Track whether we have already connected each gain routing chain.
-  const ttsAudioChainConnectedRef = useRef<boolean>(false);
-  const ttsVideoChainConnectedRef = useRef<boolean>(false);
-  const avatarVideoChainConnectedRef = useRef<boolean>(false);
-
-
-  const applyTtsGainRouting = useCallback(
-    (media: HTMLMediaElement | null, kind: "audio" | "video" | "avatar") => {
-      if (!media) return;
-      const ctx = ensureTtsAudioContext();
-      if (!ctx) return;
-
-      // iPhone Live Avatar uses MediaStream routing; do not double-route the <video> element.
-      if (kind === "avatar" && isIphone) return;
-
-      // IMPORTANT: Audio-only TTS must remain on the hidden <video> path, but routing
-      // cross-origin media through WebAudio can result in silence on some browsers (notably iOS Safari)
-      // if the media response is not CORS-enabled. To guarantee audibility, we do NOT route
-      // local (audio-only) TTS through WebAudio GainNodes. (We still keep the hidden VIDEO element.)
-      if (kind === "audio" || kind === "video") {
-        try { media.muted = false; media.volume = 1; } catch (e) {}
-        return;
-      }
-
-      try {
-        // From here on, we only handle the non-iPhone Live Avatar <video> element.
-        // (Audio-only TTS elements return early above to avoid WebAudio routing issues.)
-
-        // If the underlying media element instance changed (common when Live Avatar is stopped/started),
-        // we must recreate the MediaElementSourceNode. Source nodes are permanently bound to a single element.
-        if (avatarVideoBoundElRef.current !== media) {
-          try { avatarVideoMediaSrcRef.current?.disconnect(); } catch (e) {}
-          avatarVideoMediaSrcRef.current = null;
-          avatarVideoBoundElRef.current = media;
-          avatarVideoChainConnectedRef.current = false;
-        }
-
-        // If we already created a MediaElementSourceNode for this media element, reuse it.
-        // (Browsers throw if you call createMediaElementSource() more than once per element.)
-        let src: MediaElementAudioSourceNode | null = null;
-        let gain: GainNode | null = null;
-
-        // Avatar routing
-        {
-          src = avatarVideoMediaSrcRef.current;
-          gain = avatarVideoGainRef.current;
-          if (!src) {
-            src = ctx.createMediaElementSource(media);
-            avatarVideoMediaSrcRef.current = src;
-          }
-          if (!gain) {
-            gain = ctx.createGain();
-            avatarVideoGainRef.current = gain;
-          }
-        }
-
-        // Connect once and then only update gain. Repeated disconnect/reconnect can leave
-        // iOS Safari in a bad route after modal dialogs.
-        const connectOnce = (connectedRef: React.MutableRefObject<boolean>) => {
-          if (connectedRef.current) return;
-          try {
-            src!.connect(gain!);
-          } catch (e) {}
-          try {
-            gain!.connect(ctx.destination);
-          } catch (e) {}
-          connectedRef.current = true;
-        };
-        // kind is narrowed to "avatar" here (audio/video returned early above).
-        connectOnce(avatarVideoChainConnectedRef);
-
-        gain.gain.value = TTS_GAIN;
-
-        // Keep element volume at max so the gain node is the only limiter.
-        try {
-          media.muted = false;
-          media.volume = 1;
-        } catch (e) {}
-      } catch (e) {
-        // If this fails (e.g., cross-origin media restrictions), we still keep media.volume at 1.
-        try {
-          media.muted = false;
-          media.volume = 1;
-        } catch (e) {}
-      }
-    },
-    [ensureTtsAudioContext, isIphone]
-  );
-
-  const boostAllTtsVolumes = useCallback(() => {
-    try {
-      // Local (audio-only) TTS elements intentionally NOT routed through WebAudio.
-      // Live avatar video element (non-iPhone)
-      applyTtsGainRouting(avatarVideoRef.current, "avatar");
-    } catch (e) {
-      // ignore
-    }
-  }, [applyTtsGainRouting]);
-
-
-  // Companion identity (drives persona + Phase 1 live avatar mapping)
-  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
-  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
-  // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
-  // IMPORTANT: This must never alter STT/TTS start/stop code paths.
-  const [rebrandingKey, setRebrandingKey] = useState<string>("");
-
-  // Derive legacy single-field rebranding string from the pipe-delimited RebrandingKey.
-  // Default: "" (treated as core / non-rebranded).
-  const rebranding = useMemo(() => {
-    const p = parseRebrandingKey(rebrandingKey || "");
-    return String(p?.rebranding || "").trim();
-  }, [rebrandingKey]);
-  const rebrandingInfo = useMemo(() => parseRebrandingKey(rebrandingKey), [rebrandingKey]);
-
-  const renderMsgContent = useCallback(
-  (m: Msg): React.ReactNode => {
-    const meta: any = (m as any)?.meta || {};
-    const att: any = meta?.attachment || null;
-
-    const attUrl = att?.url ? String(att.url) : "";
-    const attName = att?.name ? String(att.name) : "attachment";
-    const attType = att?.contentType ? String(att.contentType) : "";
-
-    const isImage =
-      Boolean(attUrl) &&
-      ((attType && attType.toLowerCase().startsWith("image/")) ||
-        /\.(png|jpe?g|webp|gif)(\?|#|$)/i.test(attUrl));
-
-    const stripScheme = (u: string) => (u || "").replace(/^https?:/i, "");
-
-    const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
-const upgradeKey = rebrandingInfo?.upgradeLink ? stripScheme(rebrandingInfo.upgradeLink).toLowerCase() : "";
-
-const registerPayGoIntentIfNeeded = async (): Promise<void> => {
-  // Members already have memberId from the Wix Companion payload.
-  const wixMemberId = (memberId || "").trim();
-  if (wixMemberId) return;
-
-  if (typeof window === "undefined") return;
-
-  const apiBase = (API_BASE || "").trim();
-  if (!apiBase) return;
-
-  // Brand scoping for per-device PayGo storage keys.
-  const parsedRebranding = parseRebrandingKey(rebrandingKey);
-  const brandKeyLocal = safeBrandKey(
-    String((parsedRebranding?.rebranding || companionName || DEFAULT_COMPANY_NAME) ?? "").trim(),
-  );
-
-  // Prompt once per device (stored locally).
-  let email = getStoredPaygoEmail(brandKeyLocal);
-  if (!email) {
-    const entered = window.prompt(
-      "Please enter your email so we can credit your Pay‑as‑you‑Go minutes immediately after payment:"
-    );
-    if (!entered) return;
-    const trimmed = entered.trim();
-    if (!isProbablyEmail(trimmed)) {
-      window.alert("That doesn't look like a valid email address. Please try again.");
-      return;
-    }
-    email = trimmed;
-    setStoredPaygoEmail(brandKeyLocal, email);
-  }
-
-  const memberIdForBackend = getOrCreateAnonMemberId(brandKeyLocal);
-
-  try {
-    await fetch(`${apiBase}/paygo/intent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, memberId: memberIdForBackend }),
-      // keepalive helps ensure the request completes even if the browser navigates.
-      keepalive: true,
-    });
-  } catch (err) {
-    console.warn("[paygo] intent registration failed:", err);
-  }
-};
-
-const renderTextWithLinks = (text: string, isAssistant: boolean): React.ReactNode => {
-      const urlGlobal = /(https?:\/\/[^\s]+|\/\/[^\s]+)/g;
-      const parts = (text || "").split(urlGlobal);
-
-      return parts.map((part, idx) => {
-        if (!part) return null;
-
-        const isUrl = /^https?:\/\//i.test(part) || part.startsWith("//");
-        if (!isUrl) return <span key={idx}>{part}</span>;
-
-        // Peel trailing punctuation so it doesn't get included in the href.
-        const match = part.match(/^(.*?)([\)\]\.,;:!?]+)?$/);
-        const urlRaw = match?.[1] ?? part;
-        const punct = match?.[2] ?? "";
-
-        const comparable = stripScheme(urlRaw).toLowerCase();
-
-        let label = urlRaw;
-        if (isAssistant) {
-          if (paygKey && comparable === paygKey) label = "Pay as you Go";
-          else if (upgradeKey && comparable === upgradeKey) label = "Upgrade";
-        }
-
-        const href = urlRaw.startsWith("//") ? `https:${urlRaw}` : urlRaw;
-
-        return (
-          <React.Fragment key={idx}>
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={
-                label === "Pay as you Go" ? () => { void registerPayGoIntentIfNeeded(); } : undefined
-              }
-              style={{ textDecoration: "underline" }}
-            >
-              {label}
-            </a>
-            {punct}
-          </React.Fragment>
-        );
-      });
-    };
-
-    const textNode = renderTextWithLinks(m.content || "", m.role === "assistant");
-
-    const attachmentNode = attUrl ? (
-      <div style={{ marginTop: 6 }}>
-        <a href={attUrl} target="_blank" rel="noopener noreferrer">
-          {isImage ? (
-            <img
-              src={attUrl}
-              alt={attName}
-              style={{
-                maxWidth: 320,
-                maxHeight: 320,
-                borderRadius: 12,
-                border: "1px solid #e5e5e5",
-                display: "block",
-              }}
-            />
-          ) : (
-            <span style={{ textDecoration: "underline" }}>{attName || "Open attachment"}</span>
-          )}
-        </a>
-      </div>
-    ) : null;
-
-    return (
-      <>
-        {textNode}
-        {attachmentNode}
-      </>
-    );
-  },
-  [rebrandingInfo]
-);
-
-const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), [rebrandingInfo]);
-  const rebrandingSlug = useMemo(() => normalizeRebrandingSlug(rebrandingName), [rebrandingName]);
-
-  // For rebrands, show the rebranding site's plan label when Wix provides it (e.g., "Supreme").
-  const [planLabelOverride, setPlanLabelOverride] = useState<string>("");
-
-  // Upgrade URL (defaults to env; overridden by RebrandingKey when present)
-  const upgradeUrl = useMemo(() => {
-    const u = String(rebrandingInfo?.upgradeLink || "").trim();
-    return u || UPGRADE_URL;
-  }, [rebrandingInfo]);
-
-  const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
-  const [companionKey, setCompanionKey] = useState<string>("");
-  const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
-
-  // Viewer-only: display name used in the shared in-stream chat.
-  // - Stored locally so we only prompt once per (brand, companion).
-  const liveChatUsernameStorageKey = useMemo(() => {
-    const b = safeBrandKey(String(companyName || "").trim() || "core") || "core";
-    const a = safeBrandKey(String(companionName || "").trim() || "companion") || "companion";
-    return `livekit_livechat_username:${b}:${a}`;
-  }, [companyName, companionName]);
-
-  const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
-
-  useEffect(() => {
-    // Keep state in sync with localStorage as the user switches companions/brands.
-    // Fallback to sessionStorage if localStorage is blocked (common in some iframe/privacy modes).
-    try {
-      if (typeof window === "undefined") return;
-
-      let stored = "";
-      try {
-        stored = String((() => {
-          try {
-            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
-            if (v && String(v).trim()) return v;
-          } catch (e) {}
-          try {
-            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
-            if (v2 && String(v2).trim()) return v2;
-          } catch (e) {}
-          return "";
-        })() || "").trim();
-      } catch (e) {
-        stored = "";
-      }
-      if (!stored) {
-        try {
-          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
-        } catch (e) {
-          stored = "";
-        }
-      }
-
-      setViewerLiveChatName(stored);
-    } catch (e) {
-      setViewerLiveChatName("");
-    }
-  }, [liveChatUsernameStorageKey]);
-
-  // LiveKit identity conventions used by the backend:
-  //   - user:<memberId> when memberId is available
-  //   - anon:<random> otherwise
-  // We also use this as the fallback display name when the viewer does not enter a name.
-  const getLivekitSystemIdentity = useCallback((): string => {
-    try {
-      const mid = String(memberId || "").trim();
-      if (mid) return `user:${mid}`;
-
-      const k = "dm_livekit_anon_id_v1";
-      const existing = String(window?.localStorage?.getItem(k) || "").trim();
-      if (existing) return existing;
-
-      const rnd = Math.random().toString(36).slice(2, 10);
-      const anon = `anon:${Date.now().toString(36)}_${rnd}`;
-      window?.localStorage?.setItem(k, anon);
-      return anon;
-    } catch {
-      const rnd = Math.random().toString(36).slice(2, 10);
-      return `anon:${Date.now().toString(36)}_${rnd}`;
-    }
-  }, [memberId]);
-
-  const ensureViewerLiveChatName = useCallback((opts?: { promptText?: string }): string => {
-    if (typeof window === "undefined") return "";
-
-    const current = String(viewerLiveChatName || "").trim();
-    if (current) return current;
-
-    // NOTE: In restrictive iframe environments (e.g., some mobile browsers), localStorage can be
-    // unavailable or non-persistent. We therefore try: localStorage -> sessionStorage -> window.name.
-    const WINDOW_NAME_PREFIX = "__DM_KV__=";
-
-    const readWindowNameKV = (): Record<string, string> => {
-      try {
-        const raw = String(window.name || "");
-        const idx = raw.indexOf(WINDOW_NAME_PREFIX);
-        if (idx === -1) return {};
-        const encoded = raw.substring(idx + WINDOW_NAME_PREFIX.length);
-        if (!encoded) return {};
-        const json = decodeURIComponent(encoded);
-        const obj = JSON.parse(json);
-        return obj && typeof obj === "object" ? (obj as Record<string, string>) : {};
-      } catch {
-        return {};
-      }
-    };
-
-    const writeWindowNameKV = (kv: Record<string, string>) => {
-      try {
-        const raw = String(window.name || "");
-        const base = raw.split(WINDOW_NAME_PREFIX)[0]; // preserve any pre-existing prefix
-        window.name = `${base}${WINDOW_NAME_PREFIX}${encodeURIComponent(JSON.stringify(kv))}`;
-      } catch {
-        // ignore
-      }
-    };
-
-    // Per-device, we want to prompt *once*, even if brand/companion identifiers change
-    // (common during rebrand flows or when companionName loads asynchronously).
-    const GLOBAL_LIVECHAT_KEY = "dm_livechat_username";
-
-    const keysToTry = (() => {
-      const keys: string[] = [];
-      if (liveChatUsernameStorageKey) keys.push(liveChatUsernameStorageKey);
-
-      // Global fallback (per-device) so we don't keep re-prompting in restrictive iframe contexts.
-      keys.push(GLOBAL_LIVECHAT_KEY);
-
-      // Legacy (older builds may have used a key without companionKey)
-      const legacyBase = `${safeBrandKey(companyName)}_${safeBrandKey(companionName)}_livechat_username`;
-      if (legacyBase) keys.push(legacyBase);
-
-      // Very old fallback (in case safeBrandKey or naming changed)
-      const veryOld = `dulcemoon_${safeBrandKey(companionName || "companion")}_livechat_username`;
-      if (veryOld) keys.push(veryOld);
-
-      // De-dup + remove empties
-      return Array.from(new Set(keys.filter(Boolean)));
-    })();
-
-    const tryGet = (fn: (k: string) => string | null): string => {
-      for (const k of keysToTry) {
-        try {
-          const v = fn(k);
-          const s = String(v || "").trim();
-          if (s) return s;
-        } catch {
-          // ignore and keep trying
-        }
-      }
-      return "";
-    };
-
-    const storeEverywhere = (value: string) => {
-      const v = String(value || "").trim().slice(0, 50);
-      if (!v) return;
-
-      // Always write back to the primary key (current build)
-      try {
-        if (liveChatUsernameStorageKey) {
-          window.localStorage.setItem(liveChatUsernameStorageKey, v);
-        }
-        window.localStorage.setItem(GLOBAL_LIVECHAT_KEY, v);
-      } catch {
-        // ignore
-      }
-      try {
-        if (liveChatUsernameStorageKey) {
-          window.sessionStorage.setItem(liveChatUsernameStorageKey, v);
-        }
-        window.sessionStorage.setItem(GLOBAL_LIVECHAT_KEY, v);
-      } catch {
-        // ignore
-      }
-      try {
-        const kv = readWindowNameKV();
-        if (liveChatUsernameStorageKey) {
-          kv[liveChatUsernameStorageKey] = v;
-        }
-        kv[GLOBAL_LIVECHAT_KEY] = v;
-        writeWindowNameKV(kv);
-      } catch {
-        // ignore
-      }
-    };
-
-    // 1) localStorage
-    let stored = "";
-    try {
-      stored = tryGet((k) => window.localStorage.getItem(k));
-    } catch {
-      // ignore
-    }
-
-    // 2) sessionStorage
-    if (!stored) {
-      try {
-        stored = tryGet((k) => window.sessionStorage.getItem(k));
-      } catch {
-        // ignore
-      }
-    }
-
-    // 3) window.name (fallback)
-    if (!stored) {
-      try {
-        const kv = readWindowNameKV();
-        for (const k of keysToTry) {
-          const s = String(kv[k] || "").trim();
-          if (s) {
-            stored = s;
-            break;
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    if (stored) {
-      const cleaned = stored.trim().slice(0, 50);
-      setViewerLiveChatName(cleaned);
-      storeEverywhere(cleaned);
-      return cleaned;
-    }
-
-    const suggested = "Viewer";
-    const promptText =
-      opts?.promptText || "Choose a username to display during the live session:";
-    const name = window.prompt(promptText, suggested);
-
-    // Requirement: if the viewer does not enter a name (blank or cancel), use a LiveKit system identifier.
-    const systemId = getLivekitSystemIdentity();
-
-    const cleaned =
-      String(name ?? "")
-        .replace(/[\r\n\t]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 50) || systemId;
-
-    setViewerLiveChatName(cleaned);
-    storeEverywhere(cleaned);
-    return cleaned;
-  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, getLivekitSystemIdentity]);
-
-
-  const changeViewerLiveChatName = useCallback(() => {
-    try {
-      if (typeof window === "undefined") return;
-      const existing =
-        String(viewerLiveChatName || "").trim() ||
-        String((() => {
-          try {
-            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
-            if (v && String(v).trim()) return v;
-          } catch (e) {}
-          try {
-            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
-            if (v2 && String(v2).trim()) return v2;
-          } catch (e) {}
-          return "";
-        })() || "").trim();
-
-      const raw =
-        window.prompt("Change your username for the live session:", existing) || "";
-
-      const cleaned = raw
-        .replace(/[\r\n\t]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 32);
-
-      if (!cleaned) return;
-
-      try {
-        window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
-      } catch (e) {
-        try {
-          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
-        } catch (e) {}
-      }
-      setViewerLiveChatName(cleaned);
-    } catch (e) {
-      // ignore
-    }
-  }, [viewerLiveChatName, liveChatUsernameStorageKey]);
-
-
-  // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
-  const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
-
-  
-  const [companionMappingError, setCompanionMappingError] = useState<string>("");
-useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      const brand = String(companyName || "").trim();
-      const avatar = String(companionName || "").trim();
-
-      // Strict: brand+avatar must be present (core brand defaults to Elaralo when rebrandingKey is empty).
-      if (!brand || !avatar) {
-        setCompanionMapping(null);
-        setCompanionMappingError("Missing brand or avatar for companion mapping lookup.");
-        return;
-      }
-
-      if (!API_BASE) {
-        setCompanionMapping(null);
-        setCompanionMappingError("API_BASE is not configured; cannot load companion mapping.");
-        return;
-      }
-
-      try {
-        const url = `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(
-          avatar
-        )}`;
-        const res = await fetch(url, { method: "GET" });
-
-        // Backend is strict and may return 404; surface its error message.
-        const json: any = await res.json().catch(() => ({}));
-        if (cancelled) return;
-
-        if (!res.ok) {
-          const detail = String(json?.detail || json?.message || "").trim();
-          setCompanionMapping(null);
-          setCompanionMappingError(
-            detail || `Companion mapping request failed (${res.status} ${res.statusText}).`
-          );
-          return;
-        }
-
-        // Strict: mapping endpoint must return found=true
-        if (!(json as any)?.found) {
-          setCompanionMapping(null);
-          setCompanionMappingError(`Companion mapping not found for brand='${brand}' avatar='${avatar}'.`);
-          return;
-        }
-
-        setCompanionMapping(json as CompanionMappingRow);
-        setCompanionMappingError("");
-      } catch (e: any) {
-        if (!cancelled) {
-          setCompanionMapping(null);
-          setCompanionMappingError(String(e?.message || e || "Failed to load companion mapping."));
-        }
-      }
-    }
-
-    void load();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [API_BASE, companyName, companionName]);
-
-  // Auto-join active LiveKit stream as a viewer (subscribe-only)
-  // Read `?rebrandingKey=...` for direct testing (outside Wix).
-  // Back-compat: also accept `?rebranding=BrandName`.
-  // In production, Wix should pass { rebrandingKey: "..." } via postMessage.
-  useEffect(() => {
-    try {
-      const u = new URL(window.location.href);
-      const qKey = u.searchParams.get(REBRANDING_KEY_QUERY_PARAM);
-      const qLegacy = u.searchParams.get(LEGACY_REBRANDING_QUERY_PARAM);
-      const q = String(qKey || "").trim() || String(qLegacy || "").trim();
-      if (q) setRebrandingKey(q);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
-
-  // Resolve the default company logo when rebranding is active.
-  // This only affects the header circle image when no companion image is available.
-  useEffect(() => {
-    const rawBrand = (rebrandingName || "").trim();
-    const slug = (rebrandingSlug || "").trim();
-
-    // No rebranding: revert to the default Elaralo logo.
-    if (!rawBrand) {
-      setCompanyLogoSrc(DEFAULT_AVATAR);
-
-      // Keep the header image in sync if we are currently showing a company logo.
-      // Do NOT override a companion headshot.
-      setAvatarSrc((prev) => {
-        const p = String(prev || "").trim();
-        if (!p) return DEFAULT_AVATAR;
-
-        // Covers both:
-        // - "/companion/headshot/..."
-        // - "/rebranding/<brand>/companion/headshot/..."
-        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
-
-        if (p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
-
-        // If we were previously showing a rebrand logo, revert to default.
-        if (p.includes("-logo.")) return DEFAULT_AVATAR;
-
-        return prev;
-      });
-
-      return;
-    }
-
-    const base = slug || normalizeRebrandingSlug(rawBrand);
-
-    const candidates: string[] = [];
-    if (base) {
-      // IMPORTANT:
-      // - Logo assets live under frontend/public.
-      // - For rebrands, the logo is now located under:
-      //     /rebranding/<brand>/<brand>-logo.(png|jpg|jpeg|webp)
-      // - We keep a legacy fallback for older deployments where the logo lived at site root.
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.png`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.jpeg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${base}/${base}-logo.webp`));
-
-      // Legacy fallback: root-level logo
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.png`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.jpeg`));
-      candidates.push(joinUrlPrefix(APP_BASE_PATH, `/${base}-logo.webp`));
-    }
-
-    // Fallback: default Elaralo logo (imported asset)
-    candidates.push(DEFAULT_AVATAR);
-
-    let cancelled = false;
-
-    pickFirstLoadableImage(candidates).then((picked) => {
-      if (cancelled) return;
-
-      setCompanyLogoSrc(picked);
-
-      // If the current image is a company logo (default or previous rebrand), update it.
-      // Do NOT override a companion headshot.
-      setAvatarSrc((prev) => {
-        const p = String(prev || "").trim();
-        if (!p) return picked;
-
-        // Covers both default + rebrand headshots.
-        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
-
-        if (p === DEFAULT_AVATAR) return picked;
-
-        // If we were showing some other "-logo.*" asset, treat it as a company logo and swap it.
-        if (p.includes("-logo.")) return picked;
-
-        return prev;
-      });
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [rebrandingName, rebrandingSlug]);
-
-
-
-// ----------------------------
-// Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
-// ----------------------------
-const didSrcObjectRef = useRef<any | null>(null);
-const didAgentMgrRef = useRef<any | null>(null);
-const didReconnectInFlightRef = useRef<boolean>(false);
-
-// iPhone-only: boost Live Avatar audio by routing the streamed MediaStream audio through WebAudio.
-// This avoids iPhone's low/receiver-like WebRTC audio output and makes the avatar clearly audible.
-const didIphoneAudioCtxRef = useRef<AudioContext | null>(null);
-const didIphoneAudioSrcRef = useRef<MediaStreamAudioSourceNode | null>(null);
-const didIphoneAudioGainRef = useRef<GainNode | null>(null);
-const didIphoneBoostActiveRef = useRef<boolean>(false);
-
-
-  const [avatarStatus, setAvatarStatus] = useState<
-    "idle" | "connecting" | "connected" | "reconnecting" | "waiting" | "error"
-  >(
-  "idle"
-);
-const [avatarError, setAvatarError] = useState<string | null>(null);
-  // Live stream embed URL (deprecated; LiveKit uses room tokens)
-  // LiveKit provider
-  const LIVEKIT_URL = useMemo(() => normalizeLivekitWsUrl(String((process.env.NEXT_PUBLIC_LIVEKIT_URL || process.env.LIVEKIT_URL || "")).trim()), [normalizeLivekitWsUrl]);
-  const [livekitToken, setLivekitToken] = useState<string>("");
-  const [livekitHlsUrl, setLivekitHlsUrl] = useState<string>("");
-  const [livekitRoomName, setLivekitRoomName] = useState<string>("");
-  const [livekitRole, setLivekitRole] = useState<"unknown" | "host" | "attendee" | "viewer">("unknown");
-  
-  const [livekitJoinStatus, setLivekitJoinStatus] = useState<"idle" | "pending" | "joined" | "error">("idle");
-  const [livekitMicEnabled, setLivekitMicEnabled] = useState<boolean>(true);
-  const [livekitCameraEnabled, setLivekitCameraEnabled] = useState<boolean>(true);
-
-  // Private conference view mode:
-  //  - split: show both participants side-by-side
-  //  - focus: show only the *other* participant full-frame
-  const [conferenceViewMode, setConferenceViewMode] = useState<"split" | "focus">("split");
-
-  const [livekitServerUrl, setLivekitServerUrl] = useState<string>(String(LIVEKIT_URL || "").trim());
-  // LiveKit session state
-  const [sessionActive, setSessionActive] = useState<boolean>(false);
-  const [sessionKind, setSessionKind] = useState<SessionKind>("");
-
-  useEffect(() => {
-    // Always reset when leaving private conference.
-    if (sessionKind !== "conference") setConferenceViewMode("split");
-  }, [sessionKind]);
-
-  const [sessionRoom, setSessionRoom] = useState<string>("");
-  useEffect(() => {
-    sessionActiveRef.current = sessionActive;
-  }, [sessionActive]);
-	  const mappedHostMemberId = useMemo(() => {
-	    const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
-	    return String(v || "");
-	  }, [companionMapping]);
-
-	  // Treat "host" as the *membership* that owns this companion.
-	  // IMPORTANT: do NOT derive host-ness from `livekitRole` because `livekitRole` is updated asynchronously
-	  // and the Host must never be prompted for a viewer username.
-	  const isHost = Boolean(memberId && mappedHostMemberId && memberId === mappedHostMemberId);
-	  const isViewer = Boolean(memberId && mappedHostMemberId && memberId !== mappedHostMemberId);
-	  useEffect(() => {
-	    hostMemberIdRef.current = String(mappedHostMemberId || "");
-	  }, [mappedHostMemberId]);
-  const livekitRoleKnown = livekitRole !== "unknown";
-  const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
-
-  const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
-	const livekitPendingUnique = useMemo(() => {
-		const byKey = new Map<string, any>();
-		for (const r of livekitPending || []) {
-			const key = String(r?.memberId || r?.requestId || "");
-			if (!key) continue;
-			if (!byKey.has(key)) byKey.set(key, r);
-		}
-		return Array.from(byKey.values());
-	}, [livekitPending]);
-  // Viewers must press Play to join live streams.
-  // We only reset the auto-join guard when a live stream ends.
-  useEffect(() => {
-    if (!(sessionActive && sessionKind === "stream")) {
-      autoJoinStreamRef.current = false;
-    }
-  }, [sessionActive, sessionKind]);
-
-  // Host: poll join requests while a LiveKit session is active.
-  useEffect(() => {
-    if (!isHost) return;
-    if (!sessionActive) return;
-    let cancelled = false;
-
-    const tick = async () => {
-      try {
-        const resp = await fetch(
-          `${API_BASE}/livekit/join_requests?brand=${encodeURIComponent(companyName)}&avatar=${encodeURIComponent(companionName)}`
-        );
-        const data: any = await resp.json().catch(() => ({}));
-        const requests = Array.isArray(data?.requests) ? data.requests : [];
-        const annotated = requests.map((r: any) => {
-          const viewerLabel = String((r as any)?.viewer_name || r?.name || r?.viewerName || r?.username || r?.memberId || "Viewer")
-            .trim()
-            .slice(0, 32);
-          const identity = String(r?.memberId || r?.identity || r?.requestId || "").trim();
-          return { ...r, viewerLabel: viewerLabel || "Viewer", identity };
-        });
-        if (!cancelled) setLivekitPending(annotated);
-      } catch {
-        if (!cancelled) setLivekitPending([]);
-      }
-    };
-
-    const id = window.setInterval(tick, 1200);
-    void tick();
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [API_BASE, companyName, companionName, isHost, sessionActive]);
-
-  // Viewer: poll join-request status until admitted/denied.
-  useEffect(() => {
-    if (isHost) return;
-    if (!livekitJoinRequestId) return;
-
-    let cancelled = false;
-
-    const poll = async () => {
-      if (cancelled) return;
-
-      try {
-        const resp = await fetch(
-          `${API_BASE}/livekit/join_request_status?requestId=${encodeURIComponent(livekitJoinRequestId)}`
-        );
-        const data = await resp.json().catch(() => ({} as any));
-
-        if (!resp.ok || !data?.ok) return;
-
-        const status = String((data as any)?.status || "").toLowerCase();
-        if (status === "admitted") {
-          const token = String((data as any)?.token || "").trim();
-          const roomName = String((data as any)?.roomName || (data as any)?.room || "").trim();
-          const serverUrl = String((data as any)?.serverUrl || "").trim();
-          if (!token) return;
-
-          if (serverUrl) setLivekitServerUrl(serverUrl);
-          if (roomName) {
-            setLivekitRoomName(roomName);
-            setSessionRoom(roomName);
-            // Keep streamEventRef aligned with the active room so Live Sharing can mirror correctly.
-            setStreamEventRef(roomName);
-          }
-
-          setLivekitToken(token);
-          setLivekitRole("viewer");
-          setSessionKind("conference");
-          setSessionActive(true);
-          setConferenceJoined(true);
-          setLivekitJoinStatus("joined");
-          setLivekitMicEnabled(true);
-          setLivekitCameraEnabled(true);
-          setAvatarStatus("connected");
-          setStreamNotice(null);
-          setLivekitJoinRequestId("");
-        } else if (status === "denied" || status === "expired") {
-          setStreamNotice(status === "denied" ? "Join request denied." : "Join request expired.");
-          setLivekitJoinRequestId("");
-          setAvatarStatus("waiting");
-        }
-      } catch (_err) {
-        // Ignore transient errors; we will retry.
-      }
-    };
-
-    const timer = window.setInterval(poll, 1000);
-    void poll();
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [API_BASE, LIVEKIT_URL, isHost, livekitJoinRequestId]);
-
-
-
-  const admitLivekit = useCallback(async (requestId: string) => {
-    const rid = String(requestId || "").trim();
-    if (!rid) return;
-    await fetch(`${API_BASE}/livekit/admit`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requestId: rid, brand: companyName, avatar: companionName, memberId: memberIdRef.current || "" }),
-    }).catch(() => {});
-  }, [API_BASE, companyName, companionName]);
-
-  const denyLivekit = useCallback(async (requestId: string) => {
-    const rid = String(requestId || "").trim();
-    if (!rid) return;
-    await fetch(`${API_BASE}/livekit/deny`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requestId: rid, brand: companyName, avatar: companionName, memberId: memberIdRef.current || "" }),
-    }).catch(() => {});
-  }, [API_BASE, companyName, companionName]);
-
-  const [streamEventRef, setStreamEventRef] = useState<string>("");
-  const [streamCanStart, setStreamCanStart] = useState<boolean>(false);
-
-  useEffect(() => {
-    if (!memberId) return;
-    if (!mappedHostMemberId) return;
-
-    if (memberId === mappedHostMemberId) {
-      setStreamCanStart(true);
-      setLivekitRole("host");
-    } else {
-      setStreamCanStart(false);
-      setLivekitRole((prev) => (prev === "unknown" ? "viewer" : prev));
-    }
-  }, [memberId, mappedHostMemberId]);
-
-  // Priority #2 (default companion view): if there is no active live session, clear any stale
-  // LiveKit + live-session UI artifacts so a fresh page load (F5) reliably lands on the default UI.
-  useEffect(() => {
-    if (sessionActive) return;
-    if (avatarStatus !== "idle") return;
-
-    // Stream artifacts
-    joinedStreamRef.current = false;
-    setStreamEventRef("");
-    setLivekitToken("");
-    setLivekitRoomName("");
-    setLivekitHlsUrl("");
-    setLivekitJoinRequestId("");
-
-    // Conference artifacts (legacy)
-    setConferenceJoined(false);
-
-    // Host broadcast overlay artifacts
-    setShowBroadcasterOverlay(false);
-    setBroadcastPreparing(false);
-    setBroadcastError("");
-  }, [sessionActive, avatarStatus]);
-
-  const [streamNotice, setStreamNotice] = useState<string>("");
-
-
-  // Notice for Live Sharing (websocket chat)
-  const [liveSharingNotice, setLiveSharingNotice] = useState<string | null>(null);
-
-const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
-
-const channelCap: ChannelCap = useMemo(() => {
-  // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
-  const capRaw = String((companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? "")
-    .trim()
-    .toLowerCase();
-
-  if (capRaw === "video") return "video";
-  if (capRaw === "audio") return "audio";
-  return "";
-}, [companionMapping]);
-
-const liveProvider: LiveProvider = useMemo(() => {
-  // Strict mapping: DB values are Stream, D-ID, or NULL.
-  // NOTE: "did" (no hyphen) is NOT accepted.
-  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
-
-  if (liveRaw === "stream") return "stream";
-  if (liveRaw === "d-id") return "d-id";
-
-  // If channel_cap=Video but live is empty/invalid, treat as misconfigured.
-  // We default to "d-id" as a safe runtime fallback, but we also surface an error via companionMappingError.
-  return "d-id";
-}, [companionMapping]);
-
-
-// Strict validation: Video companions must have a Live provider (Stream or D-ID).
-useEffect(() => {
-  if (channelCap === "video") {
-    const liveRaw = String(companionMapping?.live || "").trim();
-    if (!liveRaw) {
-      setCompanionMappingError(
-        `Invalid companion mapping: channel_cap=Video but live is NULL/empty for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`
-      );
-    }
-  }
-}, [channelCap, companionMapping, companyName, companionName]);
-const streamUrl = useMemo(() => {
-  const raw = String(companionKeyRaw || "").trim();
-  const { flags } = splitCompanionKey(raw);
-  return String(flags["streamurl"] || "").trim() || STREAM_URL;
-}, [companionKeyRaw]);
-
-const liveEnabled = useMemo(() => {
-  // Product requirement (Video Icon next to the microphone):
-  // - Show when channel_cap === "Video" AND live is "Stream" or "D-ID"
-  // - Hide otherwise
-  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
-  const liveOk = liveRaw === "stream" || liveRaw === "d-id";
-  return channelCap === "video" && liveOk;
-}, [channelCap, companionMapping]);
-
-
-  // Wix templates (and some site themes) may apply a gray page background.
-  // The Companion UI should always render on a white canvas.
-  useEffect(() => {
-    if (typeof document === "undefined") return;
-    const prevHtmlBg = document.documentElement.style.backgroundColor;
-    const prevBodyBg = document.body.style.backgroundColor;
-    document.documentElement.style.backgroundColor = "#fff";
-    document.body.style.backgroundColor = "#fff";
-    return () => {
-      document.documentElement.style.backgroundColor = prevHtmlBg;
-      document.body.style.backgroundColor = prevBodyBg;
-    };
-  }, []);
-
-
-
-  // UI layout
-  const conversationHeight = 520;
-  // UI: show the video frame whenever the user is in a Live Video session.
-// For Stream (LegacyStream): show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
-// so the click is never perceived as a no-op and the viewer can always press Stop to exit waiting.
-// LiveKit sessions (Stream + Private): keep the session frame visible whenever a session is active,
-// so refreshes don't hide the live session UI.
-const livekitUiActive =
-  liveProvider === "stream" &&
-  ((sessionActive && isHost) ||
-    Boolean(livekitToken) ||
-    livekitJoinStatus === "pending" ||
-    avatarStatus === "connecting" ||
-    avatarStatus === "waiting" ||
-    avatarStatus === "connected" ||
-    avatarStatus === "reconnecting" ||
-    Boolean(streamEventRef) );
-
-const showAvatarFrame =
-  (liveProvider === "stream" && livekitUiActive) ||
-  (Boolean(phase1AvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
-
-  // Viewer-only: treat any active LegacyStream embed as "Live Streaming".
-  // Used to hide controls that must not be available to viewers during the stream.
-
-const cleanupIphoneLiveAvatarAudio = useCallback(() => {
-  if (!didIphoneBoostActiveRef.current && !didIphoneAudioCtxRef.current) return;
-
-  didIphoneBoostActiveRef.current = false;
-
-  try {
-    didIphoneAudioSrcRef.current?.disconnect();
-  } catch (e) {}
-  try {
-    didIphoneAudioGainRef.current?.disconnect();
-  } catch (e) {}
-
-  didIphoneAudioSrcRef.current = null;
-  didIphoneAudioGainRef.current = null;
-
-  try {
-    // Closing releases resources; we recreate on demand.
-    didIphoneAudioCtxRef.current?.close?.();
-  } catch (e) {}
-  didIphoneAudioCtxRef.current = null;
-
-  // Restore video element audio defaults (in case we muted it for iPhone boost)
-  const vid = avatarVideoRef.current;
-  if (vid) {
-    try {
-      vid.muted = false;
-      vid.volume = 1;
-    } catch (e) {}
-  }
-}, []);
-
-const ensureIphoneAudioContextUnlocked = useCallback(() => {
-  if (!isIphone) return;
-  if (typeof window === "undefined") return;
-
-  try {
-    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (!AudioCtx) return;
-
-    if (!didIphoneAudioCtxRef.current) {
-      didIphoneAudioCtxRef.current = new AudioCtx();
-    }
-
-    const ctx = didIphoneAudioCtxRef.current;
-    // Resume inside user gesture when possible
-    if (ctx?.state === "suspended" && ctx.resume) {
-      ctx.resume().catch(() => {});
-    }
-  } catch (e) {
-    // ignore
-  }
-}, [isIphone]);
-
-
-const requestLivekitAvPermissions = useCallback(
-  async (opts: { audio?: boolean; video?: boolean; reason: string }) => {
-    const wantAudio = opts.audio !== false;
-    const wantVideo = opts.video !== false;
-
-    try {
-      if (typeof navigator === "undefined") return true;
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return true;
-
-      // On iOS/Safari, permission prompts are far more reliable when triggered directly
-      // from the same user gesture as the "Play" click.
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: wantAudio,
-        video: wantVideo,
-      });
-
-      // Immediately stop; we only need permissions primed for LiveKit's own track creation.
-      for (const track of stream.getTracks()) track.stop();
-
-      return true;
-    } catch (err) {
-      console.warn(`[LiveKit] getUserMedia failed (${opts.reason})`, err);
-      return false;
-    }
-  },
-  [],
-);
-
-const applyIphoneLiveAvatarAudioBoost = useCallback(
-  (stream: any) => {
-    if (!isIphone) return;
-    if (typeof window === "undefined") return;
-
-    if (!stream || typeof stream.getAudioTracks !== "function") return;
-    const tracks = stream.getAudioTracks();
-    if (!tracks || tracks.length === 0) return;
-
-    try {
-      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-
-      let ctx = didIphoneAudioCtxRef.current;
-      if (!ctx) {
-        ctx = new AudioCtx();
-        didIphoneAudioCtxRef.current = ctx;
-      }
-
-      if (ctx?.state === "suspended" && ctx.resume) {
-        ctx.resume().catch(() => {});
-      }
-
-      // Clear any previous routing
-      try {
-        didIphoneAudioSrcRef.current?.disconnect();
-      } catch (e) {}
-      try {
-        didIphoneAudioGainRef.current?.disconnect();
-      } catch (e) {}
-
-      // Route MediaStream audio -> Gain -> destination
-      const source = ctx.createMediaStreamSource(stream);
-      const gain = ctx.createGain();
-
-      // Boost amount tuned for iPhone; iPad/Desktop already fine.
-      // Use a higher gain because iPhone often routes WebRTC audio at a receiver-like level.
-      gain.gain.value = 10.0;
-
-      source.connect(gain);
-      gain.connect(ctx.destination);
-
-      didIphoneAudioSrcRef.current = source;
-      didIphoneAudioGainRef.current = gain;
-      didIphoneBoostActiveRef.current = true;
-
-      // Mute the <video>'s audio so we don't get double audio (and avoid iPhone low WebRTC path)
-      const vid = avatarVideoRef.current;
-      if (vid) {
-        try {
-          vid.muted = true;
-          vid.volume = 0;
-        } catch (e) {}
-      }
-    } catch (e) {
-      console.warn("iPhone Live Avatar audio boost failed:", e);
-    }
-  },
-  [isIphone]
-);
-
-
-
-
-const stopLiveAvatar = useCallback(async () => {
-  if (stopInProgressRef.current) return;
-  stopInProgressRef.current = true;
-  setStreamNotice(null);
-
-  try {
-    // Always tear down local media + UI state so the user can recover from a stuck session.
-    cleanupIphoneLiveAvatarAudio();
-
-    setLivekitToken("");
-    setLivekitRoomName("");
-    setLivekitHlsUrl("");
-
-      // Always clear any broadcast overlay/UI state to avoid stale sessions when switching modes.
-      setShowBroadcasterOverlay(false);
-      setBroadcasterOverlayUrl("");
-      setBroadcastPreparing(false);
-      setBroadcastError(null);
-    // Note: we no longer track a dedicated `streamJoined` flag.
-    // The UI derives join state from `livekitUiActive`, `livekitToken`, and `avatarStatus`.
-    setConferenceJoined(false);
-    setAvatarStatus("idle");
-    setStreamEventRef("");
-    setLivekitJoinRequestId("");
-    setLivekitJoinStatus("idle");
-    setLivekitPending([]);
-    // Do NOT wipe AI chat transcripts here. We want queued AI messages/responses to remain visible
-    // after leaving a LiveKit session; only live-sharing chat should be suppressed outside a session.
-    setMessages((prev: any[]) =>
-      (prev || []).filter((m: any) => !Boolean(m?.meta?.liveChat))
-    );
-    setLiveSharingNotice(null);
-
-    // Viewers leaving should NOT stop the live session for everyone.
-    if (!isHost) {
-      return;
-    }
-
-    // Host: stop *any* active session (stream OR private) to prevent stale/stuck state.
-    const payload = {
-      brand: companyName,
-      avatar: companionName,
-      memberId: memberIdRef.current || "",
-    };
-
-    // Stop both kinds defensively (backend is idempotent).
-    await fetch(`${API_BASE}/stream/livekit/stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(() => null);
-
-    await fetch(`${API_BASE}/conference/livekit/stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(() => null);
-
-    // Local session reset for host (poller will reconcile too).
-    setSessionActive(false);
-    setSessionKind("");
-    sessionActiveRef.current = false;
-    streamOptOutRef.current = false;
-    conferenceOptOutRef.current = false;
-    setStreamCanStart(false);
-
-    setStreamNotice("Stopped.");
-  } catch (err) {
-    console.error("stopLiveAvatar failed", err);
-    setStreamNotice("Stop failed. Please refresh and try again.");
-  } finally {
-    stopInProgressRef.current = false;
-  }
-}, [API_BASE, companyName, companionName, cleanupIphoneLiveAvatarAudio, isHost]);
-
-const reconnectLiveAvatar = useCallback(async () => {
-  const mgr = didAgentMgrRef.current;
-  if (!mgr) return;
-  if (didReconnectInFlightRef.current) return;
-
-  didReconnectInFlightRef.current = true;
-  setAvatarError(null);
-  setAvatarStatus("reconnecting");
-
-  try {
-    if (typeof (mgr as any).reconnect === "function") {
-      await (mgr as any).reconnect();
-    } else {
-      // Fallback for SDK versions without reconnect()
-      await mgr.disconnect();
-      await mgr.connect();
-    }
-  } catch (err: any) {
-    console.error("D-ID reconnect failed", err);
-    setAvatarStatus("idle");
-    setAvatarError(`Live Avatar reconnect failed: ${formatDidError(err)}`);
-  } finally {
-    didReconnectInFlightRef.current = false;
-  }
-}, []);
-
-
-const startLiveAvatar = useCallback(async () => {
-  setAvatarError(null);
-  ensureIphoneAudioContextUnlocked();
-
-if (liveProvider === "stream") {
-  // LiveKit (Human companion) — conference + broadcast, with Pattern A lobby.
-  setAvatarError(null);
-  setAvatarStatus("connecting");
-
-  // Clear any prior messages so the live session starts with a blank transcript.
-  // (This keeps the live-chat pane focused on the current session.)
-  setMessages([]);
-  setLiveSharingNotice(null);
-  setLivekitMicEnabled(true);
-  setLivekitCameraEnabled(true);
-  liveChatSeenIdsRef.current = new Set();
-  liveChatSeenOrderRef.current = [];
-
-  // For Hosts (and conference attendees), prime camera/microphone permissions inside this click
-  // gesture so Safari/iOS doesn't silently block getUserMedia later.
-  if (isHost) {
-    const ok = await requestLivekitAvPermissions({ audio: true, video: true, reason: "starting a Live Stream" });
-    if (!ok) {
-      setAvatarStatus("error");
-      setAvatarError("Microphone and camera permissions are required to start a live stream.");
-      return;
-    }
-  }
-
-  try {
-    const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
-
-	    // Ask server to resolve room + determine host vs viewer.
-	    // NOTE: Never prompt the Host for a username.
-	    const displayNameForToken = isViewer
-	      ? String(ensureViewerLiveChatName() || viewerLiveChatName || "Viewer").trim()
-	      : String(companionName || "Host").trim();
-
-const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        brand: companyName,
-        avatar: companionName,
-        embedDomain,
-        memberId: memberIdRef.current || "",
-        displayName: displayNameForToken,
-      }),
-    });
-
-    const data: any = await res.json().catch(() => ({}));
-    if (!res.ok || !data?.ok) {
-      throw new Error(String(data?.detail || data?.error || `HTTP ${res.status}`));
-    }
-
-    const canStart = !!data?.canStart;
-    const roomName = String(data?.roomName || data?.sessionRoom || "").trim();
-    const token = String(data?.token || "").trim();
-    const role = String(data?.role || (canStart ? "host" : "viewer")).trim().toLowerCase();
-    const hlsUrl = String(data?.hlsUrl || "").trim();
-    const serverUrl = String((data as any)?.serverUrl || (data as any)?.server_url || "").trim();
-    const hostId = String((data as any)?.hostMemberId || (data as any)?.host_member_id || "").trim();
-
-    setLivekitRoomName(roomName);
-    setLivekitHlsUrl(hlsUrl);
-    setLivekitRole(role === "host" ? "host" : role === "attendee" ? "attendee" : "viewer");
-    if (serverUrl) {
-      setLivekitServerUrl(serverUrl);
-    }
-    if (hostId) {
-      setLivekitHostMemberId(hostId);
-    }
-
-
-    if (canStart) {
-      // Clear any prior live-chat messages from previous sessions in the UI.
-      setMessages((prev) => prev.filter((m) => !(m as any)?.meta?.liveChat));
-      // Host: connect immediately.
-      setLivekitToken(token);
-      setSessionActive(true);
-      setSessionKind("stream");
-      setSessionRoom(roomName);
-      setStreamEventRef(roomName);
-      setStreamNotice("");
-      setAvatarStatus("connected");
-      joinedStreamRef.current = true;
-      return;
-    }
-
-    // Viewer: auto-join when the stream is active (subscribe-only token).
-    if (token) {
-      setLivekitRole("viewer");
-      setLivekitRoomName(roomName);
-      setLivekitToken(String(token));
-      setSessionActive(true);
-      setSessionKind("stream");
-      setSessionRoom(roomName);
-      setStreamEventRef(roomName);
-      setStreamNotice("");
-      setAvatarStatus("connected");
-      joinedStreamRef.current = true;
-      return;
-    }
-
-    // Viewer attempted to join, but no token was issued.
-    // If the host is not actively streaming, treat this as "no stream" (do not enter a waiting state),
-    // and optionally allow the viewer to request a private session instead.
-    if (!canStart && !sessionActive) {
-      setStreamNotice("No live stream is active right now.");
-      setAvatarStatus("idle");
-      const wantsPrivate = window.confirm(
-        "No live stream is active right now.\n\nWould you like to request a private session instead?"
-      );
-      if (wantsPrivate) {
-        await startConferenceSession();
-      }
-      return;
-    }
-
-    setStreamNotice("Live stream is active. Connecting…");
-    setAvatarStatus("waiting");
-    return;
-  } catch (err: any) {
-    console.error("LiveKit start failed:", err);
-    setAvatarStatus("error");
-    setAvatarError(`Live session failed to start. ${err?.message ? String(err.message) : String(err)}`);
-    return;
-  }
-}
-
-if (!phase1AvatarMedia) {
-  setAvatarStatus("error");
-  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
-  return;
-}
-
-  if (
-    avatarStatus === "connecting" ||
-    avatarStatus === "connected" ||
-    avatarStatus === "reconnecting"
-  )
-    return;
-
-  setAvatarStatus("connecting");
-
-  try {
-    // Defensive: if something is lingering from a prior attempt, disconnect & clear.
-    try {
-      if (didAgentMgrRef.current) {
-        await didAgentMgrRef.current.disconnect();
-      }
-    } catch (e) {}
-    didAgentMgrRef.current = null;
-
-    try {
-      const existingStream = didSrcObjectRef.current;
-      if (existingStream && typeof existingStream.getTracks === "function") {
-        existingStream.getTracks().forEach((t: any) => t?.stop?.());
-      }
-    } catch (e) {}
-    didSrcObjectRef.current = null;
-    if (avatarVideoRef.current) {
-      try {
-        const vid = avatarVideoRef.current;
-        vid.srcObject = null;
-        vid.pause();
-        vid.removeAttribute("src");
-        (vid as any).src = "";
-        vid.load?.();
-      } catch (e) {
-        // ignore
-      }
-    }
-
-    const { createAgentManager } = await import("@d-id/client-sdk");
-    // NOTE: Some versions of @d-id/client-sdk ship stricter TS types (e.g., requiring
-    // additional top-level fields like `mode`) that are not present in the public
-    // quickstart snippets. We keep runtime behavior aligned with D-ID docs and
-    // cast the options object to `any` to avoid CI type-check failures.
-    const mgr = await createAgentManager(
-      phase1AvatarMedia.didAgentId,
+from __future__ import annotations
+
+import os
+import time
+import re
+import uuid
+import json
+import hashlib
+import base64
+import mimetypes
+import asyncio
+import threading
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+# Pydantic (v1/v2 compatibility)
+try:
+    from pydantic import BaseModel, validator, Field  # type: ignore
+except Exception:  # pragma: no cover
+    from pydantic.v1 import BaseModel, validator, Field  # type: ignore
+
+from filelock import FileLock  # type: ignore
+
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends, Body
+from fastapi.responses import HTMLResponse, Response, JSONResponse
+# Threadpool helper (prevents blocking the event loop on requests/azure upload)
+from starlette.concurrency import run_in_threadpool  # type: ignore
+
+# NOTE: This app is deployed in multiple layouts (sometimes as a package, sometimes as a single-file drop-in).
+# These import fallbacks prevent 503 "Service Unavailable" at the App Service layer when Python can't resolve
+# relative imports due to module/package context.
+try:
+    from .settings import settings  # type: ignore
+    from .models import ChatResponse  # type: ignore  # kept for compatibility with existing codebase
+except Exception:  # pragma: no cover
+    try:
+        from settings import settings  # type: ignore
+        from models import ChatResponse  # type: ignore
+    except Exception:
+        # Last-resort common package layout
+        from app.settings import settings  # type: ignore
+        from app.models import ChatResponse  # type: ignore
+
+try:
+    from .consent_routes import router as consent_router  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from consent_routes import router as consent_router  # type: ignore
+    except Exception:
+        try:
+            from app.consent_routes import router as consent_router  # type: ignore
+        except Exception:
+            consent_router = None
+STATUS_SAFE = "safe"
+STATUS_BLOCKED = "explicit_blocked"
+STATUS_ALLOWED = "explicit_allowed"
+
+app = FastAPI(title="Elaralo API")
+
+# ----------------------------
+# WIX FORM
+# ----------------------------
+WIX_API_KEY = (os.getenv("WIX_API_KEY", "") or "").strip()
+WIX_APP_ID = (os.getenv("WIX_APP_ID", "") or "").strip()
+WIX_APP_SECRET = (os.getenv("WIX_APP_SECRET", "") or "").strip()
+WIX_WEBHOOK_PUBLIC_KEY = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY", "") or "").strip()
+
+
+async def require_wix_api_key(
+    request: Request,
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    digest: str | None = Header(default=None, alias="digest"),
+    authorization: str | None = Header(default=None, alias="authorization"),
+) -> None:
+    """Auth guard for Wix -> backend webhooks.
+
+    Accepts either:
+      1) A shared `x-api-key` header (configure this in the Wix webhook subscription), OR
+      2) A Wix-signed JWT (RS256) found in:
+         - `digest` header (some Wix webhook setups),
+         - `Authorization` header, or
+         - request JSON body field `data` (standard Wix REST webhook format).
+
+    On success, sets:
+      - request.state.wix_verified = True
+      - request.state.wix_auth_method = "x-api-key" | "jwt"
+    """
+
+    request.state.wix_verified = False
+    request.state.wix_auth_method = None
+
+    expected = (os.getenv("WIX_API_KEY") or "").strip()
+    if expected and x_api_key and x_api_key == expected:
+        request.state.wix_verified = True
+        request.state.wix_auth_method = "x-api-key"
+        return
+
+    pub_raw = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY") or "").strip()
+    if not pub_raw:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Build PEM if needed.
+    if "-----BEGIN" not in pub_raw:
+        pub_pem = "-----BEGIN PUBLIC KEY-----\n" + pub_raw.strip() + "\n-----END PUBLIC KEY-----\n"
+    else:
+        pub_pem = pub_raw
+
+    candidates: list[str] = []
+    for v in (digest, authorization):
+        if not v:
+            continue
+        vv = v.strip()
+        if vv.lower().startswith("bearer "):
+            vv = vv[7:].strip()
+        candidates.append(vv)
+
+    # Try to pull JWT from JSON body (common Wix webhook format: {"data": "<jwt>"}).
+    try:
+        body = await request.body()
+        if body:
+            parsed = json.loads(body.decode("utf-8"))
+            if isinstance(parsed, dict):
+                data = parsed.get("data")
+                if isinstance(data, str):
+                    candidates.append(data.strip())
+    except Exception:
+        # Ignore parse errors; we’ll fall back to headers.
+        pass
+
+    for token in candidates:
+        if not token or token.count(".") < 2:
+            continue
+        try:
+            jwt.decode(token, pub_pem, algorithms=["RS256"], options={"verify_aud": False})
+            request.state.wix_verified = True
+            request.state.wix_auth_method = "jwt"
+            return
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+def _split_cors_origins(raw: str) -> list[str]:
+    """Split + normalize CORS origins from an env var.
+
+    - Supports comma and/or whitespace separation
+    - Removes surrounding quotes and trailing slashes
+    - Normalizes to lower-case (scheme/host are case-insensitive)
+    - De-dupes while preserving order
+    """
+    if not raw:
+        return []
+    parts = re.split(r"[\s,]+", raw.strip())
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        t = (p or "").strip()
+        if not t:
+            continue
+        # Strip surrounding quotes that sometimes show up in App Service config.
+        if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+            t = t[1:-1].strip()
+        t = t.rstrip("/").lower()
+        if not t:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+def _wildcard_to_regex(pattern: str) -> str:
+    # Convert a wildcard origin (e.g. "https://*.azurestaticapps.net") into a regex.
+    # NOTE: We normalize tokens to lower-case and test against a lower-case origin string.
+    escaped = re.escape(pattern).replace(r"\*", "[^/]+")  # '*' matches up to the next '/'
+    return "^" + escaped + "$"
+
+
+_cors_tokens = _split_cors_origins(cors_env)
+
+# Conservative default to keep dev usable if CORS_ALLOW_ORIGINS is not set.
+# Override in production via the CORS_ALLOW_ORIGINS app setting.
+if not _cors_tokens:
+    _cors_tokens = [
+        "https://elaralo.com",
+        "https://www.elaralo.com",
+        "https://editor.wix.com",
+        "https://manage.wix.com",
+        "https://*.azurestaticapps.net",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+_cors_allow_all = any(t == "*" for t in _cors_tokens)
+
+_cors_allow_origins: set[str] = {t for t in _cors_tokens if t != "*" and "*" not in t}
+_cors_wildcards: list[str] = [t for t in _cors_tokens if t != "*" and "*" in t]
+_cors_allow_origin_regexes: list[re.Pattern[str]] = [re.compile(_wildcard_to_regex(w)) for w in _cors_wildcards]
+
+# If an explicit azurestaticapps origin is listed, also allow any azurestaticapps subdomain.
+if any(o.endswith(".azurestaticapps.net") for o in _cors_allow_origins) and not any(
+    "azurestaticapps.net" in w for w in _cors_wildcards
+):
+    _cors_allow_origin_regexes.append(
+        re.compile(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)*\.azurestaticapps\.net$")
+    )
+
+def _cors_origin_allowed(origin: str | None) -> bool:
+    if not origin:
+        return False
+    o = (origin or "").strip()
+    if not o:
+        return False
+    # Strip quotes/trailing slash + normalize to lower-case for matching.
+    if (o.startswith('"') and o.endswith('"')) or (o.startswith("'") and o.endswith("'")):
+        o = o[1:-1].strip()
+    o = o.rstrip("/").lower()
+
+    if _cors_allow_all:
+        return True
+    if o in _cors_allow_origins:
+        return True
+    for rx in _cors_allow_origin_regexes:
+        if rx.match(o):
+            return True
+    return False
+
+def _cors_append_vary(headers: dict, value: str) -> None:
+    try:
+        existing = headers.get("Vary")
+    except Exception:
+        existing = None
+    if not existing:
+        headers["Vary"] = value
+        return
+    parts = [p.strip() for p in str(existing).split(",") if p.strip()]
+    if value.lower() not in {p.lower() for p in parts}:
+        headers["Vary"] = str(existing) + ", " + value
+
+@app.middleware("http")
+async def _cors_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    # Short-circuit preflight to avoid 405s (and to ensure headers are present even on errors).
+    if request.method == "OPTIONS":
+        response = Response(status_code=200)
+    else:
+        # IMPORTANT:
+        # This middleware sits *outside* FastAPI/Starlette's ExceptionMiddleware.
+        # If an exception bubbles up past ExceptionMiddleware, call_next() will raise and
+        # we would return a response *without* CORS headers (browser shows it as "CORS").
+        try:
+            response = await call_next(request)
+        except HTTPException as exc:
+            response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        except Exception:
+            import traceback
+            print("[ERROR] Unhandled exception while serving request:", request.method, str(request.url))
+            traceback.print_exc()
+            response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+    if origin and _cors_origin_allowed(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        _cors_append_vary(response.headers, "Origin")
+
+        if request.method == "OPTIONS":
+            req_headers = request.headers.get("access-control-request-headers")
+            req_method = request.headers.get("access-control-request-method")
+            response.headers["Access-Control-Allow-Headers"] = req_headers or "*"
+            response.headers["Access-Control-Allow-Methods"] = req_method or "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+            response.headers["Access-Control-Max-Age"] = "86400"
+
+    return response
+
+if not cors_env:
+    print("[WARN] CORS_ALLOW_ORIGINS is not set; using a conservative default allow list. Set CORS_ALLOW_ORIGINS to override.")
+# Routes
+# ----------------------------
+if consent_router is not None:
+    app.include_router(consent_router)
+
+
+@app.get("/")
+def root():
+    """
+    Minimal root endpoint.
+
+    Azure App Service (Linux) health probes and some monitoring tools will call "/"
+    by default. Returning 200 here prevents false "container failed to start" / 502
+    notifications when the API itself is healthy but has no root route.
+    """
+    return {"ok": True, "service": "Elaralo API"}
+
+
+@app.get("/health")
+@app.get("/healthz")
+def health():
+    """
+    Liveness probe.
+
+    Keep this fast and dependency-free (no downstream calls) so platform health checks
+    remain reliable during partial outages.
+    """
+    return {"ok": True}
+
+import json
+import logging
+
+logger = logging.getLogger("wix")
+logger.setLevel(logging.INFO)
+
+def _decode_wix_jwt(token: str) -> dict | None:
+    """Decode a Wix webhook JWT (RS256) using WIX_WEBHOOK_PUBLIC_KEY.
+
+    Wix REST webhooks commonly deliver event data as a JWT in the request body (often under `data`).
+    This helper is intentionally tolerant: it returns None if decoding isn't possible.
+    """
+    token = (token or "").strip()
+    if token.count(".") < 2:
+        return None
+
+    key = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY") or "").strip()
+    if not key:
+        return None
+
+    if "BEGIN PUBLIC KEY" not in key:
+        key = "-----BEGIN PUBLIC KEY-----\n" + key + "\n-----END PUBLIC KEY-----\n"
+
+    try:
+        import jwt  # PyJWT
+        decoded = jwt.decode(
+            token,
+            key,
+            algorithms=["RS256"],
+            options={"verify_aud": False},
+        )
+        return decoded if isinstance(decoded, dict) else None
+    except Exception:
+        return None
+
+
+def _normalize_wix_webhook_payload(payload: dict) -> dict:
+    """Normalize Wix webhook payloads across formats.
+
+    Wix can send:
+    - A plain JSON envelope where `data` is already a dict.
+    - A JSON envelope where `data` is a JWT string (REST webhook style).
+    After normalization, `payload["data"]` and `payload["identity"]` will be dicts when possible.
+    """
+    if not isinstance(payload, dict):
+        return {}
+
+    # Case 1: outer envelope contains `data` as a JWT string -> decode it into the canonical envelope.
+    outer_data = payload.get("data")
+    if isinstance(outer_data, str):
+        decoded_outer = _decode_wix_jwt(outer_data)
+        if decoded_outer:
+            payload = decoded_outer
+
+    # Case 2: decoded payload contains `data` and/or `identity` as JSON strings -> parse to dict.
+    inner_data = payload.get("data")
+    if isinstance(inner_data, str):
+        try:
+            payload["data"] = json.loads(inner_data)
+        except Exception:
+            # Keep original string if it's not JSON.
+            pass
+
+    inner_identity = payload.get("identity")
+    if isinstance(inner_identity, str):
+        try:
+            payload["identity"] = json.loads(inner_identity)
+        except Exception:
+            pass
+
+    return payload
+
+@app.post("/wix-form")
+async def wix_form(request: Request, payload: dict, _auth: None = Depends(require_wix_api_key)):
+    """Receives Wix callbacks.
+
+    - For Wix webhooks: Wix includes a signed `digest` header. We verify it in `require_wix_api_key`
+      and then process PayGo top-up events here.
+    - For manual testing: you can post here with `x-api-key: $WIX_API_KEY` (no crediting occurs).
+    """
+    logger.info("RAW WIX PAYLOAD:\n%s", json.dumps(payload, indent=2))
+
+    if getattr(request.state, "wix_verified", False):
+        normalized = _normalize_wix_webhook_payload(payload)
+        try:
+            meta = {
+                "eventType": normalized.get("eventType"),
+                "entityFqdn": normalized.get("entityFqdn"),
+                "instanceId": normalized.get("instanceId"),
+            }
+            print("WIX WEBHOOK META:", json.dumps(meta, indent=2))
+            if os.getenv("WIX_WEBHOOK_DEBUG_LOG", "").strip() == "1":
+                print("WIX WEBHOOK DECODED (TRUNC):", json.dumps(normalized, indent=2)[:5000])
+        except Exception:
+            pass
+        processed = _paygo_process_wix_webhook(normalized)
+        return {"ok": True, "processed": processed}
+
+    return {"ok": True, "processed": False}
+
+
+@app.post("/wix/webhook")
+async def wix_webhook(request: Request, payload: dict, _auth: None = Depends(require_wix_api_key)):
+    """Alias for Wix webhooks (same handler as /wix-form)."""
+    return await wix_form(request, payload, _auth)
+
+
+@app.post("/usage/credit")
+async def usage_credit(request: Request):
+    """Credit purchased minutes to a member.
+
+    Intended for payment provider webhooks or admin tooling.
+
+    Security:
+      - Requires header "X-Admin-Token" matching env var USAGE_ADMIN_TOKEN.
+
+    Body (JSON):
       {
-      auth: { type: "key", clientKey: phase1AvatarMedia.didClientKey },
-      callbacks: {
-        onConnectionStateChange: (state: any) => {
-          if (state === "connected") {
-            setAvatarStatus("connected");
-            setAvatarError(null);
-          }
-          if (state === "disconnected" || state === "closed") setAvatarStatus("idle");
-        },
+        "member_id": "abc123",
+        "minutes": 60
+      }
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
 
-        // Mandatory per D-ID docs: bind the streamed MediaStream to the <video>.
-        onSrcObjectReady: (value: any) => {
-          didSrcObjectRef.current = value;
-          const vid = avatarVideoRef.current;
-          if (vid) {
-            // If we were showing the presenter's idle_video, clear it before attaching the MediaStream
-            try {
-              vid.removeAttribute("src");
-              (vid as any).src = "";
-              vid.load?.();
-            } catch (e) {
-              // ignore
+    token = (request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token") or "").strip()
+    if not USAGE_ADMIN_TOKEN or token != USAGE_ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    member_id = str(raw.get("member_id") or raw.get("memberId") or "").strip()
+    minutes = raw.get("minutes") or raw.get("add_minutes") or raw.get("purchased_minutes") or 0
+
+    try:
+        minutes_i = int(minutes)
+    except Exception:
+        minutes_i = 0
+
+    if not member_id or minutes_i <= 0:
+        raise HTTPException(status_code=400, detail="member_id and minutes (> 0) are required")
+
+    identity_key = f"member::{member_id}"
+    result = await run_in_threadpool(_usage_credit_minutes_sync, identity_key, minutes_i)
+    return result
+
+
+
+# ============================
+# PayGo: Wix Payment Links top-up
+# ============================
+
+class PayGoIntentRequest(BaseModel):
+    # For visitors we require email, but members may omit email (memberId-only).
+    email: str | None = Field(default=None, description="Email address used at Wix checkout (required for visitors; optional for members if memberId is present)")
+    memberId: str | None = Field(default=None, description="Wix memberId or anon:<uuid> (sent by the Companion page)")
+    sessionId: str | None = Field(default=None, description="Optional session id fallback (legacy)")
+
+class PayGoIntentResponse(BaseModel):
+    ok: bool
+    email: str
+    identity_key: str
+    expires_at: float
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def _normalize_email(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _is_probably_email(s: str) -> bool:
+    return bool(_EMAIL_RE.match(_normalize_email(s)))
+
+def _paygo_intents_get(store: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], float]:
+    """Return (by_email, by_member_id, last_prune_at) and normalize legacy storage.
+
+    Storage lives inside the usage store so it survives restarts.
+
+    Legacy (older) format:
+        store["__paygo_intents__"] = { "email@example.com": { ... } }
+
+    Current format:
+        store["__paygo_intents__"] = {
+            "byEmail": { "email@example.com": { ... } },
+            "byMemberId": { "<memberId>": { ... } },
+            "lastPruneAt": 0.0
+        }
+    """
+    raw = store.get("__paygo_intents__", {}) or {}
+    by_email: Dict[str, Any] = {}
+    by_member: Dict[str, Any] = {}
+    last_prune_at = 0.0
+
+    if isinstance(raw, dict):
+        if "byEmail" in raw or "byMemberId" in raw:
+            be = raw.get("byEmail", {}) or {}
+            bm = raw.get("byMemberId", {}) or {}
+            by_email = be if isinstance(be, dict) else {}
+            by_member = bm if isinstance(bm, dict) else {}
+            try:
+                last_prune_at = float(raw.get("lastPruneAt", 0) or 0)
+            except Exception:
+                last_prune_at = 0.0
+        else:
+            # Legacy: treat dict as by-email map.
+            by_email = raw
+    else:
+        by_email = {}
+
+    store["__paygo_intents__"] = {"byEmail": by_email, "byMemberId": by_member, "lastPruneAt": last_prune_at}
+    return by_email, by_member, last_prune_at
+
+
+def _paygo_intents_set(store: Dict[str, Any], by_email: Dict[str, Any], by_member: Dict[str, Any], last_prune_at: float) -> None:
+    store["__paygo_intents__"] = {"byEmail": by_email, "byMemberId": by_member, "lastPruneAt": float(last_prune_at or 0.0)}
+
+
+def _paygo_prune_store(store: Dict[str, Any]) -> None:
+    """Prune old PayGo intents + processed-event ids."""
+    now_ts = time.time()
+    by_email, by_member, last_prune_at = _paygo_intents_get(store)
+
+    # Don't prune on every request (this endpoint can be hit frequently).
+    if now_ts - last_prune_at < 30:
+        return
+
+    cutoff_intents = now_ts - float(PAYGO_INTENT_TTL_SECONDS or 0)
+    if cutoff_intents > 0:
+        for mapping in (by_email, by_member):
+            stale_keys = [
+                k
+                for k, rec in list(mapping.items())
+                if float((rec or {}).get("createdAt", 0) or 0) < cutoff_intents
+            ]
+            for k in stale_keys:
+                mapping.pop(k, None)
+
+    cutoff_events = now_ts - float(PAYGO_EVENT_TTL_SECONDS or 0)
+    events = store.get("__paygo_events__", {}) or {}
+    if isinstance(events, dict) and cutoff_events > 0:
+        stale_eids = [
+            eid
+            for eid, rec in list(events.items())
+            if float((rec or {}).get("ts", 0) or 0) < cutoff_events
+        ]
+        for eid in stale_eids:
+            events.pop(eid, None)
+        store["__paygo_events__"] = events
+
+    _paygo_intents_set(store, by_email, by_member, now_ts)
+
+def _usage_credit_minutes_in_store(store: Dict[str, Any], identity_key: str, minutes: float, reason: str) -> Dict[str, Any]:
+    rec = store.get(identity_key) or {}
+    rec.setdefault("minutes_total", 0.0)
+    rec.setdefault("seconds_total", 0.0)
+    rec.setdefault("seconds_used", 0.0)
+    rec.setdefault("paid_minutes_total", 0.0)
+    rec.setdefault("paid_seconds_total", 0.0)
+    rec.setdefault("last_plan", "")
+    rec.setdefault("last_update_ts", 0.0)
+    rec.setdefault("last_charge_ts", 0.0)
+    rec.setdefault("last_credit_ts", 0.0)
+    rec.setdefault("last_credit_reason", "")
+    rec.setdefault("last_seen_ip", "")
+
+    delta_sec = float(minutes) * 60.0
+    rec["paid_minutes_total"] = float(rec.get("paid_minutes_total", 0.0)) + float(minutes)
+    rec["paid_seconds_total"] = float(rec.get("paid_seconds_total", 0.0)) + delta_sec
+    rec["minutes_total"] = float(rec.get("minutes_total", 0.0)) + float(minutes)
+    rec["seconds_total"] = float(rec.get("seconds_total", 0.0)) + delta_sec
+    rec["last_credit_ts"] = time.time()
+    rec["last_credit_reason"] = str(reason)[:200]
+    store[identity_key] = rec
+    return rec
+
+def _find_email_in_obj(obj: Any) -> str:
+    # Prefer explicit keys
+    if isinstance(obj, dict):
+        for key in ("email", "buyerEmail", "payerEmail", "customerEmail", "contactEmail"):
+            v = obj.get(key)
+            if isinstance(v, str) and _is_probably_email(v):
+                return _normalize_email(v)
+        for v in obj.values():
+            e = _find_email_in_obj(v)
+            if e:
+                return e
+    elif isinstance(obj, list):
+        for it in obj:
+            e = _find_email_in_obj(it)
+            if e:
+                return e
+    elif isinstance(obj, str):
+        if _is_probably_email(obj):
+            return _normalize_email(obj)
+    return ""
+
+def _extract_payment_entity(envelope: Any) -> Dict[str, Any] | None:
+    if not isinstance(envelope, dict):
+        return None
+
+    # Some envelopes wrap the entity
+    for key in ("entity", "paymentLinkPayment", "payment_link_payment", "payment"):
+        v = envelope.get(key)
+        if isinstance(v, dict):
+            return v
+
+    data = envelope.get("data")
+    if isinstance(data, dict):
+        for key in ("entity", "paymentLinkPayment", "payment_link_payment", "payment"):
+            v = data.get(key)
+            if isinstance(v, dict):
+                return v
+        # Sometimes "data" IS the entity
+        if "paymentLinkId" in data or "extendedFields" in data or "extended_fields" in data:
+            return data
+
+        # Sometimes nested again
+        data2 = data.get("data")
+        if isinstance(data2, dict):
+            for key in ("entity", "paymentLinkPayment"):
+                v = data2.get(key)
+                if isinstance(v, dict):
+                    return v
+            if "paymentLinkId" in data2 or "extendedFields" in data2:
+                return data2
+
+    # Envelope itself might be the entity
+    if "paymentLinkId" in envelope or "extendedFields" in envelope:
+        return envelope
+
+    return None
+
+def _extract_member_id(payment: Dict[str, Any]) -> str:
+    if not isinstance(payment, dict):
+        return ""
+    ext = payment.get("extendedFields") or payment.get("extended_fields") or {}
+    if isinstance(ext, dict):
+        for k in ("memberId", "memberID", "member_id"):
+            v = ext.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    # fallback if stored directly on payment
+    for k in ("memberId", "member_id"):
+        v = payment.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+def _extract_payment_id(envelope: Dict[str, Any], payment: Dict[str, Any]) -> str:
+    for k in ("id", "_id", "paymentId", "payment_id", "paymentLinkPaymentId"):
+        v = payment.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for k in ("eventId", "id", "_id"):
+        v = envelope.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # deterministic hash fallback
+    try:
+        blob = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return "sha256:" + hashlib.sha256(blob).hexdigest()
+    except Exception:
+        return "sha256:" + hashlib.sha256(str(envelope).encode("utf-8")).hexdigest()
+
+def _deep_find_first_str(obj: Any, keys: set[str], max_depth: int = 6, _depth: int = 0) -> str | None:
+    """Best-effort nested lookup for a string value by key name.
+
+    We keep this conservative (max_depth) to avoid surprises.
+    """
+    if _depth > max_depth:
+        return None
+    if isinstance(obj, dict):
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for v in obj.values():
+            found = _deep_find_first_str(v, keys, max_depth=max_depth, _depth=_depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for it in obj:
+            found = _deep_find_first_str(it, keys, max_depth=max_depth, _depth=_depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _paygo_process_wix_webhook(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process Wix Get Paid webhooks and credit PayGo minutes immediately.
+
+    Supported matching strategies (in order):
+      1) payment.extendedFields.memberId (string):
+         - If it looks like an email -> match pending intent by that email.
+         - Else -> treat as memberId and credit directly.
+      2) buyer email (from various buyer/billing fields) -> match pending intent by email.
+      3) memberId present somewhere else in the payment object -> match pending intent by memberId, or credit directly.
+
+    NOTE: For visitors, we rely on (2) by asking for email once per device.
+    """
+    now_ts = time.time()
+    data = payload.get("data") or {}
+    payment = (
+        data.get("payment")
+        or data.get("paymentLinkPayment")
+        or data.get("entity")
+        or {}
+    )
+
+    payment_id = (
+        payment.get("id")
+        or payment.get("_id")
+        or data.get("paymentId")
+        or payload.get("entityId")
+        or payload.get("id")
+        or ""
+    )
+
+    # Extract buyer email (best-effort, schema varies across webhook types).
+    buyer_email = ""
+    reg = payment.get("regularPaymentLinkPayment") or payment.get("regular_payment_link_payment") or {}
+    buyer_info = (reg.get("buyerInfo") or reg.get("buyer_info") or reg.get("buyer") or {}) if isinstance(reg, dict) else {}
+    if isinstance(buyer_info, dict):
+        buyer_email = (
+            buyer_info.get("email")
+            or buyer_info.get("buyerEmail")
+            or buyer_info.get("buyer_email")
+            or ""
+        )
+    if not buyer_email and isinstance(payment, dict):
+        buyer_email = (
+            payment.get("buyerEmail")
+            or payment.get("buyer_email")
+            or (payment.get("buyer") or {}).get("email") if isinstance(payment.get("buyer"), dict) else ""
+        )
+    buyer_email = _normalize_email(str(buyer_email or ""))
+
+    # Extract memberId from extendedFields (if configured).
+    extended = payment.get("extendedFields") or payment.get("extended_fields") or {}
+    member_id_field = ""
+    if isinstance(extended, dict):
+        member_id_field = str(extended.get("memberId") or extended.get("member_id") or "").strip()
+
+    # Determine how many minutes to credit (allow override, else default env-based).
+    minutes_field = None
+    if isinstance(extended, dict):
+        minutes_field = extended.get("minutes") or extended.get("topupMinutes") or extended.get("topup_minutes")
+    minutes_to_credit = _paygo_increment_minutes(minutes_field)
+
+    # Candidate memberId elsewhere (fallback).
+    member_id_fallback = None
+    if not member_id_field and isinstance(payment, dict):
+        member_id_fallback = _deep_find_first_str(payment, {"memberId", "siteMemberId", "buyerMemberId", "wixMemberId"})
+    member_id_fallback = str(member_id_fallback or "").strip() or None
+
+    with USAGE_STORE_LOCK:
+        store = _load_usage_store()
+
+        # Prune + load intent maps.
+        _paygo_prune_store(store)
+        by_email, by_member, _ = _paygo_intents_get(store)
+
+        # Idempotency: avoid double-crediting the same payment.
+        events = store.get("__paygo_events__", {}) or {}
+        if not isinstance(events, dict):
+            events = {}
+        if payment_id and payment_id in events:
+            return {"ok": True, "skipped": True, "reason": "duplicate_payment", "paymentId": payment_id}
+
+        identity_key = None
+        intent = None
+
+        # 1) memberId in extended fields
+        if member_id_field:
+            if _is_probably_email(member_id_field):
+                email_key = _normalize_email(member_id_field)
+                intent = by_email.pop(email_key, None)
+                if intent and float(intent.get("expiresAt", 0) or 0) < now_ts:
+                    intent = None
+            else:
+                # Treat as memberId and credit directly.
+                identity_key = f"member::{member_id_field}"
+
+        # 2) buyer email intent match
+        if not identity_key and not intent and buyer_email:
+            intent = by_email.pop(buyer_email, None)
+            if intent and float(intent.get("expiresAt", 0) or 0) < now_ts:
+                intent = None
+
+        # 3) memberId fallback (from payment object)
+        if not identity_key and not intent and member_id_fallback:
+            intent = by_member.pop(member_id_fallback, None)
+            if intent and float(intent.get("expiresAt", 0) or 0) < now_ts:
+                intent = None
+            if not intent:
+                # If Wix gives us a memberId, we can safely credit it even without a registered intent.
+                identity_key = f"member::{member_id_fallback}"
+
+        if intent and not identity_key:
+            identity_key = str(intent.get("identity_key") or "").strip() or None
+            # Allow per-intent minutes override if present.
+            minutes_to_credit = _paygo_increment_minutes(intent.get("minutes"))
+
+        if not identity_key:
+            # Record event so we don't keep re-processing (Wix may retry).
+            if payment_id:
+                events[payment_id] = {"ts": now_ts, "credited": False, "reason": "no_identity_match", "buyerEmail": buyer_email}
+                store["__paygo_events__"] = events
+                _save_usage_store(store)
+            return {"ok": True, "skipped": True, "reason": "no_identity_match", "paymentId": payment_id, "buyerEmail": buyer_email}
+
+        # Apply credit
+        _credit_minutes_for_identity(store, identity_key=identity_key, minutes=minutes_to_credit)
+
+        # Save idempotency record
+        if payment_id:
+            events[payment_id] = {
+                "ts": now_ts,
+                "credited": True,
+                "identity_key": identity_key,
+                "minutes": minutes_to_credit,
+                "buyerEmail": buyer_email,
             }
-            vid.loop = false;
-            vid.srcObject = value;
-            vid.play().catch(() => {});
-            // iPhone: route WebRTC audio through WebAudio gain so volume is audible
-            applyIphoneLiveAvatarAudioBoost(value);
+            store["__paygo_events__"] = events
 
-            // Non-iPhone: also route the <video> element through a gain node to ensure robust volume.
-            try {
-              applyTtsGainRouting(vid, "avatar");
-            } catch (e) {}
-          }
-          return value;
-        },
+        _save_usage_store(store)
 
-        onVideoStateChange: (state: any) => {
-          const vid = avatarVideoRef.current;
-          if (!vid) return;
+        return {"ok": True, "credited": True, "paymentId": payment_id, "identity_key": identity_key, "minutes": minutes_to_credit, "buyerEmail": buyer_email}
 
-          const s = typeof state === "string" ? state : String(state ?? "");
-          const mgr = didAgentMgrRef.current;
-          const stream = didSrcObjectRef.current;
 
-          // When the live stream stops, switch to the presenter's idle_video so the avatar isn't frozen.
-          if (s === "STOP") {
-            const idleUrl = mgr?.agent?.presenter?.idle_video;
-            if (idleUrl) {
-              try {
-                // Detach the MediaStream (do NOT stop tracks; we may resume).
-                vid.srcObject = null;
-                if (vid.src !== idleUrl) vid.src = idleUrl;
-                vid.loop = true;
-                vid.play().catch(() => {});
-              } catch (e) {
-                // ignore
-              }
-            }
-            return;
-          }
+@app.post("/paygo/intent", response_model=PayGoIntentResponse)
+def paygo_create_intent(req: PayGoIntentRequest):
+    """
+    Registers an intent so when Wix sends a payment webhook we can credit minutes immediately.
 
-          // Any non-STOP state: ensure we are showing the live MediaStream.
-          if (stream) {
-            try {
-              // Clear idle video if it was set
-              if (vid.src) {
-                vid.pause();
-                vid.removeAttribute("src");
-                (vid as any).src = "";
-                vid.load?.();
-              }
-              vid.loop = false;
-              vid.srcObject = stream;
-              vid.play().catch(() => {});
-            } catch (e) {
-              // ignore
-            }
-          }
-        },
+    - Visitors: provide an email (used at checkout) + an anon memberId (generated client-side).
+    - Members: may provide memberId only (email optional).
+    """
+    email_norm = _normalize_email((req.email or "").strip())
+    member_id = (req.memberId or "").strip()
+    session_id = (req.sessionId or "").strip()
 
-        onError: (err: any) => {
-          if (isDidSessionError(err)) {
-            console.warn("D-ID SessionError; attempting reconnect", err);
-            void reconnectLiveAvatar();
-            return;
-          }
-          setAvatarStatus("error");
-          setAvatarError(formatDidError(err));
-        },
-      },
-      streamOptions: { compatibilityMode: "auto", streamWarmup: true },
-      } as any
-    );
+    if not email_norm and not member_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing identity. Provide email (visitors) or memberId (members).",
+        )
 
-    didAgentMgrRef.current = mgr;
-    await mgr.connect();
-  } catch (e) {
-    setAvatarStatus("error");
-    setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
-    didAgentMgrRef.current = null;
-  }
-}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost, requestLivekitAvPermissions]);
+    if email_norm and not _is_probably_email(email_norm):
+        raise HTTPException(status_code=400, detail="Invalid email.")
 
-useEffect(() => {
-  // Stop when switching companions
-  void stopLiveAvatar();
-}, [companionKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    # Identity key: what we actually credit in the usage store.
+    if member_id:
+        identity_key = f"member::{member_id}"
+    elif session_id:
+        identity_key = f"session::{session_id}"
+    else:
+        identity_key = f"email::{email_norm}"
 
-const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?: AbortSignal): Promise<string | null> => {
-  try {
-    const res = await fetch(`${API_BASE}/tts/audio-url`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal,
-      body: JSON.stringify({
-        session_id: sessionIdRef.current || "anon",
-        voice_id: voiceId,
-        brand: companyName,
-        avatar: companionName,
-        text,
-      }),
-    });
+    minutes = _paygo_increment_minutes(req.minutes)
+    now_ts = time.time()
+    expires_at = now_ts + float(PAYGO_INTENT_TTL_SECONDS or (48 * 3600))
 
-    if (!res.ok) {
-      const msg = await res.text().catch(() => "");
-      console.warn("TTS/audio-url failed:", res.status, msg);
-      return null;
+    entry = {
+        "identity_key": identity_key,
+        "email": email_norm,
+        "memberId": member_id,
+        "sessionId": session_id,
+        "minutes": minutes,
+        "createdAt": now_ts,
+        "expiresAt": expires_at,
     }
 
-    const data = (await res.json()) as { audio_url?: string };
-    return data.audio_url || null;
-  } catch (e) {
-    console.warn("TTS/audio-url error:", e);
-    return null;
-  }
-}, []);
+    with USAGE_STORE_LOCK:
+        store = _load_usage_store()
+        _paygo_prune_store(store)
+        by_email, by_member, _ = _paygo_intents_get(store)
 
-  type SpeakAssistantHooks = {
-    // Called right before we ask D-ID to speak.
-    // Used to delay the assistant text until the avatar begins speaking.
-    onWillSpeak?: () => void;
-    // Called when we cannot / did not speak via D-ID.
-    onDidNotSpeak?: () => void;
-  };
+        if email_norm:
+            by_email[email_norm] = entry
+        if member_id:
+            by_member[member_id] = entry
 
-  // ---------- Local (audio-only) TTS playback ----------
-  // Used when Live Avatar is NOT active/available, but the user is in hands-free STT mode.
-  // iOS Safari requires a user gesture to "unlock" programmatic audio playback, so we prime
-  // this hidden <audio> element on the first mic click.
-  const PRIME_SILENT_MP3 =
-    "data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU5LjI3LjEwMAAAAAAAAAAAAAAA//tAwAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAJAAAEXgBBQUFBQUFBQUFBQVlZWVlZWVlZWVlZcXFxcXFxcXFxcXGIiIiIiIiIiIiIiKCgoKCgoKCgoKCguLi4uLi4uLi4uLjQ0NDQ0NDQ0NDQ0Ojo6Ojo6Ojo6Ojo//////////////8AAAAATGF2YzU5LjM3AAAAAAAAAAAAAAAAJAPMAAAAAAAABF6gwS6ZAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVf/7EMQpg8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVV//sQxFMDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVX/+xDEfIPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMSmA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxM+DwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/+xDE1gPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMTWA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxNYDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+        _save_usage_store(store)
 
-  const primeLocalTtsAudio = useCallback((force: boolean = false) => {
-    // iOS/Safari autoplay rules: unlocking media MUST happen synchronously in a user gesture
-    // (e.g., mic button tap). We "prime" a hidden media element with a tiny silent MP3.
-    if (!force && localTtsUnlockedRef.current) return;
-    if (force) localTtsUnlockedRef.current = false;
+    return PayGoIntentResponse(intentId=_make_short_token("pgi"))
+@app.get("/ready")
+def ready():
+    """
+    Readiness probe.
 
-    let unlocked = false;
-    const markUnlocked = () => {
-      if (unlocked) return;
-      unlocked = true;
-      localTtsUnlockedRef.current = true;
-      console.log("Local TTS unlocked");
-    };
+    If you want a stricter readiness check (e.g., verify required env vars),
+    add lightweight checks here. For now it mirrors liveness.
+    """
+    return {"ok": True}
+# ----------------------------
+# Helpers
+# ----------------------------
+def _dbg(enabled: bool, *args: Any) -> None:
+    if enabled:
+        print(*args)
 
-    const prime = (m: HTMLMediaElement | null, label: string) => {
-      if (!m) return;
-      try {
-        // Load a tiny silent MP3 and attempt play/pause.
-        m.src = PRIME_SILENT_MP3;
-        m.muted = false;
-        m.volume = 1;
 
-        // playsinline helps on iOS; safe to set on audio too.
-        try {
-          (m as any).playsInline = true;
-          (m as any).setAttribute?.("playsinline", "");
-        } catch (e) {}
+def _now_ts() -> int:
+    return int(time.time())
 
-        const p = m.play();
-        Promise.resolve(p)
-          .then(() => {
-            markUnlocked();
-            try {
-              m.pause();
-            } catch (e) {}
-            try {
-              (m as any).currentTime = 0;
-            } catch (e) {}
-          })
-          .catch((e) => {
-            const nm = (e as any)?.name;
-            // AbortError is common when the browser interrupts autoplay/prime attempts; it is not actionable.
-            if (nm === "AbortError") return;
-            console.warn("Failed to prime local TTS", {
-              mediaTag: m.tagName,
-              err: String(e),
-              name: nm,
-              message: (e as any)?.message,
-            });
-          });
-      } catch (e) {
-        console.warn("Failed to prime local TTS", {
-            mediaTag: m.tagName,
-          err: String(e),
-          name: (e as any)?.name,
-          message: (e as any)?.message,
-        });
-      }
-    };
 
-    // Prime BOTH. iOS prefers the hidden VIDEO element (routes like Live Avatar),
-    // but we also prime the AUDIO element as fallback.
-    prime(localTtsVideoRef.current, "video");
-    prime(localTtsAudioRef.current, "audio");
+# ----------------------------
+# Usage / Minutes limits (Trial + plan quotas)
+# ----------------------------
+# This feature enforces time budgets for:
+# - Visitors without a memberId (Free Trial) using client IP address as identity
+# - Members with a memberId (subscription plan minutes + optional purchased minutes)
+#
+# Storage strategy:
+# - A single JSON file on the App Service Linux shared filesystem (/home) so that it survives restarts.
+# - A file lock to coordinate writes across gunicorn workers.
+#
+# NOTE: This is intentionally simple and fail-open (it will not crash the API).
+#       If the usage file is unavailable, the system will allow access rather than block.
+_USAGE_STORE_PATH = (os.getenv("USAGE_STORE_PATH", "/home/elaralo_usage.json") or "").strip() or "/home/elaralo_usage.json"
+_USAGE_LOCK_PATH = _USAGE_STORE_PATH + ".lock"
+_USAGE_LOCK = FileLock(_USAGE_LOCK_PATH)
 
-    // Ensure boosted routing is in place after priming.
-    try {
-      boostAllTtsVolumes();
-    } catch (e) {}
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name, "")
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(str(v).strip())
+    except Exception:
+        return int(default)
 
-    // If neither succeeds, localTtsUnlockedRef remains false and we'll retry on the next user gesture.
-  }, []);
+# PayGo configuration
+# - PAYGO_INTENT_TTL_SECONDS: how long we keep a "pending top-up intent" before it expires.
+# - PAYGO_EVENT_TTL_SECONDS: how long we keep processed webhook event ids to prevent duplicate credits.
+PAYGO_INTENT_TTL_SECONDS = _env_int("PAYGO_INTENT_TTL_SECONDS", 48 * 3600)  # 48h
+PAYGO_EVENT_TTL_SECONDS = _env_int("PAYGO_EVENT_TTL_SECONDS", 90 * 24 * 3600)  # 90d
 
-const playLocalTtsUrl = useCallback(
-    async (url: string, hooks?: SpeakAssistantHooks) => {
-      const audioEl = localTtsAudioRef.current;
-      const videoEl = localTtsVideoRef.current;
+# Minutes for visitors without a memberId
+TRIAL_MINUTES = _env_int("TRIAL_MINUTES", 15)
 
-      // iOS Safari can route <audio> to the receiver (or mute it) after mic/STT.
-      // Using a hidden <video> element often matches Live Avatar output routing (speaker).
-      //
-      // IMPORTANT (Elaralo stability rule): Always route audio-only TTS through the hidden VIDEO
-      // element. Alternate <audio> playback paths have proven unstable across devices.
-      const forceHiddenVideo = true;
-      const preferVideo = !!videoEl && (isIOS || forceHiddenVideo);
+# Included minutes per subscription plan (set these in App Service Configuration)
+INCLUDED_MINUTES_FRIEND = _env_int("INCLUDED_MINUTES_FRIEND", 0)
+INCLUDED_MINUTES_ROMANTIC = _env_int("INCLUDED_MINUTES_ROMANTIC", 0)
+INCLUDED_MINUTES_INTIMATE = _env_int("INCLUDED_MINUTES_INTIMATE", 0)
+INCLUDED_MINUTES_PAYG = _env_int("INCLUDED_MINUTES_PAYG", 0)
 
-      const stopWebSpeechIfNeeded = async () => {
-        if (!(isIOS && sttRecRef.current)) return;
+# Billing/usage tuning (optional)
+USAGE_CYCLE_DAYS = _env_int("USAGE_CYCLE_DAYS", 30)  # member usage resets every N days (subscription cycle)
+USAGE_IDLE_GRACE_SECONDS = _env_int("USAGE_IDLE_GRACE_SECONDS", 600)  # gaps bigger than this are not charged
+USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST", 120)  # cap per chat call
 
-        const rec = sttRecRef.current;
-        try {
-          await new Promise<void>((resolve) => {
-            let done = false;
-            const finish = () => {
-              if (done) return;
-              done = true;
-              resolve();
-            };
+# Pay links (shown to the user when minutes are exhausted)
+UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
+PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
+PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", _env_int("WIX_PAYLINK_TOPUP_MINUTES", 60))
 
-            const prevOnEnd = (rec as any).onend;
-            (rec as any).onend = (...args: any[]) => {
-              try {
-                prevOnEnd?.(...args);
-              } catch (e) {}
-              finish();
-            };
+# Base Pay-As-You-Go price (e.g., "$4.99"). If PAYG_PRICE_TEXT is not set, we derive it as:
+#   "<PAYG_PRICE> per <PAYG_INCREMENT_MINUTES> minutes"
+PAYG_PRICE = (os.getenv("PAYG_PRICE", "") or "").strip()
+PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
+if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
+    PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
 
-            try {
-              rec.stop();
-            } catch (e) {
-              finish();
-            }
 
-            // Safety if onend never arrives
-            setTimeout(finish, 220);
-          });
-        } catch (e) {
-          // ignore
-        }
-      };
+# Admin token for server-side minute credits (payment webhook can call this)
+USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
 
-      const playOn = async (m: HTMLMediaElement, useVideo: boolean): Promise<boolean> => {
-        await stopWebSpeechIfNeeded();
+def _extract_plan_name(session_state: Dict[str, Any]) -> str:
+    plan = (
+        session_state.get("planName")
+        or session_state.get("plan_name")
+        or session_state.get("plan")
+        or ""
+    )
+    return str(plan).strip() if plan is not None else ""
 
-        // Give Safari a beat to swap audio-session away from capture.
-        if (isIOS) await new Promise((r) => setTimeout(r, 180));
 
-        // Cache-bust on iOS (some devices can aggressively cache the same URL path).
-        const finalUrl = isIOS ? `${url}${url.includes("?") ? "&" : "?"}cb=${Date.now()}` : url;
+def _extract_rebranding_key(session_state: Dict[str, Any]) -> str:
+    """Extract the Wix-provided RebrandingKey (preferred) or legacy rebranding string."""
+    rk = (
+        session_state.get("rebrandingKey")
+        or session_state.get("rebranding_key")
+        or session_state.get("RebrandingKey")
+        or session_state.get("rebranding")  # legacy: brand name only
+        or ""
+    )
+    return str(rk).strip() if rk is not None else ""
 
-        // Prepare element
-        try {
-          m.pause();
-          m.currentTime = 0;
-        } catch (e) {}
+def _strip_rebranding_key_label(part: str) -> str:
+    """Accept either raw values or labeled values like 'PayGoMinutes: 60'."""
+    s = (part or "").strip()
+    m = re.match(r"^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$", s)
+    return m.group(1).strip() if m else s
 
-        try {
-        } catch (e) {}
+def _parse_rebranding_key(raw: str) -> Dict[str, str]:
+    """Parse a '|' separated RebrandingKey.
 
-        if (useVideo) {
-          try {
-            const v = m as HTMLVideoElement;
-            v.playsInline = true;
-            v.setAttribute("playsinline", "true");
-            v.setAttribute("webkit-playsinline", "true");
-          } catch (e) {}
+    Expected order:
+      Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+    """
+    v = (raw or "").strip()
+    if not v:
+        return {}
+
+    # Legacy support: no delimiter -> only brand name
+    if "|" not in v:
+        return {
+            "rebranding": _strip_rebranding_key_label(v),
+            "upgrade_link": "",
+            "pay_go_link": "",
+            "pay_go_price": "",
+            "pay_go_minutes": "",
+            "plan": "",
+            "elaralo_plan_map": "",
+            "free_minutes": "",
+            "cycle_days": "",
         }
 
-        try {
-          m.muted = false;
-          m.volume = 1;
-        } catch (e) {}
-
-        // Local (audio-only) TTS stays on the hidden VIDEO element, but we do not
-        // route it through WebAudio (can cause silence with non-CORS media).
-        try { m.muted = false; m.volume = 1; } catch (e) {}
-
-        try {
-          (m as any).preload = "auto";
-        } catch (e) {}
-
-        try {
-          m.src = finalUrl;
-          try {
-            (m as any).load?.();
-          } catch (e) {}
-        } catch (e) {}
-
-        try {
-          hooks?.onWillSpeak?.();
-        } catch (e) {}
-
-        try {
-          await m.play();
-          localTtsUnlockedRef.current = true;
-          // iOS Safari can sometimes resolve play() but keep media effectively paused/silent.
-          // Confirm playback actually started before we proceed.
-          const started = await new Promise<boolean>((resolve) => {
-            let settled = false;
-
-            function finish(ok: boolean) {
-              if (settled) return;
-              settled = true;
-              try {
-                m.removeEventListener("playing", onPlaying);
-                m.removeEventListener("timeupdate", onTimeUpdate);
-                m.removeEventListener("error", onErr);
-              } catch (e) {}
-              resolve(ok);
-            }
-
-            function onPlaying() {
-              finish(true);
-            }
-            function onTimeUpdate() {
-              if (m.currentTime > 0) finish(true);
-            }
-            function onErr() {
-              finish(false);
-            }
-
-            try {
-              m.addEventListener("playing", onPlaying, { once: true });
-              m.addEventListener("timeupdate", onTimeUpdate);
-              m.addEventListener("error", onErr, { once: true });
-            } catch (e) {
-              // If we can't attach events, just accept.
-              finish(true);
-              return;
-            }
-
-            setTimeout(() => {
-              finish(m.currentTime > 0 || !m.paused);
-            }, 600);
-          });
-
-          if (!started) {
-            try {
-              m.pause();
-              m.currentTime = 0;
-            } catch (e) {}
-            return false;
-          }
-        } catch (e) {
-          console.warn("Local TTS playback failed:", {
-            mediaTag: m.tagName,
-            err: String(e),
-            name: (e as any)?.name,
-            message: (e as any)?.message,
-            readyState: m.readyState,
-            networkState: m.networkState,
-            src: (m as any).currentSrc || m.src,
-            mediaError: m.error ? { code: m.error.code } : null,
-          });
-          localTtsUnlockedRef.current = false;
-          return false;
-        }
-
-        await new Promise<void>((resolve) => {
-          let done = false;
-
-          const cleanup = () => {
-            if (done) return;
-            done = true;
-
-            // If the Stop button was wired to this playback, clear it.
-            if (localTtsStopFnRef.current === cleanup) {
-              localTtsStopFnRef.current = null;
-            }
-
-            m.onended = null;
-            m.onerror = null;
-            m.onabort = null;
-            m.onloadedmetadata = null;
-            m.ondurationchange = null;
-            if (hardTimer != null) {
-              window.clearTimeout(hardTimer);
-              hardTimer = null;
-            }
-
-            try {
-              m.pause();
-              m.currentTime = 0;
-            } catch (e) {}
-
-            // iOS Safari sometimes gets "stuck" if we leave the src attached.
-            if (isIOS) {
-              try {
-                m.removeAttribute("src");
-                (m as any).load?.();
-              } catch (e) {}
-            }
-
-            resolve();
-          };
-
-          // Allow the Stop button to interrupt the currently playing local TTS.
-          localTtsStopFnRef.current = cleanup;
-
-          m.onended = cleanup;
-          m.onerror = cleanup;
-          m.onabort = cleanup;
-
-          // Hard timeout if Safari never fires ended
-          // Safari occasionally fails to fire `ended`. Use a duration-aware hard timeout
-          // so we *don't* cut off longer audio, but we also don't hang forever.
-          let hardTimer: number | null = null;
-
-          const armHardTimeout = (ms: number) => {
-            if (hardTimer != null) window.clearTimeout(hardTimer);
-            hardTimer = window.setTimeout(() => cleanup(), ms);
-          };
-
-          // Start with a generous fallback; tighten once duration is known.
-          armHardTimeout(90_000);
-
-          const maybeTightenHardTimeout = () => {
-            const d = Number.isFinite(m.duration) ? m.duration : NaN;
-            if (!Number.isFinite(d) || d <= 0) return;
-            // duration is seconds; add a small buffer
-            const ms = Math.min(5 * 60_000, Math.max(15_000, Math.ceil(d * 1000) + 2_000));
-            armHardTimeout(ms);
-          };
-
-          m.onloadedmetadata = maybeTightenHardTimeout;
-          m.ondurationchange = maybeTightenHardTimeout;
-
-        });
-
-        return true;
-      };
-
-      // Elaralo policy: prefer the hidden VIDEO element for all audio-only TTS playback.
-      // We intentionally do NOT fall back to <audio> because alternate paths have been unstable
-      // across devices (and historically caused STT regressions after playback in some browsers).
-      if (preferVideo && videoEl) {
-        const ok = await playOn(videoEl, true);
-        if (ok) return;
-
-        try {
-          hooks?.onDidNotSpeak?.();
-        } catch (e) {}
-        return;
-      }
-
-      // Only allow <audio> fallback if hidden-video TTS has been explicitly disabled.
-      if (!forceHiddenVideo && audioEl) {
-        const ok = await playOn(audioEl, false);
-        if (ok) return;
-      }
-
-      try {
-        hooks?.onDidNotSpeak?.();
-      } catch (e) {}
-    },
-    [isIOS, applyTtsGainRouting],
-  );
-
-  // Stop any in-progress local (audio-only) TTS playback immediately.
-  // This is required so the Stop button can reliably interrupt audio-only conversations.
-  const stopLocalTtsPlayback = useCallback(() => {
-    try {
-      localTtsStopFnRef.current?.();
-    } catch (e) {
-      // ignore
-    }
-    localTtsStopFnRef.current = null;
-
-    const a = localTtsAudioRef.current;
-    if (a) {
-      try {
-        a.pause();
-        a.currentTime = 0;
-      } catch (e) {}
-      try {
-        a.removeAttribute("src");
-        (a as any).load?.();
-      } catch (e) {}
-    }
-
-    const v = localTtsVideoRef.current;
-    if (v) {
-      try {
-        v.pause();
-        v.currentTime = 0;
-      } catch (e) {}
-      try {
-        v.removeAttribute("src");
-        (v as any).load?.();
-      } catch (e) {}
-    }
-  }, []);
-
-  const speakLocalTtsReply = useCallback(
-    async (replyText: string, voiceId: string, hooks?: SpeakAssistantHooks) => {
-      const clean = (replyText || "").trim();
-      if (!clean) {
-        hooks?.onDidNotSpeak?.();
-        return;
-      }
-
-      // Guard against mid-stream Stop/Save/Clear: cancel any in-flight request and ignore late results.
-      const epoch = localTtsEpochRef.current;
-      try {
-        localTtsAbortRef.current?.abort();
-      } catch (e) {}
-      const controller = new AbortController();
-      localTtsAbortRef.current = controller;
-
-      const audioUrl = await getTtsAudioUrl(clean, voiceId, controller.signal);
-      if (controller.signal.aborted || localTtsEpochRef.current != epoch) {
-        // Stop/Save/Clear happened while we were generating the audio URL.
-        hooks?.onDidNotSpeak?.();
-        return;
-      }
-      if (!audioUrl) {
-        hooks?.onDidNotSpeak?.();
-        return;
-      }
-
-      // If a stop happens during playback start, playLocalTtsUrl will be interrupted by stopLocalTtsPlayback().
-      if (localTtsEpochRef.current != epoch) {
-        hooks?.onDidNotSpeak?.();
-        return;
-      }
-
-      await playLocalTtsUrl(audioUrl, hooks);
-    },
-    [getTtsAudioUrl, playLocalTtsUrl]
-  );
-
-
-const speakAssistantReply = useCallback(
-    async (replyText: string, hooks?: SpeakAssistantHooks) => {
-    // NOTE: We intentionally keep STT paused while the avatar is speaking.
-    // The D-ID SDK's speak() promise can resolve before audio playback finishes,
-    // so we add a best-effort duration wait to prevent STT feedback (avatar "talking to itself").
-    const clean = (replyText || "").trim();
-
-    const callDidNotSpeak = () => {
-      try {
-        hooks?.onDidNotSpeak?.();
-      } catch (e) {
-        // ignore
-      }
-    };
-
-    let willSpeakCalled = false;
-    const callWillSpeakOnce = () => {
-      if (willSpeakCalled) return;
-      willSpeakCalled = true;
-      try {
-        hooks?.onWillSpeak?.();
-      } catch (e) {
-        // ignore
-      }
-    };
-
-    if (!clean) {
-      callDidNotSpeak();
-      return;
-    }
-    if (clean.startsWith("Error:")) {
-      callDidNotSpeak();
-      return;
-    }
-
-    if (avatarStatus !== "connected") {
-      callDidNotSpeak();
-      return;
-    }
-    if (!phase1AvatarMedia) {
-      callDidNotSpeak();
-      return;
-    }
-
-    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
-    if (!audioUrl) {
-      callDidNotSpeak();
-      return;
-    }
-
-    // Estimate duration (fallback) based on text length.
-    const estimateSpeechMs = (text: string) => {
-      const words = text.trim().split(/\s+/).filter(Boolean).length;
-      // Typical conversational pace ~160-175 WPM. Use a slightly slower rate to be safe.
-      const wpm = 160;
-      const baseMs = (words / wpm) * 60_000;
-      const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
-      return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
-    };
-
-    const fallbackMs = estimateSpeechMs(clean);
-
-    // Best-effort: read actual audio duration from the blob URL (if metadata is accessible).
-    const probeAudioDurationMs = (url: string, fallback: number) =>
-      new Promise<number>((resolve) => {
-        if (typeof Audio === "undefined") return resolve(fallback);
-        const a = new Audio();
-        a.preload = "metadata";
-        // Some CDNs require this for cross-origin metadata access (best-effort).
-        try {
-        } catch (e) {
-          // ignore
-        }
-
-        let doneCalled = false;
-        const done = (ms: number) => {
-          if (doneCalled) return;
-          doneCalled = true;
-          try {
-            a.onloadedmetadata = null as any;
-            a.onerror = null as any;
-          } catch (e) {
-            // ignore
-          }
-          // release resource
-          try {
-            a.src = "";
-          } catch (e) {
-            // ignore
-          }
-          resolve(ms);
-        };
-
-        const t = window.setTimeout(() => done(fallback), 2500);
-
-        a.onloadedmetadata = () => {
-          window.clearTimeout(t);
-          const d = a.duration;
-          if (typeof d === "number" && isFinite(d) && d > 0) return done(Math.round(d * 1000));
-          return done(fallback);
-        };
-        a.onerror = () => {
-          window.clearTimeout(t);
-          return done(fallback);
-        };
-
-        a.src = url;
-      });
-
-    const durationMsPromise = probeAudioDurationMs(audioUrl, fallbackMs);
-
-    const speakPayload = {
-      type: "audio",
-      audio_url: audioUrl,
-      audioType: "audio/mpeg",
-    } as any;
-
-    let spoke = false;
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const mgr = didAgentMgrRef.current;
-      if (!mgr) {
-        callDidNotSpeak();
-        return;
-      }
-
-      try {
-        callWillSpeakOnce();
-        await mgr.speak(speakPayload);
-        spoke = true;
-        break;
-      } catch (e) {
-        if (attempt === 0 && isDidSessionError(e)) {
-          console.warn("D-ID session error during speak; reconnecting and retrying...", e);
-          await reconnectLiveAvatar();
-          continue;
-        }
-        console.warn("D-ID speak failed:", e);
-        setAvatarError(formatDidError(e));
-        callDidNotSpeak();
-        return;
-      }
-    }
-
-    if (!spoke) {
-      callDidNotSpeak();
-      return;
-    }
-
-    // Wait for audio playback to finish (plus buffer) before allowing STT to resume.
-    const durationMs = await durationMsPromise;
-    const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
-    await new Promise((r) => window.setTimeout(r, waitMs));
-  },
-  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
-);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const key = "ELARALO_SESSION_ID";
-    let id = window.sessionStorage.getItem(key);
-    if (!id) {
-      id = (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      window.sessionStorage.setItem(key, id);
-    }
-    sessionIdRef.current = id;
-  }, []);
-
-  const [input, setInput] = useState("");
-  const inputElRef = useRef<HTMLInputElement | null>(null);
-  // Attachments (image uploads to Azure Blob via backend)
-  const uploadInputRef = useRef<HTMLInputElement | null>(null);
-  const [pendingAttachment, setPendingAttachment] = useState<UploadedAttachment | null>(null);
-  const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
-  const [uploadError, setUploadError] = useState<string>("");
-
-  const [messages, setMessages] = useState<Msg[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
-  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
-  const [savingSummary, setSavingSummary] = useState(false);
-  const clearEpochRef = useRef(0);
-
-  const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
-
-  const [sessionState, setSessionState] = useState<SessionState>({
-    mode: "friend",
-    model: "gpt-4o",
-    adult_verified: false,
-    romance_consented: false,
-    explicit_consented: false,
-    pending_consent: null,
-  });
-
-  const [planName, setPlanName] = useState<PlanName>(null);
-
-  // Sync memberId into a ref so callbacks defined above can always access the latest value.
-  useEffect(() => {
-    memberIdRef.current = String(memberId || "").trim();
-  }, [memberId]);
-
-  // Stable member id used for live chat (Wix memberId when available, otherwise anon:...)
-  const brandKeyForAnon = useMemo(() => {
-    // `rebranding` is derived from RebrandingKey and is safe to use here.
-    const rawBrand = String(rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
-    return safeBrandKey(rawBrand);
-  }, [rebranding]);
-
-  const memberIdForLiveChat = useMemo(() => {
-    const mid = String(memberId || "").trim();
-    if (mid) return mid;
-    return getOrCreateAnonMemberId(brandKeyForAnon);
-  }, [memberId, brandKeyForAnon]);
-
-
-    // Lightweight viewer auto-refresh: if you are not the host, keep polling until the host creates/starts the event.
-  // This avoids requiring manual page refresh for viewers waiting on the host.
-  
-
-
-
-  const [loggedIn, setLoggedIn] = useState<boolean>(false);
-  // True once we have received the Wix postMessage handoff (plan + companion).
-  // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
-  const [handoffReady, setHandoffReady] = useState<boolean>(false);
-  const [showModePicker, setShowModePicker] = useState(false);
-  const [setModeFlash, setSetModeFlash] = useState(false);
-  const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
-  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
-
-  // LegacyStream broadcaster (host-only) overlay
-  // - "host" is determined by comparing the current Wix memberId to the LegacyStream host_member_id
-  //   stored in voice_video_mappings.sqlite3 (exposed via /stream/livekit/status).
-  const [livekitHostMemberId, setLivekitHostMemberId] = useState<string>("");
-// Host-only Play modal (Stream vs Conference)
-const [showPlayChoiceModal, setShowPlayChoiceModal] = useState<boolean>(false);
-
-// Conference intent flag (prevents auto-rejoin when a user explicitly leaves).
-
-// Track whether THIS client has actually joined the private session.
-// We use both state (for UI) and a ref (for send() gating without stale closures).
-const [conferenceJoined, setConferenceJoined] = useState<boolean>(false);
-const conferenceJoinedRef = useRef<boolean>(false);
-
-useEffect(() => {
-  conferenceJoinedRef.current = conferenceJoined;
-}, [conferenceJoined]);
-
-  // LegacyStream status polling can hit different backend instances; avoid flickering UI by
-  // only changing sessionActive on confirmed status responses.
-  const livekitStatusInactivePollsRef = useRef<number>(0);
-  // Viewer-only: treat the companion's LegacyStream session as "Live Streaming" when the HOST is live.
-  // This is intentionally *global* (not tied to whether the viewer currently has the iframe open),
-  // because we must block AI responses for everyone while the host is streaming.
-  const viewerLiveStreaming =
-    liveProvider === "stream" &&
-    !streamCanStart &&
-    (sessionActive ||
-      (Boolean(streamEventRef) &&
-        (avatarStatus === "connected" ||
-          avatarStatus === "waiting" ||
-          avatarStatus === "connecting" ||
-          avatarStatus === "reconnecting")));
-
-  // Viewer UX:
-  // Once a Viewer joins the live stream session (Play -> iframe open), disable the Play button
-  // to prevent duplicate joins. Pressing Stop re-enables Play.
-  const viewerHasJoinedStream =
-    liveProvider === "stream" &&
-    !streamCanStart &&
-    (avatarStatus === "connected" ||
-      avatarStatus === "waiting" ||
-      avatarStatus === "connecting" ||
-      avatarStatus === "reconnecting");
-
-  // ---------------------------------------------------------------------------
-  // LegacyStream shared in-stream live chat (Host + joined Viewers)
-  // - Only participants who have joined the stream UI (Play) connect.
-  // - Messages are broadcast via WebSocket (HTTP fallback if WS not ready).
-  // - Out-of-session visitors/members do NOT connect (so they cannot see the chat).
-  // ---------------------------------------------------------------------------
-  const liveChatWsRef = useRef<WebSocket | null>(null);
-  const liveChatIdentityRef = useRef<string>("");
-  const liveChatWsClosingRef = useRef<boolean>(false);
-  const liveChatMemberIdRef = useRef<string>("");
-  const liveChatRoleRef = useRef<string>("");
-  const liveChatNameRef = useRef<string>("");
-  const liveChatEventRefRef = useRef<string>("");
-  const [, setLiveChatConnected] = useState<boolean>(false);
-
-  // Dedup incoming chat messages (we echo-send to self).
-  const liveChatSeenIdsRef = useRef<Set<string>>(new Set());
-  const liveChatSeenOrderRef = useRef<string[]>([]);
-  const liveChatSkipNextHistoryRef = useRef<boolean>(false);
-
-  const rememberLiveChatId = useCallback((id: string) => {
-    const msgId = String(id || '').trim();
-    if (!msgId) return;
-    const seen = liveChatSeenIdsRef.current;
-    if (seen.has(msgId)) return;
-    seen.add(msgId);
-    liveChatSeenOrderRef.current.push(msgId);
-    // prevent unbounded growth
-    if (liveChatSeenOrderRef.current.length > 800) {
-      const drop = liveChatSeenOrderRef.current.splice(0, 200);
-      drop.forEach((d) => seen.delete(d));
-    }
-  }, []);
-
-  const appendLiveChatMessage = useCallback(
-    (payload: any) => {
-      if (!payload || typeof payload !== 'object') return;
-      const text = String(payload?.text || '').trim();
-      if (!text) return;
-
-      const clientMsgId = String(payload?.clientMsgId || '').trim();
-      if (clientMsgId) {
-        if (liveChatSeenIdsRef.current.has(clientMsgId)) return;
-        rememberLiveChatId(clientMsgId);
-      }
-
-      const senderId = String(payload?.senderId || '').trim();
-      const senderRole = String(payload?.senderRole || '').trim().toLowerCase();
-      const nameRaw = String(payload?.name || '').trim();
-      const fallbackLabel =
-        senderRole === 'host'
-          ? (String(companionName || 'Host').trim() || 'Host')
-          : (senderId ? `Viewer-${senderId.slice(-4)}` : 'Viewer');
-      const label = nameRaw || fallbackLabel;
-
-      // Never include any live-chat lines in future /chat context (AI must ignore in-stream chat).
-      const includeInAiContext = false;
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'user',
-          content: text,
-          meta: { liveChat: true, senderId, senderRole, name: label, includeInAiContext, clientMsgId },
-        },
-      ]);
-    },
-    [companionName, rememberLiveChatId],
-  );
-
-  // Connect/disconnect the live chat websocket as the viewer/host joins/leaves the stream UI.
-  useEffect(() => {
-    const kind = String(sessionKind || "").trim().toLowerCase();
-
-    const computeLiveChatEventRef = () => {
-      if (kind === "conference") {
-        const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
-        const room = String(sessionRoom || fallbackRoom).trim();
-        const cleanRoom = sanitizeRoomToken(room, 96);
-        return cleanRoom || "";
-      }
-      // Livestream viewers may only learn the room/eventRef from status polling (sessionRoom).
-      return String(streamEventRef || sessionRoom || "").trim();
-    };
-
-    const eventRef = computeLiveChatEventRef();
-
-    // IMPORTANT: this must be independent from the current UI mode (liveProvider).
-    // Once a user has joined a live experience, they should remain connected to shared chat
-    // until they explicitly press Stop (host) or opt-out (viewer, private session only).
-    const inStreamUi =
-      Boolean(sessionActive) && kind !== "conference" && !!eventRef;
-
-    const inConferenceUi =
-      (Boolean(sessionActive) || Boolean(conferenceJoined)) && kind === "conference" && !!eventRef;
-
-    const inLiveChatUi = inStreamUi || inConferenceUi;
-
-    // Always close if not in a live UI.
-    if (!inLiveChatUi || !API_BASE) {
-      try {
-        liveChatWsRef.current?.close?.();
-      } catch {}
-      liveChatWsRef.current = null;
-      liveChatWsClosingRef.current = true;
-      liveChatEventRefRef.current = "";
-      liveChatMemberIdRef.current = "";
-      liveChatRoleRef.current = "";
-      liveChatNameRef.current = "";
-      return;
-    }
-
-    const role = isHost ? "host" : "viewer";
-    const name =
-      role === "host" ? String(companionName || "Host") : String(viewerLiveChatName || "").trim() || "Viewer";
-    const memberIdForWs = String(memberIdForLiveChat || "").trim();
-
-    if (
-      liveChatWsRef.current &&
-      liveChatWsRef.current.readyState === WebSocket.OPEN &&
-      liveChatEventRefRef.current === eventRef &&
-      liveChatMemberIdRef.current === memberIdForWs &&
-      liveChatRoleRef.current === role &&
-      liveChatNameRef.current === name
-    ) {
-      return;
-    }
-
-    try {
-      liveChatWsRef.current?.close?.();
-    } catch {}
-    liveChatWsRef.current = null;
-    liveChatWsClosingRef.current = false;
-
-    const wsUrl = `${API_BASE.replace(/^http/, "ws")}/stream/livekit/livechat/${encodeURIComponent(
-      eventRef
-    )}?memberId=${encodeURIComponent(memberIdForWs || "")}&role=${encodeURIComponent(role)}&name=${encodeURIComponent(
-      name
-    )}`;
-
-    const ws = new WebSocket(wsUrl);
-    liveChatWsRef.current = ws;
-    liveChatEventRefRef.current = eventRef;
-    liveChatMemberIdRef.current = memberIdForWs;
-    liveChatRoleRef.current = role;
-    liveChatNameRef.current = name;
-
-    ws.onmessage = (evt) => {
-      try {
-        const payload: any = JSON.parse(String((evt as any).data || "{}"));
-        const t = String(payload?.type || "").toLowerCase();
-
-        // History payload: { type: "history", messages: [...] }
-        if (t === "history" && Array.isArray(payload?.messages)) {
-          // For Live Private Conference we always start with a blank Live Sharing box.
-          // Do not replay persisted history when a participant is admitted or reconnects.
-          if (sessionKind === "conference") {
-            liveChatSkipNextHistoryRef.current = false;
-            return;
-          }
-
-          if (liveChatSkipNextHistoryRef.current) {
-            // Keep the Live Sharing box blank when entering a session (Host clears history on entry).
-            liveChatSkipNextHistoryRef.current = false;
-            return;
-          }
-          for (const m of payload.messages) appendLiveChatMessage(m);
-          return;
-        }
-
-        // Individual message payloads are typically { type: "chat", ... }.
-        // Some legacy senders may use { type: "message", message: {...} }.
-        if (t === "chat" || t === "message" || t === "") {
-          const inner: any =
-            t === "message" && payload?.message && typeof payload.message === "object" ? payload.message : payload;
-
-          const textVal =
-            inner && typeof inner === "object" ? inner.text ?? inner.message ?? inner.content : undefined;
-
-          if (textVal != null && String(textVal).trim()) {
-            appendLiveChatMessage(
-              inner && typeof inner === "object" ? { ...inner, text: String(textVal) } : { text: String(textVal) }
-            );
-          }
-          return;
-        }
-
-        // ignore other message types
-      } catch {
-        // ignore parse errors
-      }
-    };
-    ws.onclose = () => {
-      if (liveChatWsRef.current === ws) {
-        liveChatWsRef.current = null;
-      }
-    };
-
-    ws.onerror = () => {
-      // Let HTTP fallback handle sends if WS fails.
-    };
-
-    return () => {
-      try {
-        ws.close();
-      } catch {}
-    };
-  }, [
-    API_BASE,
-    sessionActive,
-    "",
-    streamEventRef,
-    isHost,
-    memberIdForLiveChat,
-    companionName,
-    viewerLiveChatName,
-    appendLiveChatMessage,
-    sessionKind,
-    sessionRoom,
-    companyName,
-    conferenceJoined,
-  ]);
-
-
-  const sendLiveChatMessage = useCallback(
-    async (text: string, clientMsgId: string) => {
-      const kind = String(sessionKind || "").trim().toLowerCase();
-      let eventRef = "";
-      if (kind === "conference") {
-        const fallbackRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
-        const room = String(sessionRoom || fallbackRoom).trim();
-        const cleanRoom = sanitizeRoomToken(room, 96);
-        eventRef = cleanRoom || "";
-      } else {
-        // Livestream viewers may only learn the active room via status polling (sessionRoom)
-        // until they explicitly join.
-        eventRef = String(streamEventRef || sessionRoom || "").trim();
-      }
-
-      if (!API_BASE || !eventRef) return;
-      const clean = String(text || '').trim();
-      if (!clean) return;
-
-      const role = isHost ? 'host' : 'viewer';
-      const name =
-        role === 'host'
-          ? (String(companionName || 'Host').trim() || 'Host')
-          : (String(viewerLiveChatName || '').trim() || (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer'));
-      // IMPORTANT:
-      // - The server expects a stable `clientMsgId` so clients can de-dupe websocket echo/history.
-      // - We also include `clientId` for back-compat with older builds.
-      const stableClientMsgId =
-        String(clientMsgId || '').trim() ||
-        ((crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`);
-
-      const payload = {
-        role,
-        from: name,
-        text: clean,
-        userId: String(memberIdForLiveChat || '').trim(),
-        clientMsgId: stableClientMsgId,
-        clientId: stableClientMsgId,
-      } as any;
-
-      const ws = liveChatWsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN && liveChatEventRefRef.current === eventRef) {
-        try {
-          ws.send(JSON.stringify(payload));
-          return;
-        } catch (e) {
-          // fall through to HTTP
-        }
-      }
-
-      // HTTP fallback (stores message in room history + broadcasts to any connected sockets)
-      try {
-        const httpPayload = {
-          eventRef,
-          clientMsgId: payload.clientMsgId,
-          name: payload.from,
-          text: payload.text,
-          role: payload.role,
-          memberId: payload.userId,
-        };
-
-        const httpUrl = kind === 'conference' ? `${API_BASE}/conference/livekit/livechat/send` : `${API_BASE}/stream/livekit/livechat/send`;
-        await fetch(httpUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(httpPayload),
-        });
-      } catch (e) {
-        // ignore
-      }
-    },
-    [API_BASE, streamEventRef, isHost, memberIdForLiveChat, companionName, viewerLiveChatName, sessionKind, sessionRoom, companyName],
-  );
-
-  const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
-  const [broadcasterOverlayUrl, setBroadcasterOverlayUrl] = useState<string>("");
-  const [broadcastPreparing, setBroadcastPreparing] = useState<boolean>(false);
-  const [broadcastError, setBroadcastError] = useState<string>("");
-
-
-// LegacyStream "live session" gating (global per companion)
-// - While the host is streaming, we must NOT generate AI responses for anyone.
-// - We queue user messages locally and flush them once the host stops streaming.
-const streamDeferredQueueRef = useRef<Array<{ text: string; state: SessionState; queuedAt: number; noticeIndex: number }>>([]);
-const streamDeferredFlushInFlightRef = useRef<boolean>(false);
-const streamPreSessionHistoryRef = useRef<Msg[] | null>(null);
-const prevSessionActiveRef = useRef<boolean>(false);
-
-// True when THIS browser session has explicitly joined the in-stream experience
-// (Play pressed and not yet stopped). This is intentionally independent from the
-// global sessionActive flag, because that flag indicates that *someone*
-// (the Host) is streaming, while this ref indicates whether *this user* is in the
-// shared in-stream chat.
-const joinedStreamRef = useRef<boolean>(false);
-
-// ===============================
-// Conference helpers
-// ===============================
-const sanitizeRoomToken = useCallback((raw: string, maxLen = 128) => {
-  // MUST match backend `_sanitize_room_token()` in main.py.
-  // Backend uses underscores (not hyphens) and collapses repeated separators.
-  const s = String(raw || "")
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/(^_+|_+$)/g, "");
-  const out = s.length ? s : "room";
-  return out.slice(0, maxLen);
-}, []);
-
-const startConferenceSession = useCallback(async () => {
-    setAvatarError(null);
-    setMessages([]); // Clear Live Sharing history on entry
-    liveChatSeenIdsRef.current = new Set();
-    liveChatSeenOrderRef.current = [];
-    liveChatSkipNextHistoryRef.current = true;
-
-    setLivekitMicEnabled(true);
-  setLivekitCameraEnabled(true);
-
-	    // Host: prime A/V permissions on the Play click (iOS/Safari requirement).
-	    // Viewers are subscribe-only for now, so we do NOT require mic/cam permissions to request access.
-	    if (isHost) {
-	      const ok = await requestLivekitAvPermissions({
-	        audio: true,
-	        video: true,
-	        reason: "starting a Private conference",
-	      });
-	      if (!ok) {
-	        setAvatarStatus("error");
-	        setAvatarError("Microphone and camera permissions are required to host the private conference.");
-	        return;
-	      }
-	    }
-
-    // Viewers request to join a private session. The host must admit them.
-    if (!isHost) {
-      setStreamNotice(null);
-      setLivekitJoinStatus("pending");
-      setAvatarStatus("waiting");
-
-      // Reset any prior join attempt / token.
-      setConferenceJoined(false);
-      setLivekitJoinRequestId("");
-      setLivekitToken("");
-      setLivekitRole("viewer");
-
-      // Mark intent so the "waiting to be admitted" overlay can render.
-      setSessionKind("conference");
-
-      // IMPORTANT: In conference mode, the backend may reuse an existing event_ref as the LiveKit room.
-      // If we guess the room incorrectly here, the viewer will be admitted into a different room and
-      // will see a blank screen. So we try to fetch the current room from status first.
-      let requestedRoom = String(sessionRoom || "").trim();
-      try {
-        const b = encodeURIComponent(companyName);
-        const a = encodeURIComponent(companionName);
-        const mid = encodeURIComponent(String(memberId || ""));
-        const statusResp = await fetch(
-          `${API_BASE}/stream/livekit/status?brand=${b}&avatar=${a}&memberId=${mid}`
-        );
-        if (statusResp.ok) {
-          const st = await statusResp.json();
-          const stRoom = String(st.roomName || st.sessionRoom || st.streamEventRef || "").trim();
-          if (stRoom) requestedRoom = stRoom;
-          const stKind = String(st.sessionKind || st.kind || "").trim().toLowerCase();
-          if (stKind) setSessionKind(stKind as SessionKind);
-        }
-      } catch {
-        // ignore
-      }
-      if (!requestedRoom) requestedRoom = sanitizeRoomToken(`${companyName}-${companionName}`);
-      if (requestedRoom) {
-        setSessionRoom(requestedRoom);
-        setLivekitRoomName(requestedRoom);
-        setStreamEventRef(requestedRoom);
-      }
-
-      // Viewers must join with mic + camera (they can switch to listen-only after joining).
-      const granted = await requestLivekitAvPermissions({ audio: true, video: true, reason: "joining the private conference" });
-      if (!granted) {
-        setLivekitJoinStatus("idle");
-        setAvatarStatus("idle");
-        return;
-      }
-
-      // Clear any prior live-chat transcript for a clean join.
-      setMessages((prev) => prev.filter((m) => !m?.meta?.liveChat));
-      liveChatSeenIdsRef.current = new Set();
-
-	      try {
-	        const requestedDisplayName = String(
-	          ensureViewerLiveChatName({
-	            promptText: "Please enter your name to enter the the session",
-	          }) ||
-	            viewerLiveChatName ||
-	            "",
-	        ).trim();
-
-        const resp = await fetch(`${API_BASE}/livekit/join_request`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            brand: companyName,
-            avatar: companionName,
-            roomName: requestedRoom,
-            memberId: memberId || "",
-            name: requestedDisplayName,
-            displayName: requestedDisplayName,
-          }),
-        });
-
-        const data = await resp.json().catch(() => ({} as any));
-
-        if (!resp.ok || !data?.ok || !(data as any)?.requestId) {
-          const msg =
-            (data as any)?.detail ||
-            (data as any)?.error ||
-            `Unable to request private session (HTTP ${resp.status})`;
-          setStreamNotice(String(msg));
-          setAvatarStatus("waiting");
-          return;
-        }
-
-        setLivekitJoinRequestId(String((data as any).requestId));
-        setStreamNotice("Join request sent. Waiting for host approval…");
-        return;
-      } catch (err: any) {
-        setStreamNotice(err?.message || "Unable to request private session.");
-        setAvatarStatus("waiting");
-        return;
-      }
-    }
-
-    // Host starts (or resumes) the private session.
-    conferenceOptOutRef.current = false;
-    setStreamNotice(null);
-      setLivekitJoinStatus("pending");
-    setAvatarStatus("connecting");
-    setConferenceJoined(false);
-    setLivekitJoinRequestId("");
-
-    try {
-      const resp = await fetch(`${API_BASE}/conference/livekit/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brand: companyName,
-          avatar: companionName,
-          memberId: memberId || "",
-          displayName: String(companionName || "Host").trim(),
-        }),
-      });
-
-      const data = await resp.json().catch(() => ({} as any));
-
-      if (!resp.ok || !data?.ok) {
-        const msg =
-          (data as any)?.detail ||
-          (data as any)?.error ||
-          `Failed to start private session (HTTP ${resp.status})`;
-        setAvatarError(String(msg));
-        setAvatarStatus("idle");
-        return;
-      }
-
-      const room = String(
-        (data as any)?.sessionRoom ||
-          (data as any)?.room ||
-          (data as any)?.roomName ||
-          sanitizeRoomToken(`${companyName}-${companionName}`)
-      ).trim();
-      const token = String((data as any)?.token || "").trim();
-      const serverUrl = String(
-        (data as any)?.serverUrl || (data as any)?.server_url || LIVEKIT_URL || ""
-      ).trim();
-
-      if (!room || !token || !serverUrl) {
-        setAvatarError("Private session did not return room/token/serverUrl.");
-        setAvatarStatus("idle");
-        return;
-      }
-
-      setLivekitServerUrl(serverUrl);
-      const hostId = String((data as any)?.hostMemberId || "").trim();
-      if (hostId) {
-        setLivekitHostMemberId(hostId);
-      }
-
-      // Clear any prior live-chat messages from previous sessions in the UI.
-      setMessages((prev) => prev.filter((m) => !(m as any)?.meta?.liveChat));
-
-      // Clear prior live-chat transcript for a clean session start.
-      setMessages((prev) => prev.filter((m) => !m?.meta?.liveChat));
-      liveChatSeenIdsRef.current = new Set();
-
-      setSessionKind("conference");
-      setSessionActive(true);
-      setSessionRoom(room);
-      setLivekitRoomName(room);
-      setStreamEventRef(room);
-      setLivekitRole("host");
-      setLivekitToken(token);
-      setConferenceJoined(true);
-      setAvatarStatus("connected");
-    } catch (err: any) {
-      setAvatarError(err?.message || "Network error starting private session.");
-      setAvatarStatus("idle");
-    }
-  }, [API_BASE, companyName, companionName, isHost, memberId, sanitizeRoomToken, viewerLiveChatName, requestLivekitAvPermissions]);
-
-// Keep refs to the latest state for async flush logic (avoids stale closures).
-const messagesRef = useRef<Msg[]>([]);
-useEffect(() => {
-  messagesRef.current = messages;
-}, [messages]);
-
-const stopConferenceSession = useCallback(async () => {
-  if (stopInProgressRef.current) return;
-  stopInProgressRef.current = true;
-  setStreamNotice(null);
-
-  try {
-    // Always tear down local media + UI state (lets the user recover from a stuck session).
-    cleanupIphoneLiveAvatarAudio();
-
-    setLivekitToken("");
-    setLivekitRoomName("");
-    setLivekitHlsUrl("");
-    setConferenceJoined(false);
-      setShowBroadcasterOverlay(false);
-      setBroadcasterOverlayUrl("");
-      setBroadcastPreparing(false);
-      setBroadcastError(null);
-
-    setAvatarStatus("idle");
-    setLivekitJoinRequestId("");
-    setLivekitJoinStatus("idle");
-    setLivekitPending([]);
-    // Preserve AI chat history on stop; remove only live-sharing chat messages.
-    setMessages((prev: any[]) =>
-      (prev || []).filter((m: any) => !Boolean(m?.meta?.liveChat))
-    );
-    setLiveSharingNotice(null);
-
-    // Viewer leaving should NOT stop the private session for everyone.
-    if (!isHost) {
-      conferenceOptOutRef.current = true;
-      return;
-    }
-
-    // Host: stop *any* active session (private OR stream) to prevent stale/stuck state.
-    const payload = {
-      brand: companyName,
-      avatar: companionName,
-      memberId: memberIdRef.current || "",
-    };
-
-    await fetch(`${API_BASE}/conference/livekit/stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(() => null);
-
-    await fetch(`${API_BASE}/stream/livekit/stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(() => null);
-
-    setSessionActive(false);
-    setSessionKind("");
-    sessionActiveRef.current = false;
-    streamOptOutRef.current = false;
-    conferenceOptOutRef.current = false;
-    setStreamCanStart(false);
-
-    setStreamNotice("Stopped.");
-  } catch (err) {
-    console.error("stopConferenceSession failed", err);
-    setStreamNotice("Stop failed. Please refresh and try again.");
-  } finally {
-    stopInProgressRef.current = false;
-  }
-}, [API_BASE, companyName, companionName, cleanupIphoneLiveAvatarAudio, isHost]);
-
-const sessionStateRef = useRef<SessionState>(sessionState);
-useEffect(() => {
-  sessionStateRef.current = sessionState;
-}, [sessionState]);
-
-
-  const showBroadcastButton = false; // Disabled: Broadcast overlay reserved for future HLS/egress. Use Play/Stop for WebRTC LiveKit.
-const goToMyElaralo = useCallback(() => {
-    const url = "https://www.elaralo.com/myelaralo";
-
-    // If running inside an iframe, attempt to navigate the *top* browsing context
-    // so we leave the embed and avoid “stacked headers”.
-    try {
-      if (window.top && window.top !== window.self) {
-        window.top.location.href = url;
-        return;
-      }
-    } catch (e) {
-      // Cross-origin access to window.top can throw.
-    }
-
-    // Alternate attempt that may still target the top browsing context.
-    try {
-      window.open(url, "_top");
-      return;
-    } catch (e) {
-      // ignore
-    }
-
-    // Fallback: navigate the current frame.
-    window.location.href = url;
-  }, []);
-
-  const goToUpgrade = useCallback(() => {
-    const url = upgradeUrl;
-
-    // If running inside an iframe, attempt to navigate the *top* browsing context
-    // so we leave the embed and avoid “stacked headers”.
-    try {
-      if (window.top && window.top !== window.self) {
-        window.top.location.href = url;
-        return;
-      }
-    } catch (e) {
-      // Cross-origin access to window.top can throw.
-    }
-
-    // Alternate attempt that may still target the top browsing context.
-    try {
-      window.open(url, "_top");
-      return;
-    } catch (e) {
-      // ignore
-    }
-
-    // Fallback: navigate the current frame.
-    window.location.href = url;
-  }, [upgradeUrl]);
-
-
-
-// ---------------------------------------------------------------------------
-// LegacyStream broadcaster overlay (Host-only) + session status (Host + Viewer)
-// - Fetch the host_member_id + current sessionActive flag for the current companion.
-// - Polls so *all* visitors/members (even when not in Stream mode) can immediately gate AI replies
-//   as soon as the Host hits Play.
-// ---------------------------------------------------------------------------
-useEffect(() => {
-    if (!API_BASE || !companyName || !companionName) {
-      setLivekitHostMemberId("");
-      setSessionActive(false);
-      livekitStatusInactivePollsRef.current = 0;
-      return;
-    }
-
-    let cancelled = false;
-    let pollTimer: any = null;
-
-    const fetchStatus = async () => {
-      try {
-        const url = `${API_BASE}/stream/livekit/status?brand=${encodeURIComponent(
-          companyName,
-        )}&avatar=${encodeURIComponent(companionName)}&memberId=${encodeURIComponent(
-          memberIdRef.current || "",
-        )}`;
-        const res = await fetch(url, { cache: "no-store" });
-
-        if (cancelled) return;
-
-        let data: any = null;
-        try {
-          data = await res.json();
-        } catch (_) {
-          data = null;
-        }
-
-        if (cancelled) return;
-
-        if (!res.ok || !data?.ok) {
-          // Keep last known-good; do not flicker sessionActive on transient poll failures.
-          return;
-        }
-
-        const nextHostId = String(data.hostMemberId || "").trim();
-        if (nextHostId) {
-          setLivekitHostMemberId(nextHostId);
-        }
-        const nextServerUrl = String((data as any).serverUrl || (data as any).server_url || "").trim();
-        if (nextServerUrl) {
-          setLivekitServerUrl(nextServerUrl);
-        }
-
-
-        const rawKind = String((data as any).sessionKind || "").trim().toLowerCase();
-        const nextRoom = String(
-          (data as any).room ||
-            (data as any).sessionRoom ||
-            (data as any).roomName ||
-            ""
-        ).trim();
-
-        // Backend versions prior to main_V11 reported `sessionActive=false` for conferences.
-        // To avoid breaking Private conference UX (blank screen + state resets), treat an
-        // active conference as "active" when kind=conference and roomName is present.
-        const nextActive =
-          Boolean((data as any).sessionActive) || (rawKind === "conference" && Boolean(nextRoom));
-
-        const nextKind: SessionKind =
-          rawKind === "conference" || rawKind === "stream" ? (rawKind as SessionKind) : nextActive ? "stream" : "";
-
-        const effectiveMemberId = String(memberIdRef.current || "").trim();
-
-        const nextCanStart =
-          effectiveMemberId && typeof (data as any).canStart === "boolean"
-            ? Boolean((data as any).canStart)
-            : null;
-
-        if (nextCanStart !== null) {
-          setStreamCanStart(nextCanStart);
-          if (nextCanStart) setLivekitRole("host");
-          else setLivekitRole((prev) => (prev === "unknown" ? "viewer" : prev));
-        }
-
-        if (nextActive) {
-          livekitStatusInactivePollsRef.current = 0;
-          setSessionActive(true);
-          setSessionKind(nextKind);
-          setSessionRoom(nextRoom);
-        } else {
-          livekitStatusInactivePollsRef.current += 1;
-
-          // Only clear after 2 consecutive "inactive" polls to avoid flicker.
-          if (livekitStatusInactivePollsRef.current >= 2) {
-            setSessionActive(false);
-            setSessionKind("");
-            setSessionRoom("");
-            conferenceOptOutRef.current = false;
-          }
-        }
-      }
-      catch (_e) {
-        // Keep last known-good on fetch errors.
-        return;
-      }
-    };
-
-    void fetchStatus();
-    pollTimer = window.setInterval(() => {
-      void fetchStatus();
-    }, 2500);
-
-    return () => {
-      cancelled = true;
-      if (pollTimer) {
-        window.clearInterval(pollTimer);
-      }
-    };
-  }, [API_BASE, companyName, companionName]);
-
-  // If the host ends a session, ensure viewers fully exit (equivalent to pressing Stop).
-  // This is a safety net in addition to LiveKit's kick/disconnect behavior.
-  useEffect(() => {
-    if (isHost) return;
-    if (sessionActive) return;
-
-    const viewerWasInLiveUi =
-      Boolean(livekitToken) ||
-      Boolean(conferenceJoined) ||
-      Boolean(viewerHasJoinedStream) ||
-      Boolean(streamEventRef) ||
-      Boolean(sessionRoom) ||
-      livekitJoinStatus !== "idle" ||
-      Boolean(livekitJoinRequestId);
-
-    if (!viewerWasInLiveUi) return;
-    if (stopInProgressRef.current) return;
-
-    void stopConferenceSession();
-  }, [
-    isHost,
-    sessionActive,
-    livekitToken,
-    conferenceJoined,
-    viewerHasJoinedStream,
-    streamEventRef,
-    sessionRoom,
-    livekitJoinStatus,
-    livekitJoinRequestId,
-    stopConferenceSession,
-  ]);
-
-// Viewer UX: if a viewer joined before the host activated the session, we initially show a
-// "Waiting on ..." notice (avatarStatus="waiting"). As soon as the host activates the session,
-// remove the waiting notice.
-useEffect(() => {
-  if (!sessionActive) return;
-    if (sessionKind === "conference") return;
-  if (streamCanStart) return; // host
-  if (!joinedStreamRef.current) return;
-  if (avatarStatus !== "waiting") return;
-
-  setStreamNotice("");
-  setAvatarStatus("connected");
-}, [sessionActive, sessionKind, streamCanStart, avatarStatus]);
-
-  // Conference join is mediated via LiveKit join requests (viewer requests → host admits).
-
-  
-
-
-  // Reset broadcaster UI when switching companion / provider.
-useEffect(() => {
-  // Broadcaster overlay is stream-only and must never persist across companion/provider switches.
-  setShowBroadcasterOverlay(false);
-  setBroadcasterOverlayUrl("");
-  setBroadcastPreparing(false);
-  setBroadcastError("");
-}, [companyName, companionName, liveProvider]);
-
-// Reset stream chat queue only when switching companions (NOT when toggling providers).
-// Visitors/members may be queued while Dulce is live even if they are not in Stream mode.
-useEffect(() => {
-  streamDeferredQueueRef.current = [];
-  streamPreSessionHistoryRef.current = null;
-  prevSessionActiveRef.current = false;
-  joinedStreamRef.current = false;
-
-  setLivekitHostMemberId("");
-  setSessionActive(false);
-}, [companyName, companionName]);
-
-  // If host-eligibility changes (e.g., user logs out), force-hide the overlay.
-  useEffect(() => {
-    if (!showBroadcastButton) setShowBroadcasterOverlay(false);
-  }, [showBroadcastButton]);
-
-  const toggleBroadcastOverlay = useCallback(async () => {
-    if (!showBroadcastButton) return;
-
-    // Toggle OFF: stop the LiveKit stream session (server-side) and close overlay.
-    if (showBroadcasterOverlay) {
-      setBroadcastError("");
-      setBroadcastPreparing(true);
-      try {
-        await fetch(`${API_BASE}/stream/livekit/stop`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            brand: companyName,
-            avatar: companionName,
-            memberId: memberIdRef.current || "",
-          }),
-        }).catch(() => {});
-      } finally {
-        setBroadcastPreparing(false);
-        setShowBroadcasterOverlay(false);
-        // Disconnect LiveKit UI (if connected via overlay)
-        setLivekitToken("");
-        setLivekitRoomName("");
-        setLivekitHlsUrl("");
-      }
-      return;
-    }
-
-    // Toggle ON: start/ensure session is live + get host token.
-    setShowBroadcasterOverlay(true);
-    setBroadcastError("");
-    setBroadcastPreparing(true);
-
-    try {
-      const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
-
-      const res = await fetch(`${API_BASE}/stream/livekit/start_broadcast`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brand: companyName,
-          avatar: companionName,
-          embedDomain,
-          memberId: memberIdRef.current || "",
-        }),
-      });
-
-      const data: any = await res.json().catch(() => ({}));
-      if (!res.ok || !data?.ok) {
-        throw new Error(String(data?.detail || data?.error || data?.message || `HTTP ${res.status}`));
-      }
-      if (!data?.isHost) {
-        throw new Error("Broadcast is only available for the host account.");
-      }
-
-      const roomName = String(data?.roomName || "").trim();
-      const token = String(data?.token || "").trim();
-      const hlsUrl = String(data?.hlsUrl || "").trim();
-
-      if (!roomName || !token) throw new Error("LiveKit did not return a roomName/token.");
-
-      setLivekitRoomName(roomName);
-      setLivekitRole("host");
-      setLivekitToken(token);
-      setLivekitHlsUrl(hlsUrl);
-
-      // Mark locally active (used elsewhere for gating)
-      setSessionActive(true);
-      setSessionKind("stream");
-      setSessionRoom(roomName);
-    } catch (err: any) {
-      console.error("LiveKit start_broadcast failed:", err);
-      setBroadcastError(err?.message ? String(err.message) : String(err));
-      // Keep overlay open so the host can see the error and close it via the Broadcast button.
-    } finally {
-      setBroadcastPreparing(false);
-    }
-  }, [
-    API_BASE,
-    companyName,
-    companionName,
-    showBroadcastButton,
-    showBroadcasterOverlay,
-  ]);
-
-
-
-  const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
-  const messagesBoxRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const el = messagesBoxRef.current;
-    if (!el) return;
-
-    // Keep scrolling inside the message box so the page itself doesn't "jump"
-    el.scrollTop = el.scrollHeight;
-  }, [messages, loading]);
-
-  // Speech-to-text (Web Speech API): "hands-free" mode
-  // - User clicks mic once to start/stop
-  // - Auto-sends after 2s of silence
-  // - Automatically restarts recognition when it stops (browser behavior)
-  const sttRecRef = useRef<any>(null);
-  const sttSilenceTimerRef = useRef<number | null>(null);
-  const sttRestartTimerRef = useRef<number | null>(null);
-  const sttRecoverTimerRef = useRef<number | null>(null);
-  const sttAudioCaptureFailsRef = useRef<number>(0);
-  const sttLastAudioCaptureAtRef = useRef<number>(0);
-
-  const sttFinalRef = useRef<string>("");
-  const sttInterimRef = useRef<string>("");
-  const sttIgnoreUntilRef = useRef<number>(0); // suppress STT while avatar is speaking (prevents feedback loop)
-
-  const [sttEnabled, setSttEnabled] = useState(false);
-  const [sttRunning, setSttRunning] = useState(false);
-  const [sttError, setSttError] = useState<string | null>(null);
-  // Track whether the user has already granted microphone access in this session.
-  // On iOS Web Speech, this becomes true on SpeechRecognition.onstart (after the permission prompt).
-  const [micGranted, setMicGranted] = useState(false);
-  const micGrantedRef = useRef<boolean>(false);
-
-  // If a voice greeting is requested before mic permission is granted, we queue it here and
-  // play it as soon as both mic permission + (for live) the avatar connection are ready.
-  const pendingGreetingModeRef = useRef<("live" | "audio") | null>(null);
-
-
-  // iOS: prefer backend STT (MediaRecorder → /stt/transcribe) for **audio-only** mode.
-  // Browser SpeechRecognition can be flaky on iOS (especially after auto-restarts).
-  const [backendSttAvailable, setBackendSttAvailable] = useState(true);
-
-  // These state setters exist to trigger renders when backend STT updates refs (mobile stability).
-  // We intentionally ignore the state values to avoid UI changes.
-  const [, setSttInterim] = useState<string>("");
-  const [, setSttFinal] = useState<string>("");
-
-  const sttEnabledRef = useRef<boolean>(false);
-  useEffect(() => {
-    micGrantedRef.current = micGranted;
-  }, [micGranted]);
-
-  const sttPausedRef = useRef<boolean>(false);
-  // Backend STT (iOS-safe): record mic audio via getUserMedia + MediaRecorder and transcribe server-side.
-  const backendSttInFlightRef = useRef<boolean>(false);
-  const backendSttAbortRef = useRef<AbortController | null>(null);
-  const backendSttStreamRef = useRef<MediaStream | null>(null);
-  const backendSttRecorderRef = useRef<MediaRecorder | null>(null);
-  const backendSttAudioCtxRef = useRef<AudioContext | null>(null);
-  const backendSttRafRef = useRef<number | null>(null);
-  const backendSttHardStopTimerRef = useRef<number | null>(null);
-  const backendSttLastVoiceAtRef = useRef<number>(0);
-  const backendSttHasSpokenRef = useRef<boolean>(false);
-
-
-  const getEmbedHint = useCallback(() => {
-    if (typeof window === "undefined") return "";
-    const hint =
-      " (If this page is embedded, ensure the embed/iframe allows microphone access.)";
-    try {
-      return window.self !== window.top ? hint : "";
-    } catch (e) {
-      return hint;
-    }
-  }, []);
-
-
-  // Greeting once per browser session per companion
-// Fix: if companionName arrives AFTER the initial greeting timer (e.g., slow Wix postMessage),
-// we may have already inserted the default "Elara" greeting. If the user hasn't typed yet,
-// replace the greeting so it matches the selected companion.
-useEffect(() => {
-  if (typeof window === "undefined") return;
-
-  const desiredName =
-    (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
-
-  const keyName = normalizeKeyForFile(desiredName);
-  const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
-
-  const tmr = window.setTimeout(() => {
-    const already = sessionStorage.getItem(greetKey) === "1";
-    const greetingText = greetingFor(desiredName);
-
-    const greetingMsg: Msg = {
-      role: "assistant",
-      content: greetingText,
-    };
-
-    setMessages((prev) => {
-      // If no messages yet, insert greeting only if we elara't greeted this companion in this session.
-      if (prev.length === 0) {
-        return already ? prev : [greetingMsg];
-      }
-
-      // If the only existing message is a greeting for a different companion (and no user messages yet),
-      // replace it so the name matches the current companion.
-      if (prev.length === 1 && prev[0].role === "assistant") {
-        const existing = String((prev[0] as any)?.content ?? "");
-        const m = existing.match(/^Hi,\s*(.+?)\s+here\./i);
-        const existingName = m?.[1]?.trim();
-        if (existingName && existingName.toLowerCase() !== desiredName.toLowerCase()) {
-          return [{ ...prev[0], content: greetingText }];
-        }
-      }
-
-      return prev;
-    });
-
-    if (!already) sessionStorage.setItem(greetKey, "1");
-  }, 150);
-
-  return () => window.clearTimeout(tmr);
-}, [companionName]);
-
-  function showUpgradeMessage(requestedMode: Mode) {
-    const modeLabel = MODE_LABELS[requestedMode];
-    const msg =
-      `The requested mode (${modeLabel}) isn't available on your current plan. ` +
-      `Please upgrade here: ${upgradeUrl} or click the upgrade button below the text input box`;
-
-    setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
-  }
-
-  // Receive plan + companion from Wix postMessage
-  useEffect(() => {
-    // iOS/Safari can strip document.referrer, which can make strict origin checks flaky.
-    // We "learn" the parent origin from the first MEMBER_PLAN payload we accept, then lock to it.
-    let trustedParentOrigin: string | null = null;
-
-    const looksLikeMemberPlanPayload = (d: any) => {
-      return (
-        !!d &&
-        typeof d === "object" &&
-        (d as any).type === "MEMBER_PLAN" &&
-        typeof (d as any).brand === "string" &&
-        typeof (d as any).avatar === "string"
-      );
-    };
-
-    const isAllowedPostMessage = (origin: string, data: any) => {
-      if (origin === window.location.origin) return true;
-      if (trustedParentOrigin && origin === trustedParentOrigin) return true;
-
-      if (isAllowedOrigin(origin)) {
-        if (!trustedParentOrigin) trustedParentOrigin = origin;
-        return true;
-      }
-
-      // Safari/iOS sometimes provides an empty referrer; accept the first valid payload and lock to that origin.
-      if (!trustedParentOrigin && origin && origin.startsWith("https://") && looksLikeMemberPlanPayload(data)) {
-        trustedParentOrigin = origin;
-        return true;
-      }
-
-      return false;
-    };
-
-    function onMessage(event: MessageEvent) {
-      // Wix HTML components sometimes deliver the payload as a JSON string.
-      // Accept both object and string forms.
-      let data: any = (event as any).data;
-      if (typeof data === "string") {
-        try {
-          data = JSON.parse(data);
-        } catch (e) {
-          return;
-        }
-      }
-
-      if (!isAllowedPostMessage(event.origin, data)) return;
-      if (!data || typeof data !== "object" || (data as any).type !== "MEMBER_PLAN") return;
-
-      // loggedIn must come from Wix; do NOT infer from memberId.
-      const incomingLoggedIn = (data as any).loggedIn;
-      if (typeof incomingLoggedIn === "boolean") {
-        setLoggedIn(incomingLoggedIn);
-      } else {
-        setLoggedIn(false);
-      }
-
-      const incomingPlan = normalizePlanName((data as any).planName);
-
-      // Optional white-label brand handoff from Wix.
-      // - Elaralo site should send: { rebrandingKey: "" }
-      // - Rebranding sites should send the full RebrandingKey (pipe-delimited).
-      //
-      // IMPORTANT: This must never alter STT/TTS start/stop code paths.
-      let rawRebrandingKey = "";
-
-      if (
-        "rebrandingKey" in (data as any) ||
-        "rebranding_key" in (data as any) ||
-        "RebrandingKey" in (data as any) ||
-        "rebrandingkey" in (data as any)
-      ) {
-        rawRebrandingKey =
-          typeof (data as any).rebrandingKey === "string"
-            ? String((data as any).rebrandingKey)
-            : typeof (data as any).rebranding_key === "string"
-              ? String((data as any).rebranding_key)
-              : typeof (data as any).rebrandingkey === "string"
-                ? String((data as any).rebrandingkey)
-                : typeof (data as any).RebrandingKey === "string"
-                  ? String((data as any).RebrandingKey)
-                  : "";
-        rawRebrandingKey = rawRebrandingKey.trim();
-
-        // Allow empty string to explicitly clear any previous rebranding state.
-        setRebrandingKey(rawRebrandingKey);
-      } else if ("rebranding" in (data as any)) {
-        // Legacy support: some older Wix pages may still send { rebranding: "BrandName" }.
-        rawRebrandingKey = typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
-        if (rawRebrandingKey) setRebrandingKey(rawRebrandingKey);
-      }
-
-      const rkParts = parseRebrandingKey(rawRebrandingKey);
-      const rebrandSlugFromMessage = normalizeRebrandingSlug(rkParts?.rebranding || "");
-
-
-
-
-      const incomingMemberId =
-        typeof (data as any).memberId === "string"
-          ? String((data as any).memberId).trim()
-          : typeof (data as any).member_id === "string"
-            ? String((data as any).member_id).trim()
-            : "";
-      setMemberId(incomingMemberId);
-
-      // When RebrandingKey is present, use ElaraloPlanMap for capability gating
-      // (Wix planName may be the rebrand site's plan names like "Supreme").
-      const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
-      const hasEntitledPlan = Boolean((mappedPlanFromKey || incomingPlan).trim());
-      const effectivePlan: PlanName = hasEntitledPlan ? (mappedPlanFromKey || incomingPlan) : "Trial";
-      setPlanName(effectivePlan);
-
-      // Display the rebranding site's plan label when provided (e.g., "Supreme"),
-      // but only for logged-in members (Free Trial ignores plan labels by design).
-      const planLabel = incomingMemberId ? String(rkParts?.plan || "").trim() : "";
-      setPlanLabelOverride(planLabel);
-
-      const incomingCompanion =
-        typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
-      const resolvedCompanionKey = incomingCompanion || "";
-      const { baseKey } = splitCompanionKey(resolvedCompanionKey);
-
-      if (resolvedCompanionKey) {
-        setCompanionKeyRaw(resolvedCompanionKey);
-        const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
-        setCompanionKey(parsed.key);
-        setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
-
-        // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
-        setSessionState((prev) => ({
-          ...prev,
-          companion: parsed.key,
-          companionName: parsed.key,
-          companion_name: parsed.key,
-        }));
-      } else {
-        setCompanionKeyRaw("");
-        setCompanionKey("");
-        setCompanionName(DEFAULT_COMPANION_NAME);
-
-        setSessionState((prev) => ({
-          ...prev,
-          companion: DEFAULT_COMPANION_NAME,
-          companionName: DEFAULT_COMPANION_NAME,
-          companion_name: DEFAULT_COMPANION_NAME,
-        }));
-      }
-
-      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, rebrandSlugFromMessage);
-      pickFirstLoadableImage(avatarCandidates).then((picked) => setAvatarSrc(picked));
-
-      // Brand-default starting mode:
-      // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
-      // - Fallback: entitled plans default to Intimate, Trial/visitors default to Romantic.
-      const desiredStartMode: Mode =
-        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) || (hasEntitledPlan ? "intimate" : "romantic");
-
-      const nextAllowed = allowedModesForPlan(effectivePlan);
-      setAllowedModes(nextAllowed);
-
-      setSessionState((prev) => {
-        let nextMode: Mode = prev.mode;
-
-        // If the previous mode is the default placeholder (Friend) or no longer allowed,
-        // snap to the brand-default start mode (if allowed).
-        if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
-          nextMode = desiredStartMode;
-        } else if (!nextAllowed.includes(nextMode)) {
-          nextMode = "friend";
-        }
-
-        if (nextMode === prev.mode) return prev;
-        return { ...prev, mode: nextMode, pending_consent: null };
-      });
-
-      // Mark handoff ready so the first audio-only TTS can deterministically use the selected companion voice.
-      setHandoffReady(true);
-    }
-
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
-  }, []);
-
-  async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
-    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
-
-    const session_id =
-      sessionIdRef.current ||
-      (crypto as any).randomUUID?.() ||
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-const wants_explicit = stateToSend.mode === "intimate";
-
-// Ensure backend receives the selected companion so it can apply the correct persona.
-// Without this, the backend may fall back to the default companion ("Elara") even when the UI shows another.
-const companionForBackend =
-  (companionKey || "").trim() ||
-  (companionName || DEFAULT_COMPANION_NAME).trim() ||
-  DEFAULT_COMPANION_NAME;
-
-
-// NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
-const brandKey = safeBrandKey(rawBrand);
-
-// For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
-const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
-
-// If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
-// from the rebranding key so backend quota comes from the mapped Elaralo plan.
-
-// `loggedIn` is only available when the Wix parent posts it.
-// For white-label, keep the full rebrandingKey intact so backend can apply minutes/mode/links overrides.
-const rebrandingKeyForBackend = (rebrandingKey || "");
-
-    const stateToSendWithCompanion: SessionState = {
-  ...stateToSend,
-  companion: companionForBackend,
-  // Backward/forward compatibility with any backend expecting different field names
-  companionName: companionForBackend,
-  companion_name: companionForBackend,
-  // Member identity (from Wix)
-  memberId: (memberIdForBackend || "").trim(),
-  member_id: (memberIdForBackend || "").trim(),
-
-  // Plan for entitlements (use mapped Elaralo plan when rebrandingKey provides one)
-  planName: (planName || "").trim(),
-  plan_name: (planName || "").trim(),
-
-  // Optional display label (white-label plan name). Backend can use this for messaging only.
-  planLabelOverride: (planLabelOverride || "").trim(),
-  plan_label_override: (planLabelOverride || "").trim(),
-
-  // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
-  rebrandingKey: (rebrandingKeyForBackend || "").trim(),
-  rebranding_key: (rebrandingKeyForBackend || "").trim(),
-  RebrandingKey: (rebrandingKeyForBackend || "").trim(),
-  // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
-  rebranding: (rebranding || "").trim(),
-};
-
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id,
-        wants_explicit,
-        session_state: stateToSendWithCompanion,
-        messages: trimMessagesForChat(nextMessages).map((m) => {
-          let content = m.content || "";
-          const att = m.meta?.attachment;
-          if (att?.url) {
-            const name = att.name || "attachment";
-            content = `${content}${content ? "\n\n" : ""}Attachment: ${name}\n${att.url}`;
-          }
-          return { role: m.role, content };
-        }),
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Backend error ${res.status}: ${errText}`);
-    }
-
-    return (await res.json()) as ChatApiResponse;
-  }
-
-  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
-    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
-
-    const session_id =
-      sessionIdRef.current ||
-      (crypto as any).randomUUID?.() ||
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-    const companionForBackend =
-      (companionKey || "").trim() ||
-      (companionName || DEFAULT_COMPANION_NAME).trim() ||
-      DEFAULT_COMPANION_NAME;
-
-    const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
-
-    
-// NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
-const brandKey = safeBrandKey(rawBrand);
-
-// For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
-const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
-
-// If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
-// from the rebranding key so backend quota comes from the mapped Elaralo plan.
-// For white-label, keep the full rebrandingKey intact so backend can apply minutes/mode/links overrides.
-const rebrandingKeyForBackend = (rebrandingKey || "");
-
-  const stateToSendWithCompanion: SessionState = {
-      ...stateToSend,
-      companion: companionForBackend,
-      companionName: companionForBackend,
-      companion_name: companionForBackend,
-      planName: effectivePlanForBackend,
-      plan_name: effectivePlanForBackend,
-      plan: effectivePlanForBackend,
-      memberId: (memberIdForBackend || "").trim(),
-      member_id: (memberIdForBackend || "").trim(),
-
-  // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
-  rebrandingKey: (rebrandingKeyForBackend || "").trim(),
-  rebranding_key: (rebrandingKeyForBackend || "").trim(),
-  RebrandingKey: (rebrandingKeyForBackend || "").trim(),
-  // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
-  rebranding: (rebranding || "").trim(),
-};
-
-    const res = await fetch(`${API_BASE}/chat/save-summary`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id,
-        session_state: stateToSendWithCompanion,
-        messages: nextMessages.map((m) => {
-          let content = m.content || "";
-          const att = m.meta?.attachment;
-          if (att?.url) {
-            const name = att.name || "attachment";
-            content = `${content}${content ? "\n\n" : ""}Attachment: ${name}\n${att.url}`;
-          }
-          return { role: m.role, content };
-        }),
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Backend error ${res.status}: ${errText}`);
-    }
-
-    return (await res.json()) as any;
-  }
-
-  // ---------------------------------------------------------------------
-// Attachments (Azure Blob via backend)
-// - Only image/* uploads are supported (rendered as image previews).
-// - Attachments are DISABLED during Shared Live (LegacyStream sessionActive).
-// ---------------------------------------------------------------------
-const uploadsDisabled = Boolean(sessionActive && sessionKind === "stream");
-
-const uploadAttachment = useCallback(
-  async (file: File): Promise<UploadedAttachment> => {
-    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
-
-    const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
-    const member = String(memberIdForLiveChat || "").trim();
-
-    if (!brand || !avatar) throw new Error("Missing brand/avatar for upload");
-    if (!file) throw new Error("No file selected");
-
-    const filename = String((file as any).name || "upload").trim() || "upload";
-    const contentType =
-      String((file as any).type || "").trim() || "application/octet-stream";
-    // Full file support (Option B): allow any file type.
-
-    const res = await fetch(`${API_BASE}/files/upload`, {
-      method: "POST",
-      headers: {
-        "Content-Type": contentType,
-        "X-Filename": filename,
-        "X-Brand": brand,
-        "X-Avatar": avatar,
-        "X-Member-Id": member,
-      },
-      body: file,
-    });
-
-    const rawText = await res.text().catch(() => "");
-    let json: any = null;
-    try {
-      json = rawText ? JSON.parse(rawText) : null;
-    } catch (e) {
-      json = null;
-    }
-
-    if (!res.ok) {
-      const detail = String(json?.detail || rawText || "").trim();
-      throw new Error(detail || `Upload failed (${res.status})`);
-    }
-
-    const url = String(json?.url || "").trim();
-    if (!url) throw new Error("Upload succeeded but no URL was returned");
+    parts = [_strip_rebranding_key_label(p) for p in v.split("|")]
+    parts += [""] * (9 - len(parts))
+
+    (
+        rebranding,
+        upgrade_link,
+        pay_go_link,
+        pay_go_price,
+        pay_go_minutes,
+        plan,
+        elaralo_plan_map,
+        free_minutes,
+        cycle_days,
+    ) = parts[:9]
 
     return {
-      url,
-      name: String(json?.name || filename || "attachment"),
-      size: Number(json?.size || (file as any).size || 0),
-      contentType: String(json?.contentType || contentType || "application/octet-stream"),
-      container: json?.container,
-      blobName: json?.blobName,
-    };
-  },
-  [API_BASE, companyName, companionName, memberIdForLiveChat]
+        "rebranding": str(rebranding or "").strip(),
+        "upgrade_link": str(upgrade_link or "").strip(),
+        "pay_go_link": str(pay_go_link or "").strip(),
+        "pay_go_price": str(pay_go_price or "").strip(),
+        "pay_go_minutes": str(pay_go_minutes or "").strip(),
+        "plan": str(plan or "").strip(),
+        "elaralo_plan_map": str(elaralo_plan_map or "").strip(),
+        "free_minutes": str(free_minutes or "").strip(),
+        "cycle_days": str(cycle_days or "").strip(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# RebrandingKey validation
+# ---------------------------------------------------------------------------
+# IMPORTANT: RebrandingKey format/field validation is performed upstream in Wix (Velo).
+# The API intentionally accepts the RebrandingKey as-is to avoid breaking Wix flows.
+#
+# If you remove Wix-side validation in the future, you can enable the server-side
+# validator below by uncommenting it AND the call site in /chat.
+#
+# def _validate_rebranding_key_server_side(raw: str) -> Tuple[bool, str]:
+#     """Server-side validator for RebrandingKey.
+#
+#     Expected order:
+#       Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+#     """
+#     v = (raw or "").strip()
+#     if not v:
+#         return True, ""
+#
+#     # Guardrail: prevent extremely large payloads
+#     if len(v) > 2048:
+#         return False, "too long"
+#
+#     # Legacy support: no delimiter => brand name only
+#     if "|" not in v:
+#         return True, ""
+#
+#     parts = v.split("|")
+#     if len(parts) != 9:
+#         return False, f"expected 9 parts, got {len(parts)}"
+#
+#     rebranding = parts[0].strip()
+#     if not rebranding:
+#         return False, "missing Rebranding"
+#
+#     # Validate URLs (when present)
+#     def _is_http_url(s: str) -> bool:
+#         s = (s or "").strip()
+#         if not s:
+#             return True
+#         return bool(re.match(r"^https?://", s, re.IGNORECASE))
+#
+#     if not _is_http_url(parts[1]):
+#         return False, "UpgradeLink must be http(s) URL"
+#     if not _is_http_url(parts[2]):
+#         return False, "PayGoLink must be http(s) URL"
+#
+#     # Validate integers (when present)
+#     for name, val in [
+#         ("PayGoMinutes", parts[4]),
+#         ("FreeMinutes", parts[7]),
+#         ("CycleDays", parts[8]),
+#     ]:
+#         s = (val or "").strip()
+#         if not s:
+#             continue
+#         if not re.fullmatch(r"-?\d+", s):
+#             return False, f"{name} must be an integer"
+#
+#     # Basic price sanity (allow "$5.99", "5.99", "USD 5.99")
+#     price = (parts[3] or "").strip()
+#     if price and len(price) > 32:
+#         return False, "PayGoPrice too long"
+#
+#     # Basic length checks (defense-in-depth)
+#     for i, p in enumerate(parts):
+#         if len((p or "").strip()) > 512:
+#             return False, f"part {i} too long"
+#
+#     return True, ""
+
+
+
+
+# ---------------------------------------------------------------------------
+# Voice/Video companion capability mappings (SQLite -> in-memory)
+# ---------------------------------------------------------------------------
+# This database is generated from the Excel mapping sheet ("Voice and Video Mappings - Elaralo.xlsx")
+# and shipped alongside the API so the frontend can query companion capabilities at runtime:
+#   - which companions are Audio-only vs Video+Audio
+#   - which Live provider to use (D-ID vs Stream)
+#   - ElevenLabs voice IDs (TTS voice selection)
+#   - D-ID Agent IDs / Client Keys (for the D-ID browser SDK)
+#
+# Design choice:
+#   - We load the full table into memory at startup (fast lookups, no per-request DB IO).
+#   - The DB is treated as read-only config; updates are made by regenerating the SQLite file
+#     and redeploying (or by mounting a new file and restarting).
+#
+# Default lookup key is (brand, avatar), case-insensitive.
+
+import sqlite3
+import shutil
+import tempfile
+from urllib.parse import urlparse, parse_qs
+
+_COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_COMPANION_MAPPINGS_LOADED_AT: float | None = None
+_COMPANION_MAPPINGS_SOURCE: str = ""
+_COMPANION_MAPPINGS_TABLE: str = ""
+
+
+def _norm_key(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _candidate_mapping_db_paths() -> List[str]:
+    base_dir = os.path.dirname(__file__)
+    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    candidates = [
+        env_path,
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+    ]
+    # keep unique, preserve order
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in candidates:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+def _ensure_writable_db_copy(src_db_path: str) -> str:
+    """Return a DB path we can safely write to.
+
+    Azure App Service commonly runs the deployed package from a read-only mount
+    (e.g. WEBSITE_RUN_FROM_PACKAGE=1). In that mode, writes to files shipped with
+    the app (including SQLite DBs) can fail.
+
+    Strategy:
+      - Prefer a stable writable path (env VOICE_VIDEO_DB_RW_PATH if set).
+      - Otherwise prefer /home/site (persisted) when available.
+      - Fall back to /tmp (ephemeral but writable).
+      - If the writable copy already exists, use it (do NOT overwrite).
+      - If it doesn't exist, copy from the packaged DB.
+
+    This keeps runtime state (like BeeStreamed event_ref) consistent across
+    multiple Uvicorn workers and across restarts (when /home is used).
+    """
+
+    src_db_path = (src_db_path or "").strip()
+    if not src_db_path:
+        return src_db_path
+
+    # Explicit override for the *writable* DB path.
+    rw_path = (os.getenv("VOICE_VIDEO_DB_RW_PATH", "") or "").strip()
+
+    # If not explicitly set, prefer /home/site for persistence.
+    if not rw_path:
+        home_site = "/home/site"
+        if os.path.isdir(home_site) and os.access(home_site, os.W_OK):
+            rw_path = os.path.join(home_site, os.path.basename(src_db_path))
+        else:
+            rw_path = os.path.join(tempfile.gettempdir(), os.path.basename(src_db_path))
+
+    # If the source already IS the writable path, we're done.
+    try:
+        if os.path.abspath(rw_path) == os.path.abspath(src_db_path):
+            return src_db_path
+    except Exception:
+        pass
+
+    # If a writable copy already exists, prefer it — but refresh it when the packaged DB changes.
+    #
+    # Why:
+    # - We often copy the packaged DB into /home/site on first boot so we can persist runtime state (e.g., event_ref).
+    # - If we later deploy a NEW packaged DB (new mappings/rows), the persisted copy would otherwise stay stale
+    #   forever and strict lookups like ("DulceMoon","Dulce") will 404 even though they exist in the repo DB.
+    #
+    # Refresh behavior:
+    # - We track the SHA256 of the packaged DB in a sidecar file <rw_path>.packaged.sha256.
+    # - If that hash changes, we overwrite the writable copy with the new packaged DB and then migrate runtime-only
+    #   columns (currently: event_ref) from the old copy into the refreshed DB when possible.
+    if os.path.exists(rw_path):
+        lock_path = rw_path + ".lock"
+        marker_path = rw_path + ".packaged.sha256"
+        try:
+            with FileLock(lock_path):
+                def _sha256_file(path: str) -> str:
+                    h = hashlib.sha256()
+                    with open(path, "rb") as f:
+                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                            h.update(chunk)
+                    return h.hexdigest()
+
+                try:
+                    src_hash = _sha256_file(src_db_path)
+                except Exception:
+                    return rw_path
+
+                prev_hash = ""
+                try:
+                    prev_hash = str(open(marker_path, "r", encoding="utf-8").read() or "").strip()
+                except Exception:
+                    prev_hash = ""
+
+                # If the packaged DB hasn't changed since the last refresh, keep the existing writable DB
+                # (which may have updated runtime fields like event_ref).
+                if prev_hash and prev_hash == src_hash:
+                    return rw_path
+
+                # Backup old writable DB, then refresh from packaged DB.
+                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                backup_path = f"{rw_path}.bak.{ts}"
+                try:
+                    shutil.copy2(rw_path, backup_path)
+                except Exception:
+                    backup_path = ""
+
+                try:
+                    parent = os.path.dirname(rw_path) or "."
+                    os.makedirs(parent, exist_ok=True)
+                    shutil.copy2(src_db_path, rw_path)
+                    try:
+                        with open(marker_path, "w", encoding="utf-8") as f:
+                            f.write(src_hash)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"[mappings] WARNING: Failed to refresh writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
+                    return rw_path
+
+                # Best-effort: migrate runtime event_ref from the previous writable copy into the refreshed DB.
+                try:
+                    if backup_path and os.path.exists(backup_path):
+                        def _pick_table(conn: sqlite3.Connection) -> str:
+                            cur = conn.cursor()
+                            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                            names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+                            lc = {n.lower(): n for n in names}
+                            for cand in ("companion_mappings", "voice_video_mappings", "voice_video_mapping", "mappings"):
+                                if cand in lc:
+                                    return lc[cand]
+                            return names[0] if names else ""
+
+                        def _colset(conn: sqlite3.Connection, table: str) -> set[str]:
+                            cur = conn.cursor()
+                            cur.execute(f'PRAGMA table_info("{table}")')
+                            return {str(r[1]).lower() for r in cur.fetchall() if r and len(r) > 1}
+
+                        old_conn = sqlite3.connect(backup_path)
+                        old_conn.row_factory = sqlite3.Row
+                        new_conn = sqlite3.connect(rw_path)
+                        new_conn.row_factory = sqlite3.Row
+                        try:
+                            old_table = _pick_table(old_conn)
+                            new_table = _pick_table(new_conn)
+                            if old_table and new_table:
+                                old_cols = _colset(old_conn, old_table)
+                                new_cols = _colset(new_conn, new_table)
+                                if {"brand", "avatar", "event_ref"}.issubset(old_cols) and {"brand", "avatar", "event_ref"}.issubset(new_cols):
+                                    cur_old = old_conn.cursor()
+                                    cur_old.execute(f'SELECT brand, avatar, event_ref FROM "{old_table}" WHERE event_ref IS NOT NULL AND trim(event_ref) != ""')
+                                    rows = cur_old.fetchall()
+                                    cur_new = new_conn.cursor()
+                                    for r in rows:
+                                        b = str(r["brand"] or "").strip()
+                                        a = str(r["avatar"] or "").strip()
+                                        ev = str(r["event_ref"] or "").strip()
+                                        if not b or not a or not ev:
+                                            continue
+                                        cur_new.execute(
+                                            f'UPDATE "{new_table}" SET event_ref=? WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) AND (event_ref IS NULL OR trim(event_ref) = "")',
+                                            (ev, b, a),
+                                        )
+                                    new_conn.commit()
+                        finally:
+                            old_conn.close()
+                            new_conn.close()
+                except Exception as e:
+                    print(f"[mappings] WARNING: failed migrating event_ref after DB refresh: {e}")
+
+                print(f"[mappings] Refreshed writable mapping DB at {rw_path} from packaged DB {src_db_path}")
+                return rw_path
+        except Exception:
+            return rw_path
+
+    # Create parent dir, then copy.
+    try:
+        parent = os.path.dirname(rw_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        shutil.copy2(src_db_path, rw_path)
+        # Record packaged DB fingerprint so future startups can detect when the packaged DB changes.
+        try:
+            h = hashlib.sha256()
+            with open(src_db_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            with open(rw_path + ".packaged.sha256", "w", encoding="utf-8") as f:
+                f.write(h.hexdigest())
+        except Exception:
+            pass
+        return rw_path
+    except Exception as e:
+        print(f"[mappings] WARNING: Failed to create writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
+        return src_db_path
+
+
+def _load_companion_mappings_sync() -> None:
+    global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
+
+    db_path = ""
+    for p in _candidate_mapping_db_paths():
+        if os.path.exists(p):
+            db_path = p
+            break
+
+    if not db_path:
+        print("[mappings] WARNING: voice/video mappings DB not found. Video/audio capabilities will fall back to frontend defaults.")
+        _COMPANION_MAPPINGS = {}
+        _COMPANION_MAPPINGS_LOADED_AT = time.time()
+        _COMPANION_MAPPINGS_SOURCE = ""
+        return
+
+    # Ensure we can persist runtime state (e.g. event_ref) even when the deployed
+    # package is mounted read-only (common on Azure App Service).
+    db_path = _ensure_writable_db_copy(db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+
+        # The mapping table name differs between environments.
+        # Prefer the canonical names, but fall back to any table present.
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+        tables_lc = {t.lower(): t for t in table_names}
+
+        preferred = [
+            "companion_mappings",
+            "voice_video_mappings",
+            "voice_video_mapping",
+            "mappings",
+        ]
+        table = ""
+        for cand in preferred:
+            if cand.lower() in tables_lc:
+                table = tables_lc[cand.lower()]
+                break
+
+        # If none of the preferred names exist, pick the first available table.
+        if not table and table_names:
+            table = table_names[0]
+
+        if not table:
+            print(f"[mappings] WARNING: mapping DB found at {db_path} but contains no tables.")
+            _COMPANION_MAPPINGS = {}
+            _COMPANION_MAPPINGS_LOADED_AT = time.time()
+            _COMPANION_MAPPINGS_SOURCE = db_path
+            _COMPANION_MAPPINGS_TABLE = ""
+            return
+
+        # Quote the table name to safely handle names with special characters.
+        cur.execute(f'SELECT * FROM "{table}"')
+        rows = cur.fetchall()
+        table_name_for_source = str(table or "")
+    finally:
+        conn.close()
+
+    d: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        # sqlite3.Row keys preserve the column names from the DB. Different environments may
+        # have different capitalization (e.g., Live vs live) or legacy names (e.g., Companion).
+        keys_lc = {str(k).lower(): k for k in r.keys()}
+
+        def get_col(*candidates: str, default: Any = "") -> Any:
+            for cand in candidates:
+                k = keys_lc.get(str(cand).lower())
+                if k is not None:
+                    return r[k]
+            return default
+
+        brand = str(
+            get_col(
+                "brand",
+                "rebranding",
+                "company",
+                "brand_id",
+                "Brand",
+                default="",
+           )
+            or ""
+       ).strip()
+
+        # Core brand behavior:
+        # - Wix sends rebrandingKey="" (or NULL) when there is NO white label.
+        # - An empty/NULL brand is therefore treated as the core brand: "Elaralo".
+        if not brand:
+            brand = "Elaralo"
+
+        avatar = str(
+            get_col(
+                "avatar",
+                "companion",
+                "Companion",
+                "companion_name",
+                "companionName",
+                "first_name",
+                "firstname",
+                default="",
+           )
+            or ""
+       ).strip()
+        if not brand or not avatar:
+            continue
+
+        key = (_norm_key(brand), _norm_key(avatar))
+
+        d[key] = {
+            "brand": brand,
+            "avatar": avatar,
+            "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
+            # UI uses channel_cap to decide whether to show the video/play controls.
+            "channel_cap": str(get_col("channel_cap", "channelCap", "chanel_cap", "channel_capability", default="") or "").strip(),
+            "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
+            "live": str(get_col("live", "Live", default="") or "").strip(),
+            "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
+            "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
+            "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
+            "phonetic": str(get_col("phonetic", "Phonetic", default="") or "").strip(),
+            "did_embed_code": str(get_col("did_embed_code", "DID_EMBED_CODE", default="") or ""),
+            "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
+            "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
+            "did_client_key": str(get_col("did_client_key", "DID_CLIENT_KEY", default="") or ""),
+            # Preserve common extra fields when present (helps debugging / future UIs).
+            "companion_id": str(get_col("companion_id", "Companion_ID", "CompanionId", default="") or ""),
+        }
+
+    _COMPANION_MAPPINGS = d
+    _COMPANION_MAPPINGS_LOADED_AT = time.time()
+    _COMPANION_MAPPINGS_SOURCE = db_path
+    _COMPANION_MAPPINGS_TABLE = table_name_for_source
+    print(f"[mappings] Loaded {len(_COMPANION_MAPPINGS)} companion mapping rows from {db_path} (table={table_name_for_source})")
+
+
+def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
+    # Strict: exact (brand, avatar) match required (case-insensitive via _norm_key).
+    # Core brand: empty brand is treated as Elaralo.
+    b = _norm_key(brand) or "elaralo"
+    a = _norm_key(avatar)
+    if not a:
+        return None
+
+    return _COMPANION_MAPPINGS.get((b, a))
+
+
+@app.on_event("startup")
+async def _startup_load_companion_mappings() -> None:
+    # Load once at startup; do not block on errors.
+    try:
+        await run_in_threadpool(_load_companion_mappings_sync)
+    except Exception as e:
+        print(f"[mappings] ERROR loading companion mappings: {e!r}")
+
+
+@app.get("/mappings/companion")
+async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
+    """Lookup a companion mapping row by (brand, avatar).
+
+    This endpoint is intentionally STRICT:
+      - exact (brand, avatar) match required (case-insensitive via lower/strip normalization)
+      - errors out when a mapping is missing, so configuration issues are visible during development
+
+    Query params:
+      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
+      - avatar: Avatar first name (e.g., "Jennifer")
+
+    Response (200):
+      {
+        found: true,
+        brand: str,
+        avatar: str,
+        companionType: "Human"|"AI",
+        channel_cap: "Video"|"Audio" ,
+        channelCap: "Video"|"Audio" ,   # alias for convenience
+        live: "D-ID"|"Stream" ,
+        elevenVoiceId: str,
+        elevenVoiceName: str,
+        didAgentId: str,
+        didClientKey: str,
+        didAgentLink: str,
+        didEmbedCode: str,
+        loadedAt: <unix seconds> | null,
+        source: <db path> | ""
+      }
+    """
+    b_in = (brand or "").strip()
+    a = (avatar or "").strip()
+
+    if not a:
+        raise HTTPException(status_code=400, detail="avatar is required")
+
+    # Core brand default: empty brand => Elaralo
+    b = b_in or "Elaralo"
+
+    m = _lookup_companion_mapping(b, a)
+    if not m:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "Companion mapping not found",
+                "brand": b,
+                "avatar": a,
+                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+                "source": _COMPANION_MAPPINGS_SOURCE,
+                "table": _COMPANION_MAPPINGS_TABLE,
+                "count": len(_COMPANION_MAPPINGS),
+            },
+        )
+
+    cap_raw = str(m.get("channel_cap") or "").strip()
+    live_raw = str(m.get("live") or "").strip()
+    ctype_raw = str(m.get("companion_type") or "").strip()
+
+    # Strict validation (config contract)
+    cap_lc = cap_raw.lower()
+    if cap_lc not in ("video", "audio"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
+        )
+
+    live_lc = live_raw.lower()
+    if live_lc not in ("stream", "d-id"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
+        )
+
+    ctype_lc = ctype_raw.lower()
+    if ctype_lc not in ("human", "ai"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
+        )
+
+    # Business rule: AI companions must use D-ID. Human companions must use Stream.
+    if ctype_lc == "human" and live_lc != "stream":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
+        )
+    if ctype_lc == "ai" and live_lc != "d-id":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
+        )
+
+    cap_out = "Video" if cap_lc == "video" else "Audio"
+    live_out = "Stream" if live_lc == "stream" else "D-ID"
+    ctype_out = "Human" if ctype_lc == "human" else "AI"
+
+    return {
+        "found": True,
+        "brand": str(m.get("brand") or b),
+        "avatar": str(m.get("avatar") or a),
+        "hostMemberId": str(m.get("host_member_id") or ""),
+        "host_member_id": str(m.get("host_member_id") or ""),
+        "companionType": ctype_out,
+        "companion_type": ctype_out,
+        "channel_cap": cap_out,
+        "channelCap": cap_out,
+        "live": live_out,
+        "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
+        "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
+        "didAgentId": str(m.get("did_agent_id") or ""),
+        "didClientKey": str(m.get("did_client_key") or ""),
+        "didAgentLink": str(m.get("did_agent_link") or ""),
+        "didEmbedCode": str(m.get("did_embed_code") or ""),
+        "phonetic": str(m.get("phonetic") or ""),
+        "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+        "source": _COMPANION_MAPPINGS_SOURCE,
+        "table": _COMPANION_MAPPINGS_TABLE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# BeeStreamed: Start WebRTC streams (Live=Stream companions)
+# -----------------------------------------------------------------------------
+# BeeStreamed in-memory session state + shared live chat hub
+# -----------------------------------------------------------------------------
+
+_BEE_SESSION_LOCK = threading.Lock()
+# _BEE_SESSION_STATE[key] = {"active": bool, "event_ref": str, "updated_at": float}
+_BEE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
+
+_LIVECHAT_LOCK = threading.Lock()
+# _LIVECHAT_CLIENTS[event_ref] = set(WebSocket)
+_LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
+# Per-connection identity metadata, keyed by websocket instance.
+# Used so the server can attach senderRole/name to each broadcast.
+_LIVECHAT_CLIENT_META: Dict[WebSocket, Dict[str, str]] = {}
+# Simple in-memory message history per event_ref so late-joiners see recent chat.
+_LIVECHAT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
+_LIVECHAT_HISTORY_MAX = 200
+
+
+def _normalize_livechat_role(role: str) -> str:
+    r = (role or "").strip().lower()
+    if r in ("host", "viewer", "system"):
+        return r
+    return "viewer"
+
+
+def _livechat_push_history(event_ref: str, msg: Dict[str, Any]) -> None:
+    # Append a chat message to in-memory history (bounded).
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
+        return
+    with _LIVECHAT_LOCK:
+        hist = _LIVECHAT_HISTORY.get(event_ref)
+        if hist is None:
+            hist = []
+            _LIVECHAT_HISTORY[event_ref] = hist
+        hist.append(msg)
+        if len(hist) > _LIVECHAT_HISTORY_MAX:
+            # Keep the most recent N messages
+            del hist[: len(hist) - _LIVECHAT_HISTORY_MAX]
+
+
+
+async def _livechat_broadcast(event_ref: str, msg: Dict[str, Any]) -> None:
+    """Broadcast a JSON-serializable message to all connected live-chat clients for an event_ref.
+
+    This must work reliably with multiple Uvicorn workers. Each worker maintains its own in-memory
+    websocket set, so this broadcasts only to clients connected to THIS worker — which is exactly
+    what we want because each websocket connection is pinned to a worker process.
+
+    The frontend already de-dupes echoed messages using clientMsgId, so we broadcast to everyone,
+    including the sender.
+    """
+    ref = (event_ref or "").strip()
+    if not ref:
+        return
+
+    try:
+        payload = json.dumps(msg, ensure_ascii=False)
+    except Exception:
+        # Fallback: stringify
+        payload = json.dumps({"type": "error", "error": "Invalid livechat payload"}, ensure_ascii=False)
+
+    # Snapshot sockets under lock so we don't hold the lock during awaits.
+    with _LIVECHAT_LOCK:
+        sockets = list(_LIVECHAT_CLIENTS.get(ref, set()))
+
+    if not sockets:
+        return
+
+    dead: List[WebSocket] = []
+    for ws in sockets:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(ws)
+
+    if dead:
+        with _LIVECHAT_LOCK:
+            s = _LIVECHAT_CLIENTS.get(ref)
+            if s is not None:
+                for ws in dead:
+                    try:
+                        s.discard(ws)
+                    except Exception:
+                        pass
+                    try:
+                        _LIVECHAT_CLIENT_META.pop(ws, None)
+                    except Exception:
+                        pass
+                if not s:
+                    _LIVECHAT_CLIENTS.pop(ref, None)
+                    # Keep history for a bit in case late joiners arrive; do not delete here.
+
+
+# --- Shared (cross-worker) live chat persistence --------------------------------
+#
+# IMPORTANT: The API may run with multiple Uvicorn workers. In-memory websocket client
+# sets are per-worker, so to mirror messages across ALL connected clients we persist
+# live chat messages into the shared SQLite DB and have each websocket connection poll
+# for new rows.
+
+_LIVECHAT_DB_TABLE = os.environ.get('LIVECHAT_DB_TABLE', 'livechat_messages').strip() or 'livechat_messages'
+_LIVECHAT_DB_HISTORY_LIMIT = int(os.environ.get('LIVECHAT_DB_HISTORY_LIMIT', '80') or '80')
+_LIVECHAT_DB_POLL_INTERVAL_SEC = float(os.environ.get('LIVECHAT_DB_POLL_INTERVAL_SEC', '0.35') or '0.35')
+
+def _livechat_db_init_sync(conn) -> None:
+    try:
+        conn.execute(
+            f"""
+CREATE TABLE IF NOT EXISTS {_LIVECHAT_DB_TABLE} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_ref TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  client_msg_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL
 );
+"""
+        )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{_LIVECHAT_DB_TABLE}_event_id ON {_LIVECHAT_DB_TABLE}(event_ref, id);"
+        )
+    except Exception:
+        # DB is best-effort for live chat. If it fails, the websocket still works per-worker.
+        pass
 
-const openUploadPicker = useCallback(() => {
-  if (uploadsDisabled) {
-    try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
-    return;
-  }
-  if (uploadingAttachment) return;
-  try {
-    uploadInputRef.current?.click();
-  } catch (e) {
-    // ignore
-  }
-}, [uploadsDisabled, uploadingAttachment]);
+def _livechat_db_connect_sync(db_path: str):
+    import sqlite3
 
-const onAttachmentSelected = useCallback(
-  async (ev: React.ChangeEvent<HTMLInputElement>) => {
-    const input = ev.target;
-    const file = input?.files && input.files.length ? input.files[0] : null;
+    conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+    except Exception:
+        pass
+    try:
+        conn.execute('PRAGMA synchronous=NORMAL;')
+    except Exception:
+        pass
+    _livechat_db_init_sync(conn)
+    return conn
 
-    // Allow selecting the same file twice in a row.
-    try { input.value = ""; } catch (e) {}
+def _livechat_db_insert_sync(event_ref: str, payload: Dict[str, Any]) -> int:
+    ref = (event_ref or '').strip()
+    if not ref:
+        return 0
 
-    if (!file) return;
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    lock_path = db_path + '.livechat.lock'
+    try:
+        with FileLock(lock_path):
+            conn = _livechat_db_connect_sync(db_path)
+            created_at = int(time.time() * 1000)
+            client_msg_id = str(payload.get('clientMsgId') or payload.get('client_msg_id') or '').strip() or str(uuid.uuid4())
+            payload_json = json.dumps(payload, ensure_ascii=False)
+            try:
+                conn.execute(
+                    f"INSERT INTO {_LIVECHAT_DB_TABLE} (event_ref, created_at, client_msg_id, payload_json) VALUES (?,?,?,?)",
+                    (ref, created_at, client_msg_id, payload_json),
+                )
+                row_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+                conn.commit()
+                return int(row_id or 0)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        return 0
 
-    if (uploadsDisabled) {
-      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
-      return;
-    }
+def _livechat_db_fetch_history_sync(event_ref: str, limit: int) -> Tuple[int, List[Dict[str, Any]]]:
+    ref = (event_ref or '').strip()
+    if not ref:
+        return 0, []
 
-    setUploadError("");
-    setUploadingAttachment(true);
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    try:
+        conn = _livechat_db_connect_sync(db_path)
+        rows = conn.execute(
+            f"SELECT id, payload_json FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=? ORDER BY id DESC LIMIT ?",
+            (ref, int(limit)),
+        ).fetchall()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return 0, []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-    try {
-      const uploaded = await uploadAttachment(file);
-      setPendingAttachment(uploaded);
-    } catch (e: any) {
-      setPendingAttachment(null);
-      setUploadError(String(e?.message || "Upload failed"));
-    } finally {
-      setUploadingAttachment(false);
-    }
-  },
-  [uploadsDisabled, uploadAttachment]
-);
-
-const clearPendingAttachment = useCallback(() => {
-  setPendingAttachment(null);
-  setUploadError("");
-}, []);
-
-// This is the mode that drives the UI highlight:
-  // - If backend is asking for intimate consent, keep intimate pill highlighted
-  const effectiveActiveMode: Mode =
-    sessionState.pending_consent === "intimate" ? "intimate" : sessionState.mode;
-
-  const showConsentOverlay =
-    sessionState.pending_consent === "intimate" || chatStatus === "explicit_blocked";
-
-  function setModeFromPill(m: Mode) {
-    if (!allowedModes.includes(m)) {
-      showUpgradeMessage(m);
-      return;
-    }
-
-    // Selecting Intimate (18+) requires explicit consent; trigger the consent overlay if not already consented.
-    if (m === "intimate" && !sessionState.explicit_consented) {
-      setChatStatus("explicit_blocked");
-    }
-
-    setSessionState((prev) => {
-      // If switching to intimate and consent is not yet granted, keep pending consent active so the overlay is shown.
-      const nextPending =
-        m === "intimate" && !prev.explicit_consented ? "intimate" : null;
-      return { ...prev, mode: m, pending_consent: nextPending };
-    });
-
-    setMessages((prev) => [...prev, { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` }]);
-  }
-
-
-const isLiveSessionNoticeText = (s: string) => {
-  const t = String(s || "").toLowerCase();
-  // Back-compat: earlier builds used "Streaming live right now..."
-  if (t.includes("streaming live right now") && t.includes("will respond")) return true;
-  if (t.includes("in a live session") && t.includes("will respond")) return true;
-  return false;
-};
-
-const filterMessagesForBackend = (msgs: Msg[]): Msg[] => {
-  // Never send our local "live session" notice bubbles to the backend.
-  // They are UI-only and can confuse the model if included as conversation context.
-  return (msgs || []).filter((m) => {
-    if (!m) return false;
-    if (m.role === "assistant" && isLiveSessionNoticeText(String(m.content || ""))) return false;
-
-    // Shared in-stream live chat: never include any live chat lines in /chat context.
-    // Live stream chat is human-to-human only; AI must ignore it.
-    const meta: any = (m as any).meta;
-    if (meta?.liveChat === true) return false;
-    return true;
-  });
-};
-
-  
-async function send(textOverride?: string, stateOverride?: Partial<SessionState>) {
-    if (loading) return;
-
-    // Attachments are uploaded ahead of time (pendingAttachment holds the SAS URL).
-    // Allow send() when either text OR an attachment is present.
-    const hasAttachment = Boolean(pendingAttachment);
-    const rawText = (textOverride ?? input).trim();
-
-    if (uploadingAttachment) return;
-    if (!rawText && !hasAttachment) return;
-
-	    // Hard rule: no attachments during Live Stream sessions.
-	    if (sessionKind === "stream" && (uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
-	      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
-	      return;
-	    }
-
-    // If the user clears messages mid-flight, we "invalidate" any in-progress send()
-    // so the assistant reply doesn't append into a cleared chat.
-    const epochAtStart = clearEpochRef.current;
-
-    // detect mode switch from prompt text
-    const { mode: detectedMode, cleaned } = detectModeSwitchAndClean(rawText);
-
-    // Plan-gate mode if user is attempting to switch
-    if (detectedMode && !allowedModes.includes(detectedMode)) {
-      showUpgradeMessage(detectedMode);
-      setInput("");
-      return;
-    }
-
-    // If the user message is ONLY a mode switch token, apply locally and don't call backend
-    // e.g. "[mode:romantic]" by itself
-    if (detectedMode && cleaned.length === 0) {
-      setSessionState((prev) => ({ ...prev, mode: detectedMode, pending_consent: null }));
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: `Mode set to: ${MODE_LABELS[detectedMode]}` },
-      ]);
-      setInput("");
-      return;
-    }
-
-    // Apply mode locally (so pill highlights immediately), but still send message.
-    // If detectedMode is intimate, keep/trigger pending overlay on response.
-    let nextState: SessionState = sessionState;
-    if (detectedMode) {
-      // If we switch away from intimate while consent is pending, clear the pending flag
-      const nextPending = detectedMode === "intimate" ? sessionState.pending_consent : null;
-      nextState = { ...sessionState, mode: detectedMode, pending_consent: nextPending };
-
-      // If user is switching away from intimate, also clear any explicit_blocked overlay state
-      if (detectedMode !== "intimate") {
-        setChatStatus("safe");
-      }
-
-      setSessionState(nextState);
-    }
-
-    // Build user message content:
-    // If a [mode:*] token was present, we remove it from content (cleaned) to keep chat natural.
-    
-const outgoingText = (detectedMode ? cleaned : rawText).trim();
-    // If the user sends an attachment without text, still create a stable message for the backend/UI.
-    const finalUserContent = outgoingText || (hasAttachment ? "Sent an attachment." : "");
-
-    // Build the user message.
-
-    // Build the user message. During LegacyStream live sessions, this may also be
-    // broadcast to the shared in-stream chat (without calling /chat).
-    
-let userMsg: Msg = { role: "user", content: finalUserContent };
-    if (pendingAttachment) {
-      userMsg = {
-        ...userMsg,
-        meta: { ...(userMsg as any).meta, attachment: pendingAttachment },
-      };
-    }
-    const nextMessages: Msg[] = [...messages, userMsg];
+    rows = list(reversed(rows or []))
+    msgs: List[Dict[str, Any]] = []
+    last_id = 0
+    for rid, payload_json in rows:
+        try:
+            rid_int = int(rid or 0)
+            last_id = max(last_id, rid_int)
+        except Exception:
+            pass
+        try:
+            obj = json.loads(payload_json) if payload_json else None
+            if isinstance(obj, dict):
+                msgs.append(obj)
+        except Exception:
+            pass
+    return last_id, msgs
 
 
-// ---------------------------------------------------------------------
-// Live Stream rule (LegacyStream):
-// As soon as the HOST hits Play, LegacyStream sessionActive becomes true.
-// While sessionActive is true, the AI companion must NOT generate responses.
-//
-// Behavior:
-//   - Everyone: we queue the user's message locally (no /chat call).
-//   - Visitors/members NOT currently inside the live stream session (no stream iframe open):
-//       show a deterministic notice message.
-//   - Members currently inside the live stream session:
-//       allow them to type freely (no notice), but still queue messages.
-//   - When the host stops streaming (sessionActive -> false): flush queued messages.
-// ---------------------------------------------------------------------
-let streamSessionActive = Boolean(sessionActive);
-  // Whether THIS user is currently inside the shared in-stream experience.
-  // (Important: this must NOT depend on the current UI mode selection; users can switch modes
-  // and must still remain blocked from AI while the host is live until the stream ends.)
-  const userInStreamSession = sessionKind === "conference" ? conferenceJoinedRef.current : joinedStreamRef.current;
+def _livechat_db_clear_event_sync(event_ref: str) -> int:
+    """Delete all persisted livechat messages for a given BeeStreamed event_ref.
 
-// Avoid race with the polling loop:
-// right before deciding to call /chat, do a one-off status check.
-// This ensures the moment the Host hits Play (sessionActive flips) we immediately gate messages.
-if (!streamSessionActive && API_BASE && companyName && companionName) {
-  try {
-    const url = new URL(`${API_BASE}/stream/livekit/status`);
-    url.searchParams.set("brand", companyName);
-    url.searchParams.set("avatar", companionName);
+    We clear per-event history when a new stream session starts so a reused event_ref
+    doesn't replay the previous session's chat.
+    """
+    ref = (event_ref or "").strip()
+    if not ref:
+        return 0
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    lock_path = db_path + ".livechat.lock"
+    deleted = 0
+    try:
+        with FileLock(lock_path):
+            conn = _livechat_db_connect_sync(db_path)
+            try:
+                cur = conn.execute(f"DELETE FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=?", (ref,))
+                conn.commit()
+                try:
+                    deleted = int(cur.rowcount or 0)
+                except Exception:
+                    deleted = 0
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        return 0
+    return deleted
 
-    const res = await fetch(url.toString(), { cache: "no-store" });
-    if (res.ok) {
-      const data: any = await res.json().catch(() => ({}));
-      const active = Boolean(data?.sessionActive);
-      const hostId = String(data?.hostMemberId || "").trim();
 
-      // Keep UI state in sync (poller will also keep updating).
-      if (active !== Boolean(sessionActive)) setSessionActive(active);
-      if (hostId && hostId !== livekitHostMemberId) setLivekitHostMemberId(hostId);
+def _livechat_db_fetch_after_sync(event_ref: str, after_id: int, limit: int = 80) -> Tuple[int, List[Dict[str, Any]]]:
+    ref = (event_ref or '').strip()
+    if not ref:
+        return int(after_id or 0), []
 
-      streamSessionActive = active;
-    }
-  } catch (e) {
-    // ignore
-  }
-}
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    try:
+        conn = _livechat_db_connect_sync(db_path)
+        rows = conn.execute(
+            f"SELECT id, payload_json FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=? AND id>? ORDER BY id ASC LIMIT ?",
+            (ref, int(after_id or 0), int(limit)),
+        ).fetchall()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return int(after_id or 0), []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-if (streamSessionActive) {
-  const who = (companionName || "This companion").trim() || "This companion";
-  const sessionLabel = sessionKind === "conference" ? "private session" : "live stream";
-  const notice = `${who} is in a ${sessionLabel} now but will respond once the ${sessionLabel} concludes.`;
+    msgs: List[Dict[str, Any]] = []
+    last_id = int(after_id or 0)
+    for rid, payload_json in (rows or []):
+        try:
+            rid_int = int(rid or 0)
+            last_id = max(last_id, rid_int)
+        except Exception:
+            pass
+        try:
+            obj = json.loads(payload_json) if payload_json else None
+            if isinstance(obj, dict):
+                msgs.append(obj)
+        except Exception:
+            pass
+    return last_id, msgs
 
-  // In-stream members (host + joined viewers): this is a *shared live chat*.
-  // Do NOT queue these messages for AI and do NOT send them to /chat later.
-  if (userInStreamSession) {
-    const clientMsgId =
-      (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+async def _livechat_poll_db(websocket: WebSocket, event_ref: str, after_id: int) -> None:
+    last_id = int(after_id or 0)
+    try:
+        while True:
+            await asyncio.sleep(_LIVECHAT_DB_POLL_INTERVAL_SEC)
+            new_last, msgs = await run_in_threadpool(_livechat_db_fetch_after_sync, event_ref, last_id, 80)
+            if not msgs:
+                last_id = max(last_id, int(new_last or 0))
+                continue
+            last_id = max(last_id, int(new_last or 0))
+            for m in msgs:
+                try:
+                    await websocket.send_text(json.dumps(m, ensure_ascii=False))
+                except Exception:
+                    return
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
 
-    // Mark this message as a live-chat line (used for dedupe + UI labeling).
-    const senderRole = isHost ? "host" : "viewer";
-    const senderName =
-      senderRole === "host"
-        ? (String(companionName || "Host").trim() || "Host")
-        : (String(viewerLiveChatName || "").trim() ||
-           (memberIdForLiveChat ? `Viewer-${String(memberIdForLiveChat).slice(-4)}` : "Viewer"));
+class LiveChatSendRequest(BaseModel):
+    eventRef: str = ""
+    clientMsgId: Optional[str] = None
 
-    userMsg = {
-      ...userMsg,
-      meta: {
-        liveChat: true,
-        senderId: String(memberIdForLiveChat || "").trim(),
-        senderRole,
-        name: senderName,
-        // IMPORTANT: never include any in-stream live chat lines in AI context
-        includeInAiContext: false,
-        clientMsgId,
-      },
-    };
+    # Accept either 'role' or 'senderRole' from older/newer clients.
+    role: Optional[str] = None
+    senderRole: Optional[str] = None
 
-    // Update the message list to reference the updated object.
-    try {
-      nextMessages[nextMessages.length - 1] = userMsg;
-    } catch (e) {
-      // ignore
-    }
+    # Display name
+    name: Optional[str] = None
 
-    // Prevent echo duplication when the server broadcasts the same message back to us.
-    rememberLiveChatId(clientMsgId);
+    # Accept either 'text' or 'message' from older/newer clients.
+    text: Optional[str] = None
+    message: Optional[str] = None
 
-    // Fire-and-forget: WS send (HTTP fallback inside helper).
-    void sendLiveChatMessage(outgoingText, clientMsgId);
+    # Accept either 'memberId' or 'senderId' from older/newer clients.
+    memberId: Optional[str] = None
+    senderId: Optional[str] = None
 
-    // In-session members see their message immediately; no "live session" notice.
-    setMessages(nextMessages);
-    setInput("");
-    clearPendingAttachment();
-    return;
-  }
+    ts: Optional[float] = None
 
-  // Out-of-session visitors/members: show a deterministic notice and queue their message so
-  // the AI can respond once the host stops streaming.
-  // (These users are NOT in the shared live chat.)
-  if (!streamPreSessionHistoryRef.current) {
-    streamPreSessionHistoryRef.current = filterMessagesForBackend(messages);
-  }
 
-  const queuedState: SessionState = { ...nextState, ...(stateOverride || {}) };
-  const noticeIndex = nextMessages.length;
-  streamDeferredQueueRef.current.push({
-    text: outgoingText,
-    state: queuedState,
-    queuedAt: Date.now(),
-    noticeIndex,
-  });
+@app.websocket("/stream/beestreamed/livechat/{event_ref}")
+async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
+    event_ref = (event_ref or "").strip()
+    await websocket.accept()
 
-  setMessages([...nextMessages, { role: "assistant", content: notice }]);
-  setInput("");
-  return;
-}
+    if not event_ref:
+        await websocket.close(code=1008)
+        return
 
-// If speech-to-text "hands-free" mode is enabled, pause recognition while we send
-    // and while the avatar speaks. We'll auto-resume after speaking finishes.
-    const resumeSttAfter = sttEnabledRef.current;
-    let resumeScheduled = false;
-    if (resumeSttAfter) {
-      pauseSpeechToText();
+    # Capture identity from connection query params.
+    qs = websocket.query_params
+    member_id = (qs.get("memberId") or qs.get("member_id") or qs.get("senderId") or qs.get("sender_id") or "").strip()
+    role = _normalize_livechat_role(qs.get("role") or "")
+    name = (qs.get("name") or "").strip()
 
-      // Defensive: clear any in-progress transcript to avoid accidental duplicate sends.
-      sttFinalRef.current = "";
-      sttInterimRef.current = "";
-    }
-
-    setMessages(nextMessages);
-    setInput("");
-    clearPendingAttachment();
-    setLoading(true);
-
-    try {
-      const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
-      const data = await callChat(filterMessagesForBackend(nextMessages), sendState);
-
-      // If the user hit "Clear Messages" while we were waiting on the response,
-      // ignore this result and do not append it to a cleared chat.
-      if (epochAtStart !== clearEpochRef.current) return;
-
-      // status from backend (safe/explicit_blocked/explicit_allowed)
-      if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
-        setChatStatus(data.mode);
-      }
-
-      // Some backends return camelCase "sessionState" instead of snake_case "session_state"
-      const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
-
-      // Normalize & apply server session state WITHOUT using data.mode as pill mode
-      if (serverSessionState) {
-        setSessionState((prev) => {
-          const merged: SessionState = { ...(prev as any), ...(serverSessionState as any) };
-
-          // If backend says blocked, keep pill as intimate AND set pending
-          if (data.mode === "explicit_blocked") {
-            merged.mode = "intimate";
-            merged.pending_consent = "intimate";
-          }
-
-          // If backend says allowed, clear pending (and keep mode whatever backend returned in session state)
-          if (data.mode === "explicit_allowed" && merged.pending_consent) {
-            merged.pending_consent = null;
-          }
-
-          // If the backend sent a mode (in session state OR top-level), normalize it so Romantic always highlights
-          const backendMode = normalizeMode((serverSessionState as any)?.mode ?? (data as any)?.mode);
-          if (backendMode && data.mode !== "explicit_blocked") {
-            merged.mode = backendMode;
-          }
-
-          // If we are not in intimate, never keep the intimate pending flag (prevents the Intimate pill from "sticking")
-          if (merged.mode !== "intimate" && merged.pending_consent === "intimate") {
-            merged.pending_consent = null;
-          }
-
-          return merged;
-        });
-      } else {
-        // If blocked but session_state missing, still reflect pending
-        if (data.mode === "explicit_blocked") {
-          setSessionState((prev) => ({ ...prev, mode: "intimate", pending_consent: "intimate" }));
+    # Register socket + identity
+    with _LIVECHAT_LOCK:
+        _LIVECHAT_CLIENTS.setdefault(event_ref, set()).add(websocket)
+        _LIVECHAT_CLIENT_META[websocket] = {
+            "eventRef": event_ref,
+            "memberId": member_id,
+            "role": role,
+            "name": name,
         }
-
-        // If allowed but session_state missing, clear pending and mark consented
-        if (data.mode === "explicit_allowed") {
-          setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: true }));
-        }
-
-        // Fallback: if backend returned a pill mode at top-level, apply it
-        const backendMode = normalizeMode((data as any)?.mode);
-        if (backendMode && data.mode !== "explicit_blocked") {
-          setSessionState((prev) => ({
-            ...prev,
-            mode: backendMode,
-            pending_consent: backendMode === "intimate" ? prev.pending_consent : null,
-          }));
-        }
-      }
-
-      // Phase 1: Speak the assistant reply (if Live Avatar is connected).
-      // When Live Avatar is active, we delay the assistant's text from appearing until
-      // we are about to trigger the avatar speech.
-      const replyText = String(data.reply || "");
-      let assistantCommitted = false;
-      const commitAssistantMessage = () => {
-        if (assistantCommitted) return;
-        assistantCommitted = true;
-        setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
-
-      };
-
-      // Guard against STT feedback: ignore any recognition results until after the avatar finishes speaking.
-      // (We also keep STT paused during speak; this is an extra safety net.)
-      const estimateSpeechMs = (text: string) => {
-        const words = text.trim().split(/\s+/).filter(Boolean).length;
-        const wpm = 160;
-        const baseMs = (words / wpm) * 60_000;
-        const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
-        return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
-      };
-      const estimatedSpeechMs = estimateSpeechMs(replyText);
-
-      const hooks: SpeakAssistantHooks = {
-        onWillSpeak: () => {
-          // We'll treat "speaking" the same whether it's Live Avatar or local audio-only.
-          if (!assistantCommitted) {
-            commitAssistantMessage();
-            assistantCommitted = true;
-          }
-
-          // Block STT from capturing the assistant speech.
-          if (sttEnabledRef.current) {
-            const now = Date.now();
-            const ignoreMs = estimatedSpeechMs + 1200;
-            sttIgnoreUntilRef.current = Math.max(sttIgnoreUntilRef.current || 0, now + ignoreMs);
-          }
-        },
-        onDidNotSpeak: () => {
-          // If we can't speak, still show the assistant message immediately.
-          if (!assistantCommitted) {
-            commitAssistantMessage();
-            assistantCommitted = true;
-          }
-        },
-      };
-
-      const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
-
-      // Prefer the DB-mapped ElevenLabs voice when present (fixes Dulce voice fallback).
-      const voiceId = ((companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey));
-
-      const canLiveAvatarSpeak =
-        avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
-
-      // Audio-only TTS is only played in hands-free STT mode (mic button enabled),
-      // when Live Avatar is NOT speaking.
-      const shouldUseLocalTts = !canLiveAvatarSpeak && sttEnabledRef.current;
-
-      const speakPromise = (canLiveAvatarSpeak
-        ? speakAssistantReply(replyText, hooks)
-        : shouldUseLocalTts
-          ? speakLocalTtsReply(replyText, voiceId, hooks)
-          : (hooks.onDidNotSpeak(), Promise.resolve())
-      ).catch(() => {
-        // If something goes wrong, just fall back to showing text.
-        hooks.onDidNotSpeak();
-      });
-
-
-      // If STT is enabled, resume listening only after the avatar finishes speaking.
-      if (resumeSttAfter) {
-        resumeScheduled = true;
-        speakPromise.finally(() => {
-          if (sttEnabledRef.current) resumeSpeechToText();
-        });
-      }
-    } catch (err: any) {
-      if (epochAtStart !== clearEpochRef.current) return;
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
-      ]);
-    } finally {
-      setLoading(false);
-      if (resumeSttAfter && !resumeScheduled) {
-        // No speech was triggered (e.g., request failed). Resume immediately.
-        if (sttEnabledRef.current) resumeSpeechToText();
-      }
-    }
-  }
-
-  // Keep a ref to the latest send() callback so STT handlers don't close over stale state.
-  const sendRef = useRef(send);
-  useEffect(() => {
-    sendRef.current = send;
-  }, [send]);
-
-
-// ---------------------------------------------------------------------
-// Flush queued viewer/host messages once the host stops streaming.
-// This keeps the "no AI responses while live" rule, while still responding later.
-// ---------------------------------------------------------------------
-const flushQueuedStreamMessages = useCallback(async () => {
-  if (streamDeferredFlushInFlightRef.current) return;
-  if (!streamDeferredQueueRef.current.length) return;
-
-  // If the user clears messages mid-flight, we invalidate any in-progress flush.
-  const epochAtStart = clearEpochRef.current;
-
-  streamDeferredFlushInFlightRef.current = true;
-  setLoading(true);
-
-  try {
-    // Start from the chat history snapshot taken when the stream session started.
-    // Fall back to current messages filtered (should be rare).
-    let history: Msg[] = streamPreSessionHistoryRef.current
-      ? [...streamPreSessionHistoryRef.current]
-      : filterMessagesForBackend(messagesRef.current || []);
-
-    // Use the latest session state at flush time, then allow server updates to merge in.
-    let workingState: SessionState = { ...(sessionStateRef.current as any) };
-
-    // Process in FIFO order.
-    while (streamDeferredQueueRef.current.length) {
-      if (epochAtStart !== clearEpochRef.current) return;
-
-      const item = streamDeferredQueueRef.current[0];
-      const userMsg: Msg = { role: "user", content: String(item?.text || "").trim() };
-      if (!userMsg.content) {
-        streamDeferredQueueRef.current.shift();
-        continue;
-      }
-
-      const callMsgs: Msg[] = [...history, userMsg];
-
-      const data = await callChat(callMsgs, item?.state ? (item.state as any) : (workingState as any));
-
-      if (epochAtStart !== clearEpochRef.current) return;
-
-      // status from backend (safe/explicit_blocked/explicit_allowed)
-      if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
-        setChatStatus(data.mode);
-      }
-
-      const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
-
-      if (serverSessionState) {
-        const merged: SessionState = { ...(workingState as any), ...(serverSessionState as any) };
-
-        // If backend says blocked, keep pill as intimate AND set pending
-        if (data.mode === "explicit_blocked") {
-          (merged as any).mode = "intimate";
-          (merged as any).pending_consent = "intimate";
-        }
-
-        // If backend says allowed, clear pending
-        if (data.mode === "explicit_allowed" && (merged as any).pending_consent) {
-          (merged as any).pending_consent = null;
-        }
-
-        // Normalize & apply backend mode when present
-        const backendMode = normalizeMode((serverSessionState as any)?.mode ?? (data as any)?.mode);
-        if (backendMode && data.mode !== "explicit_blocked") {
-          (merged as any).mode = backendMode;
-        }
-
-        // If we are not in intimate, never keep the intimate pending flag
-        if ((merged as any).mode !== "intimate" && (merged as any).pending_consent === "intimate") {
-          (merged as any).pending_consent = null;
-        }
-
-        workingState = merged;
-        sessionStateRef.current = merged;
-        setSessionState(merged);
-      } else {
-        // If blocked but session_state missing, still reflect pending
-        if (data.mode === "explicit_blocked") {
-          workingState = { ...(workingState as any), mode: "intimate", pending_consent: "intimate" } as any;
-          sessionStateRef.current = workingState;
-          setSessionState(workingState);
-        }
-
-        // If allowed but session_state missing, clear pending and mark consented
-        if (data.mode === "explicit_allowed") {
-          workingState = { ...(workingState as any), pending_consent: null, explicit_consented: true } as any;
-          sessionStateRef.current = workingState;
-          setSessionState(workingState);
-        }
-      }
-
-      const replyText = String((data as any).reply || "");
-
-      // If this queued message came from an out-of-session user, we rendered a placeholder
-      // notice bubble at noticeIndex. Replace it in-place so chat ordering stays coherent.
-      const noticeIndex = Number((item as any)?.noticeIndex ?? -1);
-      setMessages((prev) => {
-        if (!Array.isArray(prev)) return prev as any;
-        if (noticeIndex >= 0 && noticeIndex < prev.length) {
-          const next = prev.slice();
-          next[noticeIndex] = { role: "assistant", content: replyText };
-          return next;
-        }
-        // Fallback: append if index missing/out-of-range (or in-session member).
-        return [...prev, { role: "assistant", content: replyText }];
-      });
-
-      // Advance the backend history used for subsequent queued messages
-      history = [...callMsgs, { role: "assistant", content: replyText }];
-
-      // Remove the item only after successful processing
-      streamDeferredQueueRef.current.shift();
-    }
-  } catch (err: any) {
-    if (epochAtStart !== clearEpochRef.current) return;
-    setMessages((prev) => [
-      ...prev,
-      { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
-    ]);
-  } finally {
-    streamPreSessionHistoryRef.current = null;
-    streamDeferredFlushInFlightRef.current = false;
-    setLoading(false);
-  }
-}, [callChat]);
-
-// Detect LegacyStream session start/stop to capture history + flush queue.
-useEffect(() => {
-  const prev = prevSessionActiveRef.current;
-  const cur = Boolean(sessionActive);
-
-  // When the stream starts (host begins live session), snapshot the current chat history for the flush.
-  if (!prev && cur) {
-    streamPreSessionHistoryRef.current = filterMessagesForBackend(messagesRef.current || []);
-  }
-
-  // When the stream ends, flush queued messages automatically.
-  if (prev && !cur) {
-    void flushQueuedStreamMessages();
-  }
-
-  prevSessionActiveRef.current = cur;
-}, [sessionActive, flushQueuedStreamMessages]);
-
-  function clearSttSilenceTimer() {
-    if (sttSilenceTimerRef.current) {
-      window.clearTimeout(sttSilenceTimerRef.current);
-      sttSilenceTimerRef.current = null;
-    }
-  }
-
-  function clearSttRestartTimer() {
-    if (sttRestartTimerRef.current) {
-      window.clearTimeout(sttRestartTimerRef.current);
-      sttRestartTimerRef.current = null;
-    }
-  }
-
-  function clearSttRecoverTimer() {
-    if (sttRecoverTimerRef.current) {
-      window.clearTimeout(sttRecoverTimerRef.current);
-      sttRecoverTimerRef.current = null;
-    }
-  }
-
-  const resetSpeechRecognition = useCallback(() => {
-    const rec = sttRecRef.current as any;
-    if (!rec) return;
-
-    try {
-      rec.onstart = null;
-      rec.onend = null;
-      rec.onerror = null;
-      rec.onresult = null;
-    } catch (e) {
-      // ignore
-    }
-
-    try {
-      rec.abort?.();
-    } catch (e) {
-      // ignore
-    }
-    try {
-      rec.stop?.();
-    } catch (e) {
-      // ignore
-    }
-
-    sttRecRef.current = null;
-    setSttRunning(false);
-  }, []);
-
-  const getCurrentSttText = useCallback((): string => {
-    return `${(sttFinalRef.current || "").trim()} ${(sttInterimRef.current || "").trim()}`.trim();
-  }, []);
-
-    // ------------------------------------------------------------
-  // Backend STT (record + server-side transcription).
-  // iOS/iPadOS Web Speech STT can be unstable; this path is far more reliable.
-  // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
-  // ------------------------------------------------------------
-  const liveAvatarActive =
-    liveProvider === "d-id" &&
-    (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
-
-  // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
-  // Keep Live Avatar mode on browser STT (it is already stable across devices).
-  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
-
-  const cleanupBackendSttResources = useCallback(() => {
-    try {
-      if (backendSttRecorderRef.current && backendSttRecorderRef.current.state !== "inactive") {
-        backendSttRecorderRef.current.stop();
-      }
-    } catch (e) {}
-    backendSttRecorderRef.current = null;
-
-    if (backendSttHardStopTimerRef.current) {
-      window.clearTimeout(backendSttHardStopTimerRef.current);
-      backendSttHardStopTimerRef.current = null;
-    }
-
-    if (backendSttRafRef.current !== null) {
-      cancelAnimationFrame(backendSttRafRef.current);
-      backendSttRafRef.current = null;
-    }
-
-    if (backendSttStreamRef.current) {
-      backendSttStreamRef.current.getTracks().forEach((t) => {
-        try {
-          t.stop();
-        } catch (e) {}
-      });
-      backendSttStreamRef.current = null;
-    }
-
-    if (backendSttAudioCtxRef.current) {
-      try {
-        backendSttAudioCtxRef.current.close();
-      } catch (e) {}
-      backendSttAudioCtxRef.current = null;
-    }
-
-    backendSttHasSpokenRef.current = false;
-    backendSttLastVoiceAtRef.current = 0;
-  }, []);
-
-  const abortBackendStt = useCallback(() => {
-    try {
-      backendSttAbortRef.current?.abort();
-    } catch (e) {}
-    backendSttAbortRef.current = null;
-
-    cleanupBackendSttResources();
-
-    // NOTE: we intentionally do NOT flip backendSttInFlightRef here.
-    // startBackendSttOnce() owns that lifecycle and will clear it in its own finally blocks.
-    setSttRunning(false);
-  }, [cleanupBackendSttResources]);
-
-  const transcribeBackendStt = useCallback(
-    async (blob: Blob): Promise<string> => {
-      if (!API_BASE) throw new Error("Missing NEXT_PUBLIC_API_BASE_URL");
-
-      // Backend expects raw audio bytes in the request body (NOT multipart/form-data).
-      const controller = new AbortController();
-      backendSttAbortRef.current = controller;
-
-      const apiBase = API_BASE.replace(/\/+$/, "");
-      const contentType = blob.type || (isIOS ? "audio/mp4" : "audio/webm");
-
-      const resp = await fetch(`${apiBase}/stt/transcribe`, {
-        method: "POST",
-        headers: { "Content-Type": contentType, Accept: "application/json" },
-        body: blob,
-        signal: controller.signal,
-      });
-
-      if (!resp.ok) {
-        let detail = "";
-        try {
-          detail = await resp.text();
-        } catch (e) {}
-        throw new Error(`STT backend error ${resp.status}: ${detail || resp.statusText}`);
-      }
-
-      const data = (await resp.json()) as any;
-      return String(data?.text ?? "").trim();
-    },
-    [API_BASE, isIOS],
-  );
-
-  const startBackendSttOnce = useCallback(async (): Promise<void> => {
-    if (!useBackendStt) return;
-    if (!sttEnabledRef.current || sttPausedRef.current) return;
-    if (backendSttInFlightRef.current) return;
-
-    const now0 = performance.now();
-    if (now0 < sttIgnoreUntilRef.current) {
-      const waitMs = Math.max(0, Math.ceil(sttIgnoreUntilRef.current - now0 + 50));
-      setTimeout(() => {
-        if (sttEnabledRef.current && !sttPausedRef.current) {
-          startBackendSttOnce().catch(() => {});
-        }
-      }, waitMs);
-      return;
-    }
-
-    backendSttInFlightRef.current = true;
-    backendSttHasSpokenRef.current = false;
-    backendSttLastVoiceAtRef.current = performance.now();
-
-    clearSttSilenceTimer();
-    setSttError(null);
-    setSttRunning(true);
-    setSttInterim("");
-    setSttFinal("");
-
-    try {
-      const getStreamWithRetries = async (): Promise<MediaStream> => {
-        const constraints: MediaStreamConstraints = {
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        };
-
-        let lastErr: any = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
-          try {
-            return await navigator.mediaDevices.getUserMedia(constraints);
-          } catch (e) {
-            lastErr = e;
-            const name = e?.name || "";
-            // Permission/security errors won't succeed on retry.
-            if (name === "NotAllowedError" || name === "SecurityError") break;
-            await new Promise((r) => setTimeout(r, 250));
-          }
-        }
-
-        throw lastErr;
-      };
-
-      const stream = await getStreamWithRetries();
-      backendSttStreamRef.current = stream;
-
-      // Choose best available recording MIME type for this browser.
-      let mimeType = "";
-      try {
-        const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/aac", "audio/mpeg"];
-        for (const c of candidates) {
-          if (typeof MediaRecorder !== "undefined" && (MediaRecorder as any).isTypeSupported?.(c)) {
-            mimeType = c;
-            break;
-          }
-        }
-      } catch (e) {}
-
-      let recorder: MediaRecorder;
-      try {
-        recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      } catch (e) {
-        throw new Error("This browser cannot record audio for STT. Please use Live Avatar mode on this device.");
-      }
-      backendSttRecorderRef.current = recorder;
-
-      const chunks: BlobPart[] = [];
-      recorder.ondataavailable = (ev: BlobEvent) => {
-        if (ev.data && ev.data.size > 0) chunks.push(ev.data);
-      };
-
-      const blobPromise = new Promise<Blob>((resolve, reject) => {
-        recorder.onstop = () => {
-          const type = recorder.mimeType || mimeType || "audio/webm";
-          resolve(new Blob(chunks, { type }));
-        };
-        (recorder as any).onerror = (ev: any) => reject(ev?.error || new Error("Recorder error"));
-      });
-
-      // Simple VAD (silence detection) using AnalyserNode
-      try {
-        const Ctx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
-        const ctx: AudioContext = new Ctx();
-        backendSttAudioCtxRef.current = ctx;
-        try {
-          await ctx.resume();
-        } catch (e) {}
-
-        const src = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 2048;
-        src.connect(analyser);
-
-        const data = new Uint8Array(analyser.fftSize);
-
-        const threshold = 0.02; // RMS threshold
-        const minRecordMs = 350;
-        const maxRecordMs = 15000;
-        const silenceMs = 2000;
-        const startedAt = performance.now();
-
-        const tick = () => {
-          if (!sttEnabledRef.current || sttPausedRef.current) {
-            try {
-              if (recorder.state !== "inactive") recorder.stop();
-            } catch (e) {}
-            return;
-          }
-
-          analyser.getByteTimeDomainData(data);
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) {
-            const v = (data[i] - 128) / 128;
-            sum += v * v;
-          }
-          const rms = Math.sqrt(sum / data.length);
-          const now = performance.now();
-
-          if (rms > threshold) {
-            backendSttLastVoiceAtRef.current = now;
-            backendSttHasSpokenRef.current = true;
-          }
-
-          const elapsed = now - startedAt;
-          const silentFor = now - backendSttLastVoiceAtRef.current;
-
-          if (elapsed >= maxRecordMs) {
-            try {
-              if (recorder.state !== "inactive") recorder.stop();
-            } catch (e) {}
-            return;
-          }
-
-          if (backendSttHasSpokenRef.current && elapsed > minRecordMs && silentFor >= silenceMs) {
-            try {
-              if (recorder.state !== "inactive") recorder.stop();
-            } catch (e) {}
-            return;
-          }
-
-          backendSttRafRef.current = requestAnimationFrame(tick);
-        };
-
-        backendSttRafRef.current = requestAnimationFrame(tick);
-      } catch (e) {
-        // If VAD setup fails, we still record; hard-stop timer will end it.
-      }
-
-      backendSttHardStopTimerRef.current = window.setTimeout(() => {
-        try {
-          if (recorder.state !== "inactive") recorder.stop();
-        } catch (e) {}
-      }, 16000);
-
-      try {
-        recorder.start(250);
-      } catch (e) {
-        throw new Error("Failed to start recording.");
-      }
-
-      const blob = await blobPromise;
-      const hadSpeech = backendSttHasSpokenRef.current;
-
-      // Important: release the mic/audio session BEFORE we attempt any TTS playback.
-      cleanupBackendSttResources();
-      setSttRunning(false);
-
-      // If user disabled/paused during capture, do nothing further.
-      if (!sttEnabledRef.current || sttPausedRef.current) return;
-
-      // If we never detected speech, skip transcription to avoid cost/noise.
-      if (!hadSpeech) return;
-      if (!blob || blob.size < 2048) return;
-
-      const text = await transcribeBackendStt(blob);
-      if (!text) return;
-
-      // Ignore if we're still inside an ignore window (e.g., avatar speech bleed).
-      if (performance.now() < sttIgnoreUntilRef.current) return;
-
-      setSttFinal(text);
-      sttFinalRef.current = text;
-
-      await send(text);
-    } catch (e) {
-      setSttError(e?.message || "STT failed.");
-    } finally {
-      cleanupBackendSttResources();
-      setSttRunning(false);
-      backendSttInFlightRef.current = false;
-
-      // Hands-free loop: if still enabled, start listening again.
-      if (sttEnabledRef.current && !sttPausedRef.current) {
-        const now = performance.now();
-        const ignoreWait = now < sttIgnoreUntilRef.current ? Math.ceil(sttIgnoreUntilRef.current - now + 50) : 0;
-        const baseDelay = isIOS ? 100 : 0;
-
-        setTimeout(() => {
-          startBackendSttOnce().catch(() => {});
-        }, Math.max(ignoreWait, baseDelay));
-      }
-    }
-  }, [
-    clearSttSilenceTimer,
-    cleanupBackendSttResources,
-    isIOS,
-    send,
-    transcribeBackendStt,
-    useBackendStt,
-  ]);
-
-  const kickBackendStt = useCallback(() => {
-    if (!useBackendStt) return;
-    if (!sttEnabledRef.current || sttPausedRef.current) return;
-    if (backendSttInFlightRef.current) return;
-
-    // Small delay helps iOS fully exit previous audio state.
-    setTimeout(() => {
-      startBackendSttOnce().catch(() => {});
-    }, isIOS ? 100 : 0);
-  }, [isIOS, startBackendSttOnce, useBackendStt]);
-
-const pauseSpeechToText = useCallback(() => {
-    sttPausedRef.current = true;
-    clearSttSilenceTimer();
-
-    setSttInterim("");
-    setSttFinal("");
-
-    // Backend STT: abort any in-flight record/transcribe
-    abortBackendStt();
-
-    // Browser STT: stop recognition if it exists
-    const rec = sttRecRef.current;
-    try {
-      rec?.stop?.();
-    } catch (e) {
-      // ignore
-    }
-
-    // iOS Web Speech can get stuck after stop(); force a fresh recognizer next time.
-    // (Embedded iOS uses Web Speech; backend STT is disabled when embedded.)
-    if (isIOS && !useBackendStt) {
-      resetSpeechRecognition();
-    }
-
-    setSttRunning(false);
-  }, [abortBackendStt, clearSttSilenceTimer, isIOS, useBackendStt, resetSpeechRecognition]);
-
-  const scheduleSttAutoSend = useCallback(() => {
-    if (!sttEnabledRef.current) return;
-
-    clearSttSilenceTimer();
-
-    sttSilenceTimerRef.current = window.setTimeout(() => {
-      const text = getCurrentSttText();
-      if (!text) return;
-
-      // NOTE:
-      // We intentionally do NOT pause STT here.
-      // - send() already pauses/resumes STT as needed for normal (non-stream) interactions to prevent feedback.
-      // - During LegacyStream live sessions, send() will *not* call the backend and will *not* pause STT,
-      //   which keeps iOS/Safari stable and lets members keep speaking/typing freely.
-      sttFinalRef.current = "";
-      sttInterimRef.current = "";
-      setInput("");
-
-      void sendRef.current(text);
-    }, 2000);
-  }, [getCurrentSttText, clearSttSilenceTimer]);
-
-  const requestMicPermission = useCallback(async (): Promise<boolean> => {
-    // NOTE: Web Speech API does not reliably prompt on iOS if start() is called
-    // outside the user's click. We still use getUserMedia to ensure permission exists.
-    if (!navigator.mediaDevices?.getUserMedia) return true;
-    // iOS Safari (especially when embedded) can reject getUserMedia even when SpeechRecognition still works.
-    // If we're not using backend STT, let SpeechRecognition trigger the permission prompt instead.
-    if (isIOS && !useBackendStt) return true;
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((t) => t.stop());
-
-      // Mic permission is granted once getUserMedia succeeds.
-      micGrantedRef.current = true;
-      setMicGranted(true);
-      return true;
-    } catch (e) {
-      console.warn("Mic permission denied/unavailable:", e);
-      setSttError(getEmbedHint());
-
-      const name = e?.name || "";
-      // If backend STT can't access the mic (common in some embedded contexts),
-      // fall back to browser SpeechRecognition for this session.
-      if (name === "NotAllowedError" || name === "SecurityError") {
-        setBackendSttAvailable(false);
-        try {
-          sttRecRef.current?.abort?.();
-        } catch (e) {
-          // ignore
-        }
-        sttRecRef.current = null;
-      }
-
-      return false;
-    }
-  }, [getEmbedHint, isIOS, setBackendSttAvailable, useBackendStt]);
-
-  const ensureSpeechRecognition = useCallback((): any | null => {
-    if (typeof window === "undefined") return null;
-
-    const SpeechRecognitionCtor =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognitionCtor) return null;
-
-    if (sttRecRef.current) return sttRecRef.current as any;
-
-    const rec = new SpeechRecognitionCtor();
-
-    // iOS + embedded contexts are more stable with continuous=false and manual restarts.
-    try {
-      rec.continuous = !isIOS;
-    } catch (e) {
-      // ignore
-    }
-
-    try {
-      rec.interimResults = true;
-    } catch (e) {
-      // ignore
-    }
-
-    try {
-      rec.lang = "en-US";
-    } catch (e) {
-      // ignore
-    }
-
-    rec.onstart = () => {
-      setSttRunning(true);
-      setSttError(null);
-
-      micGrantedRef.current = true;
-      setMicGranted(true);
-      // reset audio-capture fail window on successful start
-      sttAudioCaptureFailsRef.current = 0;
-      sttLastAudioCaptureAtRef.current = 0;
-    };
-
-    rec.onend = () => {
-      setSttRunning(false);
-
-      if (!sttEnabledRef.current || sttPausedRef.current) return;
-
-      clearSttRestartTimer();
-
-      const now = Date.now();
-      const ignoreDelay = Math.max(0, (sttIgnoreUntilRef.current || 0) - now);
-
-      // iOS/iPadOS: keep restart delay short to reduce clipped first words; onerror recovery handles flaky starts.
-      const baseDelay = isIOS ? 200 : 250;
-
-      sttRestartTimerRef.current = window.setTimeout(() => {
-        if (!sttEnabledRef.current || sttPausedRef.current) return;
-
-        try {
-          rec.start();
-        } catch (e) {
-          // ignore
-        }
-      }, baseDelay + ignoreDelay);
-    };
-
-    rec.onerror = (event: any) => {
-      const code = String(event?.error || "");
-
-      if (code === "no-speech" || code === "aborted") {
-        return;
-      }
-
-      if (code === "not-allowed" || code === "service-not-allowed") {
-        sttEnabledRef.current = false;
-        sttPausedRef.current = false;
-        setSttEnabled(false);
-        setSttRunning(false);
-        clearSttSilenceTimer();
-        clearSttRestartTimer();
-        clearSttRecoverTimer();
-        clearSttRecoverTimer();
-        setSttError("Microphone permission was blocked." + getEmbedHint());
-        try {
-          rec.stop?.();
-        } catch (e) {
-          // ignore
-        }
-        return;
-      }
-
-      if (code === "audio-capture") {
-        const now = Date.now();
-        const withinWindow = now - sttLastAudioCaptureAtRef.current < 10_000;
-        sttAudioCaptureFailsRef.current = withinWindow
-          ? sttAudioCaptureFailsRef.current + 1
-          : 1;
-        sttLastAudioCaptureAtRef.current = now;
-
-        setSttError("Speech-to-text error: audio-capture (no microphone found). Retrying…");
-
-        // If it keeps failing, we stop instead of looping forever.
-        if (sttAudioCaptureFailsRef.current >= 4) {
-          sttEnabledRef.current = false;
-          sttPausedRef.current = false;
-          setSttEnabled(false);
-          setSttRunning(false);
-          clearSttSilenceTimer();
-          clearSttRestartTimer();
-        clearSttRecoverTimer();
-          clearSttRecoverTimer();
-          setSttError(
-            "Speech-to-text could not access the microphone on this device. Please reload the page and try again."
-              + getEmbedHint()
-          );
-          try {
-            rec.stop?.();
-          } catch (e) {
-            // ignore
-          }
-          return;
-        }
-
-        // Recovery path: recreate recognition (helps iOS) and try again after a short delay.
-        clearSttRecoverTimer();
-        sttRecoverTimerRef.current = window.setTimeout(async () => {
-          if (!sttEnabledRef.current || sttPausedRef.current) return;
-
-          resetSpeechRecognition();
-
-          const ok = await requestMicPermission();
-          if (!ok) return;
-
-          const r2 = ensureSpeechRecognition();
-          if (!r2) return;
-
-          try {
-            r2.start();
-          } catch (e) {
-            // ignore
-          }
-        }, isIOS ? 1200 : 650);
-
-        return;
-      }
-
-      console.warn("STT error:", code, event);
-      setSttError(`Speech-to-text error: ${code}`);
-    };
-
-    rec.onresult = (event: any) => {
-      if (!sttEnabledRef.current || sttPausedRef.current) return;
-      if (Date.now() < (sttIgnoreUntilRef.current || 0)) return;
-
-      let finalText = "";
-      let interimText = "";
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const res = event.results[i];
-        const txt = res?.[0]?.transcript ?? "";
-        if (res?.isFinal) finalText += txt;
-        else interimText += txt;
-      }
-
-      if (finalText) sttFinalRef.current = `${sttFinalRef.current} ${finalText}`.trim();
-      sttInterimRef.current = interimText.trim();
-
-      const combined = getCurrentSttText();
-      setInput(combined);
-
-      scheduleSttAutoSend();
-    };
-
-    sttRecRef.current = rec;
-    return rec;
-  }, [
-    isIOS,
-    getCurrentSttText,
-    scheduleSttAutoSend,
-    getEmbedHint,
-    requestMicPermission,
-    resetSpeechRecognition,
-  ]);
-
-  const resumeSpeechToText = useCallback(() => {
-    if (!sttEnabledRef.current) return;
-
-    sttPausedRef.current = false;
-
-    // iOS/iPadOS: use backend STT recorder (more stable than Web Speech)
-    if (useBackendStt) {
-      kickBackendStt();
-      return;
-    }
-
-    // iOS/iPadOS: starting recognition can be flaky right after media playback,
-    // but adding a big delay clips the user's first words. Start immediately and
-    // rely on the onerror recovery path to back off if Safari isn't ready yet.
-    clearSttRestartTimer();
-    const delayMs = 0; // Start immediately to avoid clipping the user's first words; onerror recovery handles mic warm-up.
-
-    sttRestartTimerRef.current = window.setTimeout(() => {
-      if (!sttEnabledRef.current) return;
-      if (sttPausedRef.current) return;
-
-      const ok = ensureSpeechRecognition();
-      if (!ok) {
-        sttEnabledRef.current = false;
-        setSttRunning(false);
-        setSttError("Speech-to-text is not supported in this browser.");
-        return;
-      }
-
-      const rec = sttRecRef.current;
-      if (!rec) return;
-
-      try {
-        rec.start();
-        setSttRunning(true);
-      } catch (e) {
-        // ignore; will restart on onend if needed
-      }
-    }, delayMs);
-  }, [
-    clearSttRestartTimer,
-    ensureSpeechRecognition,
-    isIOS,
-    kickBackendStt,
-    useBackendStt,
-  ]);
-
-  // Play the companion greeting in voice/video modes (once per session, per companion).
-  // (The greeting text is already injected into the chat on load — this only plays it.)
-const greetInFlightRef = useRef(false);
-
-const speakGreetingIfNeeded = useCallback(
-  async (mode: "live" | "audio") => {
-    // Ensure the first audio-only TTS greeting uses the selected companion voice.
-    // If Wix hasn't provided plan/companion yet, defer until the handoff arrives.
-    if (mode === "audio" && !handoffReady) {
-      pendingGreetingModeRef.current = "audio";
-      return;
-    }
-
-    const name = (companionName || "").trim() || "Companion";
-    const key = `ELARALO_GREET_SPOKEN:${name}`;
-
-    // Already spoken this session?
-    try {
-      if (sessionStorage.getItem(key) === "1") return;
-    } catch (e) {}
-
-    // Prevent duplicates/races (e.g., Live Avatar connects right after mic-start).
-    if (greetInFlightRef.current) return;
-    greetInFlightRef.current = true;
-
-    // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
-    // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
-    const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
-    // Local audio-only greeting must always use the companion's ElevenLabs voice.
-    // (Live avatar uses its own configured voice via the DID agent.)
-    const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
-
-      // Prefer DB-driven voice mapping when available (fixes rebrands like Dulce using the default voice).
-      const voiceId = ((companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey));
-
-    // Belt & suspenders: avoid STT re-capturing the greeting audio.
-    const prevIgnore = sttIgnoreUntilRef.current;
-    sttIgnoreUntilRef.current = performance.now() + 60_000; // 60s
-
-    try {
-      try {
-        await pauseSpeechToText();
-      } catch (e) {}
-
-      // iOS/Safari can start the first post-mic playback in a low/communications-volume route.
-      // Re-prime the audio session right before the first greeting so it isn't feeble.
-      if (mode === "audio") {
-        try { boostAllTtsVolumes(); } catch (e) {}
-        try { await nudgeAudioSession(); } catch (e) {}
-        try { primeLocalTtsAudio(true); } catch (e) {}
-        try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-      }
-
-      const hooks: SpeakAssistantHooks = {
-        onWillSpeak: () => {},
-        onDidNotSpeak: () => {},
-      };
-
-      if (mode === "live" && didAgentMgrRef.current) {
-        // Live avatar speaks using the avatar's configured voice
-        await speakAssistantReply(greetText);
-      } else {
-        // Local audio-only (video element on iOS; audio element on desktop)
-        await speakLocalTtsReply(greetText, voiceId, hooks);
-      }
-
-      // Mark spoken ONLY after successful playback.
-      try {
-        sessionStorage.setItem(key, "1");
-      } catch (e) {}
-    } catch (e) {
-      // Allow retry later if something failed.
-      try {
-        sessionStorage.removeItem(key);
-      } catch (e) {}
-      console.warn("Greeting playback failed:", e);
-    } finally {
-      sttIgnoreUntilRef.current = prevIgnore;
-      greetInFlightRef.current = false;
-      try {
-        await resumeSpeechToText();
-      } catch (e) {}
-    }
-  },
-  [
-    companionName,
-    companionKey,
-    companionMapping,
-    handoffReady,
-    pauseSpeechToText,
-    resumeSpeechToText,
-    speakAssistantReply,
-    speakLocalTtsReply,
-    boostAllTtsVolumes,
-    nudgeAudioSession,
-    primeLocalTtsAudio,
-    ensureIphoneAudioContextUnlocked,
-  ],
-);
-
-  const maybePlayPendingGreeting = useCallback(async () => {
-    const mode = pendingGreetingModeRef.current;
-    if (!mode) return;
-    if (!micGrantedRef.current) return;
-
-    // Live Avatar greeting must wait until the agent is fully connected.
-    if (mode === "live") {
-      if (avatarStatus !== "connected" || !didAgentMgrRef.current) return;
-    }
-
-    // Clear first so we don't re-enter if something throws.
-    pendingGreetingModeRef.current = null;
-    await speakGreetingIfNeeded(mode);
-  }, [avatarStatus, speakGreetingIfNeeded]);
-
-  // If the user started an audio-only experience before the Wix handoff arrived,
-  // play the pending greeting once plan/companion information is available.
-  useEffect(() => {
-    if (!handoffReady) return;
-    if (!pendingGreetingModeRef.current) return;
-    void maybePlayPendingGreeting();
-  }, [handoffReady, maybePlayPendingGreeting]);
-
-  // Auto-play the greeting once the Live Avatar is connected, but ONLY after the user has granted mic access.
-  useEffect(() => {
-    if (!liveAvatarActive) return;
-    if (avatarStatus !== "connected") return;
-
-    pendingGreetingModeRef.current = "live";
-    void maybePlayPendingGreeting();
-  }, [avatarStatus, liveAvatarActive, maybePlayPendingGreeting]);
-
-  // Play any queued greeting as soon as mic access is granted.
-  useEffect(() => {
-    if (!micGranted) return;
-    void maybePlayPendingGreeting();
-  }, [micGranted, maybePlayPendingGreeting]);
-
-
-
-  const stopSpeechToText = useCallback(
-    (clearError: boolean = true) => {
-      sttEnabledRef.current = false;
-      sttPausedRef.current = false;
-      setSttEnabled(false);
-      clearSttSilenceTimer();
-
-      setSttInterim("");
-      setSttFinal("");
-      setSttRunning(false);
-
-      // Abort backend STT capture/transcribe if in flight
-      abortBackendStt();
-      backendSttInFlightRef.current = false;
-
-      // Stop browser SpeechRecognition if it exists
-      resetSpeechRecognition();
-
-      if (clearError) setSttError(null);
-    },
-    [abortBackendStt, clearSttSilenceTimer, resetSpeechRecognition]
-  );
-
-  const startSpeechToText = useCallback(async (opts?: { forceBrowser?: boolean; suppressGreeting?: boolean }) => {
-    const forceBrowser = !!opts?.forceBrowser;
-    // iOS Safari can enter a low-volume route after stop/start transitions.
-    // Apply the same "loud path" recovery we use for Clear/Save before kicking off STT.
-    // IMPORTANT: do not await here; iOS SpeechRecognition must start directly from the user gesture.
-    try { boostAllTtsVolumes(); } catch (e) {}
-    void nudgeAudioSession();
-    primeLocalTtsAudio(true);
-    void ensureIphoneAudioContextUnlocked();
-
-    sttEnabledRef.current = true;
-    sttPausedRef.current = false;
-    setSttEnabled(true);
-    setSttError(null);
-
-    const usingBackend = useBackendStt && !forceBrowser;
-
-    // IMPORTANT (iOS Safari / iOS embedded): SpeechRecognition.start() must be invoked directly
-    // from the user's gesture. Avoid awaiting anything before starting browser STT.
-    if (isIOS && !usingBackend) {
-      const ok = ensureSpeechRecognition();
-      if (!ok) {
-        setSttError("Speech-to-text is not supported in this browser.");
-        stopSpeechToText(false);
-        return;
-      }
-      resumeSpeechToText();
-      if (!liveAvatarActive && !opts?.suppressGreeting) {
-        pendingGreetingModeRef.current = "audio";
-        void maybePlayPendingGreeting();
-      }
-      return;
-    }
-
-    const permOk = await requestMicPermission();
-    if (!permOk) {
-      setSttError("Microphone permission denied.");
-      stopSpeechToText(false);
-      return;
-    }
-
-    // iOS/iPadOS: prefer backend STT recorder (more stable than Web Speech)
-    // NOTE: When starting Live Avatar, we force browser STT so D-ID voice doesn't rely on backend recorder.
-    if (usingBackend) {
-      // Backend STT: if we need to play the audio greeting, do it first (after mic is granted),
-      // then resumeSpeechToText() will start the backend recorder.
-      if (!liveAvatarActive && !opts?.suppressGreeting) {
-        pendingGreetingModeRef.current = "audio";
-        void maybePlayPendingGreeting();
-      } else {
-        kickBackendStt();
-      }
-      return;
-    }
-
-    const ok = ensureSpeechRecognition();
-    if (!ok) {
-      setSttError("Speech-to-text is not supported in this browser.");
-      stopSpeechToText(false);
-      return;
-    }
-
-    resumeSpeechToText();
-    if (!liveAvatarActive && !opts?.suppressGreeting) {
-      pendingGreetingModeRef.current = "audio";
-      void maybePlayPendingGreeting();
-    }
-  }, [
-    boostAllTtsVolumes,
-    ensureSpeechRecognition,
-    kickBackendStt,
-    liveAvatarActive,
-    maybePlayPendingGreeting,
-    nudgeAudioSession,
-    primeLocalTtsAudio,
-    ensureIphoneAudioContextUnlocked,
-    requestMicPermission,
-    resumeSpeechToText,
-    speakGreetingIfNeeded,
-    stopSpeechToText,
-    useBackendStt,
-  ]);
-
-  const toggleSpeechToText = useCallback(async () => {
-    // In Live Avatar mode, mic is required. We don't allow toggling it off.
-    // If STT isn't running (permission denied or stopped), we try to start it again.
-    if (liveAvatarActive) {
-      if (!sttEnabledRef.current) {
-        await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
-      }
-      return;
-    }
-
-    if (sttEnabledRef.current) stopSpeechToText();
-    else await startSpeechToText();
-  }, [liveAvatarActive, startSpeechToText, stopSpeechToText]);
-
-  const stopHandsFreeSTT = useCallback(() => {
-    // Cancel any in-flight local TTS work and advance epoch so late callbacks are ignored.
-    localTtsEpochRef.current += 1;
-    try {
-      localTtsAbortRef.current?.abort();
-    } catch (e) {}
-    localTtsAbortRef.current = null;
-    // Stop listening immediately
-    stopSpeechToText();
-
-    // Stop any local audio-only playback (audio OR video element).
-    stopLocalTtsPlayback();
-    // Force a fresh iOS audio-route prime next time the mic/audio starts (prevents low/silent volume after stop/cancel).
-    localTtsUnlockedRef.current = false;
-
-    // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
-    if (liveAvatarActive) {
-      void stopLiveAvatar();
-    }
-  }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
-
-  // Stop button handler (explicit user gesture): stop all comms AND immediately
-  // re-prime the iOS/Safari audio route so that when the user manually resumes
-  // (Live Avatar or Audio-only), volume does not drop to the quiet receiver path.
-  const handleStopClick = useCallback(() => {
-    try {
-      stopHandsFreeSTT();
-    } catch (e) {}
-
-    // Conference: Stop/leave (host stops the session for everyone).
-    if (sessionKind === "conference") {
-      void stopConferenceSession();
-      return;
-    }
-
-
-    // Viewer-only (Live Stream): enable Stop to close the embedded player even when mic/STT isn't running.
-    // IMPORTANT: This must be synchronous on the user gesture on iOS to avoid breaking future TTS routing.
-    // This does NOT affect the underlying stream session because ONLY the host calls stop_embed.
-    if (liveProvider === "stream" && !streamCanStart && (joinedStreamRef.current || avatarStatus !== "idle")) {
-      // Viewer stop:
-      // - Always allow leaving the waiting/connected UI, even if the host has not created an eventRef yet.
-      // - This MUST NOT stop the underlying live session (only the host can do that).
-      try {
-setStreamEventRef("");
-        setStreamCanStart(false);
-        setStreamNotice("");
-
-        // Viewer explicitly left the in-stream experience.
-        joinedStreamRef.current = false;
-      } catch (e) {}
-      try {
-        setAvatarStatus("idle");
-        setAvatarError(null);
-      } catch (e) {}
-    }
-
-    // Host (Live Stream): ensure Stop always ends the session even if mic/STT isn't running.
-    // (This is idempotent; stopLiveAvatar has its own in-flight guard.)
-    if (liveProvider === "stream" && streamCanStart) {
-      try {
-        void stopLiveAvatar();
-      } catch (e) {}
-    }
-
-
-    // Re-assert boosted audio routing and nudge audio session on the same user gesture.
-    try { boostAllTtsVolumes(); } catch (e) {}
-    try { void nudgeAudioSession(); } catch (e) {}
-    try { primeLocalTtsAudio(true); } catch (e) {}
-    try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, liveProvider, streamCanStart, "", streamEventRef, stopLiveAvatar]);
-
-  // Clear Messages (with confirmation)
-  const requestClearMessages = useCallback(() => {
-    // Stop all audio/video + STT immediately on click (even before the user confirms).
-    // This is an overt user action and prevents the assistant from continuing to speak.
-    clearEpochRef.current += 1;
-    setLoading(false);
-
-    try {
-      stopHandsFreeSTT();
-    } catch (e) {
-      // ignore
-    }
-
-    // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
-    try {
-      boostAllTtsVolumes();
-    } catch (e) {}
-    try {
-      void nudgeAudioSession();
-    } catch (e) {}
-
-    // Strong iOS recovery: prime the hidden VIDEO element on this user gesture so audio-only TTS
-    // is not left in a silent/receiver route after the confirmation modal.
-    try {
-      primeLocalTtsAudio(true);
-    } catch (e) {}
-    try {
-      void ensureIphoneAudioContextUnlocked();
-    } catch (e) {}
-
-
-    setShowClearMessagesConfirm(true);
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
-
-  // Save Chat Summary (with confirmation)
-  const requestSaveChatSummary = useCallback(() => {
-    // REQUIREMENT: behave like Clear Messages with respect to media stability.
-    // We halt all communication immediately using the Stop button logic.
-    // The user will manually choose what to resume after selecting Yes/No.
-    // IMPORTANT: Unlike Clear, do NOT bump clearEpochRef or change loading state here;
-    // doing so can interfere with subsequent reply speaking.
-
-    try {
-      stopHandsFreeSTT();
-    } catch (e) {}
-
-    // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
-    try {
-      boostAllTtsVolumes();
-    } catch (e) {}
-    try {
-      void nudgeAudioSession();
-    } catch (e) {}
-
-    // Prime the hidden VIDEO element on this user gesture so audio-only TTS remains healthy.
-    try {
-      primeLocalTtsAudio(true);
-    } catch (e) {}
-    try {
-      void ensureIphoneAudioContextUnlocked();
-    } catch (e) {}
-
-    setShowSaveSummaryConfirm(true);
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
-
-  // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
-  // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
-  // audio session back to normal playback volume and ensure our media elements
-  // are not left muted/low.
-  const restoreVolumesAfterClearCancel = useCallback(async () => {
-    // This function runs on a user gesture (Yes/No click). Its job is purely to ensure
-    // that *future* manual resumption of TTS is not routed to a silent/receiver path.
-
-    // Re-assert boosted routing first.
-    try { boostAllTtsVolumes(); } catch (e) {}
-
-    // iOS route recovery: nudge the audio session back to normal playback.
-    try { await nudgeAudioSession(); } catch (e) {}
-
-    // Prime the hidden VIDEO element (required by your constraint) so the next audio-only
-    // TTS playback is unlocked and uses the correct output route.
-    try { primeLocalTtsAudio(true); } catch (e) {}
-
-    // If Live Avatar is used on iPhone, ensure its audio context is also unlocked.
-    try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
-
-    // Ensure element mute/volume flags are sane (gain routing provides the loudness).
-    try {
-      const v = localTtsVideoRef.current;
-      if (v) {
-        v.muted = false;
-        v.volume = 1;
-        v.setAttribute?.("playsinline", "");
-        // @ts-ignore
-        v.playsInline = true;
-      }
-    } catch (e) {}
-
-    try {
-      const a = localTtsAudioRef.current;
-      if (a) {
-        a.muted = false;
-        a.volume = 1;
-      }
-    } catch (e) {}
-
-    try {
-      const av = avatarVideoRef.current;
-      if (av) {
-        av.muted = false;
-        av.volume = 1;
-      }
-    } catch (e) {}
-  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes, nudgeAudioSession]);
-
-
-  // Cleanup
-  useEffect(() => {
-    return () => {
-      try {
-        sttEnabledRef.current = false;
-        sttPausedRef.current = false;
-        clearSttSilenceTimer();
-        clearSttRestartTimer();
-        clearSttRecoverTimer();
-        const rec = sttRecRef.current;
-        if (rec) {
-          try {
-            rec.onstart = null;
-            rec.onend = null;
-            rec.onresult = null;
-            rec.onerror = null;
-          } catch (e) {}
-          try {
-            rec.abort?.();
-          } catch (e) {
-            try {
-              rec.stop?.();
-            } catch (e) {}
-          }
-        }
-      } catch (e) {}
-    };
-  }, []);
-
-  // UI controls (layout-only): reused in multiple locations without changing logic.
-// Viewer requirement: in Live Stream mode, the Stop button should allow a viewer to close *their own*
-// embedded player (and halt any STT/TTS) without affecting the host's stream session.
-const viewerCanStopStream =
-  liveProvider === "stream" &&
-  !streamCanStart &&
-  // Allow Stop even before an eventRef/embedUrl exists (viewer waiting for host).
-  (Boolean(joinedStreamRef.current) ||
-    avatarStatus === "connected" ||
-    avatarStatus === "waiting" ||
-    avatarStatus === "connecting" ||
-    avatarStatus === "reconnecting" ||
-    avatarStatus === "error");
-
-// Private session stop rules.
-// Viewer can only opt-out after they\'ve actually joined.
-// Host can always stop the private session when it is active (host-only).
-const viewerCanStopConference = sessionKind === "conference" && !isHost && conferenceJoined;
-const hostCanStopConference = sessionKind === "conference" && isHost;
-
-// Host requirement: Stop must end the live session (and send the end-event signal to LegacyStream).
-const hostCanStopStream =
-  liveProvider === "stream" &&
-  streamCanStart &&
-  (Boolean(streamEventRef) ||
-    avatarStatus === "connected" ||
-    avatarStatus === "waiting" ||
-    avatarStatus === "connecting" ||
-    avatarStatus === "reconnecting" ||
-    avatarStatus === "error");
-
-const hostInStreamUi =
-  liveProvider === "stream" &&
-  streamCanStart &&
-  (Boolean(streamEventRef) ||
-    avatarStatus === "connected" ||
-    avatarStatus === "waiting" ||
-    avatarStatus === "connecting" ||
-    avatarStatus === "reconnecting");
-
-const viewerInStreamUi = viewerHasJoinedStream;
-		// Attachments are disabled during Live Stream sessions, but should remain enabled for Live Private Conference.
-		const attachmentButtonDisabled =
-		  loading ||
-		  uploadingAttachment ||
-		  uploadsDisabled ||
-		  (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
-
-useEffect(() => {
-  // Viewer STT must be disabled while in the LegacyStream stream UI to avoid transcribing the host audio.
-  if (!viewerInStreamUi) return;
-  if (!sttEnabledRef.current) return;
-  void stopSpeechToText();
-}, [viewerInStreamUi, stopSpeechToText]);
-
-const sttControls =
-    liveProvider === "stream" && livekitToken
-      ? null
-      : (
-
-    <>
-      <button
-        type="button"
-        onClick={() => {
-          if (liveProvider === "stream") {
-                      if (
-                        streamCanStart &&
-                        Boolean(streamEventRef) &&
-                        (avatarStatus === "connected" || avatarStatus === "waiting")
-                      )
-                        return;
-                      // Viewer STT must be disabled while in the stream UI to avoid transcribing the host audio.
-                      if (!streamCanStart && avatarStatus !== "idle") return;
-                    }
-          void toggleSpeechToText();
-        }}
-        disabled={(liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ||
-                    viewerInStreamUi || (!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
-        title="Audio"
-        style={{
-          width: 44,
-          minWidth: 44,
-          borderRadius: 10,
-          border: "1px solid #111",
-          background: sttEnabled ? "#b00020" : "#fff",
-          color: sttEnabled ? "#fff" : "#111",
-          cursor: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
-          opacity: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
-          fontWeight: 700,
-        }}
-      >
-        🎤
-      </button>
-
-      {liveProvider !== "stream" && (
-        <button
-          type="button"
-          onClick={handleStopClick}
-          disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference)}
-          style={{
-            border: "1px solid rgba(255,255,255,0.35)",
-            background: "transparent",
-            color: "#fff",
-            width: 44,
-            height: 44,
-            borderRadius: 12,
-            cursor: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? "pointer" : "not-allowed",
-            opacity: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? 1 : 0.45,
-            fontWeight: 700,
-          }}
-        >
-          ■
-        </button>
-      )}
-</>
-  );
-
-  
-  const visibleModePills = useMemo(() => {
-    // Keep stable ordering regardless of allowedModes ordering.
-    const ordered: Mode[] = ["friend", "romantic", "intimate"];
-    return ordered.filter((m) => allowedModes.includes(m));
-  }, [allowedModes]);
-
-  const showUpgradePill = useMemo(() => {
-    // Requirement: show Upgrade whenever Friend and/or Romantic pills are available,
-    // except when Intimate (18+) is available (no further upgrade path).
-    return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
-}, [allowedModes]);
-
-
-// Hide "Set Mode" while the LegacyStream live session UI is active (host + viewer).
-// Requirement: "Please hide the Set Mode button when in live stream."
-//
-// IMPORTANT: this is a *global* gate — if the host is currently streaming, Set Mode is hidden
-// even if a viewer has closed the iframe locally.
-const hideSetModeInStream =
-  liveProvider === "stream" &&
-  (sessionActive ||
-    avatarStatus === "connecting" ||
-    avatarStatus === "connected" ||
-    avatarStatus === "reconnecting" ||
-    avatarStatus === "waiting");
-
-// If the picker is open and we enter live stream state, close it.
-useEffect(() => {
-  if (hideSetModeInStream && showModePicker) setShowModePicker(false);
-}, [hideSetModeInStream, showModePicker]);
-
-const modePillControls = (
-
-    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-      {!showModePicker ? (
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>{!hideSetModeInStream ? (
-
-          <button
-            type="button"
-            onClick={() => {
-              setSetModeFlash(true);
-              window.setTimeout(() => {
-                setShowModePicker(true);
-                setSetModeFlash(false);
-              }, 120);
-            }}
-            style={{
-              padding: "10px 14px",
-              borderRadius: 10,
-              border: "1px solid #111",
-              background: setModeFlash ? "#111" : "#fff",
-              color: setModeFlash ? "#fff" : "#111",
-              cursor: "pointer",
-              fontWeight: 400,
-              whiteSpace: "nowrap",
-              display: "inline-flex",
-              alignItems: "center",
-            }}
-          >
-            Set Mode
-          </button>
-) : null}
-
-
-          {showBroadcastButton ? (
-            <button
-              type="button"
-              onClick={() => {
-                void toggleBroadcastOverlay();
-              }}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: showBroadcasterOverlay ? "#111" : "#fff",
-                color: showBroadcasterOverlay ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 400,
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-                opacity: broadcastPreparing ? 0.75 : 1,
-              }}
-              disabled={broadcastPreparing}
-              aria-pressed={showBroadcasterOverlay}
-              title="Show/Hide Broadcast UI"
-            >
-              {broadcastPreparing ? "Broadcast…" : "Broadcast"}
-            </button>
-          ) : null}
-
-
-
-          {(!rebrandingKey || String(rebrandingKey).trim() === "") && (
-            <button
-              type="button"
-              onClick={() => {
-                setSwitchCompanionFlash(true);
-                window.setTimeout(() => {
-                  goToMyElaralo();
-                  setSwitchCompanionFlash(false);
-                }, 120);
-              }}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: switchCompanionFlash ? "#111" : "#fff",
-                color: switchCompanionFlash ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 400,
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-              }}
-            >
-              Switch Companion
-            </button>
-          )}
-        </div>
-      ) : (
-        <>
-          {visibleModePills.map((m) => {
-            const active = effectiveActiveMode === m;
-            return (
-              <button
-                key={m}
-                onClick={() => {
-                  setModeFromPill(m);
-                  setShowModePicker(false);
-                }}
-                style={{
-                  padding: "8px 12px",
-                  borderRadius: 999,
-                  border: "1px solid #ddd",
-                  background: active ? "#111" : "#fff",
-                  color: active ? "#fff" : "#111",
-                  cursor: "pointer",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {MODE_LABELS[m]}
-              </button>
-            );
-          })}
-
-          {showUpgradePill ? (
-            <button
-              key="upgrade"
-              onClick={() => {
-                setShowModePicker(false);
-                goToUpgrade();
-              }}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                background: "#fff",
-                color: "#111",
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-              }}
-            >
-              Upgrade
-            </button>
-          ) : null}
-
-          {showBroadcastButton ? (
-            <button
-              key="broadcast"
-              onClick={() => {
-                void toggleBroadcastOverlay();
-              }}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                background: showBroadcasterOverlay ? "#111" : "#fff",
-                color: showBroadcasterOverlay ? "#fff" : "#111",
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-                opacity: broadcastPreparing ? 0.75 : 1,
-              }}
-              disabled={broadcastPreparing}
-              aria-pressed={showBroadcasterOverlay}
-              title="Show/Hide Broadcast UI"
-            >
-              {broadcastPreparing ? "Broadcast…" : "Broadcast"}
-            </button>
-          ) : null}
-        </>
-      )}
-    </div>
-  );
-
-  const handleAnyUserGesture = useCallback(() => {
-    void primeLocalTtsAudio(true);
-    void nudgeAudioSession();
-    void ensureIphoneAudioContextUnlocked();
-  }, [primeLocalTtsAudio, nudgeAudioSession, ensureIphoneAudioContextUnlocked]);
-
-  return (
-    <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
-      {/* Hidden audio element for audio-only TTS (mic mode) */}
-      <audio ref={localTtsAudioRef} style={{ display: "none" }} />
-      {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
-      <video
-        ref={localTtsVideoRef}
-        playsInline
-        preload="auto"
-        style={{ position: "fixed", left: 0, bottom: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none", zIndex: -1 }}
-      />
-      {showPlayChoiceModal && isHost ? (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.55)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 9999,
-            padding: 16,
-          }}
-          onClick={() => setShowPlayChoiceModal(false)}
-        >
-          <div
-            style={{
-              width: "min(520px, 100%)",
-              background: "#111827",
-              color: "#ffffff",
-              border: "1px solid rgba(255,255,255,0.12)",
-              borderRadius: 14,
-              padding: 16,
-              boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Start a session</div>
-            <div style={{ opacity: 0.85, fontSize: 13, marginBottom: 14 }}>
-              Choose <b>Stream</b> or <b>Private</b>. You can&apos;t run both at the same time.
-            </div>
-
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-              <button
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  color: "#ffffff",
-                  background: "rgba(255,255,255,0.06)",
-                  cursor: "pointer",
-                }}
-                onClick={() => {
-                  setShowPlayChoiceModal(false);
-                  void startLiveAvatar();
-                }}
-              >
-                Stream
-              </button>
-
-              <button
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  background: "rgba(255,255,255,0.06)",
-                  color: "#ffffff",
-                  cursor: "pointer",
-                }}
-                onClick={() => {
-                  setShowPlayChoiceModal(false);
-                  void startConferenceSession();
-                }}
-              >
-                Private
-              </button>
-
-              <button
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  color: "#ffffff",
-                  background: "transparent",
-                  cursor: "pointer",
-                }}
-                onClick={() => setShowPlayChoiceModal(false)}
-              >
-                Cancel
-              </button>
-            </div>
-
-          </div>
-        </div>
-      ) : null}
-
-      <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
-          <img
-            // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
-            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
-            alt={companyName}
-            style={{ width: "100%", height: "100%" }}
-            onError={(e) => {
-              // IMPORTANT: Persist the fallback in state to prevent flicker on subsequent renders.
-              const fallback = (companyLogoSrc || DEFAULT_AVATAR);
-              (e.currentTarget as HTMLImageElement).src = fallback;
-              setAvatarSrc(fallback);
-            }}
-          />
-        </div>
-        <div>
-          <h1 style={{ margin: 0, fontSize: 22 }}>{companyName}</h1>
-          <div style={{ fontSize: 12, color: "#666" }}>
-            Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-            <b>{displayPlanLabel(planName, memberId, planLabelOverride)}</b>
-          </div>
-          <div style={{ fontSize: 12, color: "#666" }}>
-            Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
-            {chatStatus === "explicit_allowed" ? (
-              <span style={{ marginLeft: 8, color: "#0a7a2f" }}>• Consent: Allowed</span>
-            ) : chatStatus === "explicit_blocked" ? (
-              <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
-            ) : null}
-          </div>
-          {liveProvider === "stream" ? (
-            <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
-                <span
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 6,
-                    padding: "2px 8px",
-                    borderRadius: 999,
-                    background: "#e8f5e9",
-                    color: "#1b5e20",
-                    fontSize: 12,
-                    fontWeight: 700,
-                  }}
-                >
-                  ● Live {sessionKind === "conference" ? "private" : "stream"} active
-                </span>
-              ) : null}
-
-              {!!livekitToken ? (
-                <span
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 6,
-                    padding: "2px 8px",
-                    borderRadius: 999,
-                    background: "#e3f2fd",
-                    color: "#0d47a1",
-                    fontSize: 12,
-                    fontWeight: 700,
-                  }}
-                >
-					● {hostInStreamUi ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}` : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
-                </span>
-              ) : null}
-            </div>
-          ) : null}
-        </div>
-      </header>
-
-{companionMappingError ? (
-  <div
-    style={{
-      margin: "10px 0",
-      padding: "10px 12px",
-      borderRadius: 10,
-      background: "#ffebee",
-      color: "#b71c1c",
-      fontSize: 13,
-      fontWeight: 700,
-      lineHeight: 1.35,
-    }}
-  >
-    {companionMappingError}
-  </div>
-) : null}
-
-{liveEnabled ? (
-  <section
-    style={{
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 12,
-      marginBottom: 12,
-      flexWrap: "wrap",
-    }}
-  >
-    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-      <button
-        onClick={() => {
-          // Stream provider: Play = join/start. It must NOT toggle to Pause.
-          // Leaving the session is done exclusively via Stop.
-          if (liveProvider === "stream") {
-            if (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) return;
-
-            // If a conference is active, Play joins it (no STT).
-            if (sessionActive && sessionKind === "conference") {
-              conferenceOptOutRef.current = false;
-              void startConferenceSession();
-              return;
+        history: List[Dict[str, Any]] = []  # per-worker; DB history is fetched below
+
+    # Shared DB history (cross-worker).
+    last_db_id, history = await run_in_threadpool(_livechat_db_fetch_history_sync, event_ref, _LIVECHAT_DB_HISTORY_LIMIT)
+    poll_task: Optional[asyncio.Task] = None
+
+    # Send recent history to the newly connected client.
+    if history:
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {"type": "history", "eventRef": event_ref, "messages": history, "ts": time.time()},
+                    ensure_ascii=False,
+                )
+            )
+        except Exception:
+            pass
+
+    # Poll shared DB for messages inserted by other API workers and mirror them to this websocket.
+    try:
+        poll_task = asyncio.create_task(_livechat_poll_db(websocket, event_ref, last_db_id))
+    except Exception:
+        poll_task = None
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                incoming = json.loads(raw)
+                if not isinstance(incoming, dict):
+                    incoming = {"text": str(incoming)}
+            except Exception:
+                incoming = {"text": raw}
+
+            msg_type = str(incoming.get("type") or "chat").strip().lower()
+
+            # Optional ping/pong
+            if msg_type == "ping":
+                try:
+                    await websocket.send_text(json.dumps({"type": "pong", "ts": time.time()}))
+                except Exception:
+                    pass
+                continue
+
+            # We only broadcast chat messages.
+            if msg_type not in ("chat", "message"):
+                continue
+
+            text_val = incoming.get("text")
+            if text_val is None or str(text_val).strip() == "":
+                text_val = incoming.get("message") or incoming.get("content") or ""
+            text_val = str(text_val).strip()
+            if not text_val:
+                continue
+
+            # Accept both clientMsgId (preferred) and legacy clientId fields.
+            client_msg_id = (
+                str(
+                    incoming.get("clientMsgId")
+                    or incoming.get("client_msg_id")
+                    or incoming.get("clientId")
+                    or incoming.get("client_id")
+                    or ""
+                ).strip()
+                or str(uuid.uuid4())
+            )
+
+            ts_in = incoming.get("ts")
+            try:
+                ts = float(ts_in) if ts_in is not None else time.time()
+            except Exception:
+                ts = time.time()
+
+            out: Dict[str, Any] = {
+                "type": "chat",
+                "eventRef": event_ref,
+                "text": text_val,
+                "clientMsgId": client_msg_id,
+                "ts": ts,
+                "senderId": member_id,
+                "senderRole": role,
+                "name": name,
             }
 
-            // Host-only: when idle, prompt for Stream vs Conference.
-            if (isHost && !sessionActive) {
-              // New live session: clear any leftover live-sharing UI from the prior run.
-              setMessages([]);
-              setLiveSharingNotice(null);
-              setShowPlayChoiceModal(true);
-              return;
+            _livechat_push_history(event_ref, out)
+            await run_in_threadpool(_livechat_db_insert_sync, event_ref, out)
+            await _livechat_broadcast(event_ref, out)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        # Keep the server resilient: drop the connection silently.
+        pass
+    finally:
+        try:
+            if poll_task is not None:
+                poll_task.cancel()
+        except Exception:
+            pass
+
+        with _LIVECHAT_LOCK:
+            s = _LIVECHAT_CLIENTS.get(event_ref, set())
+            try:
+                s.discard(websocket)
+            except Exception:
+                pass
+            _LIVECHAT_CLIENT_META.pop(websocket, None)
+            if not s:
+                _LIVECHAT_CLIENTS.pop(event_ref, None)
+                _LIVECHAT_HISTORY.pop(event_ref, None)
+
+
+@app.post("/stream/beestreamed/livechat/send")
+async def beestreamed_livechat_send(req: LiveChatSendRequest):
+    event_ref = (req.eventRef or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="eventRef is required")
+
+    text_val = str((req.text or req.message or "")).strip()
+    if not text_val:
+        return {"ok": True}
+
+    sender_id = str((req.senderId or req.memberId or "")).strip()
+    sender_role = _normalize_livechat_role(req.senderRole or req.role or "viewer")
+    name = str((req.name or "")).strip()
+
+    try:
+        ts = float(req.ts) if req.ts is not None else time.time()
+    except Exception:
+        ts = time.time()
+
+    payload: Dict[str, Any] = {
+        "type": "chat",
+        "eventRef": event_ref,
+        "clientMsgId": (req.clientMsgId or str(uuid.uuid4())),
+        "text": text_val,
+        "ts": ts,
+        "senderId": sender_id,
+        "senderRole": sender_role,
+        "name": name,
+    }
+
+    _livechat_push_history(event_ref, payload)
+    await run_in_threadpool(_livechat_db_insert_sync, event_ref, payload)
+    await _livechat_broadcast(event_ref, payload)
+    return {"ok": True}
+
+# ---------------------------------------------------------------------------
+# IMPORTANT:
+# - BeeStreamed tokens MUST NOT be exposed to the browser. The frontend calls this endpoint,
+#   and the API performs BeeStreamed authentication server-side.
+# - Authentication format per BeeStreamed docs:
+#     Authorization: Basic base64_encode({token_id}:{secret_key})
+# - Start WebRTC stream endpoint:
+#     POST https://api.beestreamed.com/events/[EVENT REF]/startwebrtcstream
+#
+# Docs: https://docs.beestreamed.com/introduction (API Overview / Authentication)
+
+
+def _extract_beestreamed_event_ref_from_url(stream_url: str) -> str:
+    """Best-effort extraction of BeeStreamed event_ref from a viewer URL.
+
+    This is intentionally flexible because BeeStreamed viewer URLs can be customized.
+    We attempt, in order:
+      1) query string parameters: event_ref / eventRef
+      2) last path segment that looks like an alphanumeric ref (6-32 chars)
+    """
+    u = (stream_url or "").strip()
+    if not u:
+        return ""
+
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return ""
+
+    try:
+        qs = parse_qs(parsed.query or "")
+        for k in ("event_ref", "eventRef", "event", "ref"):
+            v = qs.get(k)
+            if v and isinstance(v, list) and v[0]:
+                cand = str(v[0]).strip()
+                if re.fullmatch(r"[A-Za-z0-9]{6,32}", cand):
+                    return cand
+    except Exception:
+        pass
+
+    # Path fallback
+    try:
+        segments = [s for s in (parsed.path or "").split("/") if s]
+        for seg in reversed(segments):
+            seg = seg.strip()
+            if re.fullmatch(r"[A-Za-z0-9]{6,32}", seg):
+                return seg
+    except Exception:
+        pass
+
+    return ""
+
+
+@app.post("/stream/beestreamed/start")
+async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
+    """Start a BeeStreamed WebRTC stream for the configured event.
+
+    Body (JSON):
+      {
+        "stream_url": "https://..."     (optional; used to derive event_ref)
+        "event_ref": "abcd12345678"    (optional; overrides URL parsing)
+      }
+
+    Env vars (server-side only):
+      STREAM_TOKEN_ID
+      STREAM_SECRET_KEY
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    stream_url = str(raw.get("stream_url") or raw.get("streamUrl") or "").strip()
+    event_ref = str(raw.get("event_ref") or raw.get("eventRef") or "").strip()
+
+    if not event_ref:
+        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
+
+    # Optional server-side fallback (useful when the viewer URL does not contain the event_ref).
+    if not event_ref:
+        event_ref = (os.getenv("STREAM_EVENT_REF", "") or "").strip()
+
+    if not event_ref:
+        raise HTTPException(
+            status_code=400,
+            detail="BeeStreamed event_ref is required (provide event_ref, STREAM_EVENT_REF, or a stream_url containing it).",
+        )
+
+    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
+    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
+
+    if not token_id or not secret_key:
+        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
+
+    # BeeStreamed auth header: Basic base64(token_id:secret_key)
+    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
+    headers = {"Authorization": f"Basic {basic}"}
+
+    api_url = f"https://api.beestreamed.com/events/{event_ref}/startwebrtcstream"
+
+    import requests  # type: ignore
+
+    try:
+        r = requests.post(api_url, headers=headers, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed request failed: {e!r}")
+
+    if r.status_code >= 400:
+        msg = (r.text or "").strip()
+        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed error {r.status_code}: {msg[:500]}")
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {"message": (r.text or "").strip(), "status": r.status_code}
+
+    return {"ok": True, "event_ref": event_ref, "beestreamed": data}
+
+# ---------------------------------------------------------------------------
+# BeeStreamed embed + host gating (white-label friendly)
+#
+# Goals:
+# - Each "Human / Stream" companion has a stable event_ref (preferably stored in the SQLite mapping DB).
+# - Only the Human Companion (host) can start/stop the WebRTC stream.
+# - Everyone else can open the embed and will see a "waiting for host" experience until the host starts.
+#
+# Notes:
+# - host_member_id can be stored per companion in the mapping DB as `host_member_id`.
+# - If `host_member_id` is missing for DulceMoon/Dulce, we fall back to a known host id (single human companion).
+# - If `event_ref` is missing, ONLY the host will create it (via BeeStreamed API) and we will best-effort persist it.
+# ---------------------------------------------------------------------------
+
+DULCE_HOST_MEMBER_ID_FALLBACK = "1dc3fe06-c351-4678-8fe4-6a4b1350c556"
+
+def _beestreamed_api_base() -> str:
+    return (os.getenv("BEESTREAMED_API_BASE", "") or "https://api.beestreamed.com").strip().rstrip("/")
+
+def _beestreamed_public_event_url(event_ref: str) -> str:
+    # BeeStreamed public event page (works as an embeddable viewer page in an iframe).
+    base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
+    return f"{base}?id={event_ref}"
+
+@app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
+async def beestreamed_embed_page(event_ref: str):
+    """Render a BeeStreamed event inside a sandboxed iframe.
+
+    Why this exists:
+      - The BeeStreamed viewer UI can include actions that open a pop-out / new window.
+      - By wrapping the viewer in a sandboxed iframe WITHOUT `allow-popups`, those actions
+        are prevented and the experience stays within the iframe container.
+    """
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="event_ref is required")
+
+    viewer_url = _beestreamed_public_event_url(event_ref)
+
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Live Stream</title>
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }}
+      .frame {{
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }}
+    </style>
+  </head>
+  <body>
+    <iframe
+      class="frame"
+      src="{viewer_url}"
+      title="Live Stream"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+      referrerpolicy="no-referrer-when-downgrade"
+      allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
+      allowfullscreen
+    ></iframe>
+  </body>
+</html>"""
+
+    # No caching: viewer state is time-sensitive.
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
+
+
+def _beestreamed_auth_headers() -> Dict[str, str]:
+    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
+    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
+    if not token_id or not secret_key:
+        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
+
+    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {basic}", "Content-Type": "application/json"}
+
+def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
+    import requests  # type: ignore
+
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    # Create an event
+    try:
+        r = requests.post(f"{api_base}/events", headers=headers, json={}, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed create event failed: {e!r}")
+
+    if r.status_code >= 400:
+        msg = (r.text or "").strip()
+        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed create event error {r.status_code}: {msg[:500]}")
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+
+    event_ref = (data.get("event_ref") or data.get("eventRef") or data.get("id") or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=502, detail="BeeStreamed create event did not return an event_ref")
+
+    # Best-effort: set embed domain on the event so the iframe host is allowed.
+    # If this fails, we continue — the embed may still work depending on BeeStreamed account settings.
+    embed_domain = (embed_domain or "").strip()
+    if embed_domain:
+        try:
+            requests.patch(
+                f"{api_base}/events/{event_ref}",
+                headers=headers,
+                json={"event_embed_domain": embed_domain},
+                timeout=20,
+            )
+        except Exception:
+            pass
+
+    return event_ref
+
+
+def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_domain: str = "") -> None:
+    """Best-effort: set the event date to 'now' so the event is effectively scheduled immediately.
+
+    BeeStreamed docs: PATCH /events/[EVENT REF] supports `date` (formatted) and `title`.
+    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS". citeturn3view1turn3view0
+    """
+    import requests  # type: ignore
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        return
+
+    payload = {}
+    # Use UTC to avoid timezone ambiguity across API hosts.
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    payload["date"] = now_str
+
+    if (title or "").strip():
+        payload["title"] = (title or "").strip()
+
+    # Some BeeStreamed accounts may accept embed domain as a field; we keep this best-effort.
+    # If not supported, BeeStreamed will ignore or reject; we swallow failures.
+    if (embed_domain or "").strip():
+        payload["event_embed_domain"] = (embed_domain or "").strip()
+
+    try:
+        requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload, timeout=20)
+    except Exception:
+        pass
+
+def _beestreamed_start_webrtc_sync(event_ref: str) -> Dict[str, Any]:
+    import requests  # type: ignore
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        return {"ok": False, "error": "event_ref required"}
+
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    try:
+        r = requests.post(f"{api_base}/events/{ref}/startwebrtcstream", headers=headers, timeout=20)
+        return {
+            "ok": (r.status_code // 100 == 2),
+            "status_code": r.status_code,
+            "body": (r.text or ""),
+            "authMode": "basic",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "authMode": "basic"}
+def _beestreamed_stop_webrtc_sync(event_ref: str) -> Dict[str, Any]:
+    """Stop the BeeStreamed WebRTC stream and fully end the event.
+
+    IMPORTANT:
+      - The *Stop* action in our UI must end the live stream in BeeStreamed (no manual "End Live").
+      - We do this in two steps:
+          1) POST /events/{event_ref}/stopwebrtcstream
+          2) PATCH /events/{event_ref} with status = "done"
+
+    Auth:
+      - Server-side Basic auth using STREAM_TOKEN_ID / STREAM_SECRET_KEY.
+      - Tokens are never exposed to the browser.
+    """
+    import requests  # type: ignore
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        return {"ok": False, "error": "event_ref required"}
+
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    # 1) Stop WebRTC stream
+    try:
+        r = requests.post(f"{api_base}/events/{ref}/stopwebrtcstream", headers=headers, timeout=20)
+    except Exception as e:
+        return {"ok": False, "error": f"stopwebrtcstream request failed: {e!r}"}
+
+    stop_ok = (r.status_code // 100 == 2)
+    res: Dict[str, Any] = {
+        "stop_ok": stop_ok,
+        "stop_status_code": r.status_code,
+        "stop_body": (r.text or "")[:1200],
+    }
+    if not stop_ok:
+        res["ok"] = False
+        return res
+
+    # 2) Finalize/End the event (equivalent to BeeStreamed UI "End Live")
+    # NOTE: We use exact "done" (lowercase) and include both `status` and `Status` keys defensively.
+    payload = {"status": "done", "Status": "done"}
+    try:
+        r2 = requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload, timeout=20)
+        end_ok = (r2.status_code // 100 == 2)
+        res.update(
+            {
+                "end_ok": end_ok,
+                "end_status_code": r2.status_code,
+                "end_body": (r2.text or "")[:1200],
+            }
+        )
+
+        # 3) BeeStreamed recommends setting the event back to idle if you want to reuse the same event_ref.
+        # We attempt this as a best-effort step after ending the live session.
+        if end_ok:
+            payload_idle = {"status": "idle", "Status": "idle"}
+            try:
+                r3 = requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload_idle, timeout=20)
+                idle_ok = (r3.status_code // 100 == 2)
+                res.update(
+                    {
+                        "idle_ok": idle_ok,
+                        "idle_status_code": r3.status_code,
+                        "idle_body": (r3.text or "")[:1200],
+                    }
+                )
+            except Exception as e:
+                res.update({"idle_ok": False, "idle_error": f"idle patch failed: {e!r}"})
+
+        # Ending the live session is the primary requirement for stop.
+        # We still include idle_ok diagnostics, but ok tracks end_ok so the UI can recover cleanly.
+        res["ok"] = bool(end_ok)
+        return res
+    except Exception as e:
+        res.update({"end_ok": False, "end_error": f"end-event patch failed: {e!r}", "ok": False})
+        return res
+def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str, Any]]) -> str:
+    host = ""
+    if mapping:
+        host = str(mapping.get("host_member_id") or "").strip()
+
+    # Fallback for current single-host deployment (DulceMoon/Dulce).
+    if not host:
+        if (brand or "").strip().lower() == "dulcemoon" and (avatar or "").strip().lower().startswith("dulce"):
+            host = DULCE_HOST_MEMBER_ID_FALLBACK
+    return host
+
+def _persist_event_ref_best_effort(brand: str, avatar: str, event_ref: str) -> bool:
+    """Try to persist event_ref into the companion_mappings SQLite DB (if writable). Always updates in-memory mapping."""
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    e = (event_ref or "").strip()
+    if not b or not a or not e:
+        return False
+
+    # Always update in-memory mapping so this process is consistent.
+    try:
+        key = (b.lower(), a.lower())
+        if key in _COMPANION_MAPPINGS:
+            _COMPANION_MAPPINGS[key]["event_ref"] = e
+    except Exception:
+        pass
+
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    if not db_path or not os.path.exists(db_path):
+        return False
+
+    try:
+        table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+        # table_name comes from sqlite_master at startup, but keep this defensive.
+        if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+            table_name = "companion_mappings"
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [str(r[1] or "").strip() for r in cur.fetchall()]
+        cols_l = [c.lower() for c in cols]
+
+        # Ensure event_ref column exists
+        if "event_ref" not in cols_l:
+            try:
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN event_ref TEXT")
+                conn.commit()
+                cols_l.append("event_ref")
+            except Exception:
+                # read-only DB or unsupported ALTER; give up persistence but keep in-memory update
+                return False
+
+        # Determine key columns
+        brand_col = "brand" if "brand" in cols_l else ("brand_id" if "brand_id" in cols_l else "")
+        avatar_col = "avatar" if "avatar" in cols_l else ("companion" if "companion" in cols_l else "")
+        if not brand_col or not avatar_col:
+            return False
+
+        cur.execute(
+            f"UPDATE {table_name} SET event_ref = ? WHERE lower({brand_col}) = lower(?) AND lower({avatar_col}) = lower(?)",
+            (e, b, a),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _read_event_ref_from_db(brand: str, avatar: str) -> str:
+    """Read event_ref directly from SQLite.
+
+    Uses the same resolved DB path as session_active so that reads reflect any
+    updates made at runtime (e.g., when /home/site is read-only and we write to
+    the writable /tmp copy).
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return ""
+
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    if not db_path or not os.path.exists(db_path):
+        return ""
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        # If the column isn't present (older DB), treat as empty.
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
+        if "event_ref" not in cols:
+            return ""
+
+        cur.execute(
+            f"SELECT event_ref FROM {table_name} WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
+            (b, a),
+        )
+        row = cur.fetchone()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+
+
+def _get_companion_mappings_db_path(for_write: bool = False) -> str:
+    """Return the SQLite path to use for companion_mappings reads/writes.
+
+    In Azure App Service, /home/site is often read-only at runtime. When we need to
+    write (or read what we previously wrote), we use the writable copy under /tmp
+    created by _ensure_writable_db_copy().
+    """
+    db_path = (_COMPANION_MAPPINGS_SOURCE or "").strip()
+    if not db_path:
+        return ""
+    if for_write:
+        try:
+            return _ensure_writable_db_copy(db_path)
+        except Exception:
+            return db_path
+    # For reads, prefer the writable copy *if it already exists*; otherwise fall back
+    # to the source path.
+    try:
+        writable = _ensure_writable_db_copy(db_path)
+        return writable or db_path
+    except Exception:
+        return db_path
+
+
+def _is_session_active(brand: str, avatar: str) -> bool:
+    """Read session_active from SQLite (fallback to False if missing).
+
+    Defensive: treat a session as active only when it has a non-empty kind and room/ref
+    (when those columns exist). This prevents "phantom" active sessions when a flag
+    is left true but the room/ref is blank.
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return False
+
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    if not db_path or not os.path.exists(db_path):
+        return False
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
+        if "session_active" not in cols:
+            return False
+
+        has_kind = "session_kind" in cols
+        has_ref = "session_event_ref" in cols
+
+        select_cols = ["session_active"]
+        if has_kind:
+            select_cols.append("session_kind")
+        if has_ref:
+            select_cols.append("session_event_ref")
+
+        cur.execute(
+            f"SELECT {', '.join(select_cols)} FROM {table_name} "
+            f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?) LIMIT 1",
+            (b, a),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False
+
+        active_raw = row[0]
+        try:
+            active = bool(int(active_raw)) if active_raw is not None else False
+        except Exception:
+            active = bool(active_raw)
+
+        if not active:
+            return False
+
+        idx = 1
+        if has_kind:
+            kind = str(row[idx] or "").strip()
+            idx += 1
+            if not kind:
+                return False
+
+        if has_ref:
+            ref = str(row[idx] or "").strip()
+            if not ref:
+                return False
+
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+def _set_session_active(brand: str, avatar: str, active: bool, event_ref: Optional[str] = None) -> bool:
+    """Persist session_active (and optionally event_ref if currently empty) to SQLite.
+
+    Returns True if an UPDATE/INSERT was attempted successfully.
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return False
+
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    if not db_path or not os.path.exists(db_path):
+        return False
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    ev = (event_ref or "").strip()
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        # Ensure columns exist; if session_active is missing, do nothing (caller already migrated DB).
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
+        if "session_active" not in cols:
+            return False
+
+        # Update existing row.
+        if ev and ("event_ref" in cols):
+            # Only set event_ref if it's currently NULL/empty, to keep the DB as source of truth.
+            cur.execute(
+                f"UPDATE {table_name} "
+                f"SET session_active = ?, "
+                f"    event_ref = CASE WHEN event_ref IS NULL OR trim(event_ref) = '' THEN ? ELSE event_ref END "
+                f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?)",
+                (1 if active else 0, ev, b, a),
+            )
+        else:
+            cur.execute(
+                f"UPDATE {table_name} "
+                f"SET session_active = ? "
+                f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?)",
+                (1 if active else 0, b, a),
+            )
+
+        if cur.rowcount == 0:
+            # If row doesn't exist, insert minimal keys (other columns nullable).
+            if ev and ("event_ref" in cols):
+                cur.execute(
+                    f"INSERT INTO {table_name} (brand, avatar, session_active, event_ref) VALUES (?, ?, ?, ?)",
+                    (b, a, 1 if active else 0, ev),
+                )
+            else:
+                cur.execute(
+                    f"INSERT INTO {table_name} (brand, avatar, session_active) VALUES (?, ?, ?)",
+                    (b, a, 1 if active else 0),
+                )
+
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+
+
+
+# =============================================================================
+# Session kind/room helpers (shared across workers via the DB)
+#
+# session_active (0/1) remains the truth source for "is a live session active?"
+# session_kind indicates WHAT kind of session is active: "stream" or "conference".
+# session_room is used for conference providers (Jitsi room name).
+# =============================================================================
+
+def _sanitize_room_token(raw: str, *, max_len: int = 128) -> str:
+  """Sanitize a string into a URL-safe token (lowercase, letters/digits/-)."""
+  s = (raw or "").strip().lower()
+  # Replace any non [a-z0-9] with hyphen
+  s = re.sub(r"[^a-z0-9]+", "-", s)
+  s = re.sub(r"-+", "-", s).strip("-")
+  if not s:
+    return "room"
+  return s[:max_len]
+
+
+def _read_session_kind_room(resolved_brand: str, resolved_avatar: str) -> tuple[str, str]:
+  """Read session_kind/session_room from DB. Returns (kind, room) or ("", "") if unavailable."""
+  try:
+    b = (resolved_brand or "").strip()
+    a = (resolved_avatar or "").strip()
+    if not b or not a:
+      return "", ""
+
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+      cur = conn.cursor()
+
+      # Columns may not exist yet in older DBs; detect safely.
+      cur.execute("PRAGMA table_info(companion_mappings)")
+      cols = {row[1].lower() for row in cur.fetchall()}
+
+      if "session_kind" not in cols and "session_room" not in cols:
+        return "", ""
+
+      sel_cols = []
+      if "session_kind" in cols:
+        sel_cols.append("COALESCE(session_kind, '') AS session_kind")
+      else:
+        sel_cols.append("'' AS session_kind")
+      if "session_room" in cols:
+        sel_cols.append("COALESCE(session_room, '') AS session_room")
+      else:
+        sel_cols.append("'' AS session_room")
+
+      cur.execute(
+        f"SELECT {', '.join(sel_cols)} FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)",
+        (b, a),
+      )
+      row = cur.fetchone()
+      if not row:
+        return "", ""
+      kind = (row["session_kind"] or "").strip().lower()
+      room = (row["session_room"] or "").strip()
+      return kind, room
+    finally:
+      conn.close()
+  except Exception:
+    return "", ""
+
+
+def _set_session_kind_room_best_effort(resolved_brand: str, resolved_avatar: str, *, kind: str | None = None, room: str | None = None) -> bool:
+  """Best-effort upsert/update of session_kind/session_room in companion_mappings."""
+  if kind is None and room is None:
+    return True
+
+  try:
+    b = (resolved_brand or "").strip()
+    a = (resolved_avatar or "").strip()
+    if not b or not a:
+      return False
+
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    conn = sqlite3.connect(db_path)
+    try:
+      cur = conn.cursor()
+
+      # Ensure columns exist
+      cur.execute("PRAGMA table_info(companion_mappings)")
+      cols = {row[1].lower() for row in cur.fetchall()}
+
+      if "session_kind" not in cols:
+        cur.execute("ALTER TABLE companion_mappings ADD COLUMN session_kind TEXT")
+        cols.add("session_kind")
+      if "session_room" not in cols:
+        cur.execute("ALTER TABLE companion_mappings ADD COLUMN session_room TEXT")
+        cols.add("session_room")
+
+      # Ensure row exists (INSERT OR IGNORE)
+      cur.execute(
+        "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+        (b, a),
+      )
+
+      # UPDATE only provided fields
+      sets = []
+      params = []
+      if kind is not None:
+        sets.append("session_kind = ?")
+        params.append((kind or "").strip().lower() or None)
+      if room is not None:
+        sets.append("session_room = ?")
+        params.append((room or "").strip() or None)
+
+      if sets:
+        params.extend([b, a])
+        cur.execute(
+          f"UPDATE companion_mappings SET {', '.join(sets)} WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)",
+          tuple(params),
+        )
+
+      conn.commit()
+      return True
+    finally:
+      conn.close()
+  except Exception:
+    return False
+
+
+
+# =============================================================================
+# LiveKit DB columns (non-destructive migrations)
+# =============================================================================
+def _ensure_livekit_columns_best_effort() -> None:
+    """Ensure LiveKit-specific columns exist in companion_mappings.
+
+    This is NON-DESTRUCTIVE: it only adds columns if missing and never drops any
+    existing (including BeeStreamed) columns.
+    """
+    try:
+        db_path = _get_companion_mappings_db_path(for_write=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(companion_mappings)")
+            cols = {row[1].lower() for row in cur.fetchall()}
+
+            # Keep event_ref as the reusable identifier (we store LiveKit roomName there for now).
+            # Add additional LiveKit operational fields.
+            to_add = []
+            if "livekit_room_name" not in cols:
+                to_add.append(("livekit_room_name", "TEXT"))
+            if "livekit_record_egress_id" not in cols:
+                to_add.append(("livekit_record_egress_id", "TEXT"))
+            if "livekit_hls_egress_id" not in cols:
+                to_add.append(("livekit_hls_egress_id", "TEXT"))
+            if "livekit_hls_url" not in cols:
+                to_add.append(("livekit_hls_url", "TEXT"))
+            if "livekit_last_started_at" not in cols:
+                to_add.append(("livekit_last_started_at", "INTEGER"))
+
+            for name, typ in to_add:
+                try:
+                    cur.execute(f"ALTER TABLE companion_mappings ADD COLUMN {name} {typ}")
+                except Exception:
+                    pass
+
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        # Best-effort: DB may be read-only in some environments.
+        return
+
+
+def _set_livekit_fields_best_effort(
+    resolved_brand: str,
+    resolved_avatar: str,
+    *,
+    room_name: str | None = None,
+    record_egress_id: str | None = None,
+    hls_egress_id: str | None = None,
+    hls_url: str | None = None,
+    last_started_at_ms: int | None = None,
+) -> bool:
+    """Best-effort update of LiveKit-specific columns for a (brand, avatar)."""
+    if all(v is None for v in (room_name, record_egress_id, hls_egress_id, hls_url, last_started_at_ms)):
+        return True
+    try:
+        b = (resolved_brand or "").strip()
+        a = (resolved_avatar or "").strip()
+        if not b or not a:
+            return False
+
+        db_path = _get_companion_mappings_db_path(for_write=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            _ensure_livekit_columns_best_effort()
+
+            cur.execute(
+                "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+                (b, a),
+            )
+
+            sets = []
+            params = []
+            if room_name is not None:
+                sets.append("livekit_room_name = ?")
+                params.append((room_name or "").strip() or None)
+            if record_egress_id is not None:
+                sets.append("livekit_record_egress_id = ?")
+                params.append((record_egress_id or "").strip() or None)
+            if hls_egress_id is not None:
+                sets.append("livekit_hls_egress_id = ?")
+                params.append((hls_egress_id or "").strip() or None)
+            if hls_url is not None:
+                sets.append("livekit_hls_url = ?")
+                params.append((hls_url or "").strip() or None)
+            if last_started_at_ms is not None:
+                sets.append("livekit_last_started_at = ?")
+                params.append(int(last_started_at_ms))
+
+            if sets:
+                params.extend([b, a])
+                cur.execute(
+                    f"UPDATE companion_mappings SET {', '.join(sets)} WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)",
+                    tuple(params),
+                )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+class BeeStreamedStartEmbedRequest(BaseModel):
+    brand: str
+    avatar: str
+    embedDomain: Optional[str] = None
+    memberId: Optional[str] = None
+
+class BeeStreamedStopEmbedRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: Optional[str] = None
+    eventRef: Optional[str] = None
+
+class BeeStreamedCreateEventRequest(BaseModel):
+    """Create a BeeStreamed event for a specific (brand, avatar) mapping.
+
+    Only the user whose memberId matches the mapping's host_member_id may create/start the event.
+    Credentials are taken from env on the API host:
+      - STREAM_TOKEN_ID
+      - STREAM_SECRET_KEY
+    """
+    brand: str
+    avatar: str
+    memberId: str
+    embedDomain: Optional[str] = None
+    startStream: bool = True
+
+
+class BeeStreamedEmbedUrlRequest(BaseModel):
+    """Resolve a BeeStreamed embed URL that stays inside our iframe wrapper.
+
+    Accepts either:
+      - eventRef / event_ref, OR
+      - streamUrl / stream_url (we'll try to parse the event ref out of it)
+    """
+    eventRef: Optional[str] = None
+    streamUrl: Optional[str] = None
+
+
+@app.post("/stream/beestreamed/start_embed")
+async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
+    mapping = _lookup_companion_mapping(req.brand, req.avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="No mapping for that brand/avatar")
+
+    resolved_brand = mapping.get("brand") or req.brand
+    resolved_avatar = mapping.get("avatar") or req.avatar
+
+    # Guardrail: BeeStreamed is ONLY for Human companions configured for Stream video.
+    live_lc = str(mapping.get("live") or "").strip().lower()
+    ctype_lc = str(mapping.get("companion_type") or "").strip().lower()
+    cap_lc = str(mapping.get("channel_cap") or "").strip().lower()
+
+    if live_lc != "stream" or ctype_lc != "human" or cap_lc != "video":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "BeeStreamed is only valid for Human companions with channel_cap=Video and live=Stream",
+                "brand": str(resolved_brand),
+                "avatar": str(resolved_avatar),
+                "companion_type": str(mapping.get("companion_type") or ""),
+                "channel_cap": str(mapping.get("channel_cap") or ""),
+                "live": str(mapping.get("live") or ""),
+            },
+        )
+
+    # Host auth: only the configured host can START the stream.
+    host_id = (mapping.get("host_member_id") or "").strip()
+    member_id = (req.memberId or "").strip()
+    is_host = bool(host_id) and bool(member_id) and (host_id.lower() == member_id.lower())
+
+    # We intentionally track "session active" in-memory so viewers can JOIN after the host has started,
+    # without needing to be the host themselves.
+    session_active = _is_session_active(resolved_brand, resolved_avatar)
+
+    # Always read the latest persisted event_ref (this is the value viewers must use to join).
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar) or ""
+    embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
+
+    # Viewer path: allow join only when the host has started a session.
+    if not is_host:
+        if not session_active or not event_ref:
+            return {
+                "ok": True,
+                "status": "waiting",
+                "canStart": False,
+                "isHost": False,
+                "sessionActive": bool(session_active),
+                "eventRef": event_ref,
+                "embedUrl": embed_url,
+                "message": f"Waiting on {resolved_avatar} to start event",
             }
 
-            void startLiveAvatar();
-            return;
-          }
-
-          if (
-            avatarStatus === "connected" ||
-            avatarStatus === "connecting" ||
-            avatarStatus === "reconnecting"
-          ) {
-            void stopLiveAvatar();
-          } else {
-            void (async () => {
-              // Live Avatar requires microphone / STT. Start it automatically.
-              // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
-              if (sttEnabledRef.current && useBackendStt) {
-                stopSpeechToText();
-              }
-
-              if (!sttEnabledRef.current) {
-                await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
-              }
-
-              // If mic permission was denied, don't start Live Avatar.
-              if (!sttEnabledRef.current) return;
-
-              await startLiveAvatar();
-            })();
-          }
-        }}
-        disabled={liveProvider === "stream" ? (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) : false}
-        style={{
-          padding: "10px 14px",
-          borderRadius: 10,
-          border: "1px solid #111",
-          background: "#fff",
-          color: "#111",
-          cursor:
-            liveProvider === "stream" && (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error"))
-              ? "not-allowed"
-              : "pointer",
-          opacity:
-            liveProvider === "stream" && (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) ? 0.6 : 1,
-          fontWeight: 700,
-        }}
-        aria-label={
-          liveProvider === "stream"
-            ? viewerHasJoinedStream
-              ? "Already joined"
-              : "Join live stream"
-            : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting"
-              ? "Stop Live Avatar"
-              : "Start Live Avatar"
+        return {
+            "ok": True,
+            "status": "started",
+            "canStart": False,
+            "isHost": False,
+            "sessionActive": True,
+            "eventRef": event_ref,
+            "embedUrl": embed_url,
+            "message": "",
         }
-        title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
-      >
-        {liveProvider === "stream" ? (
-          <PlayIcon />
-        ) : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" ? (
-          <PauseIcon />
-        ) : (
-          <PlayIcon />
-        )}
-      </button>
 
-      
-      {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
-      {sttControls}
-	      {liveProvider === "stream" &&
-	        ((isHost &&
-	          ((sessionKind === "conference" && Boolean(livekitToken)) ||
-	            (sessionKind === "stream" && sessionActive))) ||
-	          (!isHost && sessionKind === "conference" && Boolean(livekitToken))) ? (	          <button
-	            type="button"
-	            onClick={async () => {
-	              const next = !livekitMicEnabled;
-	              if (next) {
-	                const ok = await requestLivekitAvPermissions({
-	                  audio: true,
-	                  video: sessionKind === "conference",
-	                  reason: "enabling microphone/camera",
-	                });
-	                if (!ok) return;
-	              }
-	              setLivekitMicEnabled(next);
-	              if (sessionKind === "conference") {
-	                setLivekitCameraEnabled(next);
-	              }
-	            }}
-	            style={{
-	              ...smallBtn,
-	              background: livekitMicEnabled ? "#1b5e20" : "#eee",
-	              color: livekitMicEnabled ? "#fff" : "#222",
-	            }}
-	            title={livekitMicEnabled ? "Mute Mic" : "Unmute Mic"}
-	          >
-	            🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
-	          </button>
-	        ) : null}
+    # Host path: ensure an event_ref exists, then start WebRTC.
+    if not event_ref:
+        event_ref = _beestreamed_create_event_sync(req.embedDomain)
+        embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
 
-	      {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
-	        <button
-	          type="button"
-	          onClick={() => {
-	            setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
-	          }}
-	          style={{
-	            ...smallBtn,
-	            background: conferenceViewMode === "focus" ? "#111" : "#eee",
-	            color: conferenceViewMode === "focus" ? "#fff" : "#222",
-	          }}
-	          title={
-	            conferenceViewMode === "focus"
-	              ? "Show split view (both participants)"
-	              : "Show full view (other participant only)"
-	          }
-	        >
-	          {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
-	        </button>
-	      ) : null}
-{liveProvider === "stream" &&
-        ((isHost && sessionActive) ||
-          (!isHost &&
-            (viewerHasJoinedStream || conferenceJoined || livekitJoinStatus === "pending"))) ? (
-        <button
-          type="button"
-          onClick={() => {
-            stopLiveAvatar();
-          }}
-          style={{
-            ...smallBtn,
-            background: "#b00020",
-            color: "#fff",
-          }}
-          title={isHost ? "Stop live session" : "Leave session"}
-        >
-          <StopIcon />
-        </button>
-      ) : null}
+    # Ensure event is scheduled "now" and bound to the correct embed domain (prevents pop-out issues).
+    _beestreamed_schedule_now_sync(
+        event_ref,
+        title=f"{resolved_brand} {resolved_avatar}",
+        embed_domain=req.embedDomain,
+    )
 
-      {liveProvider === "stream" && !isHost ? (
-        <button
-          type="button"
-          onClick={changeViewerLiveChatName}
-          style={{
-            border: "none",
-            background: "transparent",
-            padding: 0,
-            margin: 0,
-            fontSize: 12,
-            color: "#111",
-            textDecoration: "underline",
-            cursor: "pointer",
-            whiteSpace: "nowrap",
-          }}
-          aria-label="Change username"
-          title="Change the name shown to others during the live session"
-        >
-          {String(viewerLiveChatName || "").trim() ? "Change username" : "Set username"}
-        </button>
-      ) : null}
+    start_res = _beestreamed_start_webrtc_sync(event_ref)
 
-      <div style={{ fontSize: 12, color: "#666" }}>
-        {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}:{" "}
-        <b>{avatarStatus}</b>
-        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
-      </div>
-    </div>
+    # BeeStreamed occasionally returns 404 for a stale event ref. Recreate once and retry.
+    if (not start_res.get("ok")) and (start_res.get("status_code") == 404):
+        event_ref = _beestreamed_create_event_sync(req.embedDomain)
+        embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+        _beestreamed_schedule_now_sync(
+            event_ref,
+            title=f"{resolved_brand} {resolved_avatar}",
+            embed_domain=req.embedDomain,
+        )
+        start_res = _beestreamed_start_webrtc_sync(event_ref)
 
-    {/* Right-justified Mode controls */}
-    {modePillControls}
-  </section>
-) : null}
+    if not start_res.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"BeeStreamed start_webrtc failed: {start_res.get('error') or start_res.get('body') or start_res}",
+        )
 
-      <section style={{ marginTop: 18 }}>
-        <div
-          style={{
-            display: "flex",
-            gap: 18,
-            marginTop: 18,
-            flexWrap: "wrap",
-            alignItems: "flex-start",
-          }}
-        >
-          {showAvatarFrame ? (
-            <div
-	              style={{
-	                flex:
-	                  liveProvider === "stream" && sessionKind === "conference"
-	                    ? "2 1 0"
-	                    : liveProvider === "stream" && !isHost
-	                      ? "2 1 0"
-	                      : "0 0 360px",
-                minWidth: liveProvider === "stream" && !isHost ? 320 : 280,
-                maxWidth: "100%",
-              }}
-            >
-              <div
-                style={{
-                  width: "100%",
-                  height: 440,
-                  background: "#000",
-                  border: "1px solid #e5e5e5",
-                  borderRadius: 12,
-                  overflow: "hidden",
-                  position: "relative",
-                }}
-              >
-                {livekitToken ? (
-                  <LiveKitRoom
-                    token={livekitToken}
-                    serverUrl={livekitServerUrl || LIVEKIT_URL}
-                    connect={Boolean(livekitToken)}
-	                    audio={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
-	                    video={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
-                    onConnected={() => {
-	                      // Host: once connected we treat the session as active.
-	                      if (isHost) setSessionActive(true);
-                      // Conference: track that we've joined the room.
-                      if (sessionKind === "conference") setConferenceJoined(true);
-                    }}
-                    onDisconnected={() => {
-                      // If the host ends the session, viewers are kicked from the room.
-                      // Mirror the Stop button behavior so the viewer UI fully exits.
-                      if (!stopInProgressRef.current && !isHost) {
-                        void stopConferenceSession();
-                        return;
-                      }
 
-                      setConferenceJoined(false);
-                      setLivekitToken(null);
-                      setLivekitRole(null);
-                      // Viewer disconnect should not mark the session inactive globally;
-                      // the status poller will reflect whether the host is still live.
-                      if (isHost) setSessionActive(false);
-                    }}
-                    style={{ width: "100%", height: "100%" }}
-                  >
-                    <LiveKitAutoPublish
-                      enabled={sessionKind === "conference" ? true : isHost}
-                      micEnabled={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
-                      cameraEnabled={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
-                      onError={(msg) => setStreamNotice(msg)}
-                    />
-	                    {sessionKind === "conference" ? (
-	                      <LiveKitPrivateConferenceStage viewMode={conferenceViewMode} />
-	                    ) : livekitRole === "viewer" && sessionKind === "stream" ? (
-	                      <LiveKitStreamViewerStage />
-	                    ) : (
-	                      <VideoConference
-	                        chatMessageFormatter={undefined as any}
-	                        onError={(e: any) => {
-	                          console.warn("LiveKit UI error", e);
-	                        }}
-	                      />
-	                    )}
+    # If we're starting a new session on a reused event_ref, clear any persisted livechat rows
+    # so the new session doesn't replay the previous session's chat history.
+    if (not session_active) and event_ref:
+        try:
+            deleted = await run_in_threadpool(_livechat_db_clear_event_sync, event_ref)
+            if deleted:
+                _dlog("Cleared prior livechat history", {"event_ref": event_ref, "deleted": deleted})
+        except Exception as e:
+            _dlog("Failed clearing livechat history (ignored)", {"event_ref": event_ref, "err": str(e)})
 
-                    {livekitRole === "viewer" && (sessionKind === "stream" || sessionKind === "conference") ? null : <StartAudio label="Enable audio" />}
+    _set_session_active(resolved_brand, resolved_avatar, active=True, event_ref=event_ref)
 
-						{livekitRole === "host" && livekitPendingUnique.length > 0 ? (
-                      <div
-                        style={{
-                          position: "absolute",
-                          inset: 0,
-                          pointerEvents: "none",
-                          display: "flex",
-                          alignItems: "flex-end",
-                          justifyContent: "center",
-                          padding: 12,
-                        }}
-                      >
-                        <div
-                          style={{
-                            background: "rgba(0,0,0,0.65)",
-                            border: "1px solid rgba(255,255,255,0.15)",
-                            borderRadius: 12,
-                            padding: 14,
-                            maxWidth: 340,
-                            width: "100%",
-                            pointerEvents: "auto",
-                          }}
-                        >
-                          <div style={{ fontWeight: 700, marginBottom: 8 }}>Join Requests</div>
-                          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-							{livekitPendingUnique.map((req) => (
-                              <div
-                                key={req.requestId}
-                                style={{
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "space-between",
-                                  gap: 10,
-                                }}
-                              >
-                                <div style={{ minWidth: 0 }}>
-                                  <div
-                                    style={{
-                                      fontWeight: 600,
-                                      overflow: "hidden",
-                                      textOverflow: "ellipsis",
-                                      whiteSpace: "nowrap",
-                                    }}
-                                  >
-                                    {req.viewerLabel || "Viewer"}
-                                  </div>
-                                  <div
-                                    style={{
-                                      fontSize: 12,
-                                      opacity: 0.85,
-                                      overflow: "hidden",
-                                      textOverflow: "ellipsis",
-                                      whiteSpace: "nowrap",
-                                    }}
-                                  >
-                                    {req.identity}
-                                  </div>
-                                </div>
-                                <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-                                  <button
-                                    onClick={() => {
-                                      void denyLivekit(req.requestId);
-                                      setLivekitPending((p) => p.filter((x) => x.requestId !== req.requestId));
-                                    }}
-                                    style={{
-                                      padding: "6px 10px",
-                                      borderRadius: 10,
-                                      border: "1px solid rgba(255,255,255,0.25)",
-                                      background: "transparent",
-                                      color: "#fff",
-                                      cursor: "pointer",
-                                      fontWeight: 700,
-                                    }}
-                                  >
-                                    Deny {req.viewerLabel}
-                                  </button>
-                                  <button
-                                    onClick={() => {
-                                      void admitLivekit(req.requestId);
-                                      setLivekitPending((p) => p.filter((x) => x.requestId !== req.requestId));
-                                    }}
-                                    style={{
-                                      padding: "6px 10px",
-                                      borderRadius: 10,
-                                      border: "1px solid rgba(255,255,255,0.25)",
-                                      background: "#fff",
-                                      color: "#111",
-                                      cursor: "pointer",
-                                      fontWeight: 800,
-                                    }}
-                                  >
-                                    Admit {req.viewerLabel}
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      </div>
-                    ) : null}
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room="")
 
-                    {(livekitRole === "viewer" && sessionKind === "conference" && !conferenceJoined) ||
-                    (livekitRole === "viewer" && sessionKind === "conference" && livekitJoinRequestId) ? (
-                      <div
-                        style={{
-                          position: "absolute",
-                          inset: 0,
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          padding: 16,
-                          textAlign: "center",
-                        }}
-                      >
-                        <div
-                          style={{
-                            background: "rgba(0,0,0,0.65)",
-                            border: "1px solid rgba(255,255,255,0.15)",
-                            borderRadius: 12,
-                            padding: 14,
-                            maxWidth: 340,
-                            color: "#fff",
-                          }}
-                        >
-                          <div style={{ fontWeight: 800, marginBottom: 6 }}>
-                            {livekitJoinRequestId ? "Request sent" : "Private session"}
-                          </div>
-                          <div style={{ fontSize: 12, opacity: 0.9 }}>
-                            {livekitJoinRequestId
-                              ? "Waiting for the host to admit you…"
-                              : "Press Play to request to join."}
-                          </div>
-                        </div>
-                      </div>
-                    ) : null}
-                  </LiveKitRoom>
-                ) : liveProvider === "stream" ? (
-                  sessionKind === "stream" && livekitHlsUrl ? (
-                    <LiveKitHlsPlayer src={livekitHlsUrl} />
-                  ) : !(
-                      avatarStatus === "connecting" ||
-                      avatarStatus === "reconnecting" ||
-                      (avatarStatus === "waiting" &&
-                        !(liveProvider === "stream" &&
-                          sessionKind === "conference" &&
-                          livekitRole === "viewer" &&
-                          Boolean(livekitJoinRequestId)))
-                    ) ? (
-                    <div
-                      style={{
-                        position: "absolute",
-                        inset: 0,
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        color: "#fff",
-                        padding: 16,
-                        textAlign: "center",
-                        background: "rgba(0,0,0,0.6)",
-                      }}
-                    >
-                      {sessionActive
-                        ? isHost
-                          ? sessionKind === "conference"
-                            ? "Press Play to re-join your Private session."
-                            : "Press Play to re-join your live stream."
-                          : sessionKind === "conference"
-                            ? livekitJoinRequestId
-                              ? "Request sent — waiting for the host to admit you…"
-                              : "Press Play to request access to Private."
-                            : "Press Play to join the live stream."
-                        : isHost
-                        ? "Press Play to start a session."
-                        : "Host is offline."}
-                    </div>
-                  ) : null
-                ) : null}
+    return {
+        "ok": True,
+        "status": "started",
+        "canStart": True,
+        "isHost": True,
+        "sessionActive": True,
+        "eventRef": event_ref,
+        "embedUrl": embed_url,
+        "message": "",
+    }
+@app.post("/stream/beestreamed/create_event")
+async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
+    """Create (and optionally start) a BeeStreamed event for a configured companion.
 
-				{showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
-                  <div
-                    style={{
-                      position: "absolute",
-                      inset: 0,
-                      background: "rgba(0,0,0,0.35)",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      color: "#fff",
-                      fontWeight: 600,
-                      padding: 16,
-                      textAlign: "center",
-                    }}
-                  >
-                    {avatarStatus === "connecting"
-                      ? "Starting live session…"
-                      : avatarStatus === "waiting"
-                      ? "Waiting for host…"
-                      : avatarStatus === "reconnecting"
-                      ? "Reconnecting…"
-                      : "Live session ended"}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
+    Authorization rule:
+      - Only the host (memberId == host_member_id in voice_video_mappings.sqlite3) may create/start.
+      - Everyone else gets a "waiting" response.
+    """
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
+    member_id = (req.memberId or "").strip()
 
-          <div
-                    style={{
-	                    flex: showAvatarFrame
-	                      ? (liveProvider === "stream" && sessionKind === "conference"
-	                          ? "1 1 0"
-	                          : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
-	                            ? "1 1 0"
-	                            : "2 1 0")
-	                      : "1 1 0",
-                      minWidth: 280,
-                      height: conversationHeight,
-                      display: "flex",
-                      flexDirection: "column",
-                      position: "relative",
-                    }}
-                  >
-                    <div
-                      ref={messagesBoxRef}
-                      style={{
-                        flex: "1 1 auto",
-                        border: "1px solid #e5e5e5",
-                        borderRadius: 12,
-                        padding: 12,
-                        overflowY: "auto",
-                        background: "#fff",
-                      }}
-                    >
-                      {(livekitUiActive
-                        ? messages.filter((x: any) => Boolean((x as any)?.meta?.liveChat))
-                        : messages.filter((x: any) => !Boolean((x as any)?.meta?.liveChat))
-                      ).map((m, i) => {
-                        const meta: any = (m as any).meta;
-                        const displayName =
-                          meta?.liveChat && meta?.name
-                            ? String(meta.name)
-                            : m.role === "assistant"
-                            ? (companionName || DEFAULT_COMPANION_NAME)
-                            : "You";
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
 
-                        return (
-                          <div
-                            key={i}
-                            style={{
-                              marginBottom: 10,
-                              whiteSpace: "pre-wrap",
-                              color: m.role === "assistant" ? "#111" : "#333",
-                            }}
-                          >
-                            <b>{displayName}:</b> {renderMsgContent(m)}
-                          </div>
-                        );
-                      })}
-                      {!livekitUiActive && loading ? (
-                        <div style={{ color: "#666" }}>Thinking…</div>
-                      ) : null}
-                    </div>
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
 
-                    <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>
-                      {/** Input line with mode pills moved to the right (layout-only). */}
-                      <button
-                            type="button"
-                            onClick={requestSaveChatSummary}
-                            title="Save"
-                            aria-label="Save"
-                            style={{
-                              width: 44,
-                              height: 44,
-                              borderRadius: 10,
-                              border: "1px solid #bbb",
-                              background: "#fff",
-                              cursor: "pointer",
-                              opacity: 1,
-                              display: "inline-flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                            }}
-                          >
-                            <SaveIcon size={18} />
-                          </button>
+    resolved_brand = str(mapping.get("brand") or brand).strip()
+    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
 
-                          <button
-                            type="button"
-                            onClick={requestClearMessages}
-                            title="Clear"
-                            aria-label="Delete"
-                            style={{
-                              width: 44,
-                              height: 44,
-                              borderRadius: 10,
-                              border: "1px solid #bbb",
-                              background: "#fff",
-                              cursor: "pointer",
-                              opacity: 1,
-                              display: "inline-flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                            }}
-                          >
-                            <TrashIcon size={18} />
-                          </button>
+    live = str(mapping.get("live") or "").strip().lower()
+    if "stream" not in live:
+        raise HTTPException(status_code=400, detail="This companion is not configured for stream")
 
-                      {/* Attachment upload (images only) */}
-                      <input
-                        ref={uploadInputRef}
-                        type="file"
-                        accept="*/*"
-                        style={{ display: "none" }}
-                        onChange={onAttachmentSelected}
-                      />
-	                  <button
-	                    onClick={openUploadPicker}
-	                    disabled={attachmentButtonDisabled}
-                        title={
-                          uploadsDisabled || hostInStreamUi || viewerInStreamUi
-                            ? "Attachments are disabled during Shared Live streaming."
-                            : "Attach a file"
-                        }
-	                    className="rounded border border-gray-300 px-3 py-2 text-sm"
-	                    style={{
-	                      height: 44,
-	                      minWidth: 44,
-	                      background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
-	                    }}
-                        type="button"
-                      >
-                        {uploadingAttachment ? "⏳" : "📎"}
-                      </button>
+    comp_type = str(mapping.get("companion_type") or "").strip()
+    if comp_type and comp_type.lower() != "human":
+        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
 
-                      {pendingAttachment && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 6,
-                            padding: "4px 8px",
-                            border: "1px solid #e5e5e5",
-                            borderRadius: 9999,
-                            background: "#fff",
-                            maxWidth: 320,
-                          }}
-                          title={pendingAttachment?.name || "attachment"}
-                        >
-                          <a href={pendingAttachment.url} target="_blank" rel="noopener noreferrer">
-                            {pendingAttachment.contentType?.toLowerCase().startsWith("image/") ? (
-                            <img
-                              src={pendingAttachment.url}
-                              alt={pendingAttachment.name}
-                              style={{
-                                width: 28,
-                                height: 28,
-                                objectFit: "cover",
-                                borderRadius: 6,
-                              }}
-                            />
-                          ) : (
-                            <div
-                              style={{
-                                width: 28,
-                                height: 28,
-                                borderRadius: 6,
-                                border: "1px solid #e5e7eb",
-                                background: "#fff",
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                fontSize: 16,
-                                lineHeight: "16px",
-                              }}
-                              title={pendingAttachment.contentType || "file"}
-                            >
-                              📎
-                            </div>
-                          )}
-                          </a>
-                          <a
-                            href={pendingAttachment.url}
-                            target="_blank"
-                            rel="noreferrer"
-                            style={{
-                              fontSize: 12,
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                              maxWidth: 220,
-                              color: "#111827",
-                              textDecoration: "underline",
-                            }}
-                            title={pendingAttachment.url}
-                          >
-                            {pendingAttachment.name}
-                          </a>
-                          <button
-                            onClick={clearPendingAttachment}
-                            type="button"
-                            style={{
-                              width: 22,
-                              height: 22,
-                              borderRadius: 9999,
-                              border: "1px solid #ddd",
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              lineHeight: 1,
-                            }}
-                            aria-label="Remove attachment"
-                            title="Remove attachment"
-                          >
-                            ×
-                          </button>
-                        </div>
-                      ) : uploadError && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
-                        <div
-                          style={{
-                            fontSize: 12,
-                            color: "#b91c1c",
-                            maxWidth: 320,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                          title={uploadError}
-                        >
-                          {uploadError}
-                        </div>
-                      ) : null}
+    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
+    is_host = bool(host_id and member_id and member_id == host_id)
 
-                      <input
-                        ref={inputElRef}
-                        value={input}
-                        onChange={(e) => setInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.preventDefault();
-                            send();
-                          }
-                        }}
-                        placeholder={
-                          sttEnabled
-                            ? "Listening…"
-                            : !isHost && sessionActive && sessionKind === "conference" && !conferenceJoined
-                            ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
-                            : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
-                            ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
-                            : "Type a message…"
-                        }
-                        style={{
-                          flex: 1,
-                          padding: "10px 12px",
-                          borderRadius: 10,
-                          border: "1px solid #ddd",
-                        }}
-                      />
+    if not is_host:
+        existing_ref = str(mapping.get("event_ref") or "").strip()
+        return {
+            "ok": True,
+            "status": "waiting_for_host",
+            "canStart": False,
+            "isHost": False,
+            "eventRef": existing_ref,
+            "embedUrl": f"/stream/beestreamed/embed/{existing_ref}" if existing_ref else "",
+            "message": f"Waiting on {resolved_avatar} to start event",
+        }
 
-                      <button
-                        onClick={() => send()}
-                        disabled={loading || uploadingAttachment}
-                        style={{
-                          padding: "10px 14px",
-                          borderRadius: 10,
-                          border: "1px solid #111",
-                          background: "#111",
-                          color: "#fff",
-                          cursor: "pointer",
-                        }}
-                      >
-                        Send
-                      </button>
+    # Host path: reuse existing event_ref if present, else create and persist.
+    event_ref = str(mapping.get("event_ref") or "").strip()
+    created_in_this_call = False
+    if not event_ref:
+        created_in_this_call = True
+        event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
 
-                    </div>
+    if bool(req.startStream):
+        def _start_event(_ref: str) -> None:
+            _beestreamed_schedule_now_sync(_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
+            _beestreamed_start_webrtc_sync(_ref)
 
-          	          {sttError ? (
-          	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-          	          ) : null}
+        try:
+            _start_event(event_ref)
+        except HTTPException as e:
+            if int(getattr(e, "status_code", 0) or 0) == 404:
+                if created_in_this_call:
+                    import time as _time
 
-                    {/* LiveKit Broadcast overlay (Host-only) */}
-                    {showBroadcastButton && showBroadcasterOverlay ? (
-                      <div
-                        style={{
-                          position: "absolute",
-                          inset: 0,
-                          zIndex: 50,
-                          borderRadius: 12,
-                          overflow: "hidden",
-                          background: "#0b0b0b",
-                          border: "1px solid #e5e5e5",
-                          display: "flex",
-                          flexDirection: "column",
-                        }}
-                      >
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            gap: 10,
-                            padding: "10px 12px",
-                            background: "#111",
-                            color: "#fff",
-                            borderBottom: "1px solid rgba(255,255,255,0.12)",
-                          }}
-                        >
-                          <div style={{ fontWeight: 800, fontSize: 13 }}>Broadcast (LiveKit)</div>
+                    _time.sleep(1.0)
+                    _start_event(event_ref)
+                else:
+                    event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
+                    _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+                    _start_event(event_ref)
+            else:
+                raise
 
-                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                            {livekitHlsUrl ? (
-                              <span style={{ fontSize: 12, opacity: 0.85 }} title={livekitHlsUrl}>
-                                HLS enabled
-                              </span>
-                            ) : null}
-
-                            <button
-                              type="button"
-                              onClick={() => void toggleBroadcastOverlay()}
-                              style={{
-                                padding: "8px 12px",
-                                borderRadius: 10,
-                                border: "1px solid #fff",
-                                background: "transparent",
-                                color: "#fff",
-                                cursor: "pointer",
-                                fontWeight: 800,
-                                fontSize: 12,
-                              }}
-                              title="Stop broadcast"
-                            >
-                              Stop
-                            </button>
-                          </div>
-                        </div>
-
-                        <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
-                          {broadcastPreparing ? (
-                            <div
-                              style={{
-                                width: "100%",
-                                height: "100%",
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                padding: 16,
-                                textAlign: "center",
-                                color: "#fff",
-                              }}
-                            >
-                              Preparing broadcast…
-                            </div>
-                          ) : broadcastError ? (
-                            <div
-                              style={{
-                                width: "100%",
-                                height: "100%",
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                padding: 16,
-                                textAlign: "center",
-                                color: "#ffb4b4",
-                              }}
-                            >
-                              Broadcast unavailable: {broadcastError}
-                            </div>
-                          ) : livekitToken && livekitRoomName ? (
-                            <LiveKitRoom
-                              token={livekitToken}
-                              serverUrl={livekitServerUrl || LIVEKIT_URL}
-                              connect={Boolean(livekitToken)}
-                              audio={true}
-                              video={true}
-                              style={{ width: "100%", height: "100%" }}
-                              onDisconnected={() => {
-                                // If the backend stops the session, close the overlay UI.
-                                setLivekitToken("");
-                                setShowBroadcasterOverlay(false);
-                                setSessionActive(false);
-                                setSessionKind("");
-                                setSessionRoom("");
-                                setAvatarStatus("idle");
-                              }}
-                            >
-                              {livekitRole === "viewer" && (sessionKind === "stream" || sessionKind === "conference") ? (
-              <LiveKitStreamViewerStage />
-            ) : (
-              <VideoConference />
-            )}
-                            </LiveKitRoom>
-                          ) : (
-                            <div
-                              style={{
-                                width: "100%",
-                                height: "100%",
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                padding: 16,
-                                textAlign: "center",
-                                color: "#fff",
-                              }}
-                            >
-                              No host token available. Click Broadcast again to retry.
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    ) : null}
-                  </div>
-      
-        </div>
-      </section>
+    return {
+        "ok": True,
+        "status": "started",
+        "canStart": True,
+        "isHost": True,
+        "eventRef": event_ref,
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
+        "message": "",
+    }
 
 
 
-      {/* Save Chat Summary confirmation overlay */}
-      {showSaveSummaryConfirm && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.4)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-            zIndex: 10000,
-          }}
-        >
-          <div
-            style={{
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              maxWidth: 560,
-              width: "100%",
-              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
-            }}
-          >
-            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
-              Save chat summary?
-            </div>
-            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
-              Saving stores a server-side summary of this conversation for future reference across your devices.
-              By selecting <b>Yes, save</b>, you authorize AI Elara to store chat summary data associated with your
-              account for later use.
-              <div style={{ marginTop: 8 }}>
-                All audio, video, and mic listening have been stopped. You can resume manually using the controls
-                after closing this dialog.
-              </div>
-            </div>
+@app.get("/stream/beestreamed/status")
+async def beestreamed_status(brand: str, avatar: str):
+    """Return current BeeStreamed mapping state for a companion (does not start anything)."""
+    brand = (brand or "").strip()
+    avatar = (avatar or "").strip()
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
 
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
-              <button
-                type="button"
-                onClick={() => {
-                  if (savingSummary) return;
-                  setShowSaveSummaryConfirm(false);
-                  // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
-                  try { boostAllTtsVolumes(); } catch (e) {}
-                  void restoreVolumesAfterClearCancel();
-                }}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  border: "1px solid #bbb",
-                  background: "#fff",
-                  cursor: savingSummary ? "not-allowed" : "pointer",
-                  opacity: savingSummary ? 0.65 : 1,
-                }}
-              >
-                No
-              </button>
-              <button
-                type="button"
-                onClick={async () => {
-                  if (savingSummary) return;
-                  setSavingSummary(true);
-                  const rawCompanionLabel = (
-                     (companionName || "").trim() ||
-                    (companionKey || "").trim() ||
-                    DEFAULT_COMPANION_NAME
-                  ).trim() || DEFAULT_COMPANION_NAME;
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
 
-                  // For user-facing messages, show only the companion's first name (no demographics).
-                  const companionForDisplay = (() => {
-                    const s = rawCompanionLabel;
-                    const afterNs = s.includes("::") ? (s.split("::").pop() || s) : s;
-                    const base = (afterNs.split("-")[0] || "").trim();
-                    return base || afterNs || DEFAULT_COMPANION_NAME;
-                  })();
-                  try {
-                    const payloadMessages = messages.slice();
-                    if (payloadMessages.length === 0) {
-                      setMessages((prev) => [
-                        ...prev,
-                        { role: "assistant", content: "There is nothing to save yet." },
-                      ]);
-                      setShowSaveSummaryConfirm(false);
-                      return;
-                    }
+    resolved_brand = mapping.get("brand") or brand
+    resolved_avatar = mapping.get("avatar") or avatar
 
-                    const resp = await callSaveChatSummary(payloadMessages, sessionState);
-                    if (resp?.ok) {
-                      const keyHint = typeof resp?.key === "string" ? resp.key : "";
-                      const persistHint = keyHint.startsWith("session::")
-                        ? " (note: no memberId detected; memory will not persist across new sessions)"
-                        : "";
-                      setMessages((prev) => [
-                        ...prev,
-                        { role: "assistant", content: `Chat saved for ${companionForDisplay}.${persistHint}` },
-                      ]);
-                    } else {
-                      setMessages((prev) => [
-                        ...prev,
-                        { role: "assistant", content: `Chat NOT saved for ${companionForDisplay}${resp?.error_code ? ` (reason: ${resp.error_code})` : ""}.` },
-                      ]);
-                    }
-                  } catch (e) {
-                    setMessages((prev) => [
-                      ...prev,
-                      { role: "assistant", content: `Save failed for ${companionForDisplay}: ${String(e?.message || e)}` },
-                    ]);
-                  } finally {
-                    setSavingSummary(false);
-                    setShowSaveSummaryConfirm(false);
-                    // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
-                    try { boostAllTtsVolumes(); } catch (e) {}
-                    void restoreVolumesAfterClearCancel();
-                  }
-                }}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
-                  color: "#fff",
-                  cursor: savingSummary ? "not-allowed" : "pointer",
-                  opacity: savingSummary ? 0.7 : 1,
-                }}
-              >
-                {savingSummary ? "Saving…" : "Yes, save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+    # Use DB as the source of truth for event_ref.
+    # When the app runs with multiple workers, each worker has its own in-memory
+    # mapping cache; without this DB read, pollers can observe different eventRef values.
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar)
+    mapping["event_ref"] = event_ref
 
-      {/* Clear Messages confirmation overlay */}
-      {showClearMessagesConfirm && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.4)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-            zIndex: 10000,
-          }}
-        >
-          <div
-            style={{
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              maxWidth: 520,
-              width: "100%",
-              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
-            }}
-          >
-            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Clear messages?</div>
-            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
-              This will clear the conversation on your screen. All audio, video, and mic listening have been stopped. You can resume manually using the controls after closing this dialog.
-            </div>
+    active = bool(_is_session_active(resolved_brand, resolved_avatar))
 
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
-              <button
-                type="button"
-                onClick={() => {
-                    setShowClearMessagesConfirm(false);
-                    // User gesture: restore boosted routing so subsequent TTS isn't quiet.
-                    try { boostAllTtsVolumes(); } catch (e) {}
-                    // Restore audio routing/volume immediately.
-                    void restoreVolumesAfterClearCancel();
-                  }}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  border: "1px solid #bbb",
-                  background: "#fff",
-                  cursor: "pointer",
-                }}
-              >
-                No
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  // Clear UI + any queued (live-session) messages.
-                  streamDeferredQueueRef.current = [];
-                  streamPreSessionHistoryRef.current = null;
-                  prevSessionActiveRef.current = false;
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
 
-                  setMessages([]);
-                  setInput("");
-                  try { if (inputElRef.current) inputElRef.current.value = ""; } catch (e) {}
-                  setShowClearMessagesConfirm(false);
-                  // User gesture: restore boosted routing so subsequent TTS isn't quiet.
-                  try { boostAllTtsVolumes(); } catch (e) {}
-                  // Re-prime audio outputs after a hard stop so Audio TTS doesn't come back quiet (iOS/Safari).
-                  void restoreVolumesAfterClearCancel();
-                }}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
-                  color: "#fff",
-                  cursor: "pointer",
-                }}
-              >
-                Yes, clear
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+    # Back-compat: older DBs won't have session_kind; treat an active session as a stream.
 
-{/* Consent overlay */}
-      {showConsentOverlay && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.4)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-            zIndex: 9999,
-          }}
-        >
-          <div
-            style={{
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              maxWidth: 520,
-              width: "100%",
-            }}
-          >
-            <h3 style={{ marginTop: 0 }}>Consent Required</h3>
-            <p style={{ marginTop: 0 }}>
-              To enable <b>Intimate (18+)</b> mode, please confirm you are 18+ and consent to an
-              Intimate (18+) conversation.
-            </p>
+    if active and not session_kind:
 
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                onClick={() => {
-                  // Ensure backend receives pending_consent + intimate mode
-                  setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
-                  send("Yes", { pending_consent: "intimate", mode: "intimate" });
-                }}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
-                  color: "#fff",
-                }}
-              >
-                Yes
-              </button>
+        session_kind = "stream"
 
-              <button
-                onClick={() => {
-                  setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
-                  send("No", { pending_consent: "intimate", mode: "intimate" });
-                }}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #ddd",
-                  background: "#fff",
-                }}
-              >
-                No
-              </button>
 
-              <button
-                onClick={() => {
-                  setChatStatus("safe");
-                  setSessionState((prev) => ({ ...prev, pending_consent: null, mode: "friend" }));
-                }}
-                style={{
-                  marginLeft: "auto",
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #ddd",
-                  background: "#fff",
-                }}
-              >
-                Cancel
-              </button>
-            </div>
+    return {
 
-            <div style={{ marginTop: 10, fontSize: 12, color: "#666" }}>
-              Tip: You can also type <b>[mode:intimate]</b> or <b>[mode:romantic]</b> to switch.
-            </div>
-          </div>
-        </div>
-      )}
+        "ok": True,
 
-      {/* Debug overlay (mobile-friendly) */}
-      {debugOpen && (
-        <div
-          style={{
-            position: "fixed",
-            left: 10,
-            right: 10,
-            // Place the overlay at the bottom so it doesn't cover the mic + input controls.
-            bottom: "calc(10px + env(safe-area-inset-bottom))",
-            zIndex: 999999,
-            background: "rgba(0,0,0,0.88)",
-            color: "#fff",
-            borderRadius: 12,
-            padding: 10,
-            boxShadow: "0 10px 24px rgba(0,0,0,0.35)",
-            maxHeight: "35vh",
-            overflow: "hidden",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <div style={{ fontWeight: 700, fontSize: 13 }}>Debug Logs ({debugLogs.length})</div>
-            <button
-              onClick={async () => {
-                const textToCopy = debugLogs.join("\n");
-                let copied = false;
+        "eventRef": event_ref,
 
-                // Try modern Clipboard API first.
-                try {
-                  if (navigator.clipboard?.writeText) {
-                    await navigator.clipboard.writeText(textToCopy);
-                    copied = true;
-                  }
-                } catch {
-                  copied = false;
-                }
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
 
-                // Fallback: execCommand("copy") via a hidden textarea.
-                if (!copied) {
-                  try {
-                    const ta = document.createElement("textarea");
-                    ta.value = textToCopy;
-                    ta.setAttribute("readonly", "true");
-                    ta.style.position = "fixed";
-                    ta.style.top = "0";
-                    ta.style.left = "0";
-                    ta.style.width = "1px";
-                    ta.style.height = "1px";
-                    ta.style.opacity = "0";
-                    document.body.appendChild(ta);
-                    ta.focus();
-                    ta.select();
-                    copied = document.execCommand("copy");
-                    document.body.removeChild(ta);
-                  } catch {
-                    copied = false;
-                  }
-                }
+        "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
 
-                if (copied) {
-                  // eslint-disable-next-line no-alert
-                  alert("Copied debug logs to clipboard.");
-                } else {
-                  // Last resort: show a prompt with selectable text so the user can copy manually.
-                  // eslint-disable-next-line no-alert
-                  window.prompt("Copy debug logs:", textToCopy);
-                }
-              }}
-              style={{
-                marginLeft: "auto",
-                padding: "6px 10px",
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.25)",
-                background: "rgba(255,255,255,0.10)",
-                color: "#fff",
-                cursor: "pointer",
-              }}
-            >
-              Copy
-            </button>
-            <button
-              onClick={() => setDebugLogs([])}
-              style={{
-                padding: "6px 10px",
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.25)",
-                background: "rgba(255,255,255,0.10)",
-                color: "#fff",
-                cursor: "pointer",
-              }}
-            >
-              Clear
-            </button>
-            <button
-              onClick={() => setDebugOpen(false)}
-              style={{
-                padding: "6px 10px",
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.25)",
-                background: "rgba(255,255,255,0.10)",
-                color: "#fff",
-                cursor: "pointer",
-              }}
-            >
-              Close
-            </button>
-            <button
-              onClick={() => {
-                setDebugOpen(false);
-                setDebugEnabled(false);
-                setDebugLogs([]);
-              }}
-              style={{
-                padding: "6px 10px",
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.25)",
-                background: "rgba(255,80,80,0.25)",
-                color: "#fff",
-                cursor: "pointer",
-              }}
-            >
-              Disable
-            </button>
-          </div>
+        "companionType": str(mapping.get("companion_type") or "").strip(),
 
-          <div
-            style={{
-              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
-              fontSize: 11,
-              lineHeight: 1.35,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              overflowY: "auto",
-              maxHeight: "26vh",
-              borderRadius: 10,
-              padding: 8,
-              background: "rgba(255,255,255,0.06)",
-              border: "1px solid rgba(255,255,255,0.12)",
-            }}
-          >
-            {debugLogs.length === 0 ? (
-              <div style={{ opacity: 0.8 }}>No logs yet. Tap around, then press Copy.</div>
-            ) : (
-              debugLogs.map((l, i) => <div key={i}>{l}</div>)
-            )}
-          </div>
+        "live": str(mapping.get("live") or "").strip(),
 
-          <div style={{ marginTop: 8, fontSize: 11, opacity: 0.85 }}>
-            Tip: Tap the avatar image 5 times to toggle this overlay.
-          </div>
-        </div>
-      )}
+        "sessionActive": active,
 
-</main>
-  );
-}
+        "sessionKind": session_kind,
+
+        "sessionRoom": session_room,
+    }
+
+
+    
+
+
+
+@app.get("/stream/livekit/status_legacy")
+async def livekit_status(brand: str, avatar: str):
+    """Return current LiveKit mapping state for a companion (does not start anything).
+
+    Mirrors /stream/beestreamed/status but sources LiveKit-specific fields from DB.
+    """
+    brand = (brand or "").strip()
+    avatar = (avatar or "").strip()
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
+
+    resolved_brand = mapping.get("brand") or brand
+    resolved_avatar = mapping.get("avatar") or avatar
+
+    # Canonical durable reference for the session in this app is event_ref (now used as room name for LiveKit).
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar)
+    mapping["event_ref"] = event_ref
+
+    active = bool(_is_session_active(resolved_brand, resolved_avatar))
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    if active and not session_kind:
+        session_kind = "stream"
+
+    # LiveKit fields (best-effort; columns may not exist on older DBs)
+    livekit_room_name = ""
+    livekit_hls_url = ""
+    livekit_record_egress_id = ""
+    livekit_hls_egress_id = ""
+    livekit_last_started_at = 0
+    try:
+        db_path = _get_companion_mappings_db_path(for_write=False)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT livekit_room_name, livekit_hls_url, livekit_record_egress_id, livekit_hls_egress_id, livekit_last_started_at
+                FROM companion_mappings
+                WHERE brand = ? AND avatar = ?
+                LIMIT 1
+                """,
+                (resolved_brand, resolved_avatar),
+            )
+            row = cur.fetchone()
+            if row:
+                livekit_room_name = str(row[0] or "").strip()
+                livekit_hls_url = str(row[1] or "").strip()
+                livekit_record_egress_id = str(row[2] or "").strip()
+                livekit_hls_egress_id = str(row[3] or "").strip()
+                try:
+                    livekit_last_started_at = int(row[4] or 0)
+                except Exception:
+                    livekit_last_started_at = 0
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        # ignore; return base fields only
+        pass
+
+    # Normalize: prefer session_room, then livekit_room_name, then event_ref
+    room = (session_room or "").strip() or livekit_room_name or event_ref
+
+    return {
+        "ok": True,
+        "eventRef": room,  # frontend uses this as its durable room reference
+        "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
+        "companionType": str(mapping.get("companion_type") or "").strip(),
+        "live": str(mapping.get("live") or "").strip(),
+        "sessionActive": active,
+        "sessionKind": session_kind,
+        "sessionRoom": room,
+        "livekit": {
+            "roomName": livekit_room_name or room,
+            "hlsUrl": livekit_hls_url,
+            "recordEgressId": livekit_record_egress_id,
+            "hlsEgressId": livekit_hls_egress_id,
+            "lastStartedAt": livekit_last_started_at,
+        },
+    }
+
+
+@app.post("/stream/livekit/livechat/send")
+async def livekit_livechat_send(req: LiveChatSendRequest):
+    """Alias LiveKit chat send to the existing livechat pipeline (room is eventRef)."""
+    return await beestreamed_livechat_send(req)
+
+
+@app.websocket("/stream/livekit/livechat/{event_ref}")
+async def livekit_livechat_ws(websocket: WebSocket, event_ref: str):
+    """Alias LiveKit chat websocket to the existing livechat pipeline."""
+    return await beestreamed_livechat_ws(websocket, event_ref)
+
+
+@app.post("/conference/livekit/livechat/send")
+async def conference_livekit_livechat_send(req: LiveChatSendRequest):
+    """Conference LiveKit chat send (same pipeline as stream)."""
+    return await beestreamed_livechat_send(req)
+
+
+@app.websocket("/conference/livekit/livechat/{event_ref}")
+async def conference_livekit_livechat_ws(websocket: WebSocket, event_ref: str):
+    """Conference LiveKit chat websocket (same pipeline as stream)."""
+    return await beestreamed_livechat_ws(websocket, event_ref)
+
+@app.post("/stream/beestreamed/embed_url")
+async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
+    """Return an embeddable URL that *cannot* pop out of the iframe.
+
+    This is useful when the frontend already has an eventRef (or a BeeStreamed viewer URL)
+    and only needs the safe wrapper URL for the iframe container.
+    """
+    event_ref = (req.eventRef or "").strip()
+    stream_url = (req.streamUrl or "").strip()
+
+    if not event_ref and stream_url:
+        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
+
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="eventRef (or a streamUrl containing it) is required")
+
+    return {
+        "ok": True,
+        "eventRef": event_ref,
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
+    }
+@app.post("/stream/beestreamed/stop_embed")
+async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
+    """Stop a BeeStreamed stream session.
+
+    - Only the configured host may actually stop/end the stream.
+    - Viewers may call this endpoint (e.g., when closing the iframe) but it won't stop the stream.
+    """
+    mapping = _lookup_companion_mapping(req.brand, req.avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="No mapping for that brand/avatar")
+
+    resolved_brand = mapping.get("brand") or req.brand
+    resolved_avatar = mapping.get("avatar") or req.avatar
+
+    host_id = (mapping.get("host_member_id") or "").strip()
+    member_id = (req.memberId or "").strip()
+    is_host = bool(host_id) and bool(member_id) and (host_id.lower() == member_id.lower())
+
+    # Prefer explicit eventRef from the client; fall back to DB.
+    event_ref = (req.eventRef or "").strip() or (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip()
+
+    if not is_host:
+        return {
+            "ok": True,
+            "status": "not_host",
+            "isHost": False,
+            "canStop": False,
+            "sessionActive": bool(_is_session_active(resolved_brand, resolved_avatar)),
+            "eventRef": event_ref,
+            "message": "",
+        }
+
+    if not event_ref:
+        # If the host tries to stop without an eventRef, mark the session inactive anyway.
+        _set_session_active(resolved_brand, resolved_avatar, active=False)
+
+        _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+        _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, record_egress_id=None, hls_egress_id=None, hls_url=None)
+        return {
+            "ok": True,
+            "status": "no_event_ref",
+            "isHost": True,
+            "canStop": True,
+            "sessionActive": False,
+            "eventRef": "",
+            "message": "No eventRef to stop.",
+        }
+
+
+    # Idempotence: remember whether the session was actually active before stopping, so we don't
+    # spam duplicate system lines if stop is called multiple times.
+    was_active = bool(_is_session_active(resolved_brand, resolved_avatar))
+
+    stop_res = _beestreamed_stop_webrtc_sync(event_ref)
+    if not stop_res.get("ok"):
+        raise HTTPException(status_code=502, detail=f"BeeStreamed stop failed: {stop_res}")
+
+    _set_session_active(resolved_brand, resolved_avatar, active=False, event_ref=event_ref)
+
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+    # Best-effort: notify any connected shared-live-chat clients.
+    if was_active:
+        try:
+            # 1) Force clients to exit live-chat mode cleanly.
+            await _livechat_broadcast(
+                event_ref,
+                {"type": "session_ended", "eventRef": event_ref, "ts": time.time()},
+            )
+
+            # 2) Also emit a visible system line into the chat history/UI.
+            sys_msg: Dict[str, Any] = {
+                "type": "chat",
+                "eventRef": event_ref,
+                "text": "Host ended the live stream.",
+                "clientMsgId": str(uuid.uuid4()),
+                "ts": time.time(),
+                "senderId": "",
+                "senderRole": "system",
+                "name": "System",
+            }
+            _livechat_push_history(event_ref, sys_msg)
+            await run_in_threadpool(_livechat_db_insert_sync, event_ref, sys_msg)
+            await _livechat_broadcast(event_ref, sys_msg)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "status": "stopped",
+        "isHost": True,
+        "canStop": True,
+        "sessionActive": False,
+        "eventRef": event_ref,
+        "message": "",
+    }
+
+
+# =============================================================================
+# Jitsi Conference (one-on-one) session control
+#
+# The front-end embeds Jitsi Meet (External API) when session_active=1 AND
+# session_kind == "conference". Viewers never call /start (host-only).
+# =============================================================================
+
+class JitsiConferenceStartRequest(BaseModel):
+  brand: str
+  avatar: str
+  memberId: str = ""
+  displayName: str = ""
+
+
+class JitsiConferenceStopRequest(BaseModel):
+  brand: str
+  avatar: str
+  memberId: str = ""
+
+
+@app.post("/conference/jitsi/start")
+async def jitsi_conference_start(req: JitsiConferenceStartRequest):
+  resolved_brand = (req.brand or "").strip()
+  resolved_avatar = (req.avatar or "").strip()
+  if not resolved_brand or not resolved_avatar:
+    raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+  if not mapping:
+    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+  host_member_id = str(mapping.get("host_member_id") or "").strip()
+  caller_member_id = str(req.memberId or "").strip()
+
+  if not host_member_id or caller_member_id != host_member_id:
+    raise HTTPException(status_code=403, detail="Only the host can start the conference.")
+
+  # Stable, per-companion room name (shared across sessions)
+  room = _sanitize_room_token(f"{resolved_brand}-{resolved_avatar}")
+
+  # Persist state for multi-worker viewers
+  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
+  _set_session_active(resolved_brand, resolved_avatar, True, event_ref=None)
+
+  return {"ok": True, "sessionActive": True, "sessionKind": "conference", "sessionRoom": room}
+
+
+@app.post("/conference/jitsi/stop")
+async def jitsi_conference_stop(req: JitsiConferenceStopRequest):
+  resolved_brand = (req.brand or "").strip()
+  resolved_avatar = (req.avatar or "").strip()
+  if not resolved_brand or not resolved_avatar:
+    raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+  if not mapping:
+    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+  host_member_id = str(mapping.get("host_member_id") or "").strip()
+  caller_member_id = str(req.memberId or "").strip()
+
+  if not host_member_id or caller_member_id != host_member_id:
+    raise HTTPException(status_code=403, detail="Only the host can stop the conference.")
+
+  _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
+  # Clear kind/room so next Play click re-prompts host
+  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+  return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
+
+def _safe_int(val: Any) -> Optional[int]:
+    """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
+    try:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+        m = re.search(r"-?\d+", s)
+        if not m:
+            return None
+        return int(m.group(0))
+    except Exception:
+        return None
+
+def _session_get_str(session_state: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        try:
+            v = session_state.get(k)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+def _normalize_plan_name_for_limits(plan_name: str) -> str:
+    p = (plan_name or "").strip()
+    if not p:
+        return ""
+    # Normalize "Test - X" plans to X for quota purposes
+    if p.lower().startswith("test - "):
+        p = p[7:].strip()
+    return p
+
+def _included_minutes_for_plan(plan_name: str) -> int:
+    p = _normalize_plan_name_for_limits(plan_name).lower()
+
+    if p == "friend":
+        return INCLUDED_MINUTES_FRIEND
+    if p == "romantic":
+        return INCLUDED_MINUTES_ROMANTIC
+    if p == "intimate (18+)":
+        return INCLUDED_MINUTES_INTIMATE
+    if p == "pay as you go":
+        return INCLUDED_MINUTES_PAYG
+    # Unknown / not provided -> 0 included minutes
+    return 0
+
+def _get_client_ip(request: Request) -> str:
+    # Azure front-ends commonly set x-forwarded-for with a comma-separated chain.
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    rip = (request.headers.get("x-real-ip") or "").strip()
+    if rip:
+        return rip
+    cip = (request.headers.get("x-client-ip") or "").strip()
+    if cip:
+        return cip
+    try:
+        return str(getattr(request.client, "host", "") or "").strip()
+    except Exception:
+        return ""
+
+def _load_usage_store() -> Dict[str, Any]:
+    try:
+        if not os.path.isfile(_USAGE_STORE_PATH):
+            return {}
+        with open(_USAGE_STORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_usage_store(store: Dict[str, Any]) -> None:
+    try:
+        folder = os.path.dirname(_USAGE_STORE_PATH) or "."
+        os.makedirs(folder, exist_ok=True)
+        tmp = _USAGE_STORE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store, f)
+        os.replace(tmp, _USAGE_STORE_PATH)
+    except Exception:
+        # Fail-open: do not crash the API
+        return
+
+def _usage_paywall_message(
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed: int,
+    *,
+    upgrade_url: str = "",
+    payg_pay_url: str = "",
+    payg_increment_minutes: Optional[int] = None,
+    payg_price_text: str = "",
+) -> str:
+    """Generate the user-facing message when minutes are exhausted.
+
+    Supports per-request overrides (RebrandingKey) for:
+      - upgrade_url
+      - payg_pay_url
+      - payg_increment_minutes
+      - payg_price_text
+    """
+    # Keep this short and plain so it can be spoken via TTS.
+    lines: List[str] = []
+
+    resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
+    resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
+    resolved_payg_minutes = (
+        int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
+    )
+    resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
+
+    if is_trial:
+        lines.append(f"Your Free Trial time has ended ({minutes_allowed} minutes).")
+    else:
+        nice_plan = (plan_name or "").strip()
+        if not nice_plan:
+            lines.append("Your membership plan is Unknown / Not Provided, so minutes cannot be allocated.")
+        else:
+            lines.append(f"You have no minutes remaining for your plan ({nice_plan}).")
+
+    if resolved_payg_pay_url and resolved_payg_minutes > 0:
+        price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
+        lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
+
+    if resolved_upgrade_url:
+        lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
+
+    lines.append("Once you have more minutes, come back here and continue our conversation.")
+    return " ".join([ln.strip() for ln in lines if ln.strip()])
+def _usage_status_message(
+    *,
+    is_trial: bool,
+    plan_name: str,
+    minutes_used: int,
+    minutes_allowed: int,
+    minutes_remaining: int,
+    cycle_days: int,
+    upgrade_url: str = "",
+    payg_pay_url: str = "",
+    payg_increment_minutes: Optional[int] = None,
+    payg_price_text: str = "",
+) -> str:
+    """Generate a short, deterministic answer about remaining minutes.
+
+    This is used when the user asks questions like:
+      - "How many minutes do I have left?"
+      - "How many more minutes can we talk?"
+      - "How much time do I have remaining on my plan?"
+
+    The response is intentionally plain so it can be spoken via TTS.
+    """
+    lines: List[str] = []
+
+    m_used = max(0, int(minutes_used or 0))
+    m_allowed = max(0, int(minutes_allowed or 0))
+    m_rem = max(0, int(minutes_remaining or 0))
+
+    if is_trial:
+        lines.append(f"You have {m_rem} minutes remaining in your Free Trial.")
+    else:
+        nice_plan = (plan_name or "").strip()
+        if nice_plan:
+            lines.append(f"You have {m_rem} minutes remaining on your plan ({nice_plan}).")
+        else:
+            lines.append(f"You have {m_rem} minutes remaining on your plan.")
+
+    # Include a small breakdown for clarity.
+    if m_allowed > 0 or m_used > 0:
+        lines.append(f"Used: {m_used} of {m_allowed} minutes.")
+
+    if (not is_trial) and int(cycle_days or 0) > 0:
+        lines.append(f"Your usage cycle resets every {int(cycle_days)} days.")
+
+    # If exhausted, include the same upgrade/pay links used by the paywall.
+    if m_rem <= 0:
+        resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
+        resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
+        resolved_payg_minutes = (
+            int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
+        )
+        resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
+
+        if resolved_payg_pay_url and resolved_payg_minutes > 0:
+            price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
+            lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
+
+        if resolved_upgrade_url:
+            lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
+
+    return " ".join([ln.strip() for ln in lines if ln.strip()])
+
+
+def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str, minutes_allowed_override: Optional[int] = None, cycle_days_override: Optional[int] = None) -> Tuple[bool, Dict[str, Any]]:
+    """Charge usage time and determine whether the identity still has minutes.
+
+    Returns:
+      (ok, info)
+        ok: True if allowed to continue, False if minutes exhausted.
+        info: includes minutes_used / minutes_allowed / minutes_remaining for optional UI/debug.
+    """
+    now = time.time()
+    try:
+        with _USAGE_LOCK:
+            store = _load_usage_store()
+            rec = store.get(identity_key)
+            if not isinstance(rec, dict):
+                rec = {}
+
+            # Initialize record
+            used_seconds = float(rec.get("used_seconds") or 0.0)
+            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+            last_seen = rec.get("last_seen")
+            cycle_start = float(rec.get("cycle_start") or now)
+
+            # Member cycle reset (trial does not reset)
+            cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
+            if not is_trial and cycle_days and cycle_days > 0:
+                cycle_len = float(cycle_days) * 86400.0
+                if (now - cycle_start) >= cycle_len:
+                    used_seconds = 0.0
+                    cycle_start = now
+
+            # Charge time since last chat call (capped)
+            delta = 0.0
+            if last_seen is not None:
+                try:
+                    delta = float(now - float(last_seen))
+                except Exception:
+                    delta = 0.0
+
+            if delta < 0:
+                delta = 0.0
+
+            # Don't charge long idle gaps (prevents "went AFK" from burning minutes)
+            if USAGE_IDLE_GRACE_SECONDS and delta > float(USAGE_IDLE_GRACE_SECONDS):
+                delta = 0.0
+
+            # Cap per-request billable time
+            max_bill = float(USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST) if USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST > 0 else 0.0
+            if max_bill and delta > max_bill:
+                delta = max_bill
+
+            used_seconds += delta
+
+            # Compute allowed seconds
+            if minutes_allowed_override is not None:
+                try:
+                    minutes_allowed = max(0, int(minutes_allowed_override))
+                except Exception:
+                    minutes_allowed = 0
+            else:
+                minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
+            allowed_seconds = max(0.0, (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0))
+
+            # Hard stop: do not allow overage. Clamp used_seconds to allowed_seconds.
+            if used_seconds > allowed_seconds:
+                used_seconds = allowed_seconds
+
+            # Persist record
+            rec_out = {
+                "used_seconds": used_seconds,
+                "purchased_seconds": purchased_seconds,
+                "last_seen": now,
+                "cycle_start": cycle_start,
+                "plan_name": plan_name,
+                "is_trial": bool(is_trial),
+            }
+            store[identity_key] = rec_out
+            _save_usage_store(store)
+
+        remaining_seconds = max(0.0, allowed_seconds - used_seconds)
+        ok = remaining_seconds > 0.0
+
+        return ok, {
+            "minutes_used": int(used_seconds // 60),
+            "minutes_allowed": int(minutes_allowed),
+            "minutes_remaining": int(remaining_seconds // 60),
+            "identity_key": identity_key,
+        }
+    except Exception:
+        # Fail-open
+        return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": identity_key}
+
+def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any]:
+    """Add purchased minutes to an identity record (used by payment webhooks/admin tooling)."""
+    now = time.time()
+    try:
+        minutes_i = int(minutes)
+        if minutes_i <= 0:
+            return {"ok": False, "error": "minutes must be > 0", "identity_key": identity_key}
+
+        with _USAGE_LOCK:
+            store = _load_usage_store()
+            rec = store.get(identity_key)
+            if not isinstance(rec, dict):
+                rec = {}
+
+            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+            purchased_seconds += float(minutes_i) * 60.0
+
+            rec["purchased_seconds"] = purchased_seconds
+            rec.setdefault("used_seconds", float(rec.get("used_seconds") or 0.0))
+            rec.setdefault("cycle_start", float(rec.get("cycle_start") or now))
+            rec.setdefault("last_seen", float(rec.get("last_seen") or now))
+            rec["plan_name"] = rec.get("plan_name") or "Pay as You Go"
+
+            store[identity_key] = rec
+            _save_usage_store(store)
+
+        return {
+            "ok": True,
+            "identity_key": identity_key,
+            "minutes_added": minutes_i,
+            "purchased_minutes_total": int(purchased_seconds // 60),
+        }
+    except Exception:
+        return {"ok": False, "identity_key": identity_key}
+
+
+def _normalize_mode(raw: str) -> str:
+    t = (raw or "").strip().lower()
+    # allow some synonyms from older frontend builds
+    if t in {"explicit", "intimate", "18+", "adult"}:
+        return "intimate"
+    if t in {"romance", "romantic"}:
+        return "romantic"
+    return "friend"
+
+
+def _detect_mode_switch_from_text(text: str) -> Optional[str]:
+    t = (text or "").lower().strip()
+
+    # explicit hints: allow [mode:romantic] etc
+    if "mode:friend" in t or "[mode:friend]" in t:
+        return "friend"
+    if "mode:romantic" in t or "[mode:romantic]" in t:
+        return "romantic"
+    if (
+        "mode:intimate" in t
+        or "[mode:intimate]" in t
+        or "mode:explicit" in t
+        or "[mode:explicit]" in t
+    ):
+        return "intimate"
+
+    # soft detection (more natural language coverage)
+    # friend
+    if any(p in t for p in [
+        "switch to friend",
+        "go to friend",
+        "back to friend",
+        "friend mode",
+        "set friend",
+        "set mode to friend",
+        "turn on friend",
+    ]):
+        return "friend"
+
+    # romantic
+    if any(p in t for p in [
+        "switch to romantic",
+        "go to romantic",
+        "back to romantic",
+        "romantic mode",
+        "set romantic",
+        "set mode to romantic",
+        "turn on romantic",
+        "let's be romantic",
+    ]):
+        return "romantic"
+
+    # intimate/explicit
+    if any(p in t for p in [
+        "switch to intimate",
+        "go to intimate",
+        "back to intimate",
+        "intimate mode",
+        "set intimate",
+        "set mode to intimate",
+        "turn on intimate",
+        "switch to explicit",
+        "explicit mode",
+        "set explicit",
+        "set mode to explicit",
+        "turn on explicit",
+    ]):
+        return "intimate"
+
+    return None
+def _is_minutes_balance_question(text: str) -> bool:
+    """
+    Return True when the user is asking about their remaining chat time/minutes.
+    This is intentionally broad because users phrase this many different ways.
+    """
+    if not text:
+        return False
+    t = text.strip().lower()
+
+    # Fast exact-ish contains (covers prior phrases)
+    needles = [
+        "minutes remaining",
+        "minutes left",
+        "remaining minutes",
+        "time remaining",
+        "time left",
+        "how many minutes",
+        "how much time",
+        "minutes balance",
+        "balance minutes",
+        "what is my balance",
+        "what's my balance",
+        "how many minutes remain",
+        "how many minutes are remaining",
+        "how many minutes for chat",
+        "chat minutes",
+        "minutes for chat",
+        "how many minutes do i have",
+        "how many minutes do i have left",
+        "how many minutes do i have remaining",
+        "how much time do i have left",
+        "how much time do i have remaining",
+        "how much time is left",
+        "how many minutes are left",
+        "minutes used",
+        "how many minutes have i used",
+        "how much have i used",
+        "usage minutes",
+    ]
+    if any(n in t for n in needles):
+        return True
+
+    # Regex fallback: any question containing "minute(s)" + remaining/left/balance/usage
+    if re.search(r"\bminute(s)?\b", t) and re.search(r"\b(remain|remaining|left|balance|used|usage)\b", t):
+        return True
+
+    # Or "time" + remaining/left/balance (but avoid generic "time" questions)
+    if re.search(r"\btime\b", t) and re.search(r"\b(remain|remaining|left|balance|used|usage)\b", t):
+        return True
+
+    return False
+
+def _looks_intimate(text: str) -> bool:
+    t = (text or "").lower()
+    return any(
+        k in t
+        for k in [
+            "explicit", "intimate", "nsfw", "sex", "nude", "porn",
+            "fuck", "cock", "pussy", "blowjob", "anal", "orgasm",
+        ]
+    )
+
+
+def _parse_companion_meta(raw: Any) -> Dict[str, str]:
+    if isinstance(raw, str):
+        # Companion keys may include additional metadata after a pipe, e.g.:
+        #   "Elara-Female-Caucasian-GenZ|live=stream"
+        # For persona generation we only want the base identity.
+        base = raw.split("|", 1)[0].strip()
+        parts = [p.strip() for p in base.split("-") if p.strip()]
+        if len(parts) >= 4:
+            return {
+                "first_name": parts[0],
+                "gender": parts[1],
+                "ethnicity": parts[2],
+                "generation": "-".join(parts[3:]),
+            }
+    return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
+
+
+
+def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
+    comp = _parse_companion_meta(
+        session_state.get("companion")
+        or session_state.get("companionName")
+        or session_state.get("companion_name")
+    )
+    name = comp.get("first_name") or "Elara"
+
+    lines = [
+        f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
+        "You speak naturally and conversationally.",
+        "You prioritize consent, safety, and emotional connection.",
+    ]
+
+    if mode == "romantic":
+        lines.append("You may be affectionate and flirty while remaining respectful.")
+
+    if mode == "intimate" and intimate_allowed:
+        lines.append(
+            "The user has consented to Intimate (18+) conversation. "
+            "You may engage in adult, sensual discussion, but avoid graphic or pornographic detail. "
+            "Focus on intimacy, emotion, and connection."
+        )
+
+    return " ".join(lines)
+
+
+def _to_openai_messages(
+    messages: List[Dict[str, str]],
+    session_state: dict,
+    *,
+    mode: str,
+    intimate_allowed: bool,
+    debug: bool
+):
+    sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
+    _dbg(debug, "SYSTEM PROMPT:", sys)
+
+    out = [{"role": "system", "content": sys}]
+    for m in messages:
+        if m.get("role") in ("user", "assistant"):
+            out.append({"role": m["role"], "content": m.get("content", "")})
+    return out
+
+
+def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
+    from openai import OpenAI
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        messages=messages,
+        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+
+def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
+    """Summarization call with conservative limits for reliability."""
+    from openai import OpenAI
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    timeout_s = float(os.getenv("SAVE_SUMMARY_OPENAI_TIMEOUT_S", "25") or "25")
+    client = OpenAI(api_key=api_key, timeout=timeout_s)
+    resp = client.chat.completions.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        messages=messages,
+        temperature=float(os.getenv("SAVE_SUMMARY_TEMPERATURE", "0.2") or "0.2"),
+        max_tokens=int(os.getenv("SAVE_SUMMARY_MAX_TOKENS", "350") or "350"),
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+def _normalize_payload(raw: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]], Dict[str, Any], bool]:
+    sid = raw.get("session_id") or raw.get("sid")
+    msgs = raw.get("messages") or []
+    state = raw.get("session_state") or {}
+    wants = bool(raw.get("wants_explicit"))
+
+    if not sid or not isinstance(sid, str):
+        raise HTTPException(422, "session_id required")
+    if not msgs or not isinstance(msgs, list):
+        raise HTTPException(422, "messages required")
+    if not isinstance(state, dict):
+        state = {}
+
+    return sid, msgs, state, wants
+
+
+def _extract_voice_id(raw: Dict[str, Any]) -> str:
+    """
+    Supports both snake_case and camelCase for frontend convenience.
+    """
+    return (
+        (raw.get("voice_id") or raw.get("voiceId") or raw.get("eleven_voice_id") or raw.get("elevenVoiceId") or "")
+    ).strip()
+
+
+# ----------------------------
+# TTS Helpers (ElevenLabs -> Azure Blob SAS)
+# ----------------------------
+_TTS_CONTAINER = os.getenv("AZURE_TTS_CONTAINER", os.getenv("AZURE_STORAGE_CONTAINER", "tts")) or "tts"
+_TTS_BLOB_PREFIX = os.getenv("TTS_BLOB_PREFIX", "audio") or "audio"
+_TTS_SAS_MINUTES = int(os.getenv("TTS_SAS_MINUTES", os.getenv("AZURE_BLOB_SAS_EXPIRY_MINUTES", "30")) or "30")
+
+# TTS cache (Azure Blob) — deterministic blob names to avoid regenerating identical audio.
+# Enabled by default. Disable by setting TTS_CACHE_ENABLED=0.
+_TTS_CACHE_ENABLED = (os.getenv("TTS_CACHE_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+# Cache blobs live under this prefix within the same container.
+_TTS_CACHE_PREFIX = (os.getenv("TTS_CACHE_PREFIX", "tts_cache") or "tts_cache").strip().strip("/")
+# Whether to normalize whitespace in TTS text before hashing.
+_TTS_CACHE_NORMALIZE_WS = (os.getenv("TTS_CACHE_NORMALIZE_WS", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _normalize_tts_text_for_cache(text: str) -> str:
+    t = (text or "").strip()
+    if _TTS_CACHE_NORMALIZE_WS:
+        t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _tts_cache_blob_name(voice_id: str, text: str) -> str:
+    """Deterministic blob name for caching across sessions and workers."""
+    safe_voice = re.sub(r"[^A-Za-z0-9_-]", "_", (voice_id or "voice"))[:48]
+
+    model_id = (os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2") or "eleven_multilingual_v2").strip()
+    output_format = (os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128") or "mp3_44100_128").strip()
+    silence = str(_TTS_LEADING_SILENCE_COPIES)
+
+    norm_text = _normalize_tts_text_for_cache(text)
+    h = hashlib.sha256(
+        (safe_voice + "|" + model_id + "|" + output_format + "|" + silence + "|" + norm_text).encode("utf-8")
+    ).hexdigest()[:40]
+
+    # Keep under a predictable prefix; safe_voice helps partition blobs for listing/debug.
+    return f"{_TTS_CACHE_PREFIX}/{safe_voice}/{h}.mp3"
+
+
+
+
+# 235ms silent MP3 prefix used to prevent some clients (notably iOS/Safari in embedded contexts)
+# from clipping the first ~200ms of audio when switching from microphone capture to playback.
+# You can tune this without redeploying frontend by setting TTS_LEADING_SILENCE_COPIES (0,1,2...).
+_SILENT_MP3_PREFIX_B64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU5LjI3LjEwMAAAAAAAAAAAAAAA//tAwAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAJAAAEXgBBQUFBQUFBQUFBQVlZWVlZWVlZWVlZcXFxcXFxcXFxcXGIiIiIiIiIiIiIiKCgoKCgoKCgoKCguLi4uLi4uLi4uLjQ0NDQ0NDQ0NDQ0Ojo6Ojo6Ojo6Ojo//////////////8AAAAATGF2YzU5LjM3AAAAAAAAAAAAAAAAJAPMAAAAAAAABF6gwS6ZAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVf/7EMQpg8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVV//sQxFMDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVX/+xDEfIPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMSmA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxM+DwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/+xDE1gPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMTWA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxNYDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU="
+_SILENT_MP3_PREFIX_BYTES = base64.b64decode(_SILENT_MP3_PREFIX_B64)
+_TTS_LEADING_SILENCE_COPIES = max(0, int(os.getenv("TTS_LEADING_SILENCE_COPIES", "1") or "1"))
+
+def _tts_blob_name(session_id: str, voice_id: str, text: str) -> str:
+    safe_session = re.sub(r"[^A-Za-z0-9_-]", "_", (session_id or "session"))[:64]
+    safe_voice = re.sub(r"[^A-Za-z0-9_-]", "_", (voice_id or "voice"))[:48]
+    h = hashlib.sha1((safe_voice + "|" + (text or "")).encode("utf-8")).hexdigest()[:16]
+    ts_ms = int(time.time() * 1000)
+    # include hash for debugging/caching, but still unique by timestamp
+    return f"{_TTS_BLOB_PREFIX}/{safe_session}/{ts_ms}-{h}-{uuid.uuid4().hex}.mp3"
+
+
+def _elevenlabs_tts_mp3_bytes(voice_id: str, text: str) -> bytes:
+    import requests  # type: ignore
+
+    xi_api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not xi_api_key:
+        raise RuntimeError("ELEVENLABS_API_KEY is not configured")
+
+    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip() or "eleven_multilingual_v2"
+    output_format = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128").strip() or "mp3_44100_128"
+
+    # Using /stream tends to be lower latency on ElevenLabs.
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format={output_format}"
+    headers = {
+        "xi-api-key": xi_api_key,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+    body = {"text": text, "model_id": model_id}
+
+    r = requests.post(url, headers=headers, json=body, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs error {r.status_code}: {(r.text or '')[:400]}")
+    if not r.content:
+        raise RuntimeError("ElevenLabs returned empty audio")
+    audio_bytes = r.content
+    if _TTS_LEADING_SILENCE_COPIES:
+        audio_bytes = (_SILENT_MP3_PREFIX_BYTES * _TTS_LEADING_SILENCE_COPIES) + audio_bytes
+    return audio_bytes
+
+
+
+
+def _azure_blob_sas_url(blob_name: str) -> str:
+    """Create a read-only SAS URL for an existing blob name in the TTS container."""
+    from azure.storage.blob import BlobServiceClient  # type: ignore
+    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
+
+    storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    if not storage_conn_str:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+
+    blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+    container_client = blob_service.get_container_client(_TTS_CONTAINER)
+    blob_client = container_client.get_blob_client(blob_name)
+
+    # Parse AccountName/AccountKey from connection string for SAS
+    parts: Dict[str, str] = {}
+    for seg in storage_conn_str.split(";"):
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            parts[k] = v
+    account_name = parts.get("AccountName") or getattr(blob_service, "account_name", None)
+    account_key = parts.get("AccountKey")
+    if not account_name or not account_key:
+        raise RuntimeError("Could not parse AccountName/AccountKey from AZURE_STORAGE_CONNECTION_STRING")
+
+    expiry = datetime.utcnow() + timedelta(minutes=max(5, min(_TTS_SAS_MINUTES, 24 * 60)))
+    sas = generate_blob_sas(
+        account_name=account_name,
+        container_name=_TTS_CONTAINER,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=expiry,
+    )
+    return f"{blob_client.url}?{sas}"
+def _azure_upload_mp3_and_get_sas_url(blob_name: str, mp3_bytes: bytes) -> str:
+    from azure.storage.blob import BlobServiceClient, ContentSettings  # type: ignore
+    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
+
+    storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    if not storage_conn_str:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+
+    blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+    container_client = blob_service.get_container_client(_TTS_CONTAINER)
+
+    # Ensure container exists (safe)
+    try:
+        container_client.get_container_properties()
+    except Exception:
+        try:
+            container_client.create_container()
+        except Exception:
+            pass
+
+    blob_client = container_client.get_blob_client(blob_name)
+    blob_client.upload_blob(
+        mp3_bytes,
+        overwrite=True,
+        content_settings=ContentSettings(content_type="audio/mpeg"),
+    )
+
+    # Parse AccountName/AccountKey from connection string for SAS
+    parts: Dict[str, str] = {}
+    for seg in storage_conn_str.split(";"):
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            parts[k] = v
+    account_name = parts.get("AccountName") or getattr(blob_service, "account_name", None)
+    account_key = parts.get("AccountKey")
+    if not account_name or not account_key:
+        raise RuntimeError("Could not parse AccountName/AccountKey from AZURE_STORAGE_CONNECTION_STRING")
+
+    expiry = datetime.utcnow() + timedelta(minutes=max(5, min(_TTS_SAS_MINUTES, 24 * 60)))
+    sas = generate_blob_sas(
+        account_name=account_name,
+        container_name=_TTS_CONTAINER,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=expiry,
+    )
+    return f"{blob_client.url}?{sas}"
+
+
+def _split_camel_case_words(s: str) -> str:
+    """Insert spaces in CamelCase identifiers to improve pronunciation (e.g., DulceMoon -> Dulce Moon)."""
+    if not s:
+        return s
+    if " " in s:
+        return s
+    s2 = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s)
+    s2 = re.sub(r"(?<=[A-Za-z])(?=[0-9])", " ", s2)
+    s2 = re.sub(r"(?<=[0-9])(?=[A-Za-z])", " ", s2)
+    return s2
+
+
+def _apply_phonetic_word_boundary(text: str, target: str, phonetic: str) -> str:
+    """Case-insensitive replace of target as a standalone token (no alnum adjacent)."""
+    if not text or not target or not phonetic:
+        return text
+    pattern = re.compile(rf"(?i)(?<![A-Za-z0-9]){re.escape(target)}(?![A-Za-z0-9])")
+    return pattern.sub(phonetic, text)
+
+
+def _normalize_tts_text(
+    text: str,
+    *,
+    brand: str,
+    avatar: str,
+    mapping_phonetic: str,
+    brand_phonetic: str | None = None,
+) -> str:
+    """
+    Normalize text before any TTS generation.
+
+    Goals:
+    - Avoid speaking raw URLs (common in paywall / upgrade messages) which can cause awkward
+      pronunciations like "DulceMoon" being read from "dulcemoon.net".
+    - Expand CamelCase brand strings ("DulceMoon" -> "Dulce Moon") when they appear in text.
+    - Apply companion phonetic pronunciation consistently (e.g., Dulce -> "DOOL-seh").
+    """
+    if not text:
+        return ""
+
+    s = str(text)
+
+    # 0) Replace markdown links: [Label](https://...) => "Label"
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1", s)
+
+    # 1) Replace bare URLs with a neutral token so we don't speak domains/paths.
+    #    (This is the main fix for paywall pronunciation issues.)
+    s = re.sub(r"https?://\S+", " link ", s, flags=re.IGNORECASE)
+
+    # 2) Replace www.* links without scheme.
+    s = re.sub(r"\bwww\.[^\s]+\b", " link ", s, flags=re.IGNORECASE)
+
+    # Collapse whitespace early.
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # 3) Brand normalization (CamelCase -> spaced) so phonetics can match word boundaries.
+    brand = (brand or "").strip()
+    if brand:
+        spaced_brand = _split_camel_case_words(brand)
+        if spaced_brand != brand:
+            # Replace literal brand occurrences (case-insensitive)
+            s = re.sub(re.escape(brand), spaced_brand, s, flags=re.IGNORECASE)
+
+        # Also handle compact brand tokens (punctuation-delimited), e.g. "dulcemoon" in text.
+        brand_compact = re.sub(r"[^A-Za-z0-9]", "", brand)
+        if brand_compact:
+            spaced_compact = _split_camel_case_words(brand_compact)
+            token_pat = re.compile(
+                rf"(?i)(?<![A-Za-z0-9]){re.escape(brand_compact)}(?![A-Za-z0-9])"
+            )
+            s = token_pat.sub(spaced_compact, s)
+
+    # 4) Apply phonetic pronunciation for the companion name.
+    avatar = (avatar or "").strip()
+    mapping_phonetic = (mapping_phonetic or "").strip()
+    if avatar and mapping_phonetic:
+        # Handle CamelCase concatenations (e.g., "DulceMoon") by inserting a space.
+        s = re.sub(
+            rf"(?i)(?<![A-Za-z0-9]){re.escape(avatar)}(?=[A-Z])",
+            mapping_phonetic + " ",
+            s,
+        )
+        # Word-boundary replacement (normal case)
+        s = _apply_phonetic_word_boundary(s, avatar, mapping_phonetic)
+
+    # 5) Optional brand phonetic (future-proof; not currently required).
+    brand_phonetic = (brand_phonetic or "").strip()
+    if brand and brand_phonetic:
+        s = _apply_phonetic_word_boundary(s, brand, brand_phonetic)
+
+    # Final cleanup
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "") -> str:
+    text = (text or "").strip()
+
+    # Pronunciation normalization (runs before caching / audio generation).
+    # - Splits CamelCase brand tokens (e.g., DulceMoon -> Dulce Moon)
+    # - Applies companion phonetic name (DB mapping) at token boundaries
+    try:
+        if brand:
+            phon = ""
+            if avatar:
+                m = _lookup_companion_mapping(brand, avatar) or {}
+                phon = (m.get("phonetic") or "").strip()
+            text = _normalize_tts_text(text, brand=brand, avatar=avatar, phonetic=phon)
+    except Exception:
+        # Never fail TTS due to normalization
+        pass
+    if not text:
+        raise RuntimeError("TTS text is empty")
+
+    # Cache path: deterministic blob name, cross-session.
+    if _TTS_CACHE_ENABLED:
+        cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
+        try:
+            from azure.storage.blob import BlobServiceClient  # type: ignore
+
+            storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+            if not storage_conn_str:
+                raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+
+            blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+            container_client = blob_service.get_container_client(_TTS_CONTAINER)
+            blob_client = container_client.get_blob_client(cache_blob)
+
+            # Fast existence check (SDK-level). If present, return SAS immediately.
+            exists = False
+            try:
+                exists = bool(blob_client.exists())
+            except Exception:
+                try:
+                    blob_client.get_blob_properties()
+                    exists = True
+                except Exception:
+                    exists = False
+
+            if exists:
+                _clear_inflight_marker(cache_blob)
+
+                return _azure_blob_sas_url(blob_name=cache_blob)
+
+            # Cache miss: generate and upload.
+
+
+            _touch_inflight_marker(cache_blob)
+            mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
+
+            # Upload without overwrite to avoid clobbering a concurrent writer.
+            try:
+                from azure.storage.blob import ContentSettings  # type: ignore
+                blob_client.upload_blob(
+                    mp3_bytes,
+                    overwrite=False,
+                    content_settings=ContentSettings(content_type="audio/mpeg"),
+                )
+            except Exception:
+                # If another worker won the race and uploaded first, just return SAS.
+                pass
+
+            return _azure_blob_sas_url(blob_name=cache_blob)
+        except Exception:
+            # Fail-open: if cache path fails for any reason, fall back to the legacy per-session upload.
+            pass
+
+    # Legacy path: per-session unique blob (no caching).
+    blob_name = _tts_blob_name(session_id=session_id, voice_id=voice_id, text=text)
+    mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
+    return _azure_upload_mp3_and_get_sas_url(blob_name=blob_name, mp3_bytes=mp3_bytes)
+
+# ----------------------------
+# STEP A (Latency): TTS Cache Prewarm (Azure Blob)
+# ----------------------------
+# Objective:
+#   Pre-generate a small set of common system phrases into the deterministic Azure Blob cache so that
+#   first-use latency for these phrases is near-zero after a cold start/restart.
+#
+# Safety properties:
+#   - Backend-only change; no frontend impact.
+#   - Fire-and-forget: does not block application startup.
+#   - Fail-open: any error during prewarm is ignored; normal runtime behavior is unchanged.
+#   - Uses the same TTS/cache path as production (/chat and /tts/audio-url), so behavior is consistent.
+#
+# Controls:
+#   TTS_PREWARM_ENABLED=1|0   (default: 1)
+#   TTS_PREWARM_VOICE_ID=<elevenlabs_voice_id>  (optional; if missing, prewarm is skipped)
+#   TTS_PREWARM_PHRASES_JSON='["Hello!", "..."]' (optional override)
+
+_TTS_PREWARM_ENABLED = (os.getenv("TTS_PREWARM_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+# We deliberately do NOT guess a voice_id from companion here because this is backend-only and we want
+# to avoid unintended cross-companion behavior. If you want prewarm for a specific voice, set it explicitly.
+_TTS_PREWARM_VOICE_ID = (os.getenv("TTS_PREWARM_VOICE_ID", "") or "").strip()
+
+_DEFAULT_PREWARM_PHRASES: list[str] = [
+    "Hello!",
+    "Hi there!",
+    "How can I help you today?",
+    "Sure.",
+    "Okay.",
+    "Got it.",
+    "All set.",
+]
+
+def _load_prewarm_phrases() -> list[str]:
+    raw = (os.getenv("TTS_PREWARM_PHRASES_JSON", "") or "").strip()
+    if not raw:
+        return list(_DEFAULT_PREWARM_PHRASES)
+    try:
+        v = json.loads(raw)
+        if isinstance(v, list):
+            out: list[str] = []
+            for item in v:
+                s = str(item or "").strip()
+                if s:
+                    out.append(s)
+            return out or list(_DEFAULT_PREWARM_PHRASES)
+    except Exception:
+        pass
+    return list(_DEFAULT_PREWARM_PHRASES)
+
+async def _tts_prewarm_task() -> None:
+    if not _TTS_PREWARM_ENABLED:
+        return
+    if not _TTS_PREWARM_VOICE_ID:
+        # No explicit voice configured; skip prewarm to avoid generating for the wrong companion.
+        return
+
+    phrases = _load_prewarm_phrases()
+    # Use a fixed session id; caching ignores session id when _TTS_CACHE_ENABLED is on.
+    sid = "prewarm"
+    for phrase in phrases:
+        try:
+            # run the synchronous generator in a thread to avoid blocking the event loop
+            await run_in_threadpool(_tts_audio_url_sync, sid, _TTS_PREWARM_VOICE_ID, phrase)
+        except Exception:
+            # fail-open: ignore
+            continue
+
+@app.on_event("startup")
+async def _startup_tts_prewarm() -> None:
+    # Fire-and-forget. Do not await; do not block startup.
+    try:
+        asyncio.create_task(_tts_prewarm_task())
+    except Exception:
+        pass
+
+# ----------------------------
+# STEP B (Latency): Cache-first TTS for audio/video (rule-preserving)
+# ----------------------------
+# Rule: For audio and live-avatar flows, do NOT return assistant text before audio/video is ready.
+# This step therefore keeps /chat synchronous when voice_id is present, but adds a cache-first fast path
+# to avoid an ElevenLabs call on repeats. It also adds a lightweight "inflight" marker so /tts/audio-url
+# can wait briefly for another request/worker that is already generating the same cached blob.
+#
+# No default voice is introduced; this engages only when the frontend supplies voice_id (as today).
+#
+# Controls:
+#   TTS_CHAT_CACHE_FIRST=1|0     (default: 1)
+#   TTS_INFLIGHT_WAIT_MS=1500    (default: 1500ms)
+#   TTS_INFLIGHT_STALE_S=90      (default: 90s)
+#   TTS_INFLIGHT_DIR=/home/tts_inflight
+
+_TTS_CHAT_CACHE_FIRST = (os.getenv("TTS_CHAT_CACHE_FIRST", "1") or "1").strip().lower() not in {"0","false","no","off"}
+_TTS_INFLIGHT_WAIT_MS = max(0, int(os.getenv("TTS_INFLIGHT_WAIT_MS", "1500") or "1500"))
+_TTS_INFLIGHT_STALE_S = max(10, int(os.getenv("TTS_INFLIGHT_STALE_S", "90") or "90"))
+_TTS_INFLIGHT_DIR = (os.getenv("TTS_INFLIGHT_DIR", "/home/tts_inflight") or "/home/tts_inflight").strip()
+
+def _inflight_marker_path(cache_blob_name: str) -> str:
+    h = hashlib.sha256((cache_blob_name or "").encode("utf-8")).hexdigest()[:40]
+    return os.path.join(_TTS_INFLIGHT_DIR, f"{h}.lock")
+
+def _touch_inflight_marker(cache_blob_name: str) -> None:
+    try:
+        os.makedirs(_TTS_INFLIGHT_DIR, exist_ok=True)
+        with open(_inflight_marker_path(cache_blob_name), "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
+
+def _clear_inflight_marker(cache_blob_name: str) -> None:
+    try:
+        p = _inflight_marker_path(cache_blob_name)
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+def _inflight_marker_is_fresh(cache_blob_name: str) -> bool:
+    try:
+        p = _inflight_marker_path(cache_blob_name)
+        if not os.path.exists(p):
+            return False
+        age = time.time() - os.path.getmtime(p)
+        return age >= 0 and age <= _TTS_INFLIGHT_STALE_S
+    except Exception:
+        return False
+
+def _tts_cache_peek_sync(voice_id: str, text: str) -> Optional[str]:
+    """Cache-only lookup: returns SAS URL if deterministic cache blob exists, else None."""
+    if not _TTS_CACHE_ENABLED:
+        return None
+    t = (text or "").strip()
+    if not t:
+        return None
+    cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=t)
+    try:
+        from azure.storage.blob import BlobServiceClient  # type: ignore
+        storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+        if not storage_conn_str:
+            return None
+        blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+        container_client = blob_service.get_container_client(_TTS_CONTAINER)
+        blob_client = container_client.get_blob_client(cache_blob)
+        try:
+            if blob_client.exists():
+                return _azure_blob_sas_url(blob_name=cache_blob)
+        except Exception:
+            try:
+                blob_client.get_blob_properties()
+                return _azure_blob_sas_url(blob_name=cache_blob)
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
+
+
+
+
+# ----------------------------
+# FILE UPLOADS (Azure Blob)
+# ----------------------------
+#
+# Requirements:
+# - Uploads are NOT allowed during Shared Live (BeeStreamed) sessions.
+# - The frontend uploads raw bytes (no multipart) to avoid python-multipart dependency.
+# - We return a read-only SAS URL so the sender/receiver can open the attachment.
+# - Container name: "uploads" (override via UPLOADS_CONTAINER env var).
+# - Currently supports image/* uploads (rendered as image previews in the UI).
+# ----------------------------
+
+_UPLOADS_CONTAINER = (os.getenv("UPLOADS_CONTAINER", "uploads") or "uploads").strip() or "uploads"
+_UPLOAD_MAX_BYTES = int(os.getenv("UPLOAD_MAX_BYTES", "10485760") or 10485760)  # 10 MB
+_UPLOAD_SAS_DAYS = int(os.getenv("UPLOAD_SAS_DAYS", "30") or 30)  # SAS validity for attachments
+
+
+def _slugify_segment(s: str, *, default: str = "x") -> str:
+    s = (s or "").strip().lower()
+    if not s:
+        return default
+    # Keep alnum, dash, underscore; collapse whitespace to dashes
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-z0-9\-_]", "", s)
+    s = s.strip("-_")
+    return s[:64] or default
+
+
+def _safe_filename(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return "upload"
+    # Only keep the basename and strip dangerous characters.
+    n = os.path.basename(n)
+    n = re.sub(r"[\r\n\t]+", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    # Avoid extremely long filenames
+    return n[:120] or "upload"
+
+
+def _infer_upload_ext(content_type: str, filename: str) -> str:
+    """Infer a safe file extension for uploads.
+
+    Preference order:
+    1) Extension from the original filename (if safe)
+    2) Extension guessed from the MIME content type
+    3) Fallback to .bin
+
+    Always returns a non-empty extension starting with ".".
+    """
+    fn = (filename or "").strip()
+    if fn and "." in fn:
+        ext = ("." + fn.rsplit(".", 1)[-1]).lower()
+        if len(ext) <= 12 and re.fullmatch(r"\.[a-z0-9]+", ext):
+            if ext in (".jpeg", ".jpe"):
+                return ".jpg"
+            return ext
+
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct:
+        guessed = mimetypes.guess_extension(ct) or ""
+        guessed = guessed.lower().strip()
+        if guessed:
+            if guessed in (".jpeg", ".jpe"):
+                return ".jpg"
+            return guessed
+
+    return ".bin"
+
+
+def _infer_image_ext(content_type: str, filename: str) -> str:
+    """Backward-compatible alias (historically image-only)."""
+    ext = _infer_upload_ext(content_type, filename)
+    # Historical default for unknown images was .png; keep that behavior for image/*.
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ext == ".bin" and ct.startswith("image/"):
+        return ".png"
+    return ext
+
+def _azure_upload_bytes_and_get_sas_url(
+    *, container_name: str, blob_name: str, content_type: str, data: bytes
+) -> str:
+    from azure.storage.blob import BlobServiceClient, ContentSettings  # type: ignore
+    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
+
+    storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    if not storage_conn_str:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+
+    blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+    container_client = blob_service.get_container_client(container_name)
+
+    # Ensure container exists (best-effort).
+    try:
+        container_client.get_container_properties()
+    except Exception:
+        try:
+            container_client.create_container()
+        except Exception:
+            pass
+
+    blob_client = container_client.get_blob_client(blob_name)
+    blob_client.upload_blob(
+        data,
+        overwrite=True,
+        content_settings=ContentSettings(content_type=(content_type or "application/octet-stream")),
+    )
+
+    # Parse AccountName/AccountKey from connection string for SAS
+    parts: Dict[str, str] = {}
+    for seg in storage_conn_str.split(";"):
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            parts[k] = v
+    account_name = parts.get("AccountName") or getattr(blob_service, "account_name", None)
+    account_key = parts.get("AccountKey")
+    if not account_name or not account_key:
+        raise RuntimeError("Could not parse AccountName/AccountKey from AZURE_STORAGE_CONNECTION_STRING")
+
+    expiry = datetime.utcnow() + timedelta(days=max(1, min(_UPLOAD_SAS_DAYS, 365)))
+    sas = generate_blob_sas(
+        account_name=account_name,
+        container_name=container_name,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=expiry,
+    )
+    return f"{blob_client.url}?{sas}"
+
+
+@app.post("/files/upload")
+async def files_upload(request: Request) -> Dict[str, Any]:
+    """Upload a file and return a read-only SAS URL.
+
+    Client contract (no multipart):
+      - Body: raw bytes
+      - Headers:
+          Content-Type: MIME type (e.g. image/png, application/pdf, etc.)
+          X-Filename: original file name
+          X-Brand: brand (company) name (for gating against session_active)
+          X-Avatar: avatar name (for gating against session_active)
+          X-Member-Id: optional member id (for blob path organization)
+
+    Notes:
+      - Attachments are **not allowed** during Shared Live (session_active=1).
+      - This endpoint intentionally avoids multipart to keep dependencies minimal.
+    """
+    filename = _safe_filename(request.headers.get("x-filename") or request.headers.get("X-Filename") or "")
+    brand = (request.headers.get("x-brand") or request.headers.get("X-Brand") or "").strip()
+    avatar = (request.headers.get("x-avatar") or request.headers.get("X-Avatar") or "").strip()
+    member_id = (request.headers.get("x-member-id") or request.headers.get("X-Member-Id") or "").strip()
+    content_type = (request.headers.get("content-type") or "application/octet-stream").strip()
+
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="X-Brand and X-Avatar headers are required")
+
+    # Hard rule: no attachments during shared live streaming.
+    if _is_session_active(brand, avatar):
+        raise HTTPException(status_code=403, detail="Attachments are disabled during shared live streaming")
+
+    # Only images for now (required by UI preview behavior).
+
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload body")
+    if len(data) > int(_UPLOAD_MAX_BYTES):
+        raise HTTPException(status_code=413, detail=f"Upload too large (max {_UPLOAD_MAX_BYTES} bytes)")
+
+    ext = _infer_upload_ext(content_type, filename)
+    blob_name = (
+        f"{_slugify_segment(brand, default='core')}/"
+        f"{_slugify_segment(avatar, default='companion')}/"
+        f"{_slugify_segment(member_id, default='anon')}/"
+        f"{uuid.uuid4().hex}{ext}"
+    )
+
+    try:
+        url = await run_in_threadpool(
+            _azure_upload_bytes_and_get_sas_url,
+            container_name=_UPLOADS_CONTAINER,
+            blob_name=blob_name,
+            content_type=content_type,
+            data=data,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {type(e).__name__}: {e}")
+
+    return {
+        "ok": True,
+        "url": url,
+        "name": filename,
+        "size": len(data),
+        "contentType": content_type,
+        "container": _UPLOADS_CONTAINER,
+        "blobName": blob_name,
+    }
+
+# ----------------------------
+# CHAT (Optimized: optional audio_url in same response)
+# ----------------------------
+@app.post("/chat", response_model=None)
+async def chat(request: Request):
+    """
+    Backward-compatible /chat endpoint.
+
+    Optimization:
+      If the request includes `voice_id` (or `voiceId`), the API will ALSO generate
+      an ElevenLabs MP3, upload it to Azure Blob, and return `audio_url` in the same
+      /chat response — avoiding a second round-trip to /tts/audio-url.
+
+    Request (existing fields):
+      { session_id, messages, session_state, wants_explicit }
+
+    Additional optional fields:
+      { voice_id: "<elevenlabs_voice_id>" }   or  { voiceId: "<...>" }
+    """
+    debug = bool(getattr(settings, "DEBUG", False))
+
+    raw = await request.json()
+    session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
+    
+    voice_id = _extract_voice_id(raw)
+
+    # ----------------------------
+    # Usage / minutes enforcement
+    # ----------------------------
+    # Rule: If we do NOT have a memberId, the visitor is on Free Trial (IP-based identity).
+    # Every plan (including subscriptions) has a minute budget. When exhausted, we return a pay/upgrade message.
+    member_id = _extract_member_id(session_state)
+    plan_name_raw = _extract_plan_name(session_state)
+
+    # RebrandingKey (Wix) overrides (upgrade/pay links + quota settings) when present.
+    # Wix provides: Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
+    rebranding_key_raw = _extract_rebranding_key(session_state)
+
+    # NOTE: RebrandingKey validation is performed in Wix (Velo) before sending to this API.
+    # Server-side validation is intentionally disabled to avoid breaking existing Wix flows.
+    # If Wix-side validation is removed, you can enable the validator by uncommenting below:
+    # ok, err = _validate_rebranding_key_server_side(rebranding_key_raw)
+    # if not ok:
+    #     _dbg(debug, f"[RebrandingKey] rejected: {err}")
+    #     rebranding_key_raw = ""
+    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+
+    # Prefer explicit fields (if provided) and fall back to the parsed RebrandingKey.
+    upgrade_link_override = _session_get_str(session_state, "upgrade_link", "upgradeLink") or rebranding_parsed.get("upgrade_link", "")
+    pay_go_link_override = _session_get_str(session_state, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
+    pay_go_price = _session_get_str(session_state, "pay_go_price", "payGoPrice") or rebranding_parsed.get("pay_go_price", "")
+    pay_go_minutes_raw = _session_get_str(session_state, "pay_go_minutes", "payGoMinutes") or rebranding_parsed.get("pay_go_minutes", "")
+    plan_external = (
+        _session_get_str(session_state, "rebranding_plan", "rebrandingPlan", "planExternal", "plan_external")
+        or rebranding_parsed.get("plan", "")
+    )
+    plan_map = _session_get_str(session_state, "elaralo_plan_map", "elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map", "")
+    free_minutes_raw = _session_get_str(session_state, "free_minutes", "freeMinutes") or rebranding_parsed.get("free_minutes", "")
+    cycle_days_raw = _session_get_str(session_state, "cycle_days", "cycleDays") or rebranding_parsed.get("cycle_days", "")
+
+    pay_go_minutes = _safe_int(pay_go_minutes_raw)
+    free_minutes = _safe_int(free_minutes_raw)
+    cycle_days = _safe_int(cycle_days_raw)
+
+    is_trial = not bool(member_id)
+    identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+
+    # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
+    minutes_allowed_override: Optional[int] = None
+    if free_minutes is not None:
+        minutes_allowed_override = free_minutes
+    elif plan_map:
+        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
+
+    cycle_days_override: Optional[int] = None
+    if cycle_days is not None:
+        cycle_days_override = cycle_days
+
+    # Plan name used for quota purposes (fallback) should use the mapped plan if provided.
+    plan_name_for_limits = plan_map or plan_name_raw
+
+    # Plan label shown to the user should use the external plan name (if provided).
+    plan_label_for_messages = plan_external or plan_name_raw
+
+    # For rebranding, construct PAYG_PRICE_TEXT as:
+    #   PayGoPrice + " per " + PayGoMinutes + " minutes"
+    is_rebranding = bool(rebranding_key_raw or plan_external or plan_map or upgrade_link_override or pay_go_link_override or pay_go_price)
+
+    payg_price_text_override = ""
+    if is_rebranding:
+        minutes_part = ""
+        if pay_go_minutes is not None:
+            minutes_part = str(pay_go_minutes)
+        else:
+            minutes_part = str(pay_go_minutes_raw or "").strip()
+        if pay_go_price and minutes_part:
+            payg_price_text_override = f"{pay_go_price} per {minutes_part} minutes"
+
+    usage_ok, usage_info = await run_in_threadpool(
+        _usage_charge_and_check_sync,
+        identity_key,
+        is_trial=is_trial,
+        plan_name=plan_name_for_limits,
+        minutes_allowed_override=minutes_allowed_override,
+        cycle_days_override=cycle_days_override,
+    )
+
+
+    # Special-case: allow "minutes remaining" questions to return a status message
+    # even when minutes are exhausted (no OpenAI call).
+    probe_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    probe_text = ((probe_last_user.get("content") if probe_last_user else "") or "").strip()
+    is_minutes_balance_query = _is_minutes_balance_question(probe_text)
+
+    if not usage_ok and not is_minutes_balance_query:
+        minutes_allowed = int(
+            usage_info.get("minutes_allowed")
+            or (minutes_allowed_override if minutes_allowed_override is not None else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits)))
+            or 0
+        )
+        session_state_out = dict(session_state)
+        session_state_out.update(
+            {
+                "minutes_exhausted": True,
+                "minutes_used": int(usage_info.get("minutes_used") or 0),
+                "minutes_allowed": int(minutes_allowed),
+                "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
+            }
+        )
+        reply = _usage_paywall_message(
+            is_trial=is_trial,
+            plan_name=plan_label_for_messages,
+            minutes_allowed=minutes_allowed,
+            upgrade_url=upgrade_link_override,
+            payg_pay_url=pay_go_link_override,
+            payg_increment_minutes=pay_go_minutes,
+            payg_price_text=payg_price_text_override,
+        )
+        return {
+            "session_id": session_id,
+            "mode": STATUS_SAFE,
+            "reply": reply,
+            "session_state": session_state_out,
+            "audio_url": None,
+        }
+
+# Best-effort retrieval of a previously saved chat summary.
+    # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
+    saved_summary: str | None = None
+    memory_key: str | None = None
+    try:
+        # Use the exact same keying logic as /chat/save-summary, otherwise retrieval will miss.
+        # If memberId is present but companion is missing/empty, _summary_store_key() returns 'unknown'
+        # and we deliberately do NOT inject memory (prevents cross-companion leakage).
+        key = _summary_store_key(session_state, session_id)
+        if key.startswith('session::'):
+            memory_key = key
+        else:
+            # memberId-based key: require a real companion key
+            if key.endswith('::unknown'):
+                memory_key = None
+            else:
+                memory_key = key
+
+        if memory_key:
+            _refresh_summary_store_if_needed()
+            rec = _CHAT_SUMMARY_STORE.get(memory_key) or {}
+            s = rec.get('summary')
+            if isinstance(s, str) and s.strip():
+                saved_summary = s.strip()
+    except Exception:
+        saved_summary = None
+        memory_key = None
+
+    # Helper to build responses consistently and optionally include audio_url.
+    async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
+        audio_url: Optional[str] = None
+        if voice_id and (reply or "").strip():
+            try:
+                if _TTS_CHAT_CACHE_FIRST and _TTS_CACHE_ENABLED:
+                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, reply)
+                if audio_url is None:
+                    audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply, session_state.get("brand", ""), session_state.get("avatar", ""))
+            except Exception as e:
+                # Fail-open: never break chat because TTS failed
+                _dbg(debug, "TTS generation failed:", repr(e))
+                state_out = dict(state_out)
+                state_out["tts_error"] = f"{type(e).__name__}: {e}"
+
+        return {
+            "session_id": session_id,
+            "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
+            "reply": reply,
+            "session_state": state_out,
+            "audio_url": audio_url,       # NEW (optional)
+        }
+
+    # If the user is asking about their remaining minutes, answer deterministically
+    # (no OpenAI call). This also works when minutes are exhausted.
+    if is_minutes_balance_query:
+        minutes_used = int(usage_info.get("minutes_used") or 0)
+        minutes_allowed = int(usage_info.get("minutes_allowed") or 0)
+        minutes_remaining = int(usage_info.get("minutes_remaining") or 0)
+
+        effective_cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
+
+        session_state_out = dict(session_state)
+        session_state_out.update(
+            {
+                "minutes_exhausted": minutes_remaining <= 0,
+                "minutes_used": minutes_used,
+                "minutes_allowed": minutes_allowed,
+                "minutes_remaining": minutes_remaining,
+            }
+        )
+        # Ensure mode is always present for the frontend.
+        session_state_out["mode"] = session_state_out.get("mode") or "friend"
+
+        reply = _usage_status_message(
+            is_trial=is_trial,
+            plan_name=plan_label_for_messages,
+            minutes_used=minutes_used,
+            minutes_allowed=minutes_allowed,
+            minutes_remaining=minutes_remaining,
+            cycle_days=effective_cycle_days,
+            upgrade_url=upgrade_link_override,
+            payg_pay_url=pay_go_link_override,
+            payg_increment_minutes=pay_go_minutes,
+            payg_price_text=payg_price_text_override,
+        )
+        return await _respond(reply, STATUS_SAFE, session_state_out)
+
+    # last user message
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    user_text = ((last_user.get("content") if last_user else "") or "").strip()
+    normalized_text = user_text.lower().strip()
+
+    # allow text-based mode switching
+    detected_switch = _detect_mode_switch_from_text(user_text)
+    if detected_switch:
+        session_state["mode"] = detected_switch
+
+    requested_mode = _normalize_mode(str(session_state.get("mode") or "friend"))
+    requested_intimate = (requested_mode == "intimate")
+
+    # authoritative consent flag should live in session_state (works across gunicorn workers)
+    intimate_allowed = bool(session_state.get("explicit_consented") is True)
+
+    # if user is requesting intimate OR the UI is in intimate mode, treat as intimate request
+    user_requesting_intimate = wants_explicit or requested_intimate or _looks_intimate(user_text)
+
+    # consent keywords
+    CONSENT_YES = {
+        "yes", "y", "yeah", "yep", "sure", "ok", "okay",
+        "i consent", "i agree", "i confirm", "confirm",
+        "i am 18+", "i'm 18+", "i am over 18", "i'm over 18",
+        "i confirm i am 18+", "i confirm that i am 18+",
+        "i confirm and consent",
+    }
+    CONSENT_NO = {"no", "n", "nope", "nah", "decline", "cancel"}
+
+    pending = (session_state.get("pending_consent") or "")
+    pending = pending.strip().lower() if isinstance(pending, str) else ""
+
+    def _grant_intimate(state_in: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(state_in)
+        out["adult_verified"] = True
+        out["explicit_consented"] = True
+        out["pending_consent"] = None
+        out["mode"] = "intimate"
+        out["explicit_granted_at"] = _now_ts()
+        return out
+
+    # If we are waiting on consent, only accept yes/no
+    if pending == "intimate" and not intimate_allowed:
+        if normalized_text in CONSENT_YES:
+            session_state_out = _grant_intimate(session_state)
+            return await _respond(
+                "Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
+                STATUS_ALLOWED,
+                session_state_out,
+            )
+
+        if normalized_text in CONSENT_NO:
+            session_state_out = dict(session_state)
+            session_state_out["pending_consent"] = None
+            session_state_out["explicit_consented"] = False
+            session_state_out["mode"] = "friend"
+            return await _respond(
+                "No problem — we’ll keep things in Friend mode.",
+                STATUS_SAFE,
+                session_state_out,
+            )
+
+        # still pending; remind
+        session_state_out = dict(session_state)
+        session_state_out["pending_consent"] = "intimate"
+        session_state_out["mode"] = "intimate"  # keep pill highlighted
+        return await _respond(
+            "Please reply with 'yes' or 'no' to continue.",
+            STATUS_BLOCKED,
+            session_state_out,
+        )
+
+    # Start consent if intimate requested but not allowed
+    require_consent = bool(getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True))
+    if require_consent and user_requesting_intimate and not intimate_allowed:
+        session_state_out = dict(session_state)
+        session_state_out["pending_consent"] = "intimate"
+        session_state_out["mode"] = "intimate"
+        return await _respond(
+            "Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
+            STATUS_BLOCKED,
+            session_state_out,
+        )
+
+    # Effective mode for the model (never intimate unless allowed)
+    effective_mode = requested_mode
+    if effective_mode == "intimate" and not intimate_allowed:
+        effective_mode = "friend"
+
+    _dbg(
+        debug,
+        f"/chat session={session_id} requested_mode={requested_mode} effective_mode={effective_mode} "
+        f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending} voice_id={'yes' if voice_id else 'no'}",
+    )
+
+    # call model
+    try:
+        openai_messages = _to_openai_messages(
+            messages,
+            session_state,
+            mode=effective_mode,
+            intimate_allowed=intimate_allowed,
+            debug=debug,
+        )
+
+        # Memory policy: do not guess about prior conversations.
+        # - If a saved summary is injected, you may use ONLY that as cross-session context.
+        # - If no saved summary is injected, explicitly say no saved summary is available if asked.
+        # Platform capability policy:
+        # - This app can speak your replies via TTS / Live Avatar. Do not claim you "don't have TTS".
+        memory_policy = (
+            "Memory rule: Only reference cross-session history if a 'Saved conversation summary' is provided. "
+            "If no saved summary is provided and the user asks about past conversations, say you do not have a saved summary for this companion.\n"
+            "Capability rule: Your replies may be spoken aloud in this app (audio TTS and/or a live avatar). "
+            "Do not say you lack text-to-speech; instead explain that you generate text and the platform voices it."
+        )
+        openai_messages.insert(1, {"role": "system", "content": memory_policy})
+
+        if saved_summary:
+            openai_messages.insert(
+                2,
+                {
+                    "role": "system",
+                    "content": "Saved conversation summary (user-authorized, for reference across devices):\n" + saved_summary,
+                },
+            )
+
+        assistant_reply = _call_gpt4o(openai_messages)
+    except Exception as e:
+        _dbg(debug, "OpenAI call failed:", repr(e))
+        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {e}")
+
+    # echo back session_state (ensure correct mode)
+    session_state_out = dict(session_state)
+    session_state_out["mode"] = effective_mode
+    session_state_out["pending_consent"] = None if intimate_allowed else session_state_out.get("pending_consent")
+    session_state_out["companion_meta"] = _parse_companion_meta(
+        session_state_out.get("companion")
+        or session_state_out.get("companionName")
+        or session_state_out.get("companion_name")
+    )
+
+    return await _respond(
+        assistant_reply,
+        STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
+        session_state_out,
+    )
+
+
+# ----------------------------
+# SAVE CHAT SUMMARY
+# ----------------------------
+# NOTE: This stores summaries server-side (in memory, with optional file persistence).
+# This is intentionally simple; durable storage / retrieval strategy can be evolved
+# incrementally without changing the frontend contract.
+_CHAT_SUMMARY_STORE: Dict[str, Dict[str, Any]] = {}
+_CHAT_SUMMARY_FILE = os.getenv("CHAT_SUMMARY_FILE", "")
+_CHAT_SUMMARY_FILE_MTIME: float = 0.0
+
+# Lock for cross-worker file refresh/write coordination (best-effort).
+# This only synchronizes within a single worker process; cross-worker sync is via atomic file replace + mtime.
+_CHAT_SUMMARY_LOCK = __import__("threading").RLock()
+
+
+def _load_summary_store() -> None:
+    """Best-effort load of persisted summary store.
+
+    Worker-safe behavior for single-instance App Service:
+      - Load from CHAT_SUMMARY_FILE if present.
+      - Clear and replace the in-memory store to match disk.
+      - Track file mtime to enable refresh-on-change across gunicorn workers.
+
+    Fail-open: never crashes the API.
+    """
+    global _CHAT_SUMMARY_FILE_MTIME
+    if not _CHAT_SUMMARY_FILE:
+        return
+    try:
+        if not os.path.isfile(_CHAT_SUMMARY_FILE):
+            return
+        with open(_CHAT_SUMMARY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _CHAT_SUMMARY_STORE.clear()
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, dict):
+                    _CHAT_SUMMARY_STORE[k] = v
+        try:
+            _CHAT_SUMMARY_FILE_MTIME = os.stat(_CHAT_SUMMARY_FILE).st_mtime
+        except Exception:
+            pass
+    except Exception:
+        # Fail-open
+        return
+
+
+def _refresh_summary_store_if_needed() -> None:
+    """Refresh the in-memory store if the backing file changed.
+
+    This enables cross-worker consistency on a single instance because each gunicorn
+    worker sees the shared filesystem and can reload when another worker writes.
+    """
+    global _CHAT_SUMMARY_FILE_MTIME
+    if not _CHAT_SUMMARY_FILE:
+        return
+    try:
+        st = os.stat(_CHAT_SUMMARY_FILE)
+    except FileNotFoundError:
+        return
+    except Exception:
+        return
+
+    if st.st_mtime <= _CHAT_SUMMARY_FILE_MTIME:
+        return
+
+    with _CHAT_SUMMARY_LOCK:
+        # Re-check inside lock to avoid redundant reloads within this worker
+        try:
+            st2 = os.stat(_CHAT_SUMMARY_FILE)
+        except Exception:
+            return
+        if st2.st_mtime <= _CHAT_SUMMARY_FILE_MTIME:
+            return
+        _load_summary_store()
+
+
+def _normalize_companion_key(raw: Any) -> str:
+    """Normalize a companion identifier for stable keying.
+
+    Used ONLY for storage keys; display names remain unchanged.
+    """
+    s = "" if raw is None else str(raw)
+    s = re.sub(r"\s+", " ", s.strip())
+    # Strip any pipe-appended metadata to keep keys stable across live providers
+    s = s.split("|", 1)[0].strip()
+    return s.lower()
+
+
+def _extract_member_id(session_state: Dict[str, Any]) -> str:
+    member_id = (
+        session_state.get("memberId")
+        or session_state.get("member_id")
+        or session_state.get("member")
+        or ""
+    )
+    return str(member_id).strip() if member_id is not None else ""
+
+
+def _extract_companion_raw(session_state: Dict[str, Any]) -> str:
+    companion = (
+        session_state.get("companion")
+        or session_state.get("companionName")
+        or session_state.get("companion_name")
+        or ""
+    )
+    return str(companion).strip() if companion is not None else ""
+
+
+def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
+    """Stable key using memberId + normalized companion; falls back to session_id.
+
+    IMPORTANT: Companion isolation is enforced by including the normalized companion key.
+    If memberId is present but companion is missing/empty, we deliberately use 'unknown'
+    and retrieval must treat that as 'no saved memory'.
+    """
+    member_id = _extract_member_id(session_state)
+    companion_key = _normalize_companion_key(_extract_companion_raw(session_state))
+
+    if member_id:
+        return f"{member_id}::{companion_key or 'unknown'}"
+    return f"session::{session_id}"
+
+
+def _persist_summary_store() -> None:
+    """Best-effort atomic persistence to a shared file.
+
+    Uses write-to-temp + os.replace to avoid other workers reading partial files.
+    """
+    global _CHAT_SUMMARY_FILE_MTIME
+    if not _CHAT_SUMMARY_FILE:
+        return
+    try:
+        tmp_path = _CHAT_SUMMARY_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_CHAT_SUMMARY_STORE, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, _CHAT_SUMMARY_FILE)
+        try:
+            _CHAT_SUMMARY_FILE_MTIME = os.stat(_CHAT_SUMMARY_FILE).st_mtime
+        except Exception:
+            pass
+    except Exception:
+        # Fail-open
+        return
+
+
+# Load persisted summaries once at startup (best-effort).
+_load_summary_store()
+
+
+@app.post("/chat/save-summary", response_model=None)
+async def save_chat_summary(request: Request):
+    """Saves a server-side summary of the chat history.
+
+    Reliability goals:
+      - Never leave the browser with an ambiguous network failure when possible.
+      - Cap inputs to avoid oversized payloads/timeouts.
+      - Return a structured JSON response even when summarization fails.
+
+    Request JSON:
+      { session_id, messages, session_state }
+
+    Response JSON:
+      { ok: true|false, summary?: "...", error_code?: "...", error?: "...", saved_at?: <ts>, key?: "..." }
+    """
+    debug = bool(getattr(settings, "DEBUG", False))
+
+    try:
+        raw = await request.json()
+    except Exception as e:
+        return {"ok": False, "error_code": "invalid_json", "error": f"{type(e).__name__}: {e}"}
+
+    session_id, messages, session_state, _wants_explicit = _normalize_payload(raw)
+
+    # Normalize + cap the conversation for summarization to reduce cost and avoid request failures.
+    max_msgs = int(os.getenv("SAVE_SUMMARY_MAX_MESSAGES", "80") or "80")
+    max_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS", "12000") or "12000")
+    per_msg_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS_PER_MESSAGE", "2000") or "2000")
+
+    convo_items: List[Dict[str, str]] = []
+    for m in messages:
+        role = m.get("role")
+        if role in ("user", "assistant"):
+            content = str(m.get("content") or "")
+            if per_msg_chars > 0 and len(content) > per_msg_chars:
+                content = content[:per_msg_chars] + " …"
+            convo_items.append({"role": role, "content": content})
+
+    if max_msgs > 0 and len(convo_items) > max_msgs:
+        convo_items = convo_items[-max_msgs:]
+
+    # Enforce a total character budget from the end (most recent is most useful).
+    total = 0
+    capped: List[Dict[str, str]] = []
+    for m in reversed(convo_items):
+        c = m["content"]
+        if total >= max_chars:
+            break
+        # keep at least some of this message
+        remaining = max_chars - total
+        if remaining <= 0:
+            break
+        if len(c) > remaining:
+            c = c[-remaining:]
+        capped.append({"role": m["role"], "content": c})
+        total += len(c)
+    convo_items = list(reversed(capped))
+
+    sys = (
+        "You are a concise assistant that creates a server-side chat summary for future context. "
+        "Write a compact summary that captures: relationship tone, key facts, user preferences/boundaries, "
+        "names/roles, and any commitments or plans. Avoid quoting long passages. "
+        "Output plain text only."
+    )
+
+    convo: List[Dict[str, str]] = [{"role": "system", "content": sys}] + convo_items
+
+    # Time-bound the summarization request to prevent upstream timeouts.
+    timeout_s = float(os.getenv("SAVE_SUMMARY_TIMEOUT_S", "30") or "30")
+    try:
+        summary = await asyncio.wait_for(run_in_threadpool(_call_gpt4o_summary, convo), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error_code": "timeout", "error": f"Save summary timed out after {timeout_s:.0f}s"}
+    except Exception as e:
+        _dbg(debug, "Summary generation failed:", repr(e))
+        return {"ok": False, "error_code": "summary_failed", "error": f"{type(e).__name__}: {e}"}
+
+    # Refresh from disk before write to avoid clobbering another worker's recent update.
+    _refresh_summary_store_if_needed()
+
+    key = _summary_store_key(session_state, session_id)
+    record = {
+        "saved_at": _now_ts(),
+        "session_id": session_id,
+        "member_id": session_state.get("memberId") or session_state.get("member_id"),
+        "companion": session_state.get("companion") or session_state.get("companionName") or session_state.get("companion_name"),
+        "summary": summary,
+    }
+    _CHAT_SUMMARY_STORE[key] = record
+    _persist_summary_store()
+
+    return {"ok": True, "summary": summary, "saved_at": record["saved_at"], "key": key}
+
+
+# ----------------------------
+# BACKWARD-COMPAT TTS ENDPOINT (still supported)
+# ----------------------------
+@app.post("/tts/audio-url")
+async def tts_audio_url(request: Request) -> Dict[str, Any]:
+    """
+    Backward compatible endpoint.
+
+    Request JSON:
+      {
+        "session_id": "...",
+        "voice_id": "<ElevenLabsVoiceId>",
+        "text": "..."
+      }
+
+    Response JSON:
+      { "audio_url": "https://...sas..." }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    session_id = (body.get("session_id") or body.get("sid") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=422, detail="session_id required")
+
+    voice_id = ((body.get("voice_id") or body.get("voiceId") or "")).strip()
+    text = (body.get("text") or "").strip()
+
+    if not voice_id or not text:
+        raise HTTPException(status_code=422, detail="voice_id and text are required")
+
+    try:
+        # STEP B: if another worker/request is already generating the same cached blob, wait briefly.
+        audio_url: Optional[str] = None
+        if _TTS_CACHE_ENABLED and voice_id and text:
+            try:
+                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
+                if _inflight_marker_is_fresh(cache_blob):
+                    waited = 0
+                    while waited < _TTS_INFLIGHT_WAIT_MS:
+                        peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text)
+                        if peek:
+                            audio_url = peek
+                            break
+                        await asyncio.sleep(0.15)
+                        waited += 150
+            except Exception:
+                pass
+        if audio_url is None:
+
+            brand = (body.get("brand") or "").strip()
+
+            avatar = (body.get("avatar") or "").strip()
+
+            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text, brand, avatar)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
+
+    return {"audio_url": audio_url}
+
+
+# --------------------------
+# STT (Speech-to-Text)
+# --------------------------
+# NOTE: This endpoint intentionally accepts RAW audio bytes in the request body (not multipart/form-data)
+# to avoid requiring the `python-multipart` package (which can otherwise prevent FastAPI from starting).
+#
+# Frontend should POST the recorded Blob directly:
+#   fetch(`${API_BASE}/stt/transcribe`, { method:"POST", headers:{ "Content-Type": blob.type }, body: blob })
+#
+@app.post("/stt/transcribe")
+async def stt_transcribe(request: Request):
+    if not settings.OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+
+    content_type = (request.headers.get("content-type") or "").lower().strip()
+    audio_bytes = await request.body()
+
+    if not audio_bytes or len(audio_bytes) < 16:
+        raise HTTPException(status_code=400, detail="No audio received")
+
+    # Infer file extension for OpenAI transcription.
+    if "webm" in content_type:
+        ext = "webm"
+    elif "ogg" in content_type:
+        ext = "ogg"
+    elif "mp4" in content_type or "m4a" in content_type or "aac" in content_type:
+        ext = "mp4"
+    elif "wav" in content_type:
+        ext = "wav"
+    else:
+        # Fallback; OpenAI can often still detect format, but providing a filename helps.
+        ext = "bin"
+
+    bio = io.BytesIO(audio_bytes)
+    bio.name = f"stt.{ext}"
+
+    try:
+        # Use the same OpenAI client used elsewhere in this service.
+        # `settings.STT_MODEL` can be set; fallback is whisper-1.
+        stt_model = getattr(settings, "STT_MODEL", None) or "whisper-1"
+        resp = client.audio.transcriptions.create(
+            model=stt_model,
+            file=bio,
+        )
+        text = getattr(resp, "text", None)
+        if text is None and isinstance(resp, dict):
+            text = resp.get("text")
+        if not text:
+            text = ""
+        return {"text": str(text).strip()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
+
+
+
+# =============================================================================
+# Option B — Separate Journaling Endpoint (does NOT touch /chat or TTS/STT)
+# =============================================================================
+#
+# Goal:
+#   Capture *copies* of incoming/outgoing messages to an append-only journal store.
+#   Summaries (manual or automated) can later be generated from this journal without
+#   invoking the existing /chat/save-summary flow that the frontend currently treats
+#   as a "stop everything" action.
+#
+# IMPORTANT:
+#   - This code path is separate from /chat, /tts/*, /stt/*.
+#   - It is only executed if the frontend calls /journal/append.
+#   - No TTS/STT logic is modified by this feature.
+#
+# Storage:
+#   - Default: local persistent /home on Azure App Service.
+#   - Set CHAT_JOURNAL_DIR to override.
+#
+# Payload contract (frontend → backend):
+#   POST /journal/append
+#   {
+#     "session_id": "....",
+#     "session_state": { ... },     # same object you send to /chat
+#     "events": [
+#       { "role": "user"|"assistant", "content": "...", "ts": 1730000000.123 }
+#     ]
+#   }
+#
+# Response:
+#   { ok: true|false, key: "...", count: N, error?: "..." }
+# =============================================================================
+
+_CHAT_JOURNAL_DIR = (os.getenv("CHAT_JOURNAL_DIR", "") or "/home/chat_journals").strip()
+
+
+def _journal_safe_filename(key: str) -> str:
+    # memberId::companionKey (contains ':' and other chars) → filesystem-safe slug
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", (key or "").strip())
+    if not safe:
+        safe = "unknown"
+    return safe + ".jsonl"
+
+
+def _journal_path_for_key(key: str) -> str:
+    try:
+        os.makedirs(_CHAT_JOURNAL_DIR, exist_ok=True)
+    except Exception:
+        # Fail-open: journaling should never break the API
+        pass
+    return os.path.join(_CHAT_JOURNAL_DIR, _journal_safe_filename(key))
+
+
+def _append_journal_events_sync(path: str, events: List[Dict[str, Any]]) -> None:
+    # Append JSONL with a per-file lock for multi-worker safety.
+    lock = FileLock(path + ".lock")
+    with lock:
+        with open(path, "a", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+@app.post("/journal/append", response_model=None)
+async def journal_append(request: Request):
+    try:
+        raw = await request.json()
+    except Exception as e:
+        return {"ok": False, "error": f"invalid_json: {type(e).__name__}: {e}"}
+
+    session_id = str(raw.get("session_id") or "").strip()
+    session_state = raw.get("session_state") or {}
+    events_in = raw.get("events") or []
+
+    if not isinstance(session_state, dict):
+        session_state = {}
+    if not isinstance(events_in, list):
+        events_in = []
+
+    # Compute the same stable keying scheme used by summaries.
+    # (memberId + normalized companion; falls back to session::<session_id>)
+    if not session_id:
+        # journaling must still have a stable file name; fall back to an ephemeral id
+        session_id = "session-" + uuid.uuid4().hex
+
+    key = _summary_store_key(session_state, session_id)
+
+    # Normalize/cap events (journaling must be cheap + safe)
+    now_ts = time.time()
+    max_events = int(os.getenv("CHAT_JOURNAL_MAX_EVENTS", "20") or "20")
+    max_chars = int(os.getenv("CHAT_JOURNAL_MAX_CHARS", "8000") or "8000")
+    max_chars_per_event = int(os.getenv("CHAT_JOURNAL_MAX_CHARS_PER_EVENT", "2000") or "2000")
+
+    norm: List[Dict[str, Any]] = []
+    for e in events_in[:max_events]:
+        if not isinstance(e, dict):
+            continue
+        role = str(e.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(e.get("content") or "")
+        content = content.strip()
+        if not content:
+            continue
+        if len(content) > max_chars_per_event:
+            content = content[:max_chars_per_event] + "…"
+        ts = e.get("ts")
+        try:
+            ts_f = float(ts) if ts is not None else now_ts
+        except Exception:
+            ts_f = now_ts
+
+        norm.append(
+            {
+                "ts": ts_f,
+                "role": role,
+                "content": content,
+                "session_id": session_id,
+                "key": key,
+            }
+        )
+
+    # Global cap
+    total_chars = 0
+    capped: List[Dict[str, Any]] = []
+    for e in norm:
+        total_chars += len(e.get("content") or "")
+        if total_chars > max_chars:
+            break
+        capped.append(e)
+
+    if not capped:
+        return {"ok": True, "key": key, "count": 0}
+
+    path = _journal_path_for_key(key)
+    try:
+        await run_in_threadpool(_append_journal_events_sync, path, capped)
+        return {"ok": True, "key": key, "count": len(capped)}
+    except Exception as e:
+        # Fail-open: journaling errors shouldn't break UX.
+        return {"ok": False, "key": key, "count": 0, "error": f"{type(e).__name__}: {e}"}
+
+
+# -----------------------------------------------------------------------------
+# (Optional / future) Server-side summarization from journal
+# -----------------------------------------------------------------------------
+# If, later, you decide to remove Wix-side validation or want backend-driven
+# automatic summaries, you can build it on top of the journal file(s) above.
+#
+# We are intentionally NOT enabling this now, because it introduces extra model
+# calls and could create new performance variables. Keep it as a controlled,
+# explicit feature rollout.
+#
+# @app.post("/journal/summarize", response_model=None)
+# async def journal_summarize(request: Request):
+#     ...
+
+# =============================================================================
+# LiveKit (replaces BeeStreamed + Jitsi for stream + conference)
+#
+# Supports:
+# - Persistent roomName per (brand, avatar) (stored in the existing event_ref column when present)
+# - Host-controlled start/stop via API (start sets session_active + session_kind + room)
+# - Pattern A lobby: viewers create join_request; host admits/denies; token issued on admit
+# - Recording / broadcast prep via LiveKit Egress (optional; requires storage env vars)
+#
+# Environment:
+#   NEXT_PUBLIC_LIVEKIT_URL (frontend)
+#   LIVEKIT_URL (backend, e.g. https://<project>.livekit.cloud)
+#   LIVEKIT_API_KEY / LIVEKIT_API_SECRET
+#
+# Optional (HLS segments to S3-compatible storage):
+#   LIVEKIT_S3_BUCKET
+#   LIVEKIT_S3_ACCESS_KEY
+#   LIVEKIT_S3_SECRET
+#   LIVEKIT_S3_REGION
+#   LIVEKIT_S3_ENDPOINT (optional)
+#   LIVEKIT_S3_FORCE_PATH_STYLE ("1"|"0", optional)
+#   LIVEKIT_HLS_PUBLIC_BASE_URL (public base for serving playlists; e.g. https://cdn.example.com/livekit)
+# =============================================================================
+
+try:
+    import jwt  # PyJWT
+except Exception:  # pragma: no cover
+    jwt = None  # type: ignore
+
+_LIVEKIT_JOIN_LOCK = threading.Lock()
+# requestId -> request dict
+_LIVEKIT_JOIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
+# Track active egress jobs per room so STOP can deterministically end recording/broadcast.
+# NOTE: This is in-memory. If you run multiple workers, use a shared store (Redis/DB) for production.
+_LIVEKIT_ACTIVE_EGRESS: Dict[str, Dict[str, str]] = {}  # roomName -> {"record": egressId, "hls": egressId}
+
+
+def _livekit_env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
+
+def _livekit_http_url() -> str:
+    """Base URL for LiveKit *server* APIs (Twirp/egress).
+
+    LiveKit server APIs are HTTPS endpoints. Many deployments accidentally set
+    LIVEKIT_URL / NEXT_PUBLIC_LIVEKIT_URL to a websocket URL (wss://...). We
+    accept that and normalize it for server-side calls.
+    """
+
+    raw = _livekit_env("LIVEKIT_URL", _livekit_env("NEXT_PUBLIC_LIVEKIT_URL", ""))
+    url = str(raw).strip().rstrip("/")
+    if not url:
+        return ""
+
+    # Convert websocket scheme -> http(s) for server API calls.
+    if url.startswith("wss://"):
+        url = "https://" + url[len("wss://") :]
+    elif url.startswith("ws://"):
+        url = "http://" + url[len("ws://") :]
+
+    # If scheme omitted, assume https.
+    if "://" not in url:
+        url = "https://" + url
+
+    return url
+
+
+def _livekit_client_ws_url() -> str:
+    """Base URL for LiveKit *client* signaling (Room.connect).
+
+    LiveKit JS expects a websocket URL (ws:// or wss://). If the configured URL
+    is https://..., convert it to wss://... for the browser.
+    """
+
+    raw = _livekit_env("NEXT_PUBLIC_LIVEKIT_URL", _livekit_env("LIVEKIT_URL", ""))
+    url = str(raw).strip().rstrip("/")
+    if not url:
+        return ""
+
+    if url.startswith("https://"):
+        url = "wss://" + url[len("https://") :]
+    elif url.startswith("http://"):
+        url = "ws://" + url[len("http://") :]
+
+    if "://" not in url:
+        url = "wss://" + url
+
+    return url
+
+def _livekit_api_key() -> str:
+    return _livekit_env("LIVEKIT_API_KEY")
+
+def _livekit_api_secret() -> str:
+    return _livekit_env("LIVEKIT_API_SECRET")
+
+def _livekit_twirp_headers() -> Dict[str, str]:
+    # LiveKit server API auth is also JWT-based, but for simplicity we sign with API secret in bearer token.
+    # Twirp endpoints accept "Authorization: Bearer <jwt>" with claim "video": {"roomCreate":true, ...} for service tokens.
+    # In practice, LiveKit server SDKs use a "service token". We implement minimal bearer token here.
+    if jwt is None:
+        raise HTTPException(status_code=500, detail="PyJWT is required for LiveKit integration (pip install PyJWT).")
+    key = _livekit_api_key()
+    secret = _livekit_api_secret()
+    if not key or not secret:
+        raise HTTPException(status_code=500, detail="LIVEKIT_API_KEY / LIVEKIT_API_SECRET are not configured")
+
+    now = int(time.time())
+    payload = {
+        "iss": key,
+        "sub": "service",
+        "nbf": now - 5,
+        "exp": now + 60,
+        "video": {"roomCreate": True, "roomList": True, "roomRecord": True, "roomAdmin": True},
+    }
+    token = jwt.encode(payload, secret, algorithm="HS256")
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def _livekit_participant_token(room: str, identity: str, name: str, *, can_publish: bool, can_subscribe: bool, room_admin: bool=False) -> str:
+    if jwt is None:
+        raise HTTPException(status_code=500, detail="PyJWT is required for LiveKit integration (pip install PyJWT).")
+    key = _livekit_api_key()
+    secret = _livekit_api_secret()
+    if not key or not secret:
+        raise HTTPException(status_code=500, detail="LIVEKIT_API_KEY / LIVEKIT_API_SECRET are not configured")
+
+    now = int(time.time())
+    video_grant: Dict[str, Any] = {
+        "room": room,
+        "roomJoin": True,
+        "canPublish": bool(can_publish),
+        "canSubscribe": bool(can_subscribe),
+        "canPublishData": bool(can_publish),
+    }
+    if room_admin:
+        video_grant["roomAdmin"] = True
+
+    payload = {
+        "iss": key,
+        "sub": identity,
+        "name": name or identity,
+        "nbf": now - 5,
+        "exp": now + 60 * 60,  # 1 hour
+        "video": video_grant,
+        "metadata": "",
+    }
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+def _twirp_post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    import requests  # type: ignore
+    base = _livekit_http_url()
+    if not base:
+        raise HTTPException(status_code=500, detail="LIVEKIT_URL is not configured")
+    url = f"{base}{path}"
+    try:
+        r = requests.post(url, headers=_livekit_twirp_headers(), json=payload, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LiveKit API call failed: {e!r}")
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=f"LiveKit API error {r.status_code}: {(r.text or '')[:500]}")
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": (r.text or "").strip()}
+
+def _livekit_room_name_for_companion(brand: str, avatar: str) -> str:
+    # Reuse your existing stable token helper for rooms.
+    return _sanitize_room_token(f"{(brand or '').strip()}-{(avatar or '').strip()}")
+
+def _livekit_storage_s3_config() -> Optional[Dict[str, Any]]:
+    bucket = _livekit_env("LIVEKIT_S3_BUCKET")
+    access_key = _livekit_env("LIVEKIT_S3_ACCESS_KEY")
+    secret = _livekit_env("LIVEKIT_S3_SECRET")
+    region = _livekit_env("LIVEKIT_S3_REGION")
+    endpoint = _livekit_env("LIVEKIT_S3_ENDPOINT")
+    force_path = _livekit_env("LIVEKIT_S3_FORCE_PATH_STYLE", "1")
+    if not bucket or not access_key or not secret:
+        return None
+    cfg: Dict[str, Any] = {
+        "access_key": access_key,
+        "secret": secret,
+        "bucket": bucket,
+        "region": region,
+        "force_path_style": str(force_path).strip() in ("1", "true", "True", "yes", "YES"),
+    }
+    if endpoint:
+        cfg["endpoint"] = endpoint
+    return cfg
+
+
+def _livekit_storage_azure_config() -> Optional[Dict[str, Any]]:
+    account_name = _livekit_env("LIVEKIT_AZURE_ACCOUNT_NAME")
+    account_key = _livekit_env("LIVEKIT_AZURE_ACCOUNT_KEY")
+    container_name = _livekit_env("LIVEKIT_AZURE_CONTAINER_NAME")
+    if not (account_name and account_key and container_name):
+        return None
+    return {"account_name": account_name, "account_key": account_key, "container_name": container_name}
+
+def _livekit_start_recording_egress(room_name: str) -> Dict[str, Any]:
+    """
+    Start an MP4 room-composite recording using LiveKit Egress.
+
+    Storage options:
+      - Azure Blob: set LIVEKIT_AZURE_ACCOUNT_NAME/KEY/CONTAINER_NAME
+      - S3: set LIVEKIT_S3_* (same as HLS)
+    Optional:
+      - LIVEKIT_RECORDING_PUBLIC_BASE_URL (if you serve recordings via CDN/public URL)
+    """
+    azure = _livekit_storage_azure_config()
+    s3 = _livekit_storage_s3_config()
+    if not azure and not s3:
+        return {"ok": False, "error": "Recording storage env not configured (LIVEKIT_AZURE_* or LIVEKIT_S3_*)"}
+
+    ts = int(time.time())
+    # Do not include file extension in directory portion; LiveKit will store the file at this key/path.
+    filepath = f"recordings/{room_name}/{ts}.mp4"
+
+    out: Dict[str, Any] = {"filepath": filepath}
+    if azure:
+        out["azure"] = azure
+    else:
+        out["s3"] = s3
+
+    req = {
+        "room_name": room_name,
+        "layout": "grid",
+        "preset": "H264_720P_30",
+        "audio_only": False,
+        "file_outputs": [out],
+    }
+    info = _twirp_post_json("/twirp/livekit.Egress/StartRoomCompositeEgress", req)
+
+    pub_base = _livekit_env("LIVEKIT_RECORDING_PUBLIC_BASE_URL").rstrip("/")
+    recording_url = f"{pub_base}/{filepath}" if pub_base else ""
+    return {"ok": True, "egress": info, "recordingUrl": recording_url, "filepath": filepath}
+
+def _livekit_stop_egress(egress_id: str) -> None:
+    if not egress_id:
+        return
+    try:
+        _twirp_post_json("/twirp/livekit.Egress/StopEgress", {"egress_id": egress_id})
+    except Exception:
+        # Best-effort; stopping a non-existent/ended egress should not break STOP.
+        pass
+
+def _livekit_kick_all(room_name: str) -> None:
+    try:
+        resp = _twirp_post_json("/twirp/livekit.RoomService/ListParticipants", {"room": room_name})
+        parts = resp.get("participants") or []
+        for p in parts:
+            ident = str(p.get("identity") or "").strip()
+            if not ident:
+                continue
+            try:
+                _twirp_post_json("/twirp/livekit.RoomService/RemoveParticipant", {"room": room_name, "identity": ident})
+            except Exception:
+                continue
+    except Exception:
+        return
+
+def _livekit_start_hls_egress(room_name: str) -> Dict[str, Any]:
+    s3 = _livekit_storage_s3_config()
+    if not s3:
+        return {"ok": False, "error": "S3 storage env not configured for HLS egress"}
+
+    # Use a predictable prefix so the playback URL is reusable.
+    prefix = f"hls/{room_name}"
+    playlist = "playlist.m3u8"
+    live_playlist = "live.m3u8"
+
+    req = {
+        "room_name": room_name,
+        "layout": "grid",
+        "preset": "H264_720P_30",
+        "audio_only": False,
+        "segment_outputs": [
+            {
+                "filename_prefix": prefix,
+                "playlist_name": playlist,
+                "live_playlist_name": live_playlist,
+                "segment_duration": 2,
+                "s3": s3,
+            }
+        ],
+    }
+    info = _twirp_post_json("/twirp/livekit.Egress/StartRoomCompositeEgress", req)
+    base = _livekit_env("LIVEKIT_HLS_PUBLIC_BASE_URL").rstrip("/")
+    hls_url = f"{base}/{prefix}/{live_playlist}" if base else ""
+    return {"ok": True, "egress": info, "hlsUrl": hls_url, "prefix": prefix, "livePlaylist": live_playlist}
+
+class LiveKitStartEmbedRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+    displayName: str = ""
+    embedDomain: str = ""
+
+@app.post("/stream/livekit/start_embed")
+async def livekit_stream_start_embed(req: LiveKitStartEmbedRequest):
+    """
+    Start or join a LiveKit 'stream' session (host-controlled).
+    - Host gets an immediate token.
+    - Viewer gets roomName + canStart=false and must go through join_request/admit.
+    """
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+
+
+    is_host = bool(host_member_id) and bool(caller_member_id) and (host_member_id.lower() == caller_member_id.lower())
+
+    # Stable room (reuse event_ref storage)
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    session_kind = (session_kind or "").strip()
+    session_room = (session_room or "").strip()
+    hls_url = ""
+    room = session_room or (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+    if not _read_event_ref_from_db(resolved_brand, resolved_avatar):
+        _set_session_active(resolved_brand, resolved_avatar, bool(_is_session_active(resolved_brand, resolved_avatar)), event_ref=room)
+
+    session_active = bool(_is_session_active(resolved_brand, resolved_avatar))
+    if is_host:
+        # Start session and persist session state.
+        _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room=room)
+        _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+        _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, room_name=room, last_started_at_ms=int(time.time()*1000))
+
+        # Clear prior live-chat transcript when starting a *new* stream session.
+        # (Avoid clearing on host refresh while the session is already active.)
+        if (not session_active) or (session_kind != "stream"):
+            try:
+                _livechat_db_clear_event_sync(room)
+            except Exception:
+                pass
+
+        # Optionally start HLS egress immediately on host start.
+        try:
+            autohls = str(_livekit_env("LIVEKIT_AUTO_HLS", "0")).strip().lower() in ("1", "true", "yes")
+            if autohls:
+                e = await _livekit_start_hls_egress(room)
+                hls_url = (e.get("hlsUrl") or "").strip()
+        except Exception:
+            pass
+
+
+        token = _livekit_participant_token(
+            room,
+            identity=f"host:{caller_member_id or 'host'}",
+            name=resolved_avatar or "Host",
+            can_publish=True,
+            can_subscribe=True,
+            room_admin=True,
+        )
+        return {
+            "ok": True,
+            "canStart": True,
+            "role": "host",
+            "room": room,
+            "roomName": room,
+            "sessionRoom": room,
+            "sessionActive": True,
+            "sessionKind": "stream",
+            "hostMemberId": host_member_id,
+            # LiveKit JS expects ws(s):// for signaling.
+            "serverUrl": _livekit_client_ws_url(),
+            "token": token,
+            "hlsUrl": hls_url,
+        }
+
+    # Viewer: issue a subscribe-only token automatically for livestreams (no approval).
+    viewer_token = ""
+    if session_active and session_kind == "stream" and room:
+        viewer_identity = f"viewer:{caller_member_id}" if caller_member_id else f"viewer:{uuid.uuid4().hex[:10]}"
+        viewer_name = (req.displayName or "").strip() or "Viewer"
+        viewer_token = _livekit_participant_token(
+            room,
+            identity=viewer_identity,
+            name=viewer_name,
+            can_publish=False,
+            can_subscribe=True,
+            room_admin=False,
+        )
+    return {
+        "ok": True,
+        "canStart": False,
+        "role": "viewer",
+        "room": room,
+        "roomName": room,
+        "sessionRoom": room,
+        "sessionActive": session_active,
+        "sessionKind": session_kind,
+        "hostMemberId": host_member_id,
+        "serverUrl": _livekit_client_ws_url(),
+        "token": viewer_token,
+        "hlsUrl": hls_url if session_active else "",
+    }
+
+
+@app.get("/stream/livekit/status")
+def livekit_stream_status(brand: str = "", avatar: str = "", memberId: str = "") -> Dict[str, Any]:
+    """Lightweight stream status for the Companion page.
+
+    IMPORTANT: This endpoint **does not** mint tokens.
+    """
+
+    resolved_brand = (brand or "").strip()
+    resolved_avatar = (avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    session_kind = (session_kind or "").strip()
+    session_room = (session_room or "").strip()
+
+    session_kind_lower = (session_kind or "").strip().lower()
+
+    # Treat both Stream and Private Conference as "active" for the companion status API.
+    # (Front-end needs to know the session is live in order to join the correct room.)
+    is_active = bool(session_room) and (session_kind_lower in ("stream", "conference")) and bool(
+        _is_session_active(resolved_brand, resolved_avatar)
+    )
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar) or {}
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    resolved_member_id = str(memberId or "").strip()
+    can_start = bool(resolved_member_id and host_member_id and (resolved_member_id == host_member_id))
+    hls_url = str(mapping.get("livekit_hls_url") or "").strip() or str(mapping.get("hls_url") or "").strip()
+
+    return {
+        "ok": True,
+        "sessionActive": bool(is_active),
+        "sessionKind": session_kind_lower or session_kind,
+        "roomName": session_room,
+        "sessionRoom": session_room,
+        "room": session_room,
+        # Frontend historically uses streamEventRef for its livechat websocket.
+        "streamEventRef": session_room,
+        "hostMemberId": host_member_id,
+        "canStart": bool(can_start),
+        "hlsUrl": hls_url,
+        "serverUrl": _livekit_client_ws_url(),
+    }
+
+
+@app.post("/stream/livekit/join")
+def livekit_stream_join(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """Issue a **viewer** token for an active stream."""
+
+    brand = str(body.get("brand") or body.get("companionName") or "").strip()
+    avatar = str(body.get("avatar") or "").strip()
+    member_id = str(body.get("memberId") or "").strip()
+    username = str(body.get("username") or body.get("displayName") or "").strip()
+
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    session_kind, session_room = _read_session_kind_room(brand, avatar)
+    session_kind = (session_kind or "").strip()
+    session_room = (session_room or "").strip()
+
+    if not (session_kind.lower() == "stream" and session_room and bool(_is_session_active(brand, avatar))):
+        return {
+            "ok": True,
+            "sessionActive": False,
+            "sessionKind": session_kind,
+            "roomName": session_room,
+            "role": "viewer",
+            "serverUrl": _livekit_client_ws_url(),
+        }
+
+    display_name = username or f"Viewer-{uuid.uuid4().hex[:4]}"
+    identity = member_id or f"viewer_{uuid.uuid4().hex[:12]}"
+
+    token = _livekit_participant_token(
+        session_room,
+        identity=identity,
+        name=display_name,
+        can_publish=False,
+        can_subscribe=True,
+        room_admin=False,
+    )
+
+    return {
+        "ok": True,
+        "sessionActive": True,
+        "sessionKind": "stream",
+        "role": "viewer",
+        "roomName": session_room,
+        "token": token,
+        "serverUrl": _livekit_client_ws_url(),
+    }
+
+
+class LiveKitStartBroadcastRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+    embedDomain: str = ""
+
+@app.post("/stream/livekit/start_broadcast")
+async def livekit_stream_start_broadcast(req: LiveKitStartBroadcastRequest):
+    """Host-only: start the reusable LiveKit broadcast session and return a host token.
+
+    This endpoint is designed for your existing "Broadcast" host button.
+    It:
+      - sets sessionActive=true and sessionKind='stream'
+      - starts recording egress (MP4) if storage is configured
+      - starts HLS egress (optional) if LIVEKIT_AUTO_HLS=1 and storage is configured
+      - returns {roomName, token, hlsUrl}
+    """
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    is_host = bool(host_member_id) and bool(caller_member_id) and (host_member_id.lower() == caller_member_id.lower())
+    if not is_host:
+        return {"ok": True, "isHost": False}
+
+    room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+    if not _read_event_ref_from_db(resolved_brand, resolved_avatar):
+        _set_session_active(resolved_brand, resolved_avatar, bool(_is_session_active(resolved_brand, resolved_avatar)), event_ref=room)
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room=room)
+    _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+    _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, room_name=room, last_started_at_ms=int(time.time()*1000))
+
+    # Start/ensure egress jobs (best-effort). Store ids for deterministic stop.
+    hls_url = ""
+    with _LIVEKIT_JOIN_LOCK:
+        _LIVEKIT_ACTIVE_EGRESS.setdefault(room, {})
+
+    if _livekit_env("LIVEKIT_RECORDING_ENABLED", "1") in ("1", "true", "True", "yes", "YES"):
+        try:
+            rec = _livekit_start_recording_egress(room)
+            if rec.get("ok"):
+                egress_id = str((rec.get("egress") or {}).get("egress_id") or (rec.get("egress") or {}).get("egressId") or "").strip()
+                if egress_id:
+                    with _LIVEKIT_JOIN_LOCK:
+                        _LIVEKIT_ACTIVE_EGRESS[room]["record"] = egress_id
+                    _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, record_egress_id=egress_id)
+        except Exception:
+            pass
+
+    if _livekit_env("LIVEKIT_AUTO_HLS", "0") in ("1", "true", "True", "yes", "YES"):
+        try:
+            e = _livekit_start_hls_egress(room)
+            if e.get("ok"):
+                hls_url = str(e.get("hlsUrl") or "")
+                hls_egress_id = str((e.get("egress") or {}).get("egress_id") or (e.get("egress") or {}).get("egressId") or "").strip()
+                if hls_egress_id:
+                    with _LIVEKIT_JOIN_LOCK:
+                        _LIVEKIT_ACTIVE_EGRESS[room]["hls"] = hls_egress_id
+                    _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, hls_egress_id=hls_egress_id, hls_url=hls_url)
+        except Exception:
+            pass
+
+    token = _livekit_participant_token(
+        room,
+        identity=f"host:{caller_member_id or 'host'}",
+        name="Host",
+        can_publish=True,
+        can_subscribe=True,
+        room_admin=True,
+    )
+    return {
+        "ok": True,
+        "isHost": True,
+        "roomName": room,
+        "token": token,
+        "hlsUrl": hls_url,
+        "sessionActive": True,
+        "serverUrl": _livekit_client_ws_url(),
+    }
+
+
+class LiveKitStopRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+
+@app.post("/stream/livekit/stop")
+async def livekit_stream_stop(req: LiveKitStopRequest):
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    if not host_member_id or caller_member_id != host_member_id:
+        return {"ok": True, "status": "not_host", "sessionActive": bool(_is_session_active(resolved_brand, resolved_avatar))}
+
+    room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+
+    # Stop any active egress jobs (recording/HLS) and kick participants to force-end the session.
+    with _LIVEKIT_JOIN_LOCK:
+        e = dict(_LIVEKIT_ACTIVE_EGRESS.get(room) or {})
+        _LIVEKIT_ACTIVE_EGRESS.pop(room, None)
+
+    _livekit_stop_egress(str(e.get("record") or ""))
+    _livekit_stop_egress(str(e.get("hls") or ""))
+    _livekit_kick_all(room)
+
+    # Reset session state in DB.
+    _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+    # Clear any pending join requests for this companion
+    with _LIVEKIT_JOIN_LOCK:
+        to_del = [rid for rid, r in _LIVEKIT_JOIN_REQUESTS.items() if (r.get("brand")==resolved_brand and r.get("avatar")==resolved_avatar)]
+        for rid in to_del:
+            _LIVEKIT_JOIN_REQUESTS.pop(rid, None)
+
+    return {"ok": True, "status": "stopped", "sessionActive": False}
+
+
+# ---- Conference session control (same room, different kind flag) -----------------
+
+class LiveKitConferenceStartRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+    displayName: str = ""
+
+class LiveKitConferenceStopRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str = ""
+
+@app.post("/conference/livekit/start")
+async def livekit_conference_start(req: LiveKitConferenceStartRequest):
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+
+    if not host_member_id or caller_member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Only the host can start the conference.")
+
+    # Determine whether a conference is already active (used to decide whether
+    # we should clear prior live-chat transcript).
+    prev_kind, prev_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    prev_kind = (prev_kind or "").strip()
+    prev_room = (prev_room or "").strip()
+    prev_active = bool(prev_room) and bool(_is_session_active(resolved_brand, resolved_avatar))
+
+    room = (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip() or _livekit_room_name_for_companion(resolved_brand, resolved_avatar)
+    if not _read_event_ref_from_db(resolved_brand, resolved_avatar):
+        _set_session_active(resolved_brand, resolved_avatar, bool(_is_session_active(resolved_brand, resolved_avatar)), event_ref=room)
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
+    _set_session_active(resolved_brand, resolved_avatar, True, event_ref=room)
+
+    # Always start a host-entered private conference with a clean live-chat transcript.
+    # (The room name is stable across sessions, so without this you'll see old message history.)
+    try:
+        _livechat_db_clear_event_sync(room)
+    except Exception:
+        pass
+
+    token = _livekit_participant_token(
+        room,
+        identity=f"host:{caller_member_id or 'host'}",
+        name=str(req.displayName or resolved_avatar or "Host").strip() or "Host",
+        can_publish=True,
+        can_subscribe=True,
+        room_admin=True,
+    )
+
+    return {
+        "ok": True,
+        "sessionActive": True,
+        "sessionKind": "conference",
+        "sessionRoom": room,
+        "token": token,
+        "serverUrl": _livekit_client_ws_url(),
+    }
+
+@app.post("/conference/livekit/stop")
+async def livekit_conference_stop(req: LiveKitConferenceStopRequest):
+    resolved_brand = (req.brand or "").strip()
+    resolved_avatar = (req.avatar or "").strip()
+    if not resolved_brand or not resolved_avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+    mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    if not host_member_id or caller_member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Only the host can stop the conference.")
+
+    _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+    # Clear pending join requests
+    with _LIVEKIT_JOIN_LOCK:
+        to_del = [rid for rid, r in _LIVEKIT_JOIN_REQUESTS.items() if (r.get("brand")==resolved_brand and r.get("avatar")==resolved_avatar)]
+        for rid in to_del:
+            _LIVEKIT_JOIN_REQUESTS.pop(rid, None)
+
+    return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
+
+# ---- Pattern A Lobby ------------------------------------------------------------
+
+class LiveKitJoinRequestCreate(BaseModel):
+    brand: str
+    avatar: str
+    memberId: str
+    name: str = ""
+    roomName: str = ""
+
+@app.post("/livekit/join_request")
+async def livekit_join_request(req: LiveKitJoinRequestCreate):
+    b = (req.brand or "").strip()
+    a = (req.avatar or "").strip()
+    if not b or not a:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+    rid = str(uuid.uuid4())
+
+    member_id = (req.memberId or "").strip()
+    # LiveKit identity convention (must match what we mint into the token on admit):
+    #   - user:<memberId> when memberId is available
+    #   - user:<rid> otherwise
+    identity = f"user:{member_id}" if member_id else f"user:{rid}"
+
+    # Requirement: if the viewer/attendee does not enter a name, use a LiveKit system identifier.
+    name = (req.name or "").strip()[:64] or identity
+
+    with _LIVEKIT_JOIN_LOCK:
+        _LIVEKIT_JOIN_REQUESTS[rid] = {
+            "requestId": rid,
+            "brand": b,
+            "avatar": a,
+            "roomName": (req.roomName or "").strip() or _livekit_room_name_for_companion(b, a),
+            "memberId": member_id,
+            "identity": identity,
+            "name": name,
+            "status": "PENDING",
+            "createdAt": int(time.time()),
+            "token": "",
+        }
+    return {"ok": True, "requestId": rid, "status": "PENDING"}
+
+@app.get("/livekit/join_requests")
+async def livekit_join_requests(brand: str, avatar: str):
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    with _LIVEKIT_JOIN_LOCK:
+        reqs = [r for r in _LIVEKIT_JOIN_REQUESTS.values() if r.get("brand")==b and r.get("avatar")==a and r.get("status")=="PENDING"]
+    # Most recent first
+    reqs.sort(key=lambda r: int(r.get("createdAt") or 0), reverse=True)
+    return {"ok": True, "requests": reqs[:50]}
+
+class LiveKitJoinDecision(BaseModel):
+    requestId: str
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+
+@app.post("/livekit/admit")
+async def livekit_admit(req: LiveKitJoinDecision):
+    rid = (req.requestId or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="requestId is required")
+
+    # Host authorization (use brand/avatar of the request if not provided)
+    with _LIVEKIT_JOIN_LOCK:
+        r = _LIVEKIT_JOIN_REQUESTS.get(rid)
+    if not r:
+        raise HTTPException(status_code=404, detail="join request not found")
+
+    b = (r.get("brand") or req.brand or "").strip()
+    a = (r.get("avatar") or req.avatar or "").strip()
+    mapping = _lookup_companion_mapping(b, a)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    if not host_member_id or caller_member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Only host can admit participants.")
+
+    room = str(r.get("roomName") or "").strip() or _livekit_room_name_for_companion(b, a)
+    identity = f"user:{str(r.get('memberId') or '').strip() or rid}"
+    name = str(r.get("name") or "").strip() or "Guest"
+
+    # IMPORTANT: Do NOT rely on _lookup_companion_mapping() for session_kind.
+    # That mapping is loaded once at startup; session_kind/session_room are updated in SQLite
+    # via _set_session_kind_room_best_effort(). For conference, viewers must be allowed to publish.
+    db_kind, _db_room = _read_session_kind_room(b, a)
+    session_kind = (db_kind or str(mapping.get("session_kind") or "")).strip().lower()
+    if session_kind not in ("conference", "stream"):
+        session_kind = "stream"
+    can_publish = session_kind == "conference"
+    token = _livekit_participant_token(room, identity=identity, name=name, can_publish=can_publish, can_subscribe=True)
+
+    with _LIVEKIT_JOIN_LOCK:
+        rr = _LIVEKIT_JOIN_REQUESTS.get(rid)
+        if rr:
+            rr["status"] = "ADMITTED"
+            rr["token"] = token
+            rr["decidedAt"] = int(time.time())
+
+    return {"ok": True, "status": "ADMITTED"}
+
+@app.post("/livekit/deny")
+async def livekit_deny(req: LiveKitJoinDecision):
+    rid = (req.requestId or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="requestId is required")
+
+    with _LIVEKIT_JOIN_LOCK:
+        r = _LIVEKIT_JOIN_REQUESTS.get(rid)
+    if not r:
+        raise HTTPException(status_code=404, detail="join request not found")
+
+    b = (r.get("brand") or req.brand or "").strip()
+    a = (r.get("avatar") or req.avatar or "").strip()
+    mapping = _lookup_companion_mapping(b, a)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+    host_member_id = str(mapping.get("host_member_id") or "").strip()
+    caller_member_id = str(req.memberId or "").strip()
+    if not host_member_id or caller_member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Only host can deny participants.")
+
+    with _LIVEKIT_JOIN_LOCK:
+        rr = _LIVEKIT_JOIN_REQUESTS.get(rid)
+        if rr:
+            rr["status"] = "DENIED"
+            rr["token"] = ""
+            rr["decidedAt"] = int(time.time())
+
+    return {"ok": True, "status": "DENIED"}
+
+@app.get("/livekit/join_request_status")
+async def livekit_join_request_status(requestId: str):
+    rid = (requestId or "").strip()
+    with _LIVEKIT_JOIN_LOCK:
+        r = _LIVEKIT_JOIN_REQUESTS.get(rid)
+    if not r:
+        return {"ok": True, "status": "MISSING", "serverUrl": _livekit_client_ws_url()}
+
+    # Derive the current session kind from the authoritative SQLite mapping table.
+    # (The in-memory mapping cache may be stale.)
+    b = (r.get("brand") or "").strip()
+    a = (r.get("avatar") or "").strip()
+    db_kind, _db_room = _read_session_kind_room(b, a)
+    return {
+        "ok": True,
+        "status": r.get("status"),
+        "token": r.get("token") or "",
+        "serverUrl": _livekit_client_ws_url(),
+        "roomName": r.get("roomName") or r.get("room") or "",
+        "sessionKind": (db_kind or r.get("session_kind") or ""),
+        "identity": r.get("identity") or "",
+        "name": r.get("name") or "",
+        "displayName": r.get("name") or "",
+        "memberId": r.get("memberId") or "",
+    }
