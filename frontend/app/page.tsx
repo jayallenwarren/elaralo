@@ -289,6 +289,32 @@ function getOrCreateAnonMemberId(brand: string): string {
   }
 }
 
+// ---- PayGo (Pay-as-you-Go) helpers ----
+const PAYGO_EMAIL_STORAGE_PREFIX = "elaralo_paygo_email:";
+
+function getStoredPaygoEmail(brandKey: string): string {
+  try {
+    return (localStorage.getItem(`${PAYGO_EMAIL_STORAGE_PREFIX}${brandKey}`) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function setStoredPaygoEmail(brandKey: string, email: string) {
+  try {
+    localStorage.setItem(`${PAYGO_EMAIL_STORAGE_PREFIX}${brandKey}`, email.trim());
+  } catch {
+    // ignore
+  }
+}
+
+function isProbablyEmail(s: string): boolean {
+  const t = (s || "").trim();
+  // Very lightweight validation; backend re-validates.
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t);
+}
+
+
 function isAnonMemberId(memberId: string): boolean {
   return (memberId || "").trim().toLowerCase().startsWith(ANON_ID_PREFIX);
 }
@@ -1685,67 +1711,48 @@ export default function Page() {
     const stripScheme = (u: string) => (u || "").replace(/^https?:/i, "");
 
     const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
-    const upgradeKey = rebrandingInfo?.upgradeLink ? stripScheme(rebrandingInfo.upgradeLink).toLowerCase() : "";
+const upgradeKey = rebrandingInfo?.upgradeLink ? stripScheme(rebrandingInfo.upgradeLink).toLowerCase() : "";
 
-        // PayGo: register a short-lived email -> identity mapping so Wix webhooks can credit minutes immediately.
-    const registerPayGoIntent = async (payerEmail: string) => {
-      const email = (payerEmail || "").trim();
-      if (!email) return;
+const registerPayGoIntentIfNeeded = async (): Promise<void> => {
+  // Members already have memberId from the Wix Companion payload.
+  const wixMemberId = (memberId || "").trim();
+  if (wixMemberId) return;
 
-      try {
-        if (!API_BASE) return;
+  if (typeof window === "undefined") return;
 
-        await fetch(`${API_BASE}/paygo/intent`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            email,
-            memberId: memberIdForLiveChat,
-            brandKey: brandKeyForAnon,
-          }),
-        });
-      } catch (err) {
-        console.warn("PayGo intent registration failed:", err);
-      }
-    };
+  const apiBase = (API_BASE || "").trim();
+  if (!apiBase) return;
 
-    const handlePayGoLinkClick = async (href: string) => {
-      const isSiteMember = Boolean(memberId) && !isAnonMemberId(memberIdForLiveChat);
+  // Prompt once per device (stored locally).
+  let email = getStoredPaygoEmail(brandKey);
+  if (!email) {
+    const entered = window.prompt(
+      "Please enter your email so we can credit your Pay‑as‑you‑Go minutes immediately after payment:"
+    );
+    if (!entered) return;
+    const trimmed = entered.trim();
+    if (!isProbablyEmail(trimmed)) {
+      window.alert("That doesn't look like a valid email address. Please try again.");
+      return;
+    }
+    email = trimmed;
+    setStoredPaygoEmail(brandKey, email);
+  }
 
-      if (!isSiteMember) {
-        const storageKey = `paygo_email::${brandKeyForAnon || "default"}`;
-        let email = "";
+  const memberIdForBackend = getOrCreateAnonMemberId(brandKey);
 
-        try {
-          email = (localStorage.getItem(storageKey) || "").trim();
-        } catch {
-          // ignore
-        }
-
-        if (!email) {
-          const entered = window.prompt("Please enter your email to receive your top-up minutes instantly after payment.") || "";
-          email = entered.trim();
-          if (email) {
-            try {
-              localStorage.setItem(storageKey, email);
-            } catch {
-              // ignore
-            }
-          }
-        }
-
-        if (email) {
-          await registerPayGoIntent(email);
-        } else {
-          const proceed = window.confirm(
-            "Without an email, we may not be able to automatically apply PayGo minutes. Continue to payment?"
-          );
-          if (!proceed) return;
-        }
-      }
-
-      window.open(href, "_blank", "noopener,noreferrer");
-    };
+  try {
+    await fetch(`${apiBase}/paygo/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, memberId: memberIdForBackend }),
+      // keepalive helps ensure the request completes even if the browser navigates.
+      keepalive: true,
+    });
+  } catch (err) {
+    console.warn("[paygo] intent registration failed:", err);
+  }
+};
 
 const renderTextWithLinks = (text: string, isAssistant: boolean): React.ReactNode => {
       const urlGlobal = /(https?:\/\/[^\s]+|\/\/[^\s]+)/g;
@@ -1779,12 +1786,7 @@ const renderTextWithLinks = (text: string, isAssistant: boolean): React.ReactNod
               target="_blank"
               rel="noopener noreferrer"
               onClick={
-                normalizedUrl === payGoLink
-                  ? (e) => {
-                      e.preventDefault();
-                      void handlePayGoLinkClick(href);
-                    }
-                  : undefined
+                label === "Pay as you Go" ? () => { void registerPayGoIntentIfNeeded(); } : undefined
               }
               style={{ textDecoration: "underline" }}
             >
