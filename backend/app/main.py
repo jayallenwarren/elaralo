@@ -6129,3 +6129,818 @@ async def livekit_join_request_status(requestId: str):
         "displayName": r.get("name") or "",
         "memberId": r.get("memberId") or "",
     }
+
+# ============================================================
+# WIX PAYMENT LINKS TOP-UP (PayGo) — Webhook + Pending Intents
+# ============================================================
+#
+# Goal:
+# - Reuse an existing Wix Pay Link (e.g., "PayGo Chat - 60 Min")
+# - Credit minutes immediately on payment (via Wix webhooks)
+# - For Wix members: credit by webhook identity.memberId when available
+# - For non-members/visitors: collect an email pre-payment, create a "pending top-up" intent,
+#   and credit minutes to the anonId when the webhook arrives (matched by payer email).
+# - Block concurrent pending top-ups by email to eliminate ambiguity.
+#
+# IMPORTANT:
+# - This logic is additive only (new endpoints + helpers). It does NOT alter existing chat flow.
+
+_TOPUP_STORE_PATH = (os.getenv("TOPUP_STORE_PATH", "/home/elaralo_topups.json") or "").strip() or "/home/elaralo_topups.json"
+_TOPUP_LOCK = FileLock(_TOPUP_STORE_PATH + ".lock")
+
+# Optional: restrict which Pay Link IDs are allowed to credit minutes.
+# Recommended: set PAYG_PAYLINK_IDS to a comma-separated list of allowed paylink IDs (GUIDs).
+_PAYG_PAYLINK_IDS_RAW = (os.getenv("PAYG_PAYLINK_IDS", "") or "").strip()
+_PAYG_PAYLINK_IDS: Set[str] = set([p.strip() for p in _PAYG_PAYLINK_IDS_RAW.split(",") if p.strip()]) if _PAYG_PAYLINK_IDS_RAW else set()
+
+# How long a pending intent stays valid (minutes). Keep this short to reduce ambiguity.
+_TOPUP_PENDING_TTL_MINUTES = _env_int("TOPUP_PENDING_TTL_MINUTES", 30)
+
+# Wix app credentials for calling Wix APIs (Query Payment Link Payments).
+_WIX_APP_ID = (os.getenv("WIX_APP_ID", "") or "").strip()
+_WIX_APP_SECRET = (os.getenv("WIX_APP_SECRET", "") or "").strip()
+
+# Wix webhook verification public key (from the Webhooks page > Get Public Key)
+_WIX_WEBHOOK_PUBLIC_KEY_RAW = (os.getenv("WIX_WEBHOOK_PUBLIC_KEY", "") or "").strip()
+
+
+def _topup_store_default() -> Dict[str, Any]:
+    return {
+        "pendingByEmail": {},      # email_norm -> pendingId
+        "pendingById": {},         # pendingId -> record
+        "paymentLedger": {},       # paymentLinkPaymentId -> processing/credited/failed
+        "processedEventIds": {},   # eventId -> ts (best-effort)
+        "lastCleanup": 0,
+    }
+
+
+def _load_topup_store() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(_TOPUP_STORE_PATH):
+            return _topup_store_default()
+        with open(_TOPUP_STORE_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            return _topup_store_default()
+        base = _topup_store_default()
+        for k, v in base.items():
+            obj.setdefault(k, v)
+        return obj
+    except Exception:
+        return _topup_store_default()
+
+
+def _save_topup_store(store: Dict[str, Any]) -> None:
+    tmp = _TOPUP_STORE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False)
+    os.replace(tmp, _TOPUP_STORE_PATH)
+
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _parse_price_to_float(price_str: str) -> Optional[float]:
+    """
+    Accepts formats like "$5.99", "5.99", "USD 5.99".
+    Returns float or None.
+    """
+    t = (price_str or "").strip()
+    if not t:
+        return None
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", t)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def _topup_cleanup_locked(store: Dict[str, Any], *, now: Optional[float] = None) -> Dict[str, Any]:
+    now_ts = float(now if now is not None else time.time())
+    last = float(store.get("lastCleanup") or 0.0)
+    if now_ts - last < 60.0:
+        return store
+
+    pending_by_email = store.get("pendingByEmail") or {}
+    pending_by_id = store.get("pendingById") or {}
+    ledger = store.get("paymentLedger") or {}
+    if not isinstance(pending_by_email, dict):
+        pending_by_email = {}
+    if not isinstance(pending_by_id, dict):
+        pending_by_id = {}
+    if not isinstance(ledger, dict):
+        ledger = {}
+
+    # Expire pending
+    for pid, rec in list(pending_by_id.items()):
+        if not isinstance(rec, dict):
+            pending_by_id.pop(pid, None)
+            continue
+        status = str(rec.get("status") or "").upper()
+        expires_at = float(rec.get("expiresAt") or 0.0)
+        if status == "PENDING" and expires_at and now_ts > expires_at:
+            rec["status"] = "EXPIRED"
+            rec["expiredAt"] = int(now_ts)
+            pending_by_id[pid] = rec
+            # free email slot if still mapped
+            em = str(rec.get("email") or "").strip().lower()
+            if em and pending_by_email.get(em) == pid:
+                pending_by_email.pop(em, None)
+
+        # Remove very old records (7 days)
+        created_at = float(rec.get("createdAt") or 0.0)
+        if created_at and (now_ts - created_at) > (7 * 86400.0):
+            em = str(rec.get("email") or "").strip().lower()
+            if em and pending_by_email.get(em) == pid:
+                pending_by_email.pop(em, None)
+            pending_by_id.pop(pid, None)
+
+    # Trim ledger entries older than 30 days
+    for pay_id, entry in list(ledger.items()):
+        if not isinstance(entry, dict):
+            ledger.pop(pay_id, None)
+            continue
+        first_seen = float(entry.get("firstSeen") or 0.0)
+        if first_seen and (now_ts - first_seen) > (30 * 86400.0):
+            ledger.pop(pay_id, None)
+
+    store["pendingByEmail"] = pending_by_email
+    store["pendingById"] = pending_by_id
+    store["paymentLedger"] = ledger
+    store["lastCleanup"] = int(now_ts)
+    return store
+
+
+def _topup_get_active_pending_by_email(email_norm: str) -> Optional[Dict[str, Any]]:
+    em = _normalize_email(email_norm)
+    if not em:
+        return None
+    now_ts = time.time()
+    with _TOPUP_LOCK:
+        store = _load_topup_store()
+        store = _topup_cleanup_locked(store, now=now_ts)
+        pid = (store.get("pendingByEmail") or {}).get(em)
+        rec = (store.get("pendingById") or {}).get(pid) if pid else None
+        _save_topup_store(store)
+
+    if not isinstance(rec, dict):
+        return None
+    if str(rec.get("status") or "").upper() != "PENDING":
+        return None
+    expires_at = float(rec.get("expiresAt") or 0.0)
+    if expires_at and now_ts > expires_at:
+        return None
+    return rec
+
+
+def _resolve_paygo_from_session_state(session_state: Optional[Dict[str, Any]]) -> Tuple[str, int, str, Optional[float]]:
+    """
+    Mirrors the PayGo resolution logic in /chat:
+    - Base from env PAYG_PAY_URL / PAYG_INCREMENT_MINUTES / PAYG_PRICE_TEXT (or PAYG_PRICE)
+    - Override from session_state payGoLink/payGoPrice/payGoMinutes OR rebrandingKey parts.
+    """
+    payg_url = (PAYG_PAY_URL or "").strip()
+    minutes = int(PAYG_INCREMENT_MINUTES or 0)
+    price_text = (PAYG_PRICE_TEXT or "").strip()
+    price_num = _parse_price_to_float(PAYG_PRICE)
+
+    try:
+        ss = session_state if isinstance(session_state, dict) else {}
+        rebranding_key_raw = _extract_rebranding_key(ss)
+        rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+
+        pay_go_link_override = _session_get_str(ss, "pay_go_link", "payGoLink") or rebranding_parsed.get("pay_go_link", "")
+        pay_go_price = _session_get_str(ss, "pay_go_price", "payGoPrice") or rebranding_parsed.get("pay_go_price", "")
+        pay_go_minutes_raw = _session_get_str(ss, "pay_go_minutes", "payGoMinutes") or rebranding_parsed.get("pay_go_minutes", "")
+        pay_go_minutes = _safe_int(pay_go_minutes_raw)
+
+        if pay_go_link_override:
+            payg_url = str(pay_go_link_override).strip()
+        if pay_go_minutes is not None:
+            minutes = int(pay_go_minutes)
+        if pay_go_price:
+            price_num = _parse_price_to_float(str(pay_go_price))
+            minutes_part = str(pay_go_minutes) if pay_go_minutes is not None else str(pay_go_minutes_raw or "").strip()
+            if minutes_part:
+                price_text = f"{str(pay_go_price).strip()} per {minutes_part} minutes"
+    except Exception:
+        pass
+
+    return payg_url, max(0, int(minutes or 0)), price_text, price_num
+
+
+class TopupPendingRequest(BaseModel):
+    email: str
+    # For non-members this should be your anonId (e.g., "anon:brand:uuid"); for members, this can be the Wix memberId.
+    memberId: str
+    # Optional: pass the same session_state you already send to /chat so PayGo overrides are consistent.
+    session_state: Optional[Dict[str, Any]] = None
+    # Optional: override minutes explicitly (rare; prefer session_state or env)
+    minutes: Optional[int] = None
+
+
+@app.post("/topup/pending")
+async def topup_create_pending(req: TopupPendingRequest):
+    """
+    Create a "pending top-up" intent keyed by email.
+    - Blocks concurrent pending for same email (409).
+    - Returns pendingId + the resolved PayGo URL/minutes for UI display.
+    """
+    email_norm = _normalize_email(req.email)
+    if not email_norm or "@" not in email_norm:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+
+    member_id = (req.memberId or "").strip()
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required (use anonId for non-members)")
+
+    payg_url, payg_minutes, payg_price_text, payg_price_num = _resolve_paygo_from_session_state(req.session_state)
+
+    minutes_to_credit = payg_minutes
+    if req.minutes is not None:
+        try:
+            minutes_to_credit = max(1, int(req.minutes))
+        except Exception:
+            minutes_to_credit = payg_minutes
+
+    if minutes_to_credit <= 0:
+        raise HTTPException(status_code=400, detail="PayGo minutes must be > 0")
+
+    now_ts = time.time()
+    expires_at = now_ts + (float(_TOPUP_PENDING_TTL_MINUTES) * 60.0)
+
+    with _TOPUP_LOCK:
+        store = _load_topup_store()
+        store = _topup_cleanup_locked(store, now=now_ts)
+
+        pending_by_email = store.get("pendingByEmail") or {}
+        pending_by_id = store.get("pendingById") or {}
+        if not isinstance(pending_by_email, dict):
+            pending_by_email = {}
+        if not isinstance(pending_by_id, dict):
+            pending_by_id = {}
+
+        existing_pid = pending_by_email.get(email_norm)
+        if existing_pid:
+            existing_rec = pending_by_id.get(existing_pid)
+            if isinstance(existing_rec, dict) and str(existing_rec.get("status") or "").upper() == "PENDING":
+                ex_exp = float(existing_rec.get("expiresAt") or 0.0)
+                if ex_exp and now_ts <= ex_exp:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "PENDING_EXISTS",
+                            "pendingId": existing_pid,
+                            "expiresAt": int(ex_exp),
+                            "payUrl": existing_rec.get("payUrl") or payg_url,
+                        },
+                    )
+
+        pending_id = str(uuid.uuid4())
+        rec = {
+            "id": pending_id,
+            "status": "PENDING",
+            "email": email_norm,
+            "memberId": member_id,
+            "identityKey": f"member::{member_id}",
+            "createdAt": int(now_ts),
+            "expiresAt": int(expires_at),
+            "minutesToCredit": int(minutes_to_credit),
+            "payUrl": payg_url,
+            "priceText": payg_price_text,
+            "priceNum": payg_price_num,
+        }
+
+        pending_by_email[email_norm] = pending_id
+        pending_by_id[pending_id] = rec
+        store["pendingByEmail"] = pending_by_email
+        store["pendingById"] = pending_by_id
+        _save_topup_store(store)
+
+    return {
+        "ok": True,
+        "pendingId": pending_id,
+        "expiresAt": int(expires_at),
+        "payUrl": payg_url,
+        "minutesToCredit": int(minutes_to_credit),
+        "priceText": payg_price_text,
+    }
+
+
+@app.get("/topup/pending/{pendingId}")
+async def topup_get_pending(pendingId: str):
+    pid = (pendingId or "").strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="pendingId is required")
+
+    with _TOPUP_LOCK:
+        store = _load_topup_store()
+        store = _topup_cleanup_locked(store)
+        rec = (store.get("pendingById") or {}).get(pid)
+        _save_topup_store(store)
+
+    if not isinstance(rec, dict):
+        raise HTTPException(status_code=404, detail="pendingId not found")
+
+    return {
+        "ok": True,
+        "id": rec.get("id"),
+        "status": rec.get("status"),
+        "expiresAt": rec.get("expiresAt"),
+        "creditedAt": rec.get("creditedAt"),
+        "minutesToCredit": rec.get("minutesToCredit"),
+        "payUrl": rec.get("payUrl"),
+        "paymentId": rec.get("paymentId"),
+        "error": rec.get("error"),
+    }
+
+
+def _wix_public_key_to_pem(key_raw: str) -> str:
+    """
+    Accepts either:
+      - PEM (-----BEGIN PUBLIC KEY-----)
+      - base64 DER (no header/footer)
+    Returns PEM.
+    """
+    k = (key_raw or "").strip()
+    if not k:
+        return ""
+    if "BEGIN PUBLIC KEY" in k:
+        return k
+    b64 = re.sub(r"\s+", "", k)
+    wrapped = "\n".join([b64[i:i+64] for i in range(0, len(b64), 64)])
+    return "-----BEGIN PUBLIC KEY-----\n" + wrapped + "\n-----END PUBLIC KEY-----\n"
+
+
+def _wix_decode_webhook_jwt(token: str) -> Dict[str, Any]:
+    """
+    Verify + decode Wix webhook JWT using the public key from the app dashboard.
+    """
+    if not _WIX_WEBHOOK_PUBLIC_KEY_RAW:
+        raise RuntimeError("WIX_WEBHOOK_PUBLIC_KEY is not configured")
+    if jwt is None:
+        raise RuntimeError("PyJWT is not available (jwt import failed)")
+    pem = _wix_public_key_to_pem(_WIX_WEBHOOK_PUBLIC_KEY_RAW)
+    try:
+        header = jwt.get_unverified_header(token)
+        alg = str(header.get("alg") or "RS256")
+    except Exception:
+        alg = "RS256"
+
+    decoded = jwt.decode(
+        token,
+        pem,
+        algorithms=[alg, "RS256", "RS512"],
+        options={
+            "verify_signature": True,
+            "verify_exp": True,
+        },
+        audience=None,
+    )
+    if not isinstance(decoded, dict):
+        raise RuntimeError("Decoded webhook payload is not an object")
+    return decoded
+
+
+def _wix_oauth_access_token(instance_id: str) -> Optional[str]:
+    """
+    Create an access token with Wix app identity, using OAuth client_credentials + instance_id.
+    Endpoint: POST https://www.wixapis.com/oauth2/token
+    """
+    iid = (instance_id or "").strip()
+    if not iid:
+        return None
+    if not _WIX_APP_ID or not _WIX_APP_SECRET:
+        return None
+
+    cache_key = f"wix_token::{iid}"
+    now_ts = time.time()
+    try:
+        cache = getattr(_wix_oauth_access_token, "_cache", {})  # type: ignore[attr-defined]
+    except Exception:
+        cache = {}
+    if isinstance(cache, dict):
+        entry = cache.get(cache_key)
+        if isinstance(entry, dict):
+            tok = entry.get("token")
+            exp = float(entry.get("exp") or 0.0)
+            if tok and now_ts < (exp - 30.0):
+                return str(tok)
+
+    try:
+        import requests  # type: ignore
+        r = requests.post(
+            "https://www.wixapis.com/oauth2/token",
+            headers={"Content-Type": "application/json"},
+            json={
+                "grant_type": "client_credentials",
+                "client_id": _WIX_APP_ID,
+                "client_secret": _WIX_APP_SECRET,
+                "instance_id": iid,
+            },
+            timeout=5,
+        )
+        if r.status_code != 200:
+            logger.warning("Wix oauth2/token failed %s %s", r.status_code, r.text[:500])
+            return None
+        data = r.json()
+        tok = data.get("access_token")
+        expires_in = float(data.get("expires_in") or 0.0)
+        if not tok:
+            return None
+        exp_ts = now_ts + (expires_in if expires_in > 0 else 3600.0)
+        cache[cache_key] = {"token": tok, "exp": exp_ts}
+        try:
+            setattr(_wix_oauth_access_token, "_cache", cache)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return str(tok)
+    except Exception as e:
+        logger.warning("Wix oauth2/token exception: %s", e)
+        return None
+
+
+def _wix_query_payment_link_payment(payment_id: str, instance_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Query Payment Link Payments and return the first matching object.
+    Endpoint: POST https://www.wixapis.com/payment-links/v1/payment-link-payments/query
+    """
+    pid = (payment_id or "").strip()
+    if not pid:
+        return None
+    tok = _wix_oauth_access_token(instance_id)
+    if not tok:
+        return None
+    try:
+        import requests  # type: ignore
+        r = requests.post(
+            "https://www.wixapis.com/payment-links/v1/payment-link-payments/query",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {tok}",
+            },
+            json={
+                "query": {
+                    "filter": {"id": {"$eq": pid}},
+                    "cursorPaging": {"limit": 1},
+                }
+            },
+            timeout=5,
+        )
+        if r.status_code != 200:
+            logger.warning("Query payment-link-payments failed %s %s", r.status_code, r.text[:500])
+            return None
+        data = r.json()
+        arr = data.get("paymentLinkPayments") or data.get("items") or []
+        if isinstance(arr, list) and arr:
+            obj = arr[0]
+            return obj if isinstance(obj, dict) else None
+        return None
+    except Exception as e:
+        logger.warning("Query payment-link-payments exception: %s", e)
+        return None
+
+
+def _extract_payment_email(payment_obj: Dict[str, Any]) -> str:
+    try:
+        reg = payment_obj.get("regularPaymentLinkPayment") or {}
+        if isinstance(reg, dict):
+            cd = reg.get("contactDetails") or {}
+            if isinstance(cd, dict):
+                email = cd.get("email")
+                if email:
+                    return _normalize_email(str(email))
+    except Exception:
+        pass
+    for key in ("email", "payerEmail", "customerEmail"):
+        v = payment_obj.get(key)
+        if v:
+            return _normalize_email(str(v))
+    return ""
+
+
+def _extract_payment_amount(payment_obj: Dict[str, Any]) -> Optional[float]:
+    try:
+        amt = payment_obj.get("amount") or {}
+        if isinstance(amt, dict):
+            v = amt.get("value")
+            if v is not None:
+                return float(v)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_payment_link_id(payment_obj: Dict[str, Any]) -> str:
+    v = payment_obj.get("paymentLinkId") or payment_obj.get("payment_link_id") or payment_obj.get("payLinkId")
+    return str(v).strip() if v else ""
+
+
+def _ledger_acquire_processing(payment_id: str, event_id: str) -> bool:
+    """
+    Returns True if we acquired processing for this payment_id, False if already credited/in-progress.
+    """
+    pid = (payment_id or "").strip()
+    if not pid:
+        return False
+    now_ts = int(time.time())
+    with _TOPUP_LOCK:
+        store = _load_topup_store()
+        store = _topup_cleanup_locked(store)
+        ledger = store.get("paymentLedger") or {}
+        if not isinstance(ledger, dict):
+            ledger = {}
+
+        entry = ledger.get(pid)
+        if isinstance(entry, dict):
+            status = str(entry.get("status") or "").upper()
+            if status == "CREDITED":
+                _save_topup_store(store)
+                return False
+            if status == "PROCESSING":
+                last_attempt = int(entry.get("lastAttempt") or 0)
+                # another worker/thread likely processing; treat as in-progress for 2 minutes
+                if now_ts - last_attempt < 120:
+                    _save_topup_store(store)
+                    return False
+
+        attempts = int(entry.get("attempts") or 0) + 1 if isinstance(entry, dict) else 1
+        first_seen = int(entry.get("firstSeen") or now_ts) if isinstance(entry, dict) else now_ts
+
+        ledger[pid] = {
+            "status": "PROCESSING",
+            "eventId": (event_id or ""),
+            "firstSeen": first_seen,
+            "lastAttempt": now_ts,
+            "attempts": attempts,
+        }
+        store["paymentLedger"] = ledger
+
+        # best-effort event id record (not used for idempotency)
+        if event_id:
+            pe = store.get("processedEventIds") or {}
+            if not isinstance(pe, dict):
+                pe = {}
+            pe[str(event_id)] = now_ts
+            store["processedEventIds"] = pe
+
+        _save_topup_store(store)
+    return True
+
+
+def _ledger_mark_credited(payment_id: str, *, paylink_id: str, identity_key: str, minutes: int) -> None:
+    pid = (payment_id or "").strip()
+    if not pid:
+        return
+    now_ts = int(time.time())
+    with _TOPUP_LOCK:
+        store = _load_topup_store()
+        store = _topup_cleanup_locked(store)
+        ledger = store.get("paymentLedger") or {}
+        if not isinstance(ledger, dict):
+            ledger = {}
+        entry = ledger.get(pid) if isinstance(ledger.get(pid), dict) else {}
+        entry = entry if isinstance(entry, dict) else {}
+        entry.update({
+            "status": "CREDITED",
+            "creditedAt": now_ts,
+            "paylinkId": paylink_id,
+            "identityKey": identity_key,
+            "minutes": int(minutes),
+        })
+        ledger[pid] = entry
+        store["paymentLedger"] = ledger
+        _save_topup_store(store)
+
+
+def _ledger_mark_failed(payment_id: str, error: str) -> None:
+    pid = (payment_id or "").strip()
+    if not pid:
+        return
+    now_ts = int(time.time())
+    with _TOPUP_LOCK:
+        store = _load_topup_store()
+        store = _topup_cleanup_locked(store)
+        ledger = store.get("paymentLedger") or {}
+        if not isinstance(ledger, dict):
+            ledger = {}
+        entry = ledger.get(pid) if isinstance(ledger.get(pid), dict) else {}
+        entry = entry if isinstance(entry, dict) else {}
+        entry.update({
+            "status": "FAILED",
+            "failedAt": now_ts,
+            "error": (error or "")[:400],
+        })
+        ledger[pid] = entry
+        store["paymentLedger"] = ledger
+        _save_topup_store(store)
+
+
+def _complete_pending_by_email(email_norm: str, *, payment_id: str, minutes_added: int, credited_identity_key: str) -> None:
+    em = _normalize_email(email_norm)
+    if not em:
+        return
+    now_ts = int(time.time())
+    with _TOPUP_LOCK:
+        store = _load_topup_store()
+        store = _topup_cleanup_locked(store)
+        pending_by_email = store.get("pendingByEmail") or {}
+        pending_by_id = store.get("pendingById") or {}
+        if not isinstance(pending_by_email, dict):
+            pending_by_email = {}
+        if not isinstance(pending_by_id, dict):
+            pending_by_id = {}
+
+        pid = pending_by_email.get(em)
+        if pid and pid in pending_by_id and isinstance(pending_by_id.get(pid), dict):
+            rec = pending_by_id[pid]
+            rec["status"] = "CREDITED"
+            rec["creditedAt"] = now_ts
+            rec["paymentId"] = (payment_id or "")
+            rec["minutesCredited"] = int(minutes_added)
+            rec["creditedIdentityKey"] = credited_identity_key
+            pending_by_id[pid] = rec
+
+        # Free the email for future purchases regardless
+        pending_by_email.pop(em, None)
+
+        store["pendingByEmail"] = pending_by_email
+        store["pendingById"] = pending_by_id
+        _save_topup_store(store)
+
+
+def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
+    """
+    Process webhook:
+    1) Extract payment entityId from decoded["data"] (JSON string).
+    2) Acquire ledger lock for payment_id (idempotency).
+    3) Query payment details using Wix API (requires Manage Paylinks permission).
+    4) Determine who to credit:
+       - If webhook identityType == MEMBER -> credit memberId
+       - Else match by payer email to pending intent (email -> anonId) and credit that
+    5) Credit minutes and mark ledger/pending as completed.
+    """
+    try:
+        instance_id = str(decoded.get("instanceId") or "").strip()
+
+        data_raw = decoded.get("data")
+        if isinstance(data_raw, str):
+            try:
+                data_obj = json.loads(data_raw)
+            except Exception:
+                data_obj = {}
+        elif isinstance(data_raw, dict):
+            data_obj = data_raw
+        else:
+            data_obj = {}
+
+        identity_raw = decoded.get("identity")
+        if isinstance(identity_raw, str):
+            try:
+                identity_obj = json.loads(identity_raw)
+            except Exception:
+                identity_obj = {}
+        elif isinstance(identity_raw, dict):
+            identity_obj = identity_raw
+        else:
+            identity_obj = {}
+
+        created = data_obj.get("createdEvent") if isinstance(data_obj, dict) else None
+        updated = data_obj.get("updatedEvent") if isinstance(data_obj, dict) else None
+        evt = created if isinstance(created, dict) else (updated if isinstance(updated, dict) else {})
+        event_id = str(evt.get("id") or "").strip()
+        payment_id = str(evt.get("entityId") or "").strip()
+        if not payment_id:
+            logger.warning("Wix webhook: missing payment entityId")
+            return
+
+        # Acquire processing for this payment_id (idempotency)
+        if not _ledger_acquire_processing(payment_id, event_id):
+            return
+
+        # Retry transient Wix API failures a couple times
+        payment_obj: Optional[Dict[str, Any]] = None
+        for attempt in range(3):
+            payment_obj = _wix_query_payment_link_payment(payment_id, instance_id)
+            if payment_obj:
+                break
+            time.sleep(0.5 * (2 ** attempt))
+
+        if not payment_obj:
+            _ledger_mark_failed(payment_id, "QUERY_PAYMENT_FAILED")
+            return
+
+        paylink_id = _extract_payment_link_id(payment_obj)
+        if _PAYG_PAYLINK_IDS and paylink_id and paylink_id not in _PAYG_PAYLINK_IDS:
+            _ledger_mark_failed(payment_id, f"UNRELATED_PAYLINK:{paylink_id}")
+            return
+
+        email_norm = _extract_payment_email(payment_obj)
+        amount = _extract_payment_amount(payment_obj)
+
+        # Determine identity to credit
+        identity_type = str(identity_obj.get("identityType") or "").upper()
+        member_id = str(identity_obj.get("memberId") or "").strip() if identity_type == "MEMBER" else ""
+
+        credited_identity_key = ""
+        minutes_to_credit = int(PAYG_INCREMENT_MINUTES or 0)
+
+        if member_id:
+            credited_identity_key = f"member::{member_id}"
+            minutes_to_credit = int(PAYG_INCREMENT_MINUTES or 0)
+        else:
+            if not email_norm:
+                _ledger_mark_failed(payment_id, "NO_EMAIL_AND_NO_MEMBERID")
+                return
+
+            pending = _topup_get_active_pending_by_email(email_norm)
+            if not pending:
+                _ledger_mark_failed(payment_id, f"NO_PENDING_FOR_EMAIL:{email_norm}")
+                return
+
+            # Optional price check
+            expected_price = pending.get("priceNum")
+            if expected_price is not None and amount is not None:
+                try:
+                    if abs(float(expected_price) - float(amount)) > 0.05:
+                        _ledger_mark_failed(payment_id, "AMOUNT_MISMATCH")
+                        # Leave pending as-is (still pending) so user can retry or you can resolve manually.
+                        return
+                except Exception:
+                    pass
+
+            credited_identity_key = str(pending.get("identityKey") or "").strip()
+            minutes_to_credit = int(pending.get("minutesToCredit") or int(PAYG_INCREMENT_MINUTES or 0))
+
+        if not credited_identity_key:
+            _ledger_mark_failed(payment_id, "MISSING_IDENTITY_KEY")
+            return
+        if minutes_to_credit <= 0:
+            _ledger_mark_failed(payment_id, "INVALID_MINUTES")
+            return
+
+        credit_res = _usage_credit_minutes_sync(credited_identity_key, int(minutes_to_credit))
+        if not credit_res.get("ok"):
+            _ledger_mark_failed(payment_id, "CREDIT_FAILED")
+            return
+
+        # Mark ledger + pending
+        _ledger_mark_credited(payment_id, paylink_id=paylink_id, identity_key=credited_identity_key, minutes=int(minutes_to_credit))
+        if not member_id and email_norm:
+            _complete_pending_by_email(
+                email_norm,
+                payment_id=payment_id,
+                minutes_added=int(minutes_to_credit),
+                credited_identity_key=credited_identity_key,
+            )
+
+        logger.info(
+            "Wix payment credited minutes=%s identity=%s payment_id=%s paylink_id=%s",
+            minutes_to_credit,
+            credited_identity_key,
+            payment_id,
+            paylink_id,
+        )
+
+    except Exception as e:
+        logger.warning("Wix webhook processing exception: %s", e)
+
+
+@app.post("/webhooks/wix/paymentlinks")
+async def wix_paymentlinks_webhook(request: Request):
+    """
+    Wix webhook callback URL.
+    Wix sends the webhook payload as a JWT in the request body.
+    We verify + decode the JWT, then process in a background thread and return 200 quickly.
+    """
+    raw = await request.body()
+    token = (raw.decode("utf-8", errors="ignore") or "").strip()
+
+    # Some webhook test tools send JSON like {"jwt":"..."}; support that too.
+    if token.startswith("{") and token.endswith("}"):
+        try:
+            obj = json.loads(token)
+            if isinstance(obj, dict):
+                token = str(obj.get("jwt") or obj.get("token") or obj.get("data") or "").strip()
+        except Exception:
+            pass
+
+    if not token or "." not in token:
+        raise HTTPException(status_code=400, detail="Expected JWT in request body")
+
+    try:
+        decoded = _wix_decode_webhook_jwt(token)
+    except Exception as e:
+        logger.warning("Wix webhook JWT verify/decode failed: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid webhook token")
+
+    # Process asynchronously (to respond quickly).
+    try:
+        threading.Thread(target=_wix_process_paymentlink_webhook_sync, args=(decoded,), daemon=True).start()
+    except Exception:
+        _wix_process_paymentlink_webhook_sync(decoded)
+
+    return {"ok": True}

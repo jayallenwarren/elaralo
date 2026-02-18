@@ -196,6 +196,10 @@ type CompanionMappingRow = {
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
+// PayGo top-up UI state (used to correlate non-member payments via email)
+type TopupStage = "idle" | "collect_email" | "creating" | "waiting" | "credited" | "error";
+
+
 type SessionState = {
   mode: Mode;
   adult_verified: boolean;
@@ -1712,6 +1716,16 @@ export default function Page() {
 
         const href = urlRaw.startsWith("//") ? `https:${urlRaw}` : urlRaw;
 
+        const isPaygoLink = Boolean(isAssistant && paygKey && comparable === paygKey);
+        const isNonMemberNow = !Boolean(String(memberIdRef.current || "").trim());
+
+        const onPaygoClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+          if (isPaygoLink && isNonMemberNow) {
+            e.preventDefault();
+            beginPaygoTopupForVisitor(href);
+          }
+        };
+
         return (
           <React.Fragment key={idx}>
             <a
@@ -1719,6 +1733,7 @@ export default function Page() {
               target="_blank"
               rel="noopener noreferrer"
               style={{ textDecoration: "underline" }}
+              onClick={isPaygoLink && isNonMemberNow ? onPaygoClick : undefined}
             >
               {label}
             </a>
@@ -3763,6 +3778,32 @@ const speakAssistantReply = useCallback(
 
   const [planName, setPlanName] = useState<PlanName>(null);
 
+  // ---------------------------------------------------------------------
+  // PayGo Top-up (existing Pay Link) - Visitor email capture + pending intent
+  //
+  // Non-members: we must correlate the Wix Pay Link payment back to the visitor.
+  // We do that by:
+  //   1) collecting an email BEFORE opening the PayGo checkout link
+  //   2) creating a pending record on the backend keyed by that email
+  //   3) matching the payer email from Wix payment webhooks to this pending record
+  //
+  // IMPORTANT UX NOTE:
+  //   The email entered here MUST match the email the user uses during the payment process,
+  //   otherwise the credit will not occur.
+  //
+  // The backend blocks concurrent pending top-ups by email (409).
+  // ---------------------------------------------------------------------
+  const [topupStage, setTopupStage] = useState<TopupStage>("idle");
+  const [topupModalOpen, setTopupModalOpen] = useState<boolean>(false);
+  const [topupPayUrl, setTopupPayUrl] = useState<string>("");
+  const [topupEmail, setTopupEmail] = useState<string>("");
+  const [topupPendingId, setTopupPendingId] = useState<string>("");
+  const [topupExpiresAt, setTopupExpiresAt] = useState<number | null>(null);
+  const [topupError, setTopupError] = useState<string>("");
+  const [topupLastCreditedMinutes, setTopupLastCreditedMinutes] = useState<number | null>(null);
+  const topupPollTimerRef = useRef<number | null>(null);
+
+
   // Sync memberId into a ref so callbacks defined above can always access the latest value.
   useEffect(() => {
     memberIdRef.current = String(memberId || "").trim();
@@ -3780,6 +3821,244 @@ const speakAssistantReply = useCallback(
     if (mid) return mid;
     return getOrCreateAnonMemberId(brandKeyForAnon);
   }, [memberId, brandKeyForAnon]);
+
+
+  // PayGo top-up email (stored per brand so the user doesn't have to retype it)
+  const topupEmailStorageKey = useMemo(() => {
+    const b = safeBrandKey(String(rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME) || "core";
+    return `paygo_topup_email:${b}`;
+  }, [rebranding]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if ((topupEmail || "").trim()) return;
+    try {
+      const v1 = String(window.localStorage.getItem(topupEmailStorageKey) || "").trim();
+      const v2 = String(window.sessionStorage.getItem(topupEmailStorageKey) || "").trim();
+      const v = v1 || v2;
+      if (v) setTopupEmail(v);
+    } catch (e) {}
+  }, [topupEmailStorageKey, topupEmail]);
+
+  const persistTopupEmail = useCallback(
+    (email: string) => {
+      if (typeof window === "undefined") return;
+      const v = String(email || "").trim();
+      if (!v) return;
+      try {
+        window.localStorage.setItem(topupEmailStorageKey, v);
+        return;
+      } catch (e) {}
+      try {
+        window.sessionStorage.setItem(topupEmailStorageKey, v);
+      } catch (e) {}
+    },
+    [topupEmailStorageKey]
+  );
+
+  const openPaygoUrl = useCallback((url: string) => {
+    const u = String(url || "").trim();
+    if (!u) return;
+    try {
+      window.open(u, "_blank", "noopener,noreferrer");
+    } catch (e) {
+      try {
+        window.open(u, "_blank");
+      } catch (e2) {}
+    }
+  }, []);
+
+  const beginPaygoTopupForVisitor = useCallback((payUrl: string) => {
+    setTopupPayUrl(String(payUrl || "").trim());
+    setTopupError("");
+    setTopupLastCreditedMinutes(null);
+    setTopupStage("collect_email");
+    setTopupModalOpen(true);
+  }, []);
+
+  const closeTopupModal = useCallback(() => {
+    setTopupModalOpen(false);
+  }, []);
+
+  const startPaygoTopupForVisitor = useCallback(async () => {
+    if (!API_BASE) {
+      setTopupError("API_BASE is not configured; cannot start top-up.");
+      setTopupStage("error");
+      setTopupModalOpen(true);
+      return;
+    }
+
+    const email = String(topupEmail || "").trim();
+    if (!email || !email.includes("@")) {
+      setTopupError("Please enter a valid email address.");
+      setTopupStage("collect_email");
+      setTopupModalOpen(true);
+      return;
+    }
+
+    const payUrl = String(topupPayUrl || "").trim() || String(rebrandingInfo?.payGoLink || "").trim();
+    if (!payUrl) {
+      setTopupError("PayGo payment link is not available.");
+      setTopupStage("error");
+      setTopupModalOpen(true);
+      return;
+    }
+
+    // Visitors use an anon:... id. (Members are not prompted for email.)
+    const memberIdForPending = String(memberIdForLiveChat || "").trim();
+    if (!memberIdForPending || !isAnonMemberId(memberIdForPending)) {
+      setTopupError("Visitor identity is not available. Please refresh and try again.");
+      setTopupStage("error");
+      setTopupModalOpen(true);
+      return;
+    }
+
+    setTopupStage("creating");
+    setTopupError("");
+    setTopupLastCreditedMinutes(null);
+
+    persistTopupEmail(email);
+
+    const session_state: any = {
+      rebrandingKey: (rebrandingKey || "").trim(),
+      rebranding_key: (rebrandingKey || "").trim(),
+      RebrandingKey: (rebrandingKey || "").trim(),
+      rebranding: (rebranding || "").trim(),
+      // Provide PayGo overrides when present
+      payGoLink: payUrl,
+      payGoPrice: String(rebrandingInfo?.payGoPrice || "").trim(),
+      payGoMinutes: String(rebrandingInfo?.payGoMinutes || "").trim(),
+    };
+
+    try {
+      const res = await fetch(`${API_BASE}/topup/pending`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email,
+          memberId: memberIdForPending,
+          session_state,
+        }),
+      });
+
+      const raw = await res.text().catch(() => "");
+      let json: any = null;
+      try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
+
+      if (res.ok) {
+        const pid = String(json?.pendingId || "").trim();
+        const exp = Number(json?.expiresAt || 0) || null;
+        const payUrlResp = String(json?.payUrl || payUrl).trim() || payUrl;
+
+        if (pid) setTopupPendingId(pid);
+        setTopupExpiresAt(exp && exp > 0 ? exp : null);
+
+        setTopupStage("waiting");
+        setTopupModalOpen(true);
+
+        openPaygoUrl(payUrlResp);
+        return;
+      }
+
+      // Concurrent pending by email: use the existing pendingId
+      if (res.status === 409 && json?.detail?.error === "PENDING_EXISTS") {
+        const pid = String(json?.detail?.pendingId || "").trim();
+        const exp = Number(json?.detail?.expiresAt || 0) || null;
+        const payUrlResp = String(json?.detail?.payUrl || payUrl).trim() || payUrl;
+
+        if (pid) setTopupPendingId(pid);
+        setTopupExpiresAt(exp && exp > 0 ? exp : null);
+
+        setTopupError("A top-up is already pending for this email. We'll keep watching for your payment.");
+        setTopupStage("waiting");
+        setTopupModalOpen(true);
+
+        openPaygoUrl(payUrlResp);
+        return;
+      }
+
+      const err = String(json?.detail || raw || "").trim();
+      setTopupError(err || `Top-up request failed (${res.status}).`);
+      setTopupStage("error");
+      setTopupModalOpen(true);
+    } catch (e: any) {
+      setTopupError(String(e?.message || e || "Top-up request failed"));
+      setTopupStage("error");
+      setTopupModalOpen(true);
+    }
+  }, [
+    API_BASE,
+    topupEmail,
+    topupPayUrl,
+    memberIdForLiveChat,
+    rebrandingKey,
+    rebranding,
+    rebrandingInfo,
+    persistTopupEmail,
+    openPaygoUrl,
+  ]);
+
+  // Poll the backend pending record so we can show "credited" immediately without requiring a page refresh.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!API_BASE) return;
+    const pid = String(topupPendingId || "").trim();
+    if (!pid) return;
+    if (topupStage !== "waiting") return;
+
+    let cancelled = false;
+
+    const pollOnce = async () => {
+      if (cancelled) return;
+      try {
+        const res = await fetch(`${API_BASE}/topup/pending/${encodeURIComponent(pid)}`, {
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+        });
+        const raw = await res.text().catch(() => "");
+        let json: any = null;
+        try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
+        if (!res.ok) return;
+
+        const status = String(json?.status || "").toUpperCase();
+        if (status === "CREDITED") {
+          const minutes = Number(json?.minutesCredited || json?.minutesToCredit || 0) || null;
+          setTopupLastCreditedMinutes(minutes && minutes > 0 ? minutes : null);
+          setTopupStage("credited");
+          setTopupModalOpen(false);
+          setTopupPendingId("");
+          setTopupExpiresAt(null);
+          setTopupError("");
+
+          // Add a lightweight assistant note so the user knows they can continue.
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: `✅ Payment received — ${(minutes && minutes > 0) ? minutes : "Top-up"} minutes have been added. You can continue chatting.`,
+            },
+          ]);
+        } else if (status === "EXPIRED") {
+          setTopupError("This top-up request expired. Please start again.");
+          setTopupStage("error");
+          setTopupModalOpen(true);
+          setTopupPendingId("");
+        }
+      } catch (e) {
+        // ignore transient polling errors
+      }
+    };
+
+    pollOnce();
+    const t = window.setInterval(pollOnce, 2000);
+    topupPollTimerRef.current = t as any;
+
+    return () => {
+      cancelled = true;
+      try { window.clearInterval(t); } catch (e) {}
+    };
+  }, [API_BASE, topupPendingId, topupStage]);
+
 
 
     // Lightweight viewer auto-refresh: if you are not the host, keep polling until the host creates/starts the event.
@@ -7475,6 +7754,234 @@ const modePillControls = (
         preload="auto"
         style={{ position: "fixed", left: 0, bottom: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none", zIndex: -1 }}
       />
+      {topupModalOpen ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 99999,
+            padding: 16,
+          }}
+          onClick={() => {
+            if (topupStage !== "creating") closeTopupModal();
+          }}
+        >
+          <div
+            style={{
+              width: "min(560px, 100%)",
+              background: "#111827",
+              color: "#ffffff",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: 14,
+              padding: 16,
+              boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {topupStage === "collect_email" ? (
+              <>
+                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Add minutes to continue</div>
+                <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35, marginBottom: 12 }}>
+                  Enter the <b>email you will use during the payment process</b>.
+                  <br />
+                  <b>The email must match the email used at checkout or the credit will not occur.</b>
+                </div>
+
+                <input
+                  type="email"
+                  value={topupEmail}
+                  onChange={(e) => {
+                    setTopupEmail(e.target.value);
+                    setTopupError("");
+                  }}
+                  placeholder="you@example.com"
+                  style={{
+                    width: "100%",
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid rgba(255,255,255,0.18)",
+                    background: "rgba(255,255,255,0.06)",
+                    color: "#fff",
+                    outline: "none",
+                    marginBottom: 10,
+                  }}
+                />
+
+                {topupError ? (
+                  <div style={{ color: "#ffb4b4", fontSize: 12, marginBottom: 10, lineHeight: 1.35 }}>
+                    {topupError}
+                  </div>
+                ) : null}
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  <button
+                    type="button"
+                    onClick={() => void startPaygoTopupForVisitor()}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "rgba(255,255,255,0.10)",
+                      color: "#ffffff",
+                      cursor: "pointer",
+                      fontWeight: 700,
+                    }}
+                  >
+                    Continue to payment
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => closeTopupModal()}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "transparent",
+                      color: "#ffffff",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : topupStage === "creating" ? (
+              <>
+                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Preparing checkout…</div>
+                <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35 }}>
+                  Creating a pending top-up record so we can credit your minutes as soon as Wix confirms payment.
+                </div>
+              </>
+            ) : topupStage === "waiting" ? (
+              <>
+                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Waiting for payment…</div>
+                <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35, marginBottom: 10 }}>
+                  Your payment link opens in a new tab. Once the payment completes, minutes will be credited automatically.
+                </div>
+
+                {topupError ? (
+                  <div style={{ color: "#ffe082", fontSize: 12, marginBottom: 10, lineHeight: 1.35 }}>
+                    {topupError}
+                  </div>
+                ) : null}
+
+                {topupExpiresAt ? (
+                  <div style={{ opacity: 0.8, fontSize: 12, marginBottom: 10 }}>
+                    Pending expires at: {new Date(topupExpiresAt * 1000).toLocaleString()}
+                  </div>
+                ) : null}
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  <button
+                    type="button"
+                    onClick={() => openPaygoUrl(topupPayUrl || String(rebrandingInfo?.payGoLink || "").trim())}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "rgba(255,255,255,0.10)",
+                      color: "#ffffff",
+                      cursor: "pointer",
+                      fontWeight: 700,
+                    }}
+                  >
+                    Open payment
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => closeTopupModal()}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "transparent",
+                      color: "#ffffff",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Close
+                  </button>
+                </div>
+              </>
+            ) : topupStage === "error" ? (
+              <>
+                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Top-up issue</div>
+                <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35, marginBottom: 10 }}>
+                  {topupError || "Something went wrong while setting up your top-up."}
+                </div>
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTopupError("");
+                      setTopupStage("collect_email");
+                    }}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "rgba(255,255,255,0.10)",
+                      color: "#ffffff",
+                      cursor: "pointer",
+                      fontWeight: 700,
+                    }}
+                  >
+                    Try again
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => closeTopupModal()}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "transparent",
+                      color: "#ffffff",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Close
+                  </button>
+                </div>
+              </>
+            ) : topupStage === "credited" ? (
+              <>
+                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Minutes added ✅</div>
+                <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35, marginBottom: 10 }}>
+                  {topupLastCreditedMinutes
+                    ? `${topupLastCreditedMinutes} minutes have been added. You can continue chatting.`
+                    : "Your minutes have been added. You can continue chatting."}
+                </div>
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button
+                    type="button"
+                    onClick={() => closeTopupModal()}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "rgba(255,255,255,0.10)",
+                      color: "#ffffff",
+                      cursor: "pointer",
+                      fontWeight: 700,
+                    }}
+                  >
+                    Continue
+                  </button>
+                </div>
+              </>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
       {showPlayChoiceModal && isHost ? (
         <div
           style={{
