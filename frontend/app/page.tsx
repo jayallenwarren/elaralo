@@ -3868,6 +3868,46 @@ const speakAssistantReply = useCallback(
     }
   }, []);
 
+  // CTA helper: open the site in a new tab so visitors can log in / create an account.
+  // We intentionally do NOT deep-link to a specific login URL because Wix sites commonly
+  // use a header login bar / modal, and the exact route varies by site configuration.
+  // Instead, we open the site origin derived from the PayGo / Upgrade links.
+  const membershipCtaUrl = useMemo(() => {
+    if (typeof window === "undefined") return "";
+
+    const candidates = [
+      String(rebrandingInfo?.upgradeLink || "").trim(),
+      String(rebrandingInfo?.payGoLink || "").trim(),
+      String(topupPayUrl || "").trim(),
+    ].filter(Boolean);
+
+    for (const c of candidates) {
+      try {
+        const u = new URL(c);
+        return `${u.origin}/`;
+      } catch (e) {}
+    }
+
+    try {
+      const ref = String(document.referrer || "").trim();
+      if (ref) return `${new URL(ref).origin}/`;
+    } catch (e) {}
+
+    return "";
+  }, [rebrandingInfo, topupPayUrl]);
+
+  const openMembershipCta = useCallback(() => {
+    const u = String(membershipCtaUrl || "").trim();
+    if (!u) return;
+    try {
+      window.open(u, "_blank", "noopener,noreferrer");
+    } catch (e) {
+      try {
+        window.open(u, "_blank");
+      } catch (e2) {}
+    }
+  }, [membershipCtaUrl]);
+
   const beginPaygoTopupForVisitor = useCallback((payUrl: string) => {
     setTopupPayUrl(String(payUrl || "").trim());
     setTopupError("");
@@ -7789,6 +7829,45 @@ const modePillControls = (
                   Enter the <b>email you will use during the payment process</b>.
                   <br />
                   <b>The email must match the email used at checkout or the credit will not occur.</b>
+                </div>
+
+                {/* Membership CTA (intentionally shown only in the visitor/non-member flow) */}
+                <div
+                  style={{
+                    marginBottom: 12,
+                    padding: 10,
+                    borderRadius: 12,
+                    background: "rgba(255,255,255,0.06)",
+                    border: "1px solid rgba(255,255,255,0.12)",
+                  }}
+                >
+                  <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6 }}>Want 1‑click top-ups instead?</div>
+                  <div style={{ opacity: 0.9, fontSize: 12, lineHeight: 1.35, marginBottom: 10 }}>
+                    Members skip this email step and get instant credits after payment.
+                  </div>
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                    <button
+                      type="button"
+                      onClick={() => openMembershipCta()}
+                      disabled={!String(membershipCtaUrl || "").trim()}
+                      style={{
+                        padding: "9px 12px",
+                        borderRadius: 10,
+                        border: "1px solid rgba(255,255,255,0.18)",
+                        background: "rgba(255,255,255,0.10)",
+                        color: "#ffffff",
+                        cursor: String(membershipCtaUrl || "").trim() ? "pointer" : "not-allowed",
+                        fontWeight: 800,
+                        opacity: String(membershipCtaUrl || "").trim() ? 1 : 0.6,
+                      }}
+                      title={String(membershipCtaUrl || "").trim() ? "Open site to log in or create an account" : "Site link unavailable"}
+                    >
+                      Log in / Create free account
+                    </button>
+                    <div style={{ opacity: 0.75, fontSize: 11, lineHeight: 1.35 }}>
+                      Opens your site in a new tab. Use the site’s <b>Log In</b> button in the header to sign up, then return here.
+                    </div>
+                  </div>
                 </div>
 
                 <input

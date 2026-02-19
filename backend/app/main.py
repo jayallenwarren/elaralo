@@ -6604,6 +6604,92 @@ def _wix_query_payment_link_payment(payment_id: str, instance_id: str) -> Option
         return None
 
 
+def _wix_query_member_id_by_contact_id(contact_id: str, instance_id: str) -> Optional[str]:
+    """
+    Resolve a Wix memberId given a Wix CRM contactId.
+
+    Endpoint:
+      POST https://www.wixapis.com/members/v1/members/query
+
+    Requires app permission:
+      Read Members
+    """
+    cid = (contact_id or "").strip()
+    if not cid:
+        return None
+
+    tok = _wix_oauth_access_token(instance_id)
+    if not tok:
+        return None
+
+    url = "https://www.wixapis.com/members/v1/members/query"
+    payload = {
+        "query": {
+            "filter": {"contactId": {"$eq": cid}},
+            "paging": {"limit": 1, "offset": 0},
+        }
+    }
+    headers = {"Authorization": tok, "Content-Type": "application/json"}
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(
+                "Wix Query Members failed: status=%s contactId=%s body=%s",
+                resp.status_code,
+                cid,
+                (resp.text or "")[:500],
+            )
+            return None
+        data = resp.json() if resp.content else {}
+        members = data.get("members") or data.get("items") or data.get("results") or []
+        if isinstance(members, list) and members:
+            mid = (members[0] or {}).get("id") or (members[0] or {}).get("_id")
+            if mid:
+                return str(mid).strip()
+    except Exception as e:
+        logger.warning("Wix Query Members exception (contactId=%s): %s", cid, e)
+
+    return None
+
+
+def _wix_resolve_member_id_by_contact_id(contact_id: str, instance_id: str) -> Optional[str]:
+    """
+    Cached wrapper around _wix_query_member_id_by_contact_id().
+
+    We only call this when the webhook envelope doesn't provide identity.memberId.
+    """
+    cid = (contact_id or "").strip()
+    if not cid:
+        return None
+
+    now_ts = time.time()
+    try:
+        cache = getattr(_wix_resolve_member_id_by_contact_id, "_cache", {})  # type: ignore[attr-defined]
+    except Exception:
+        cache = {}
+
+    if isinstance(cache, dict):
+        ent = cache.get(cid)
+        if isinstance(ent, dict) and ent.get("exp", 0) > now_ts:
+            mid = ent.get("mid")
+            return str(mid).strip() if mid else None
+
+    mid = _wix_query_member_id_by_contact_id(cid, instance_id)
+    if mid:
+        if not isinstance(cache, dict):
+            cache = {}
+        cache[cid] = {"mid": mid, "exp": now_ts + 3600}  # 1 hour TTL
+        try:
+            setattr(_wix_resolve_member_id_by_contact_id, "_cache", cache)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return mid
+
+    return None
+
+
+
 def _extract_payment_email(payment_obj: Dict[str, Any]) -> str:
     try:
         reg = payment_obj.get("regularPaymentLinkPayment") or {}
@@ -6619,6 +6705,30 @@ def _extract_payment_email(payment_obj: Dict[str, Any]) -> str:
         v = payment_obj.get(key)
         if v:
             return _normalize_email(str(v))
+    return ""
+
+
+
+def _extract_payment_contact_id(payment_obj: Dict[str, Any]) -> str:
+    """
+    Extract the Wix CRM contactId from a payment-link-payment entity.
+
+    IMPORTANT: contactId is NOT the same as memberId. Wix explicitly treats memberId and
+    contactId as distinct IDs. We can, however, map contactId -> memberId using the
+    Members Query Members endpoint.
+    """
+    try:
+        reg = payment_obj.get("regularPaymentLinkPayment") or {}
+        if isinstance(reg, dict):
+            cid = reg.get("contactId")
+            if cid:
+                return str(cid).strip()
+    except Exception:
+        pass
+    for key in ("contactId", "buyerContactId", "crmContactId"):
+        v = payment_obj.get(key)
+        if v:
+            return str(v).strip()
     return ""
 
 
@@ -6928,28 +7038,29 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
 
         email_norm = _extract_payment_email(payment_obj)
         amount = _extract_payment_amount(payment_obj)
+
+        # Determine identity to credit (from webhook JWT envelope)
+        identity_type = str(identity_obj.get("identityType") or "").upper()
+        member_id = str(identity_obj.get("memberId") or "").strip()
+        anon_visitor_id = str(identity_obj.get("anonymousVisitorId") or "").strip()
+
         try:
             logger.info(
-                "Wix webhook parsed payment: event_id=%s slug=%s payment_id=%s paylink_id=%s amount=%s identityType=%s hasMemberId=%s hasEmail=%s",
+                "Wix webhook parsed payment: event_id=%s slug=%s payment_id=%s paylink_id=%s amount=%s identityType=%s memberId=%s anonVisitorId=%s hasEmail=%s",
                 (event_id or "")[:8],
                 slug,
                 payment_id,
                 paylink_id,
                 amount,
                 identity_type,
-                bool(member_id),
+                (member_id or "")[:12],
+                (anon_visitor_id or "")[:12],
                 bool(email_norm),
             )
         except Exception:
             pass
 
-
-        # Determine identity to credit
-        identity_type = str(identity_obj.get("identityType") or "").upper()
-        # Some Wix webhook identities include memberId even if identityType is missing/unexpected.
-        member_id = str(identity_obj.get("memberId") or "").strip()
-
-        # Fallback: if identity doesn't include memberId, try extendedFields.memberId on the payment entity
+        # Fallback 1: if identity doesn't include memberId, try extendedFields.memberId on the payment entity
         if not member_id:
             try:
                 ext = payment_obj.get("extendedFields") or {}
@@ -6959,6 +7070,20 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                         member_id = str(mid).strip()
             except Exception:
                 pass
+
+        # Fallback 2 (recommended): resolve memberId via payer contactId
+        # Note: contactId != memberId (they are distinct Wix entities), but members can be queried by contactId.
+        contact_id = _extract_payment_contact_id(payment_obj)
+        if not member_id and contact_id:
+            resolved_mid = _wix_resolve_member_id_by_contact_id(contact_id, instance_id)
+            if resolved_mid:
+                member_id = resolved_mid
+                logger.info(
+                    "Resolved memberId via contactId: contactId=%s memberId=%s payment_id=%s",
+                    contact_id,
+                    member_id,
+                    payment_id,
+                )
 
         credited_identity_key = ""
         minutes_to_credit = int(PAYG_INCREMENT_MINUTES or 0)
