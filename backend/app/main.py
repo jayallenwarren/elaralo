@@ -298,6 +298,82 @@ async def usage_credit(request: Request):
     return result
 
 
+
+@app.post("/usage/status")
+async def usage_status(request: Request):
+    """Return current minute balance WITHOUT charging additional time.
+
+    This endpoint is used to enable a seamless PayGo top-up UX (no page refresh):
+      - When minutes are exhausted and the user completes checkout in a new tab,
+        the frontend can poll this endpoint until minutes become available.
+
+    Input JSON (same shape as /chat):
+      {
+        "session_id": "...",
+        "session_state": { ... }
+      }
+
+    Output:
+      {
+        "ok": true,
+        "minutes_used": 12,
+        "minutes_allowed": 60,
+        "minutes_remaining": 48,
+        "minutes_exhausted": false,
+        "identity_key": "member::<id>"
+      }
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    session_id = str(raw.get("session_id") or raw.get("sessionId") or "").strip()
+    session_state = raw.get("session_state") or raw.get("sessionState") or {}
+    if not isinstance(session_state, dict):
+        session_state = {}
+
+    member_id = _extract_member_id(session_state)
+    plan_name_raw = _extract_plan_name(session_state)
+    rebranding_key_raw = _extract_rebranding_key(session_state)
+    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+
+    plan_map = _session_get_str(session_state, "elaralo_plan_map", "elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map", "")
+    free_minutes_raw = _session_get_str(session_state, "free_minutes", "freeMinutes") or rebranding_parsed.get("free_minutes", "")
+    cycle_days_raw = _session_get_str(session_state, "cycle_days", "cycleDays") or rebranding_parsed.get("cycle_days", "")
+
+    free_minutes = _safe_int(free_minutes_raw)
+    cycle_days = _safe_int(cycle_days_raw)
+
+    is_anon = bool(member_id) and str(member_id).strip().lower().startswith("anon:")
+    is_trial = (not bool(member_id)) or is_anon
+    identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+
+    minutes_allowed_override: Optional[int] = free_minutes if free_minutes is not None else None
+    cycle_days_override: Optional[int] = cycle_days if cycle_days is not None else None
+
+    plan_name_for_limits = plan_map or plan_name_raw
+
+    usage_ok, usage_info = await run_in_threadpool(
+        _usage_peek_sync,
+        identity_key,
+        is_trial=is_trial,
+        plan_name=plan_name_for_limits,
+        minutes_allowed_override=minutes_allowed_override,
+        cycle_days_override=cycle_days_override,
+    )
+
+    minutes_remaining = int(usage_info.get("minutes_remaining") or 0)
+    return {
+        "ok": bool(usage_ok),
+        "minutes_used": int(usage_info.get("minutes_used") or 0),
+        "minutes_allowed": int(usage_info.get("minutes_allowed") or 0),
+        "minutes_remaining": minutes_remaining,
+        "minutes_exhausted": minutes_remaining <= 0,
+        "identity_key": str(usage_info.get("identity_key") or identity_key),
+    }
+
+
 @app.get("/ready")
 def ready():
     """
@@ -3349,6 +3425,73 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
     except Exception:
         # Fail-open
         return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": identity_key}
+
+
+def _usage_peek_sync(
+    identity_key: str,
+    *,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int] = None,
+    cycle_days_override: Optional[int] = None,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Read usage state WITHOUT charging time.
+
+    This function must NOT:
+      - update last_seen
+      - increment used_seconds
+
+    It is safe to use for UI polling after a PayGo checkout, so users are unblocked
+    automatically once minutes are credited.
+    """
+    now = time.time()
+    try:
+        with _USAGE_LOCK:
+            store = _load_usage_store()
+            rec = store.get(identity_key)
+            if not isinstance(rec, dict):
+                rec = {}
+
+            used_seconds = float(rec.get("used_seconds") or 0.0)
+            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+            cycle_start = float(rec.get("cycle_start") or now)
+
+        # Member cycle reset (trial does not reset)
+        cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
+        if not is_trial and cycle_days and cycle_days > 0:
+            cycle_len = float(cycle_days) * 86400.0
+            if (now - cycle_start) >= cycle_len:
+                used_seconds = 0.0
+                cycle_start = now  # for computation only (we do not persist here)
+
+        # Compute allowed seconds
+        if minutes_allowed_override is not None:
+            try:
+                minutes_allowed = max(0, int(minutes_allowed_override))
+            except Exception:
+                minutes_allowed = 0
+        else:
+            minutes_allowed = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_name))
+
+        allowed_seconds = max(0.0, (float(minutes_allowed) * 60.0) + float(purchased_seconds or 0.0))
+
+        # Clamp used_seconds to allowed_seconds (no overage)
+        if used_seconds > allowed_seconds:
+            used_seconds = allowed_seconds
+
+        remaining_seconds = max(0.0, allowed_seconds - used_seconds)
+        ok = remaining_seconds > 0.0
+        return ok, {
+            "minutes_used": int(used_seconds // 60),
+            "minutes_allowed": int(minutes_allowed),
+            "minutes_remaining": int(remaining_seconds // 60),
+            "identity_key": identity_key,
+        }
+    except Exception:
+        # Fail-open
+        return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": identity_key}
+
+
 
 def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any]:
     """Add purchased minutes to an identity record (used by payment webhooks/admin tooling)."""
@@ -6835,7 +6978,7 @@ def _ledger_acquire_processing(payment_id: str, event_id: str) -> bool:
     return True
 
 
-def _ledger_mark_credited(payment_id: str, *, paylink_id: str, identity_key: str, minutes: int) -> None:
+def _ledger_mark_credited(payment_id: str, *, paylink_id: str, identity_key: str, minutes: int, identity_source: str = "") -> None:
     pid = (payment_id or "").strip()
     if not pid:
         return
@@ -6854,6 +6997,7 @@ def _ledger_mark_credited(payment_id: str, *, paylink_id: str, identity_key: str
             "paylinkId": paylink_id,
             "identityKey": identity_key,
             "minutes": int(minutes),
+            "identitySource": (identity_source or ""),
         })
         ledger[pid] = entry
         store["paymentLedger"] = ledger
@@ -7074,6 +7218,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
         # Determine identity to credit
         identity_type = str(identity_obj.get("identityType") or "").upper()
         member_id = str(identity_obj.get("memberId") or "").strip()
+        identity_source = "jwt_identity.memberId" if member_id else ""
 
         # Fallback: if identity doesn't include memberId, try extendedFields.memberId on the payment entity
         if not member_id:
@@ -7083,6 +7228,8 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                     mid = ext.get("memberId") or ext.get("memberID")
                     if mid:
                         member_id = str(mid).strip()
+                        if member_id:
+                            identity_source = "payment.extendedFields.memberId"
             except Exception:
                 pass
 
@@ -7092,6 +7239,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             mid2 = _wix_query_member_by_contact_id(contact_id, instance_id)
             if mid2:
                 member_id = mid2
+                identity_source = "members.query(contactId)"
                 logger.info("Resolved memberId via contactId: contactId=%s memberId=%s", contact_id, member_id)
 
         try:
@@ -7125,6 +7273,8 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                 _ledger_mark_failed(payment_id, f"NO_PENDING_FOR_EMAIL:{email_norm}")
                 return
 
+            identity_source = "pendingEmail"
+
             # Optional price check
             expected_price = pending.get("priceNum")
             if expected_price is not None and amount is not None:
@@ -7152,7 +7302,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             return
 
         # Mark ledger + pending
-        _ledger_mark_credited(payment_id, paylink_id=paylink_id, identity_key=credited_identity_key, minutes=int(minutes_to_credit))
+        _ledger_mark_credited(payment_id, paylink_id=paylink_id, identity_key=credited_identity_key, minutes=int(minutes_to_credit), identity_source=identity_source)
         if not member_id and email_norm:
             _complete_pending_by_email(
                 email_norm,
@@ -7160,6 +7310,21 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                 minutes_added=int(minutes_to_credit),
                 credited_identity_key=credited_identity_key,
             )
+
+
+        # Diagnostic (non-PII) line to trace how we mapped the payment to an identity key.
+        # Logged at WARNING so it shows up in common Azure log-stream filters.
+        logger.warning(
+            "PayGo credit diag: payment_id=%s paylink_id=%s minutes=%s identity_source=%s identity_type=%s member_tail=%s contact_tail=%s credited_tail=%s",
+            payment_id,
+            paylink_id,
+            minutes_to_credit,
+            (identity_source or ""),
+            identity_type,
+            (member_id or "")[-8:],
+            (contact_id or "")[-8:],
+            (credited_identity_key or "")[-12:],
+        )
 
         logger.info(
             "Wix payment credited minutes=%s identity=%s payment_id=%s paylink_id=%s slug=%s",
