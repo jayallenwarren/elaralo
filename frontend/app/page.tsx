@@ -338,22 +338,19 @@ function stripTrialControlsFromRebrandingKey(key: string): string {
   // included minutes. For white-label sites, the 6th field may be the white-label plan label (e.g. "Test - Exclusive")
   // and the Elaralo entitlement plan is carried in `elaraloPlanMap` (e.g. "Intimate (18+)").
   //
-  // To ensure quota/minutes are computed from the mapped Elaralo plan, we copy `elaraloPlanMap` into the plan slot
-  // when it's present.
-  const entitlementPlan = (p.elaraloPlanMap || "").trim() || (p.plan || "").trim();
-  // Keep format stable (9 segments).
-  // Blank-out FreeMinutes + CycleDays so the backend can fall back to plan defaults
-  // when the user is entitled (i.e., has an active plan).
+  // Keep format stable (9 segments) but DO NOT blank-out FreeMinutes/CycleDays.
+  // For white-label, `FreeMinutes` is treated as the plan's top-up/included minutes value.
+  // Backend uses `elaraloPlanMap` for entitlement gating and `FreeMinutes` for quota overrides.
   return [
     p.rebranding,
     p.upgradeLink,
     p.payGoLink,
     p.payGoPrice,
     p.payGoMinutes,
-    entitlementPlan,
+    p.plan,
     p.elaraloPlanMap,
-    "",
-    "",
+    p.freeMinutes,
+    p.cycleDays,
   ].join("|");
 }
 
@@ -411,6 +408,18 @@ function splitCompanionKey(raw: string): CompanionKeySplit {
 }
 
 function modeFromElaraloPlanMap(raw: unknown): Mode | null {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (s.includes("intimate")) return "intimate";
+  if (s.includes("romantic")) return "romantic";
+  if (s.includes("friend")) return "friend";
+  return null;
+}
+
+// Companion payload override:
+// - modePill is a backend/secret-driven hint for which UI pill should be selected on initial render.
+// - Accepts common string variants ("Romantic", "romantic", "MODE_PILL_ROMANTIC", etc.).
+function modeFromModePill(raw: unknown): Mode | null {
   const s = String(raw ?? "").trim().toLowerCase();
   if (!s) return null;
   if (s.includes("intimate")) return "intimate";
@@ -754,6 +763,21 @@ function allowedModesForPlan(planName: PlanName): Mode[] {
   )
     modes.push("intimate");
   return modes;
+}
+
+// White-label support:
+// The companion page provides an Elaralo entitlement plan name via RebrandingKey.elaraloPlanMap.
+// That plan name determines how many Mode pills are available:
+//   Friend   -> [Friend]
+//   Romantic -> [Friend, Romantic]
+//   Intimate -> [Friend, Romantic, Intimate]
+// We keep a fallback to the legacy PlanName mapping when elaraloPlanMap is missing/unknown.
+function allowedModesFromElaraloPlanMap(rawPlanMap: unknown, fallbackPlan: PlanName): Mode[] {
+  const topMode = modeFromElaraloPlanMap(rawPlanMap);
+  if (topMode === "intimate") return ["friend", "romantic", "intimate"];
+  if (topMode === "romantic") return ["friend", "romantic"];
+  if (topMode === "friend") return ["friend"];
+  return allowedModesForPlan(fallbackPlan);
 }
 
 function stripExt(s: string) {
@@ -1797,6 +1821,33 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     const u = String(rebrandingInfo?.upgradeLink || "").trim();
     return u || UPGRADE_URL;
   }, [rebrandingInfo]);
+
+  // Open Upgrade URL in a new tab (preferred) so the chat session stays loaded.
+  // Fallback to top/self navigation if the popup is blocked.
+  const openUpgradeUrl = useCallback(() => {
+    const url = String(upgradeUrl || "").trim();
+    if (!url) return;
+
+    try {
+      const w = window.open(url, "_blank", "noopener,noreferrer");
+      if (w) return;
+    } catch (e) {
+      // ignore
+    }
+
+    // If running inside an iframe, attempt to navigate the *top* browsing context.
+    try {
+      if (window.top && window.top !== window.self) {
+        window.top.location.href = url;
+        return;
+      }
+    } catch (e) {
+      // Cross-origin access to window.top can throw.
+    }
+
+    // Fallback: navigate current frame.
+    window.location.href = url;
+  }, [upgradeUrl]);
 
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
   const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
@@ -3820,6 +3871,17 @@ const speakAssistantReply = useCallback(
   const [memberTopupError, setMemberTopupError] = useState<string>("");
   const memberTopupPollTimerRef = useRef<number | null>(null);
 
+  // Upgrade polling (no refresh required)
+  // - When the user clicks Upgrade, checkout/sign-up happens in another tab.
+  // - When they return, the iframe must request the latest MEMBER_PLAN payload from the Wix parent.
+  // - The Wix parent (Velo) responds by re-sending MEMBER_PLAN (planName/loggedIn/memberId/rebrandingKey).
+  const [upgradeWatching, setUpgradeWatching] = useState<boolean>(false);
+  const upgradeWatchStartedAtRef = useRef<number>(0);
+  const upgradeWatchInitialPlanRef = useRef<string>("");
+  const upgradeWatchInitialLoggedInRef = useRef<boolean>(false);
+  const upgradeWatchTimerRef = useRef<number | null>(null);
+  const upgradeWatchLastRequestAtRef = useRef<number>(0);
+
 
   // Sync memberId into a ref so callbacks defined above can always access the latest value.
   useEffect(() => {
@@ -3923,6 +3985,115 @@ const speakAssistantReply = useCallback(
     setTopupModalOpen(false);
   }, []);
 
+  // ---------------------------------------------------------------------
+  // Upgrade polling (plan refresh) via postMessage
+  // - Iframe requests latest plan from Wix parent by sending { type: "REQUEST_MEMBER_PLAN" }
+  // - Companion page responds by re-sending MEMBER_PLAN payload to this iframe (#html1)
+  // ---------------------------------------------------------------------
+  const requestLatestMemberPlanFromParent = useCallback((reason: string) => {
+    try {
+      if (typeof window === "undefined") return;
+
+      const now = Date.now();
+      // Throttle so we don't spam Velo / backend plan lookup.
+      if (now - (upgradeWatchLastRequestAtRef.current || 0) < 900) return;
+      upgradeWatchLastRequestAtRef.current = now;
+
+      const msg = {
+        type: "REQUEST_MEMBER_PLAN",
+        reason: String(reason || "").slice(0, 64),
+        ts: now,
+      };
+
+      // Wix HTML components are tolerant to string payloads; Velo code should parse JSON strings.
+      window.parent?.postMessage(JSON.stringify(msg), "*");
+    } catch (e) {
+      // ignore
+    }
+  }, []);
+
+  const startUpgradeWatch = useCallback(
+    (reason: string) => {
+      // Capture baseline so we can stop polling once the plan/loggedIn changes.
+      upgradeWatchInitialPlanRef.current = String(planName || "").trim();
+      upgradeWatchInitialLoggedInRef.current = Boolean(loggedIn);
+      upgradeWatchStartedAtRef.current = Date.now();
+
+      setUpgradeWatching(true);
+      requestLatestMemberPlanFromParent(reason || "upgrade");
+    },
+    [planName, loggedIn, requestLatestMemberPlanFromParent]
+  );
+
+  const stopUpgradeWatch = useCallback(() => {
+    setUpgradeWatching(false);
+  }, []);
+
+  // After an upgrade (plan change), refresh the usage balance once so minutes/metering gates
+  // update immediately without requiring a page refresh.
+  const refreshUsageStatusOnce = useCallback(async () => {
+    try {
+      if (typeof window === "undefined") return;
+      if (!API_BASE) return;
+
+      const companionForBackend =
+        (companionKey || "").trim() ||
+        (companionName || DEFAULT_COMPANION_NAME).trim() ||
+        DEFAULT_COMPANION_NAME;
+
+      const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+      const brandKey = safeBrandKey(rawBrand);
+      const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
+
+      const session_state: any = {
+        ...(sessionStateRef.current as any),
+        companion: companionForBackend,
+        companionName: companionForBackend,
+        companion_name: companionForBackend,
+
+        memberId: (memberIdForBackend || "").trim(),
+        member_id: (memberIdForBackend || "").trim(),
+
+        planName: String(planName || "").trim(),
+        plan_name: String(planName || "").trim(),
+
+        planLabelOverride: String(planLabelOverride || "").trim(),
+        plan_label_override: String(planLabelOverride || "").trim(),
+
+        rebrandingKey: String(rebrandingKey || "").trim(),
+        rebranding_key: String(rebrandingKey || "").trim(),
+        RebrandingKey: String(rebrandingKey || "").trim(),
+        rebranding: String(rebranding || "").trim(),
+      };
+
+      const res = await fetch(`${API_BASE}/usage/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionIdRef.current || "",
+          session_state,
+        }),
+        cache: "no-store" as any,
+      } as any);
+
+      if (!res.ok) return;
+
+      const data: any = await res.json().catch(() => ({}));
+      const remaining = Number(data?.minutes_remaining ?? data?.minutesRemaining ?? 0) || 0;
+      if (remaining > 0) {
+        setSessionState((prev) => ({
+          ...(prev as any),
+          minutes_exhausted: false,
+          minutes_remaining: remaining,
+          minutes_allowed: Number(data?.minutes_allowed ?? (prev as any)?.minutes_allowed ?? 0) || 0,
+          minutes_used: Number(data?.minutes_used ?? (prev as any)?.minutes_used ?? 0) || 0,
+        }));
+      }
+    } catch (e) {
+      // ignore
+    }
+  }, [API_BASE, companionKey, companionName, memberId, planName, planLabelOverride, rebrandingKey, rebranding]);
+
   // CTA: Encourage visitors to become members for a smoother top-up experience (no email entry).
   // We intentionally keep the non-member flow more tedious (email required), but provide a clear upgrade path.
   const handleBecomeMemberCta = useCallback(() => {
@@ -3930,6 +4101,18 @@ const speakAssistantReply = useCallback(
     setTopupModalOpen(false);
     setTopupStage("idle");
     setTopupError("");
+
+    // Open the Upgrade URL (white-label override via rebrandingKey, else Elaralo default).
+    // This matches the same URL logic used by the persistent Upgrade button.
+    try {
+      openUpgradeUrl();
+    } catch (e) {}
+
+    // Start upgrade polling so when the user returns (after signing up / upgrading)
+    // we can request the updated MEMBER_PLAN payload and unlock immediately.
+    try {
+      startUpgradeWatch("nonmember_cta");
+    } catch (e) {}
 
     // If the Wix parent/companion implements a login prompt, this message can trigger it.
     // Safe no-op if not handled.
@@ -3946,7 +4129,7 @@ const speakAssistantReply = useCallback(
           "🔐 Want 1‑click top‑ups? Log in or sign up as a site member, then click “Add minutes” again. Members don’t need to enter an email and minutes credit instantly after payment.",
       },
     ]);
-  }, []);
+  }, [openUpgradeUrl, startUpgradeWatch]);
 
 
   const startPaygoTopupForVisitor = useCallback(async () => {
@@ -4235,6 +4418,91 @@ const speakAssistantReply = useCallback(
       try { window.clearInterval(t); } catch (e) {}
     };
   }, [API_BASE, memberTopupWatching, memberTopupStartedAt, memberId, companionKey, companionName, planName, planLabelOverride, rebrandingKey, rebranding]);
+
+
+  // Upgrade polling: while the user is in the upgrade flow, keep requesting the latest MEMBER_PLAN payload
+  // so the iframe learns about the plan change without requiring a page refresh.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!upgradeWatching) return;
+
+    let cancelled = false;
+    const startedAt = upgradeWatchStartedAtRef.current || Date.now();
+
+    const pollOnce = () => {
+      if (cancelled) return;
+
+      // Stop after 3 minutes to avoid infinite polling.
+      if (Date.now() - startedAt > 3 * 60_000) {
+        stopUpgradeWatch();
+        return;
+      }
+
+      requestLatestMemberPlanFromParent("upgrade_poll");
+    };
+
+    pollOnce();
+    const t = window.setInterval(pollOnce, 2000);
+    upgradeWatchTimerRef.current = t as any;
+
+    return () => {
+      cancelled = true;
+      try {
+        window.clearInterval(t);
+      } catch (e) {}
+    };
+  }, [upgradeWatching, requestLatestMemberPlanFromParent, stopUpgradeWatch]);
+
+  // When the user returns to this tab after upgrading, request a refresh immediately.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!upgradeWatching) return;
+
+    const onFocus = () => requestLatestMemberPlanFromParent("focus");
+    const onVis = () => {
+      try {
+        if (document.visibilityState === "visible") requestLatestMemberPlanFromParent("visible");
+      } catch (e) {}
+    };
+
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVis);
+
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [upgradeWatching, requestLatestMemberPlanFromParent]);
+
+  // Stop upgrade polling once we detect a plan or login state change.
+  useEffect(() => {
+    if (!upgradeWatching) return;
+
+    const initPlan = String(upgradeWatchInitialPlanRef.current || "").trim();
+    const initLoggedIn = Boolean(upgradeWatchInitialLoggedInRef.current);
+    const curPlan = String(planName || "").trim();
+    const curLoggedIn = Boolean(loggedIn);
+
+    const planChanged = Boolean(curPlan) && curPlan !== initPlan;
+    const loginChanged = curLoggedIn !== initLoggedIn;
+
+    if (!planChanged && !loginChanged) return;
+
+    stopUpgradeWatch();
+
+    // Refresh usage once so minute gates lift immediately (e.g., upgrading from Trial to a paid plan).
+    void refreshUsageStatusOnce();
+
+    // Add a short confirmation message.
+    const label = String(planLabelOverride || "").trim() || curPlan || "your new plan";
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "assistant",
+        content: `✅ Upgrade detected — your plan is now ${label}. You can continue chatting.`,
+      },
+    ]);
+  }, [upgradeWatching, planName, loggedIn, planLabelOverride, stopUpgradeWatch, refreshUsageStatusOnce]);
 
 
 
@@ -4942,31 +5210,8 @@ const goToMyElaralo = useCallback(() => {
     window.location.href = url;
   }, []);
 
-  const goToUpgrade = useCallback(() => {
-    const url = upgradeUrl;
-
-    // If running inside an iframe, attempt to navigate the *top* browsing context
-    // so we leave the embed and avoid “stacked headers”.
-    try {
-      if (window.top && window.top !== window.self) {
-        window.top.location.href = url;
-        return;
-      }
-    } catch (e) {
-      // Cross-origin access to window.top can throw.
-    }
-
-    // Alternate attempt that may still target the top browsing context.
-    try {
-      window.open(url, "_top");
-      return;
-    } catch (e) {
-      // ignore
-    }
-
-    // Fallback: navigate the current frame.
-    window.location.href = url;
-  }, [upgradeUrl]);
+  // NOTE: Upgrade navigation is handled by `openUpgradeUrl()` near the RebrandingKey section
+  // so the chat session can stay loaded while the user upgrades in a new tab.
 
 
 
@@ -5382,7 +5627,7 @@ useEffect(() => {
     const modeLabel = MODE_LABELS[requestedMode];
     const msg =
       `The requested mode (${modeLabel}) isn't available on your current plan. ` +
-      `Please upgrade here: ${upgradeUrl} or click the upgrade button below the text input box`;
+      `Please upgrade here: ${upgradeUrl} (or click the Upgrade button in the top-right).`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
@@ -5496,7 +5741,7 @@ useEffect(() => {
       // When RebrandingKey is present, use ElaraloPlanMap for capability gating
       // (Wix planName may be the rebrand site's plan names like "Supreme").
       const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
-      const hasEntitledPlan = Boolean((mappedPlanFromKey || incomingPlan).trim());
+      const hasEntitledPlan = Boolean(String(mappedPlanFromKey || incomingPlan || "").trim());
       const effectivePlan: PlanName = hasEntitledPlan ? (mappedPlanFromKey || incomingPlan) : "Trial";
       setPlanName(effectivePlan);
 
@@ -5542,10 +5787,22 @@ useEffect(() => {
       // Brand-default starting mode:
       // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
       // - Fallback: entitled plans default to Intimate, Trial/visitors default to Romantic.
-      const desiredStartMode: Mode =
-        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) || (hasEntitledPlan ? "intimate" : "romantic");
+      const incomingModePillRaw =
+        typeof (data as any).modePill === "string"
+          ? String((data as any).modePill)
+          : typeof (data as any).mode_pill === "string"
+            ? String((data as any).mode_pill)
+            : typeof (data as any).modepill === "string"
+              ? String((data as any).modepill)
+              : "";
 
-      const nextAllowed = allowedModesForPlan(effectivePlan);
+      const desiredStartMode: Mode =
+        modeFromModePill(incomingModePillRaw) ||
+        modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) ||
+        (hasEntitledPlan ? "intimate" : "romantic");
+
+      // Requirement: the *Elaralo* entitlement plan determines how many mode pills exist.
+      const nextAllowed = allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan);
       setAllowedModes(nextAllowed);
 
       setSessionState((prev) => {
@@ -7725,11 +7982,8 @@ const sttControls =
     return ordered.filter((m) => allowedModes.includes(m));
   }, [allowedModes]);
 
-  const showUpgradePill = useMemo(() => {
-    // Requirement: show Upgrade whenever Friend and/or Romantic pills are available,
-    // except when Intimate (18+) is available (no further upgrade path).
-    return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
-}, [allowedModes]);
+  // Upgrade is always available as a persistent top-right control (white-label URL override via rebrandingKey).
+  // (We no longer gate Upgrade visibility based on allowed modes.)
 
 
 // Hide "Set Mode" while the LegacyStream live session UI is active (host + viewer).
@@ -7781,6 +8035,35 @@ const modePillControls = (
             Set Mode
           </button>
 ) : null}
+
+          {/* Persistent Upgrade button (always visible; uses rebrandingKey UpgradeLink override, else Elaralo default). */}
+          <button
+            type="button"
+            onClick={() => {
+              try {
+                openUpgradeUrl();
+              } catch (e) {}
+
+              // Start upgrade polling so plan changes apply without refresh.
+              try {
+                startUpgradeWatch("upgrade_button");
+              } catch (e) {}
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Upgrade
+          </button>
 
 
           {showBroadcastButton ? (
@@ -7865,26 +8148,32 @@ const modePillControls = (
             );
           })}
 
-          {showUpgradePill ? (
-            <button
-              key="upgrade"
-              onClick={() => {
-                setShowModePicker(false);
-                goToUpgrade();
-              }}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                background: "#fff",
-                color: "#111",
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-              }}
-            >
-              Upgrade
-            </button>
-          ) : null}
+          {/* Upgrade is always available (white-label URL override via rebrandingKey). */}
+          <button
+            key="upgrade"
+            onClick={() => {
+              setShowModePicker(false);
+              try {
+                openUpgradeUrl();
+              } catch (e) {}
+
+              // Start upgrade polling so plan changes apply without refresh.
+              try {
+                startUpgradeWatch("upgrade_button");
+              } catch (e) {}
+            }}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 999,
+              border: "1px solid #ddd",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Upgrade
+          </button>
 
           {showBroadcastButton ? (
             <button
@@ -7994,13 +8283,13 @@ const modePillControls = (
                         cursor: "pointer",
                         fontWeight: 800,
                       }}
-                      title="Log in or sign up to remove the email step"
+                      title="Upgrade or sign up to remove the email step"
                     >
-                      Log in / Sign up
+                      Upgrade / Sign up
                     </button>
                   </div>
                   <div style={{ opacity: 0.75, fontSize: 11, lineHeight: 1.35, marginTop: 8 }}>
-                    Tip: This will close this dialog so you can use the site’s “Log In” button (header).
+                    Tip: This opens the Upgrade page in a new tab. After you sign up/log in, come back here.
                   </div>
                 </div>
 
