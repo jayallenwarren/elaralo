@@ -3274,6 +3274,7 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
             used_seconds = float(rec.get("used_seconds") or 0.0)
             purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
             last_seen = rec.get("last_seen")
+            restart_grace = bool(rec.get("restart_grace"))
             cycle_start = float(rec.get("cycle_start") or now)
 
             # Member cycle reset (trial does not reset)
@@ -3293,6 +3294,10 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
                     delta = 0.0
 
             if delta < 0:
+                delta = 0.0
+
+            # If we just credited minutes after exhaustion, do not bill the gap between credit and the next turn.
+            if restart_grace:
                 delta = 0.0
 
             # Don't charge long idle gaps (prevents "went AFK" from burning minutes)
@@ -3359,13 +3364,33 @@ def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any
             if not isinstance(rec, dict):
                 rec = {}
 
-            purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
-            purchased_seconds += float(minutes_i) * 60.0
+            # Snapshot current usage BEFORE credit so we can apply pause/resume semantics.
+            purchased_seconds_before = float(rec.get("purchased_seconds") or 0.0)
+            used_seconds_before = float(rec.get("used_seconds") or 0.0)
+
+            # Determine whether this identity was exhausted before the credit.
+            is_trial_rec = bool(rec.get("is_trial"))
+            plan_for_limits = str(rec.get("plan_name") or "").strip()
+            minutes_allowed_before = int(TRIAL_MINUTES) if is_trial_rec else int(_included_minutes_for_plan(plan_for_limits))
+            allowed_seconds_before = max(0.0, (float(minutes_allowed_before) * 60.0) + float(purchased_seconds_before))
+            exhausted_before = used_seconds_before >= (allowed_seconds_before - 1e-6)
+
+            purchased_seconds = purchased_seconds_before + (float(minutes_i) * 60.0)
 
             rec["purchased_seconds"] = purchased_seconds
-            rec.setdefault("used_seconds", float(rec.get("used_seconds") or 0.0))
+            rec["used_seconds"] = used_seconds_before
             rec.setdefault("cycle_start", float(rec.get("cycle_start") or now))
-            rec.setdefault("last_seen", float(rec.get("last_seen") or now))
+
+            # IMPORTANT:
+            # When the user was exhausted and then purchases minutes, we restart the billing clock at the
+            # time the payment is verified (credit time). This prevents checkout time from being billed.
+            if exhausted_before:
+                rec["last_seen"] = float(now)
+                rec["restart_grace"] = True
+            else:
+                rec.setdefault("last_seen", float(rec.get("last_seen") or now))
+
+            rec["last_credit_at"] = int(now)
             rec["plan_name"] = rec.get("plan_name") or "Pay as You Go"
 
             store[identity_key] = rec
@@ -4404,7 +4429,8 @@ async def chat(request: Request):
     free_minutes = _safe_int(free_minutes_raw)
     cycle_days = _safe_int(cycle_days_raw)
 
-    is_trial = not bool(member_id)
+    is_anon = bool(member_id) and str(member_id).strip().lower().startswith("anon:")
+    is_trial = (not bool(member_id)) or is_anon
     identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
 
     # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
@@ -6604,14 +6630,11 @@ def _wix_query_payment_link_payment(payment_id: str, instance_id: str) -> Option
         return None
 
 
-def _wix_query_member_id_by_contact_id(contact_id: str, instance_id: str) -> Optional[str]:
-    """
-    Resolve a Wix site memberId from a CRM contactId.
+def _wix_query_member_by_contact_id(contact_id: str, instance_id: str) -> Optional[str]:
+    """Return a Wix Member ID for the given CRM contactId, if that contact belongs to a member.
 
-    Endpoint (REST):
-      POST https://www.wixapis.com/members/v1/members/query
-
-    Requires app permission: Read Members
+    Requires the app permission **Read Members**.
+    Endpoint: POST https://www.wixapis.com/members/v1/members/query
     """
     cid = (contact_id or "").strip()
     if not cid:
@@ -6619,7 +6642,6 @@ def _wix_query_member_id_by_contact_id(contact_id: str, instance_id: str) -> Opt
     tok = _wix_oauth_access_token(instance_id)
     if not tok:
         return None
-
     try:
         import requests  # type: ignore
         r = requests.post(
@@ -6639,17 +6661,64 @@ def _wix_query_member_id_by_contact_id(contact_id: str, instance_id: str) -> Opt
         if r.status_code != 200:
             logger.warning("Query members by contactId failed %s %s", r.status_code, r.text[:500])
             return None
-        data = r.json()
-        arr = data.get("members") or data.get("items") or []
+        data = r.json() if hasattr(r, "json") else {}
+        arr = data.get("members") or data.get("items") or data.get("results") or []
         if isinstance(arr, list) and arr:
-            obj = arr[0]
-            if isinstance(obj, dict):
-                mid = obj.get("id") or obj.get("_id")
-                return str(mid).strip() if mid else None
+            m = arr[0]
+            if isinstance(m, dict):
+                mid = m.get("id") or m.get("_id")
+                if mid:
+                    return str(mid).strip()
         return None
     except Exception as e:
         logger.warning("Query members by contactId exception: %s", e)
         return None
+
+
+def _wix_query_member_by_login_email(email: str, instance_id: str) -> Optional[str]:
+    """Return a Wix Member ID for the given loginEmail, if any.
+
+    Requires the app permission **Read Members**.
+    Endpoint: POST https://www.wixapis.com/members/v1/members/query
+    """
+    em = _normalize_email(email)
+    if not em:
+        return None
+    tok = _wix_oauth_access_token(instance_id)
+    if not tok:
+        return None
+    try:
+        import requests  # type: ignore
+        r = requests.post(
+            "https://www.wixapis.com/members/v1/members/query",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {tok}",
+            },
+            json={
+                "query": {
+                    "filter": {"loginEmail": {"$eq": em}},
+                    "paging": {"limit": 1, "offset": 0},
+                }
+            },
+            timeout=5,
+        )
+        if r.status_code != 200:
+            logger.warning("Query members by loginEmail failed %s %s", r.status_code, r.text[:500])
+            return None
+        data = r.json() if hasattr(r, "json") else {}
+        arr = data.get("members") or data.get("items") or data.get("results") or []
+        if isinstance(arr, list) and arr:
+            m = arr[0]
+            if isinstance(m, dict):
+                mid = m.get("id") or m.get("_id")
+                if mid:
+                    return str(mid).strip()
+        return None
+    except Exception as e:
+        logger.warning("Query members by loginEmail exception: %s", e)
+        return None
+
 
 
 
@@ -6670,45 +6739,44 @@ def _extract_payment_email(payment_obj: Dict[str, Any]) -> str:
             return _normalize_email(str(v))
     return ""
 
+
 def _extract_payment_contact_id(payment_obj: Dict[str, Any]) -> str:
-    """Extract buyer contactId from a payment link payment entity."""
+    """Extract the Wix CRM contactId associated with this payment, if present."""
     try:
         reg = payment_obj.get("regularPaymentLinkPayment") or {}
         if isinstance(reg, dict):
-            cid = reg.get("contactId")
+            cid = reg.get("contactId") or reg.get("contact_id")
             if cid:
                 return str(cid).strip()
     except Exception:
         pass
-    # Fallback keys (defensive)
-    for key in ("contactId", "buyerContactId", "customerContactId"):
+    for key in ("contactId", "contact_id"):
         v = payment_obj.get(key)
         if v:
             return str(v).strip()
     return ""
 
 
-
-
 def _extract_payment_amount(payment_obj: Dict[str, Any]) -> Optional[float]:
-    """Extract amount as float from various Wix payment-link-payment shapes."""
+    """Return the payment amount as a float when possible.
+
+    Wix Payment Link Payments commonly represent amount as a string (e.g. "5.99").
+    Some integrations may represent amount as an object with a "value" field.
+    """
     try:
         amt = payment_obj.get("amount")
-        # Common REST shape: amount is a string/number (e.g. "5.99")
-        if isinstance(amt, (int, float)):
-            return float(amt)
-        if isinstance(amt, str) and amt.strip():
-            return float(amt.strip())
-        # Some APIs use a money object: {"value": "...", "currency": "..."}
+        if amt is None:
+            return None
         if isinstance(amt, dict):
-            v = amt.get("value")
-            if v is None:
-                v = amt.get("amount")
-            if v is not None:
-                return float(v)
+            for k in ("value", "amount"):
+                v = amt.get(k)
+                if v is not None:
+                    return float(v)
+            return None
+        return float(amt)
     except Exception:
-        pass
-    return None
+        return None
+
 
 def _extract_payment_link_id(payment_obj: Dict[str, Any]) -> str:
     v = payment_obj.get("paymentLinkId") or payment_obj.get("payment_link_id") or payment_obj.get("payLinkId")
@@ -6852,126 +6920,86 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
     """
     Process Wix payment-links webhooks for PayGo top-ups.
 
-    Wix delivers REST webhooks as a JWT. The decoded JWT typically contains an "envelope" with:
-      - instanceId
-      - eventType
-      - identity (stringified JSON or object)
-      - data (stringified JSON *or* an object)
+    Wix REST webhooks arrive as a JWT. After decoding, we commonly see an "envelope" object like:
 
-    In practice, Wix has shipped multiple shapes over time, including nested envelopes where
-    envelope["data"] is itself another envelope. We therefore unwrap defensively until we reach
-    the actual *event JSON* that contains:
-      - id
-      - entityFqdn
-      - slug
-      - entityId
-      - createdEvent / updatedEvent
+      { "instanceId": "...", "eventType": "...", "identity": "<stringified JSON>", "data": "<stringified JSON>" }
 
-    For PayGo crediting we only care about:
-      entityFqdn == "wix.paymentlinks.payments.v1.payment_link_payment"
-      slug == "created" (or "updated" if you later choose to handle it)
+    In practice, Wix (and some Wix tooling) may NEST this envelope one more level, for example:
+      - decoded = { instanceId, eventType, identity, data: "<JSON of another envelope>" }
+      - decoded = { data: { instanceId, eventType, identity, data: "<JSON of event>" } }
+
+    This handler unwraps up to a few levels until it reaches the actual EVENT JSON (a dict that contains
+    top-level fields such as: id, entityFqdn, slug, entityId, createdEvent/updatedEvent).
     """
     try:
-        def _looks_like_envelope(obj: Any) -> bool:
-            if not isinstance(obj, dict):
-                return False
-            if "data" not in obj:
-                return False
-            # Envelope meta keys commonly present in Wix webhook JWT payloads.
-            meta_keys = ("instanceId", "eventType", "identity", "webhookId")
-            if not any(k in obj for k in meta_keys):
-                return False
-            # If it also looks like the actual *event* object, treat it as event, not envelope.
-            eventish_keys = ("entityFqdn", "entityId", "slug", "createdEvent", "updatedEvent", "id")
-            if any(k in obj for k in eventish_keys):
-                return False
-            return True
+        # ---- Unwrap the JWT envelope(s) until we reach the event JSON dict ----
+        envelope_obj: Dict[str, Any] = decoded if isinstance(decoded, dict) else {}
 
-        def _redact_sample(s: str, limit: int = 200) -> str:
-            try:
-                s2 = (s or "")[:limit]
-                # Redact emails and long digit runs (phones, IDs) to avoid leaking PII in logs.
-                s2 = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "<email>", s2)
-                s2 = re.sub(r"\b\d{7,}\b", "<num>", s2)
-                return s2
-            except Exception:
-                return ""
+        # Some Wix payloads use shape B: { "data": { instanceId, eventType, identity, data } }
+        d0 = envelope_obj.get("data")
+        if isinstance(d0, dict) and ("data" in d0) and ("eventType" in d0 or "instanceId" in d0 or "identity" in d0 or "webhookId" in d0):
+            envelope_obj = d0
 
-        # ----------------------------
-        # Unwrap envelope (supports multiple nested shapes)
-        # ----------------------------
-        env: Dict[str, Any] = decoded if isinstance(decoded, dict) else {}
+        event_type = ""
+        instance_id = ""
+        identity_raw: Any = None
 
-        # Some payloads wrap the envelope in decoded["data"].
-        for _ in range(5):
-            d0 = env.get("data")
-            if isinstance(d0, dict) and _looks_like_envelope(d0):
-                env = d0
+        cur: Any = envelope_obj
+        data_obj: Dict[str, Any] = {}
+
+        # Iterate a few times to handle occasional nesting: envelope -> envelope -> event
+        for _depth in range(4):
+            if isinstance(cur, dict) and ("data" in cur) and ("eventType" in cur or "instanceId" in cur or "identity" in cur or "webhookId" in cur):
+                if cur.get("eventType"):
+                    event_type = str(cur.get("eventType") or "").strip() or event_type
+                if cur.get("instanceId"):
+                    instance_id = str(cur.get("instanceId") or "").strip() or instance_id
+                if cur.get("identity") is not None:
+                    identity_raw = cur.get("identity")
+                inner = cur.get("data")
+            else:
+                inner = cur
+
+            # Parse JSON-string inner payloads
+            if isinstance(inner, str):
+                try:
+                    inner_parsed: Any = json.loads(inner)
+                except Exception:
+                    inner_parsed = {}
+            else:
+                inner_parsed = inner
+
+            # If we landed on another envelope, keep unwrapping
+            if isinstance(inner_parsed, dict) and ("data" in inner_parsed) and (
+                "eventType" in inner_parsed or "instanceId" in inner_parsed or "identity" in inner_parsed or "webhookId" in inner_parsed
+            ):
+                cur = inner_parsed
                 continue
+
+            data_obj = inner_parsed if isinstance(inner_parsed, dict) else {}
             break
 
-        # Parse identity JSON from *current* envelope (may change if we unwrap further).
-        def _parse_identity_from_env(e: Dict[str, Any]) -> Dict[str, Any]:
-            ir = e.get("identity")
-            if ir is None and isinstance(decoded, dict):
-                ir = decoded.get("identity")
-            if isinstance(ir, str):
-                try:
-                    return json.loads(ir) if ir else {}
-                except Exception:
-                    return {}
-            if isinstance(ir, dict):
-                return ir
-            return {}
+        # ---- Parse identity JSON (stringified JSON inside envelope["identity"]) ----
+        if isinstance(identity_raw, str):
+            try:
+                identity_obj = json.loads(identity_raw)
+            except Exception:
+                identity_obj = {}
+        elif isinstance(identity_raw, dict):
+            identity_obj = identity_raw
+        else:
+            identity_obj = {}
 
-        identity_obj: Dict[str, Any] = _parse_identity_from_env(env)
+        # ---- Event metadata is at top-level of data_obj for payment link payment events ----
+        event_id = str(data_obj.get("id") or "").strip()
+        entity_fqdn = str(data_obj.get("entityFqdn") or "").strip()
+        slug = str(data_obj.get("slug") or "").strip()
+        payment_id = str(data_obj.get("entityId") or "").strip()
 
-        # Parse event JSON from env["data"] and unwrap nested envelopes if needed.
-        event_obj: Dict[str, Any] = {}
-        data_sample: str = ""
-        data_type: str = ""
-        for _ in range(6):
-            data_raw = env.get("data")
-            data_type = type(data_raw).__name__
-            if isinstance(data_raw, str):
-                data_sample = _redact_sample(data_raw)
-                try:
-                    parsed = json.loads(data_raw) if data_raw else {}
-                except Exception:
-                    parsed = {}
-                if isinstance(parsed, dict) and _looks_like_envelope(parsed):
-                    env = parsed
-                    identity_obj = _parse_identity_from_env(env)
-                    continue
-                event_obj = parsed if isinstance(parsed, dict) else {}
-                break
-            elif isinstance(data_raw, dict):
-                # If the "data" itself is another envelope, unwrap and continue.
-                if _looks_like_envelope(data_raw):
-                    env = data_raw
-                    identity_obj = _parse_identity_from_env(env)
-                    continue
-                event_obj = data_raw
-                break
-            else:
-                event_obj = {}
-                break
-
-        event_type = str(env.get("eventType") or (decoded.get("eventType") if isinstance(decoded, dict) else "") or "").strip()
-        instance_id = str(env.get("instanceId") or (decoded.get("instanceId") if isinstance(decoded, dict) else "") or "").strip()
-
-        # ----------------------------
-        # Extract event metadata (these are TOP LEVEL on the event object)
-        # ----------------------------
-        event_id = str(event_obj.get("id") or "").strip()
-        entity_fqdn = str(event_obj.get("entityFqdn") or "").strip()
-        slug = str(event_obj.get("slug") or "").strip()
-        payment_id = str(event_obj.get("entityId") or "").strip()
-
-        # Fallbacks if entityId isn't present
+        # Fallbacks (rare) if entityId isn't present
         if not payment_id:
             for k in ("createdEvent", "updatedEvent"):
-                ev = event_obj.get(k)
+                ev = data_obj.get(k)
                 if isinstance(ev, dict):
                     ent = ev.get("entity") or ev.get("currentEntity") or ev.get("newEntity")
                     if isinstance(ent, dict):
@@ -6980,25 +7008,16 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                             payment_id = str(pid).strip()
                             break
 
-        # If we still can't find it, log diagnostics and stop (do not crash the webhook handler).
         if not payment_id:
-            try:
-                logger.warning(
-                    "Wix webhook: missing payment entityId (eventType=%s slug=%s env_keys=%s event_keys=%s data_type=%s data_sample=%s)",
-                    event_type,
-                    slug,
-                    list(env.keys())[:25],
-                    list(event_obj.keys())[:25] if isinstance(event_obj, dict) else [],
-                    data_type,
-                    data_sample,
-                )
-            except Exception:
-                pass
+            logger.warning(
+                "Wix webhook: missing payment entityId (eventType=%s slug=%s keys=%s)",
+                event_type,
+                slug,
+                list(data_obj.keys())[:25],
+            )
             return
 
-        # ----------------------------
-        # Only process *payment* entities
-        # ----------------------------
+        # Ignore non-payment entities (e.g. payment link entity events)
         expected_fqdn = "wix.paymentlinks.payments.v1.payment_link_payment"
         if entity_fqdn and entity_fqdn != expected_fqdn:
             logger.info(
@@ -7014,19 +7033,18 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
         if not _ledger_acquire_processing(payment_id, event_id):
             return
 
-        # ----------------------------
-        # Prefer embedded entity to avoid REST calls
-        # ----------------------------
+        # ---- Prefer embedded entity to avoid REST calls ----
         payment_obj: Optional[Dict[str, Any]] = None
-        created_ev = event_obj.get("createdEvent")
+        created_ev = data_obj.get("createdEvent")
         if isinstance(created_ev, dict):
             ent = created_ev.get("entity")
             if isinstance(ent, dict):
                 payment_obj = ent
 
         if payment_obj is None:
-            updated_ev = event_obj.get("updatedEvent")
+            updated_ev = data_obj.get("updatedEvent")
             if isinstance(updated_ev, dict):
+                # updatedEvent formats vary; try common keys
                 for k in ("currentEntity", "entity", "newEntity"):
                     ent = updated_ev.get(k)
                     if isinstance(ent, dict):
@@ -7052,15 +7070,12 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
 
         email_norm = _extract_payment_email(payment_obj)
         amount = _extract_payment_amount(payment_obj)
-        contact_id = _extract_payment_contact_id(payment_obj)
 
-        # ----------------------------
-        # Determine identity to credit (member first, else visitor email intent)
-        # ----------------------------
+        # Determine identity to credit
         identity_type = str(identity_obj.get("identityType") or "").upper()
         member_id = str(identity_obj.get("memberId") or "").strip()
 
-        # Fallback: extendedFields.memberId on the payment entity
+        # Fallback: if identity doesn't include memberId, try extendedFields.memberId on the payment entity
         if not member_id:
             try:
                 ext = payment_obj.get("extendedFields") or {}
@@ -7071,22 +7086,22 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-        # Fallback: resolve memberId via buyer contactId
+        # Fallback: resolve memberId via the buyer contactId (members have distinct memberId and contactId)
+        contact_id = _extract_payment_contact_id(payment_obj)
         if not member_id and contact_id:
-            mid2 = _wix_query_member_id_by_contact_id(contact_id, instance_id)
+            mid2 = _wix_query_member_by_contact_id(contact_id, instance_id)
             if mid2:
                 member_id = mid2
                 logger.info("Resolved memberId via contactId: contactId=%s memberId=%s", contact_id, member_id)
 
         try:
             logger.info(
-                "Wix webhook parsed payment: event_id=%s slug=%s payment_id=%s paylink_id=%s amount=%s contactId=%s identityType=%s hasMemberId=%s hasEmail=%s",
+                "Wix webhook parsed payment: event_id=%s slug=%s payment_id=%s paylink_id=%s amount=%s identityType=%s hasMemberId=%s hasEmail=%s",
                 (event_id or "")[:8],
                 slug,
                 payment_id,
                 paylink_id,
                 amount,
-                (contact_id or "")[:8],
                 identity_type,
                 bool(member_id),
                 bool(email_norm),
@@ -7116,6 +7131,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                 try:
                     if abs(float(expected_price) - float(amount)) > 0.05:
                         _ledger_mark_failed(payment_id, "AMOUNT_MISMATCH")
+                        # Leave pending as-is (still pending) so user can retry or you can resolve manually.
                         return
                 except Exception:
                     pass
@@ -7135,8 +7151,8 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             _ledger_mark_failed(payment_id, "CREDIT_FAILED")
             return
 
+        # Mark ledger + pending
         _ledger_mark_credited(payment_id, paylink_id=paylink_id, identity_key=credited_identity_key, minutes=int(minutes_to_credit))
-
         if not member_id and email_norm:
             _complete_pending_by_email(
                 email_norm,
@@ -7156,6 +7172,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
 
     except Exception as e:
         logger.warning("Wix webhook processing exception: %s", e)
+
 
 
 @app.post("/webhooks/wix/paymentlinks")

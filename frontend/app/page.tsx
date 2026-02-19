@@ -1717,13 +1717,22 @@ export default function Page() {
         const href = urlRaw.startsWith("//") ? `https:${urlRaw}` : urlRaw;
 
         const isPaygoLink = Boolean(isAssistant && paygKey && comparable === paygKey);
-        const isNonMemberNow = !Boolean(String(memberIdRef.current || "").trim());
+        const midNow = String(memberIdRef.current || "").trim();
+        const isNonMemberNow = !Boolean(midNow);
+        const isAnonNow = isAnonMemberId(midNow);
 
         const onPaygoClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
-          if (isPaygoLink && isNonMemberNow) {
+          if (!isPaygoLink) return;
+
+          // Visitors/non-members: capture email first so we can correlate the payment.
+          if (isNonMemberNow || isAnonNow) {
             e.preventDefault();
             beginPaygoTopupForVisitor(href);
+            return;
           }
+
+          // Members: no email capture. Start watching for credit and let the checkout open normally.
+          beginPaygoTopupForMember();
         };
 
         return (
@@ -1733,7 +1742,7 @@ export default function Page() {
               target="_blank"
               rel="noopener noreferrer"
               style={{ textDecoration: "underline" }}
-              onClick={isPaygoLink && isNonMemberNow ? onPaygoClick : undefined}
+              onClick={isPaygoLink ? onPaygoClick : undefined}
             >
               {label}
             </a>
@@ -3803,6 +3812,14 @@ const speakAssistantReply = useCallback(
   const [topupLastCreditedMinutes, setTopupLastCreditedMinutes] = useState<number | null>(null);
   const topupPollTimerRef = useRef<number | null>(null);
 
+  // Members: auto-unlock PayGo without requiring a page refresh.
+  // We start watching when a member clicks the PayGo link, and poll the backend
+  // (read-only) until minutes are credited.
+  const [memberTopupWatching, setMemberTopupWatching] = useState<boolean>(false);
+  const [memberTopupStartedAt, setMemberTopupStartedAt] = useState<number | null>(null);
+  const [memberTopupError, setMemberTopupError] = useState<string>("");
+  const memberTopupPollTimerRef = useRef<number | null>(null);
+
 
   // Sync memberId into a ref so callbacks defined above can always access the latest value.
   useEffect(() => {
@@ -3868,46 +3885,6 @@ const speakAssistantReply = useCallback(
     }
   }, []);
 
-  // CTA helper: open the site in a new tab so visitors can log in / create an account.
-  // We intentionally do NOT deep-link to a specific login URL because Wix sites commonly
-  // use a header login bar / modal, and the exact route varies by site configuration.
-  // Instead, we open the site origin derived from the PayGo / Upgrade links.
-  const membershipCtaUrl = useMemo(() => {
-    if (typeof window === "undefined") return "";
-
-    const candidates = [
-      String(rebrandingInfo?.upgradeLink || "").trim(),
-      String(rebrandingInfo?.payGoLink || "").trim(),
-      String(topupPayUrl || "").trim(),
-    ].filter(Boolean);
-
-    for (const c of candidates) {
-      try {
-        const u = new URL(c);
-        return `${u.origin}/`;
-      } catch (e) {}
-    }
-
-    try {
-      const ref = String(document.referrer || "").trim();
-      if (ref) return `${new URL(ref).origin}/`;
-    } catch (e) {}
-
-    return "";
-  }, [rebrandingInfo, topupPayUrl]);
-
-  const openMembershipCta = useCallback(() => {
-    const u = String(membershipCtaUrl || "").trim();
-    if (!u) return;
-    try {
-      window.open(u, "_blank", "noopener,noreferrer");
-    } catch (e) {
-      try {
-        window.open(u, "_blank");
-      } catch (e2) {}
-    }
-  }, [membershipCtaUrl]);
-
   const beginPaygoTopupForVisitor = useCallback((payUrl: string) => {
     setTopupPayUrl(String(payUrl || "").trim());
     setTopupError("");
@@ -3916,9 +3893,61 @@ const speakAssistantReply = useCallback(
     setTopupModalOpen(true);
   }, []);
 
+  // Members do NOT enter email. We just watch for the webhook credit.
+  const beginPaygoTopupForMember = useCallback(() => {
+    // Only start watching if the backend has told us minutes are exhausted.
+    // Otherwise, we could falsely interpret a non-zero balance as "payment credited".
+    const mr = Number((sessionStateRef.current as any)?.minutes_remaining ?? (sessionStateRef.current as any)?.minutesRemaining ?? 0) || 0;
+    const exhausted = Boolean((sessionStateRef.current as any)?.minutes_exhausted ?? (sessionStateRef.current as any)?.minutesExhausted) || mr <= 0;
+    if (!exhausted) return;
+
+    setMemberTopupError("");
+    setMemberTopupStartedAt(Date.now());
+    setMemberTopupWatching((prev) => {
+      // Only add the hint once per watch session.
+      if (!prev) {
+        setMessages((msgs) => [
+          ...msgs,
+          {
+            role: "assistant",
+            content:
+              "💳 After checkout completes, return to this tab — I’ll unlock your chat as soon as minutes are credited.",
+          },
+        ]);
+      }
+      return true;
+    });
+  }, []);
+
   const closeTopupModal = useCallback(() => {
     setTopupModalOpen(false);
   }, []);
+
+  // CTA: Encourage visitors to become members for a smoother top-up experience (no email entry).
+  // We intentionally keep the non-member flow more tedious (email required), but provide a clear upgrade path.
+  const handleBecomeMemberCta = useCallback(() => {
+    // Close the modal so the visitor can use the site's header "Log In" control immediately.
+    setTopupModalOpen(false);
+    setTopupStage("idle");
+    setTopupError("");
+
+    // If the Wix parent/companion implements a login prompt, this message can trigger it.
+    // Safe no-op if not handled.
+    try {
+      window.parent?.postMessage({ type: "PROMPT_LOGIN" }, "*");
+    } catch (e) {}
+
+    // Add an in-chat reminder so the user knows what to do next.
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "assistant",
+        content:
+          "🔐 Want 1‑click top‑ups? Log in or sign up as a site member, then click “Add minutes” again. Members don’t need to enter an email and minutes credit instantly after payment.",
+      },
+    ]);
+  }, []);
+
 
   const startPaygoTopupForVisitor = useCallback(async () => {
     if (!API_BASE) {
@@ -4098,6 +4127,114 @@ const speakAssistantReply = useCallback(
       try { window.clearInterval(t); } catch (e) {}
     };
   }, [API_BASE, topupPendingId, topupStage]);
+
+
+  // Members: poll /usage/status (read-only) until minutes are credited.
+  // This avoids a page refresh and avoids burning minutes while waiting.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!API_BASE) return;
+    if (!memberTopupWatching) return;
+
+    // Only meaningful for real members.
+    const mid = String(memberIdRef.current || "").trim();
+    if (!mid || isAnonMemberId(mid)) return;
+
+    let cancelled = false;
+    const startedAt = memberTopupStartedAt || Date.now();
+
+    const pollOnce = async () => {
+      if (cancelled) return;
+
+      // Stop after 10 minutes to avoid infinite polling if the user abandons checkout.
+      if (Date.now() - startedAt > 10 * 60_000) {
+        setMemberTopupWatching(false);
+        return;
+      }
+
+      try {
+        // Build a minimal session_state compatible with backend's usage logic.
+        const companionForBackend =
+          (companionKey || "").trim() ||
+          (companionName || DEFAULT_COMPANION_NAME).trim() ||
+          DEFAULT_COMPANION_NAME;
+
+        const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+        const brandKey = safeBrandKey(rawBrand);
+        const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
+
+        const session_state: any = {
+          ...(sessionStateRef.current as any),
+          companion: companionForBackend,
+          companionName: companionForBackend,
+          companion_name: companionForBackend,
+
+          memberId: (memberIdForBackend || "").trim(),
+          member_id: (memberIdForBackend || "").trim(),
+
+          planName: String(planName || "").trim(),
+          plan_name: String(planName || "").trim(),
+
+          planLabelOverride: String(planLabelOverride || "").trim(),
+          plan_label_override: String(planLabelOverride || "").trim(),
+
+          rebrandingKey: String(rebrandingKey || "").trim(),
+          rebranding_key: String(rebrandingKey || "").trim(),
+          RebrandingKey: String(rebrandingKey || "").trim(),
+          rebranding: String(rebranding || "").trim(),
+        };
+
+        const res = await fetch(`${API_BASE}/usage/status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionIdRef.current || "",
+            session_state,
+          }),
+          cache: "no-store" as any,
+        } as any);
+
+        if (!res.ok) return;
+
+        const data: any = await res.json().catch(() => ({}));
+        const remaining = Number(data?.minutes_remaining ?? data?.minutesRemaining ?? 0) || 0;
+
+        if (remaining > 0) {
+          setMemberTopupWatching(false);
+          setMemberTopupError("");
+
+          // Reflect the updated balance in the session state (so the user can ask "minutes left" and see current values).
+          setSessionState((prev) => ({
+            ...(prev as any),
+            minutes_exhausted: false,
+            minutes_remaining: remaining,
+            minutes_allowed: Number(data?.minutes_allowed ?? (prev as any)?.minutes_allowed ?? 0) || 0,
+            minutes_used: Number(data?.minutes_used ?? (prev as any)?.minutes_used ?? 0) || 0,
+          }));
+
+          // Add a lightweight assistant note so the user knows they can continue.
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: "✅ Payment received — minutes have been added. You can continue chatting.",
+            },
+          ]);
+        }
+      } catch (e: any) {
+        // ignore transient polling errors
+      }
+    };
+
+    pollOnce();
+    const t = window.setInterval(pollOnce, 2500);
+    memberTopupPollTimerRef.current = t as any;
+
+    return () => {
+      cancelled = true;
+      try { window.clearInterval(t); } catch (e) {}
+    };
+  }, [API_BASE, memberTopupWatching, memberTopupStartedAt, memberId, companionKey, companionName, planName, planLabelOverride, rebrandingKey, rebranding]);
 
 
 
@@ -7831,42 +7968,39 @@ const modePillControls = (
                   <b>The email must match the email used at checkout or the credit will not occur.</b>
                 </div>
 
-                {/* Membership CTA (intentionally shown only in the visitor/non-member flow) */}
                 <div
                   style={{
                     marginBottom: 12,
-                    padding: 10,
+                    padding: 12,
                     borderRadius: 12,
+                    border: "1px solid rgba(255,255,255,0.14)",
                     background: "rgba(255,255,255,0.06)",
-                    border: "1px solid rgba(255,255,255,0.12)",
                   }}
                 >
-                  <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6 }}>Want 1‑click top-ups instead?</div>
-                  <div style={{ opacity: 0.9, fontSize: 12, lineHeight: 1.35, marginBottom: 10 }}>
-                    Members skip this email step and get instant credits after payment.
+                  <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 4 }}>Want 1‑click top‑ups?</div>
+                  <div style={{ opacity: 0.9, fontSize: 12, lineHeight: 1.35 }}>
+                    Become a member to top up without typing your email. Members get instant credit after payment.
                   </div>
-                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
                     <button
                       type="button"
-                      onClick={() => openMembershipCta()}
-                      disabled={!String(membershipCtaUrl || "").trim()}
+                      onClick={() => handleBecomeMemberCta()}
                       style={{
-                        padding: "9px 12px",
+                        padding: "9px 11px",
                         borderRadius: 10,
                         border: "1px solid rgba(255,255,255,0.18)",
                         background: "rgba(255,255,255,0.10)",
                         color: "#ffffff",
-                        cursor: String(membershipCtaUrl || "").trim() ? "pointer" : "not-allowed",
+                        cursor: "pointer",
                         fontWeight: 800,
-                        opacity: String(membershipCtaUrl || "").trim() ? 1 : 0.6,
                       }}
-                      title={String(membershipCtaUrl || "").trim() ? "Open site to log in or create an account" : "Site link unavailable"}
+                      title="Log in or sign up to remove the email step"
                     >
-                      Log in / Create free account
+                      Log in / Sign up
                     </button>
-                    <div style={{ opacity: 0.75, fontSize: 11, lineHeight: 1.35 }}>
-                      Opens your site in a new tab. Use the site’s <b>Log In</b> button in the header to sign up, then return here.
-                    </div>
+                  </div>
+                  <div style={{ opacity: 0.75, fontSize: 11, lineHeight: 1.35, marginTop: 8 }}>
+                    Tip: This will close this dialog so you can use the site’s “Log In” button (header).
                   </div>
                 </div>
 
