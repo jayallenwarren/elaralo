@@ -3838,6 +3838,10 @@ const speakAssistantReply = useCallback(
 
   const [planName, setPlanName] = useState<PlanName>(null);
 
+  // loggedIn must come from Wix; do NOT infer from memberId.
+  // Used for upgrade polling and entitlement refresh without a full page reload.
+  const [loggedIn, setLoggedIn] = useState<boolean>(false);
+
   // ---------------------------------------------------------------------
   // PayGo Top-up (existing Pay Link) - Visitor email capture + pending intent
   //
@@ -4512,7 +4516,6 @@ const speakAssistantReply = useCallback(
 
 
 
-  const [loggedIn, setLoggedIn] = useState<boolean>(false);
   // True once we have received the Wix postMessage handoff (plan + companion).
   // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
   const [handoffReady, setHandoffReady] = useState<boolean>(false);
