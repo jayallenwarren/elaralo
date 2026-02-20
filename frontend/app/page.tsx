@@ -217,6 +217,36 @@ type ChatApiResponse = {
   session_state?: Partial<SessionState>;
 };
 
+
+type RelayEvent = {
+  seq: number;
+  ts: number;
+  role: "user" | "assistant" | "system";
+  content: string;
+  sender: "user" | "ai" | "xai" | "host" | "system" | string;
+  audience?: "all" | "user" | "host" | string;
+  kind?: string;
+};
+
+type HostActiveChat = {
+  session_id: string;
+  member_id: string;
+  brand?: string;
+  avatar?: string;
+  last_seen?: number;
+  override_active?: boolean;
+  override_started_at?: number | null;
+  unread?: number;
+  summary?: string;
+  summary_source?: string;
+  usage_ok?: boolean;
+  minutes_used?: number;
+  minutes_allowed?: number;
+  minutes_remaining?: number;
+  plan_label?: string;
+  is_trial?: boolean;
+};
+
 type PlanName =
   | "Trial"
   | "Friend"
@@ -482,7 +512,8 @@ function buildDigestFromDroppedMessages(dropped: Msg[]): string {
     if (!c) continue;
 
     if (c.length > DIGEST_MAX_CHARS_PER_LINE) c = c.slice(0, DIGEST_MAX_CHARS_PER_LINE) + "…";
-    lines.push(`${m.role === "user" ? "User" : "Assistant"}: ${c}`);
+    const senderLabel = m.role === "user" ? "User" : ((m as any)?.meta?.sender === "host" ? "Host" : "Assistant");
+    lines.push(`${senderLabel}: ${c}`);
   }
 
   const remaining = dropped.length - lines.length;
@@ -2406,6 +2437,25 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 	  useEffect(() => {
 	    hostMemberIdRef.current = String(mappedHostMemberId || "");
 	  }, [mappedHostMemberId]);
+
+
+// ----------------------------
+// Host override console (AI chat takeover)
+// ----------------------------
+const [hostConsoleOpen, setHostConsoleOpen] = useState<boolean>(false);
+const [hostActiveChats, setHostActiveChats] = useState<HostActiveChat[]>([]);
+const [hostActiveLoading, setHostActiveLoading] = useState<boolean>(false);
+const [hostActiveError, setHostActiveError] = useState<string>("");
+const [hostSelectedSessionId, setHostSelectedSessionId] = useState<string>("");
+const [hostSelectedEvents, setHostSelectedEvents] = useState<RelayEvent[]>([]);
+const [hostPollSinceSeq, setHostPollSinceSeq] = useState<number>(0);
+const hostPollSinceSeqRef = useRef<number>(0);
+useEffect(() => {
+  hostPollSinceSeqRef.current = hostPollSinceSeq;
+}, [hostPollSinceSeq]);
+const [hostSendText, setHostSendText] = useState<string>("");
+const [hostNotice, setHostNotice] = useState<string>("");
+
   const livekitRoleKnown = livekitRole !== "unknown";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
@@ -3858,7 +3908,404 @@ const speakAssistantReply = useCallback(
   const [uploadError, setUploadError] = useState<string>("");
 
   const [messages, setMessages] = useState<Msg[]>([]);
+
+// Relay polling for host override (member side)
+const [relaySinceSeq, setRelaySinceSeq] = useState<number>(0);
+const relaySinceSeqRef = useRef<number>(0);
+useEffect(() => {
+  relaySinceSeqRef.current = relaySinceSeq;
+}, [relaySinceSeq]);
+
+
+// Member-side relay poll: receives host/system messages during a host override.
+useEffect(() => {
+  if (isHost) return;
+  if (!API_BASE) return;
+
+  const sid = sessionIdRef.current;
+  if (!sid) return;
+
+  let cancelled = false;
+  let timer: any = null;
+
+  const pollOnce = async () => {
+    try {
+      const shouldPoll =
+        (messagesRef.current?.length || 0) > 0 ||
+        Boolean((sessionStateRef.current as any)?.host_override_active);
+
+      if (!shouldPoll) return;
+
+      const rawBrand =
+        (parseRebrandingKey(rebrandingKey || "")?.rebranding ||
+          companyName ||
+          DEFAULT_COMPANY_NAME ||
+          "").trim();
+
+      const brandKey = safeBrandKey(rawBrand);
+      const memberIdForBackend =
+        (String(memberIdRef.current || "").trim() ||
+          getOrCreateAnonMemberId(brandKey) ||
+          "").trim();
+
+      const companionForBackend =
+        ((companionKey || "").trim() ||
+          (companionName || DEFAULT_COMPANION_NAME).trim() ||
+          DEFAULT_COMPANION_NAME).trim();
+
+      const pollSessionState: SessionState = {
+        memberId: memberIdForBackend,
+        companion: companionForBackend,
+        companionName: companionForBackend,
+        companion_name: companionForBackend,
+        brand: (companyName || "").trim(),
+        avatar: (companionName || "").trim(),
+        planName: planName || null,
+        rebrandingKey: stripTrialControlsFromRebrandingKey(rebrandingKey),
+        rebranding: rawBrand,
+      };
+
+      const res = await fetch(`${API_BASE}/chat/relay/poll`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sid,
+          since_seq: relaySinceSeqRef.current,
+          session_state: pollSessionState,
+        }),
+      });
+
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        events?: RelayEvent[];
+        next_since_seq?: number;
+        override_active?: boolean;
+      };
+
+      if (cancelled) return;
+
+      const nextSince =
+        typeof data.next_since_seq === "number"
+          ? data.next_since_seq
+          : relaySinceSeqRef.current;
+
+      if (nextSince !== relaySinceSeqRef.current) {
+        setRelaySinceSeq(nextSince);
+      }
+
+      if (typeof data.override_active === "boolean") {
+        setSessionState((prev) => ({
+          ...prev,
+          host_override_active: data.override_active,
+        }));
+      }
+
+      const evs = Array.isArray(data.events) ? data.events : [];
+      if (evs.length) {
+        setMessages((prev) => {
+          const out = [...prev];
+          for (const ev of evs) {
+            const content = String((ev as any).content || "");
+            if (!content.trim()) continue;
+
+            const sender = String((ev as any).sender || "");
+            const kind = String((ev as any).kind || "");
+            const role = String((ev as any).role || "");
+
+            if (role === "system" || sender === "system" || kind.startsWith("override_")) {
+              out.push({
+                role: "assistant",
+                content,
+                meta: { sender: "system" },
+              } as any);
+              continue;
+            }
+
+            if (sender === "host") {
+              out.push({
+                role: "assistant",
+                content,
+                meta: { sender: "host" },
+              } as any);
+              continue;
+            }
+
+            // Fallback: still show as a system message.
+            out.push({
+              role: "assistant",
+              content,
+              meta: { sender: "system" },
+            } as any);
+          }
+          return out;
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const tick = async () => {
+    if (cancelled) return;
+    await pollOnce();
+    timer = setTimeout(tick, 1200);
+  };
+
+  tick();
+
+  return () => {
+    cancelled = true;
+    if (timer) clearTimeout(timer);
+  };
+}, [
+  API_BASE,
+  isHost,
+  companyName,
+  companionName,
+  companionKey,
+  planName,
+  rebrandingKey,
+]);
+
   const [loading, setLoading] = useState(false);
+
+
+// Host console polling (list + selected transcript)
+useEffect(() => {
+  if (!hostConsoleOpen) return;
+  if (!isHost) return;
+  if (!API_BASE) return;
+
+  let cancelled = false;
+  let timer: any = null;
+
+  const fetchActive = async () => {
+    try {
+      const brand = (companyName || "").trim();
+      const avatar = (companionName || "").trim();
+      const memberId = String(memberIdRef.current || "").trim();
+
+      if (!brand || !avatar || !memberId) return;
+
+      // Keep loading indicator only when opening or when list is empty.
+      setHostActiveLoading((prev) => prev || hostActiveChats.length === 0);
+      setHostActiveError("");
+
+      const res = await fetch(`${API_BASE}/host/ai-chats/active`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          brand,
+          avatar,
+          memberId,
+          limit: 50,
+        }),
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(txt || `HTTP ${res.status}`);
+      }
+
+      const data = (await res.json()) as {
+        ok?: boolean;
+        sessions?: HostActiveChat[];
+      };
+
+      if (cancelled) return;
+
+      const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      setHostActiveChats(sessions);
+      setHostActiveLoading(false);
+    } catch (e: any) {
+      if (cancelled) return;
+      setHostActiveLoading(false);
+      setHostActiveError(String(e?.message || e || "Failed to load active chats"));
+    }
+  };
+
+  const tick = async () => {
+    if (cancelled) return;
+    await fetchActive();
+    timer = setTimeout(tick, 2000);
+  };
+
+  tick();
+
+  return () => {
+    cancelled = true;
+    if (timer) clearTimeout(timer);
+  };
+}, [API_BASE, hostConsoleOpen, isHost, companyName, companionName, hostActiveChats.length]);
+
+useEffect(() => {
+  if (!hostConsoleOpen) return;
+  if (!isHost) return;
+  if (!API_BASE) return;
+  if (!hostSelectedSessionId) return;
+
+  let cancelled = false;
+  let timer: any = null;
+
+  const pollSelected = async () => {
+    try {
+      const brand = (companyName || "").trim();
+      const avatar = (companionName || "").trim();
+      const memberId = String(memberIdRef.current || "").trim();
+
+      if (!brand || !avatar || !memberId) return;
+
+      const res = await fetch(`${API_BASE}/host/ai-chats/poll`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          brand,
+          avatar,
+          memberId,
+          session_id: hostSelectedSessionId,
+          since_seq: hostPollSinceSeqRef.current,
+          mark_read: true,
+        }),
+      });
+
+      if (!res.ok) return;
+
+      const data = (await res.json()) as {
+        ok?: boolean;
+        events?: RelayEvent[];
+        next_since_seq?: number;
+        override_active?: boolean;
+        usage_info?: {
+          minutes_remaining?: number;
+          minutes_allowed?: number;
+          minutes_used?: number;
+        };
+      };
+
+      if (cancelled) return;
+
+      const evs = Array.isArray(data.events) ? data.events : [];
+      if (evs.length) {
+        setHostSelectedEvents((prev) => {
+          const out = [...prev, ...evs];
+          // Cap for UI safety.
+          return out.slice(-400);
+        });
+      }
+
+      const nextSince =
+        typeof data.next_since_seq === "number"
+          ? data.next_since_seq
+          : hostPollSinceSeqRef.current;
+
+      if (nextSince !== hostPollSinceSeqRef.current) {
+        setHostPollSinceSeq(nextSince);
+      }
+
+      // If minutes are exhausted, backend will auto-end override and emit a system event.
+      if (data.override_active === false) {
+        // no-op; UI will reflect from list refresh
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const tick = async () => {
+    if (cancelled) return;
+    await pollSelected();
+    timer = setTimeout(tick, 900);
+  };
+
+  tick();
+
+  return () => {
+    cancelled = true;
+    if (timer) clearTimeout(timer);
+  };
+}, [
+  API_BASE,
+  hostConsoleOpen,
+  isHost,
+  companyName,
+  companionName,
+  hostSelectedSessionId,
+]);
+
+const hostSelectSession = (sid: string) => {
+  setHostSelectedSessionId(sid);
+  setHostSelectedEvents([]);
+  setHostPollSinceSeq(0);
+  setHostSendText("");
+  setHostNotice("");
+};
+
+const hostSetOverride = async (enabled: boolean) => {
+  try {
+    const brand = (companyName || "").trim();
+    const avatar = (companionName || "").trim();
+    const memberId = String(memberIdRef.current || "").trim();
+    const session_id = String(hostSelectedSessionId || "").trim();
+
+    if (!brand || !avatar || !memberId || !session_id) return;
+
+    const res = await fetch(`${API_BASE}/host/ai-chats/override`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ brand, avatar, memberId, session_id, enabled }),
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(txt || `HTTP ${res.status}`);
+    }
+
+    setHostNotice(enabled ? "Override enabled." : "Override ended.");
+  } catch (e: any) {
+    setHostNotice(String(e?.message || e || "Failed to set override"));
+  }
+};
+
+const hostSendMessage = async () => {
+  try {
+    const text = String(hostSendText || "").trim();
+    if (!text) return;
+
+    const brand = (companyName || "").trim();
+    const avatar = (companionName || "").trim();
+    const memberId = String(memberIdRef.current || "").trim();
+    const session_id = String(hostSelectedSessionId || "").trim();
+
+    if (!brand || !avatar || !memberId || !session_id) return;
+
+    const res = await fetch(`${API_BASE}/host/ai-chats/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ brand, avatar, memberId, session_id, text }),
+    });
+
+    const data = await res.json().catch(() => ({} as any));
+
+    if (!res.ok) {
+      const txt = (data && (data.detail || data.message)) || `HTTP ${res.status}`;
+      throw new Error(String(txt));
+    }
+
+    if (data?.minutes_exhausted) {
+      setHostNotice("Member is out of minutes — override ended.");
+      setHostSendText("");
+      return;
+    }
+
+    setHostSendText("");
+    setHostNotice("");
+    // Poll loop will pick up the new message.
+  } catch (e: any) {
+    setHostNotice(String(e?.message || e || "Failed to send host message"));
+  }
+};
+
+
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
   const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
   const [savingSummary, setSavingSummary] = useState(false);
@@ -4093,6 +4540,9 @@ const speakAssistantReply = useCallback(
         companion: companionForBackend,
         companionName: companionForBackend,
         companion_name: companionForBackend,
+  // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
+  brand: (companyName || "").trim(),
+  avatar: (companionName || "").trim(),
 
         memberId: (memberIdForBackend || "").trim(),
         member_id: (memberIdForBackend || "").trim(),
@@ -5910,6 +6360,10 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   // Backward/forward compatibility with any backend expecting different field names
   companionName: companionForBackend,
   companion_name: companionForBackend,
+  // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
+  brand: (companyName || "").trim(),
+  avatar: (companionName || "").trim(),
+
   // Member identity (from Wix)
   memberId: (memberIdForBackend || "").trim(),
   member_id: (memberIdForBackend || "").trim(),
@@ -6547,8 +7001,11 @@ if (streamSessionActive) {
       const commitAssistantMessage = () => {
         if (assistantCommitted) return;
         assistantCommitted = true;
-        setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
-
+        if (!replyText.trim()) return;
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: replyText, meta: { sender: "ai" } },
+        ]);
       };
 
       // Guard against STT feedback: ignore any recognition results until after the avatar finishes speaking.
@@ -6598,9 +7055,11 @@ if (streamSessionActive) {
       // when Live Avatar is NOT speaking.
       const shouldUseLocalTts = !canLiveAvatarSpeak && sttEnabledRef.current;
 
-      const speakPromise = (canLiveAvatarSpeak
+      const hasAssistantReply = Boolean(replyText.trim());
+
+      const speakPromise = (hasAssistantReply && canLiveAvatarSpeak
         ? speakAssistantReply(replyText, hooks)
-        : shouldUseLocalTts
+        : hasAssistantReply && shouldUseLocalTts
           ? speakLocalTtsReply(replyText, voiceId, hooks)
           : (hooks.onDidNotSpeak(), Promise.resolve())
       ).catch(() => {
@@ -6739,15 +7198,15 @@ const flushQueuedStreamMessages = useCallback(async () => {
         if (!Array.isArray(prev)) return prev as any;
         if (noticeIndex >= 0 && noticeIndex < prev.length) {
           const next = prev.slice();
-          next[noticeIndex] = { role: "assistant", content: replyText };
+          next[noticeIndex] = { role: "assistant", content: replyText, meta: { sender: "ai" } };
           return next;
         }
         // Fallback: append if index missing/out-of-range (or in-session member).
-        return [...prev, { role: "assistant", content: replyText }];
+        return [...prev, { role: "assistant", content: replyText, meta: { sender: "ai" } }];
       });
 
       // Advance the backend history used for subsequent queued messages
-      history = [...callMsgs, { role: "assistant", content: replyText }];
+      history = [...callMsgs, { role: "assistant", content: replyText, meta: { sender: "ai" } }];
 
       // Remove the item only after successful processing
       streamDeferredQueueRef.current.shift();
@@ -9283,16 +9742,41 @@ const modePillControls = (
                         background: "#fff",
                       }}
                     >
+
+                      {!isHost && Boolean((sessionState as any)?.host_override_active) ? (
+                        <div
+                          style={{
+                            padding: "10px 12px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(255,255,255,0.18)",
+                            background: "rgba(0,0,0,0.25)",
+                            marginBottom: 10,
+                            fontSize: 14,
+                          }}
+                        >
+                          <b>Host override active.</b> You are now chatting with a human companion.
+                        </div>
+                      ) : null}
+
                       {(livekitUiActive
                         ? messages.filter((x: any) => Boolean((x as any)?.meta?.liveChat))
                         : messages.filter((x: any) => !Boolean((x as any)?.meta?.liveChat))
                       ).map((m, i) => {
                         const meta: any = (m as any).meta;
+                        
+                        const isHostMsg =
+                          m.role === "assistant" && String(meta?.sender || "") === "host";
+                        const isSystemMsg =
+                          m.role === "assistant" && String(meta?.sender || "") === "system";
                         const displayName =
                           meta?.liveChat && meta?.name
                             ? String(meta.name)
                             : m.role === "assistant"
-                            ? (companionName || DEFAULT_COMPANION_NAME)
+                            ? isSystemMsg
+                              ? "System"
+                              : isHostMsg
+                                ? `${(companionName || DEFAULT_COMPANION_NAME)} (Host)`
+                                : (companionName || DEFAULT_COMPANION_NAME)
                             : "You";
 
                         return (
@@ -9315,6 +9799,28 @@ const modePillControls = (
 
                     <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>
                       {/** Input line with mode pills moved to the right (layout-only). */}
+
+{isHost ? (
+  <button
+    type="button"
+    onClick={() => {
+      setHostConsoleOpen(true);
+      setHostNotice("");
+    }}
+    style={{
+      padding: "10px 12px",
+      borderRadius: 10,
+      border: "1px solid rgba(255,255,255,0.35)",
+      background: "rgba(0,0,0,0.22)",
+      color: "white",
+      cursor: "pointer",
+    }}
+    title="Host console (AI chat takeover)"
+  >
+    Host Console
+  </button>
+) : null}
+
                       <button
                             type="button"
                             onClick={requestSaveChatSummary}
@@ -9898,6 +10404,325 @@ const modePillControls = (
           </div>
         </div>
       )}
+
+
+{/* Host console overlay (AI chat takeover) */}
+{hostConsoleOpen && isHost ? (
+  <div
+    style={{
+      position: "fixed",
+      inset: 0,
+      background: "rgba(0,0,0,0.55)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 16,
+      zIndex: 50,
+    }}
+    onClick={() => setHostConsoleOpen(false)}
+  >
+    <div
+      style={{
+        width: "min(1200px, 100%)",
+        maxHeight: "min(860px, 92vh)",
+        overflow: "hidden",
+        background: "rgba(20,20,24,0.98)",
+        border: "1px solid rgba(255,255,255,0.22)",
+        borderRadius: 14,
+        padding: 14,
+        color: "white",
+      }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+        }}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <div style={{ fontSize: 18, fontWeight: 700 }}>
+            Host Console
+          </div>
+          <div style={{ fontSize: 12, opacity: 0.82 }}>
+            {companyName} · {companionName || DEFAULT_COMPANION_NAME}
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setHostConsoleOpen(false)}
+          style={{
+            padding: "8px 10px",
+            borderRadius: 10,
+            border: "1px solid rgba(255,255,255,0.28)",
+            background: "rgba(0,0,0,0.28)",
+            color: "white",
+            cursor: "pointer",
+          }}
+        >
+          Close
+        </button>
+      </div>
+
+      {hostActiveError ? (
+        <div style={{ marginTop: 10, color: "#ffb3b3", fontSize: 13 }}>
+          {hostActiveError}
+        </div>
+      ) : null}
+
+      {hostNotice ? (
+        <div style={{ marginTop: 10, color: "#fff1b3", fontSize: 13 }}>
+          {hostNotice}
+        </div>
+      ) : null}
+
+      <div
+        style={{
+          marginTop: 12,
+          display: "grid",
+          gridTemplateColumns: "360px 1fr",
+          gap: 12,
+          height: "calc(min(860px, 92vh) - 170px)",
+        }}
+      >
+        {/* Left: Active chats */}
+        <div
+          style={{
+            border: "1px solid rgba(255,255,255,0.16)",
+            borderRadius: 12,
+            padding: 10,
+            overflow: "auto",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              marginBottom: 10,
+            }}
+          >
+            <div style={{ fontWeight: 700 }}>Active chats</div>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>
+              {hostActiveLoading ? "Loading…" : `${hostActiveChats.length}`}
+            </div>
+          </div>
+
+          {hostActiveChats.length === 0 && !hostActiveLoading ? (
+            <div style={{ fontSize: 13, opacity: 0.8 }}>
+              No active sessions detected yet.
+            </div>
+          ) : null}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {hostActiveChats.map((c) => {
+              const isSelected = c.session_id === hostSelectedSessionId;
+              const memberLabel =
+                (c.member_id || "").trim() || "anonymous / visitor";
+              const mins =
+                typeof c.minutes_remaining === "number"
+                  ? c.minutes_remaining
+                  : undefined;
+
+              return (
+                <button
+                  key={c.session_id}
+                  type="button"
+                  onClick={() => hostSelectSession(c.session_id)}
+                  style={{
+                    textAlign: "left",
+                    padding: "10px 10px",
+                    borderRadius: 12,
+                    border: isSelected
+                      ? "1px solid rgba(255,255,255,0.55)"
+                      : "1px solid rgba(255,255,255,0.14)",
+                    background: isSelected
+                      ? "rgba(255,255,255,0.10)"
+                      : "rgba(0,0,0,0.20)",
+                    color: "white",
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <div style={{ fontWeight: 700, fontSize: 13 }}>
+                      {memberLabel}
+                    </div>
+                    <div style={{ fontSize: 12, opacity: 0.85 }}>
+                      {typeof c.unread === "number" && c.unread > 0
+                        ? `• ${c.unread} new`
+                        : ""}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 10, marginTop: 6, fontSize: 12, opacity: 0.85 }}>
+                    <div>
+                      {c.override_active ? "Override: ON" : "Override: off"}
+                    </div>
+                    {typeof mins === "number" ? <div>Minutes: {mins}</div> : null}
+                  </div>
+
+                  {c.summary ? (
+                    <div style={{ marginTop: 8, fontSize: 12, opacity: 0.9, whiteSpace: "pre-wrap" }}>
+                      {c.summary}
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7 }}>
+                      (No summary yet)
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Right: Selected transcript + controls */}
+        <div
+          style={{
+            border: "1px solid rgba(255,255,255,0.16)",
+            borderRadius: 12,
+            padding: 10,
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+            <div style={{ fontWeight: 700 }}>
+              {hostSelectedSessionId ? "Session" : "Select a session"}
+            </div>
+
+            {hostSelectedSessionId ? (
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                {(() => {
+                  const selected = hostActiveChats.find(
+                    (c) => c.session_id === hostSelectedSessionId
+                  );
+                  const overrideOn = Boolean(selected?.override_active);
+                  return (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => hostSetOverride(!overrideOn)}
+                        style={{
+                          padding: "8px 10px",
+                          borderRadius: 10,
+                          border: "1px solid rgba(255,255,255,0.28)",
+                          background: overrideOn
+                            ? "rgba(120,255,170,0.18)"
+                            : "rgba(0,0,0,0.28)",
+                          color: "white",
+                          cursor: "pointer",
+                        }}
+                        title="Toggle host override for this session"
+                      >
+                        {overrideOn ? "End override" : "Enable override"}
+                      </button>
+                    </>
+                  );
+                })()}
+              </div>
+            ) : null}
+          </div>
+
+          {hostSelectedSessionId ? (
+            <div style={{ fontSize: 12, opacity: 0.78, marginTop: 6 }}>
+              {hostSelectedSessionId}
+            </div>
+          ) : null}
+
+          <div
+            style={{
+              marginTop: 10,
+              flex: 1,
+              overflow: "auto",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.12)",
+              padding: 10,
+              background: "rgba(0,0,0,0.20)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            {hostSelectedSessionId && hostSelectedEvents.length === 0 ? (
+              <div style={{ fontSize: 13, opacity: 0.75 }}>
+                Waiting for messages…
+              </div>
+            ) : null}
+
+            {hostSelectedEvents.map((ev, idx) => {
+              const sender = String((ev as any).sender || "");
+              const label =
+                sender === "user"
+                  ? "User"
+                  : sender === "host"
+                    ? "Host"
+                    : sender === "ai" || sender === "xai"
+                      ? "AI"
+                      : "System";
+
+              return (
+                <div key={`${(ev as any).seq || idx}`} style={{ fontSize: 13, lineHeight: 1.35 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 2 }}>
+                    {label}
+                  </div>
+                  <div style={{ whiteSpace: "pre-wrap" }}>
+                    {String((ev as any).content || "")}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+            <textarea
+              value={hostSendText}
+              onChange={(e) => setHostSendText(e.target.value)}
+              placeholder="Send a host message…"
+              style={{
+                flex: 1,
+                minHeight: 44,
+                maxHeight: 140,
+                resize: "vertical",
+                padding: "10px 10px",
+                borderRadius: 12,
+                border: "1px solid rgba(255,255,255,0.22)",
+                background: "rgba(0,0,0,0.22)",
+                color: "white",
+                outline: "none",
+                fontSize: 14,
+              }}
+              disabled={!hostSelectedSessionId}
+            />
+
+            <button
+              type="button"
+              onClick={hostSendMessage}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 12,
+                border: "1px solid rgba(255,255,255,0.28)",
+                background: "rgba(0,0,0,0.28)",
+                color: "white",
+                cursor: "pointer",
+                minWidth: 92,
+              }}
+              disabled={!hostSelectedSessionId || !hostSendText.trim()}
+            >
+              Send
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+) : null}
+
 
 {/* Consent overlay */}
       {showConsentOverlay && (

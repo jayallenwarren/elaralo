@@ -5290,10 +5290,15 @@ async def chat(request: Request):
     probe_text = ((probe_last_user.get("content") if probe_last_user else "") or "").strip()
     is_minutes_balance_query = _is_minutes_balance_question(probe_text)
 
+
     if not usage_ok and not is_minutes_balance_query:
         minutes_allowed = int(
             usage_info.get("minutes_allowed")
-            or (minutes_allowed_override if minutes_allowed_override is not None else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits)))
+            or (
+                minutes_allowed_override
+                if minutes_allowed_override is not None
+                else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits))
+            )
             or 0
         )
         session_state_out = dict(session_state)
@@ -5305,6 +5310,52 @@ async def chat(request: Request):
                 "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
             }
         )
+
+        # If a host takeover was active, end it and notify the host (minutes are exhausted).
+        try:
+            _ai_override_touch_from_chat(
+                session_id=session_id,
+                session_state=session_state,
+                identity_key=identity_key,
+                is_trial=is_trial,
+                plan_name_for_limits=plan_name_for_limits,
+                plan_label_for_messages=plan_label_for_messages,
+                minutes_allowed_override=minutes_allowed_override,
+                cycle_days_override=cycle_days_override,
+                upgrade_url=upgrade_link_override,
+                payg_pay_url=pay_go_link_override,
+                payg_minutes=pay_go_minutes,
+                payg_price_text=payg_price_text_override,
+            )
+            if probe_text:
+                _ai_override_append_event(
+                    session_id,
+                    role="user",
+                    content=probe_text,
+                    sender="user",
+                    audience="all",
+                    kind="message",
+                )
+
+            if _ai_override_is_active(session_id):
+                _ai_override_append_event(
+                    session_id,
+                    role="system",
+                    content="Member is out of chat minutes. Host override ended.",
+                    sender="system",
+                    audience="host",
+                    kind="minutes_exhausted",
+                )
+                _ai_override_set_active(
+                    session_id,
+                    enabled=False,
+                    host_member_id=str((_ai_override_get_session(session_id) or {}).get("override_host_member_id") or ""),
+                    reason="member_out_of_minutes",
+                )
+        except Exception:
+            pass
+
+        # Member should always see the standard pay/upgrade message.
         reply = _usage_paywall_message(
             is_trial=is_trial,
             plan_name=plan_label_for_messages,
@@ -5314,6 +5365,10 @@ async def chat(request: Request):
             payg_increment_minutes=pay_go_minutes,
             payg_price_text=payg_price_text_override,
         )
+
+        # Surface override flag to the UI even on paywalls.
+        session_state_out["host_override_active"] = False
+
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
@@ -5321,6 +5376,7 @@ async def chat(request: Request):
             "session_state": session_state_out,
             "audio_url": None,
         }
+
 
 # Best-effort retrieval of a previously saved chat summary.
     # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
@@ -5352,6 +5408,13 @@ async def chat(request: Request):
 
     # Helper to build responses consistently and optionally include audio_url.
     async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
+        # Ensure the frontend can reflect whether a human host takeover is active.
+        try:
+            state_out = dict(state_out)
+            state_out["host_override_active"] = bool(_ai_override_is_active(session_id))
+        except Exception:
+            pass
+
         audio_url: Optional[str] = None
         if voice_id and (reply or "").strip():
             try:
@@ -5530,6 +5593,60 @@ async def chat(request: Request):
         safe_saved_summary = _sanitize_summary_for_safe_mode(safe_saved_summary)
 
     in_session_summaries = _extract_in_session_summaries(session_state)
+
+    # ----------------------------
+    # Host override (human companion takeover)
+    # ----------------------------
+    # Track this session for host visibility and, if overridden, bypass the LLM.
+    try:
+        _ai_override_touch_from_chat(
+            session_id=session_id,
+            session_state=session_state,
+            identity_key=identity_key,
+            is_trial=is_trial,
+            plan_name_for_limits=plan_name_for_limits,
+            plan_label_for_messages=plan_label_for_messages,
+            minutes_allowed_override=minutes_allowed_override,
+            cycle_days_override=cycle_days_override,
+            upgrade_url=upgrade_link_override,
+            payg_pay_url=pay_go_link_override,
+            payg_minutes=pay_go_minutes,
+            payg_price_text=payg_price_text_override,
+        )
+
+        # Append the newest user message for the host transcript.
+        if user_text:
+            _ai_override_append_event(
+                session_id,
+                role="user",
+                content=user_text,
+                sender="user",
+                audience="all",
+                kind="message",
+            )
+    except Exception:
+        pass
+
+    # If the host has taken over this session, do NOT call OpenAI/xAI.
+    if _ai_override_is_active(session_id):
+        session_state_out = dict(session_state)
+        session_state_out["mode"] = effective_mode
+        session_state_out["pending_consent"] = None if intimate_allowed else session_state_out.get("pending_consent")
+        session_state_out["llm_provider"] = "host"
+        session_state_out["model_provider"] = "host"
+        session_state_out["model"] = "host"
+        session_state_out["host_override_active"] = True
+        session_state_out["companion_meta"] = _parse_companion_meta(
+            session_state_out.get("companion")
+            or session_state_out.get("companionName")
+            or session_state_out.get("companion_name")
+        )
+        return await _respond(
+            "",
+            STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
+            session_state_out,
+        )
+
     if llm_provider == "openai" and in_session_summaries:
         sanitized: List[str] = []
         for s in in_session_summaries:
@@ -5658,7 +5775,22 @@ async def chat(request: Request):
         _dbg(debug, "LLM call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
 
-    # echo back session_state (ensure correct mode)
+    
+    # Record the AI reply in the relay so the host can preview ongoing chats.
+    try:
+        if assistant_reply and str(assistant_reply).strip():
+            _ai_override_append_event(
+                session_id,
+                role="assistant",
+                content=str(assistant_reply),
+                sender=("xai" if llm_provider == "xai" else "ai"),
+                audience="all",
+                kind="message",
+            )
+    except Exception:
+        pass
+
+# echo back session_state (ensure correct mode)
     session_state_out = dict(session_state)
     session_state_out["mode"] = effective_mode
     # Surface the active provider/model to the frontend (SessionState.model exists already).
@@ -5681,6 +5813,458 @@ async def chat(request: Request):
         session_state_out,
     )
 
+
+
+
+# =============================================================================
+# HOST OVERRIDE (Human Companion takeover of AI chat)
+#
+# Use-case:
+#   - When the logged-in user's memberId == host_member_id (per brand+avatar mapping),
+#     the host may "override" AI chat and directly message members/visitors.
+#   - While override is active for a session_id:
+#       * /chat will NOT call the LLM (OpenAI/xAI). It will log the user's message
+#         and return an empty reply (frontend polls for host messages).
+#       * Minutes are still charged (same usage clock as AI chat).
+#   - When minutes are exhausted during a host takeover:
+#       * The member receives the standard paywall message.
+#       * Override is ended automatically.
+#       * The host is notified that the member is out of minutes.
+#
+# Notes:
+#   - This implementation is intentionally lightweight: in-memory store + optional
+#     JSON persistence for single-instance Azure App Service deployments.
+#   - Session isolation: keyed by session_id (stored in browser sessionStorage).
+# =============================================================================
+
+_AI_OVERRIDE_LOCK = threading.RLock()
+_AI_OVERRIDE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+_AI_OVERRIDE_ACTIVE_WINDOW_S = int(os.getenv("AI_OVERRIDE_ACTIVE_WINDOW_S", "1800") or "1800")  # 30m
+_AI_OVERRIDE_MAX_EVENTS = int(os.getenv("AI_OVERRIDE_MAX_EVENTS", "800") or "800")
+_AI_OVERRIDE_FILE = (os.getenv("AI_OVERRIDE_FILE", "") or "").strip()
+_AI_OVERRIDE_FILE_MTIME: float = 0.0
+
+
+def _ai_override_load() -> None:
+    global _AI_OVERRIDE_FILE_MTIME
+    if not _AI_OVERRIDE_FILE:
+        return
+    try:
+        if not os.path.isfile(_AI_OVERRIDE_FILE):
+            return
+        with open(_AI_OVERRIDE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            with _AI_OVERRIDE_LOCK:
+                _AI_OVERRIDE_SESSIONS.clear()
+                for k, v in data.items():
+                    if isinstance(k, str) and isinstance(v, dict):
+                        _AI_OVERRIDE_SESSIONS[k] = v
+        try:
+            _AI_OVERRIDE_FILE_MTIME = os.stat(_AI_OVERRIDE_FILE).st_mtime
+        except Exception:
+            pass
+    except Exception:
+        return
+
+
+def _ai_override_persist() -> None:
+    global _AI_OVERRIDE_FILE_MTIME
+    if not _AI_OVERRIDE_FILE:
+        return
+    try:
+        tmp = _AI_OVERRIDE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_AI_OVERRIDE_SESSIONS, f, ensure_ascii=False)
+        os.replace(tmp, _AI_OVERRIDE_FILE)
+        try:
+            _AI_OVERRIDE_FILE_MTIME = os.stat(_AI_OVERRIDE_FILE).st_mtime
+        except Exception:
+            pass
+    except Exception:
+        return
+
+
+def _ai_override_refresh_if_needed() -> None:
+    if not _AI_OVERRIDE_FILE:
+        return
+    try:
+        if not os.path.isfile(_AI_OVERRIDE_FILE):
+            return
+        mtime = os.stat(_AI_OVERRIDE_FILE).st_mtime
+        if mtime and mtime > _AI_OVERRIDE_FILE_MTIME + 1e-6:
+            _ai_override_load()
+    except Exception:
+        return
+
+
+# best-effort load at startup
+_ai_override_load()
+
+
+def _brand_avatar_from_session_state(session_state: Dict[str, Any]) -> Tuple[str, str]:
+    # Prefer explicit brand/avatar fields set by the frontend.
+    brand = str(session_state.get("brand") or session_state.get("companyName") or session_state.get("company") or "").strip()
+    avatar = str(session_state.get("avatar") or "").strip()
+
+    # Fallbacks:
+    if not avatar:
+        avatar = str(session_state.get("companionName") or session_state.get("companion") or session_state.get("companion_name") or "").strip()
+    if not brand:
+        # Use legacy single-field rebranding if present.
+        brand = str(session_state.get("rebranding") or "").strip()
+
+    return brand, avatar
+
+
+def _ai_override_get_session(session_id: str) -> Optional[Dict[str, Any]]:
+    sid = (session_id or "").strip()
+    if not sid:
+        return None
+    _ai_override_refresh_if_needed()
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if isinstance(rec, dict):
+            return rec
+    return None
+
+
+def _ai_override_touch_from_chat(
+    *,
+    session_id: str,
+    session_state: Dict[str, Any],
+    identity_key: str,
+    is_trial: bool,
+    plan_name_for_limits: str,
+    plan_label_for_messages: str,
+    minutes_allowed_override: Optional[int],
+    cycle_days_override: Optional[int],
+    upgrade_url: str,
+    payg_pay_url: str,
+    payg_minutes: Optional[int],
+    payg_price_text: str,
+) -> Dict[str, Any]:
+    sid = (session_id or "").strip()
+    if not sid:
+        return {}
+
+    brand, avatar = _brand_avatar_from_session_state(session_state)
+    member_id = _extract_member_id(session_state) or ""
+    companion_key = _normalize_companion_key(_extract_companion_raw(session_state))
+
+    # In-session digests from the frontend (optional).
+    in_session = _extract_in_session_summaries(session_state)
+
+    now = time.time()
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if not isinstance(rec, dict):
+            rec = {
+                "session_id": sid,
+                "seq": 0,
+                "events": [],
+                "override_active": False,
+                "override_started_at": None,
+                "override_host_member_id": "",
+                "host_ack_seq": 0,
+            }
+
+        rec["session_id"] = sid
+        rec["brand"] = brand
+        rec["avatar"] = avatar
+        rec["member_id"] = str(member_id or "").strip()
+        rec["identity_key"] = str(identity_key or "").strip()
+        rec["companion_key"] = companion_key
+        rec["last_seen"] = float(now)
+
+        # Usage context (needed for host messages to continue charging and for paywall messages)
+        rec["usage_ctx"] = {
+            "is_trial": bool(is_trial),
+            "plan_name_for_limits": str(plan_name_for_limits or "").strip(),
+            "plan_label_for_messages": str(plan_label_for_messages or "").strip(),
+            "minutes_allowed_override": minutes_allowed_override,
+            "cycle_days_override": cycle_days_override,
+            "upgrade_url": str(upgrade_url or "").strip(),
+            "payg_pay_url": str(payg_pay_url or "").strip(),
+            "payg_minutes": payg_minutes,
+            "payg_price_text": str(payg_price_text or "").strip(),
+        }
+
+        # Summaries for host preview
+        if in_session:
+            rec["in_session_summaries"] = in_session
+        rec["summary_key"] = _summary_store_key(session_state, sid)
+
+        _AI_OVERRIDE_SESSIONS[sid] = rec
+        _ai_override_persist()
+
+        return rec
+
+
+def _ai_override_append_event(
+    session_id: str,
+    *,
+    role: str,
+    content: str,
+    sender: str,
+    audience: str = "all",
+    kind: str = "message",
+) -> Dict[str, Any]:
+    sid = (session_id or "").strip()
+    if not sid:
+        return {}
+
+    now = time.time()
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if not isinstance(rec, dict):
+            rec = {"session_id": sid, "seq": 0, "events": [], "override_active": False, "host_ack_seq": 0}
+
+        seq = int(rec.get("seq") or 0) + 1
+        rec["seq"] = seq
+
+        ev = {
+            "seq": seq,
+            "ts": float(now),
+            "role": str(role or "").strip() or "system",
+            "content": str(content or ""),
+            "sender": str(sender or "").strip() or "system",
+            "audience": str(audience or "all").strip() or "all",
+            "kind": str(kind or "message").strip() or "message",
+        }
+
+        events = rec.get("events")
+        if not isinstance(events, list):
+            events = []
+        events.append(ev)
+
+        # Trim
+        max_events = max(50, int(_AI_OVERRIDE_MAX_EVENTS or 0))
+        if len(events) > max_events:
+            events = events[-max_events:]
+
+            # Rebase host_ack_seq so unread counts don't explode after trimming.
+            try:
+                min_seq = int(events[0].get("seq") or 0)
+                if int(rec.get("host_ack_seq") or 0) < min_seq:
+                    rec["host_ack_seq"] = min_seq - 1
+            except Exception:
+                pass
+
+        rec["events"] = events
+        rec["last_seen"] = float(now)
+
+        _AI_OVERRIDE_SESSIONS[sid] = rec
+        _ai_override_persist()
+
+        return ev
+
+
+def _ai_override_is_active(session_id: str) -> bool:
+    rec = _ai_override_get_session(session_id)
+    if not isinstance(rec, dict):
+        return False
+    return bool(rec.get("override_active") is True)
+
+
+def _ai_override_set_active(
+    session_id: str,
+    *,
+    enabled: bool,
+    host_member_id: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    sid = (session_id or "").strip()
+    if not sid:
+        return {}
+
+    now = time.time()
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if not isinstance(rec, dict):
+            rec = {"session_id": sid, "seq": 0, "events": [], "override_active": False, "host_ack_seq": 0}
+
+        rec["override_active"] = bool(enabled)
+        rec["override_host_member_id"] = str(host_member_id or "").strip()
+        rec["override_started_at"] = float(now) if enabled else None
+        rec["last_seen"] = float(now)
+
+        _AI_OVERRIDE_SESSIONS[sid] = rec
+        _ai_override_persist()
+
+    # Emit a system event so the member UI can show a banner.
+    if enabled:
+        _ai_override_append_event(
+            sid,
+            role="system",
+            content="Host override enabled — you are now chatting with a human companion.",
+            sender="system",
+            audience="all",
+            kind="override_on",
+        )
+    else:
+        msg = "Host override ended — AI companion chat will continue."
+        if reason:
+            msg = f"Host override ended ({reason})."
+        _ai_override_append_event(
+            sid,
+            role="system",
+            content=msg,
+            sender="system",
+            audience="all",
+            kind="override_off",
+        )
+
+    return _ai_override_get_session(sid) or {}
+
+
+def _ai_override_list_active_sessions(brand: str, avatar: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+    now = time.time()
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+
+    _ai_override_refresh_if_needed()
+
+    out: List[Dict[str, Any]] = []
+    with _AI_OVERRIDE_LOCK:
+        items = list(_AI_OVERRIDE_SESSIONS.values())
+
+    for rec in items:
+        if not isinstance(rec, dict):
+            continue
+        last_seen = float(rec.get("last_seen") or 0.0)
+        if not last_seen or (now - last_seen) > float(_AI_OVERRIDE_ACTIVE_WINDOW_S or 0):
+            continue
+        if b and str(rec.get("brand") or "").strip() != b:
+            continue
+        if a and str(rec.get("avatar") or "").strip() != a:
+            continue
+        out.append(rec)
+
+    out.sort(key=lambda r: float(r.get("last_seen") or 0.0), reverse=True)
+    return out[: max(1, min(int(limit or 50), 200))]
+
+
+def _ai_override_poll(
+    session_id: str,
+    *,
+    since_seq: int,
+    audience: str,
+    mark_host_read: bool = False,
+) -> Dict[str, Any]:
+    sid = (session_id or "").strip()
+    rec = _ai_override_get_session(sid) or {}
+    if not isinstance(rec, dict):
+        return {"events": [], "next_since_seq": int(since_seq or 0), "override_active": False}
+
+    try:
+        since_i = int(since_seq or 0)
+    except Exception:
+        since_i = 0
+
+    events = rec.get("events")
+    if not isinstance(events, list):
+        events = []
+
+    # Filter by seq and audience
+    wanted: List[Dict[str, Any]] = []
+    max_seq = since_i
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        seq = int(ev.get("seq") or 0)
+        if seq <= since_i:
+            continue
+        ev_aud = str(ev.get("audience") or "all").strip() or "all"
+        if ev_aud != "all" and ev_aud != audience:
+            continue
+        wanted.append(ev)
+        if seq > max_seq:
+            max_seq = seq
+
+    if mark_host_read and audience == "host":
+        with _AI_OVERRIDE_LOCK:
+            rec2 = _AI_OVERRIDE_SESSIONS.get(sid)
+            if isinstance(rec2, dict):
+                rec2["host_ack_seq"] = max(int(rec2.get("host_ack_seq") or 0), int(max_seq or 0))
+                _AI_OVERRIDE_SESSIONS[sid] = rec2
+                _ai_override_persist()
+
+    return {
+        "events": wanted,
+        "next_since_seq": int(max_seq or since_i),
+        "override_active": bool(rec.get("override_active") is True),
+        "override_started_at": rec.get("override_started_at"),
+    }
+
+
+def _ai_override_unread_for_host(rec: Dict[str, Any]) -> int:
+    try:
+        host_ack = int(rec.get("host_ack_seq") or 0)
+    except Exception:
+        host_ack = 0
+    events = rec.get("events")
+    if not isinstance(events, list):
+        return 0
+    c = 0
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        seq = int(ev.get("seq") or 0)
+        if seq <= host_ack:
+            continue
+        if str(ev.get("sender") or "") == "user":
+            c += 1
+    return c
+
+
+def _ai_override_best_summary(rec: Dict[str, Any]) -> Tuple[str, str]:
+    # 1) Saved summary (user-authorized)
+    try:
+        key = str(rec.get("summary_key") or "").strip()
+        if key:
+            _refresh_summary_store_if_needed()
+            ss = _CHAT_SUMMARY_STORE.get(key) or {}
+            s = ss.get("summary")
+            if isinstance(s, str) and s.strip():
+                return s.strip(), "saved_summary"
+    except Exception:
+        pass
+
+    # 2) In-session digests (client-side)
+    try:
+        digs = rec.get("in_session_summaries")
+        if isinstance(digs, list) and digs:
+            last = str(digs[-1] or "").strip()
+            if last:
+                return last, "in_session_digest"
+    except Exception:
+        pass
+
+    # 3) Fallback: last few events
+    try:
+        events = rec.get("events")
+        if isinstance(events, list) and events:
+            tail = events[-6:]
+            lines: List[str] = []
+            for ev in tail:
+                if not isinstance(ev, dict):
+                    continue
+                role = str(ev.get("role") or "").strip() or "system"
+                sender = str(ev.get("sender") or "").strip() or role
+                c = str(ev.get("content") or "").strip()
+                if not c:
+                    continue
+                if len(c) > 240:
+                    c = c[:240] + "…"
+                lines.append(f"{sender}: {c}")
+            if lines:
+                return "\n".join(lines), "recent_messages"
+    except Exception:
+        pass
+
+    return "", "none"
 
 # ----------------------------
 # SAVE CHAT SUMMARY
@@ -8167,3 +8751,325 @@ async def wix_paymentlinks_webhook(request: Request):
         _wix_process_paymentlink_webhook_sync(decoded)
 
     return {"ok": True}
+
+
+# =============================================================================
+# Host Override API
+# =============================================================================
+
+class HostAiChatsActiveRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    limit: int = 50
+
+
+class HostAiChatsOverrideRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    session_id: str = ""
+    enabled: bool = False
+
+
+class HostAiChatsSendRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    session_id: str = ""
+    text: str = ""
+
+
+class HostAiChatsPollRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    session_id: str = ""
+    since_seq: int = 0
+    mark_read: bool = True
+
+
+class ChatRelayPollRequest(BaseModel):
+    session_id: str = ""
+    since_seq: int = 0
+    session_state: Dict[str, Any] = {}
+
+
+def _require_host_member(brand: str, avatar: str, member_id: str) -> str:
+    brand_s = (brand or "").strip()
+    avatar_s = (avatar or "").strip()
+    caller = (member_id or "").strip()
+    if not brand_s or not avatar_s:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand_s, avatar_s) or {}
+    host_id = str(mapping.get("host_member_id") or mapping.get("hostMemberId") or "").strip()
+    if not host_id:
+        raise HTTPException(status_code=404, detail="No host_member_id configured for this companion mapping")
+    if not caller or caller != host_id:
+        raise HTTPException(status_code=403, detail="Host access denied")
+    return host_id
+
+
+@app.post("/host/ai-chats/active")
+async def host_ai_chats_active(req: HostAiChatsActiveRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+
+    recs = _ai_override_list_active_sessions(req.brand, req.avatar, limit=int(req.limit or 50))
+
+    sessions_out: List[Dict[str, Any]] = []
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+
+        ctx = rec.get("usage_ctx") or {}
+        if not isinstance(ctx, dict):
+            ctx = {}
+
+        identity_key = str(rec.get("identity_key") or "").strip()
+        usage_ok = True
+        usage_info: Dict[str, Any] = {}
+        if identity_key:
+            try:
+                usage_ok, usage_info = _usage_peek_sync(
+                    identity_key,
+                    is_trial=bool(ctx.get("is_trial") is True),
+                    plan_name=str(ctx.get("plan_name_for_limits") or "").strip(),
+                    minutes_allowed_override=ctx.get("minutes_allowed_override", None),
+                    cycle_days_override=ctx.get("cycle_days_override", None),
+                )
+            except Exception:
+                usage_ok, usage_info = True, {}
+
+        summary, summary_source = _ai_override_best_summary(rec)
+
+        sessions_out.append(
+            {
+                "session_id": str(rec.get("session_id") or "").strip(),
+                "member_id": str(rec.get("member_id") or "").strip(),
+                "brand": str(rec.get("brand") or "").strip(),
+                "avatar": str(rec.get("avatar") or "").strip(),
+                "companion_key": str(rec.get("companion_key") or "").strip(),
+                "last_seen": float(rec.get("last_seen") or 0.0),
+                "override_active": bool(rec.get("override_active") is True),
+                "override_started_at": rec.get("override_started_at"),
+                "unread": int(_ai_override_unread_for_host(rec)),
+                "summary": summary,
+                "summary_source": summary_source,
+                "usage_ok": bool(usage_ok),
+                "minutes_used": int(usage_info.get("minutes_used") or 0),
+                "minutes_allowed": int(usage_info.get("minutes_allowed") or 0),
+                "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
+                "plan_label": str(ctx.get("plan_label_for_messages") or "").strip(),
+                "is_trial": bool(ctx.get("is_trial") is True),
+            }
+        )
+
+    return {"ok": True, "hostMemberId": host_id, "sessions": sessions_out, "now": _now_ts()}
+
+
+@app.post("/host/ai-chats/override")
+async def host_ai_chats_override(req: HostAiChatsOverrideRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    sid = (req.session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    # Ensure the session record exists even if the host toggles override early.
+    rec = _ai_override_get_session(sid)
+    if not isinstance(rec, dict):
+        with _AI_OVERRIDE_LOCK:
+            _AI_OVERRIDE_SESSIONS[sid] = {"session_id": sid, "seq": 0, "events": [], "override_active": False, "host_ack_seq": 0}
+            _ai_override_persist()
+
+    out = _ai_override_set_active(sid, enabled=bool(req.enabled), host_member_id=host_id)
+    return {"ok": True, "session_id": sid, "override_active": bool(out.get("override_active") is True), "hostMemberId": host_id}
+
+
+@app.post("/host/ai-chats/send")
+async def host_ai_chats_send(req: HostAiChatsSendRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    sid = (req.session_id or "").strip()
+    text = (req.text or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    rec = _ai_override_get_session(sid) or {}
+    if not isinstance(rec, dict):
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    if not bool(rec.get("override_active") is True):
+        raise HTTPException(status_code=409, detail="Host override is not active for this session")
+
+    ctx = rec.get("usage_ctx") or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+
+    identity_key = str(rec.get("identity_key") or "").strip()
+    if not identity_key:
+        raise HTTPException(status_code=400, detail="Missing identity key for this session (member has not chatted yet)")
+
+    # Charge minutes while the host is active (same usage clock as AI chat).
+    try:
+        usage_ok, usage_info = _usage_charge_and_check_sync(
+            identity_key,
+            is_trial=bool(ctx.get("is_trial") is True),
+            plan_name=str(ctx.get("plan_name_for_limits") or "").strip(),
+            minutes_allowed_override=ctx.get("minutes_allowed_override", None),
+            cycle_days_override=ctx.get("cycle_days_override", None),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Usage enforcement failed: {type(e).__name__}: {e}")
+
+    if not usage_ok:
+        # Member is out of minutes: send paywall to member and end override.
+        minutes_allowed = int(
+            usage_info.get("minutes_allowed")
+            or (
+                ctx.get("minutes_allowed_override")
+                if ctx.get("minutes_allowed_override") is not None
+                else (TRIAL_MINUTES if bool(ctx.get("is_trial") is True) else _included_minutes_for_plan(str(ctx.get("plan_name_for_limits") or "").strip()))
+            )
+            or 0
+        )
+
+        paywall = _usage_paywall_message(
+            is_trial=bool(ctx.get("is_trial") is True),
+            plan_name=str(ctx.get("plan_label_for_messages") or "").strip() or str(ctx.get("plan_name_for_limits") or "").strip(),
+            minutes_allowed=minutes_allowed,
+            upgrade_url=str(ctx.get("upgrade_url") or "").strip(),
+            payg_pay_url=str(ctx.get("payg_pay_url") or "").strip(),
+            payg_increment_minutes=ctx.get("payg_minutes", None),
+            payg_price_text=str(ctx.get("payg_price_text") or "").strip(),
+        )
+
+        # Member sees paywall.
+        _ai_override_append_event(
+            sid,
+            role="assistant",
+            content=paywall,
+            sender="system",
+            audience="user",
+            kind="paywall",
+        )
+
+        # Host sees termination notice.
+        _ai_override_append_event(
+            sid,
+            role="system",
+            content="Member is out of chat minutes. Host override ended.",
+            sender="system",
+            audience="host",
+            kind="minutes_exhausted",
+        )
+
+        _ai_override_set_active(sid, enabled=False, host_member_id=host_id, reason="member_out_of_minutes")
+
+        return {
+            "ok": False,
+            "minutes_exhausted": True,
+            "session_id": sid,
+            "override_active": False,
+            "usage_info": usage_info,
+            "paywall": paywall,
+        }
+
+    # Normal host message.
+    _ai_override_append_event(
+        sid,
+        role="assistant",
+        content=text,
+        sender="host",
+        audience="all",
+        kind="message",
+    )
+
+    return {"ok": True, "session_id": sid, "override_active": True, "usage_info": usage_info}
+
+
+@app.post("/host/ai-chats/poll")
+async def host_ai_chats_poll(req: HostAiChatsPollRequest):
+    _require_host_member(req.brand, req.avatar, req.memberId)
+    sid = (req.session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    out = _ai_override_poll(
+        sid,
+        since_seq=int(req.since_seq or 0),
+        audience="host",
+        mark_host_read=bool(req.mark_read),
+    )
+
+    rec = _ai_override_get_session(sid) or {}
+    ctx = rec.get("usage_ctx") if isinstance(rec, dict) else {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+
+    identity_key = str((rec or {}).get("identity_key") or "").strip() if isinstance(rec, dict) else ""
+    usage_info: Dict[str, Any] = {}
+    if identity_key:
+        try:
+            _ok, usage_info = _usage_peek_sync(
+                identity_key,
+                is_trial=bool(ctx.get("is_trial") is True),
+                plan_name=str(ctx.get("plan_name_for_limits") or "").strip(),
+                minutes_allowed_override=ctx.get("minutes_allowed_override", None),
+                cycle_days_override=ctx.get("cycle_days_override", None),
+            )
+        except Exception:
+            usage_info = {}
+
+    return {"ok": True, "session_id": sid, **out, "usage_info": usage_info}
+
+
+@app.post("/chat/relay/poll")
+async def chat_relay_poll(req: ChatRelayPollRequest):
+    sid = (req.session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    rec = _ai_override_get_session(sid) or {}
+    if not isinstance(rec, dict):
+        return {"ok": True, "session_id": sid, "events": [], "next_since_seq": int(req.since_seq or 0), "override_active": False}
+
+    # Soft identity check: only enforce when both sides present.
+    try:
+        caller_member = _extract_member_id(req.session_state or {}) or ""
+        stored_member = str(rec.get("member_id") or "").strip()
+        if stored_member and caller_member and stored_member != caller_member:
+            raise HTTPException(status_code=403, detail="Session access denied")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    polled = _ai_override_poll(
+        sid,
+        since_seq=int(req.since_seq or 0),
+        audience="user",
+        mark_host_read=False,
+    )
+
+    # Member only needs out-of-band messages:
+    #   - host replies
+    #   - system notices (override on/off, paywalls, etc.)
+    events = polled.get("events") or []
+    filtered: List[Dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        sender = str(ev.get("sender") or "").strip()
+        kind = str(ev.get("kind") or "").strip()
+        if sender in ("host", "system"):
+            filtered.append(ev)
+            continue
+        if kind in ("override_on", "override_off", "paywall", "minutes_exhausted"):
+            filtered.append(ev)
+
+    polled["events"] = filtered
+    polled["ok"] = True
+    polled["session_id"] = sid
+    return polled
