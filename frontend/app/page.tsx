@@ -455,6 +455,43 @@ function trimMessagesForChat<T extends { role: string; content: any }>(messages:
   return hasSystem ? ([first, ...trimmedBody] as T[]) : (trimmedBody as T[]);
 }
 
+
+// -----------------------------------------------------------------------------
+// In-session conversation "summaries" (client-side digests)
+// - When older turns are trimmed before sending to /chat, we keep a compact digest
+//   in session_state so the backend can inject it as context.
+// - These digests are NOT the same as the explicit user-authorized /chat/save-summary.
+// -----------------------------------------------------------------------------
+const MAX_IN_SESSION_SUMMARY_CHUNKS = 8;
+const DIGEST_MAX_LINES = 12;
+const DIGEST_MAX_CHARS_PER_LINE = 220;
+
+function normalizeDigestLine(s: string): string {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+function buildDigestFromDroppedMessages(dropped: Msg[]): string {
+  if (!Array.isArray(dropped) || dropped.length === 0) return "";
+  const lines: string[] = [];
+
+  for (let i = 0; i < dropped.length && lines.length < DIGEST_MAX_LINES; i++) {
+    const m = dropped[i];
+    if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
+
+    let c = normalizeDigestLine(String((m as any).content ?? ""));
+    if (!c) continue;
+
+    if (c.length > DIGEST_MAX_CHARS_PER_LINE) c = c.slice(0, DIGEST_MAX_CHARS_PER_LINE) + "…";
+    lines.push(`${m.role === "user" ? "User" : "Assistant"}: ${c}`);
+  }
+
+  const remaining = dropped.length - lines.length;
+  if (remaining > 0) lines.push(`(… ${remaining} earlier message(s) omitted)`);
+
+  return lines.join("\n");
+}
+
+
 const HEADSHOT_DIR = "/companion/headshot";
 
 // Resolve companion key/name for backend requests and TTS voice selection.
@@ -5893,14 +5930,72 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   rebranding: (rebranding || "").trim(),
 };
 
+    const trimmedForChat = trimMessagesForChat(nextMessages);
+
+    // Build/extend in-session conversation digests when older turns are trimmed.
+    // These are kept in session_state and injected server-side so model switches remain coherent.
+    const droppedCount = Math.max(0, nextMessages.length - trimmedForChat.length);
+    const prevDroppedCountRaw =
+      (stateToSendWithCompanion as any).summary_dropped_count ??
+      (stateToSendWithCompanion as any).summaryDroppedCount ??
+      0;
+    const prevDroppedCount = Math.max(
+      0,
+      Math.min(Number(prevDroppedCountRaw || 0) || 0, nextMessages.length)
+    );
+
+    let stateForBackend: SessionState = stateToSendWithCompanion;
+
+    if (droppedCount > prevDroppedCount) {
+      const newlyDropped = nextMessages.slice(prevDroppedCount, droppedCount);
+      const digest = buildDigestFromDroppedMessages(newlyDropped);
+
+      const existing =
+        (stateToSendWithCompanion as any).conversation_summaries ??
+        (stateToSendWithCompanion as any).conversationSummaries ??
+        (stateToSendWithCompanion as any).chat_summaries ??
+        (stateToSendWithCompanion as any).chatSummaries ??
+        (stateToSendWithCompanion as any).summaries ??
+        (stateToSendWithCompanion as any).summary_chunks ??
+        (stateToSendWithCompanion as any).summaryChunks ??
+        [];
+
+      const list: string[] = Array.isArray(existing)
+        ? existing.slice().map((x: any) => String(x || ""))
+        : [];
+
+      if (digest) {
+        if (!list.length || list[list.length - 1] !== digest) list.push(digest);
+      }
+
+      while (list.length > MAX_IN_SESSION_SUMMARY_CHUNKS) list.shift();
+
+      stateForBackend = {
+        ...(stateToSendWithCompanion as any),
+        conversation_summaries: list,
+        conversationSummaries: list,
+        summary_dropped_count: droppedCount,
+        summaryDroppedCount: droppedCount,
+      };
+    } else if (droppedCount === 0 && prevDroppedCount > 0) {
+      // Likely a reset/clear; avoid leaking prior context into a new conversation.
+      stateForBackend = {
+        ...(stateToSendWithCompanion as any),
+        conversation_summaries: [],
+        conversationSummaries: [],
+        summary_dropped_count: 0,
+        summaryDroppedCount: 0,
+      };
+    }
+
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id,
         wants_explicit,
-        session_state: stateToSendWithCompanion,
-        messages: trimMessagesForChat(nextMessages).map((m) => {
+        session_state: stateForBackend,
+        messages: trimmedForChat.map((m) => {
           let content = m.content || "";
           const att = m.meta?.attachment;
           if (att?.url) {
@@ -9763,6 +9858,23 @@ const modePillControls = (
                   prevSessionActiveRef.current = false;
 
                   setMessages([]);
+                  // Also reset any in-session summary digests so we don't leak old context into a new conversation.
+                  setSessionState((prev) => ({
+                    ...(prev as any),
+                    conversation_summaries: [],
+                    conversationSummaries: [],
+                    summary_dropped_count: 0,
+                    summaryDroppedCount: 0,
+                  }));
+                  try {
+                    sessionStateRef.current = {
+                      ...(sessionStateRef.current as any),
+                      conversation_summaries: [],
+                      conversationSummaries: [],
+                      summary_dropped_count: 0,
+                      summaryDroppedCount: 0,
+                    } as any;
+                  } catch (e) {}
                   setInput("");
                   try { if (inputElRef.current) inputElRef.current.value = ""; } catch (e) {}
                   setShowClearMessagesConfirm(false);

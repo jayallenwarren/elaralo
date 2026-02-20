@@ -3776,6 +3776,159 @@ def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
 
 
 
+
+
+# ----------------------------
+# Multi-provider LLM routing
+#   - Friend/Romantic -> OpenAI
+#   - Intimate (18+) -> xAI
+# ----------------------------
+
+def _xai_base_url() -> str:
+    """Return a normalized base_url for xAI OpenAI-compatible endpoint."""
+    raw = (os.getenv("XAI_BASE_URL", "") or os.getenv("XAI_API_BASE", "") or "https://api.x.ai/v1").strip()
+    if not raw:
+        return "https://api.x.ai/v1"
+    url = raw.rstrip("/")
+    # Accept either "https://api.x.ai" or "https://api.x.ai/v1"
+    if url.endswith("/v1"):
+        return url
+    # If someone sets just https://api.x.ai, append /v1
+    if url.endswith("api.x.ai"):
+        return url + "/v1"
+    return url
+
+
+def _call_xai_chat(messages: List[Dict[str, str]]) -> str:
+    """Call xAI (OpenAI-compatible) chat completions endpoint."""
+    from openai import OpenAI
+
+    api_key = (os.getenv("XAI_API_KEY", "") or os.getenv("XAI_API_TOKEN", "") or "").strip()
+    if not api_key:
+        raise RuntimeError("XAI_API_KEY is not set")
+
+    client = OpenAI(api_key=api_key, base_url=_xai_base_url())
+    resp = client.chat.completions.create(
+        model=(os.getenv("XAI_MODEL", "") or "grok-4").strip(),
+        messages=messages,
+        temperature=float(os.getenv("XAI_TEMPERATURE", os.getenv("OPENAI_TEMPERATURE", "0.8")) or "0.8"),
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _extract_in_session_summaries(session_state: Dict[str, Any]) -> List[str]:
+    """Extract any in-session summaries provided by the frontend/state machine.
+
+    This function is intentionally permissive about key names to support gradual rollout.
+    """
+    if not isinstance(session_state, dict):
+        return []
+
+    keys = [
+        "conversation_summaries",
+        "conversationSummaries",
+        "chat_summaries",
+        "chatSummaries",
+        "summaries",
+        "summary_chunks",
+        "summaryChunks",
+    ]
+
+    out: List[str] = []
+    for k in keys:
+        v = session_state.get(k)
+        if not v:
+            continue
+
+        if isinstance(v, str):
+            s = v.strip()
+            if s:
+                out.append(s)
+            continue
+
+        if isinstance(v, dict):
+            s = v.get("summary") or v.get("text") or v.get("content")
+            if isinstance(s, str) and s.strip():
+                out.append(s.strip())
+            continue
+
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, str):
+                    s = item.strip()
+                    if s:
+                        out.append(s)
+                elif isinstance(item, dict):
+                    s = item.get("summary") or item.get("text") or item.get("content")
+                    if isinstance(s, str) and s.strip():
+                        out.append(s.strip())
+
+    # De-dupe while preserving order (most recent items are typically appended last)
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for s in out:
+        if s in seen:
+            continue
+        seen.add(s)
+        deduped.append(s)
+
+    max_items = int(os.getenv("IN_SESSION_SUMMARY_MAX_ITEMS", "8") or "8")
+    if max_items > 0 and len(deduped) > max_items:
+        deduped = deduped[-max_items:]
+    return deduped
+
+
+def _sanitize_summary_for_safe_mode(text: str) -> str:
+    """Sanitize a summary for Friend/Romantic (OpenAI) context.
+
+    If the summary appears intimate/explicit, replace it with a high-level, non-explicit note.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if _looks_intimate(t):
+        return (
+            "Earlier conversation included an Intimate (18+) segment with consent. "
+            "Details are intentionally omitted in Friend/Romantic mode."
+        )
+
+    max_chars = int(os.getenv("SAFE_MODE_SUMMARY_MAX_CHARS", "2500") or "2500")
+    if max_chars > 0 and len(t) > max_chars:
+        t = t[:max_chars] + " …"
+    return t
+
+
+def _filter_history_for_safe_mode(messages: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    """Filter out intimate/explicit messages before sending to a safe-mode model (OpenAI).
+
+    Returns (filtered_messages, handoff_note).
+    """
+    if not messages:
+        return messages, None
+
+    kept: List[Dict[str, str]] = []
+    omitted = 0
+
+    for m in messages:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = str(m.get("content") or "")
+        if _looks_intimate(content):
+            omitted += 1
+            continue
+        kept.append({"role": role, "content": content})
+
+    if omitted <= 0:
+        return messages, None
+
+    note = (
+        f"Context note: {omitted} earlier message(s) from an Intimate (18+) segment were omitted because the current mode is Friend/Romantic. "
+        "Assume consent had been established and an intimate conversation occurred, but do not reference explicit details. "
+        "Continue naturally from the remaining chat context and any provided summaries."
+    )
+    return kept, note
+
 def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
     """Summarization call with conservative limits for reliability."""
     from openai import OpenAI
@@ -5350,10 +5503,44 @@ async def chat(request: Request):
         f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending} voice_id={'yes' if voice_id else 'no'}",
     )
 
-    # call model
+    # call model (provider-routing: Intimate -> xAI, Friend/Romantic -> OpenAI)
+    llm_provider = "xai" if effective_mode == "intimate" else "openai"
+
+    # Detect provider switches so we can encourage the model to rely on summaries for continuity.
+    prev_provider = str(
+        session_state.get("llm_provider")
+        or session_state.get("model_provider")
+        or session_state.get("provider")
+        or ""
+    ).strip().lower()
+    provider_switched = bool(prev_provider) and (prev_provider != llm_provider)
+
+    # In Friend/Romantic mode, never send explicit/intimate content to OpenAI.
+    # If the browser is still holding prior Intimate messages, omit them and provide a safe handoff note.
+    history_for_llm = messages
+    handoff_note: str | None = None
+    if llm_provider == "openai":
+        history_for_llm, handoff_note = _filter_history_for_safe_mode(messages)
+
+    # Summaries:
+    # - saved_summary is server-side cross-session memory (if user authorized)
+    # - in_session_summaries are optional summaries collected during the current chat flow
+    safe_saved_summary = saved_summary
+    if llm_provider == "openai" and safe_saved_summary:
+        safe_saved_summary = _sanitize_summary_for_safe_mode(safe_saved_summary)
+
+    in_session_summaries = _extract_in_session_summaries(session_state)
+    if llm_provider == "openai" and in_session_summaries:
+        sanitized: List[str] = []
+        for s in in_session_summaries:
+            ss = _sanitize_summary_for_safe_mode(s)
+            if ss:
+                sanitized.append(ss)
+        in_session_summaries = sanitized
+
     try:
-        openai_messages = _to_openai_messages(
-            messages,
+        llm_messages = _to_openai_messages(
+            history_for_llm,
             session_state,
             mode=effective_mode,
             intimate_allowed=intimate_allowed,
@@ -5407,7 +5594,7 @@ async def chat(request: Request):
         # Inject these blocks immediately after the base persona system prompt
         insert_at = 1
         for block in extra_system_blocks:
-            openai_messages.insert(insert_at, {"role": "system", "content": block})
+            llm_messages.insert(insert_at, {"role": "system", "content": block})
             insert_at += 1
 
         # Memory policy: do not guess about prior conversations.
@@ -5421,26 +5608,66 @@ async def chat(request: Request):
             "Capability rule: Your replies may be spoken aloud in this app (audio TTS and/or a live avatar). "
             "Do not say you lack text-to-speech; instead explain that you generate text and the platform voices it."
         )
-        openai_messages.insert(insert_at, {"role": "system", "content": memory_policy})
+        llm_messages.insert(insert_at, {"role": "system", "content": memory_policy})
         insert_at += 1
 
-        if saved_summary:
-            openai_messages.insert(
+        if provider_switched:
+            llm_messages.insert(
                 insert_at,
                 {
                     "role": "system",
-                    "content": "Saved conversation summary (user-authorized, for reference across devices):\n" + saved_summary,
+                    "content": (
+                        f"System routing note: The app switched the underlying model provider to {('xAI' if llm_provider == 'xai' else 'OpenAI')} "
+                        f"because the user is now in {effective_mode.title()} mode. "
+                        "Review any provided summaries and continue seamlessly while respecting the current mode's boundaries."
+                    ),
                 },
             )
+            insert_at += 1
 
-        assistant_reply = _call_gpt4o(openai_messages)
+        if safe_saved_summary:
+            llm_messages.insert(
+                insert_at,
+                {
+                    "role": "system",
+                    "content": "Saved conversation summary (user-authorized, for reference across devices):\n" + safe_saved_summary,
+                },
+            )
+            insert_at += 1
+
+        if in_session_summaries:
+            joined_summaries = "\n- " + "\n- ".join([s for s in in_session_summaries if (s or '').strip()])
+            llm_messages.insert(
+                insert_at,
+                {
+                    "role": "system",
+                    "content": "In-session conversation summaries (most recent last):" + joined_summaries,
+                },
+            )
+            insert_at += 1
+
+        if handoff_note:
+            llm_messages.insert(insert_at, {"role": "system", "content": handoff_note})
+            insert_at += 1
+
+        if llm_provider == "xai":
+            assistant_reply = _call_xai_chat(llm_messages)
+        else:
+            assistant_reply = _call_gpt4o(llm_messages)
     except Exception as e:
-        _dbg(debug, "OpenAI call failed:", repr(e))
-        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {e}")
+        _dbg(debug, "LLM call failed:", repr(e))
+        raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
 
     # echo back session_state (ensure correct mode)
     session_state_out = dict(session_state)
     session_state_out["mode"] = effective_mode
+    # Surface the active provider/model to the frontend (SessionState.model exists already).
+    session_state_out["llm_provider"] = llm_provider
+    session_state_out["model_provider"] = llm_provider  # back-compat alias
+    if llm_provider == "xai":
+        session_state_out["model"] = (os.getenv("XAI_MODEL", "") or "grok-4").strip()
+    else:
+        session_state_out["model"] = (os.getenv("OPENAI_MODEL", "") or "gpt-4o").strip()
     session_state_out["pending_consent"] = None if intimate_allowed else session_state_out.get("pending_consent")
     session_state_out["companion_meta"] = _parse_companion_meta(
         session_state_out.get("companion")
