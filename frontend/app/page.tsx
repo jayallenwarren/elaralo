@@ -1823,30 +1823,32 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   }, [rebrandingInfo]);
 
   // Open Upgrade URL in a new tab (preferred) so the chat session stays loaded.
-  // Fallback to top/self navigation if the popup is blocked.
+  // IMPORTANT: Do NOT navigate the current tab/frame. If popups are blocked, keep the chat page intact.
   const openUpgradeUrl = useCallback(() => {
     const url = String(upgradeUrl || "").trim();
     if (!url) return;
 
+    // Best-effort new-tab open inside a user gesture.
+    // We intentionally avoid window.location / window.top.location navigation to preserve the chat session.
     try {
-      const w = window.open(url, "_blank", "noopener,noreferrer");
-      if (w) return;
+      const a = document.createElement("a");
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      return;
     } catch (e) {
       // ignore
     }
 
-    // If running inside an iframe, attempt to navigate the *top* browsing context.
     try {
-      if (window.top && window.top !== window.self) {
-        window.top.location.href = url;
-        return;
-      }
+      window.open(url, "_blank", "noopener,noreferrer");
     } catch (e) {
-      // Cross-origin access to window.top can throw.
+      // ignore
     }
-
-    // Fallback: navigate current frame.
-    window.location.href = url;
   }, [upgradeUrl]);
 
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
