@@ -211,10 +211,32 @@ type SessionState = {
   [k: string]: any;
 };
 
+type ContentDelivery = {
+  message?: string;
+  folder?: Mode;
+  sequence?: string;
+  stage?: string;
+  attachment?: UploadedAttachment;
+  // tolerate future additions from the backend without breaking builds
+  [k: string]: any;
+};
+
+type PendingContentItem = {
+  token: string;
+  triggerMinute?: number;
+  content: ContentDelivery;
+  createdTs?: number;
+};
+
+
 type ChatApiResponse = {
   reply: string;
   mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
   session_state?: Partial<SessionState>;
+  audio_url?: string;
+  content?: ContentDelivery;
+  // tolerate future additions from the backend without breaking builds
+  [k: string]: any;
 };
 
 
@@ -226,6 +248,7 @@ type RelayEvent = {
   sender: "user" | "ai" | "xai" | "host" | "system" | string;
   audience?: "all" | "user" | "host" | string;
   kind?: string;
+  payload?: any;
 };
 
 type HostActiveChat = {
@@ -651,6 +674,60 @@ function joinUrlPrefix(prefix: string, path: string): string {
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+
+
+const API_BASE_TRIM = String(API_BASE || "").replace(/\/+$/, "");
+
+function absolutizeApiUrl(url: string): string {
+  const u = String(url || "").trim();
+  if (!u) return u;
+  if (/^https?:\/\//i.test(u)) return u;
+  if (!API_BASE_TRIM) return u;
+  const p = u.startsWith("/") ? u : `/${u}`;
+  return joinUrlPrefix(API_BASE_TRIM, p);
+}
+
+function normalizeUploadedAttachment(raw: any): UploadedAttachment | null {
+  if (!raw || typeof raw !== "object") return null;
+  const url = absolutizeApiUrl(String((raw as any).url || ""));
+  if (!url) return null;
+
+  const name = String((raw as any).name || "content");
+  const sizeNum = Number((raw as any).size ?? 0);
+  const size = Number.isFinite(sizeNum) && sizeNum >= 0 ? sizeNum : 0;
+
+  const ct = String((raw as any).contentType || (raw as any).content_type || "application/octet-stream");
+  const contentType = ct.trim() || "application/octet-stream";
+
+  const containerRaw = (raw as any).container;
+  const blobRaw = (raw as any).blobName ?? (raw as any).blob_name;
+
+  const container = containerRaw ? String(containerRaw) : undefined;
+  const blobName = blobRaw ? String(blobRaw) : undefined;
+
+  return { url, name, size, contentType, container, blobName };
+}
+
+function buildContentAssistantMsg(rawContent: any): Msg | null {
+  if (!rawContent || typeof rawContent !== "object") return null;
+  const att = normalizeUploadedAttachment((rawContent as any).attachment);
+  const message = String((rawContent as any).message || "").trim();
+  if (!att && !message) return null;
+
+  const meta: any = { sender: "ai" };
+  if (att) meta.attachment = att;
+  meta.contentDelivery = {
+    folder: String((rawContent as any).folder || ""),
+    sequence: String((rawContent as any).sequence || ""),
+    stage: String((rawContent as any).stage || ""),
+  };
+
+  return {
+    role: "assistant",
+    content: message || "",
+    meta,
+  };
+}
 
 function toWsBaseUrl(httpBase: string): string {
   const raw = String(httpBase || '').trim();
@@ -1778,6 +1855,11 @@ export default function Page() {
       ((attType && attType.toLowerCase().startsWith("image/")) ||
         /\.(png|jpe?g|webp|gif)(\?|#|$)/i.test(attUrl));
 
+    const isVideo =
+      Boolean(attUrl) &&
+      ((attType && attType.toLowerCase().startsWith("video/")) ||
+        /\.(mp4|webm|ogg|mov)(\?|#|$)/i.test(attUrl));
+
     const stripScheme = (u: string) => (u || "").replace(/^https?:/i, "");
 
     const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
@@ -1848,8 +1930,8 @@ export default function Page() {
 
     const attachmentNode = attUrl ? (
       <div style={{ marginTop: 6 }}>
-        <a href={attUrl} target="_blank" rel="noopener noreferrer">
-          {isImage ? (
+        {isImage ? (
+          <a href={attUrl} target="_blank" rel="noopener noreferrer">
             <img
               src={attUrl}
               alt={attName}
@@ -1861,10 +1943,33 @@ export default function Page() {
                 display: "block",
               }}
             />
-          ) : (
-            <span style={{ textDecoration: "underline" }}>{attName || "Open attachment"}</span>
-          )}
-        </a>
+          </a>
+        ) : isVideo ? (
+          <>
+            <video
+              src={attUrl}
+              controls
+              playsInline
+              preload="metadata"
+              style={{
+                maxWidth: 320,
+                maxHeight: 320,
+                borderRadius: 12,
+                border: "1px solid #e5e5e5",
+                display: "block",
+              }}
+            />
+            <div style={{ marginTop: 4 }}>
+              <a href={attUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "underline" }}>
+                {attName || "Open video"}
+              </a>
+            </div>
+          </>
+        ) : (
+          <a href={attUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "underline" }}>
+            {attName || "Open attachment"}
+          </a>
+        )}
       </div>
     ) : null;
 
@@ -2448,6 +2553,9 @@ const [hostActiveLoading, setHostActiveLoading] = useState<boolean>(false);
 const [hostActiveError, setHostActiveError] = useState<string>("");
 const [hostSelectedSessionId, setHostSelectedSessionId] = useState<string>("");
 const [hostSelectedEvents, setHostSelectedEvents] = useState<RelayEvent[]>([]);
+const [hostPendingContent, setHostPendingContent] = useState<PendingContentItem[]>([]);
+const [hostPendingModalOpen, setHostPendingModalOpen] = useState<boolean>(false);
+const [hostPendingActionErr, setHostPendingActionErr] = useState<string | null>(null);
 const [hostPollSinceSeq, setHostPollSinceSeq] = useState<number>(0);
 const hostPollSinceSeqRef = useRef<number>(0);
 useEffect(() => {
@@ -4011,12 +4119,20 @@ useEffect(() => {
         setMessages((prev) => {
           const out = [...prev];
           for (const ev of evs) {
-            const content = String((ev as any).content || "");
-            if (!content.trim()) continue;
-
             const sender = String((ev as any).sender || "");
             const kind = String((ev as any).kind || "");
             const role = String((ev as any).role || "");
+            const payload = (ev as any).payload;
+
+            // Host-pushed scheduled content (AI companion attachment)
+            if (kind === "user_content" && payload) {
+              const msg = buildContentAssistantMsg(payload as any);
+              if (msg) out.push(msg as any);
+              continue;
+            }
+
+            const content = String((ev as any).content || "");
+            if (!content.trim()) continue;
 
             if (role === "system" || sender === "system" || kind.startsWith("override_")) {
               out.push({
@@ -4196,6 +4312,47 @@ useEffect(() => {
           // Cap for UI safety.
           return out.slice(-400);
         });
+
+        // Queue pending scheduled content for the host (shown via modal).
+        const pendingPayloads = evs
+          .map((ev: RelayEvent) => (ev?.kind === "content_pending" ? (ev as any).payload : null))
+          .filter(Boolean) as any[];
+
+        if (pendingPayloads.length) {
+          setHostPendingContent((prev) => {
+            const seen = new Set(prev.map((p) => p.token));
+            const additions: PendingContentItem[] = [];
+
+            for (const p of pendingPayloads) {
+              const token = String(p?.token || "").trim();
+              const content = (p?.content || null) as ContentDelivery | null;
+
+              if (!token || !content) continue;
+              if (seen.has(token)) continue;
+              seen.add(token);
+
+              const triggerMinute =
+                typeof p?.trigger_minute === "number"
+                  ? p.trigger_minute
+                  : typeof p?.triggerMinute === "number"
+                  ? p.triggerMinute
+                  : undefined;
+
+              const createdTs =
+                typeof p?.created_ts === "number"
+                  ? p.created_ts
+                  : typeof p?.createdTs === "number"
+                  ? p.createdTs
+                  : undefined;
+
+              additions.push({ token, triggerMinute, createdTs, content });
+            }
+
+            return additions.length ? [...prev, ...additions] : prev;
+          });
+
+          setHostPendingModalOpen(true);
+        }
       }
 
       const nextSince =
@@ -4240,6 +4397,9 @@ useEffect(() => {
 const hostSelectSession = (sid: string) => {
   setHostSelectedSessionId(sid);
   setHostSelectedEvents([]);
+  setHostPendingContent([]);
+  setHostPendingModalOpen(false);
+  setHostPendingActionErr(null);
   setHostPollSinceSeq(0);
   setHostSendText("");
   setHostNotice("");
@@ -4309,6 +4469,41 @@ const hostSendMessage = async () => {
     setHostNotice(String(e?.message || e || "Failed to send host message"));
   }
 };
+
+
+  const hostPushPendingContent = async (token: string) => {
+    if (!hostSelectedSessionId) return;
+
+    setHostPendingActionErr(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/host/ai-chats/push-content`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          brand: brandForBackend,
+          avatar: avatarForBackend,
+          memberId: memberIdForBackend,
+          session_id: hostSelectedSessionId,
+          token,
+        }),
+      });
+
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        const detail = data?.detail || data?.error || `HTTP ${res.status}`;
+        throw new Error(String(detail));
+      }
+
+      setHostPendingContent((prev) => {
+        const next = prev.filter((p) => p.token !== token);
+        if (!next.length) setHostPendingModalOpen(false);
+        return next;
+      });
+    } catch (e: any) {
+      setHostPendingActionErr(e?.message || "Failed to push content");
+    }
+  };
 
 
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
@@ -7002,15 +7197,22 @@ if (streamSessionActive) {
       // When Live Avatar is active, we delay the assistant's text from appearing until
       // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");
+      const contentMsg = buildContentAssistantMsg((data as any).content);
       let assistantCommitted = false;
       const commitAssistantMessage = () => {
         if (assistantCommitted) return;
         assistantCommitted = true;
-        if (!replyText.trim()) return;
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: replyText, meta: { sender: "ai" } },
-        ]);
+
+        const toAdd: Msg[] = [];
+        if (replyText.trim()) {
+          toAdd.push({ role: "assistant", content: replyText, meta: { sender: "ai" } });
+        }
+        if (contentMsg) {
+          toAdd.push(contentMsg);
+        }
+        if (!toAdd.length) return;
+
+        setMessages((prev) => [...prev, ...toAdd]);
       };
 
       // Guard against STT feedback: ignore any recognition results until after the avatar finishes speaking.
@@ -7195,23 +7397,43 @@ const flushQueuedStreamMessages = useCallback(async () => {
       }
 
       const replyText = String((data as any).reply || "");
+      const contentMsg = buildContentAssistantMsg((data as any).content);
+      const replyMsg: Msg | null = replyText.trim()
+        ? { role: "assistant", content: replyText, meta: { sender: "ai" } }
+        : null;
 
       // If this queued message came from an out-of-session user, we rendered a placeholder
       // notice bubble at noticeIndex. Replace it in-place so chat ordering stays coherent.
       const noticeIndex = Number((item as any)?.noticeIndex ?? -1);
       setMessages((prev) => {
         if (!Array.isArray(prev)) return prev as any;
-        if (noticeIndex >= 0 && noticeIndex < prev.length) {
-          const next = prev.slice();
-          next[noticeIndex] = { role: "assistant", content: replyText, meta: { sender: "ai" } };
-          return next;
+
+        const next = prev.slice();
+
+        let replyToAppend: Msg | null = replyMsg;
+        let contentToAppend: Msg | null = contentMsg;
+
+        if (noticeIndex >= 0 && noticeIndex < next.length) {
+          if (replyMsg) {
+            next[noticeIndex] = replyMsg;
+            replyToAppend = null;
+          } else if (contentMsg) {
+            next[noticeIndex] = contentMsg;
+            contentToAppend = null;
+          }
         }
-        // Fallback: append if index missing/out-of-range (or in-session member).
-        return [...prev, { role: "assistant", content: replyText, meta: { sender: "ai" } }];
+
+        const append: Msg[] = [];
+        if (replyToAppend) append.push(replyToAppend);
+        if (contentToAppend) append.push(contentToAppend);
+
+        return append.length ? [...next, ...append] : next;
       });
 
       // Advance the backend history used for subsequent queued messages
-      history = [...callMsgs, { role: "assistant", content: replyText, meta: { sender: "ai" } }];
+      history = [...callMsgs];
+      if (replyMsg) history.push(replyMsg);
+      if (contentMsg) history.push(contentMsg);
 
       // Remove the item only after successful processing
       streamDeferredQueueRef.current.shift();
@@ -10439,6 +10661,107 @@ const modePillControls = (
       }}
       onClick={(e) => e.stopPropagation()}
     >
+
+      {hostPendingModalOpen && hostPendingContent.length > 0 ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 60,
+            background: "rgba(0,0,0,0.65)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+          onClick={() => setHostPendingModalOpen(false)}
+        >
+          <div
+            style={{
+              width: "min(760px, 100%)",
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 16 }}>Scheduled content ready</div>
+                <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
+                  This session is overridden. Push when you’re ready{" "}
+                  {hostPendingContent.length > 1 ? `(${hostPendingContent.length} queued)` : ""}.
+                </div>
+              </div>
+              <button
+                style={{
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  background: "transparent",
+                  borderRadius: 8,
+                  padding: "6px 10px",
+                  cursor: "pointer",
+                }}
+                onClick={() => setHostPendingModalOpen(false)}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              {(() => {
+                const item = hostPendingContent[0];
+                const msg = item?.content ? buildContentAssistantMsg(item.content) : null;
+
+                return (
+                  <div>
+                    <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 8 }}>
+                      {item?.content?.stage ? `Stage: ${item.content.stage}` : ""}
+                      {typeof item?.triggerMinute === "number" ? ` • Trigger minute: ${item.triggerMinute}` : ""}
+                    </div>
+
+                    <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 10, padding: 12 }}>
+                      {msg ? renderMsgContent(msg) : <div style={{ fontSize: 13, opacity: 0.8 }}>No preview available.</div>}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {hostPendingActionErr ? (
+              <div style={{ marginTop: 10, color: "#b00020", fontSize: 13 }}>{hostPendingActionErr}</div>
+            ) : null}
+
+            <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                style={{
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  background: "transparent",
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  cursor: "pointer",
+                }}
+                onClick={() => setHostPendingModalOpen(false)}
+              >
+                Later
+              </button>
+
+              <button
+                style={{
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  background: "rgba(0,0,0,0.06)",
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  cursor: "pointer",
+                }}
+                onClick={() => hostPushPendingContent(hostPendingContent[0].token)}
+              >
+                Push to chat
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <div
         style={{
           display: "flex",
@@ -10455,6 +10778,27 @@ const modePillControls = (
             {companyName} · {companionName || DEFAULT_COMPANION_NAME}
           </div>
         </div>
+
+        {hostPendingContent.length > 0 ? (
+          <button
+            type="button"
+            onClick={() => {
+              setHostPendingActionErr(null);
+              setHostPendingModalOpen(true);
+            }}
+            style={{
+              border: "1px solid rgba(0,0,0,0.12)",
+              background: "rgba(0,0,0,0.04)",
+              borderRadius: 10,
+              padding: "8px 10px",
+              cursor: "pointer",
+              fontSize: 12,
+              marginRight: 8,
+            }}
+          >
+            Pending ({hostPendingContent.length})
+          </button>
+        ) : null}
 
         <button
           type="button"

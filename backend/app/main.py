@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 from filelock import FileLock  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends, Body
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse, FileResponse
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
 
@@ -624,7 +624,7 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
 import sqlite3
 import shutil
 import tempfile
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 _COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _COMPANION_MAPPINGS_LOADED_AT: float | None = None
@@ -639,6 +639,12 @@ def _norm_key(s: str) -> str:
 def _candidate_mapping_db_paths() -> List[str]:
     base_dir = os.path.dirname(__file__)
     env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    # voice_video_mapping.sqlite3 was a typo; only accept voice_video_mappings.sqlite3.
+    try:
+        if env_path and os.path.basename(env_path) == "voice_video_mapping.sqlite3":
+            env_path = ""
+    except Exception:
+        pass
     candidates = [
         env_path,
         os.path.join(base_dir, "voice_video_mappings.sqlite3"),
@@ -765,7 +771,7 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
                             cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
                             names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
                             lc = {n.lower(): n for n in names}
-                            for cand in ("companion_mappings", "voice_video_mappings", "voice_video_mapping", "mappings"):
+                            for cand in ("companion_mappings", "voice_video_mappings", "mappings"):
                                 if cand in lc:
                                     return lc[cand]
                             return names[0] if names else ""
@@ -801,6 +807,71 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
                                             (ev, b, a),
                                         )
                                     new_conn.commit()
+
+                                # Also migrate runtime table: user_content_history (preserve user content delivery state).
+                                try:
+                                    def _find_table_case_insensitive(conn: sqlite3.Connection, target: str) -> str:
+                                        cur = conn.cursor()
+                                        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                                        names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+                                        lc = {n.lower(): n for n in names}
+                                        return lc.get((target or "").strip().lower(), "")
+
+                                    old_hist = _find_table_case_insensitive(old_conn, "user_content_history")
+                                    if old_hist:
+                                        new_hist = _find_table_case_insensitive(new_conn, "user_content_history") or "user_content_history"
+
+                                        # Ensure destination table exists
+                                        if not _find_table_case_insensitive(new_conn, "user_content_history"):
+                                            new_conn.execute(
+                                                """CREATE TABLE IF NOT EXISTS user_content_history (
+  user_content_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+  user_type VARCHAR(25),
+  member_id TEXT,
+  content_folder VARCHAR(25),
+  content_name TEXT,
+  content_sequence VARCHAR(25)
+);"""
+                                            )
+                                            new_conn.commit()
+
+                                        def _cols(conn: sqlite3.Connection, table: str) -> List[str]:
+                                            cur = conn.cursor()
+                                            cur.execute(f'PRAGMA table_info("{table}")')
+                                            return [str(r[1]) for r in cur.fetchall() if r and len(r) > 1]
+
+                                        old_cols2 = _cols(old_conn, old_hist)
+                                        new_cols2 = _cols(new_conn, new_hist)
+                                        new_cols_lc = {c.lower(): c for c in new_cols2}
+
+                                        common_cols = [c for c in old_cols2 if c.lower() in new_cols_lc]
+                                        if common_cols:
+                                            cols_sql = ", ".join([f'"{c}"' for c in common_cols])
+                                            placeholders = ", ".join(["?"] * len(common_cols))
+
+                                            cur_old2 = old_conn.cursor()
+                                            cur_old2.execute(f'SELECT {cols_sql} FROM "{old_hist}"')
+                                            rows2 = cur_old2.fetchall()
+
+                                            cur_new2 = new_conn.cursor()
+                                            for rr in rows2:
+                                                vals = []
+                                                for c in common_cols:
+                                                    try:
+                                                        vals.append(rr[c])
+                                                    except Exception:
+                                                        try:
+                                                            vals.append(rr[new_cols_lc.get(c.lower(), c)])
+                                                        except Exception:
+                                                            vals.append(None)
+                                                cur_new2.execute(
+                                                    f'INSERT OR REPLACE INTO "{new_hist}" ({cols_sql}) VALUES ({placeholders})',
+                                                    tuple(vals),
+                                                )
+                                            new_conn.commit()
+                                except Exception as e:
+                                    print(f"[mappings] WARNING: failed migrating user_content_history after DB refresh: {e}")
                         finally:
                             old_conn.close()
                             new_conn.close()
@@ -867,7 +938,6 @@ def _load_companion_mappings_sync() -> None:
         preferred = [
             "companion_mappings",
             "voice_video_mappings",
-            "voice_video_mapping",
             "mappings",
         ]
         table = ""
@@ -3550,13 +3620,700 @@ def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any
 
 
 def _normalize_mode(raw: str) -> str:
+    """
+    Normalizes the UI "mode pill" / session_state.mode into a directory token.
+
+    Accepted values include:
+      - friend / friendship
+      - romantic / romance
+      - intimate, explicit, adult, 18+
+      - labels like "Intimate (18+)" (mapped to "intimate")
+
+    Returned value is always one of: friend | romantic | intimate
+    """
     t = (raw or "").strip().lower()
-    # allow some synonyms from older frontend builds
-    if t in {"explicit", "intimate", "18+", "adult"}:
+    if not t:
+        return "friend"
+
+    # Handle labels such as "Intimate (18+)" by substring matching.
+    if ("intimate" in t) or ("explicit" in t) or ("adult" in t) or ("18" in t):
         return "intimate"
-    if t in {"romance", "romantic"}:
+    if ("romantic" in t) or ("romance" in t):
         return "romantic"
+    if "friend" in t:
+        return "friend"
+
     return "friend"
+
+
+def _brand_content_dir(brand: str, mode: str) -> str:
+    """Return the filesystem directory for the given brand + mode content folder."""
+    brand_in = (brand or "").strip()
+    mode_in = _normalize_mode(mode)
+    folder = mode_in if mode_in in ("friend", "romantic", "intimate") else "friend"
+
+    # Try exact brand folder first, then slugified, then core brand fallback.
+    candidates: List[str] = []
+    if brand_in:
+        candidates.append(os.path.join(BRAND_CONTENT_ROOT, brand_in, "content", "mode", folder))
+        slug = ""
+        try:
+            slug = _slugify_segment(brand_in)
+        except Exception:
+            slug = ""
+        if slug and slug != brand_in:
+            candidates.append(os.path.join(BRAND_CONTENT_ROOT, slug, "content", "mode", folder))
+
+    candidates.append(os.path.join(BRAND_CONTENT_ROOT, "Elaralo", "content", "mode", folder))
+
+    for p in candidates:
+        try:
+            if p and os.path.isdir(p):
+                return p
+        except Exception:
+            continue
+
+    return candidates[0] if candidates else ""
+
+
+def _safe_sqlite_dt(s: Any) -> Optional[datetime]:
+    if not s:
+        return None
+    ss = str(s).strip()
+    if not ss:
+        return None
+    # Common SQLite timestamp formats: "YYYY-MM-DD HH:MM:SS" (UTC-ish)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(ss, fmt)
+        except Exception:
+            pass
+    return None
+
+
+def _parse_content_filename(name: str) -> Dict[str, str]:
+    """Parse <9seq>-<desc>-<photo|video>-<begin|sequence|end>.<ext> into fields."""
+    filename = (name or "").strip()
+    base = os.path.basename(filename)
+    stem, _ext = os.path.splitext(base)
+    parts = [p for p in stem.split("-") if p != ""]
+    out = {
+        "filename": base,
+        "sequence": "",
+        "description": "",
+        "media_type_token": "",
+        "stage": "",
+    }
+    if not parts:
+        return out
+    out["sequence"] = parts[0]
+    if len(parts) >= 2:
+        out["stage"] = (parts[-1] or "").strip().lower()
+    if len(parts) >= 3:
+        out["media_type_token"] = (parts[-2] or "").strip().lower()
+    if len(parts) >= 4:
+        desc_parts = parts[1:-2]
+        out["description"] = " ".join([p.strip() for p in desc_parts if p.strip()])
+    return out
+
+
+def _guess_content_type(path: str) -> str:
+    ctype, _ = mimetypes.guess_type(path)
+    return (ctype or "application/octet-stream").strip() or "application/octet-stream"
+
+
+def _find_file_by_sequence(folder_path: str, seq9: str) -> Optional[str]:
+    """Return a filename in folder_path whose basename starts with '<seq9>-'. Deterministic pick."""
+    try:
+        entries = os.listdir(folder_path)
+    except Exception:
+        return None
+
+    prefix = f"{seq9}-"
+    matches: List[str] = []
+    for fn in entries:
+        try:
+            if not fn or fn.startswith("."):
+                continue
+            full = os.path.join(folder_path, fn)
+            if not os.path.isfile(full):
+                continue
+            if fn.startswith(prefix):
+                matches.append(fn)
+        except Exception:
+            continue
+
+    if not matches:
+        return None
+    matches.sort()
+    return matches[0]
+
+
+def _find_next_content_file(folder_path: str, seq_int: int, *, require_begin: bool) -> Optional[str]:
+    """Return the file whose prefix matches the exact next 9-digit sequence.
+
+    Spec requirement: next content = last_sequence + 1 (no skipping).
+    """
+    seq_i = max(0, int(seq_int or 0))
+    seq9 = f"{seq_i:09d}"
+    fn = _find_file_by_sequence(folder_path, seq9)
+    if not fn:
+        return None
+    if require_begin:
+        meta = _parse_content_filename(fn)
+        if meta.get("stage") != "begin":
+            return None
+    return fn
+
+
+def _user_content_db_path_sync() -> str:
+    # Prefer the already-selected writable mapping DB copy (same DB the host override uses).
+    p = str(_COMPANION_MAPPINGS_SOURCE or "").strip()
+    if p and os.path.exists(p):
+        return p
+
+    # Fallback: locate a mapping DB and ensure a writable copy.
+    for cand in _candidate_mapping_db_paths():
+        try:
+            if cand and os.path.exists(cand):
+                return _ensure_writable_db_copy(cand)
+        except Exception:
+            continue
+
+    return ""
+
+
+
+def _user_content_history_member_id_is_unique(conn: sqlite3.Connection) -> bool:
+    """
+    Returns True if the current user_content_history table has a UNIQUE index on member_id.
+    This existed in an earlier schema but must be removed (member_id is not unique).
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_content_history'")
+        if not cur.fetchone():
+            return False
+
+        cur.execute("PRAGMA index_list('user_content_history')")
+        for row in cur.fetchall() or []:
+            # PRAGMA index_list columns: seq, name, unique, origin, partial
+            try:
+                idx_name = str(row[1])
+                is_unique = int(row[2]) == 1
+            except Exception:
+                continue
+            if not is_unique:
+                continue
+
+            try:
+                cur.execute(f'PRAGMA index_info("{idx_name}")')
+                cols = [str(r[2]) for r in cur.fetchall() or [] if r and len(r) > 2 and r[2]]
+                cols_lc = [c.lower() for c in cols]
+                if cols_lc == ["member_id"]:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _migrate_user_content_history_drop_member_unique(conn: sqlite3.Connection) -> None:
+    """
+    Rebuilds user_content_history without UNIQUE(member_id).
+    SQLite can't drop a UNIQUE constraint in-place, so we rename and recreate.
+    """
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+    try:
+        cur.execute("ALTER TABLE user_content_history RENAME TO user_content_history_old")
+
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS user_content_history (
+  user_content_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+  user_type VARCHAR(25), --member or visitor
+  member_id TEXT,
+  content_folder VARCHAR(25), --directory: friend, romantic, or intimate
+  content_name TEXT,  --filename:  nine digit sequence-content description-content type (photo or video)-begin or sequence or end
+  content_sequence VARCHAR(25) --example: 000000001
+);"""
+        )
+
+        # Copy common columns
+        cur.execute('PRAGMA table_info("user_content_history_old")')
+        old_cols = [str(r[1]) for r in cur.fetchall() or [] if r and len(r) > 1 and r[1]]
+        cur.execute('PRAGMA table_info("user_content_history")')
+        new_cols = [str(r[1]) for r in cur.fetchall() or [] if r and len(r) > 1 and r[1]]
+        new_lc = {c.lower(): c for c in new_cols}
+
+        common = [c for c in old_cols if c.lower() in new_lc]
+        if common:
+            cols_sql = ", ".join([f'"{new_lc[c.lower()]}"' for c in common])
+            cur.execute(f'INSERT INTO "user_content_history" ({cols_sql}) SELECT {cols_sql} FROM "user_content_history_old"')
+
+        cur.execute("DROP TABLE user_content_history_old")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _ensure_user_content_history_table(conn: sqlite3.Connection) -> None:
+    """
+    Ensure user_content_history exists (and migrate away legacy UNIQUE(member_id)).
+    """
+    # Migrate if needed
+    try:
+        if _user_content_history_member_id_is_unique(conn):
+            _migrate_user_content_history_drop_member_unique(conn)
+    except Exception as e:
+        print(f"[content] WARNING: user_content_history migration failed: {e}")
+
+    cur = conn.cursor()
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS user_content_history (
+  user_content_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+  user_type VARCHAR(25), --member or visitor
+  member_id TEXT,
+  content_folder VARCHAR(25), --directory: friend, romantic, or intimate
+  content_name TEXT,  --filename:  nine digit sequence-content description-content type (photo or video)-begin or sequence or end
+  content_sequence VARCHAR(25) --example: 000000001
+);"""
+    )
+
+    # Helpful index for lookups (optional but recommended)
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memberid_mode_seqence ON user_content_history(member_id, content_folder, content_sequence)")
+    except Exception:
+        pass
+
+    conn.commit()
+
+
+def _fetch_recent_user_content_rows(
+    conn: sqlite3.Connection,
+    *,
+    member_id: str,
+    content_folder: str,
+    limit: int = 200,
+) -> List[sqlite3.Row]:
+    mid = (member_id or "").strip()
+    folder = (content_folder or "").strip().lower()
+    if not mid or not folder:
+        return []
+    try:
+        lim = max(1, min(int(limit or 200), 1000))
+    except Exception:
+        lim = 200
+
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT user_content_history_id, create_datetime, user_type, member_id, content_folder, content_name, content_sequence
+           FROM user_content_history
+           WHERE member_id=? AND lower(content_folder)=lower(?)
+           ORDER BY create_datetime DESC, user_content_history_id DESC
+           LIMIT ?""",
+        (mid, folder, lim),
+    )
+    return cur.fetchall() or []
+
+
+def _insert_user_content_row(
+    conn: sqlite3.Connection,
+    *,
+    user_type: str,
+    member_id: str,
+    content_folder: str,
+    content_name: str,
+    content_sequence: str,
+) -> None:
+    mid = (member_id or "").strip()
+    folder = (content_folder or "").strip().lower()
+    cname = (content_name or "").strip()
+    cseq = (content_sequence or "").strip()
+    if not mid or not folder or not cname or not cseq:
+        return
+
+    conn.execute(
+        "INSERT INTO user_content_history (user_type, member_id, content_folder, content_name, content_sequence) VALUES (?,?,?,?,?)",
+        ((user_type or "").strip() or "visitor", mid, folder, cname, cseq),
+    )
+    conn.commit()
+
+
+def _usage_last_credit_at_sync(identity_key: str) -> int:
+    try:
+        with _USAGE_LOCK:
+            store = _load_usage_store()
+            rec = store.get(identity_key)
+            if not isinstance(rec, dict):
+                return 0
+            try:
+                return int(rec.get("last_credit_at") or 0)
+            except Exception:
+                return 0
+    except Exception:
+        return 0
+
+
+
+def _maybe_pick_and_record_user_content_sync(
+    *,
+    identity_key: str,
+    member_id_for_history: str,
+    user_type: str,
+    brand: str,
+    mode: str,
+    last_credit_at: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return a content delivery payload (and persist history in SQLite) when eligible, else None.
+
+    IMPORTANT:
+      - This does NOT check the "trigger minute" (9, 19, 29, ...) nor the per-session dedupe minute.
+        The /chat handler (and host override handlers) should only call this when it is time.
+      - member_id_for_history is the Wix memberId when present; otherwise we fall back to identity_key.
+    """
+    mode_norm = _normalize_mode(mode)
+    if mode_norm not in ("friend", "romantic", "intimate"):
+        mode_norm = "friend"
+
+    folder_path = _brand_content_dir(brand, mode_norm)
+    if not folder_path or not os.path.isdir(folder_path):
+        return None
+
+    db_path = _user_content_db_path_sync()
+    if not db_path:
+        return None
+
+    now_utc = datetime.utcnow()
+    credit_ts = int(last_credit_at or 0)
+    credit_dt = datetime.utcfromtimestamp(credit_ts) if credit_ts > 0 else None
+
+    history_key = (member_id_for_history or "").strip() or (identity_key or "").strip()
+    if not history_key:
+        return None
+
+    with _USER_CONTENT_LOCK:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            _ensure_user_content_history_table(conn)
+
+            rows = _fetch_recent_user_content_rows(conn, member_id=history_key, content_folder=mode_norm, limit=250)
+            last_row = rows[0] if rows else None
+
+            last_seq_int = 0
+            last_stage = ""
+            if last_row is not None:
+                try:
+                    last_seq_int = int(str(last_row["content_sequence"] or "0").strip() or "0")
+                except Exception:
+                    last_seq_int = 0
+                try:
+                    last_stage = (_parse_content_filename(str(last_row["content_name"] or "")).get("stage") or "").strip().lower()
+                except Exception:
+                    last_stage = ""
+
+            # Determine the start of the current/most-recent eligibility window.
+            # - friend: last delivery timestamp
+            # - romantic/intimate: timestamp of the most recent "begin" in the current/last set
+            window_start: Optional[datetime] = None
+            if mode_norm == "friend":
+                if last_row is not None:
+                    window_start = _safe_sqlite_dt(last_row["create_datetime"])
+            else:
+                for r in rows:
+                    try:
+                        st = (_parse_content_filename(str(r["content_name"] or "")).get("stage") or "").strip().lower()
+                    except Exception:
+                        st = ""
+                    if st == "begin":
+                        window_start = _safe_sqlite_dt(r["create_datetime"])
+                        break
+                if window_start is None and last_row is not None:
+                    window_start = _safe_sqlite_dt(last_row["create_datetime"])
+
+            window_expired = True
+            if window_start:
+                try:
+                    window_expired = (now_utc - window_start).total_seconds() >= float(CONTENT_ELIGIBILITY_WINDOW_SECONDS or 0)
+                except Exception:
+                    window_expired = True
+
+            credit_after_window = bool(credit_dt and window_start and credit_dt > window_start)
+
+            # Decide whether we are starting a new 24h-eligible window.
+            start_new_window = False
+            if mode_norm == "friend":
+                # Friend: exactly 1 item per 24h, unless minutes were credited (PayGo/upgrade) since last item.
+                start_new_window = (last_row is None) or window_expired or credit_after_window
+                if not start_new_window:
+                    return None
+            else:
+                # Romantic/Intimate:
+                # - A "set" starts with a "begin" file and ends with an "end" file.
+                # - A new set is allowed once per 24h after the "begin" timestamp, unless minutes were credited
+                #   after the last set began (this resets the 24h clock).
+                if last_row is None:
+                    start_new_window = True
+                elif window_expired:
+                    start_new_window = True
+                elif (last_stage or "") == "end":
+                    # Set is complete; allow a new one only if credit has reset the timer.
+                    if not credit_after_window:
+                        return None
+                    start_new_window = True
+                else:
+                    # Mid-set (begin/sequence...): continue regardless of credit resets.
+                    start_new_window = False
+
+            # Determine next file sequence (always increments).
+            next_seq_int = 1 if last_row is None else max(1, int(last_seq_int) + 1)
+
+            # For a new romantic/intimate window, require the next file to be a "begin".
+            require_begin = bool(start_new_window and mode_norm in ("romantic", "intimate"))
+            fn = _find_next_content_file(folder_path, next_seq_int, require_begin=require_begin)
+            if not fn:
+                return None
+
+            full_path = os.path.join(folder_path, fn)
+            meta = _parse_content_filename(fn)
+            seq9 = meta.get("sequence") or f"{next_seq_int:09d}"
+            stage = (meta.get("stage") or "").lower()
+            media_token = (meta.get("media_type_token") or "").lower()
+            desc = meta.get("description") or ""
+
+            # Persist history row (one row per delivered file).
+            _insert_user_content_row(
+                conn,
+                user_type=user_type,
+                member_id=history_key,
+                content_folder=mode_norm,
+                content_name=fn,
+                content_sequence=seq9,
+            )
+
+            # Build message + attachment payload for frontend.
+            ctype = _guess_content_type(full_path)
+            try:
+                fsize = int(os.path.getsize(full_path))
+            except Exception:
+                fsize = 0
+
+            # Human-friendly description
+            human_desc = (desc or "").strip()
+            if human_desc:
+                human_desc = re.sub(r"\s+", " ", human_desc).strip()
+
+            noun = "photo" if (media_token == "photo" or ctype.startswith("image/")) else "video" if (media_token == "video" or ctype.startswith("video/")) else "content"
+            if mode_norm == "friend":
+                msg = f"Here's a {noun} for you{': ' + human_desc if human_desc else ''}."
+            else:
+                # Romantic / Intimate: small consistent tone, no explicit text here (content itself is in file).
+                prefix = "A little something for us"
+                if mode_norm == "intimate":
+                    prefix = "Something just for us"
+                msg = f"{prefix}{': ' + human_desc if human_desc else ''}."
+
+            # Content is served by backend route /content/mode/{mode}/{brand}/{filename}
+            brand_seg = (brand or "").strip() or "Elaralo"
+            rel_url = f"/content/mode/{quote(mode_norm)}/{quote(brand_seg)}/{quote(fn)}"
+
+            attachment = {
+                "url": rel_url,
+                "name": fn,
+                "size": fsize,
+                "contentType": ctype,
+            }
+
+            return {
+                "folder": mode_norm,
+                "sequence": seq9,
+                "stage": stage,
+                "message": msg,
+                "attachment": attachment,
+            }
+        finally:
+            conn.close()
+
+
+
+
+
+async def _maybe_schedule_mode_content_drop(
+    *,
+    session_id: str,
+    identity_key: str,
+    session_state_out: Dict[str, Any],
+    minutes_used: int,
+    effective_mode: str,
+    override_active: bool,
+) -> Optional[Dict[str, Any]]:
+    """
+    Schedules mode-based content drops at minutes 9, 19, 29, 39, ...
+
+    Behavior:
+      - If override_active is False (AI chat): returns a content payload to include in /chat response,
+        and also emits a relay event (kind='user_content') so host/member transcripts stay consistent.
+      - If override_active is True (Host override): queues a relay event (kind='content_pending') to the host,
+        stores the pending payload server-side, and returns None (member does not see the content until host pushes).
+
+    The selection cursor and eligibility window are persisted in SQLite (user_content_history).
+    """
+    try:
+        mu = int(minutes_used or 0)
+    except Exception:
+        mu = 0
+
+    if not _content_is_trigger_minute(mu):
+        return None
+
+    # Dedupe across:
+    #   - session_state (member side)
+    #   - server-side override session record (covers host-side charging/sends)
+    last_sent_state = None
+    try:
+        last_sent_state = session_state_out.get("content_last_sent_minute", session_state_out.get("contentLastSentMinute"))
+    except Exception:
+        last_sent_state = None
+
+    try:
+        last_sent_state_i = int(last_sent_state) if last_sent_state is not None else -1
+    except Exception:
+        last_sent_state_i = -1
+
+    last_sent_server_i = -1
+    try:
+        rec = _ai_override_get_session(session_id) or {}
+        last_sent_server_i = int(rec.get("content_last_sent_minute") or -1)
+    except Exception:
+        last_sent_server_i = -1
+
+    if mu == max(last_sent_state_i, last_sent_server_i):
+        return None
+
+    # Brand for content directory and content serving route
+    try:
+        brand_for_content, _ = _brand_avatar_from_session_state(session_state_out)
+    except Exception:
+        brand_for_content = str(session_state_out.get("brand") or session_state_out.get("rebranding") or "Elaralo").strip() or "Elaralo"
+
+    member_for_history = _extract_member_id(session_state_out) or ""
+    history_key = (member_for_history or "").strip() or (identity_key or "").strip()
+    if not history_key:
+        return None
+
+    utype = "member" if (member_for_history or "").strip() else "visitor"
+
+    # Credit resets the 24h window
+    try:
+        credit_at = await run_in_threadpool(_usage_last_credit_at_sync, identity_key)
+    except Exception:
+        credit_at = 0
+
+    payload = await run_in_threadpool(
+        _maybe_pick_and_record_user_content_sync,
+        identity_key=identity_key,
+        member_id_for_history=history_key,
+        user_type=utype,
+        brand=brand_for_content,
+        mode=effective_mode,
+        last_credit_at=int(credit_at or 0),
+    )
+    if not isinstance(payload, dict) or not payload:
+        return None
+
+    # Mark dedupe in both session_state and server record.
+    try:
+        session_state_out["content_last_sent_minute"] = mu
+        session_state_out["contentLastSentMinute"] = mu
+    except Exception:
+        pass
+
+    try:
+        with _AI_OVERRIDE_LOCK:
+            rec = _AI_OVERRIDE_SESSIONS.get(session_id)
+            if not isinstance(rec, dict):
+                rec = {"session_id": session_id, "seq": 0, "events": [], "override_active": False, "host_ack_seq": 0}
+            rec["content_last_sent_minute"] = mu
+            _AI_OVERRIDE_SESSIONS[session_id] = rec
+            _ai_override_persist()
+    except Exception:
+        pass
+
+    # Host override: queue for host as "pending content".
+    if override_active:
+        token = f"{_normalize_mode(effective_mode)}:{payload.get('sequence') or ''}:{mu}"
+
+        # Persist pending payload in the server record so the host can "push" later.
+        try:
+            with _AI_OVERRIDE_LOCK:
+                rec = _AI_OVERRIDE_SESSIONS.get(session_id)
+                if not isinstance(rec, dict):
+                    rec = {"session_id": session_id, "seq": 0, "events": [], "override_active": True, "host_ack_seq": 0}
+                pending = rec.get("pending_content")
+                if not isinstance(pending, dict):
+                    pending = {}
+                if token not in pending:
+                    pending[token] = {
+                        "token": token,
+                        "trigger_minute": mu,
+                        "content": payload,
+                        "created_ts": time.time(),
+                    }
+                    rec["pending_content"] = pending
+                    _AI_OVERRIDE_SESSIONS[session_id] = rec
+                    _ai_override_persist()
+        except Exception:
+            pass
+
+        # Emit a host-only relay event which the host UI uses to show a modal.
+        try:
+            msg = str(payload.get("message") or "").strip()
+            att = payload.get("attachment") or {}
+            url = str(att.get("url") or "").strip()
+            name = str(att.get("name") or "").strip()
+            fallback_txt = msg + ("\n\n" if msg and url else "") + (f"Attachment: {name or 'content'}\n{url}" if url else "")
+            _ai_override_append_event(
+                session_id,
+                role="system",
+                content=fallback_txt or "New scheduled content is ready to send.",
+                sender="system",
+                audience="host",
+                kind="content_pending",
+                payload={"token": token, "trigger_minute": mu, "content": payload},
+            )
+        except Exception:
+            pass
+
+        return None
+
+    # Normal AI chat: deliver to member and also emit to transcript store.
+    try:
+        msg = str(payload.get("message") or "").strip()
+        att = payload.get("attachment") or {}
+        url = str(att.get("url") or "").strip()
+        name = str(att.get("name") or "").strip()
+        relay_txt = msg + ("\n\n" if msg and url else "") + (f"Attachment: {name}\n{url}" if url else "")
+        _ai_override_append_event(
+            session_id,
+            role="assistant",
+            content=relay_txt,
+            sender="ai",
+            audience="host",
+            kind="user_content",
+            payload=payload,
+        )
+    except Exception:
+        pass
+
+    return payload
+
+
 
 
 def _detect_mode_switch_from_text(text: str) -> Optional[str]:
@@ -5407,7 +6164,7 @@ async def chat(request: Request):
         memory_key = None
 
     # Helper to build responses consistently and optionally include audio_url.
-    async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
+    async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any], content: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         # Ensure the frontend can reflect whether a human host takeover is active.
         try:
             state_out = dict(state_out)
@@ -5428,13 +6185,16 @@ async def chat(request: Request):
                 state_out = dict(state_out)
                 state_out["tts_error"] = f"{type(e).__name__}: {e}"
 
-        return {
+        out = {
             "session_id": session_id,
             "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
             "reply": reply,
             "session_state": state_out,
             "audio_url": audio_url,       # NEW (optional)
         }
+        if isinstance(content, dict) and content:
+            out["content"] = content
+        return out
 
     # If the user is asking about their remaining minutes, answer deterministically
     # (no OpenAI call). This also works when minutes are exhausted.
@@ -5641,6 +6401,23 @@ async def chat(request: Request):
             or session_state_out.get("companionName")
             or session_state_out.get("companion_name")
         )
+
+        # Scheduled mode-based content must still be triggered even during host override.
+        # When override is active, content is queued to the host (host modal) and only sent to the member
+        # when the host explicitly pushes it.
+        try:
+            mu_now = int(usage_info.get("minutes_used") or 0)
+            await _maybe_schedule_mode_content_drop(
+                session_id=session_id,
+                identity_key=identity_key,
+                session_state_out=session_state_out,
+                minutes_used=mu_now,
+                effective_mode=effective_mode,
+                override_active=True,
+            )
+        except Exception:
+            pass
+
         return await _respond(
             "",
             STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
@@ -5807,10 +6584,35 @@ async def chat(request: Request):
         or session_state_out.get("companion_name")
     )
 
+    # ---------------------------------------------------------
+    # Mode-pill scheduled content drops (filesystem + SQLite)
+    # - Trigger minutes: 9, 19, 29, 39, ...
+    # - Folder: /home/site/brand/<brandName>/content/mode/<mode>/
+    # - Eligibility: once per 24h (friend = 1 item; romantic/intimate = begin..end series)
+    # - Purchase/upgrade resets eligibility (via usage.last_credit_at)
+    # ---------------------------------------------------------
+
+    content_payload: Optional[Dict[str, Any]] = None
+    try:
+        mu_now = int(usage_info.get("minutes_used") or 0)
+        content_payload = await _maybe_schedule_mode_content_drop(
+            session_id=session_id,
+            identity_key=identity_key,
+            session_state_out=session_state_out,
+            minutes_used=mu_now,
+            effective_mode=effective_mode,
+            override_active=False,
+        )
+    except Exception:
+        # Never allow content delivery errors to break chat.
+        content_payload = None
+
+
     return await _respond(
         assistant_reply,
         STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
         session_state_out,
+        content=content_payload,
     )
 
 
@@ -5976,6 +6778,8 @@ def _ai_override_touch_from_chat(
         rec["member_id"] = str(member_id or "").strip()
         rec["identity_key"] = str(identity_key or "").strip()
         rec["companion_key"] = companion_key
+        # Track the user's current mode pill for scheduled content delivery.
+        rec["mode_pill"] = _normalize_mode(str(session_state.get("mode") or ""))
         rec["last_seen"] = float(now)
 
         # Usage context (needed for host messages to continue charging and for paywall messages)
@@ -6010,6 +6814,7 @@ def _ai_override_append_event(
     sender: str,
     audience: str = "all",
     kind: str = "message",
+    payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     sid = (session_id or "").strip()
     if not sid:
@@ -6033,6 +6838,8 @@ def _ai_override_append_event(
             "audience": str(audience or "all").strip() or "all",
             "kind": str(kind or "message").strip() or "message",
         }
+        if isinstance(payload, dict) and payload:
+            ev["payload"] = payload
 
         events = rec.get("events")
         if not isinstance(events, list):
@@ -8780,6 +9587,14 @@ class HostAiChatsSendRequest(BaseModel):
     text: str = ""
 
 
+class HostAiChatsPushContentRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    session_id: str = ""
+    token: str = ""
+
+
 class HostAiChatsPollRequest(BaseModel):
     brand: str = ""
     avatar: str = ""
@@ -8986,7 +9801,119 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
         kind="message",
     )
 
+    # Scheduled mode-based content must still trigger while the host is chatting (same usage clock).
+    try:
+        rec2 = _ai_override_get_session(sid) or {}
+        mode_pill = str((rec2 or {}).get("mode_pill") or "friend")
+        state_stub: Dict[str, Any] = {
+            "brand": str(req.brand or "").strip(),
+            "avatar": str(req.avatar or "").strip(),
+            "memberId": str(req.memberId or "").strip(),
+            "mode": mode_pill,
+            "companion": str((rec2 or {}).get("companion_key") or "").strip(),
+        }
+        await _maybe_schedule_mode_content_drop(
+            session_id=sid,
+            identity_key=identity_key,
+            session_state_out=state_stub,
+            minutes_used=int(usage_info.get("minutes_used") or 0),
+            effective_mode=mode_pill,
+            override_active=True,
+        )
+    except Exception:
+        pass
+
     return {"ok": True, "session_id": sid, "override_active": True, "usage_info": usage_info}
+
+
+
+
+@app.post("/host/ai-chats/push-content")
+async def host_ai_chats_push_content(req: HostAiChatsPushContentRequest):
+    """
+    Host-only: push a previously scheduled content item (queued while override was active)
+    into the shared transcript so the member sees it as an AI Companion message.
+    """
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    sid = (req.session_id or "").strip()
+    token = (req.token or "").strip()
+
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+
+    rec = _ai_override_get_session(sid) or {}
+    if not isinstance(rec, dict):
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    bound_host = str(rec.get("override_host_member_id") or "").strip()
+    if bound_host and bound_host != host_id:
+        raise HTTPException(status_code=403, detail="This session is owned by a different host")
+
+    content_payload: Optional[Dict[str, Any]] = None
+    with _AI_OVERRIDE_LOCK:
+        r = _AI_OVERRIDE_SESSIONS.get(sid)
+        if not isinstance(r, dict):
+            raise HTTPException(status_code=404, detail="Unknown session_id")
+
+        pending = r.get("pending_content")
+        if not isinstance(pending, dict):
+            pending = {}
+
+        item = pending.get(token)
+        if not item:
+            raise HTTPException(status_code=404, detail="No pending content for this token")
+
+        if isinstance(item, dict) and isinstance(item.get("content"), dict):
+            content_payload = item.get("content")
+        elif isinstance(item, dict):
+            # Back-compat if stored directly as payload
+            content_payload = {k: v for k, v in item.items() if k not in ("created_ts", "trigger_minute", "token")}
+        else:
+            content_payload = None
+
+        # Remove from pending once pushed.
+        pending.pop(token, None)
+        r["pending_content"] = pending
+
+        pushed = r.get("pushed_content_tokens")
+        if not isinstance(pushed, list):
+            pushed = []
+        if token not in pushed:
+            pushed.append(token)
+        # Cap memory
+        if len(pushed) > 2000:
+            pushed = pushed[-2000:]
+        r["pushed_content_tokens"] = pushed
+
+        _AI_OVERRIDE_SESSIONS[sid] = r
+        _ai_override_persist()
+
+    if not isinstance(content_payload, dict) or not content_payload:
+        raise HTTPException(status_code=500, detail="Pending content payload was malformed")
+
+    # Emit to both member+host transcript. Sender is 'ai' so the UI labels it as <companionName>.
+    msg = str(content_payload.get("message") or "").strip()
+    att = content_payload.get("attachment") if isinstance(content_payload.get("attachment"), dict) else {}
+    url = str((att or {}).get("url") or "").strip()
+    name = str((att or {}).get("name") or "content").strip()
+    relay_txt = msg
+    if url:
+        relay_txt = (relay_txt + ("\n\n" if relay_txt else "") + f"Attachment: {name}\n{url}").strip()
+
+    _ai_override_append_event(
+        sid,
+        role="assistant",
+        content=relay_txt or msg or " ",
+        sender="ai",
+        audience="all",
+        kind="user_content",
+        payload=content_payload,
+    )
+
+    return {"ok": True, "session_id": sid, "token": token}
+
 
 
 @app.post("/host/ai-chats/poll")
@@ -9073,3 +10000,41 @@ async def chat_relay_poll(req: ChatRelayPollRequest):
     polled["ok"] = True
     polled["session_id"] = sid
     return polled
+
+
+# ---------------------------------------------------------------------------
+# Serve brand/mode user content from the filesystem
+# ---------------------------------------------------------------------------
+
+@app.get("/content/mode/{mode}/{brand}/{filename}")
+async def get_brand_mode_content(mode: str, brand: str, filename: str) -> Response:
+    """
+    Serves files from:
+      /home/site/brand/<brandName>/content/mode/<friend|romantic|intimate>/<filename>
+
+    This is used by the frontend when the backend schedules mode-based content drops.
+    """
+    mode_norm = _normalize_mode(mode)
+    if mode_norm not in ("friend", "romantic", "intimate"):
+        raise HTTPException(status_code=400, detail="invalid mode")
+
+    # Defensive: no path traversal.
+    fn = (filename or "").strip()
+    if not fn or fn != os.path.basename(fn) or ".." in fn or "/" in fn or "\\" in fn:
+        raise HTTPException(status_code=400, detail="invalid filename")
+
+    brand_in = (brand or "").strip() or "Elaralo"
+    content_dir = _brand_content_dir(brand_in, mode_norm)
+    if not content_dir or not os.path.isdir(content_dir):
+        raise HTTPException(status_code=404, detail="content folder not found")
+
+    full_path = os.path.join(content_dir, fn)
+    if not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail="content not found")
+
+    media_type = _guess_content_type(full_path)
+    headers = {
+        # Cache OK: files are immutable by name (sequence prefix).
+        "Cache-Control": "public, max-age=3600",
+    }
+    return FileResponse(full_path, media_type=media_type, filename=fn, headers=headers)
