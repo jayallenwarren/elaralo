@@ -3967,7 +3967,6 @@ useEffect(() => {
         brand: (companyName || "").trim(),
         avatar: (companionName || "").trim(),
 
-        planName: planName || null,
         rebrandingKey: stripTrialControlsFromRebrandingKey(rebrandingKey),
         rebranding: rawBrand,
       };
@@ -4070,7 +4069,6 @@ useEffect(() => {
   companyName,
   companionName,
   companionKey,
-  planName,
   rebrandingKey,
 ]);
 
