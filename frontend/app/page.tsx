@@ -5,6 +5,7 @@ import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, R
 import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
+import elaraLogo from "../public/elaralo-logo.png";
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
   <svg
     width={size}
@@ -486,7 +487,7 @@ type CompanionMeta = {
   key: string;
 };
 
-const DEFAULT_COMPANION_NAME = "Companion";
+const DEFAULT_COMPANION_NAME = "Elara";
 
 // Step C (Latency): limit how much chat history we send to /chat.
 // 20 turns ~= 40 messages (user+assistant). System prompt (if present) is always preserved.
@@ -556,8 +557,8 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 }
 
 const GREET_ONCE_KEY = "ELARALO_GREETED";
-const DEFAULT_AVATAR = "";
-const DEFAULT_COMPANY_NAME = "";
+const DEFAULT_AVATAR = elaraLogo.src;
+const DEFAULT_COMPANY_NAME = "Elaralo";
 // Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
 const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
 
@@ -2022,7 +2023,7 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   }, [upgradeUrl]);
 
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
+  const companyName = (rebrandingName || (parseRebrandingKey(rebrandingKey || "")?.rebranding || "") || DEFAULT_COMPANY_NAME);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
@@ -6772,15 +6773,22 @@ useEffect(() => {
 
       setAllowedModes(nextAllowed);
 
+      const wixRequestedMode: Mode | null = modeFromModePill(incomingModePillRaw);
+
       setSessionState((prev) => {
         let nextMode: Mode = prev.mode;
 
-        // If the previous mode is the default placeholder (Friend) or no longer allowed,
-        // snap to the brand-default start mode (if allowed).
-        if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
-          nextMode = desiredStartMode;
-        } else if (!nextAllowed.includes(nextMode)) {
-          nextMode = "friend";
+        // Requirement: if Wix provides a modePill and it is allowed by the Elaralo entitlement plan,
+        // it MUST be the selected mode pill on load/plan refresh (regardless of the previously-stored mode).
+        if (wixRequestedMode && nextAllowed.includes(wixRequestedMode)) {
+          nextMode = wixRequestedMode;
+        } else {
+          // Otherwise, preserve the previous mode if allowed; if not allowed, fall back.
+          if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
+            nextMode = desiredStartMode;
+          } else if (!nextAllowed.includes(nextMode)) {
+            nextMode = "friend";
+          }
         }
 
         if (nextMode === prev.mode) return prev;
@@ -8252,7 +8260,7 @@ const pauseSpeechToText = useCallback(() => {
       sttLastAudioCaptureAtRef.current = 0;
     };
 
-    rec.onend = () => {
+        const scheduleRestart = () => {
       setSttRunning(false);
 
       if (!sttEnabledRef.current || sttPausedRef.current) return;
@@ -8275,6 +8283,8 @@ const pauseSpeechToText = useCallback(() => {
         }
       }, baseDelay + ignoreDelay);
     };
+
+    rec.onend = scheduleRestart;
 
     rec.onerror = (event: any) => {
       const code = String(event?.error || "");
