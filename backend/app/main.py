@@ -678,7 +678,7 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
       - If the writable copy already exists, use it (do NOT overwrite).
       - If it doesn't exist, copy from the packaged DB.
 
-    This keeps runtime state (like Stream event_ref) consistent across
+    This keeps runtime state (like the live room reference) consistent across
     multiple Uvicorn workers and across restarts (when /home is used).
     """
 
@@ -905,6 +905,112 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
         return src_db_path
 
 
+
+
+# ---------------------------------------------------------------------------
+# Host companion guideline overrides (persisted)
+# ---------------------------------------------------------------------------
+
+_HOST_GUIDELINES_TABLE = "host_companion_guidelines"
+
+
+def _ensure_host_guidelines_schema(db_path: str) -> None:
+    """Ensure the host companion guideline override table exists."""
+    try:
+        if not db_path:
+            return
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_HOST_GUIDELINES_TABLE} (
+                  brand TEXT NOT NULL,
+                  avatar TEXT NOT NULL,
+                  host_member_id TEXT NOT NULL,
+                  guidelines TEXT NOT NULL,
+                  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY (brand, avatar)
+                );
+                """
+            )
+            conn.execute(
+                f"""CREATE INDEX IF NOT EXISTS idx_hcg_brand_avatar ON {_HOST_GUIDELINES_TABLE}(brand, avatar);"""
+            )
+    except Exception:
+        # Best-effort; do not break the API if schema cannot be created.
+        pass
+
+
+def _mapping_db_path_rw() -> str:
+    """Return a writable mapping DB path (copy-on-write if needed)."""
+    global _COMPANION_MAPPINGS_SOURCE
+    try:
+        if _COMPANION_MAPPINGS_SOURCE and os.path.exists(_COMPANION_MAPPINGS_SOURCE):
+            return _COMPANION_MAPPINGS_SOURCE
+    except Exception:
+        pass
+
+    for p in _candidate_mapping_db_paths():
+        if p and os.path.exists(p):
+            try:
+                rw = _ensure_writable_db_copy(p)
+                _COMPANION_MAPPINGS_SOURCE = rw
+                return rw
+            except Exception:
+                continue
+    return ""
+
+
+def _get_host_guidelines_text(brand: str, avatar: str) -> str:
+    """Fetch stored host guideline overrides for (brand, avatar)."""
+    try:
+        b = _norm_key(brand) or "core"
+        a = _norm_key(avatar)
+        if not a:
+            return ""
+        db_path = _mapping_db_path_rw()
+        if not db_path:
+            return ""
+        _ensure_host_guidelines_schema(db_path)
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                f"SELECT guidelines FROM {_HOST_GUIDELINES_TABLE} WHERE brand=? AND avatar=? LIMIT 1",
+                (b, a),
+            ).fetchone()
+        if not row:
+            return ""
+        return str(row[0] or "").strip()
+    except Exception:
+        return ""
+
+
+def _set_host_guidelines_text(brand: str, avatar: str, host_member_id: str, guidelines: str) -> str:
+    """Upsert host guideline overrides for (brand, avatar). Returns stored text."""
+    b = _norm_key(brand) or "core"
+    a = _norm_key(avatar)
+    h = str(host_member_id or "").strip()
+    g = str(guidelines or "").strip()
+    if not a or not h:
+        return ""
+    db_path = _mapping_db_path_rw()
+    if not db_path:
+        return ""
+    _ensure_host_guidelines_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            f"""
+            INSERT INTO {_HOST_GUIDELINES_TABLE} (brand, avatar, host_member_id, guidelines)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(brand, avatar) DO UPDATE SET
+              host_member_id=excluded.host_member_id,
+              guidelines=excluded.guidelines,
+              update_datetime=CURRENT_TIMESTAMP;
+            """,
+            (b, a, h, g),
+        )
+        conn.commit()
+    return g
+
 def _load_companion_mappings_sync() -> None:
     global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
 
@@ -1044,13 +1150,17 @@ def _load_companion_mappings_sync() -> None:
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
     # Strict: exact (brand, avatar) match required (case-insensitive via _norm_key).
-    # Core brand: empty brand is treated as Elaralo.
-    b = _norm_key(brand) or "elaralo"
+    # Core brand: empty brand is treated as "core" (and will fall back to legacy "elaralo" mappings).
+    b = _norm_key(brand) or "core"
     a = _norm_key(avatar)
     if not a:
         return None
 
-    return _COMPANION_MAPPINGS.get((b, a))
+    m = _COMPANION_MAPPINGS.get((b, a))
+    if not m and b == "core":
+        # Backwards compatibility: some deployments store core mappings under brand "elaralo".
+        m = _COMPANION_MAPPINGS.get(("elaralo", a))
+    return m
 
 
 @app.on_event("startup")
@@ -1063,105 +1173,75 @@ async def _startup_load_companion_mappings() -> None:
 
 
 @app.get("/mappings/companion")
-async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
-    """Lookup a companion mapping row by (brand, avatar).
+async def get_companion_mapping(brand: str = "", avatar: str = ""):
+    """Return the companion mapping for (brand, avatar).
 
-    This endpoint is intentionally STRICT:
-      - exact (brand, avatar) match required (case-insensitive via lower/strip normalization)
-      - errors out when a mapping is missing, so configuration issues are visible during development
-
-    Query params:
-      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
-      - avatar: Avatar first name (e.g., "Jennifer")
-
-    Response (200):
-      {
-        found: true,
-        brand: str,
-        avatar: str,
-        companionType: "Human"|"AI",
-        channel_cap: "Video"|"Audio" ,
-        channelCap: "Video"|"Audio" ,   # alias for convenience
-        live: "D-ID"|"Stream" ,
-        elevenVoiceId: str,
-        elevenVoiceName: str,
-        didAgentId: str,
-        didClientKey: str,
-        didAgentLink: str,
-        didEmbedCode: str,
-        loadedAt: <unix seconds> | null,
-        source: <db path> | ""
-      }
+    Notes:
+      - For backwards compatibility, an empty brand is treated as "core" internally (and may fall back
+        to legacy "elaralo" mappings).
+      - If the caller does not provide a brand, the response brand will be an empty string (to avoid
+        leaking any default/core brand into white-label contexts).
     """
     b_in = (brand or "").strip()
-    a = (avatar or "").strip()
+    a_in = (avatar or "").strip()
 
-    if not a:
-        raise HTTPException(status_code=400, detail="avatar is required")
+    b_key = b_in or "core"
+    a = a_in
 
-    # Core brand default: empty brand => Elaralo
-    b = b_in or "Elaralo"
-
-    m = _lookup_companion_mapping(b, a)
+    m = _lookup_companion_mapping(b_key, a)
     if not m:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": "Companion mapping not found",
-                "brand": b,
-                "avatar": a,
-                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-                "source": _COMPANION_MAPPINGS_SOURCE,
-                "table": _COMPANION_MAPPINGS_TABLE,
-                "count": len(_COMPANION_MAPPINGS),
-            },
-        )
+        raise HTTPException(status_code=404, detail={"brand": b_key, "avatar": a, "error": "Mapping not found"})
 
-    cap_raw = str(m.get("channel_cap") or "").strip()
+    cap_raw = str(m.get("channel_cap") or m.get("channelCap") or "").strip()
     live_raw = str(m.get("live") or "").strip()
-    ctype_raw = str(m.get("companion_type") or "").strip()
+    ctype_raw = str(m.get("companion_type") or m.get("companionType") or "").strip()
 
-    # Strict validation (config contract)
+    if not cap_raw or not live_raw or not ctype_raw:
+        raise HTTPException(status_code=500, detail=f"Invalid mapping row for brand='{b_key}' avatar='{a}'")
+
     cap_lc = cap_raw.lower()
     if cap_lc not in ("video", "audio"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
+            detail=f"Invalid channel_cap in DB for brand='{b_key}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
         )
 
     live_lc = live_raw.lower()
     if live_lc not in ("stream", "d-id"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
+            detail=f"Invalid live in DB for brand='{b_key}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
         )
 
     ctype_lc = ctype_raw.lower()
     if ctype_lc not in ("human", "ai"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
+            detail=f"Invalid companion_type in DB for brand='{b_key}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
         )
 
     # Business rule: AI companions must use D-ID. Human companions must use Stream.
     if ctype_lc == "human" and live_lc != "stream":
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b_key}' avatar='{a}' (got {live_raw!r})",
         )
     if ctype_lc == "ai" and live_lc != "d-id":
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b_key}' avatar='{a}' (got {live_raw!r})",
         )
 
     cap_out = "Video" if cap_lc == "video" else "Audio"
     live_out = "Stream" if live_lc == "stream" else "D-ID"
     ctype_out = "Human" if ctype_lc == "human" else "AI"
 
+    # Do not leak fallback/core brand if the caller did not provide one.
+    brand_out = b_in
+
     return {
         "found": True,
-        "brand": str(m.get("brand") or b),
+        "brand": brand_out,
         "avatar": str(m.get("avatar") or a),
         "hostMemberId": str(m.get("host_member_id") or ""),
         "host_member_id": str(m.get("host_member_id") or ""),
@@ -1183,493 +1263,440 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
     }
 
 
-
-_LIVECHAT_LOCK = threading.Lock()
-# _LIVECHAT_CLIENTS[event_ref] = set(WebSocket)
-_LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
-# Per-connection identity metadata, keyed by websocket instance.
-# Used so the server can attach senderRole/name to each broadcast.
-_LIVECHAT_CLIENT_META: Dict[WebSocket, Dict[str, str]] = {}
-# Simple in-memory message history per event_ref so late-joiners see recent chat.
-_LIVECHAT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-_LIVECHAT_HISTORY_MAX = 200
+class HostCompanionGuidelinesGetRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
 
 
-def _normalize_livechat_role(role: str) -> str:
-    r = (role or "").strip().lower()
-    if r in ("host", "viewer", "system"):
-        return r
-    return "viewer"
+class HostCompanionGuidelinesSetRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    guidelines: str = ""
 
 
-def _livechat_push_history(event_ref: str, msg: Dict[str, Any]) -> None:
-    # Append a chat message to in-memory history (bounded).
-    event_ref = (event_ref or "").strip()
-    if not event_ref:
-        return
-    with _LIVECHAT_LOCK:
-        hist = _LIVECHAT_HISTORY.get(event_ref)
-        if hist is None:
-            hist = []
-            _LIVECHAT_HISTORY[event_ref] = hist
-        hist.append(msg)
-        if len(hist) > _LIVECHAT_HISTORY_MAX:
-            # Keep the most recent N messages
-            del hist[: len(hist) - _LIVECHAT_HISTORY_MAX]
+@app.post("/host/companion-guidelines/get")
+async def host_get_companion_guidelines(req: HostCompanionGuidelinesGetRequest):
+    """Host-only: fetch stored AI interaction guideline overrides for a companion."""
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
+    member_id = (req.memberId or "").strip()
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    host_member_id = str((mapping or {}).get("host_member_id") or "").strip()
+
+    if not host_member_id or not member_id or member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view companion guidelines")
+
+    text = _get_host_guidelines_text(brand, avatar)
+    return {"ok": True, "guidelines": text}
 
 
+@app.post("/host/companion-guidelines/set")
+async def host_set_companion_guidelines(req: HostCompanionGuidelinesSetRequest):
+    """Host-only: upsert stored AI interaction guideline overrides for a companion."""
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
+    member_id = (req.memberId or "").strip()
+    guidelines = str(req.guidelines or "")
 
-async def _livechat_broadcast(event_ref: str, msg: Dict[str, Any]) -> None:
-    """Broadcast a JSON-serializable message to all connected live-chat clients for an event_ref.
+    mapping = _lookup_companion_mapping(brand, avatar)
+    host_member_id = str((mapping or {}).get("host_member_id") or "").strip()
 
-    This must work reliably with multiple Uvicorn workers. Each worker maintains its own in-memory
-    websocket set, so this broadcasts only to clients connected to THIS worker — which is exactly
-    what we want because each websocket connection is pinned to a worker process.
+    if not host_member_id or not member_id or member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify companion guidelines")
 
-    The frontend already de-dupes echoed messages using clientMsgId, so we broadcast to everyone,
-    including the sender.
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return
+    stored = _set_host_guidelines_text(brand, avatar, host_member_id, guidelines)
+    return {"ok": True, "guidelines": stored}
 
-    try:
-        payload = json.dumps(msg, ensure_ascii=False)
-    except Exception:
-        # Fallback: stringify
-        payload = json.dumps({"type": "error", "error": "Invalid livechat payload"}, ensure_ascii=False)
-
-    # Snapshot sockets under lock so we don't hold the lock during awaits.
-    with _LIVECHAT_LOCK:
-        sockets = list(_LIVECHAT_CLIENTS.get(ref, set()))
-
-    if not sockets:
-        return
-
-    dead: List[WebSocket] = []
-    for ws in sockets:
-        try:
-            await ws.send_text(payload)
-        except Exception:
-            dead.append(ws)
-
-    if dead:
-        with _LIVECHAT_LOCK:
-            s = _LIVECHAT_CLIENTS.get(ref)
-            if s is not None:
-                for ws in dead:
-                    try:
-                        s.discard(ws)
-                    except Exception:
-                        pass
-                    try:
-                        _LIVECHAT_CLIENT_META.pop(ws, None)
-                    except Exception:
-                        pass
-                if not s:
-                    _LIVECHAT_CLIENTS.pop(ref, None)
-                    # Keep history for a bit in case late joiners arrive; do not delete here.
-
-
-# --- Shared (cross-worker) live chat persistence --------------------------------
+# =============================================================================
+# LiveKit Live Chat (stream + conference)
 #
-# IMPORTANT: The API may run with multiple Uvicorn workers. In-memory websocket client
-# sets are per-worker, so to mirror messages across ALL connected clients we persist
-# live chat messages into the shared SQLite DB and have each websocket connection poll
-# for new rows.
+# Legacy providers are no longer used. Live chat for LiveKit is provided via:
+#   - WebSocket:  /stream/livekit/livechat/{room}
+#                /conference/livekit/livechat/{room}
+#   - HTTP send:  /stream/livekit/livechat/send
+#                /conference/livekit/livechat/send
+#
+# Notes:
+# - Gunicorn runs multiple workers. WebSockets terminate on a single worker, while
+#   HTTP sends may land on another. To keep chat consistent across workers we use
+#   a small shared SQLite DB on the persisted /home filesystem as an append-only
+#   message log and have each connected websocket poll it.
+# =============================================================================
 
-_LIVECHAT_DB_TABLE = os.environ.get('LIVECHAT_DB_TABLE', 'livechat_messages').strip() or 'livechat_messages'
-_LIVECHAT_DB_HISTORY_LIMIT = int(os.environ.get('LIVECHAT_DB_HISTORY_LIMIT', '80') or '80')
-_LIVECHAT_DB_POLL_INTERVAL_SEC = float(os.environ.get('LIVECHAT_DB_POLL_INTERVAL_SEC', '0.35') or '0.35')
+_LK_LIVECHAT_DB_PATH = (os.getenv("LIVEKIT_LIVECHAT_DB_PATH", "/home/livekit_livechat.sqlite3") or "/home/livekit_livechat.sqlite3").strip() or "/home/livekit_livechat.sqlite3"
+_LK_LIVECHAT_DB_TIMEOUT_S = float(os.getenv("LIVEKIT_LIVECHAT_DB_TIMEOUT_S", "5.0") or "5.0")
+_LK_LIVECHAT_POLL_INTERVAL_S = float(os.getenv("LIVEKIT_LIVECHAT_POLL_INTERVAL_S", "0.35") or "0.35")
+_LK_LIVECHAT_HISTORY_LIMIT = max(50, int(os.getenv("LIVEKIT_LIVECHAT_HISTORY_LIMIT", "200") or "200"))
+_LK_LIVECHAT_POLL_BATCH_LIMIT = max(10, int(os.getenv("LIVEKIT_LIVECHAT_POLL_BATCH_LIMIT", "50") or "50"))
 
-def _livechat_db_init_sync(conn) -> None:
-    try:
-        conn.execute(
-            f"""
-CREATE TABLE IF NOT EXISTS {_LIVECHAT_DB_TABLE} (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  event_ref TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  client_msg_id TEXT NOT NULL,
-  payload_json TEXT NOT NULL
-);
-"""
-        )
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{_LIVECHAT_DB_TABLE}_event_id ON {_LIVECHAT_DB_TABLE}(event_ref, id);"
-        )
-    except Exception:
-        # DB is best-effort for live chat. If it fails, the websocket still works per-worker.
-        pass
-
-def _livechat_db_connect_sync(db_path: str):
-    import sqlite3
-
-    conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
-    try:
-        conn.execute('PRAGMA journal_mode=WAL;')
-    except Exception:
-        pass
-    try:
-        conn.execute('PRAGMA synchronous=NORMAL;')
-    except Exception:
-        pass
-    _livechat_db_init_sync(conn)
-    return conn
-
-def _livechat_db_insert_sync(event_ref: str, payload: Dict[str, Any]) -> int:
-    ref = (event_ref or '').strip()
-    if not ref:
-        return 0
-
-    db_path = _get_companion_mappings_db_path(for_write=True)
-    lock_path = db_path + '.livechat.lock'
-    try:
-        with FileLock(lock_path):
-            conn = _livechat_db_connect_sync(db_path)
-            created_at = int(time.time() * 1000)
-            client_msg_id = str(payload.get('clientMsgId') or payload.get('client_msg_id') or '').strip() or str(uuid.uuid4())
-            payload_json = json.dumps(payload, ensure_ascii=False)
-            try:
-                conn.execute(
-                    f"INSERT INTO {_LIVECHAT_DB_TABLE} (event_ref, created_at, client_msg_id, payload_json) VALUES (?,?,?,?)",
-                    (ref, created_at, client_msg_id, payload_json),
-                )
-                row_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-                conn.commit()
-                return int(row_id or 0)
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    except Exception:
-        return 0
-
-def _livechat_db_fetch_history_sync(event_ref: str, limit: int) -> Tuple[int, List[Dict[str, Any]]]:
-    ref = (event_ref or '').strip()
-    if not ref:
-        return 0, []
-
-    db_path = _get_companion_mappings_db_path(for_write=False)
-    try:
-        conn = _livechat_db_connect_sync(db_path)
-        rows = conn.execute(
-            f"SELECT id, payload_json FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=? ORDER BY id DESC LIMIT ?",
-            (ref, int(limit)),
-        ).fetchall()
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return 0, []
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    rows = list(reversed(rows or []))
-    msgs: List[Dict[str, Any]] = []
-    last_id = 0
-    for rid, payload_json in rows:
-        try:
-            rid_int = int(rid or 0)
-            last_id = max(last_id, rid_int)
-        except Exception:
-            pass
-        try:
-            obj = json.loads(payload_json) if payload_json else None
-            if isinstance(obj, dict):
-                msgs.append(obj)
-        except Exception:
-            pass
-    return last_id, msgs
-
-
-def _livechat_db_clear_event_sync(event_ref: str) -> int:
-    """Delete all persisted livechat messages for a given Stream event_ref.
-
-    We clear per-event history when a new stream session starts so a reused event_ref
-    doesn't replay the previous session's chat.
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return 0
-    db_path = _get_companion_mappings_db_path(for_write=True)
-    lock_path = db_path + ".livechat.lock"
-    deleted = 0
-    try:
-        with FileLock(lock_path):
-            conn = _livechat_db_connect_sync(db_path)
-            try:
-                cur = conn.execute(f"DELETE FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=?", (ref,))
-                conn.commit()
-                try:
-                    deleted = int(cur.rowcount or 0)
-                except Exception:
-                    deleted = 0
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    except Exception:
-        return 0
-    return deleted
-
-
-def _livechat_db_fetch_after_sync(event_ref: str, after_id: int, limit: int = 80) -> Tuple[int, List[Dict[str, Any]]]:
-    ref = (event_ref or '').strip()
-    if not ref:
-        return int(after_id or 0), []
-
-    db_path = _get_companion_mappings_db_path(for_write=False)
-    try:
-        conn = _livechat_db_connect_sync(db_path)
-        rows = conn.execute(
-            f"SELECT id, payload_json FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=? AND id>? ORDER BY id ASC LIMIT ?",
-            (ref, int(after_id or 0), int(limit)),
-        ).fetchall()
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return int(after_id or 0), []
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    msgs: List[Dict[str, Any]] = []
-    last_id = int(after_id or 0)
-    for rid, payload_json in (rows or []):
-        try:
-            rid_int = int(rid or 0)
-            last_id = max(last_id, rid_int)
-        except Exception:
-            pass
-        try:
-            obj = json.loads(payload_json) if payload_json else None
-            if isinstance(obj, dict):
-                msgs.append(obj)
-        except Exception:
-            pass
-    return last_id, msgs
-
-async def _livechat_poll_db(websocket: WebSocket, event_ref: str, after_id: int) -> None:
-    last_id = int(after_id or 0)
-    try:
-        while True:
-            await asyncio.sleep(_LIVECHAT_DB_POLL_INTERVAL_SEC)
-            new_last, msgs = await run_in_threadpool(_livechat_db_fetch_after_sync, event_ref, last_id, 80)
-            if not msgs:
-                last_id = max(last_id, int(new_last or 0))
-                continue
-            last_id = max(last_id, int(new_last or 0))
-            for m in msgs:
-                try:
-                    await websocket.send_text(json.dumps(m, ensure_ascii=False))
-                except Exception:
-                    return
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        return
+_LK_LIVECHAT_LOCK = threading.Lock()
+_LK_LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
+_LK_LIVECHAT_CLIENT_META: Dict[WebSocket, Dict[str, Any]] = {}
 
 class LiveChatSendRequest(BaseModel):
     eventRef: str = ""
     clientMsgId: Optional[str] = None
-
-    # Accept either 'role' or 'senderRole' from older/newer clients.
     role: Optional[str] = None
     senderRole: Optional[str] = None
-
-    # Display name
     name: Optional[str] = None
-
-    # Accept either 'text' or 'message' from older/newer clients.
     text: Optional[str] = None
     message: Optional[str] = None
-
-    # Accept either 'memberId' or 'senderId' from older/newer clients.
     memberId: Optional[str] = None
     senderId: Optional[str] = None
-
     ts: Optional[float] = None
 
+def _lk_livechat_db_connect() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(_LK_LIVECHAT_DB_PATH) or "/home", exist_ok=True)
+    conn = sqlite3.connect(_LK_LIVECHAT_DB_PATH, timeout=_LK_LIVECHAT_DB_TIMEOUT_S, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+    return conn
 
-async def _shared_livechat_ws(websocket: WebSocket, event_ref: str):
-    event_ref = (event_ref or "").strip()
-    await websocket.accept()
-
-    if not event_ref:
-        await websocket.close(code=1008)
-        return
-
-    # Capture identity from connection query params.
-    qs = websocket.query_params
-    member_id = (qs.get("memberId") or qs.get("member_id") or qs.get("senderId") or qs.get("sender_id") or "").strip()
-    role = _normalize_livechat_role(qs.get("role") or "")
-    name = (qs.get("name") or "").strip()
-
-    # Register socket + identity
-    with _LIVECHAT_LOCK:
-        _LIVECHAT_CLIENTS.setdefault(event_ref, set()).add(websocket)
-        _LIVECHAT_CLIENT_META[websocket] = {
-            "eventRef": event_ref,
-            "memberId": member_id,
-            "role": role,
-            "name": name,
-        }
-        history: List[Dict[str, Any]] = []  # per-worker; DB history is fetched below
-
-    # Shared DB history (cross-worker).
-    last_db_id, history = await run_in_threadpool(_livechat_db_fetch_history_sync, event_ref, _LIVECHAT_DB_HISTORY_LIMIT)
-    poll_task: Optional[asyncio.Task] = None
-
-    # Send recent history to the newly connected client.
-    if history:
+def _lk_livechat_db_init_sync() -> None:
+    try:
+        conn = _lk_livechat_db_connect()
         try:
-            await websocket.send_text(
-                json.dumps(
-                    {"type": "history", "eventRef": event_ref, "messages": history, "ts": time.time()},
-                    ensure_ascii=False,
-                )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS livekit_livechat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room TEXT NOT NULL,
+                    ts REAL NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_livekit_livechat_room_id ON livekit_livechat_messages(room, id);")
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[livekit_livechat] DB init error: {e!r}")
+
+def _lk_livechat_db_insert_sync(room: str, payload: Dict[str, Any]) -> int:
+    conn = _lk_livechat_db_connect()
+    try:
+        ts = float(payload.get("ts") or time.time())
+        payload = dict(payload)
+        payload["ts"] = ts
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        cur = conn.execute(
+            "INSERT INTO livekit_livechat_messages(room, ts, payload_json) VALUES(?,?,?)",
+            (room, ts, payload_json),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+    finally:
+        try:
+            conn.close()
         except Exception:
             pass
 
-    # Poll shared DB for messages inserted by other API workers and mirror them to this websocket.
+def _lk_livechat_db_fetch_history_sync(room: str, limit: int) -> Tuple[int, List[Dict[str, Any]]]:
+    conn = _lk_livechat_db_connect()
     try:
-        poll_task = asyncio.create_task(_livechat_poll_db(websocket, event_ref, last_db_id))
+        lim = int(limit or _LK_LIVECHAT_HISTORY_LIMIT)
+        rows = conn.execute(
+            "SELECT id, payload_json FROM livekit_livechat_messages WHERE room=? ORDER BY id DESC LIMIT ?",
+            (room, lim),
+        ).fetchall()
+        rows = list(reversed(rows))
+        out: List[Dict[str, Any]] = []
+        last_id = 0
+        for r in rows:
+            try:
+                last_id = max(last_id, int(r["id"] or 0))
+            except Exception:
+                pass
+            try:
+                out.append(json.loads(r["payload_json"]))
+            except Exception:
+                pass
+        return last_id, out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _lk_livechat_db_fetch_since_sync(room: str, since_id: int, limit: int) -> List[Tuple[int, Dict[str, Any]]]:
+    conn = _lk_livechat_db_connect()
+    try:
+        sid = int(since_id or 0)
+        lim = int(limit or _LK_LIVECHAT_POLL_BATCH_LIMIT)
+        rows = conn.execute(
+            "SELECT id, payload_json FROM livekit_livechat_messages WHERE room=? AND id>? ORDER BY id ASC LIMIT ?",
+            (room, sid, lim),
+        ).fetchall()
+        out: List[Tuple[int, Dict[str, Any]]] = []
+        for r in rows:
+            try:
+                msg_id = int(r["id"] or 0)
+            except Exception:
+                continue
+            try:
+                payload = json.loads(r["payload_json"])
+            except Exception:
+                continue
+            out.append((msg_id, payload))
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _lk_livechat_register(room: str, ws: WebSocket, meta: Dict[str, Any]) -> None:
+    with _LK_LIVECHAT_LOCK:
+        _LK_LIVECHAT_CLIENTS.setdefault(room, set()).add(ws)
+        _LK_LIVECHAT_CLIENT_META[ws] = dict(meta)
+
+def _lk_livechat_unregister(ws: WebSocket) -> None:
+    with _LK_LIVECHAT_LOCK:
+        meta = _LK_LIVECHAT_CLIENT_META.pop(ws, None) or {}
+        room = str(meta.get("room") or "")
+        if room and room in _LK_LIVECHAT_CLIENTS:
+            try:
+                _LK_LIVECHAT_CLIENTS[room].discard(ws)
+                if not _LK_LIVECHAT_CLIENTS[room]:
+                    _LK_LIVECHAT_CLIENTS.pop(room, None)
+            except Exception:
+                pass
+
+async def _lk_livechat_broadcast(room: str, payload: Dict[str, Any], *, db_id: Optional[int] = None) -> None:
+    # Broadcast only within this worker. Cross-worker delivery happens via DB polling.
+    if db_id is not None:
+        payload = dict(payload)
+        payload["_db_id"] = int(db_id)
+    with _LK_LIVECHAT_LOCK:
+        clients = list(_LK_LIVECHAT_CLIENTS.get(room, set()))
+    if not clients:
+        return
+    msg = json.dumps(payload, ensure_ascii=False)
+    for ws in clients:
+        try:
+            await ws.send_text(msg)
+            # Keep the poll cursor in sync so we don't echo the same DB row again.
+            if db_id is not None:
+                try:
+                    meta = _LK_LIVECHAT_CLIENT_META.get(ws) or {}
+                    meta["last_db_id"] = max(int(meta.get("last_db_id") or 0), int(db_id))
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            _lk_livechat_unregister(ws)
+
+async def _lk_livechat_poll_db(ws: WebSocket) -> None:
+    # Poll the DB for new messages for this websocket's room.
+    while True:
+        meta = _LK_LIVECHAT_CLIENT_META.get(ws)
+        if not meta:
+            return
+        room = str(meta.get("room") or "")
+        if not room:
+            return
+        last_db_id = int(meta.get("last_db_id") or 0)
+        try:
+            rows = await run_in_threadpool(_lk_livechat_db_fetch_since_sync, room, last_db_id, _LK_LIVECHAT_POLL_BATCH_LIMIT)
+        except Exception:
+            rows = []
+        if rows:
+            for msg_id, payload in rows:
+                try:
+                    await ws.send_text(json.dumps(payload, ensure_ascii=False))
+                    meta = _LK_LIVECHAT_CLIENT_META.get(ws) or meta
+                    meta["last_db_id"] = max(int(meta.get("last_db_id") or 0), int(msg_id))
+                except Exception:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    _lk_livechat_unregister(ws)
+                    return
+        await asyncio.sleep(_LK_LIVECHAT_POLL_INTERVAL_S)
+
+def _lk_livechat_canonical_message(room: str, *, text: str, role: str, name: str, sender_id: str, client_msg_id: str = "") -> Dict[str, Any]:
+    return {
+        "type": "chat",
+        "eventRef": room,
+        "text": text,
+        "clientMsgId": client_msg_id or str(uuid.uuid4()),
+        "ts": time.time(),
+        "senderId": sender_id,
+        "senderRole": role,
+        "name": name,
+    }
+
+def _lk_livechat_norm_role(raw: str) -> str:
+    r = (raw or "").strip().lower()
+    if r in {"host","viewer","member","system","ai"}:
+        return r
+    if not r:
+        return "viewer"
+    return r
+
+@app.on_event("startup")
+async def _startup_init_livekit_livechat() -> None:
+    try:
+        await run_in_threadpool(_lk_livechat_db_init_sync)
     except Exception:
-        poll_task = None
+        pass
+
+async def _lk_livechat_ws_handler(websocket: WebSocket, room: str) -> None:
+    room = (room or "").strip()
+    if not room:
+        await websocket.close(code=1008)
+        return
+
+    qs = dict(websocket.query_params)
+    member_id = str(qs.get("memberId") or "").strip()
+    role = _lk_livechat_norm_role(str(qs.get("role") or "").strip() or "viewer")
+    name = str(qs.get("name") or "").strip()
+    if not name:
+        name = "Host" if role == "host" else "Viewer"
+
+    await websocket.accept()
+
+    meta = {"room": room, "memberId": member_id, "role": role, "name": name, "last_db_id": 0}
+    _lk_livechat_register(room, websocket, meta)
+
+    # Send recent history first.
+    try:
+        last_id, history = await run_in_threadpool(_lk_livechat_db_fetch_history_sync, room, _LK_LIVECHAT_HISTORY_LIMIT)
+    except Exception:
+        last_id, history = 0, []
 
     try:
+        m = _LK_LIVECHAT_CLIENT_META.get(websocket) or meta
+        m["last_db_id"] = max(int(m.get("last_db_id") or 0), int(last_id or 0))
+    except Exception:
+        pass
+
+    if history:
+        for item in history:
+            try:
+                await websocket.send_text(json.dumps(item, ensure_ascii=False))
+            except Exception:
+                _lk_livechat_unregister(websocket)
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+                return
+
+    poll_task: Optional[asyncio.Task] = None
+    try:
+        poll_task = asyncio.create_task(_lk_livechat_poll_db(websocket))
+
         while True:
             raw = await websocket.receive_text()
             try:
-                incoming = json.loads(raw)
-                if not isinstance(incoming, dict):
-                    incoming = {"text": str(incoming)}
+                data = json.loads(raw)
             except Exception:
-                incoming = {"text": raw}
+                continue
+            if not isinstance(data, dict):
+                continue
 
-            msg_type = str(incoming.get("type") or "chat").strip().lower()
-
-            # Optional ping/pong
+            msg_type = str(data.get("type") or "").strip().lower()
             if msg_type == "ping":
                 try:
-                    await websocket.send_text(json.dumps({"type": "pong", "ts": time.time()}))
+                    await websocket.send_text(json.dumps({"type": "pong"}, ensure_ascii=False))
                 except Exception:
                     pass
                 continue
 
-            # We only broadcast chat messages.
-            if msg_type not in ("chat", "message"):
+            text = str(data.get("text") or data.get("message") or "").strip()
+            if not text:
                 continue
 
-            text_val = incoming.get("text")
-            if text_val is None or str(text_val).strip() == "":
-                text_val = incoming.get("message") or incoming.get("content") or ""
-            text_val = str(text_val).strip()
-            if not text_val:
-                continue
+            sender_role = _lk_livechat_norm_role(str(data.get("senderRole") or data.get("role") or role))
+            sender_name = str(data.get("name") or name).strip() or name
+            sender_id = str(data.get("senderId") or data.get("memberId") or member_id).strip()
+            client_msg_id = str(data.get("clientMsgId") or "").strip()
 
-            # Accept both clientMsgId (preferred) and legacy clientId fields.
-            client_msg_id = (
-                str(
-                    incoming.get("clientMsgId")
-                    or incoming.get("client_msg_id")
-                    or incoming.get("clientId")
-                    or incoming.get("client_id")
-                    or ""
-                ).strip()
-                or str(uuid.uuid4())
+            payload = _lk_livechat_canonical_message(
+                room,
+                text=text,
+                role=sender_role,
+                name=sender_name,
+                sender_id=sender_id,
+                client_msg_id=client_msg_id,
             )
 
-            ts_in = incoming.get("ts")
             try:
-                ts = float(ts_in) if ts_in is not None else time.time()
+                db_id = await run_in_threadpool(_lk_livechat_db_insert_sync, room, payload)
             except Exception:
-                ts = time.time()
+                db_id = None
 
-            out: Dict[str, Any] = {
-                "type": "chat",
-                "eventRef": event_ref,
-                "text": text_val,
-                "clientMsgId": client_msg_id,
-                "ts": ts,
-                "senderId": member_id,
-                "senderRole": role,
-                "name": name,
-            }
-
-            _livechat_push_history(event_ref, out)
-            await run_in_threadpool(_livechat_db_insert_sync, event_ref, out)
-            await _livechat_broadcast(event_ref, out)
-
+            await _lk_livechat_broadcast(room, payload, db_id=db_id)
     except WebSocketDisconnect:
         pass
     except Exception:
-        # Keep the server resilient: drop the connection silently.
         pass
     finally:
         try:
-            if poll_task is not None:
+            if poll_task:
                 poll_task.cancel()
         except Exception:
             pass
-
-        with _LIVECHAT_LOCK:
-            s = _LIVECHAT_CLIENTS.get(event_ref, set())
-            try:
-                s.discard(websocket)
-            except Exception:
-                pass
-            _LIVECHAT_CLIENT_META.pop(websocket, None)
-            if not s:
-                _LIVECHAT_CLIENTS.pop(event_ref, None)
-                _LIVECHAT_HISTORY.pop(event_ref, None)
+        _lk_livechat_unregister(websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
-async def _shared_livechat_send(req: LiveChatSendRequest):
-    event_ref = (req.eventRef or "").strip()
-    if not event_ref:
+async def _lk_livechat_http_send(req: LiveChatSendRequest) -> Dict[str, Any]:
+    room = (req.eventRef or "").strip()
+    if not room:
         raise HTTPException(status_code=400, detail="eventRef is required")
 
-    text_val = str((req.text or req.message or "")).strip()
-    if not text_val:
-        return {"ok": True}
+    text = str(req.text or req.message or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
 
-    sender_id = str((req.senderId or req.memberId or "")).strip()
-    sender_role = _normalize_livechat_role(req.senderRole or req.role or "viewer")
-    name = str((req.name or "")).strip()
+    role = _lk_livechat_norm_role(str(req.senderRole or req.role or "viewer"))
+    name = str(req.name or "").strip()
+    if not name:
+        name = "Host" if role == "host" else "Viewer"
 
-    try:
-        ts = float(req.ts) if req.ts is not None else time.time()
-    except Exception:
-        ts = time.time()
+    sender_id = str(req.senderId or req.memberId or "").strip()
+    client_msg_id = str(req.clientMsgId or "").strip()
 
-    payload: Dict[str, Any] = {
-        "type": "chat",
-        "eventRef": event_ref,
-        "clientMsgId": (req.clientMsgId or str(uuid.uuid4())),
-        "text": text_val,
-        "ts": ts,
-        "senderId": sender_id,
-        "senderRole": sender_role,
-        "name": name,
-    }
+    payload = _lk_livechat_canonical_message(
+        room,
+        text=text,
+        role=role,
+        name=name,
+        sender_id=sender_id,
+        client_msg_id=client_msg_id,
+    )
 
-    _livechat_push_history(event_ref, payload)
-    await run_in_threadpool(_livechat_db_insert_sync, event_ref, payload)
-    await _livechat_broadcast(event_ref, payload)
-    return {"ok": True}
+    # If caller provided an explicit ts, respect it.
+    if req.ts:
+        try:
+            payload["ts"] = float(req.ts)
+        except Exception:
+            pass
+
+    db_id = await run_in_threadpool(_lk_livechat_db_insert_sync, room, payload)
+    await _lk_livechat_broadcast(room, payload, db_id=db_id)
+
+    return {"ok": True, "eventRef": room, "db_id": db_id}
 
 def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str, Any]]) -> str:
     host = ""
@@ -1983,7 +2010,7 @@ def _set_session_active(brand: str, avatar: str, active: bool, event_ref: Option
 #
 # session_active (0/1) remains the truth source for "is a live session active?"
 # session_kind indicates WHAT kind of session is active: "stream" or "conference".
-# session_room is used for conference providers (Jitsi room name).
+# session_room is used for conference providers (LiveKit room name).
 # =============================================================================
 
 def _sanitize_room_token(raw: str, *, max_len: int = 128) -> str:
@@ -2110,7 +2137,7 @@ def _ensure_livekit_columns_best_effort() -> None:
     """Ensure LiveKit-specific columns exist in companion_mappings.
 
     This is NON-DESTRUCTIVE: it only adds columns if missing and never drops any
-    existing (including Stream) columns.
+    existing (including legacy) columns.
     """
     try:
         db_path = _get_companion_mappings_db_path(for_write=True)
@@ -2209,98 +2236,116 @@ def _set_livekit_fields_best_effort(
     except Exception:
         return False
 
+@app.get("/stream/livekit/status_legacy")
+async def livekit_status(brand: str, avatar: str):
+    """Return current LiveKit mapping state for a companion (does not start anything).
+
+    Mirrors the legacy status shape but sources LiveKit-specific fields from DB.
+    """
+    brand = (brand or "").strip()
+    avatar = (avatar or "").strip()
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
+
+    resolved_brand = mapping.get("brand") or brand
+    resolved_avatar = mapping.get("avatar") or avatar
+
+    # Canonical durable reference for the session in this app is event_ref (now used as room name for LiveKit).
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar)
+    mapping["event_ref"] = event_ref
+
+    active = bool(_is_session_active(resolved_brand, resolved_avatar))
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+    if active and not session_kind:
+        session_kind = "stream"
+
+    # LiveKit fields (best-effort; columns may not exist on older DBs)
+    livekit_room_name = ""
+    livekit_hls_url = ""
+    livekit_record_egress_id = ""
+    livekit_hls_egress_id = ""
+    livekit_last_started_at = 0
+    try:
+        db_path = _get_companion_mappings_db_path(for_write=False)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT livekit_room_name, livekit_hls_url, livekit_record_egress_id, livekit_hls_egress_id, livekit_last_started_at
+                FROM companion_mappings
+                WHERE brand = ? AND avatar = ?
+                LIMIT 1
+                """,
+                (resolved_brand, resolved_avatar),
+            )
+            row = cur.fetchone()
+            if row:
+                livekit_room_name = str(row[0] or "").strip()
+                livekit_hls_url = str(row[1] or "").strip()
+                livekit_record_egress_id = str(row[2] or "").strip()
+                livekit_hls_egress_id = str(row[3] or "").strip()
+                try:
+                    livekit_last_started_at = int(row[4] or 0)
+                except Exception:
+                    livekit_last_started_at = 0
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        # ignore; return base fields only
+        pass
+
+    # Normalize: prefer session_room, then livekit_room_name, then event_ref
+    room = (session_room or "").strip() or livekit_room_name or event_ref
+
+    return {
+        "ok": True,
+        "eventRef": room,  # frontend uses this as its durable room reference
+        "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
+        "companionType": str(mapping.get("companion_type") or "").strip(),
+        "live": str(mapping.get("live") or "").strip(),
+        "sessionActive": active,
+        "sessionKind": session_kind,
+        "sessionRoom": room,
+        "livekit": {
+            "roomName": livekit_room_name or room,
+            "hlsUrl": livekit_hls_url,
+            "recordEgressId": livekit_record_egress_id,
+            "hlsEgressId": livekit_hls_egress_id,
+            "lastStartedAt": livekit_last_started_at,
+        },
+    }
+
+
 @app.post("/stream/livekit/livechat/send")
 async def livekit_livechat_send(req: LiveChatSendRequest):
-    """Alias LiveKit chat send to the existing livechat pipeline (room is eventRef)."""
-    return await _shared_livechat_send(req)
+    """Send a LiveKit live-chat message via the shared chat pipeline."""
+    return await _lk_livechat_http_send(req)
 
 
 @app.websocket("/stream/livekit/livechat/{event_ref}")
 async def livekit_livechat_ws(websocket: WebSocket, event_ref: str):
-    """Alias LiveKit chat websocket to the existing livechat pipeline."""
-    return await _shared_livechat_ws(websocket, event_ref)
+    """LiveKit live-chat websocket."""
+    return await _lk_livechat_ws_handler(websocket, event_ref)
 
 
 @app.post("/conference/livekit/livechat/send")
 async def conference_livekit_livechat_send(req: LiveChatSendRequest):
-    """Conference LiveKit chat send (same pipeline as stream)."""
-    return await _shared_livechat_send(req)
+    """Send a LiveKit conference live-chat message."""
+    return await _lk_livechat_http_send(req)
 
 
 @app.websocket("/conference/livekit/livechat/{event_ref}")
 async def conference_livekit_livechat_ws(websocket: WebSocket, event_ref: str):
-    """Conference LiveKit chat websocket (same pipeline as stream)."""
-    return await _shared_livechat_ws(websocket, event_ref)
-
-# =============================================================================
-# Jitsi Conference (one-on-one) session control
-#
-# The front-end embeds Jitsi Meet (External API) when session_active=1 AND
-# session_kind == "conference". Viewers never call /start (host-only).
-# =============================================================================
-
-class JitsiConferenceStartRequest(BaseModel):
-  brand: str
-  avatar: str
-  memberId: str = ""
-  displayName: str = ""
-
-
-class JitsiConferenceStopRequest(BaseModel):
-  brand: str
-  avatar: str
-  memberId: str = ""
-
-
-@app.post("/conference/jitsi/start")
-async def jitsi_conference_start(req: JitsiConferenceStartRequest):
-  resolved_brand = (req.brand or "").strip()
-  resolved_avatar = (req.avatar or "").strip()
-  if not resolved_brand or not resolved_avatar:
-    raise HTTPException(status_code=400, detail="brand and avatar are required.")
-
-  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
-  if not mapping:
-    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
-
-  host_member_id = str(mapping.get("host_member_id") or "").strip()
-  caller_member_id = str(req.memberId or "").strip()
-
-  if not host_member_id or caller_member_id != host_member_id:
-    raise HTTPException(status_code=403, detail="Only the host can start the conference.")
-
-  # Stable, per-companion room name (shared across sessions)
-  room = _sanitize_room_token(f"{resolved_brand}-{resolved_avatar}")
-
-  # Persist state for multi-worker viewers
-  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
-  _set_session_active(resolved_brand, resolved_avatar, True, event_ref=None)
-
-  return {"ok": True, "sessionActive": True, "sessionKind": "conference", "sessionRoom": room}
-
-
-@app.post("/conference/jitsi/stop")
-async def jitsi_conference_stop(req: JitsiConferenceStopRequest):
-  resolved_brand = (req.brand or "").strip()
-  resolved_avatar = (req.avatar or "").strip()
-  if not resolved_brand or not resolved_avatar:
-    raise HTTPException(status_code=400, detail="brand and avatar are required.")
-
-  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
-  if not mapping:
-    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
-
-  host_member_id = str(mapping.get("host_member_id") or "").strip()
-  caller_member_id = str(req.memberId or "").strip()
-
-  if not host_member_id or caller_member_id != host_member_id:
-    raise HTTPException(status_code=403, detail="Only the host can stop the conference.")
-
-  _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
-  # Clear kind/room so next Play click re-prompts host
-  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
-
-  return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
+    """LiveKit conference live-chat websocket."""
+    return await _lk_livechat_ws_handler(websocket, event_ref)
 
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
@@ -2588,7 +2633,9 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
 
         return ok, {
             "minutes_used": int(used_seconds // 60),
-            "minutes_allowed": int(minutes_allowed),
+            "minutes_allowed": int(allowed_seconds // 60),
+            "minutes_included": int(minutes_allowed),
+            "minutes_purchased": int((purchased_seconds or 0.0) // 60),
             "minutes_remaining": int(remaining_seconds // 60),
             "identity_key": identity_key,
         }
@@ -2653,7 +2700,9 @@ def _usage_peek_sync(
         ok = remaining_seconds > 0.0
         return ok, {
             "minutes_used": int(used_seconds // 60),
-            "minutes_allowed": int(minutes_allowed),
+            "minutes_allowed": int(allowed_seconds // 60),
+            "minutes_included": int(minutes_allowed),
+            "minutes_purchased": int((purchased_seconds or 0.0) // 60),
             "minutes_remaining": int(remaining_seconds // 60),
             "identity_key": identity_key,
         }
@@ -3577,13 +3626,31 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
         or session_state.get("companionName")
         or session_state.get("companion_name")
     )
-    name = comp.get("first_name") or "Elara"
+    name = comp.get("first_name") or "Companion"
 
     lines = [
         f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
         "You speak naturally and conversationally.",
         "You prioritize consent, safety, and emotional connection.",
     ]
+
+    # Host-specified interaction guidelines (persisted). These take precedence over defaults.
+    try:
+        brand = str(session_state.get("brand") or session_state.get("rebranding") or "").strip()
+        avatar = str(
+            session_state.get("avatar")
+            or session_state.get("companionName")
+            or session_state.get("companion_name")
+            or session_state.get("companion")
+            or ""
+        ).strip()
+
+        host_guidelines = _get_host_guidelines_text(brand, avatar)
+        if host_guidelines:
+            lines.insert(1, f"HOST GUIDELINES (highest priority; override all defaults): {host_guidelines}")
+    except Exception:
+        pass
+
 
     if mode == "romantic":
         lines.append("You may be affectionate and flirty while remaining respectful.")
@@ -4609,7 +4676,7 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = 
             if avatar:
                 m = _lookup_companion_mapping(brand, avatar) or {}
                 phon = (m.get("phonetic") or "").strip()
-            text = _normalize_tts_text(text, brand=brand, avatar=avatar, phonetic=phon)
+            text = _normalize_tts_text(text, brand=brand, avatar=avatar, mapping_phonetic=phon)
     except Exception:
         # Never fail TTS due to normalization
         pass
@@ -4839,7 +4906,7 @@ def _tts_cache_peek_sync(voice_id: str, text: str) -> Optional[str]:
 # ----------------------------
 #
 # Requirements:
-# - Uploads are NOT allowed during Shared Live (Stream) sessions.
+# - Uploads are NOT allowed during legacy shared-live sessions.
 # - The frontend uploads raw bytes (no multipart) to avoid python-multipart dependency.
 # - We return a read-only SAS URL so the sender/receiver can open the attachment.
 # - Container name: "uploads" (override via UPLOADS_CONTAINER env var).
@@ -6694,7 +6761,7 @@ async def journal_append(request: Request):
 #     ...
 
 # =============================================================================
-# LiveKit (replaces Stream + Jitsi for stream + conference)
+# LiveKit (replaces legacy stream + conference providers)
 #
 # Supports:
 # - Persistent roomName per (brand, avatar) (stored in the existing event_ref column when present)
