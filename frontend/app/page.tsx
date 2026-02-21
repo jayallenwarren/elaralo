@@ -4477,18 +4477,24 @@ const hostSendMessage = async () => {
     setHostPendingActionErr(null);
 
     try {
+      const brand = (companyName || "").trim();
+      const avatar = (companionName || "").trim();
+      const memberId = String(memberIdRef.current || "").trim();
+      const session_id = String(hostSelectedSessionId || "").trim();
+
+      if (!brand || !avatar || !memberId || !session_id) return;
+
       const res = await fetch(`${API_BASE}/host/ai-chats/push-content`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          brand: brandForBackend,
-          avatar: avatarForBackend,
-          memberId: memberIdForBackend,
-          session_id: hostSelectedSessionId,
+          brand,
+          avatar,
+          memberId,
+          session_id,
           token,
         }),
       });
-
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.ok) {
         const detail = data?.detail || data?.error || `HTTP ${res.status}`;

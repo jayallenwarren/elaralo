@@ -639,12 +639,13 @@ def _norm_key(s: str) -> str:
 def _candidate_mapping_db_paths() -> List[str]:
     base_dir = os.path.dirname(__file__)
     env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-    # voice_video_mapping.sqlite3 was a typo; only accept voice_video_mappings.sqlite3.
-    try:
-        if env_path and os.path.basename(env_path) == "voice_video_mapping.sqlite3":
+    # Only accept the canonical mappings DB filename.
+    if env_path:
+        try:
+            if os.path.basename(env_path) != "voice_video_mappings.sqlite3":
+                env_path = ""
+        except Exception:
             env_path = ""
-    except Exception:
-        pass
     candidates = [
         env_path,
         os.path.join(base_dir, "voice_video_mappings.sqlite3"),
