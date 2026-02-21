@@ -905,6 +905,112 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
         return src_db_path
 
 
+
+
+# ---------------------------------------------------------------------------
+# Host companion guideline overrides (persisted)
+# ---------------------------------------------------------------------------
+
+_HOST_GUIDELINES_TABLE = "host_companion_guidelines"
+
+
+def _ensure_host_guidelines_schema(db_path: str) -> None:
+    """Ensure the host companion guideline override table exists."""
+    try:
+        if not db_path:
+            return
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_HOST_GUIDELINES_TABLE} (
+                  brand TEXT NOT NULL,
+                  avatar TEXT NOT NULL,
+                  host_member_id TEXT NOT NULL,
+                  guidelines TEXT NOT NULL,
+                  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY (brand, avatar)
+                );
+                """
+            )
+            conn.execute(
+                f"""CREATE INDEX IF NOT EXISTS idx_hcg_brand_avatar ON {_HOST_GUIDELINES_TABLE}(brand, avatar);"""
+            )
+    except Exception:
+        # Best-effort; do not break the API if schema cannot be created.
+        pass
+
+
+def _mapping_db_path_rw() -> str:
+    """Return a writable mapping DB path (copy-on-write if needed)."""
+    global _COMPANION_MAPPINGS_SOURCE
+    try:
+        if _COMPANION_MAPPINGS_SOURCE and os.path.exists(_COMPANION_MAPPINGS_SOURCE):
+            return _COMPANION_MAPPINGS_SOURCE
+    except Exception:
+        pass
+
+    for p in _candidate_mapping_db_paths():
+        if p and os.path.exists(p):
+            try:
+                rw = _ensure_writable_db_copy(p)
+                _COMPANION_MAPPINGS_SOURCE = rw
+                return rw
+            except Exception:
+                continue
+    return ""
+
+
+def _get_host_guidelines_text(brand: str, avatar: str) -> str:
+    """Fetch stored host guideline overrides for (brand, avatar)."""
+    try:
+        b = _norm_key(brand) or "core"
+        a = _norm_key(avatar)
+        if not a:
+            return ""
+        db_path = _mapping_db_path_rw()
+        if not db_path:
+            return ""
+        _ensure_host_guidelines_schema(db_path)
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                f"SELECT guidelines FROM {_HOST_GUIDELINES_TABLE} WHERE brand=? AND avatar=? LIMIT 1",
+                (b, a),
+            ).fetchone()
+        if not row:
+            return ""
+        return str(row[0] or "").strip()
+    except Exception:
+        return ""
+
+
+def _set_host_guidelines_text(brand: str, avatar: str, host_member_id: str, guidelines: str) -> str:
+    """Upsert host guideline overrides for (brand, avatar). Returns stored text."""
+    b = _norm_key(brand) or "core"
+    a = _norm_key(avatar)
+    h = str(host_member_id or "").strip()
+    g = str(guidelines or "").strip()
+    if not a or not h:
+        return ""
+    db_path = _mapping_db_path_rw()
+    if not db_path:
+        return ""
+    _ensure_host_guidelines_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            f"""
+            INSERT INTO {_HOST_GUIDELINES_TABLE} (brand, avatar, host_member_id, guidelines)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(brand, avatar) DO UPDATE SET
+              host_member_id=excluded.host_member_id,
+              guidelines=excluded.guidelines,
+              update_datetime=CURRENT_TIMESTAMP;
+            """,
+            (b, a, h, g),
+        )
+        conn.commit()
+    return g
+
 def _load_companion_mappings_sync() -> None:
     global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
 
@@ -1044,13 +1150,17 @@ def _load_companion_mappings_sync() -> None:
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
     # Strict: exact (brand, avatar) match required (case-insensitive via _norm_key).
-    # Core brand: empty brand is treated as Elaralo.
-    b = _norm_key(brand) or "elaralo"
+    # Core brand: empty brand is treated as "core" (and will fall back to legacy "elaralo" mappings).
+    b = _norm_key(brand) or "core"
     a = _norm_key(avatar)
     if not a:
         return None
 
-    return _COMPANION_MAPPINGS.get((b, a))
+    m = _COMPANION_MAPPINGS.get((b, a))
+    if not m and b == "core":
+        # Backwards compatibility: some deployments store core mappings under brand "elaralo".
+        m = _COMPANION_MAPPINGS.get(("elaralo", a))
+    return m
 
 
 @app.on_event("startup")
@@ -1063,105 +1173,75 @@ async def _startup_load_companion_mappings() -> None:
 
 
 @app.get("/mappings/companion")
-async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
-    """Lookup a companion mapping row by (brand, avatar).
+async def get_companion_mapping(brand: str = "", avatar: str = ""):
+    """Return the companion mapping for (brand, avatar).
 
-    This endpoint is intentionally STRICT:
-      - exact (brand, avatar) match required (case-insensitive via lower/strip normalization)
-      - errors out when a mapping is missing, so configuration issues are visible during development
-
-    Query params:
-      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
-      - avatar: Avatar first name (e.g., "Jennifer")
-
-    Response (200):
-      {
-        found: true,
-        brand: str,
-        avatar: str,
-        companionType: "Human"|"AI",
-        channel_cap: "Video"|"Audio" ,
-        channelCap: "Video"|"Audio" ,   # alias for convenience
-        live: "D-ID"|"Stream" ,
-        elevenVoiceId: str,
-        elevenVoiceName: str,
-        didAgentId: str,
-        didClientKey: str,
-        didAgentLink: str,
-        didEmbedCode: str,
-        loadedAt: <unix seconds> | null,
-        source: <db path> | ""
-      }
+    Notes:
+      - For backwards compatibility, an empty brand is treated as "core" internally (and may fall back
+        to legacy "elaralo" mappings).
+      - If the caller does not provide a brand, the response brand will be an empty string (to avoid
+        leaking any default/core brand into white-label contexts).
     """
     b_in = (brand or "").strip()
-    a = (avatar or "").strip()
+    a_in = (avatar or "").strip()
 
-    if not a:
-        raise HTTPException(status_code=400, detail="avatar is required")
+    b_key = b_in or "core"
+    a = a_in
 
-    # Core brand default: empty brand => Elaralo
-    b = b_in or "Elaralo"
-
-    m = _lookup_companion_mapping(b, a)
+    m = _lookup_companion_mapping(b_key, a)
     if not m:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": "Companion mapping not found",
-                "brand": b,
-                "avatar": a,
-                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-                "source": _COMPANION_MAPPINGS_SOURCE,
-                "table": _COMPANION_MAPPINGS_TABLE,
-                "count": len(_COMPANION_MAPPINGS),
-            },
-        )
+        raise HTTPException(status_code=404, detail={"brand": b_key, "avatar": a, "error": "Mapping not found"})
 
-    cap_raw = str(m.get("channel_cap") or "").strip()
+    cap_raw = str(m.get("channel_cap") or m.get("channelCap") or "").strip()
     live_raw = str(m.get("live") or "").strip()
-    ctype_raw = str(m.get("companion_type") or "").strip()
+    ctype_raw = str(m.get("companion_type") or m.get("companionType") or "").strip()
 
-    # Strict validation (config contract)
+    if not cap_raw or not live_raw or not ctype_raw:
+        raise HTTPException(status_code=500, detail=f"Invalid mapping row for brand='{b_key}' avatar='{a}'")
+
     cap_lc = cap_raw.lower()
     if cap_lc not in ("video", "audio"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
+            detail=f"Invalid channel_cap in DB for brand='{b_key}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
         )
 
     live_lc = live_raw.lower()
     if live_lc not in ("stream", "d-id"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
+            detail=f"Invalid live in DB for brand='{b_key}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
         )
 
     ctype_lc = ctype_raw.lower()
     if ctype_lc not in ("human", "ai"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
+            detail=f"Invalid companion_type in DB for brand='{b_key}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
         )
 
     # Business rule: AI companions must use D-ID. Human companions must use Stream.
     if ctype_lc == "human" and live_lc != "stream":
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b_key}' avatar='{a}' (got {live_raw!r})",
         )
     if ctype_lc == "ai" and live_lc != "d-id":
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b_key}' avatar='{a}' (got {live_raw!r})",
         )
 
     cap_out = "Video" if cap_lc == "video" else "Audio"
     live_out = "Stream" if live_lc == "stream" else "D-ID"
     ctype_out = "Human" if ctype_lc == "human" else "AI"
 
+    # Do not leak fallback/core brand if the caller did not provide one.
+    brand_out = b_in
+
     return {
         "found": True,
-        "brand": str(m.get("brand") or b),
+        "brand": brand_out,
         "avatar": str(m.get("avatar") or a),
         "hostMemberId": str(m.get("host_member_id") or ""),
         "host_member_id": str(m.get("host_member_id") or ""),
@@ -1183,333 +1263,52 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
     }
 
 
-# ---------------------------------------------------------------------------
-# BeeStreamed: Start WebRTC streams (Live=Stream companions)
-# -----------------------------------------------------------------------------
-# BeeStreamed in-memory session state + shared live chat hub
-# -----------------------------------------------------------------------------
-
-_BEE_SESSION_LOCK = threading.Lock()
-# _BEE_SESSION_STATE[key] = {"active": bool, "event_ref": str, "updated_at": float}
-_BEE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
-
-_LIVECHAT_LOCK = threading.Lock()
-# _LIVECHAT_CLIENTS[event_ref] = set(WebSocket)
-_LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
-# Per-connection identity metadata, keyed by websocket instance.
-# Used so the server can attach senderRole/name to each broadcast.
-_LIVECHAT_CLIENT_META: Dict[WebSocket, Dict[str, str]] = {}
-# Simple in-memory message history per event_ref so late-joiners see recent chat.
-_LIVECHAT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-_LIVECHAT_HISTORY_MAX = 200
+class HostCompanionGuidelinesGetRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
 
 
-def _normalize_livechat_role(role: str) -> str:
-    r = (role or "").strip().lower()
-    if r in ("host", "viewer", "system"):
-        return r
-    return "viewer"
+class HostCompanionGuidelinesSetRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    guidelines: str = ""
 
 
-def _livechat_push_history(event_ref: str, msg: Dict[str, Any]) -> None:
-    # Append a chat message to in-memory history (bounded).
-    event_ref = (event_ref or "").strip()
-    if not event_ref:
-        return
-    with _LIVECHAT_LOCK:
-        hist = _LIVECHAT_HISTORY.get(event_ref)
-        if hist is None:
-            hist = []
-            _LIVECHAT_HISTORY[event_ref] = hist
-        hist.append(msg)
-        if len(hist) > _LIVECHAT_HISTORY_MAX:
-            # Keep the most recent N messages
-            del hist[: len(hist) - _LIVECHAT_HISTORY_MAX]
+@app.post("/host/companion-guidelines/get")
+async def host_get_companion_guidelines(req: HostCompanionGuidelinesGetRequest):
+    """Host-only: fetch stored AI interaction guideline overrides for a companion."""
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
+    member_id = (req.memberId or "").strip()
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    host_member_id = str((mapping or {}).get("host_member_id") or "").strip()
+
+    if not host_member_id or not member_id or member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view companion guidelines")
+
+    text = _get_host_guidelines_text(brand, avatar)
+    return {"ok": True, "guidelines": text}
 
 
+@app.post("/host/companion-guidelines/set")
+async def host_set_companion_guidelines(req: HostCompanionGuidelinesSetRequest):
+    """Host-only: upsert stored AI interaction guideline overrides for a companion."""
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
+    member_id = (req.memberId or "").strip()
+    guidelines = str(req.guidelines or "")
 
-async def _livechat_broadcast(event_ref: str, msg: Dict[str, Any]) -> None:
-    """Broadcast a JSON-serializable message to all connected live-chat clients for an event_ref.
+    mapping = _lookup_companion_mapping(brand, avatar)
+    host_member_id = str((mapping or {}).get("host_member_id") or "").strip()
 
-    This must work reliably with multiple Uvicorn workers. Each worker maintains its own in-memory
-    websocket set, so this broadcasts only to clients connected to THIS worker — which is exactly
-    what we want because each websocket connection is pinned to a worker process.
+    if not host_member_id or not member_id or member_id != host_member_id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify companion guidelines")
 
-    The frontend already de-dupes echoed messages using clientMsgId, so we broadcast to everyone,
-    including the sender.
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return
-
-    try:
-        payload = json.dumps(msg, ensure_ascii=False)
-    except Exception:
-        # Fallback: stringify
-        payload = json.dumps({"type": "error", "error": "Invalid livechat payload"}, ensure_ascii=False)
-
-    # Snapshot sockets under lock so we don't hold the lock during awaits.
-    with _LIVECHAT_LOCK:
-        sockets = list(_LIVECHAT_CLIENTS.get(ref, set()))
-
-    if not sockets:
-        return
-
-    dead: List[WebSocket] = []
-    for ws in sockets:
-        try:
-            await ws.send_text(payload)
-        except Exception:
-            dead.append(ws)
-
-    if dead:
-        with _LIVECHAT_LOCK:
-            s = _LIVECHAT_CLIENTS.get(ref)
-            if s is not None:
-                for ws in dead:
-                    try:
-                        s.discard(ws)
-                    except Exception:
-                        pass
-                    try:
-                        _LIVECHAT_CLIENT_META.pop(ws, None)
-                    except Exception:
-                        pass
-                if not s:
-                    _LIVECHAT_CLIENTS.pop(ref, None)
-                    # Keep history for a bit in case late joiners arrive; do not delete here.
-
-
-# --- Shared (cross-worker) live chat persistence --------------------------------
-#
-# IMPORTANT: The API may run with multiple Uvicorn workers. In-memory websocket client
-# sets are per-worker, so to mirror messages across ALL connected clients we persist
-# live chat messages into the shared SQLite DB and have each websocket connection poll
-# for new rows.
-
-_LIVECHAT_DB_TABLE = os.environ.get('LIVECHAT_DB_TABLE', 'livechat_messages').strip() or 'livechat_messages'
-_LIVECHAT_DB_HISTORY_LIMIT = int(os.environ.get('LIVECHAT_DB_HISTORY_LIMIT', '80') or '80')
-_LIVECHAT_DB_POLL_INTERVAL_SEC = float(os.environ.get('LIVECHAT_DB_POLL_INTERVAL_SEC', '0.35') or '0.35')
-
-def _livechat_db_init_sync(conn) -> None:
-    try:
-        conn.execute(
-            f"""
-CREATE TABLE IF NOT EXISTS {_LIVECHAT_DB_TABLE} (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  event_ref TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  client_msg_id TEXT NOT NULL,
-  payload_json TEXT NOT NULL
-);
-"""
-        )
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{_LIVECHAT_DB_TABLE}_event_id ON {_LIVECHAT_DB_TABLE}(event_ref, id);"
-        )
-    except Exception:
-        # DB is best-effort for live chat. If it fails, the websocket still works per-worker.
-        pass
-
-def _livechat_db_connect_sync(db_path: str):
-    import sqlite3
-
-    conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
-    try:
-        conn.execute('PRAGMA journal_mode=WAL;')
-    except Exception:
-        pass
-    try:
-        conn.execute('PRAGMA synchronous=NORMAL;')
-    except Exception:
-        pass
-    _livechat_db_init_sync(conn)
-    return conn
-
-def _livechat_db_insert_sync(event_ref: str, payload: Dict[str, Any]) -> int:
-    ref = (event_ref or '').strip()
-    if not ref:
-        return 0
-
-    db_path = _get_companion_mappings_db_path(for_write=True)
-    lock_path = db_path + '.livechat.lock'
-    try:
-        with FileLock(lock_path):
-            conn = _livechat_db_connect_sync(db_path)
-            created_at = int(time.time() * 1000)
-            client_msg_id = str(payload.get('clientMsgId') or payload.get('client_msg_id') or '').strip() or str(uuid.uuid4())
-            payload_json = json.dumps(payload, ensure_ascii=False)
-            try:
-                conn.execute(
-                    f"INSERT INTO {_LIVECHAT_DB_TABLE} (event_ref, created_at, client_msg_id, payload_json) VALUES (?,?,?,?)",
-                    (ref, created_at, client_msg_id, payload_json),
-                )
-                row_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-                conn.commit()
-                return int(row_id or 0)
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    except Exception:
-        return 0
-
-def _livechat_db_fetch_history_sync(event_ref: str, limit: int) -> Tuple[int, List[Dict[str, Any]]]:
-    ref = (event_ref or '').strip()
-    if not ref:
-        return 0, []
-
-    db_path = _get_companion_mappings_db_path(for_write=False)
-    try:
-        conn = _livechat_db_connect_sync(db_path)
-        rows = conn.execute(
-            f"SELECT id, payload_json FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=? ORDER BY id DESC LIMIT ?",
-            (ref, int(limit)),
-        ).fetchall()
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return 0, []
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    rows = list(reversed(rows or []))
-    msgs: List[Dict[str, Any]] = []
-    last_id = 0
-    for rid, payload_json in rows:
-        try:
-            rid_int = int(rid or 0)
-            last_id = max(last_id, rid_int)
-        except Exception:
-            pass
-        try:
-            obj = json.loads(payload_json) if payload_json else None
-            if isinstance(obj, dict):
-                msgs.append(obj)
-        except Exception:
-            pass
-    return last_id, msgs
-
-
-def _livechat_db_clear_event_sync(event_ref: str) -> int:
-    """Delete all persisted livechat messages for a given BeeStreamed event_ref.
-
-    We clear per-event history when a new stream session starts so a reused event_ref
-    doesn't replay the previous session's chat.
-    """
-    ref = (event_ref or "").strip()
-    if not ref:
-        return 0
-    db_path = _get_companion_mappings_db_path(for_write=True)
-    lock_path = db_path + ".livechat.lock"
-    deleted = 0
-    try:
-        with FileLock(lock_path):
-            conn = _livechat_db_connect_sync(db_path)
-            try:
-                cur = conn.execute(f"DELETE FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=?", (ref,))
-                conn.commit()
-                try:
-                    deleted = int(cur.rowcount or 0)
-                except Exception:
-                    deleted = 0
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    except Exception:
-        return 0
-    return deleted
-
-
-def _livechat_db_fetch_after_sync(event_ref: str, after_id: int, limit: int = 80) -> Tuple[int, List[Dict[str, Any]]]:
-    ref = (event_ref or '').strip()
-    if not ref:
-        return int(after_id or 0), []
-
-    db_path = _get_companion_mappings_db_path(for_write=False)
-    try:
-        conn = _livechat_db_connect_sync(db_path)
-        rows = conn.execute(
-            f"SELECT id, payload_json FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=? AND id>? ORDER BY id ASC LIMIT ?",
-            (ref, int(after_id or 0), int(limit)),
-        ).fetchall()
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return int(after_id or 0), []
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    msgs: List[Dict[str, Any]] = []
-    last_id = int(after_id or 0)
-    for rid, payload_json in (rows or []):
-        try:
-            rid_int = int(rid or 0)
-            last_id = max(last_id, rid_int)
-        except Exception:
-            pass
-        try:
-            obj = json.loads(payload_json) if payload_json else None
-            if isinstance(obj, dict):
-                msgs.append(obj)
-        except Exception:
-            pass
-    return last_id, msgs
-
-async def _livechat_poll_db(websocket: WebSocket, event_ref: str, after_id: int) -> None:
-    last_id = int(after_id or 0)
-    try:
-        while True:
-            await asyncio.sleep(_LIVECHAT_DB_POLL_INTERVAL_SEC)
-            new_last, msgs = await run_in_threadpool(_livechat_db_fetch_after_sync, event_ref, last_id, 80)
-            if not msgs:
-                last_id = max(last_id, int(new_last or 0))
-                continue
-            last_id = max(last_id, int(new_last or 0))
-            for m in msgs:
-                try:
-                    await websocket.send_text(json.dumps(m, ensure_ascii=False))
-                except Exception:
-                    return
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        return
-
-class LiveChatSendRequest(BaseModel):
-    eventRef: str = ""
-    clientMsgId: Optional[str] = None
-
-    # Accept either 'role' or 'senderRole' from older/newer clients.
-    role: Optional[str] = None
-    senderRole: Optional[str] = None
-
-    # Display name
-    name: Optional[str] = None
-
-    # Accept either 'text' or 'message' from older/newer clients.
-    text: Optional[str] = None
-    message: Optional[str] = None
-
-    # Accept either 'memberId' or 'senderId' from older/newer clients.
-    memberId: Optional[str] = None
-    senderId: Optional[str] = None
-
-    ts: Optional[float] = None
-
+    stored = _set_host_guidelines_text(brand, avatar, host_member_id, guidelines)
+    return {"ok": True, "guidelines": stored}
 
 @app.websocket("/stream/beestreamed/livechat/{event_ref}")
 async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
@@ -3489,7 +3288,9 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
 
         return ok, {
             "minutes_used": int(used_seconds // 60),
-            "minutes_allowed": int(minutes_allowed),
+            "minutes_allowed": int(allowed_seconds // 60),
+            "minutes_included": int(minutes_allowed),
+            "minutes_purchased": int((purchased_seconds or 0.0) // 60),
             "minutes_remaining": int(remaining_seconds // 60),
             "identity_key": identity_key,
         }
@@ -3554,7 +3355,9 @@ def _usage_peek_sync(
         ok = remaining_seconds > 0.0
         return ok, {
             "minutes_used": int(used_seconds // 60),
-            "minutes_allowed": int(minutes_allowed),
+            "minutes_allowed": int(allowed_seconds // 60),
+            "minutes_included": int(minutes_allowed),
+            "minutes_purchased": int((purchased_seconds or 0.0) // 60),
             "minutes_remaining": int(remaining_seconds // 60),
             "identity_key": identity_key,
         }
@@ -4478,13 +4281,31 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
         or session_state.get("companionName")
         or session_state.get("companion_name")
     )
-    name = comp.get("first_name") or "Elara"
+    name = comp.get("first_name") or "Companion"
 
     lines = [
         f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
         "You speak naturally and conversationally.",
         "You prioritize consent, safety, and emotional connection.",
     ]
+
+    # Host-specified interaction guidelines (persisted). These take precedence over defaults.
+    try:
+        brand = str(session_state.get("brand") or session_state.get("rebranding") or "").strip()
+        avatar = str(
+            session_state.get("avatar")
+            or session_state.get("companionName")
+            or session_state.get("companion_name")
+            or session_state.get("companion")
+            or ""
+        ).strip()
+
+        host_guidelines = _get_host_guidelines_text(brand, avatar)
+        if host_guidelines:
+            lines.insert(1, f"HOST GUIDELINES (highest priority; override all defaults): {host_guidelines}")
+    except Exception:
+        pass
+
 
     if mode == "romantic":
         lines.append("You may be affectionate and flirty while remaining respectful.")
@@ -5510,7 +5331,7 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = 
             if avatar:
                 m = _lookup_companion_mapping(brand, avatar) or {}
                 phon = (m.get("phonetic") or "").strip()
-            text = _normalize_tts_text(text, brand=brand, avatar=avatar, phonetic=phon)
+            text = _normalize_tts_text(text, brand=brand, avatar=avatar, mapping_phonetic=phon)
     except Exception:
         # Never fail TTS due to normalization
         pass

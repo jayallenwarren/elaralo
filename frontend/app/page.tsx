@@ -1,9 +1,6 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import elaraLogo from "../public/elaralo-logo.png";
-
-
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
@@ -489,7 +486,7 @@ type CompanionMeta = {
   key: string;
 };
 
-const DEFAULT_COMPANION_NAME = "Elara";
+const DEFAULT_COMPANION_NAME = "Companion";
 
 // Step C (Latency): limit how much chat history we send to /chat.
 // 20 turns ~= 40 messages (user+assistant). System prompt (if present) is always preserved.
@@ -559,8 +556,8 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 }
 
 const GREET_ONCE_KEY = "ELARALO_GREETED";
-const DEFAULT_AVATAR = elaraLogo.src;
-const DEFAULT_COMPANY_NAME = "Elaralo";
+const DEFAULT_AVATAR = "";
+const DEFAULT_COMPANY_NAME = "";
 // Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
 const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
 
@@ -2564,6 +2561,86 @@ useEffect(() => {
 const [hostSendText, setHostSendText] = useState<string>("");
 const [hostNotice, setHostNotice] = useState<string>("");
 
+// Host: companion-level interaction guideline overrides (persisted; highest priority)
+const [hostGuidelinesOpen, setHostGuidelinesOpen] = useState<boolean>(false);
+const [hostGuidelinesText, setHostGuidelinesText] = useState<string>("");
+const [hostGuidelinesSaved, setHostGuidelinesSaved] = useState<string>("");
+const [hostGuidelinesLoading, setHostGuidelinesLoading] = useState<boolean>(false);
+const [hostGuidelinesError, setHostGuidelinesError] = useState<string>("");
+
+const loadHostGuidelines = useCallback(async () => {
+  try {
+    if (!isHost) return;
+    if (!API_BASE) return;
+
+    const brand = String(companyName || "").trim();
+    const avatar = String(companionName || "").trim();
+    const memberId = String(memberIdRef.current || "").trim();
+    if (!brand || !avatar || !memberId) return;
+
+    setHostGuidelinesLoading(true);
+    setHostGuidelinesError("");
+
+    const res = await fetch(`${API_BASE}/host/companion-guidelines/get`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ brand, avatar, memberId }),
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(txt || `HTTP ${res.status}`);
+    }
+
+    const data: any = await res.json().catch(() => ({}));
+    const text = String(data?.guidelines || "").trim();
+
+    setHostGuidelinesSaved(text);
+    setHostGuidelinesText(text);
+    setHostGuidelinesLoading(false);
+  } catch (e: any) {
+    setHostGuidelinesLoading(false);
+    setHostGuidelinesError(String(e?.message || e || "Failed to load guidelines"));
+  }
+}, [API_BASE, isHost, companyName, companionName]);
+
+const saveHostGuidelines = useCallback(async () => {
+  try {
+    if (!isHost) return;
+    if (!API_BASE) return;
+
+    const brand = String(companyName || "").trim();
+    const avatar = String(companionName || "").trim();
+    const memberId = String(memberIdRef.current || "").trim();
+    if (!brand || !avatar || !memberId) return;
+
+    setHostGuidelinesLoading(true);
+    setHostGuidelinesError("");
+
+    const res = await fetch(`${API_BASE}/host/companion-guidelines/set`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ brand, avatar, memberId, guidelines: String(hostGuidelinesText || "") }),
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(txt || `HTTP ${res.status}`);
+    }
+
+    const data: any = await res.json().catch(() => ({}));
+    const text = String(data?.guidelines || String(hostGuidelinesText || "")).trim();
+
+    setHostGuidelinesSaved(text);
+    setHostGuidelinesText(text);
+    setHostGuidelinesLoading(false);
+  } catch (e: any) {
+    setHostGuidelinesLoading(false);
+    setHostGuidelinesError(String(e?.message || e || "Failed to save guidelines"));
+  }
+}, [API_BASE, isHost, companyName, companionName, hostGuidelinesText]);
+
+
   const livekitRoleKnown = livekitRole !== "unknown";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
@@ -2588,7 +2665,7 @@ const [hostNotice, setHostNotice] = useState<string>("");
   // Host: poll join requests while a LiveKit session is active.
   useEffect(() => {
     if (!isHost) return;
-    if (!sessionActive) return;
+    if (!API_BASE || !companyName || !companionName) return;
     let cancelled = false;
 
     const tick = async () => {
@@ -2605,9 +2682,33 @@ const [hostNotice, setHostNotice] = useState<string>("");
           const identity = String(r?.memberId || r?.identity || r?.requestId || "").trim();
           return { ...r, viewerLabel: viewerLabel || "Viewer", identity };
         });
-        if (!cancelled) setLivekitPending(annotated);
+        if (cancelled) return;
+
+        const now = Date.now();
+        setLivekitPending((prev) => {
+          const prior = Array.isArray(prev) ? prev : [];
+          const byKey = new Map<string, any>();
+
+          for (const r of prior) {
+            const key = String((r as any)?.requestId || (r as any)?.identity || (r as any)?.memberId || "").trim();
+            if (!key) continue;
+            byKey.set(key, r);
+          }
+
+          for (const r of annotated) {
+            const key = String((r as any)?.requestId || (r as any)?.identity || (r as any)?.memberId || "").trim();
+            if (!key) continue;
+            byKey.set(key, { ...(r as any), _seenAt: now });
+          }
+
+          const GRACE_MS = 10000;
+          const out = Array.from(byKey.values()).filter((r) => now - Number((r as any)?._seenAt || now) < GRACE_MS);
+
+          out.sort((a, b) => Number((b as any)?.ts || 0) - Number((a as any)?.ts || 0));
+          return out;
+        });
       } catch {
-        if (!cancelled) setLivekitPending([]);
+        // Do NOT clear pending requests on transient errors; keep last known list.
       }
     };
 
@@ -5355,10 +5456,14 @@ useEffect(() => {
     // Once a user has joined a live experience, they should remain connected to shared chat
     // until they explicitly press Stop (host) or opt-out (viewer, private session only).
     const inStreamUi =
-      Boolean(sessionActive) && kind !== "conference" && !!eventRef;
+      kind !== "conference" &&
+      !!eventRef &&
+      (isHost ? Boolean(sessionActive) : Boolean(viewerHasJoinedStream));
 
     const inConferenceUi =
-      (Boolean(sessionActive) || Boolean(conferenceJoined)) && kind === "conference" && !!eventRef;
+      kind === "conference" &&
+      !!eventRef &&
+      (isHost ? Boolean(sessionActive) : Boolean(conferenceJoined));
 
     const inLiveChatUi = inStreamUi || inConferenceUi;
 
@@ -5485,6 +5590,7 @@ useEffect(() => {
     sessionRoom,
     companyName,
     conferenceJoined,
+    viewerHasJoinedStream,
   ]);
 
 
@@ -5501,6 +5607,12 @@ useEffect(() => {
         // Livestream viewers may only learn the active room via status polling (sessionRoom)
         // until they explicitly join.
         eventRef = String(streamEventRef || sessionRoom || "").trim();
+      }
+
+      // Viewers must be actively in the Live UI to send shared chat.
+      if (!isHost) {
+        if (kind === "conference" && !conferenceJoinedRef.current) return;
+        if (kind !== "conference" && !viewerHasJoinedStream) return;
       }
 
       if (!API_BASE || !eventRef) return;
@@ -5805,6 +5917,158 @@ const messagesRef = useRef<Msg[]>([]);
 useEffect(() => {
   messagesRef.current = messages;
 }, [messages]);
+
+// ---------------------------------------------------------------------------
+// Auto-save conversation summaries (requirements):
+// - every 6 turns
+// - when Host override starts
+// - when AI resumes after Host override ends
+// - after 120 seconds of inactivity
+// ---------------------------------------------------------------------------
+const autoSaveSummaryInFlightRef = useRef<boolean>(false);
+const autoSaveSummaryLastAtRef = useRef<number>(0);
+const autoSaveSummaryLastUserTurnsRef = useRef<number>(0);
+const autoSaveSummaryIdleTimerRef = useRef<number | null>(null);
+const autoSaveSummaryLastMsgLenRef = useRef<number>(0);
+
+const autoSaveChatSummary = useCallback(
+  async (reason: string) => {
+    try {
+      if (!API_BASE) return;
+
+      // Throttle: avoid spamming save-summary when multiple triggers fire in quick succession.
+      const now = Date.now();
+      if (autoSaveSummaryInFlightRef.current) return;
+      if (now - autoSaveSummaryLastAtRef.current < 3000) return;
+
+      const msgList = messagesRef.current || [];
+      if (!msgList.length) return;
+
+      autoSaveSummaryInFlightRef.current = true;
+
+      const memberIdForBackend = String(memberIdRef.current || "").trim();
+      const companionForBackend = String(companionKey || companionName || DEFAULT_COMPANION_NAME).trim();
+      const brandForBackend = String(companyName || "").trim();
+
+      const effectivePlanForBackend: PlanName = memberIdForBackend ? (planName as any) : "Trial";
+
+      const session_state = {
+        ...(sessionState || {}),
+        memberId: memberIdForBackend,
+        companion: companionForBackend,
+        companionName: companionForBackend,
+        companion_name: companionForBackend,
+        brand: brandForBackend,
+        avatar: String(companionName || "").trim(),
+        planName: effectivePlanForBackend,
+        plan_name: effectivePlanForBackend,
+        plan_label: String(planLabelOverride || "").trim(),
+      } as any;
+
+      const messagesForSummary = msgList
+        .filter((m) => {
+          const meta: any = (m as any)?.meta || {};
+          if (meta?.includeInAiContext === false) return false;
+          if (meta?.liveChat) return false;
+          return true;
+        })
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      const res = await fetch(`${API_BASE}/chat/save-summary`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          memberId: memberIdForBackend,
+          session_state,
+          messages: messagesForSummary,
+          reason,
+        }),
+      });
+
+      // Treat non-2xx as non-fatal (auto-save is best-effort).
+      if (res.ok) {
+        autoSaveSummaryLastAtRef.current = now;
+      }
+    } catch {
+      // ignore
+    } finally {
+      autoSaveSummaryInFlightRef.current = false;
+    }
+  },
+  [
+    API_BASE,
+    companionKey,
+    companionName,
+    companyName,
+    planLabelOverride,
+    planName,
+    sessionState,
+  ],
+);
+
+// Every message append: schedule idle timer (120s).
+useEffect(() => {
+  const len = (messagesRef.current || []).length || 0;
+  if (!len) return;
+
+  autoSaveSummaryLastMsgLenRef.current = len;
+
+  if (autoSaveSummaryIdleTimerRef.current) {
+    window.clearTimeout(autoSaveSummaryIdleTimerRef.current);
+    autoSaveSummaryIdleTimerRef.current = null;
+  }
+
+  const startLen = len;
+  autoSaveSummaryIdleTimerRef.current = window.setTimeout(() => {
+    const curLen = (messagesRef.current || []).length || 0;
+    if (curLen !== startLen) return; // activity occurred
+    void autoSaveChatSummary("idle_120s");
+  }, 120000);
+
+  return () => {
+    if (autoSaveSummaryIdleTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryIdleTimerRef.current);
+      autoSaveSummaryIdleTimerRef.current = null;
+    }
+  };
+}, [messages.length, autoSaveChatSummary]);
+
+// Every 6 user turns (user messages) once the assistant has replied.
+useEffect(() => {
+  const msgList = messagesRef.current || [];
+  if (!msgList.length) return;
+
+  const last = msgList[msgList.length - 1];
+  if (!last || last.role !== "assistant") return;
+
+  const userTurns = msgList.filter((m) => {
+    if (m.role !== "user") return false;
+    const meta: any = (m as any)?.meta || {};
+    if (meta?.includeInAiContext === false) return false;
+    if (meta?.liveChat) return false;
+    return true;
+  }).length;
+
+  if (!userTurns) return;
+  if (userTurns % 6 !== 0) return;
+  if (autoSaveSummaryLastUserTurnsRef.current === userTurns) return;
+
+  autoSaveSummaryLastUserTurnsRef.current = userTurns;
+  void autoSaveChatSummary(`turns_${userTurns}`);
+}, [messages.length, autoSaveChatSummary]);
+
+// Host override transitions: save immediately on start/end.
+const prevHostOverrideRef = useRef<boolean>(false);
+useEffect(() => {
+  const cur = Boolean((sessionState as any)?.host_override_active);
+  const prev = prevHostOverrideRef.current;
+
+  if (cur === prev) return;
+  prevHostOverrideRef.current = cur;
+
+  void autoSaveChatSummary(cur ? "host_override_enabled" : "host_override_ended_ai_resumed");
+}, [sessionState, autoSaveChatSummary]);
+
 
 const stopConferenceSession = useCallback(async () => {
   if (stopInProgressRef.current) return;
@@ -6216,6 +6480,8 @@ useEffect(() => {
   const sttRecoverTimerRef = useRef<number | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
+  const sttNotAllowedFailsRef = useRef<number>(0);
+  const sttLastNotAllowedAtRef = useRef<number>(0);
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
@@ -6500,7 +6766,10 @@ useEffect(() => {
         (hasEntitledPlan ? "intimate" : "romantic");
 
       // Requirement: the *Elaralo* entitlement plan determines how many mode pills exist.
+      // The Wix `modePill` selects the initially-active mode (if allowed), but does NOT change how many pills are shown.
+
       const nextAllowed = allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan);
+
       setAllowedModes(nextAllowed);
 
       setSessionState((prev) => {
@@ -8015,6 +8284,24 @@ const pauseSpeechToText = useCallback(() => {
       }
 
       if (code === "not-allowed" || code === "service-not-allowed") {
+        const now = Date.now();
+        const hadMic = Boolean(micGrantedRef.current);
+        const withinWindow = now - sttLastNotAllowedAtRef.current < 15000;
+        sttLastNotAllowedAtRef.current = now;
+        sttNotAllowedFailsRef.current = withinWindow ? (sttNotAllowedFailsRef.current + 1) : 1;
+
+        // If the user previously granted mic access and we get a transient "not-allowed" from
+        // the Web Speech service, do NOT force the user to re-click the mic button.
+        if (hadMic && sttNotAllowedFailsRef.current <= 2) {
+          setSttError("Microphone temporarily unavailable. Retrying…" + getEmbedHint());
+          try {
+            rec.stop?.();
+          } catch {}
+          scheduleRestart();
+          return;
+        }
+
+        // Hard denial (initial block) or repeated failures: disable STT.
         sttEnabledRef.current = false;
         sttPausedRef.current = false;
         setSttEnabled(false);
@@ -8022,13 +8309,10 @@ const pauseSpeechToText = useCallback(() => {
         clearSttSilenceTimer();
         clearSttRestartTimer();
         clearSttRecoverTimer();
-        clearSttRecoverTimer();
         setSttError("Microphone permission was blocked." + getEmbedHint());
         try {
           rec.stop?.();
-        } catch (e) {
-          // ignore
-        }
+        } catch {}
         return;
       }
 
@@ -8744,7 +9028,7 @@ const sttControls =
         🎤
       </button>
 
-      {liveProvider !== "stream" && (
+      {!livekitUiActive && (
         <button
           type="button"
           onClick={handleStopClick}
@@ -8887,7 +9171,7 @@ const modePillControls = (
 
 
 
-          {(!rebrandingKey || String(rebrandingKey).trim() === "") && (
+          {false && (
             <button
               type="button"
               onClick={() => {
@@ -10435,7 +10719,7 @@ const modePillControls = (
             </div>
             <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
               Saving stores a server-side summary of this conversation for future reference across your devices.
-              By selecting <b>Yes, save</b>, you authorize AI Elara to store chat summary data associated with your
+              By selecting <b>Yes, save</b>, you authorize your AI companion to store chat summary data associated with your
               account for later use.
               <div style={{ marginTop: 8 }}>
                 All audio, video, and mic listening have been stopped. You can resume manually using the controls
@@ -10768,6 +11052,116 @@ const modePillControls = (
           </div>
         </div>
       ) : null}
+
+      {/* Host guidelines modal */}
+      {hostGuidelinesOpen ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 65,
+            background: "rgba(0,0,0,0.65)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+          onClick={() => setHostGuidelinesOpen(false)}
+        >
+          <div
+            style={{
+              width: "min(820px, 100%)",
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+              <div>
+                <div style={{ fontWeight: 800, fontSize: 16 }}>AI interaction guidelines</div>
+                <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
+                  These rules are stored for this companion and applied to all future chats.
+                  If they conflict with default onboarding, <b>these guidelines take precedence</b>.
+                </div>
+              </div>
+              <button
+                style={{
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  background: "transparent",
+                  borderRadius: 8,
+                  padding: "6px 10px",
+                  cursor: "pointer",
+                }}
+                onClick={() => setHostGuidelinesOpen(false)}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              <textarea
+                value={hostGuidelinesText}
+                onChange={(e) => setHostGuidelinesText(e.target.value)}
+                placeholder="Examples: Off-limits topics, preferred terms of endearment (e.g., call viewers “papi”), tone/style constraints…"
+                style={{
+                  width: "100%",
+                  minHeight: 220,
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  padding: 12,
+                  fontSize: 14,
+                  lineHeight: 1.4,
+                  outline: "none",
+                  resize: "vertical",
+                }}
+              />
+              {hostGuidelinesError ? (
+                <div style={{ marginTop: 10, color: "#b00020", fontSize: 13 }}>{hostGuidelinesError}</div>
+              ) : null}
+
+              <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
+                Saved: {hostGuidelinesSaved ? "Yes" : "No"} • Characters: {String(hostGuidelinesText || "").length}
+              </div>
+            </div>
+
+            <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                style={{
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  background: "transparent",
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  cursor: "pointer",
+                }}
+                onClick={() => {
+                  // Revert draft to last saved value
+                  setHostGuidelinesText(hostGuidelinesSaved || "");
+                }}
+                disabled={hostGuidelinesLoading}
+              >
+                Revert
+              </button>
+
+              <button
+                style={{
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  background: "rgba(0,0,0,0.06)",
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  cursor: "pointer",
+                }}
+                onClick={() => void saveHostGuidelines()}
+                disabled={hostGuidelinesLoading}
+              >
+                {hostGuidelinesLoading ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <div
         style={{
           display: "flex",
@@ -10784,6 +11178,27 @@ const modePillControls = (
             {companyName} · {companionName || DEFAULT_COMPANION_NAME}
           </div>
         </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            setHostGuidelinesError("");
+            setHostGuidelinesOpen(true);
+            void loadHostGuidelines();
+          }}
+          style={{
+            border: "1px solid rgba(0,0,0,0.12)",
+            background: "rgba(0,0,0,0.04)",
+            borderRadius: 10,
+            padding: "8px 10px",
+            cursor: "pointer",
+            fontSize: 12,
+            marginRight: 8,
+          }}
+          title="Edit AI companion interaction guidelines (persisted)"
+        >
+          AI Guidelines
+        </button>
 
         {hostPendingContent.length > 0 ? (
           <button
