@@ -1446,6 +1446,30 @@ async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
                 _LIVECHAT_HISTORY.pop(event_ref, None)
 
 
+
+
+class LiveChatSendRequest(BaseModel):
+    eventRef: str = ""
+    clientMsgId: Optional[str] = None
+
+    # Accept either 'role' or 'senderRole' from older/newer clients.
+    role: Optional[str] = None
+    senderRole: Optional[str] = None
+
+    # Display name
+    name: Optional[str] = None
+
+    # Accept either 'text' or 'message' from older/newer clients.
+    text: Optional[str] = None
+    message: Optional[str] = None
+
+    # Accept either 'memberId' or 'senderId' from older/newer clients.
+    memberId: Optional[str] = None
+    senderId: Optional[str] = None
+
+    ts: Optional[float] = None
+
+
 @app.post("/stream/beestreamed/livechat/send")
 async def beestreamed_livechat_send(req: LiveChatSendRequest):
     event_ref = (req.eventRef or "").strip()
