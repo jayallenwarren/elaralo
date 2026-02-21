@@ -9043,19 +9043,34 @@ const sttControls =
           type="button"
           onClick={handleStopClick}
           disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference)}
+          title="Stop"
+          aria-label="Stop"
           style={{
-            border: "1px solid rgba(255,255,255,0.35)",
-            background: "transparent",
-            color: "#fff",
             width: 44,
             height: 44,
-            borderRadius: 12,
-            cursor: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? "pointer" : "not-allowed",
-            opacity: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? 1 : 0.45,
-            fontWeight: 700,
+            minWidth: 44,
+            borderRadius: 10,
+            border: "1px solid #111",
+            background:
+              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
+                ? "#fff"
+                : "#eee",
+            color: "#111",
+            cursor:
+              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
+                ? "pointer"
+                : "not-allowed",
+            opacity:
+              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
+                ? 1
+                : 0.6,
+            fontWeight: 800,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
           }}
         >
-          ■
+          <StopIcon />
         </button>
       )}
 </>
