@@ -3954,12 +3954,19 @@ useEffect(() => {
           DEFAULT_COMPANION_NAME).trim();
 
       const pollSessionState: SessionState = {
+        ...(sessionStateRef.current as any),
+
         memberId: memberIdForBackend,
+        member_id: memberIdForBackend,
+
         companion: companionForBackend,
         companionName: companionForBackend,
         companion_name: companionForBackend,
+
+        // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
         brand: (companyName || "").trim(),
         avatar: (companionName || "").trim(),
+
         planName: planName || null,
         rebrandingKey: stripTrialControlsFromRebrandingKey(rebrandingKey),
         rebranding: rawBrand,
