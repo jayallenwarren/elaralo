@@ -8649,6 +8649,14 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
 
         # Some Wix payloads use shape B: { "data": { instanceId, eventType, identity, data } }
         d0 = envelope_obj.get("data")
+        # Some Wix JWTs wrap the envelope/event JSON under the "data" claim as a *string*.
+        # Try to JSON-decode it so the unwrapping logic below can see eventType/instanceId/etc.
+        if isinstance(d0, str):
+            try:
+                d0_parsed = json.loads(d0)
+                d0 = d0_parsed
+            except Exception:
+                pass
         if isinstance(d0, dict) and ("data" in d0) and ("eventType" in d0 or "instanceId" in d0 or "identity" in d0 or "webhookId" in d0):
             envelope_obj = d0
 
@@ -8670,7 +8678,8 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                     identity_raw = cur.get("identity")
                 inner = cur.get("data")
             else:
-                inner = cur
+                # If this looks like a JWT wrapper (e.g. {"data": "...", "iat": ..., "exp": ...}), unwrap one level.
+                inner = cur.get("data") if isinstance(cur, dict) and ("data" in cur) else cur
 
             # Parse JSON-string inner payloads
             if isinstance(inner, str):
