@@ -9449,7 +9449,14 @@ const modePillControls = (
                 </div>
 
                 <input
-                  type="email"
+                  // NOTE: type="text" avoids any browser/device-level character filtering.
+                  // We validate the email on submit; do not restrict characters while typing.
+                  type="text"
+                  inputMode="email"
+                  autoComplete="email"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
                   value={topupEmail}
                   onChange={(e) => {
                     setTopupEmail(e.target.value);

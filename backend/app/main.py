@@ -3324,6 +3324,66 @@ def _maybe_pick_and_record_user_content_sync(
 
 
 
+def _content_is_trigger_minute(minutes_used: int) -> bool:
+    '''
+    True when minutes_used is exactly a trigger minute: 9, 19, 29, 39, ...
+
+    NOTE: We still use a more forgiving "due minute" mechanism below so we don't miss
+    a trigger if minutes jump (e.g., 8 -> 10 due to max-per-turn billing).
+    '''
+    try:
+        mu = int(minutes_used or 0)
+    except Exception:
+        return False
+    if mu < 9:
+        return False
+    return ((mu - 9) % 10) == 0
+
+
+def _content_due_trigger_minute(minutes_used: int, last_sent_minute: int) -> Optional[int]:
+    '''
+    Returns the trigger minute we should deliver now, or None if nothing is due.
+
+    Intended behavior:
+      - Triggers at 9, 19, 29, 39, ...
+      - If minutes jump over an exact trigger (ex: 8 -> 10), deliver the missed trigger (9).
+      - If we're far behind (ex: last_sent=-1 and minutes_used=80), do NOT spam multiple
+        content drops; deliver only the most recent trigger <= minutes_used.
+    '''
+    try:
+        mu_now = int(minutes_used or 0)
+    except Exception:
+        mu_now = 0
+
+    try:
+        last_sent = int(last_sent_minute or -1)
+    except Exception:
+        last_sent = -1
+
+    if mu_now < 9:
+        return None
+
+    # Next expected trigger after last_sent (or first trigger at 9).
+    next_trigger = 9 if last_sent < 9 else (last_sent + 10)
+
+    if mu_now < next_trigger:
+        return None
+
+    # If we're behind by >= 10 minutes (meaning we missed at least one trigger interval),
+    # deliver only the most recent trigger <= mu_now to avoid rapid catch-up spam.
+    if (mu_now - next_trigger) >= 10:
+        latest_trigger = mu_now - ((mu_now - 9) % 10)
+        if latest_trigger <= last_sent:
+            return None
+        return latest_trigger
+
+    # Normal case: we're at/just past the next trigger.
+    if next_trigger <= last_sent:
+        return None
+    return next_trigger
+
+
+
 
 async def _maybe_schedule_mode_content_drop(
     *,
@@ -3346,12 +3406,9 @@ async def _maybe_schedule_mode_content_drop(
     The selection cursor and eligibility window are persisted in SQLite (user_content_history).
     """
     try:
-        mu = int(minutes_used or 0)
+        mu_now = int(minutes_used or 0)
     except Exception:
-        mu = 0
-
-    if not _content_is_trigger_minute(mu):
-        return None
+        mu_now = 0
 
     # Dedupe across:
     #   - session_state (member side)
@@ -3374,8 +3431,13 @@ async def _maybe_schedule_mode_content_drop(
     except Exception:
         last_sent_server_i = -1
 
-    if mu == max(last_sent_state_i, last_sent_server_i):
+    last_sent_i = max(last_sent_state_i, last_sent_server_i)
+
+    # Determine which trigger minute is due (forgiving of minute-jumps).
+    mu = _content_due_trigger_minute(mu_now, last_sent_i)
+    if mu is None:
         return None
+
 
     # Brand for content directory and content serving route
     try:
@@ -3407,6 +3469,21 @@ async def _maybe_schedule_mode_content_drop(
     )
     if not isinstance(payload, dict) or not payload:
         return None
+
+    # Diagnostic log line (helps confirm scheduling/selection without exposing private content).
+    try:
+        att_dbg = payload.get("attachment") or {}
+        fn_dbg = str(att_dbg.get("name") or "").strip()
+        logger.info(
+            "[content] scheduled drop brand=%s mode=%s trigger_minute=%s minutes_used=%s file=%s",
+            str(brand_for_content),
+            str(effective_mode),
+            int(mu),
+            int(mu_now),
+            fn_dbg,
+        )
+    except Exception:
+        pass
 
     # Mark dedupe in both session_state and server record.
     try:
