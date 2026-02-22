@@ -1149,18 +1149,50 @@ def _load_companion_mappings_sync() -> None:
 
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
-    # Strict: exact (brand, avatar) match required (case-insensitive via _norm_key).
-    # Core brand: empty brand is treated as "core" (and will fall back to legacy "elaralo" mappings).
+    """
+    Lookup companion mapping (voice/phonetic/etc.) for a given brand+avatar.
+
+    In production we see multiple avatar formats:
+      - Display name: "Dulce"
+      - Descriptive key: "Dulce-Female-Black-Millennials"
+
+    The DB may store either value in `companion_mappings.avatar`. This lookup supports both.
+    """
     b = _norm_key(brand) or "core"
-    a = _norm_key(avatar)
+    raw_avatar = (avatar or "").strip()
+    a = _norm_key(raw_avatar)
     if not a:
         return None
 
+    # 1) Exact match
     m = _COMPANION_MAPPINGS.get((b, a))
     if not m and b == "core":
         # Backwards compatibility: some deployments store core mappings under brand "elaralo".
         m = _COMPANION_MAPPINGS.get(("elaralo", a))
-    return m
+    if m:
+        return m
+
+    # 2) If the incoming avatar is a descriptive key, try the display-name token.
+    if "-" in raw_avatar:
+        first = _norm_key(raw_avatar.split("-", 1)[0])
+        if first:
+            m = _COMPANION_MAPPINGS.get((b, first))
+            if not m and b == "core":
+                m = _COMPANION_MAPPINGS.get(("elaralo", first))
+            if m:
+                return m
+
+    # 3) If the incoming avatar is just a display name, try prefix matching against
+    #    descriptive keys stored in the DB (e.g. "dulce" -> "dulce-female-black-millennials").
+    best: Optional[Dict[str, Any]] = None
+    for (bb, aa), mm in _COMPANION_MAPPINGS.items():
+        if bb != b and not (b == "core" and bb == "elaralo"):
+            continue
+        if aa == a:
+            return mm
+        if aa.startswith(a + "-"):
+            best = best or mm
+    return best
 
 
 @app.on_event("startup")
@@ -3542,6 +3574,7 @@ def _is_minutes_balance_question(text: str) -> bool:
         "time remaining",
         "time left",
         "how many minutes",
+        "how many more minutes",
         "how much time",
         "minutes balance",
         "balance minutes",
@@ -3632,6 +3665,7 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
         f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
         "You speak naturally and conversationally.",
         "You prioritize consent, safety, and emotional connection.",
+        "If the user shares image attachments, you can view them and describe what you see.",
     ]
 
     # Host-specified interaction guidelines (persisted). These take precedence over defaults.
@@ -3664,26 +3698,129 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
 
     return " ".join(lines)
 
+# --- Attachments / Vision support ---
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+_ATTACHMENT_BLOCK_RE = re.compile(r"(?:^|\n)Attachment:\s*(?P<name>[^\n]+)\n(?P<url>\S+)", re.IGNORECASE)
+
+def _extract_attachments_from_text(content: str) -> tuple[str, list[dict[str, str]]]:
+    """
+    Extract attachment blocks injected by the frontend:
+
+        Attachment: filename.png
+        https://...
+
+    Returns: (cleaned_text_without_blocks, attachments=[{name,url}, ...])
+    """
+    if not content:
+        return "", []
+    attachments: list[dict[str, str]] = []
+
+    def _repl(m: re.Match) -> str:
+        name = str(m.group("name") or "").strip()
+        url = str(m.group("url") or "").strip()
+        # Trim common trailing punctuation
+        url = url.rstrip(").,;")
+        attachments.append({"name": name, "url": url})
+        return ""
+
+    cleaned = _ATTACHMENT_BLOCK_RE.sub(_repl, content)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, attachments
+
+def _is_image_attachment(name: str, url: str) -> bool:
+    probe = (name or "").strip().lower()
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url or "").path.lower()
+    except Exception:
+        path = (url or "").lower()
+
+    for ext in _IMAGE_EXTS:
+        if probe.endswith(ext) or path.endswith(ext):
+            return True
+    return False
+
+def _messages_contain_images(openai_messages: List[Dict[str, Any]]) -> bool:
+    for m in openai_messages or []:
+        c = m.get("content")
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
 
 def _to_openai_messages(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     session_state: dict,
     *,
     mode: str,
-    intimate_allowed: bool,
-    debug: bool
-):
-    sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
-    _dbg(debug, "SYSTEM PROMPT:", sys)
+    intimate_allowed: bool = False,
+    system_blocks: Optional[List[str]] = None,
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    base_system = _build_persona_system_prompt(
+        session_state=session_state,
+        mode=mode,
+        intimate_allowed=intimate_allowed,
+    )
+    out.append({"role": "system", "content": base_system})
+    for block in system_blocks or []:
+        if block:
+            out.append({"role": "system", "content": block})
 
-    out = [{"role": "system", "content": sys}]
-    for m in messages:
-        if m.get("role") in ("user", "assistant"):
-            out.append({"role": m["role"], "content": m.get("content", "")})
+    for m in messages or []:
+        role = str(m.get("role") or "user")
+        content = m.get("content", "")
+
+        # Frontend injects attachments as text blocks. Convert image attachments into multimodal parts.
+        if role == "user" and isinstance(content, str):
+            cleaned_text, attachments = _extract_attachments_from_text(content)
+            image_urls: list[str] = []
+            non_image: list[dict[str, str]] = []
+
+            for att in attachments:
+                name = str(att.get("name") or "").strip()
+                url = str(att.get("url") or "").strip()
+                if not (name or url):
+                    continue
+                if url and _is_image_attachment(name, url):
+                    image_urls.append(url)
+                else:
+                    non_image.append({"name": name, "url": url})
+
+            text = (cleaned_text or "").strip()
+            if non_image:
+                extra_lines: list[str] = []
+                for a in non_image:
+                    nm = (a.get("name") or "attachment").strip()
+                    uu = (a.get("url") or "").strip()
+                    extra_lines.append(f"- {nm}: {uu}" if uu else f"- {nm}")
+                extra = "\n".join(extra_lines).strip()
+                if extra:
+                    text = f"{text}\n\nAttachments:\n{extra}" if text else f"Attachments:\n{extra}"
+
+            if image_urls:
+                parts: list[dict[str, Any]] = []
+                if text:
+                    parts.append({"type": "text", "text": text})
+                for url in image_urls:
+                    parts.append({"type": "image_url", "image_url": {"url": url}})
+                out.append({"role": role, "content": parts})
+                if debug:
+                    logger.info("Vision: converted %d image attachment(s) into image_url parts.", len(image_urls))
+            else:
+                out.append({"role": role, "content": text})
+        else:
+            # Preserve any non-string payloads (future-proofing).
+            out.append({"role": role, "content": content if content is not None else ""})
+
     return out
 
 
-def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
+
+def _call_gpt4o(messages: List[Dict[str, Any]]) -> str:
     from openai import OpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -3723,7 +3860,7 @@ def _xai_base_url() -> str:
     return url
 
 
-def _call_xai_chat(messages: List[Dict[str, str]]) -> str:
+def _call_xai_chat(messages: List[Dict[str, Any]]) -> str:
     """Call xAI (OpenAI-compatible) chat completions endpoint."""
     from openai import OpenAI
 
@@ -3995,12 +4132,12 @@ def _fetch_onboarding_join_for_avatar_sync(avatar: str) -> Optional[Dict[str, An
                 FROM    {_HCO_TABLE} a,
                         {mapping_table} b
                 WHERE   a.companion_id = b.id
-                  AND   lower(b.avatar) = lower(?)
+                  AND   (lower(b.avatar) = lower(?) OR lower(b.avatar) LIKE lower(?) || '-%')
                 ORDER BY COALESCE(a.ingested_at, 0) DESC,
                          COALESCE(a.created_date, '') DESC
                 LIMIT 1;
                 """,
-                (a,),
+                (a, a),
             )
         else:
             # Fallback to name match (useful if onboarding table doesn't yet have companion_id)
@@ -4015,12 +4152,12 @@ def _fetch_onboarding_join_for_avatar_sync(avatar: str) -> Optional[Dict[str, An
                 FROM    {_HCO_TABLE} a,
                         {mapping_table} b
                 WHERE   lower(a.first_name) = lower(?)
-                  AND   lower(b.avatar) = lower(?)
+                  AND   (lower(b.avatar) = lower(?) OR lower(b.avatar) LIKE lower(?) || '-%')
                 ORDER BY COALESCE(a.ingested_at, 0) DESC,
                          COALESCE(a.created_date, '') DESC
                 LIMIT 1;
                 """,
-                (a, a),
+                (a, a, a),
             )
 
         row = cur.fetchone()
@@ -4052,6 +4189,7 @@ def _build_onboarding_system_block(joined: Dict[str, Any]) -> str:
     We intentionally do NOT include PII fields like email/phone/birthday.
     """
     avatar = _pick_first(joined, "avatar", "first_name") or "Companion"
+    website = _website_url_from_joined(joined)
 
     def f(*cand: str) -> str:
         return _pick_first(joined, *cand)
@@ -4081,6 +4219,7 @@ def _build_onboarding_system_block(joined: Dict[str, Any]) -> str:
     lines = [
         f"AI Representative onboarding context for {avatar} (internal guidance):",
         f"You are speaking *as* {avatar}. Use these preferences as style/boundary guidance.",
+        ("- Website: " + website) if website else "",
         "Do NOT mention forms/SQLite/imports. Do NOT quote these bullets verbatim.",
     ]
 
@@ -4338,25 +4477,74 @@ def _get_public_site_summary_cached_sync(url: str, avatar: str) -> str:
 
 
 def _website_url_from_joined(joined: Dict[str, Any]) -> str:
-    """Extract a public website URL from the onboarding row."""
-    url = _pick_first(joined, "personal_website", "Personal Website", "website", "site")
-    if url:
-        return url
+    """Extract and normalize a public website URL from the onboarding row."""
+    if not joined:
+        return ""
 
-    # If raw_json exists, try it too
-    raw = joined.get("raw_json")
-    if isinstance(raw, str) and raw.strip():
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, dict):
-                for k in ("Personal Website", "personal_website", "website", "site"):
-                    v = obj.get(k)
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
-        except Exception:
-            pass
+    # 1) Known/common column names (we keep this intentionally broad).
+    url = _pick_first(
+        joined,
+        "personal_website",
+        "Personal Website",
+        "personalWebsite",
+        "website_url",
+        "Website URL",
+        "website",
+        "Website",
+        "public_website",
+        "Public Website",
+        "homepage",
+        "Homepage",
+        "home_page",
+        "Home Page",
+        "site",
+        "Site",
+        "url",
+        "URL",
+        "domain",
+        "Domain",
+    )
 
-    return ""
+    # 2) Heuristic scan (covers custom schemas like "companion_website", etc.)
+    if not url:
+        for k, v in joined.items():
+            kl = str(k).strip().lower()
+            if kl in {"upgrade_url", "upgradeurl"}:
+                continue
+            if any(tok in kl for tok in ("website", "homepage", "home_page", "site", "domain")):
+                if isinstance(v, str) and v.strip():
+                    url = v.strip()
+                    break
+
+    # 3) Fallback: website inside raw_json
+    if not url:
+        raw_json = joined.get("raw_json")
+        if isinstance(raw_json, str) and raw_json.strip():
+            try:
+                obj = json.loads(raw_json)
+                if isinstance(obj, dict):
+                    for k in ("personal_website", "website_url", "website", "site", "url", "homepage", "domain"):
+                        v = obj.get(k)
+                        if isinstance(v, str) and v.strip():
+                            url = v.strip()
+                            break
+            except Exception:
+                pass
+
+    if not url:
+        return ""
+
+    url = str(url).strip().strip('"').strip("'")
+    if not url:
+        return ""
+
+    # Normalize scheme: fetchers do better with an explicit scheme.
+    if url.startswith("www."):
+        url = "https://" + url
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        url = "https://" + url
+
+    return url
 
 
 def _build_public_site_system_block(avatar: str, url: str, summary: str) -> str:
@@ -4646,14 +4834,32 @@ def _normalize_tts_text(
     avatar = (avatar or "").strip()
     mapping_phonetic = (mapping_phonetic or "").strip()
     if avatar and mapping_phonetic:
-        # Handle CamelCase concatenations (e.g., "DulceMoon") by inserting a space.
-        s = re.sub(
-            rf"(?i)(?<![A-Za-z0-9]){re.escape(avatar)}(?=[A-Z])",
-            mapping_phonetic + " ",
-            s,
-        )
-        # Word-boundary replacement (normal case)
-        s = _apply_phonetic_word_boundary(s, avatar, mapping_phonetic)
+        # Support both display-name and descriptive-key avatar formats.
+        raw = str(avatar).strip()
+        targets = [raw]
+        if "-" in raw:
+            targets.append(raw.split("-", 1)[0].strip())
+        if " " in raw:
+            targets.append(raw.split(" ", 1)[0].strip())
+
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for t in targets:
+            tl = t.lower()
+            if t and tl not in seen:
+                seen.add(tl)
+                uniq.append(t)
+
+        for t in uniq:
+            # Handle CamelCase concatenations (e.g., "DulceMoon") by inserting a space before replacement.
+            s = re.sub(
+                rf"(?i)(?<![A-Za-z0-9]){re.escape(t)}(?=[A-Z])",
+                mapping_phonetic + " ",
+                s,
+            )
+            # Word-boundary replacement (normal case)
+            s = _apply_phonetic_word_boundary(s, t, mapping_phonetic)
+
 
     # 5) Optional brand phonetic (future-proof; not currently required).
     brand_phonetic = (brand_phonetic or "").strip()
@@ -5711,10 +5917,18 @@ async def chat(request: Request):
             llm_messages.insert(insert_at, {"role": "system", "content": handoff_note})
             insert_at += 1
 
-        if llm_provider == "xai":
-            assistant_reply = _call_xai_chat(llm_messages)
-        else:
-            assistant_reply = _call_gpt4o(llm_messages)
+        try:
+            if llm_provider == "xai":
+                assistant_reply = _call_xai_chat(llm_messages)
+            else:
+                assistant_reply = _call_gpt4o(llm_messages)
+        except Exception as e:
+            # If the user attached images and the xAI model rejects multimodal input, fall back to OpenAI vision.
+            if llm_provider == "xai" and _messages_contain_images(llm_messages):
+                logger.warning("xAI chat failed for multimodal input; falling back to OpenAI. error=%r", e)
+                assistant_reply = _call_gpt4o(llm_messages)
+            else:
+                raise
     except Exception as e:
         _dbg(debug, "LLM call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
@@ -6247,7 +6461,11 @@ def _ai_override_best_summary(rec: Dict[str, Any]) -> Tuple[str, str]:
 # This is intentionally simple; durable storage / retrieval strategy can be evolved
 # incrementally without changing the frontend contract.
 _CHAT_SUMMARY_STORE: Dict[str, Dict[str, Any]] = {}
-_CHAT_SUMMARY_FILE = os.getenv("CHAT_SUMMARY_FILE", "")
+_CHAT_SUMMARY_FILE = (os.getenv("CHAT_SUMMARY_FILE", "") or "").strip()
+# Default to a persisted location on Azure App Service so summaries survive multi-worker deployments.
+# (Azure: any data outside '/home' is not persisted.)
+if not _CHAT_SUMMARY_FILE:
+    _CHAT_SUMMARY_FILE = "/home/chat_summaries.json"
 _CHAT_SUMMARY_FILE_MTIME: float = 0.0
 
 # Lock for cross-worker file refresh/write coordination (best-effort).

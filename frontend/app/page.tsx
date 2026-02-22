@@ -2038,40 +2038,40 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
 
   useEffect(() => {
-    // Keep state in sync with localStorage as the user switches companions/brands.
-    // Fallback to sessionStorage if localStorage is blocked (common in some iframe/privacy modes).
+    // Keep state in sync with persistent storage as the user switches companions/brands.
+    // NOTE: In embedded/iframe contexts, localStorage may be partitioned or blocked; we keep fallbacks.
     try {
       if (typeof window === "undefined") return;
 
-      let stored = "";
-      try {
-        stored = String((() => {
-          try {
-            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
-            if (v && String(v).trim()) return v;
-          } catch (e) {}
-          try {
-            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
-            if (v2 && String(v2).trim()) return v2;
-          } catch (e) {}
-          return "";
-        })() || "").trim();
-      } catch (e) {
-        stored = "";
-      }
+      const GLOBAL_LIVECHAT_KEY = "dm_livechat_username";
+
+      const tryGet = (k: string): string => {
+        try {
+          const v = window.localStorage.getItem(k);
+          if (v && String(v).trim()) return String(v).trim();
+        } catch {}
+        try {
+          const v2 = window.sessionStorage.getItem(k);
+          if (v2 && String(v2).trim()) return String(v2).trim();
+        } catch {}
+        return "";
+      };
+
+      let stored = tryGet(liveChatUsernameStorageKey) || tryGet(GLOBAL_LIVECHAT_KEY);
+
       if (!stored) {
         try {
-          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
-        } catch (e) {
-          stored = "";
-        }
+          const nm = String((window as any).name || "");
+          if (nm.startsWith("lcname:")) stored = nm.slice("lcname:".length).trim();
+        } catch {}
       }
 
-      setViewerLiveChatName(stored);
-    } catch (e) {
+      setViewerLiveChatName(String(stored || "").trim());
+    } catch {
       setViewerLiveChatName("");
     }
   }, [liveChatUsernameStorageKey]);
+
 
   // LiveKit identity conventions used by the backend:
   //   - user:<memberId> when memberId is available
@@ -2240,25 +2240,35 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
       return cleaned;
     }
 
-    const suggested = "Viewer";
+    const systemId = getLivekitSystemIdentity();
+
+    const memberIdRaw = String(memberId || "").trim();
+    const memberIdClean = memberIdRaw.replace(/^Anon:\s*/i, "").trim();
+    const idForFallback = String(memberIdClean || memberIdRaw || systemId)
+      .replace(/^(user:|anon:)/i, "")
+      .replace(/^Anon:\s*/i, "")
+      .trim();
+    const shortId = idForFallback.slice(0, 4);
+    const fallbackName = `Viewer - ${shortId || "Anon"}`;
+
+    const suggested = "";
     const promptText =
-      opts?.promptText || "Choose a username to display during the live session:";
+      opts?.promptText || "Choose a name to display during the live session:";
     const name = window.prompt(promptText, suggested);
 
-    // Requirement: if the viewer does not enter a name (blank or cancel), use a LiveKit system identifier.
-    const systemId = getLivekitSystemIdentity();
+    // Requirement: if the viewer does not enter a name (blank or cancel), use a stable fallback like "Viewer - 1234".
 
     const cleaned =
       String(name ?? "")
         .replace(/[\r\n\t]+/g, " ")
         .replace(/\s+/g, " ")
         .trim()
-        .slice(0, 50) || systemId;
+        .slice(0, 50) || fallbackName;
 
     setViewerLiveChatName(cleaned);
     storeEverywhere(cleaned);
     return cleaned;
-  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, getLivekitSystemIdentity]);
+  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, memberId, getLivekitSystemIdentity]);
 
 
   const changeViewerLiveChatName = useCallback(() => {
@@ -5275,6 +5285,48 @@ const hostSendMessage = async () => {
     };
   }, [upgradeWatching, requestLatestMemberPlanFromParent]);
 
+
+  // Auto-recovery when chat minutes are exhausted:
+  //  - keep polling /usage/status so credited minutes unlock without refresh
+  //  - keep nudging the parent iframe to refresh MEMBER_PLAN (covers plan upgrades)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const exhausted = Boolean((sessionStateRef.current as any)?.minutes_exhausted);
+    if (!exhausted) return;
+
+    // Start the upgrade watcher so MEMBER_PLAN refreshes continue even if the user upgraded in another tab.
+    try {
+      startUpgradeWatch("auto_minutes_exhausted");
+    } catch (e) {}
+
+    let cancelled = false;
+
+    const pollOnce = async () => {
+      if (cancelled) return;
+      try {
+        const stillExhausted = Boolean((sessionStateRef.current as any)?.minutes_exhausted);
+        if (!stillExhausted) return;
+
+        // Refresh backend usage/balance.
+        await refreshUsageStatusOnce();
+
+        // Also request the latest plan from the parent (Wix), if available.
+        try {
+          requestLatestMemberPlanFromParent("minutes_exhausted_poll");
+        } catch (e) {}
+      } catch (e) {}
+    };
+
+    pollOnce();
+    const t = window.setInterval(pollOnce, 4000);
+
+    return () => {
+      cancelled = true;
+      try { window.clearInterval(t); } catch (e) {}
+    };
+  }, [sessionState?.minutes_exhausted, refreshUsageStatusOnce, requestLatestMemberPlanFromParent, startUpgradeWatch]);
+
   // Stop upgrade polling once we detect a plan or login state change.
   useEffect(() => {
     if (!upgradeWatching) return;
@@ -6483,6 +6535,7 @@ useEffect(() => {
   const sttLastAudioCaptureAtRef = useRef<number>(0);
   const sttNotAllowedFailsRef = useRef<number>(0);
   const sttLastNotAllowedAtRef = useRef<number>(0);
+  const sttEverStartedRef = useRef<boolean>(false);
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
@@ -8253,6 +8306,7 @@ const pauseSpeechToText = useCallback(() => {
       setSttRunning(true);
       setSttError(null);
 
+      sttEverStartedRef.current = true;
       micGrantedRef.current = true;
       setMicGranted(true);
       // reset audio-capture fail window on successful start
@@ -8295,14 +8349,14 @@ const pauseSpeechToText = useCallback(() => {
 
       if (code === "not-allowed" || code === "service-not-allowed") {
         const now = Date.now();
-        const hadMic = Boolean(micGrantedRef.current);
+        const hadMic = Boolean(micGrantedRef.current || sttEverStartedRef.current);
+
         const withinWindow = now - sttLastNotAllowedAtRef.current < 15000;
         sttLastNotAllowedAtRef.current = now;
-        sttNotAllowedFailsRef.current = withinWindow ? (sttNotAllowedFailsRef.current + 1) : 1;
+        sttNotAllowedFailsRef.current = withinWindow ? sttNotAllowedFailsRef.current + 1 : 1;
 
-        // If the user previously granted mic access and we get a transient "not-allowed" from
-        // the Web Speech service, do NOT force the user to re-click the mic button.
-        if (hadMic && sttNotAllowedFailsRef.current <= 2) {
+        // If we've ever started successfully, treat this as transient and auto-recover.
+        if (hadMic && sttNotAllowedFailsRef.current <= 8) {
           setSttError("Microphone temporarily unavailable. Retrying…" + getEmbedHint());
           try {
             rec.stop?.();
