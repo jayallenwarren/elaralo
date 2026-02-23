@@ -64,15 +64,21 @@ const MicOffIcon = ({ size = 18 }: { size?: number }) => (
     focusable="false"
     style={{ display: "block" }}
   >
+    {/* Muted mic: lighter mic + slash */}
     <path
-      d="M19 11a7 7 0 0 1-1.62 4.5l-1.43-1.43A5 5 0 0 0 17 11h2zM12 14a3 3 0 0 0 3-3V8.41l-6 6A3 3 0 0 0 12 14zm7-9.19L4.81 19 3.39 17.58 7.17 13.8A5 5 0 0 1 7 12V11h2v1c0 .36.06.7.17 1.02l1.6-1.6A3 3 0 0 1 9 11V5a3 3 0 0 1 5.12-2.12L17.59 1.4 19 2.81 15.41 6.4V11c0 .36-.06.7-.17 1.02l3.76 3.76A7 7 0 0 0 19 11zm-7 13.89V21h-2v-2.08A7 7 0 0 1 5 11h2a5 5 0 0 0 4.29 4.92l.71-.71A3 3 0 0 1 11 14.7z"
+      d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"
       fill="currentColor"
+      opacity="0.35"
+    />
+    <path
+      d="M4 4l16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.4"
+      strokeLinecap="round"
     />
   </svg>
 );
-
-
-
 const TrashIcon = ({ size = 18 }: { size?: number }) => (
   <svg
     width={size}
