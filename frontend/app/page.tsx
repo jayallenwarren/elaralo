@@ -10608,7 +10608,7 @@ const modePillControls = (
                             ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
                             : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
                             ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
-                            : "Type a message…"
+                            : "Click microphone or type message to talk with me…"
                         }
                         style={{
                           flex: 1,
