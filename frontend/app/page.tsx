@@ -9079,7 +9079,12 @@ const sttControls =
         title="Audio"
         style={{
           width: 44,
+          height: 44,
           minWidth: 44,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 0,
           borderRadius: 10,
           border: "1px solid #111",
           background: sttEnabled ? "#b00020" : "#fff",
@@ -9089,7 +9094,7 @@ const sttControls =
           fontWeight: 700,
         }}
       >
-        🎤
+        {sttEnabled ? <MicOnIcon size={20} /> : <MicOffIcon size={20} />}
       </button>
 
       {!livekitUiActive && (
