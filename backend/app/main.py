@@ -5679,7 +5679,36 @@ async def chat(request: Request):
             payg_increment_minutes=pay_go_minutes,
             payg_price_text=payg_price_text_override,
         )
-        return await _respond(reply, STATUS_SAFE, session_state_out)
+        content_payload = None
+        try:
+            scheduled = _maybe_schedule_mode_content_drop(
+                session_id=session_id,
+                session_state_out=session_state_out,
+                usage_info=usage_info,
+                identity_key=identity_key,
+                debug=debug,
+            )
+            if scheduled:
+                token, delivery = scheduled
+                content_payload = delivery
+                _dbg(debug, f"User content drop: scheduled token={token} kind={delivery.get('kind')} mode={delivery.get('mode')} brand={delivery.get('brand')}")
+                try:
+                    _relay_emit(
+                        session_id,
+                        {
+                            "kind": "content_pending",
+                            "token": token,
+                            "mode": delivery.get("mode"),
+                            "brand": delivery.get("brand"),
+                            "sentAt": int(time.time()),
+                        },
+                    )
+                except Exception as e:
+                    _dbg(debug, f"User content drop: relay emit failed: {e!r}")
+        except Exception as e:
+            _dbg(debug, f"User content drop: schedule failed: {e!r}")
+
+        return await _respond(reply, STATUS_SAFE, session_state_out, content=content_payload)
 
     # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
