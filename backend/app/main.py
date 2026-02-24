@@ -3164,11 +3164,11 @@ def _maybe_pick_and_record_user_content_sync(
 
     folder_path = _brand_content_dir(brand, mode_norm)
     if not folder_path or not os.path.isdir(folder_path):
-        return None
+        return {"__skip_reason": "missing_content_dir", "__skip_detail": str(folder_path or "")}
 
     db_path = _user_content_db_path_sync()
     if not db_path:
-        return None
+        return {"__skip_reason": "missing_content_db_path", "__skip_detail": ""}
 
     now_utc = datetime.utcnow()
     credit_ts = int(last_credit_at or 0)
@@ -3176,7 +3176,7 @@ def _maybe_pick_and_record_user_content_sync(
 
     history_key = (member_id_for_history or "").strip() or (identity_key or "").strip()
     if not history_key:
-        return None
+        return {"__skip_reason": "missing_history_key", "__skip_detail": ""}
 
     with _USER_CONTENT_LOCK:
         conn = sqlite3.connect(db_path)
@@ -3233,7 +3233,10 @@ def _maybe_pick_and_record_user_content_sync(
                 # Friend: exactly 1 item per 24h, unless minutes were credited (PayGo/upgrade) since last item.
                 start_new_window = (last_row is None) or window_expired or credit_after_window
                 if not start_new_window:
-                    return None
+                    return {
+                        "__skip_reason": "ineligible_window",
+                        "__skip_detail": f"window_seconds={CONTENT_ELIGIBILITY_WINDOW_SECONDS} last_drop_ts={last_drop_ts} last_credit_at={last_credit_at}",
+                    }
             else:
                 # Romantic/Intimate:
                 # - A "set" starts with a "begin" file and ends with an "end" file.
@@ -3246,7 +3249,11 @@ def _maybe_pick_and_record_user_content_sync(
                 elif (last_stage or "") == "end":
                     # Set is complete; allow a new one only if credit has reset the timer.
                     if not credit_after_window:
-                        return None
+                        return {
+                            "__skip_reason": "ineligible_need_credit_reset",
+                            "__skip_detail": f"window_seconds={CONTENT_ELIGIBILITY_WINDOW_SECONDS} last_drop_ts={last_drop_ts} last_credit_at={last_credit_at}",
+                        }
+
                     start_new_window = True
                 else:
                     # Mid-set (begin/sequence...): continue regardless of credit resets.
@@ -3259,7 +3266,10 @@ def _maybe_pick_and_record_user_content_sync(
             require_begin = bool(start_new_window and mode_norm in ("romantic", "intimate"))
             fn = _find_next_content_file(folder_path, next_seq_int, require_begin=require_begin)
             if not fn:
-                return None
+                return {
+                    "__skip_reason": "no_next_content_file",
+                    "__skip_detail": f"seq={next_seq_int} require_begin={require_begin}",
+                }
 
             full_path = os.path.join(folder_path, fn)
             meta = _parse_content_filename(fn)
@@ -3433,10 +3443,20 @@ async def _maybe_schedule_mode_content_drop(
 
     last_sent_i = max(last_sent_state_i, last_sent_server_i)
 
-    # Determine which trigger minute is due (forgiving of minute-jumps).
-    mu = _content_due_trigger_minute(mu_now, last_sent_i)
-    if mu is None:
-        return None
+    # Next scheduled trigger minute (9, 19, 29, ...) based on what was last sent.
+    next_trigger = 9 if last_sent_i < 9 else (last_sent_i + 10)
+
+    # Host-override pre-window (T-1 -> T):
+    # If the Host has overridden AI chat any time in the minute leading up to the next scheduled drop,
+    # we queue the drop to the Host immediately (so the Host can optionally share it at the drop time).
+    # We still "charge" the drop to the scheduled trigger minute for dedupe/scheduling.
+    if override_active and mu_now >= (next_trigger - 1) and mu_now < next_trigger:
+        mu = next_trigger
+    else:
+        # Determine which trigger minute is due (forgiving of minute-jumps).
+        mu = _content_due_trigger_minute(mu_now, last_sent_i)
+        if mu is None:
+            return None
 
 
     # Brand for content directory and content serving route
@@ -3445,9 +3465,64 @@ async def _maybe_schedule_mode_content_drop(
     except Exception:
         brand_for_content = str(session_state_out.get("brand") or session_state_out.get("rebranding") or "Elaralo").strip() or "Elaralo"
 
+    def _skiplog_once(reason: str, detail: str = "") -> None:
+        """Log a single diagnostic line once per trigger minute when a drop was due but skipped."""
+        try:
+            trig = int(mu)
+        except Exception:
+            return
+
+        # Dedupe (client session_state + server override session record)
+        try:
+            last_state = int((session_state_out or {}).get("contentLastSkipLogMinute") or -1)
+        except Exception:
+            last_state = -1
+
+        rec2 = _ai_override_get_session(session_id) if session_id else None
+        try:
+            last_server = int((rec2 or {}).get("content_last_skip_log_minute") or -1)
+        except Exception:
+            last_server = -1
+
+        if trig <= max(last_state, last_server):
+            return
+
+        ident_short = (identity_key or "")[:12]
+        try:
+            mu_now_i = int(mu_now)
+        except Exception:
+            mu_now_i = -1
+
+        try:
+            logger.info(
+                "[content] drop skipped reason=%s brand=%s mode=%s trigger_minute=%s minutes_used=%s identity=%s detail=%s",
+                reason,
+                brand_for_content,
+                effective_mode,
+                trig,
+                mu_now_i,
+                ident_short,
+                (detail or "")[:240],
+            )
+        except Exception:
+            return
+
+        try:
+            session_state_out["contentLastSkipLogMinute"] = trig
+        except Exception:
+            pass
+
+        if rec2 is not None:
+            rec2["content_last_skip_log_minute"] = trig
+            try:
+                _ai_override_persist()
+            except Exception:
+                pass
+
     member_for_history = _extract_member_id(session_state_out) or ""
     history_key = (member_for_history or "").strip() or (identity_key or "").strip()
     if not history_key:
+        _skiplog_once("missing_history_key")
         return None
 
     utype = "member" if (member_for_history or "").strip() else "visitor"
@@ -3467,7 +3542,13 @@ async def _maybe_schedule_mode_content_drop(
         mode=effective_mode,
         last_credit_at=int(credit_at or 0),
     )
+    # Skip-reason sentinel from the picker (allows a single, explicit skip log line).
+    if isinstance(payload, dict) and payload.get("__skip_reason"):
+        _skiplog_once(str(payload.get("__skip_reason") or "skipped"), str(payload.get("__skip_detail") or ""))
+        return None
+
     if not isinstance(payload, dict) or not payload:
+        _skiplog_once("picker_returned_empty")
         return None
 
     # Diagnostic log line (helps confirm scheduling/selection without exposing private content).
