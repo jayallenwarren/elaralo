@@ -3579,6 +3579,9 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     # friend
     if any(p in t for p in [
         "switch to friend",
+        "change to friend",
+        "move to friend",
+        "make it friend",
         "go to friend",
         "back to friend",
         "friend mode",
@@ -3591,9 +3594,12 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     # romantic
     if any(p in t for p in [
         "switch to romantic",
+        "change to romantic",
+        "move to romantic",
         "go to romantic",
         "back to romantic",
         "romantic mode",
+        "romance mode",
         "set romantic",
         "set mode to romantic",
         "turn on romantic",
@@ -3604,6 +3610,8 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     # intimate/explicit
     if any(p in t for p in [
         "switch to intimate",
+        "change to intimate",
+        "move to intimate",
         "go to intimate",
         "back to intimate",
         "intimate mode",
@@ -3615,6 +3623,8 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
         "set explicit",
         "set mode to explicit",
         "turn on explicit",
+        "adult mode",
+        "18+ mode",
     ]):
         return "intimate"
 
@@ -3676,8 +3686,12 @@ def _looks_intimate(text: str) -> bool:
     return any(
         k in t
         for k in [
-            "explicit", "intimate", "nsfw", "sex", "nude", "porn",
-            "fuck", "cock", "pussy", "blowjob", "anal", "orgasm",
+            # Mode / intent
+            "explicit", "intimate", "nsfw", "adult", "18+",
+            # Common explicit content terms (kept intentionally simple: substring match)
+            "sex", "sexy", "nude", "naked", "porn",
+            "fuck", "fucking", "cock", "dick", "penis", "pussy", "vagina",
+            "blowjob", "oral", "anal", "orgasm", "cum",
         ]
     )
 

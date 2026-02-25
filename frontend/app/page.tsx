@@ -1216,13 +1216,14 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   const soft = t.trim();
 
   const wantsFriend =
-    /\b(switch|set|turn|go|back)\b.*\bfriend\b/.test(soft) || /\bfriend mode\b/.test(soft);
+    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\bfriend\b/.test(soft) ||
+    /\bfriend mode\b/.test(soft);
 
   const wantsRomantic =
     // "romantic mode" / "romance mode"
     /\b(romantic|romance) mode\b/.test(soft) ||
     // switch/set/back/go/turn ... romantic
-    /\b(switch|set|turn|go|back)\b.*\b(romantic|romance)\b/.test(soft) ||
+    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(romantic|romance)\b/.test(soft) ||
     // natural phrasing users actually type
     /\b(let['’]?s|lets)\b.*\b(romantic|romance)\b/.test(soft) ||
     /\b(be|being|try|trying|have|having)\b.*\b(romantic|romance)\b/.test(soft) ||
@@ -1231,7 +1232,7 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
     /\btry romance again\b/.test(soft);
 
   const wantsIntimate =
-    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
+    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
     /\b(intimate|explicit) mode\b/.test(soft);
 
   if (wantsFriend) return { mode: "friend", cleaned: raw };
@@ -1992,6 +1993,13 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
 
   // For rebrands, show the rebranding site's plan label when Wix provides it (e.g., "Supreme").
   const [planLabelOverride, setPlanLabelOverride] = useState<string>("");
+
+  // Wix postMessage can arrive multiple times (init + periodic refreshes). We only want the Wix-provided
+  // modePill to choose the *initial* mode (or a *changed* mode) — it must not continuously override
+  // user-initiated mode switches inside the chat.
+  const wixLastRequestedModeRef = useRef<Mode | null>(null);
+  const wixLastFingerprintRef = useRef<string>("");
+  const wixAppliedModeOnceRef = useRef<boolean>(false);
 
   // Upgrade URL (defaults to env; overridden by RebrandingKey when present)
   const upgradeUrl = useMemo(() => {
@@ -6901,12 +6909,34 @@ useEffect(() => {
 
       const wixRequestedMode: Mode | null = modeFromModePill(incomingModePillRaw);
 
+      // Wix can post MEMBER_PLAN more than once (init + periodic refresh). We must not continuously
+      // override user-driven mode switches inside the chat. We only force-apply Wix modePill when:
+      //   - this is the first MEMBER_PLAN we processed, OR
+      //   - the plan context changed (new member/plan/rebrandingKey), OR
+      //   - Wix actually changed the modePill value.
+      const fp = `${incomingMemberId || ""}|${String(effectivePlan || "").trim()}|${String(rawRebrandingKey || "").trim()}`;
+      const isPlanRefresh = fp !== wixLastFingerprintRef.current;
+      wixLastFingerprintRef.current = fp;
+
+      const wixModeChanged = Boolean(
+        wixRequestedMode && wixRequestedMode !== wixLastRequestedModeRef.current
+      );
+      if (wixRequestedMode) {
+        wixLastRequestedModeRef.current = wixRequestedMode;
+      }
+
+      const shouldForceWixMode = Boolean(
+        wixRequestedMode &&
+          nextAllowed.includes(wixRequestedMode) &&
+          (!wixAppliedModeOnceRef.current || isPlanRefresh || wixModeChanged)
+      );
+      wixAppliedModeOnceRef.current = true;
+
       setSessionState((prev) => {
         let nextMode: Mode = prev.mode;
 
-        // Requirement: if Wix provides a modePill and it is allowed by the Elaralo entitlement plan,
-        // it MUST be the selected mode pill on load/plan refresh (regardless of the previously-stored mode).
-        if (wixRequestedMode && nextAllowed.includes(wixRequestedMode)) {
+        // Force-apply Wix modePill only on init / plan refresh / Wix mode change.
+        if (shouldForceWixMode) {
           nextMode = wixRequestedMode;
         } else {
           // Otherwise, preserve the previous mode if allowed; if not allowed, fall back.
