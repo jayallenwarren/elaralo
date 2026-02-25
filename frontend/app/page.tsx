@@ -1,11 +1,13 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import elaraLogo from "../public/elaralo-logo.png";
+
+
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
-import elaraLogo from "../public/elaralo-logo.png";
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
   <svg
     width={size}
@@ -64,21 +66,15 @@ const MicOffIcon = ({ size = 18 }: { size?: number }) => (
     focusable="false"
     style={{ display: "block" }}
   >
-    {/* Muted mic: lighter mic + slash */}
     <path
-      d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"
+      d="M19 11a7 7 0 0 1-1.62 4.5l-1.43-1.43A5 5 0 0 0 17 11h2zM12 14a3 3 0 0 0 3-3V8.41l-6 6A3 3 0 0 0 12 14zm7-9.19L4.81 19 3.39 17.58 7.17 13.8A5 5 0 0 1 7 12V11h2v1c0 .36.06.7.17 1.02l1.6-1.6A3 3 0 0 1 9 11V5a3 3 0 0 1 5.12-2.12L17.59 1.4 19 2.81 15.41 6.4V11c0 .36-.06.7-.17 1.02l3.76 3.76A7 7 0 0 0 19 11zm-7 13.89V21h-2v-2.08A7 7 0 0 1 5 11h2a5 5 0 0 0 4.29 4.92l.71-.71A3 3 0 0 1 11 14.7z"
       fill="currentColor"
-      opacity="0.35"
-    />
-    <path
-      d="M4 4l16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.4"
-      strokeLinecap="round"
     />
   </svg>
 );
+
+
+
 const TrashIcon = ({ size = 18 }: { size?: number }) => (
   <svg
     width={size}
@@ -2029,7 +2025,7 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   }, [upgradeUrl]);
 
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = (rebrandingName || (parseRebrandingKey(rebrandingKey || "")?.rebranding || "") || DEFAULT_COMPANY_NAME);
+  const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
@@ -2044,40 +2040,40 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
 
   useEffect(() => {
-    // Keep state in sync with persistent storage as the user switches companions/brands.
-    // NOTE: In embedded/iframe contexts, localStorage may be partitioned or blocked; we keep fallbacks.
+    // Keep state in sync with localStorage as the user switches companions/brands.
+    // Fallback to sessionStorage if localStorage is blocked (common in some iframe/privacy modes).
     try {
       if (typeof window === "undefined") return;
 
-      const GLOBAL_LIVECHAT_KEY = "dm_livechat_username";
-
-      const tryGet = (k: string): string => {
-        try {
-          const v = window.localStorage.getItem(k);
-          if (v && String(v).trim()) return String(v).trim();
-        } catch {}
-        try {
-          const v2 = window.sessionStorage.getItem(k);
-          if (v2 && String(v2).trim()) return String(v2).trim();
-        } catch {}
-        return "";
-      };
-
-      let stored = tryGet(liveChatUsernameStorageKey) || tryGet(GLOBAL_LIVECHAT_KEY);
-
+      let stored = "";
+      try {
+        stored = String((() => {
+          try {
+            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
+            if (v && String(v).trim()) return v;
+          } catch (e) {}
+          try {
+            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
+            if (v2 && String(v2).trim()) return v2;
+          } catch (e) {}
+          return "";
+        })() || "").trim();
+      } catch (e) {
+        stored = "";
+      }
       if (!stored) {
         try {
-          const nm = String((window as any).name || "");
-          if (nm.startsWith("lcname:")) stored = nm.slice("lcname:".length).trim();
-        } catch {}
+          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+        } catch (e) {
+          stored = "";
+        }
       }
 
-      setViewerLiveChatName(String(stored || "").trim());
-    } catch {
+      setViewerLiveChatName(stored);
+    } catch (e) {
       setViewerLiveChatName("");
     }
   }, [liveChatUsernameStorageKey]);
-
 
   // LiveKit identity conventions used by the backend:
   //   - user:<memberId> when memberId is available
@@ -2246,35 +2242,25 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
       return cleaned;
     }
 
-    const systemId = getLivekitSystemIdentity();
-
-    const memberIdRaw = String(memberId || "").trim();
-    const memberIdClean = memberIdRaw.replace(/^Anon:\s*/i, "").trim();
-    const idForFallback = String(memberIdClean || memberIdRaw || systemId)
-      .replace(/^(user:|anon:)/i, "")
-      .replace(/^Anon:\s*/i, "")
-      .trim();
-    const shortId = idForFallback.slice(0, 4);
-    const fallbackName = `Viewer - ${shortId || "Anon"}`;
-
-    const suggested = "";
+    const suggested = "Viewer";
     const promptText =
-      opts?.promptText || "Choose a name to display during the live session:";
+      opts?.promptText || "Choose a username to display during the live session:";
     const name = window.prompt(promptText, suggested);
 
-    // Requirement: if the viewer does not enter a name (blank or cancel), use a stable fallback like "Viewer - 1234".
+    // Requirement: if the viewer does not enter a name (blank or cancel), use a LiveKit system identifier.
+    const systemId = getLivekitSystemIdentity();
 
     const cleaned =
       String(name ?? "")
         .replace(/[\r\n\t]+/g, " ")
         .replace(/\s+/g, " ")
         .trim()
-        .slice(0, 50) || fallbackName;
+        .slice(0, 50) || systemId;
 
     setViewerLiveChatName(cleaned);
     storeEverywhere(cleaned);
     return cleaned;
-  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, memberId, getLivekitSystemIdentity]);
+  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, getLivekitSystemIdentity]);
 
 
   const changeViewerLiveChatName = useCallback(() => {
@@ -2578,86 +2564,6 @@ useEffect(() => {
 const [hostSendText, setHostSendText] = useState<string>("");
 const [hostNotice, setHostNotice] = useState<string>("");
 
-// Host: companion-level interaction guideline overrides (persisted; highest priority)
-const [hostGuidelinesOpen, setHostGuidelinesOpen] = useState<boolean>(false);
-const [hostGuidelinesText, setHostGuidelinesText] = useState<string>("");
-const [hostGuidelinesSaved, setHostGuidelinesSaved] = useState<string>("");
-const [hostGuidelinesLoading, setHostGuidelinesLoading] = useState<boolean>(false);
-const [hostGuidelinesError, setHostGuidelinesError] = useState<string>("");
-
-const loadHostGuidelines = useCallback(async () => {
-  try {
-    if (!isHost) return;
-    if (!API_BASE) return;
-
-    const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
-    if (!brand || !avatar || !memberId) return;
-
-    setHostGuidelinesLoading(true);
-    setHostGuidelinesError("");
-
-    const res = await fetch(`${API_BASE}/host/companion-guidelines/get`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand, avatar, memberId }),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(txt || `HTTP ${res.status}`);
-    }
-
-    const data: any = await res.json().catch(() => ({}));
-    const text = String(data?.guidelines || "").trim();
-
-    setHostGuidelinesSaved(text);
-    setHostGuidelinesText(text);
-    setHostGuidelinesLoading(false);
-  } catch (e: any) {
-    setHostGuidelinesLoading(false);
-    setHostGuidelinesError(String(e?.message || e || "Failed to load guidelines"));
-  }
-}, [API_BASE, isHost, companyName, companionName]);
-
-const saveHostGuidelines = useCallback(async () => {
-  try {
-    if (!isHost) return;
-    if (!API_BASE) return;
-
-    const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
-    if (!brand || !avatar || !memberId) return;
-
-    setHostGuidelinesLoading(true);
-    setHostGuidelinesError("");
-
-    const res = await fetch(`${API_BASE}/host/companion-guidelines/set`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand, avatar, memberId, guidelines: String(hostGuidelinesText || "") }),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(txt || `HTTP ${res.status}`);
-    }
-
-    const data: any = await res.json().catch(() => ({}));
-    const text = String(data?.guidelines || String(hostGuidelinesText || "")).trim();
-
-    setHostGuidelinesSaved(text);
-    setHostGuidelinesText(text);
-    setHostGuidelinesLoading(false);
-  } catch (e: any) {
-    setHostGuidelinesLoading(false);
-    setHostGuidelinesError(String(e?.message || e || "Failed to save guidelines"));
-  }
-}, [API_BASE, isHost, companyName, companionName, hostGuidelinesText]);
-
-
   const livekitRoleKnown = livekitRole !== "unknown";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
@@ -2682,7 +2588,7 @@ const saveHostGuidelines = useCallback(async () => {
   // Host: poll join requests while a LiveKit session is active.
   useEffect(() => {
     if (!isHost) return;
-    if (!API_BASE || !companyName || !companionName) return;
+    if (!sessionActive) return;
     let cancelled = false;
 
     const tick = async () => {
@@ -2699,33 +2605,9 @@ const saveHostGuidelines = useCallback(async () => {
           const identity = String(r?.memberId || r?.identity || r?.requestId || "").trim();
           return { ...r, viewerLabel: viewerLabel || "Viewer", identity };
         });
-        if (cancelled) return;
-
-        const now = Date.now();
-        setLivekitPending((prev) => {
-          const prior = Array.isArray(prev) ? prev : [];
-          const byKey = new Map<string, any>();
-
-          for (const r of prior) {
-            const key = String((r as any)?.requestId || (r as any)?.identity || (r as any)?.memberId || "").trim();
-            if (!key) continue;
-            byKey.set(key, r);
-          }
-
-          for (const r of annotated) {
-            const key = String((r as any)?.requestId || (r as any)?.identity || (r as any)?.memberId || "").trim();
-            if (!key) continue;
-            byKey.set(key, { ...(r as any), _seenAt: now });
-          }
-
-          const GRACE_MS = 10000;
-          const out = Array.from(byKey.values()).filter((r) => now - Number((r as any)?._seenAt || now) < GRACE_MS);
-
-          out.sort((a, b) => Number((b as any)?.ts || 0) - Number((a as any)?.ts || 0));
-          return out;
-        });
+        if (!cancelled) setLivekitPending(annotated);
       } catch {
-        // Do NOT clear pending requests on transient errors; keep last known list.
+        if (!cancelled) setLivekitPending([]);
       }
     };
 
@@ -5291,48 +5173,6 @@ const hostSendMessage = async () => {
     };
   }, [upgradeWatching, requestLatestMemberPlanFromParent]);
 
-
-  // Auto-recovery when chat minutes are exhausted:
-  //  - keep polling /usage/status so credited minutes unlock without refresh
-  //  - keep nudging the parent iframe to refresh MEMBER_PLAN (covers plan upgrades)
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const exhausted = Boolean((sessionStateRef.current as any)?.minutes_exhausted);
-    if (!exhausted) return;
-
-    // Start the upgrade watcher so MEMBER_PLAN refreshes continue even if the user upgraded in another tab.
-    try {
-      startUpgradeWatch("auto_minutes_exhausted");
-    } catch (e) {}
-
-    let cancelled = false;
-
-    const pollOnce = async () => {
-      if (cancelled) return;
-      try {
-        const stillExhausted = Boolean((sessionStateRef.current as any)?.minutes_exhausted);
-        if (!stillExhausted) return;
-
-        // Refresh backend usage/balance.
-        await refreshUsageStatusOnce();
-
-        // Also request the latest plan from the parent (Wix), if available.
-        try {
-          requestLatestMemberPlanFromParent("minutes_exhausted_poll");
-        } catch (e) {}
-      } catch (e) {}
-    };
-
-    pollOnce();
-    const t = window.setInterval(pollOnce, 4000);
-
-    return () => {
-      cancelled = true;
-      try { window.clearInterval(t); } catch (e) {}
-    };
-  }, [sessionState?.minutes_exhausted, refreshUsageStatusOnce, requestLatestMemberPlanFromParent, startUpgradeWatch]);
-
   // Stop upgrade polling once we detect a plan or login state change.
   useEffect(() => {
     if (!upgradeWatching) return;
@@ -5515,14 +5355,10 @@ useEffect(() => {
     // Once a user has joined a live experience, they should remain connected to shared chat
     // until they explicitly press Stop (host) or opt-out (viewer, private session only).
     const inStreamUi =
-      kind !== "conference" &&
-      !!eventRef &&
-      (isHost ? Boolean(sessionActive) : Boolean(viewerHasJoinedStream));
+      Boolean(sessionActive) && kind !== "conference" && !!eventRef;
 
     const inConferenceUi =
-      kind === "conference" &&
-      !!eventRef &&
-      (isHost ? Boolean(sessionActive) : Boolean(conferenceJoined));
+      (Boolean(sessionActive) || Boolean(conferenceJoined)) && kind === "conference" && !!eventRef;
 
     const inLiveChatUi = inStreamUi || inConferenceUi;
 
@@ -5649,7 +5485,6 @@ useEffect(() => {
     sessionRoom,
     companyName,
     conferenceJoined,
-    viewerHasJoinedStream,
   ]);
 
 
@@ -5666,12 +5501,6 @@ useEffect(() => {
         // Livestream viewers may only learn the active room via status polling (sessionRoom)
         // until they explicitly join.
         eventRef = String(streamEventRef || sessionRoom || "").trim();
-      }
-
-      // Viewers must be actively in the Live UI to send shared chat.
-      if (!isHost) {
-        if (kind === "conference" && !conferenceJoinedRef.current) return;
-        if (kind !== "conference" && !viewerHasJoinedStream) return;
       }
 
       if (!API_BASE || !eventRef) return;
@@ -5977,158 +5806,6 @@ useEffect(() => {
   messagesRef.current = messages;
 }, [messages]);
 
-// ---------------------------------------------------------------------------
-// Auto-save conversation summaries (requirements):
-// - every 6 turns
-// - when Host override starts
-// - when AI resumes after Host override ends
-// - after 120 seconds of inactivity
-// ---------------------------------------------------------------------------
-const autoSaveSummaryInFlightRef = useRef<boolean>(false);
-const autoSaveSummaryLastAtRef = useRef<number>(0);
-const autoSaveSummaryLastUserTurnsRef = useRef<number>(0);
-const autoSaveSummaryIdleTimerRef = useRef<number | null>(null);
-const autoSaveSummaryLastMsgLenRef = useRef<number>(0);
-
-const autoSaveChatSummary = useCallback(
-  async (reason: string) => {
-    try {
-      if (!API_BASE) return;
-
-      // Throttle: avoid spamming save-summary when multiple triggers fire in quick succession.
-      const now = Date.now();
-      if (autoSaveSummaryInFlightRef.current) return;
-      if (now - autoSaveSummaryLastAtRef.current < 3000) return;
-
-      const msgList = messagesRef.current || [];
-      if (!msgList.length) return;
-
-      autoSaveSummaryInFlightRef.current = true;
-
-      const memberIdForBackend = String(memberIdRef.current || "").trim();
-      const companionForBackend = String(companionKey || companionName || DEFAULT_COMPANION_NAME).trim();
-      const brandForBackend = String(companyName || "").trim();
-
-      const effectivePlanForBackend: PlanName = memberIdForBackend ? (planName as any) : "Trial";
-
-      const session_state = {
-        ...(sessionState || {}),
-        memberId: memberIdForBackend,
-        companion: companionForBackend,
-        companionName: companionForBackend,
-        companion_name: companionForBackend,
-        brand: brandForBackend,
-        avatar: String(companionName || "").trim(),
-        planName: effectivePlanForBackend,
-        plan_name: effectivePlanForBackend,
-        plan_label: String(planLabelOverride || "").trim(),
-      } as any;
-
-      const messagesForSummary = msgList
-        .filter((m) => {
-          const meta: any = (m as any)?.meta || {};
-          if (meta?.includeInAiContext === false) return false;
-          if (meta?.liveChat) return false;
-          return true;
-        })
-        .map((m) => ({ role: m.role, content: m.content }));
-
-      const res = await fetch(`${API_BASE}/chat/save-summary`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          memberId: memberIdForBackend,
-          session_state,
-          messages: messagesForSummary,
-          reason,
-        }),
-      });
-
-      // Treat non-2xx as non-fatal (auto-save is best-effort).
-      if (res.ok) {
-        autoSaveSummaryLastAtRef.current = now;
-      }
-    } catch {
-      // ignore
-    } finally {
-      autoSaveSummaryInFlightRef.current = false;
-    }
-  },
-  [
-    API_BASE,
-    companionKey,
-    companionName,
-    companyName,
-    planLabelOverride,
-    planName,
-    sessionState,
-  ],
-);
-
-// Every message append: schedule idle timer (120s).
-useEffect(() => {
-  const len = (messagesRef.current || []).length || 0;
-  if (!len) return;
-
-  autoSaveSummaryLastMsgLenRef.current = len;
-
-  if (autoSaveSummaryIdleTimerRef.current) {
-    window.clearTimeout(autoSaveSummaryIdleTimerRef.current);
-    autoSaveSummaryIdleTimerRef.current = null;
-  }
-
-  const startLen = len;
-  autoSaveSummaryIdleTimerRef.current = window.setTimeout(() => {
-    const curLen = (messagesRef.current || []).length || 0;
-    if (curLen !== startLen) return; // activity occurred
-    void autoSaveChatSummary("idle_120s");
-  }, 120000);
-
-  return () => {
-    if (autoSaveSummaryIdleTimerRef.current) {
-      window.clearTimeout(autoSaveSummaryIdleTimerRef.current);
-      autoSaveSummaryIdleTimerRef.current = null;
-    }
-  };
-}, [messages.length, autoSaveChatSummary]);
-
-// Every 6 user turns (user messages) once the assistant has replied.
-useEffect(() => {
-  const msgList = messagesRef.current || [];
-  if (!msgList.length) return;
-
-  const last = msgList[msgList.length - 1];
-  if (!last || last.role !== "assistant") return;
-
-  const userTurns = msgList.filter((m) => {
-    if (m.role !== "user") return false;
-    const meta: any = (m as any)?.meta || {};
-    if (meta?.includeInAiContext === false) return false;
-    if (meta?.liveChat) return false;
-    return true;
-  }).length;
-
-  if (!userTurns) return;
-  if (userTurns % 6 !== 0) return;
-  if (autoSaveSummaryLastUserTurnsRef.current === userTurns) return;
-
-  autoSaveSummaryLastUserTurnsRef.current = userTurns;
-  void autoSaveChatSummary(`turns_${userTurns}`);
-}, [messages.length, autoSaveChatSummary]);
-
-// Host override transitions: save immediately on start/end.
-const prevHostOverrideRef = useRef<boolean>(false);
-useEffect(() => {
-  const cur = Boolean((sessionState as any)?.host_override_active);
-  const prev = prevHostOverrideRef.current;
-
-  if (cur === prev) return;
-  prevHostOverrideRef.current = cur;
-
-  void autoSaveChatSummary(cur ? "host_override_enabled" : "host_override_ended_ai_resumed");
-}, [sessionState, autoSaveChatSummary]);
-
-
 const stopConferenceSession = useCallback(async () => {
   if (stopInProgressRef.current) return;
   stopInProgressRef.current = true;
@@ -6202,6 +5879,38 @@ const sessionStateRef = useRef<SessionState>(sessionState);
 useEffect(() => {
   sessionStateRef.current = sessionState;
 }, [sessionState]);
+
+// --- LLM warm/priming (Optimization #5) ---
+// Warming the target provider when the modePill changes reduces the "first token" delay
+// when switching between OpenAI and Grok (xAI).
+const lastWarmKeyRef = useRef<string>("");
+
+const warmLlmProvider = useCallback(
+  async (mode: string, sessionStateForWarm: any) => {
+    try {
+      const warmKey = `${mode || "friend"}:${sessionStateForWarm?.avatar || ""}`;
+      if (lastWarmKeyRef.current === warmKey) return;
+      lastWarmKeyRef.current = warmKey;
+
+      await fetch(`${API_BASE}/llm/warm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode,
+          session_state: sessionStateForWarm,
+        }),
+      }).catch(() => {});
+    } catch {}
+  },
+  []
+);
+
+useEffect(() => {
+  if (!API_BASE) return;
+  const m = (sessionState as any)?.mode || "";
+  if (!m) return;
+  void warmLlmProvider(m, sessionState);
+}, [sessionState?.mode, (sessionState as any)?.avatar, warmLlmProvider]);
 
 
   const showBroadcastButton = false; // Disabled: Broadcast overlay reserved for future HLS/egress. Use Play/Stop for WebRTC LiveKit.
@@ -6539,9 +6248,6 @@ useEffect(() => {
   const sttRecoverTimerRef = useRef<number | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
-  const sttNotAllowedFailsRef = useRef<number>(0);
-  const sttLastNotAllowedAtRef = useRef<number>(0);
-  const sttEverStartedRef = useRef<boolean>(false);
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
@@ -6826,28 +6532,18 @@ useEffect(() => {
         (hasEntitledPlan ? "intimate" : "romantic");
 
       // Requirement: the *Elaralo* entitlement plan determines how many mode pills exist.
-      // The Wix `modePill` selects the initially-active mode (if allowed), but does NOT change how many pills are shown.
-
       const nextAllowed = allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan);
-
       setAllowedModes(nextAllowed);
-
-      const wixRequestedMode: Mode | null = modeFromModePill(incomingModePillRaw);
 
       setSessionState((prev) => {
         let nextMode: Mode = prev.mode;
 
-        // Requirement: if Wix provides a modePill and it is allowed by the Elaralo entitlement plan,
-        // it MUST be the selected mode pill on load/plan refresh (regardless of the previously-stored mode).
-        if (wixRequestedMode && nextAllowed.includes(wixRequestedMode)) {
-          nextMode = wixRequestedMode;
-        } else {
-          // Otherwise, preserve the previous mode if allowed; if not allowed, fall back.
-          if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
-            nextMode = desiredStartMode;
-          } else if (!nextAllowed.includes(nextMode)) {
-            nextMode = "friend";
-          }
+        // If the previous mode is the default placeholder (Friend) or no longer allowed,
+        // snap to the brand-default start mode (if allowed).
+        if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
+          nextMode = desiredStartMode;
+        } else if (!nextAllowed.includes(nextMode)) {
+          nextMode = "friend";
         }
 
         if (nextMode === prev.mode) return prev;
@@ -8312,7 +8008,6 @@ const pauseSpeechToText = useCallback(() => {
       setSttRunning(true);
       setSttError(null);
 
-      sttEverStartedRef.current = true;
       micGrantedRef.current = true;
       setMicGranted(true);
       // reset audio-capture fail window on successful start
@@ -8320,7 +8015,7 @@ const pauseSpeechToText = useCallback(() => {
       sttLastAudioCaptureAtRef.current = 0;
     };
 
-        const scheduleRestart = () => {
+    rec.onend = () => {
       setSttRunning(false);
 
       if (!sttEnabledRef.current || sttPausedRef.current) return;
@@ -8344,8 +8039,6 @@ const pauseSpeechToText = useCallback(() => {
       }, baseDelay + ignoreDelay);
     };
 
-    rec.onend = scheduleRestart;
-
     rec.onerror = (event: any) => {
       const code = String(event?.error || "");
 
@@ -8354,24 +8047,6 @@ const pauseSpeechToText = useCallback(() => {
       }
 
       if (code === "not-allowed" || code === "service-not-allowed") {
-        const now = Date.now();
-        const hadMic = Boolean(micGrantedRef.current || sttEverStartedRef.current);
-
-        const withinWindow = now - sttLastNotAllowedAtRef.current < 15000;
-        sttLastNotAllowedAtRef.current = now;
-        sttNotAllowedFailsRef.current = withinWindow ? sttNotAllowedFailsRef.current + 1 : 1;
-
-        // If we've ever started successfully, treat this as transient and auto-recover.
-        if (hadMic && sttNotAllowedFailsRef.current <= 8) {
-          setSttError("Microphone temporarily unavailable. Retrying…" + getEmbedHint());
-          try {
-            rec.stop?.();
-          } catch {}
-          scheduleRestart();
-          return;
-        }
-
-        // Hard denial (initial block) or repeated failures: disable STT.
         sttEnabledRef.current = false;
         sttPausedRef.current = false;
         setSttEnabled(false);
@@ -8379,10 +8054,13 @@ const pauseSpeechToText = useCallback(() => {
         clearSttSilenceTimer();
         clearSttRestartTimer();
         clearSttRecoverTimer();
+        clearSttRecoverTimer();
         setSttError("Microphone permission was blocked." + getEmbedHint());
         try {
           rec.stop?.();
-        } catch {}
+        } catch (e) {
+          // ignore
+        }
         return;
       }
 
@@ -9085,12 +8763,7 @@ const sttControls =
         title="Audio"
         style={{
           width: 44,
-          height: 44,
           minWidth: 44,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: 0,
           borderRadius: 10,
           border: "1px solid #111",
           background: sttEnabled ? "#b00020" : "#fff",
@@ -9100,42 +8773,27 @@ const sttControls =
           fontWeight: 700,
         }}
       >
-        {sttEnabled ? <MicOnIcon size={20} /> : <MicOffIcon size={20} />}
+        🎤
       </button>
 
-      {!livekitUiActive && (
+      {liveProvider !== "stream" && (
         <button
           type="button"
           onClick={handleStopClick}
           disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference)}
-          title="Stop"
-          aria-label="Stop"
           style={{
+            border: "1px solid rgba(255,255,255,0.35)",
+            background: "transparent",
+            color: "#fff",
             width: 44,
             height: 44,
-            minWidth: 44,
-            borderRadius: 10,
-            border: "1px solid #111",
-            background:
-              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
-                ? "#fff"
-                : "#eee",
-            color: "#111",
-            cursor:
-              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
-                ? "pointer"
-                : "not-allowed",
-            opacity:
-              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
-                ? 1
-                : 0.6,
-            fontWeight: 800,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
+            borderRadius: 12,
+            cursor: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? "pointer" : "not-allowed",
+            opacity: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? 1 : 0.45,
+            fontWeight: 700,
           }}
         >
-          <StopIcon />
+          ■
         </button>
       )}
 </>
@@ -9261,7 +8919,7 @@ const modePillControls = (
 
 
 
-          {false && (
+          {(!rebrandingKey || String(rebrandingKey).trim() === "") && (
             <button
               type="button"
               onClick={() => {
@@ -9460,14 +9118,7 @@ const modePillControls = (
                 </div>
 
                 <input
-                  // NOTE: type="text" avoids any browser/device-level character filtering.
-                  // We validate the email on submit; do not restrict characters while typing.
-                  type="text"
-                  inputMode="email"
-                  autoComplete="email"
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  spellCheck={false}
+                  type="email"
                   value={topupEmail}
                   onChange={(e) => {
                     setTopupEmail(e.target.value);
@@ -10619,7 +10270,7 @@ const modePillControls = (
                             ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
                             : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
                             ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
-                            : "Click microphone or type message to talk with me…"
+                            : "Type a message…"
                         }
                         style={{
                           flex: 1,
@@ -10816,7 +10467,7 @@ const modePillControls = (
             </div>
             <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
               Saving stores a server-side summary of this conversation for future reference across your devices.
-              By selecting <b>Yes, save</b>, you authorize your AI companion to store chat summary data associated with your
+              By selecting <b>Yes, save</b>, you authorize AI Elara to store chat summary data associated with your
               account for later use.
               <div style={{ marginTop: 8 }}>
                 All audio, video, and mic listening have been stopped. You can resume manually using the controls
@@ -11149,116 +10800,6 @@ const modePillControls = (
           </div>
         </div>
       ) : null}
-
-      {/* Host guidelines modal */}
-      {hostGuidelinesOpen ? (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            zIndex: 65,
-            background: "rgba(0,0,0,0.65)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-          }}
-          onClick={() => setHostGuidelinesOpen(false)}
-        >
-          <div
-            style={{
-              width: "min(820px, 100%)",
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
-              <div>
-                <div style={{ fontWeight: 800, fontSize: 16 }}>AI interaction guidelines</div>
-                <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
-                  These rules are stored for this companion and applied to all future chats.
-                  If they conflict with default onboarding, <b>these guidelines take precedence</b>.
-                </div>
-              </div>
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "transparent",
-                  borderRadius: 8,
-                  padding: "6px 10px",
-                  cursor: "pointer",
-                }}
-                onClick={() => setHostGuidelinesOpen(false)}
-              >
-                ✕
-              </button>
-            </div>
-
-            <div style={{ marginTop: 12 }}>
-              <textarea
-                value={hostGuidelinesText}
-                onChange={(e) => setHostGuidelinesText(e.target.value)}
-                placeholder="Examples: Off-limits topics, preferred terms of endearment (e.g., call viewers “papi”), tone/style constraints…"
-                style={{
-                  width: "100%",
-                  minHeight: 220,
-                  borderRadius: 10,
-                  border: "1px solid rgba(0,0,0,0.18)",
-                  padding: 12,
-                  fontSize: 14,
-                  lineHeight: 1.4,
-                  outline: "none",
-                  resize: "vertical",
-                }}
-              />
-              {hostGuidelinesError ? (
-                <div style={{ marginTop: 10, color: "#b00020", fontSize: 13 }}>{hostGuidelinesError}</div>
-              ) : null}
-
-              <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
-                Saved: {hostGuidelinesSaved ? "Yes" : "No"} • Characters: {String(hostGuidelinesText || "").length}
-              </div>
-            </div>
-
-            <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "transparent",
-                  borderRadius: 10,
-                  padding: "10px 12px",
-                  cursor: "pointer",
-                }}
-                onClick={() => {
-                  // Revert draft to last saved value
-                  setHostGuidelinesText(hostGuidelinesSaved || "");
-                }}
-                disabled={hostGuidelinesLoading}
-              >
-                Revert
-              </button>
-
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "rgba(0,0,0,0.06)",
-                  borderRadius: 10,
-                  padding: "10px 12px",
-                  cursor: "pointer",
-                }}
-                onClick={() => void saveHostGuidelines()}
-                disabled={hostGuidelinesLoading}
-              >
-                {hostGuidelinesLoading ? "Saving…" : "Save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
       <div
         style={{
           display: "flex",
@@ -11275,27 +10816,6 @@ const modePillControls = (
             {companyName} · {companionName || DEFAULT_COMPANION_NAME}
           </div>
         </div>
-
-        <button
-          type="button"
-          onClick={() => {
-            setHostGuidelinesError("");
-            setHostGuidelinesOpen(true);
-            void loadHostGuidelines();
-          }}
-          style={{
-            border: "1px solid rgba(0,0,0,0.12)",
-            background: "rgba(0,0,0,0.04)",
-            borderRadius: 10,
-            padding: "8px 10px",
-            cursor: "pointer",
-            fontSize: 12,
-            marginRight: 8,
-          }}
-          title="Edit AI companion interaction guidelines (persisted)"
-        >
-          AI Guidelines
-        </button>
 
         {hostPendingContent.length > 0 ? (
           <button
