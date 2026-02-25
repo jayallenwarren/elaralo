@@ -421,17 +421,6 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return int(default)
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name, "")
-    if v is None or str(v).strip() == "":
-        return bool(default)
-    s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return bool(default)
-
 # Minutes for visitors without a memberId
 TRIAL_MINUTES = _env_int("TRIAL_MINUTES", 15)
 
@@ -3989,155 +3978,23 @@ def _to_openai_messages(
 
 
 
-# ----------------------------
-# LLM client reuse + streaming helpers (Optimizations #1 and #2)
-# ----------------------------
-# Creating a new OpenAI() client on every request adds measurable latency (DNS/TLS, connection warm-up)
-# and prevents keep-alive reuse. We keep long-lived clients (and a shared HTTP client when supported)
-# to reduce cold-start costs, especially noticeable when switching between OpenAI and Grok (xAI).
+def _call_gpt4o(messages: List[Dict[str, Any]]) -> str:
+    from openai import OpenAI
 
-_LLM_CLIENT_LOCK = threading.RLock()
-
-_OPENAI_CLIENT = None  # type: ignore
-_OPENAI_CLIENT_KEY = ""
-
-_XAI_CLIENT = None  # type: ignore
-_XAI_CLIENT_KEY = ""
-
-_SHARED_HTTP_CLIENT = None  # type: ignore
-_SHARED_HTTP_CLIENT_LOCK = threading.RLock()
-
-
-def _get_shared_http_client():
-    """Best-effort shared HTTP client with keep-alive pooling (if supported by the OpenAI SDK)."""
-    global _SHARED_HTTP_CLIENT
-    with _SHARED_HTTP_CLIENT_LOCK:
-        if _SHARED_HTTP_CLIENT is not None:
-            return _SHARED_HTTP_CLIENT
-
-        try:
-            # Prefer the OpenAI SDK's httpx wrapper when available.
-            from openai import DefaultHttpxClient  # type: ignore
-            import httpx  # type: ignore
-
-            timeout_s = float(os.getenv("LLM_HTTP_TIMEOUT_S", "") or "60")
-            limits = httpx.Limits(
-                max_connections=int(os.getenv("LLM_HTTP_MAX_CONNECTIONS", "") or "20"),
-                max_keepalive_connections=int(os.getenv("LLM_HTTP_MAX_KEEPALIVE", "") or "10"),
-                keepalive_expiry=float(os.getenv("LLM_HTTP_KEEPALIVE_EXPIRY_S", "") or "30"),
-            )
-            http_client = DefaultHttpxClient(
-                timeout=httpx.Timeout(timeout_s),
-                limits=limits,
-                http2=_env_bool("LLM_HTTP2", True),
-            )
-            _SHARED_HTTP_CLIENT = http_client
-            return _SHARED_HTTP_CLIENT
-        except Exception:
-            _SHARED_HTTP_CLIENT = None
-            return None
-
-
-def _get_openai_client():
-    """Return a cached OpenAI client using keep-alive when possible."""
-    global _OPENAI_CLIENT, _OPENAI_CLIENT_KEY
-    from openai import OpenAI  # type: ignore
-
-    api_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
-    timeout_s = float(os.getenv("OPENAI_TIMEOUT_S", "") or "60")
-    http_client = _get_shared_http_client()
-
-    with _LLM_CLIENT_LOCK:
-        if _OPENAI_CLIENT is not None and _OPENAI_CLIENT_KEY == api_key:
-            return _OPENAI_CLIENT
-        if http_client is not None:
-            _OPENAI_CLIENT = OpenAI(api_key=api_key, timeout=timeout_s, http_client=http_client)
-        else:
-            _OPENAI_CLIENT = OpenAI(api_key=api_key, timeout=timeout_s)
-        _OPENAI_CLIENT_KEY = api_key
-        return _OPENAI_CLIENT
-
-
-def _get_xai_client():
-    """Return a cached xAI (OpenAI-compatible) client using keep-alive when possible."""
-    global _XAI_CLIENT, _XAI_CLIENT_KEY
-    from openai import OpenAI  # type: ignore
-
-    api_key = (os.getenv("XAI_API_KEY", "") or os.getenv("XAI_API_TOKEN", "") or "").strip()
-    if not api_key:
-        raise RuntimeError("XAI_API_KEY is not set")
-
-    base_url = _xai_base_url()
-    timeout_s = float(os.getenv("XAI_TIMEOUT_S", "") or os.getenv("OPENAI_TIMEOUT_S", "") or "60")
-    http_client = _get_shared_http_client()
-
-    with _LLM_CLIENT_LOCK:
-        cache_key = f"{api_key}|{base_url}"
-        if _XAI_CLIENT is not None and _XAI_CLIENT_KEY == cache_key:
-            return _XAI_CLIENT
-        if http_client is not None:
-            _XAI_CLIENT = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_s, http_client=http_client)
-        else:
-            _XAI_CLIENT = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_s)
-        _XAI_CLIENT_KEY = cache_key
-        return _XAI_CLIENT
-
-
-def _chat_completion_text(
-    client,
-    *,
-    model: str,
-    messages: List[Dict[str, Any]],
-    temperature: float,
-    max_tokens: Optional[int] = None,
-    stream: bool = False,
-) -> str:
-    """Create a chat completion and return text; optionally stream server-side to reduce buffering latency."""
-    kwargs: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if max_tokens is not None:
-        kwargs["max_tokens"] = int(max_tokens)
-
-    if not stream:
-        resp = client.chat.completions.create(**kwargs)
-        return (resp.choices[0].message.content or "").strip()
-
-    kwargs["stream"] = True
-    parts: List[str] = []
-    resp = client.chat.completions.create(**kwargs)
-    for event in resp:
-        try:
-            choice0 = event.choices[0]
-            delta = getattr(choice0, "delta", None)
-            if delta is None:
-                continue
-            piece = getattr(delta, "content", None)
-            if piece:
-                parts.append(str(piece))
-        except Exception:
-            continue
-    return "".join(parts).strip()
-
-
-def _call_gpt4o(messages: List[Dict[str, Any]], *, max_tokens: Optional[int] = None) -> str:
-    client = _get_openai_client()
-    model = (os.getenv("OPENAI_MODEL", "") or "gpt-4o").strip()
-    temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.8") or "0.8")
-    stream = _env_bool("OPENAI_STREAM", False)
-    return _chat_completion_text(
-        client,
-        model=model,
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=stream,
+        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
     )
+    return (resp.choices[0].message.content or "").strip()
+
+
+
 
 
 # ----------------------------
@@ -4161,23 +4018,21 @@ def _xai_base_url() -> str:
     return url
 
 
-def _call_xai_chat(messages: List[Dict[str, Any]], *, max_tokens: Optional[int] = None) -> str:
-    """Call xAI (OpenAI-compatible) chat completions endpoint.
+def _call_xai_chat(messages: List[Dict[str, Any]]) -> str:
+    """Call xAI (OpenAI-compatible) chat completions endpoint."""
+    from openai import OpenAI
 
-    Uses cached client + optional server-side streaming to reduce perceived latency.
-    """
-    client = _get_xai_client()
-    model = (os.getenv("XAI_MODEL", "") or "grok-4").strip()
-    temperature = float(os.getenv("XAI_TEMPERATURE", os.getenv("OPENAI_TEMPERATURE", "0.8")) or "0.8")
-    stream = _env_bool("XAI_STREAM", True)
-    return _chat_completion_text(
-        client,
-        model=model,
+    api_key = (os.getenv("XAI_API_KEY", "") or os.getenv("XAI_API_TOKEN", "") or "").strip()
+    if not api_key:
+        raise RuntimeError("XAI_API_KEY is not set")
+
+    client = OpenAI(api_key=api_key, base_url=_xai_base_url())
+    resp = client.chat.completions.create(
+        model=(os.getenv("XAI_MODEL", "") or "grok-4").strip(),
         messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=stream,
+        temperature=float(os.getenv("XAI_TEMPERATURE", os.getenv("OPENAI_TEMPERATURE", "0.8")) or "0.8"),
     )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def _extract_in_session_summaries(session_state: Dict[str, Any]) -> List[str]:
@@ -6251,14 +6106,14 @@ async def chat(request: Request):
 
         try:
             if llm_provider == "xai":
-                assistant_reply = await run_in_threadpool(_call_xai_chat, llm_messages)
+                assistant_reply = _call_xai_chat(llm_messages)
             else:
-                assistant_reply = await run_in_threadpool(_call_gpt4o, llm_messages)
+                assistant_reply = _call_gpt4o(llm_messages)
         except Exception as e:
             # If the user attached images and the xAI model rejects multimodal input, fall back to OpenAI vision.
             if llm_provider == "xai" and _messages_contain_images(llm_messages):
                 logger.warning("xAI chat failed for multimodal input; falling back to OpenAI. error=%r", e)
-                assistant_reply = await run_in_threadpool(_call_gpt4o, llm_messages)
+                assistant_reply = _call_gpt4o(llm_messages)
             else:
                 raise
     except Exception as e:
@@ -6939,105 +6794,6 @@ def _persist_summary_store() -> None:
 # Load persisted summaries once at startup (best-effort).
 _load_summary_store()
 
-
-# ----------------------------
-# LLM warm / priming endpoint (Optimization #5)
-# ----------------------------
-# The frontend calls this when the user changes modePills (e.g., switching into Intimate (18+))
-# so the target provider has its HTTP/TLS connection and internal caches warmed up *before*
-# the first user-visible generation request.
-
-_LLM_WARM_LOCK = threading.RLock()
-_LLM_WARM_LAST: Dict[str, float] = {}
-
-
-def _should_warm_now(key: str, ttl_s: float) -> bool:
-    if ttl_s <= 0:
-        return False
-    now = time.time()
-    with _LLM_WARM_LOCK:
-        last = _LLM_WARM_LAST.get(key, 0.0)
-        if now - last < ttl_s:
-            return False
-        _LLM_WARM_LAST[key] = now
-        return True
-
-
-@app.post("/llm/warm")
-async def llm_warm(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-
-    session_state = payload.get("session_state") or payload.get("sessionState") or {}
-    if not isinstance(session_state, dict):
-        session_state = {}
-
-    # Choose provider primarily by target mode (matches /chat behavior).
-    mode_raw = payload.get("mode") or session_state.get("mode") or session_state.get("modePill") or ""
-    target_mode = _normalize_mode_pill(str(mode_raw or "")) or "friend"
-
-    provider_raw = (payload.get("provider") or payload.get("llm_provider") or "").strip().lower()
-    llm_provider = provider_raw if provider_raw in ("openai", "xai") else ("xai" if target_mode == "intimate" else "openai")
-
-    warm_ttl_s = float(os.getenv("LLM_WARM_TTL_S", "") or "45")
-
-    avatar_name = _avatar_from_session_state(session_state) or ""
-    warm_key = f"{llm_provider}:{target_mode}:{avatar_name}"
-
-    if not _should_warm_now(warm_key, warm_ttl_s):
-        return {"ok": True, "warmed": False, "provider": llm_provider, "mode": target_mode}
-
-    # Build a minimal, provider-consistent prompt (includes onboarding + summaries when available)
-    try:
-        llm_messages = _to_openai_messages(
-            [],
-            session_state,
-            mode=target_mode,
-            intimate_allowed=(target_mode == "intimate"),
-            debug=False,
-        )
-
-        # Onboarding blocks are cached (Optimization #4). Keep this warm prompt aligned with /chat.
-        if avatar_name:
-            try:
-                blocks = await run_in_threadpool(_get_hco_system_blocks_cached_sync, avatar_name)
-                insert_at = 1
-                for b in blocks:
-                    if b and str(b).strip():
-                        llm_messages.insert(insert_at, {"role": "system", "content": str(b).strip()})
-                        insert_at += 1
-            except Exception:
-                pass
-
-        # Saved cross-session summary (if any)
-        try:
-            member_id = str(session_state.get("memberId") or session_state.get("member_id") or "").strip()
-            companion = str(session_state.get("companion") or session_state.get("companionKey") or "").strip()
-            if member_id and companion:
-                skey = _summary_store_key(member_id, companion)
-                saved_summary = str(_CHAT_SUMMARY_STORE.get(skey, "") or "").strip()
-                if saved_summary:
-                    # In safe modes, sanitize explicit details.
-                    summary_to_inject = saved_summary if target_mode == "intimate" else _sanitize_summary_for_safe_mode(saved_summary)
-                    llm_messages.insert(1, {"role": "system", "content": f"Saved conversation summary:\n{summary_to_inject}"})
-        except Exception:
-            pass
-
-        llm_messages.append({"role": "user", "content": "warm-up: reply with one short word."})
-
-        import functools
-
-        if llm_provider == "xai":
-            await run_in_threadpool(functools.partial(_call_xai_chat, llm_messages, max_tokens=1))
-        else:
-            await run_in_threadpool(functools.partial(_call_gpt4o, llm_messages, max_tokens=1))
-
-        return {"ok": True, "warmed": True, "provider": llm_provider, "mode": target_mode}
-    except Exception as e:
-        logger.warning("LLM warm failed. provider=%s mode=%s err=%r", llm_provider, target_mode, e)
-        return {"ok": False, "warmed": False, "provider": llm_provider, "mode": target_mode, "error": str(e)}
 
 @app.post("/chat/save-summary", response_model=None)
 async def save_chat_summary(request: Request):
