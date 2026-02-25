@@ -1488,6 +1488,15 @@ export default function Page() {
 
   const sessionIdRef = useRef<string | null>(null);
 
+// Brief startup overlay (covers the iframe on initial refresh)
+const [startupOverlayOpen, setStartupOverlayOpen] = useState<boolean>(true);
+
+useEffect(() => {
+  const t = window.setTimeout(() => setStartupOverlayOpen(false), 800);
+  return () => window.clearTimeout(t);
+}, []);
+
+
   // Keep the latest Wix memberId available for callbacks defined earlier in this file.
   // This avoids TypeScript/TDZ issues where a callback dependency array would otherwise
   // reference `memberId` before its declaration.
@@ -9474,6 +9483,39 @@ const modePillControls = (
 
   return (
     <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
+
+{startupOverlayOpen ? (
+  <div
+    style={{
+      position: "fixed",
+      inset: 0,
+      zIndex: 1000001,
+      background: "rgba(255,255,255,0.92)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      pointerEvents: "all",
+    }}
+  >
+    <div
+      style={{
+        padding: "12px 16px",
+        borderRadius: 14,
+        background: "rgba(17,24,39,0.92)",
+        color: "#fff",
+        border: "1px solid rgba(255,255,255,0.18)",
+        boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
+        fontSize: 16,
+        fontWeight: 700,
+        letterSpacing: 0.2,
+        maxWidth: "min(92vw, 520px)",
+        textAlign: "center",
+      }}
+    >
+      ...waiting on {String(companionName || DEFAULT_COMPANION_NAME || "Companion").trim()}
+    </div>
+  </div>
+) : null}
       {/* Hidden audio element for audio-only TTS (mic mode) */}
       <audio ref={localTtsAudioRef} style={{ display: "none" }} />
       {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
