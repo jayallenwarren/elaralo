@@ -3306,7 +3306,12 @@ def _usage_status_message(
 
     # Include a small breakdown for clarity.
     if m_allowed > 0 or m_used > 0:
-        lines.append(f"Used: {m_used} of {m_allowed} minutes.")
+        # minutes_allowed can represent the plan-included minutes, while minutes_remaining
+        # already reflects any top-ups. Compute a total budget so we never show
+        # confusing outputs like "Used: 93 of 30 minutes."
+        m_total = max(m_used + m_rem, m_allowed)
+        lines.append(f"Used: {m_used} of {m_total} minutes.")
+
 
     if (not is_trial) and int(cycle_days or 0) > 0:
         lines.append(f"Your usage cycle resets every {int(cycle_days)} days.")
@@ -5562,7 +5567,8 @@ async def chat(request: Request):
     # even when minutes are exhausted (no OpenAI call).
     probe_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
     probe_text = ((probe_last_user.get("content") if probe_last_user else "") or "").strip()
-    is_minutes_balance_query = _is_minutes_balance_question(probe_text)
+    probe_mode_switch = _detect_mode_switch_from_text(probe_text)
+    is_minutes_balance_query = _is_minutes_balance_question(probe_text) and not bool(probe_mode_switch)
 
 
     if not usage_ok and not is_minutes_balance_query:
@@ -5819,7 +5825,9 @@ async def chat(request: Request):
 
     # Start consent if intimate requested but not allowed
     require_consent = bool(getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True))
-    if require_consent and user_requesting_intimate and not intimate_allowed:
+    # Always gate Intimate (18+) behind explicit consent. This avoids silently ignoring
+    # a user-requested mode switch when consent has not yet been granted.
+    if user_requesting_intimate and not intimate_allowed:
         session_state_out = dict(session_state)
         session_state_out["pending_consent"] = "intimate"
         session_state_out["mode"] = "intimate"

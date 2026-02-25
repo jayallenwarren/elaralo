@@ -7438,12 +7438,20 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     // If detectedMode is intimate, keep/trigger pending overlay on response.
     let nextState: SessionState = sessionState;
     if (detectedMode) {
-      // If we switch away from intimate while consent is pending, clear the pending flag
-      const nextPending = detectedMode === "intimate" ? sessionState.pending_consent : null;
+      // Trigger/clear the pending consent overlay when switching modes via text.
+      const nextPending =
+        detectedMode === "intimate"
+          ? sessionState.explicit_consented
+            ? null
+            : "intimate"
+          : null;
+
       nextState = { ...sessionState, mode: detectedMode, pending_consent: nextPending };
 
-      // If user is switching away from intimate, also clear any explicit_blocked overlay state
-      if (detectedMode !== "intimate") {
+      // Keep UI status aligned with the pending consent state.
+      if (detectedMode === "intimate" && !sessionState.explicit_consented) {
+        setChatStatus("explicit_blocked");
+      } else if (detectedMode !== "intimate") {
         setChatStatus("safe");
       }
 
