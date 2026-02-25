@@ -4716,6 +4716,73 @@ const hostSendMessage = async () => {
   }, [memberId, brandKeyForAnon]);
 
 
+  // ---------------------------------------------------------------------------
+  // LLM priming (warm-up) to reduce latency on provider switches (OpenAI <-> xAI)
+  // ---------------------------------------------------------------------------
+  const warmProvider = useMemo(() => {
+    return sessionState.mode === "intimate" && !!sessionState.explicit_consented ? "xai" : "openai";
+  }, [sessionState.mode, sessionState.explicit_consented]);
+
+  const warmKey = useMemo(() => {
+    const rawBrand = String(companyName || rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
+    const brandKey = safeBrandKey(rawBrand) || "core";
+    const avatarKey = String(companionName || DEFAULT_COMPANION_NAME).trim().toLowerCase();
+    return `${warmProvider}|${sessionState.mode}|${sessionState.explicit_consented ? "1" : "0"}|${brandKey}|${avatarKey}`;
+  }, [warmProvider, sessionState.mode, sessionState.explicit_consented, companyName, rebranding, companionName]);
+
+  const warmLastRef = useRef<{ key: string; at: number }>({ key: "", at: 0 });
+
+  const buildWarmSessionStateForBackend = useCallback((): SessionState => {
+    const rawBrand = String(companyName || rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
+    const brandKey = safeBrandKey(rawBrand);
+    const mid = String(memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
+    const companionForBackend =
+      String(companionKey || "").trim() || String(companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+    const rebrandingKeyForBackend = String(rebrandingKey || "").trim();
+    const planNameForBackend = planName;
+
+    return {
+      ...sessionState,
+      memberId: mid,
+      member_id: mid,
+      brand: rawBrand,
+      avatar: String(companionName || companionForBackend).trim(),
+      companion: companionForBackend,
+      companionName: companionForBackend,
+      companion_name: companionForBackend,
+      planName: planNameForBackend,
+      plan_name: planNameForBackend,
+      rebrandingKey: rebrandingKeyForBackend,
+      rebranding_key: rebrandingKeyForBackend,
+      rebranding: String(rebranding || "").trim(),
+    };
+  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, rebrandingKey, planName]);
+
+  useEffect(() => {
+    if (!API_BASE) return;
+
+    // Throttle: only warm once per key per ~45s.
+    const now = Date.now();
+    const prev = warmLastRef.current;
+    if (prev.key === warmKey && now - prev.at < 45_000) return;
+    warmLastRef.current = { key: warmKey, at: now };
+
+    const payload = {
+      provider: warmProvider,
+      mode: sessionState.mode,
+      session_state: buildWarmSessionStateForBackend(),
+    };
+
+    try {
+      fetch(`${API_BASE}/llm/warm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+    } catch (e) {}
+  }, [warmKey, warmProvider, sessionState.mode, buildWarmSessionStateForBackend]);
+
+
   // PayGo top-up email (stored per brand so the user doesn't have to retype it)
   const topupEmailStorageKey = useMemo(() => {
     const b = safeBrandKey(String(rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME) || "core";

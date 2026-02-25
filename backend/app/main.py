@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 from filelock import FileLock  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Header, Depends, Body
-from fastapi.responses import HTMLResponse, Response, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
 
@@ -624,7 +624,7 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
 import sqlite3
 import shutil
 import tempfile
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse, parse_qs
 
 _COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _COMPANION_MAPPINGS_LOADED_AT: float | None = None
@@ -639,13 +639,6 @@ def _norm_key(s: str) -> str:
 def _candidate_mapping_db_paths() -> List[str]:
     base_dir = os.path.dirname(__file__)
     env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-    # Only accept the canonical mappings DB filename.
-    if env_path:
-        try:
-            if os.path.basename(env_path) != "voice_video_mappings.sqlite3":
-                env_path = ""
-        except Exception:
-            env_path = ""
     candidates = [
         env_path,
         os.path.join(base_dir, "voice_video_mappings.sqlite3"),
@@ -678,7 +671,7 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
       - If the writable copy already exists, use it (do NOT overwrite).
       - If it doesn't exist, copy from the packaged DB.
 
-    This keeps runtime state (like the live room reference) consistent across
+    This keeps runtime state (like BeeStreamed event_ref) consistent across
     multiple Uvicorn workers and across restarts (when /home is used).
     """
 
@@ -772,7 +765,7 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
                             cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
                             names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
                             lc = {n.lower(): n for n in names}
-                            for cand in ("companion_mappings", "voice_video_mappings", "mappings"):
+                            for cand in ("companion_mappings", "voice_video_mappings", "voice_video_mapping", "mappings"):
                                 if cand in lc:
                                     return lc[cand]
                             return names[0] if names else ""
@@ -808,71 +801,6 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
                                             (ev, b, a),
                                         )
                                     new_conn.commit()
-
-                                # Also migrate runtime table: user_content_history (preserve user content delivery state).
-                                try:
-                                    def _find_table_case_insensitive(conn: sqlite3.Connection, target: str) -> str:
-                                        cur = conn.cursor()
-                                        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                                        names = [str(r[0]) for r in cur.fetchall() if r and r[0]]
-                                        lc = {n.lower(): n for n in names}
-                                        return lc.get((target or "").strip().lower(), "")
-
-                                    old_hist = _find_table_case_insensitive(old_conn, "user_content_history")
-                                    if old_hist:
-                                        new_hist = _find_table_case_insensitive(new_conn, "user_content_history") or "user_content_history"
-
-                                        # Ensure destination table exists
-                                        if not _find_table_case_insensitive(new_conn, "user_content_history"):
-                                            new_conn.execute(
-                                                """CREATE TABLE IF NOT EXISTS user_content_history (
-  user_content_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
-  user_type VARCHAR(25),
-  member_id TEXT,
-  content_folder VARCHAR(25),
-  content_name TEXT,
-  content_sequence VARCHAR(25)
-);"""
-                                            )
-                                            new_conn.commit()
-
-                                        def _cols(conn: sqlite3.Connection, table: str) -> List[str]:
-                                            cur = conn.cursor()
-                                            cur.execute(f'PRAGMA table_info("{table}")')
-                                            return [str(r[1]) for r in cur.fetchall() if r and len(r) > 1]
-
-                                        old_cols2 = _cols(old_conn, old_hist)
-                                        new_cols2 = _cols(new_conn, new_hist)
-                                        new_cols_lc = {c.lower(): c for c in new_cols2}
-
-                                        common_cols = [c for c in old_cols2 if c.lower() in new_cols_lc]
-                                        if common_cols:
-                                            cols_sql = ", ".join([f'"{c}"' for c in common_cols])
-                                            placeholders = ", ".join(["?"] * len(common_cols))
-
-                                            cur_old2 = old_conn.cursor()
-                                            cur_old2.execute(f'SELECT {cols_sql} FROM "{old_hist}"')
-                                            rows2 = cur_old2.fetchall()
-
-                                            cur_new2 = new_conn.cursor()
-                                            for rr in rows2:
-                                                vals = []
-                                                for c in common_cols:
-                                                    try:
-                                                        vals.append(rr[c])
-                                                    except Exception:
-                                                        try:
-                                                            vals.append(rr[new_cols_lc.get(c.lower(), c)])
-                                                        except Exception:
-                                                            vals.append(None)
-                                                cur_new2.execute(
-                                                    f'INSERT OR REPLACE INTO "{new_hist}" ({cols_sql}) VALUES ({placeholders})',
-                                                    tuple(vals),
-                                                )
-                                            new_conn.commit()
-                                except Exception as e:
-                                    print(f"[mappings] WARNING: failed migrating user_content_history after DB refresh: {e}")
                         finally:
                             old_conn.close()
                             new_conn.close()
@@ -904,112 +832,6 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
         print(f"[mappings] WARNING: Failed to create writable DB copy at {rw_path!r} from {src_db_path!r}: {e}")
         return src_db_path
 
-
-
-
-# ---------------------------------------------------------------------------
-# Host companion guideline overrides (persisted)
-# ---------------------------------------------------------------------------
-
-_HOST_GUIDELINES_TABLE = "host_companion_guidelines"
-
-
-def _ensure_host_guidelines_schema(db_path: str) -> None:
-    """Ensure the host companion guideline override table exists."""
-    try:
-        if not db_path:
-            return
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {_HOST_GUIDELINES_TABLE} (
-                  brand TEXT NOT NULL,
-                  avatar TEXT NOT NULL,
-                  host_member_id TEXT NOT NULL,
-                  guidelines TEXT NOT NULL,
-                  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
-                  update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
-                  PRIMARY KEY (brand, avatar)
-                );
-                """
-            )
-            conn.execute(
-                f"""CREATE INDEX IF NOT EXISTS idx_hcg_brand_avatar ON {_HOST_GUIDELINES_TABLE}(brand, avatar);"""
-            )
-    except Exception:
-        # Best-effort; do not break the API if schema cannot be created.
-        pass
-
-
-def _mapping_db_path_rw() -> str:
-    """Return a writable mapping DB path (copy-on-write if needed)."""
-    global _COMPANION_MAPPINGS_SOURCE
-    try:
-        if _COMPANION_MAPPINGS_SOURCE and os.path.exists(_COMPANION_MAPPINGS_SOURCE):
-            return _COMPANION_MAPPINGS_SOURCE
-    except Exception:
-        pass
-
-    for p in _candidate_mapping_db_paths():
-        if p and os.path.exists(p):
-            try:
-                rw = _ensure_writable_db_copy(p)
-                _COMPANION_MAPPINGS_SOURCE = rw
-                return rw
-            except Exception:
-                continue
-    return ""
-
-
-def _get_host_guidelines_text(brand: str, avatar: str) -> str:
-    """Fetch stored host guideline overrides for (brand, avatar)."""
-    try:
-        b = _norm_key(brand) or "core"
-        a = _norm_key(avatar)
-        if not a:
-            return ""
-        db_path = _mapping_db_path_rw()
-        if not db_path:
-            return ""
-        _ensure_host_guidelines_schema(db_path)
-        with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                f"SELECT guidelines FROM {_HOST_GUIDELINES_TABLE} WHERE brand=? AND avatar=? LIMIT 1",
-                (b, a),
-            ).fetchone()
-        if not row:
-            return ""
-        return str(row[0] or "").strip()
-    except Exception:
-        return ""
-
-
-def _set_host_guidelines_text(brand: str, avatar: str, host_member_id: str, guidelines: str) -> str:
-    """Upsert host guideline overrides for (brand, avatar). Returns stored text."""
-    b = _norm_key(brand) or "core"
-    a = _norm_key(avatar)
-    h = str(host_member_id or "").strip()
-    g = str(guidelines or "").strip()
-    if not a or not h:
-        return ""
-    db_path = _mapping_db_path_rw()
-    if not db_path:
-        return ""
-    _ensure_host_guidelines_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            f"""
-            INSERT INTO {_HOST_GUIDELINES_TABLE} (brand, avatar, host_member_id, guidelines)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(brand, avatar) DO UPDATE SET
-              host_member_id=excluded.host_member_id,
-              guidelines=excluded.guidelines,
-              update_datetime=CURRENT_TIMESTAMP;
-            """,
-            (b, a, h, g),
-        )
-        conn.commit()
-    return g
 
 def _load_companion_mappings_sync() -> None:
     global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
@@ -1045,6 +867,7 @@ def _load_companion_mappings_sync() -> None:
         preferred = [
             "companion_mappings",
             "voice_video_mappings",
+            "voice_video_mapping",
             "mappings",
         ]
         table = ""
@@ -1149,50 +972,14 @@ def _load_companion_mappings_sync() -> None:
 
 
 def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any]]:
-    """
-    Lookup companion mapping (voice/phonetic/etc.) for a given brand+avatar.
-
-    In production we see multiple avatar formats:
-      - Display name: "Dulce"
-      - Descriptive key: "Dulce-Female-Black-Millennials"
-
-    The DB may store either value in `companion_mappings.avatar`. This lookup supports both.
-    """
-    b = _norm_key(brand) or "core"
-    raw_avatar = (avatar or "").strip()
-    a = _norm_key(raw_avatar)
+    # Strict: exact (brand, avatar) match required (case-insensitive via _norm_key).
+    # Core brand: empty brand is treated as Elaralo.
+    b = _norm_key(brand) or "elaralo"
+    a = _norm_key(avatar)
     if not a:
         return None
 
-    # 1) Exact match
-    m = _COMPANION_MAPPINGS.get((b, a))
-    if not m and b == "core":
-        # Backwards compatibility: some deployments store core mappings under brand "elaralo".
-        m = _COMPANION_MAPPINGS.get(("elaralo", a))
-    if m:
-        return m
-
-    # 2) If the incoming avatar is a descriptive key, try the display-name token.
-    if "-" in raw_avatar:
-        first = _norm_key(raw_avatar.split("-", 1)[0])
-        if first:
-            m = _COMPANION_MAPPINGS.get((b, first))
-            if not m and b == "core":
-                m = _COMPANION_MAPPINGS.get(("elaralo", first))
-            if m:
-                return m
-
-    # 3) If the incoming avatar is just a display name, try prefix matching against
-    #    descriptive keys stored in the DB (e.g. "dulce" -> "dulce-female-black-millennials").
-    best: Optional[Dict[str, Any]] = None
-    for (bb, aa), mm in _COMPANION_MAPPINGS.items():
-        if bb != b and not (b == "core" and bb == "elaralo"):
-            continue
-        if aa == a:
-            return mm
-        if aa.startswith(a + "-"):
-            best = best or mm
-    return best
+    return _COMPANION_MAPPINGS.get((b, a))
 
 
 @app.on_event("startup")
@@ -1205,75 +992,105 @@ async def _startup_load_companion_mappings() -> None:
 
 
 @app.get("/mappings/companion")
-async def get_companion_mapping(brand: str = "", avatar: str = ""):
-    """Return the companion mapping for (brand, avatar).
+async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
+    """Lookup a companion mapping row by (brand, avatar).
 
-    Notes:
-      - For backwards compatibility, an empty brand is treated as "core" internally (and may fall back
-        to legacy "elaralo" mappings).
-      - If the caller does not provide a brand, the response brand will be an empty string (to avoid
-        leaking any default/core brand into white-label contexts).
+    This endpoint is intentionally STRICT:
+      - exact (brand, avatar) match required (case-insensitive via lower/strip normalization)
+      - errors out when a mapping is missing, so configuration issues are visible during development
+
+    Query params:
+      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
+      - avatar: Avatar first name (e.g., "Jennifer")
+
+    Response (200):
+      {
+        found: true,
+        brand: str,
+        avatar: str,
+        companionType: "Human"|"AI",
+        channel_cap: "Video"|"Audio" ,
+        channelCap: "Video"|"Audio" ,   # alias for convenience
+        live: "D-ID"|"Stream" ,
+        elevenVoiceId: str,
+        elevenVoiceName: str,
+        didAgentId: str,
+        didClientKey: str,
+        didAgentLink: str,
+        didEmbedCode: str,
+        loadedAt: <unix seconds> | null,
+        source: <db path> | ""
+      }
     """
     b_in = (brand or "").strip()
-    a_in = (avatar or "").strip()
+    a = (avatar or "").strip()
 
-    b_key = b_in or "core"
-    a = a_in
+    if not a:
+        raise HTTPException(status_code=400, detail="avatar is required")
 
-    m = _lookup_companion_mapping(b_key, a)
+    # Core brand default: empty brand => Elaralo
+    b = b_in or "Elaralo"
+
+    m = _lookup_companion_mapping(b, a)
     if not m:
-        raise HTTPException(status_code=404, detail={"brand": b_key, "avatar": a, "error": "Mapping not found"})
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "Companion mapping not found",
+                "brand": b,
+                "avatar": a,
+                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
+                "source": _COMPANION_MAPPINGS_SOURCE,
+                "table": _COMPANION_MAPPINGS_TABLE,
+                "count": len(_COMPANION_MAPPINGS),
+            },
+        )
 
-    cap_raw = str(m.get("channel_cap") or m.get("channelCap") or "").strip()
+    cap_raw = str(m.get("channel_cap") or "").strip()
     live_raw = str(m.get("live") or "").strip()
-    ctype_raw = str(m.get("companion_type") or m.get("companionType") or "").strip()
+    ctype_raw = str(m.get("companion_type") or "").strip()
 
-    if not cap_raw or not live_raw or not ctype_raw:
-        raise HTTPException(status_code=500, detail=f"Invalid mapping row for brand='{b_key}' avatar='{a}'")
-
+    # Strict validation (config contract)
     cap_lc = cap_raw.lower()
     if cap_lc not in ("video", "audio"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid channel_cap in DB for brand='{b_key}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
+            detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
         )
 
     live_lc = live_raw.lower()
     if live_lc not in ("stream", "d-id"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid live in DB for brand='{b_key}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
+            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
         )
 
     ctype_lc = ctype_raw.lower()
     if ctype_lc not in ("human", "ai"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid companion_type in DB for brand='{b_key}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
+            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
         )
 
     # Business rule: AI companions must use D-ID. Human companions must use Stream.
     if ctype_lc == "human" and live_lc != "stream":
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b_key}' avatar='{a}' (got {live_raw!r})",
+            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
         )
     if ctype_lc == "ai" and live_lc != "d-id":
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b_key}' avatar='{a}' (got {live_raw!r})",
+            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
         )
 
     cap_out = "Video" if cap_lc == "video" else "Audio"
     live_out = "Stream" if live_lc == "stream" else "D-ID"
     ctype_out = "Human" if ctype_lc == "human" else "AI"
 
-    # Do not leak fallback/core brand if the caller did not provide one.
-    brand_out = b_in
-
     return {
         "found": True,
-        "brand": brand_out,
+        "brand": str(m.get("brand") or b),
         "avatar": str(m.get("avatar") or a),
         "hostMemberId": str(m.get("host_member_id") or ""),
         "host_member_id": str(m.get("host_member_id") or ""),
@@ -1295,441 +1112,882 @@ async def get_companion_mapping(brand: str = "", avatar: str = ""):
     }
 
 
-class HostCompanionGuidelinesGetRequest(BaseModel):
-    brand: str = ""
-    avatar: str = ""
-    memberId: str = ""
+# ---------------------------------------------------------------------------
+# BeeStreamed: Start WebRTC streams (Live=Stream companions)
+# -----------------------------------------------------------------------------
+# BeeStreamed in-memory session state + shared live chat hub
+# -----------------------------------------------------------------------------
+
+_BEE_SESSION_LOCK = threading.Lock()
+# _BEE_SESSION_STATE[key] = {"active": bool, "event_ref": str, "updated_at": float}
+_BEE_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
+
+_LIVECHAT_LOCK = threading.Lock()
+# _LIVECHAT_CLIENTS[event_ref] = set(WebSocket)
+_LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
+# Per-connection identity metadata, keyed by websocket instance.
+# Used so the server can attach senderRole/name to each broadcast.
+_LIVECHAT_CLIENT_META: Dict[WebSocket, Dict[str, str]] = {}
+# Simple in-memory message history per event_ref so late-joiners see recent chat.
+_LIVECHAT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
+_LIVECHAT_HISTORY_MAX = 200
 
 
-class HostCompanionGuidelinesSetRequest(BaseModel):
-    brand: str = ""
-    avatar: str = ""
-    memberId: str = ""
-    guidelines: str = ""
+def _normalize_livechat_role(role: str) -> str:
+    r = (role or "").strip().lower()
+    if r in ("host", "viewer", "system"):
+        return r
+    return "viewer"
 
 
-@app.post("/host/companion-guidelines/get")
-async def host_get_companion_guidelines(req: HostCompanionGuidelinesGetRequest):
-    """Host-only: fetch stored AI interaction guideline overrides for a companion."""
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    member_id = (req.memberId or "").strip()
+def _livechat_push_history(event_ref: str, msg: Dict[str, Any]) -> None:
+    # Append a chat message to in-memory history (bounded).
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
+        return
+    with _LIVECHAT_LOCK:
+        hist = _LIVECHAT_HISTORY.get(event_ref)
+        if hist is None:
+            hist = []
+            _LIVECHAT_HISTORY[event_ref] = hist
+        hist.append(msg)
+        if len(hist) > _LIVECHAT_HISTORY_MAX:
+            # Keep the most recent N messages
+            del hist[: len(hist) - _LIVECHAT_HISTORY_MAX]
 
-    mapping = _lookup_companion_mapping(brand, avatar)
-    host_member_id = str((mapping or {}).get("host_member_id") or "").strip()
-
-    if not host_member_id or not member_id or member_id != host_member_id:
-        raise HTTPException(status_code=403, detail="Not authorized to view companion guidelines")
-
-    text = _get_host_guidelines_text(brand, avatar)
-    return {"ok": True, "guidelines": text}
 
 
-@app.post("/host/companion-guidelines/set")
-async def host_set_companion_guidelines(req: HostCompanionGuidelinesSetRequest):
-    """Host-only: upsert stored AI interaction guideline overrides for a companion."""
-    brand = (req.brand or "").strip()
-    avatar = (req.avatar or "").strip()
-    member_id = (req.memberId or "").strip()
-    guidelines = str(req.guidelines or "")
+async def _livechat_broadcast(event_ref: str, msg: Dict[str, Any]) -> None:
+    """Broadcast a JSON-serializable message to all connected live-chat clients for an event_ref.
 
-    mapping = _lookup_companion_mapping(brand, avatar)
-    host_member_id = str((mapping or {}).get("host_member_id") or "").strip()
+    This must work reliably with multiple Uvicorn workers. Each worker maintains its own in-memory
+    websocket set, so this broadcasts only to clients connected to THIS worker — which is exactly
+    what we want because each websocket connection is pinned to a worker process.
 
-    if not host_member_id or not member_id or member_id != host_member_id:
-        raise HTTPException(status_code=403, detail="Not authorized to modify companion guidelines")
+    The frontend already de-dupes echoed messages using clientMsgId, so we broadcast to everyone,
+    including the sender.
+    """
+    ref = (event_ref or "").strip()
+    if not ref:
+        return
 
-    stored = _set_host_guidelines_text(brand, avatar, host_member_id, guidelines)
-    return {"ok": True, "guidelines": stored}
+    try:
+        payload = json.dumps(msg, ensure_ascii=False)
+    except Exception:
+        # Fallback: stringify
+        payload = json.dumps({"type": "error", "error": "Invalid livechat payload"}, ensure_ascii=False)
 
-# =============================================================================
-# LiveKit Live Chat (stream + conference)
+    # Snapshot sockets under lock so we don't hold the lock during awaits.
+    with _LIVECHAT_LOCK:
+        sockets = list(_LIVECHAT_CLIENTS.get(ref, set()))
+
+    if not sockets:
+        return
+
+    dead: List[WebSocket] = []
+    for ws in sockets:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(ws)
+
+    if dead:
+        with _LIVECHAT_LOCK:
+            s = _LIVECHAT_CLIENTS.get(ref)
+            if s is not None:
+                for ws in dead:
+                    try:
+                        s.discard(ws)
+                    except Exception:
+                        pass
+                    try:
+                        _LIVECHAT_CLIENT_META.pop(ws, None)
+                    except Exception:
+                        pass
+                if not s:
+                    _LIVECHAT_CLIENTS.pop(ref, None)
+                    # Keep history for a bit in case late joiners arrive; do not delete here.
+
+
+# --- Shared (cross-worker) live chat persistence --------------------------------
 #
-# Legacy providers are no longer used. Live chat for LiveKit is provided via:
-#   - WebSocket:  /stream/livekit/livechat/{room}
-#                /conference/livekit/livechat/{room}
-#   - HTTP send:  /stream/livekit/livechat/send
-#                /conference/livekit/livechat/send
-#
-# Notes:
-# - Gunicorn runs multiple workers. WebSockets terminate on a single worker, while
-#   HTTP sends may land on another. To keep chat consistent across workers we use
-#   a small shared SQLite DB on the persisted /home filesystem as an append-only
-#   message log and have each connected websocket poll it.
-# =============================================================================
+# IMPORTANT: The API may run with multiple Uvicorn workers. In-memory websocket client
+# sets are per-worker, so to mirror messages across ALL connected clients we persist
+# live chat messages into the shared SQLite DB and have each websocket connection poll
+# for new rows.
 
-_LK_LIVECHAT_DB_PATH = (os.getenv("LIVEKIT_LIVECHAT_DB_PATH", "/home/livekit_livechat.sqlite3") or "/home/livekit_livechat.sqlite3").strip() or "/home/livekit_livechat.sqlite3"
-_LK_LIVECHAT_DB_TIMEOUT_S = float(os.getenv("LIVEKIT_LIVECHAT_DB_TIMEOUT_S", "5.0") or "5.0")
-_LK_LIVECHAT_POLL_INTERVAL_S = float(os.getenv("LIVEKIT_LIVECHAT_POLL_INTERVAL_S", "0.35") or "0.35")
-_LK_LIVECHAT_HISTORY_LIMIT = max(50, int(os.getenv("LIVEKIT_LIVECHAT_HISTORY_LIMIT", "200") or "200"))
-_LK_LIVECHAT_POLL_BATCH_LIMIT = max(10, int(os.getenv("LIVEKIT_LIVECHAT_POLL_BATCH_LIMIT", "50") or "50"))
+_LIVECHAT_DB_TABLE = os.environ.get('LIVECHAT_DB_TABLE', 'livechat_messages').strip() or 'livechat_messages'
+_LIVECHAT_DB_HISTORY_LIMIT = int(os.environ.get('LIVECHAT_DB_HISTORY_LIMIT', '80') or '80')
+_LIVECHAT_DB_POLL_INTERVAL_SEC = float(os.environ.get('LIVECHAT_DB_POLL_INTERVAL_SEC', '0.35') or '0.35')
 
-_LK_LIVECHAT_LOCK = threading.Lock()
-_LK_LIVECHAT_CLIENTS: Dict[str, Set[WebSocket]] = {}
-_LK_LIVECHAT_CLIENT_META: Dict[WebSocket, Dict[str, Any]] = {}
+def _livechat_db_init_sync(conn) -> None:
+    try:
+        conn.execute(
+            f"""
+CREATE TABLE IF NOT EXISTS {_LIVECHAT_DB_TABLE} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_ref TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  client_msg_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+"""
+        )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{_LIVECHAT_DB_TABLE}_event_id ON {_LIVECHAT_DB_TABLE}(event_ref, id);"
+        )
+    except Exception:
+        # DB is best-effort for live chat. If it fails, the websocket still works per-worker.
+        pass
+
+def _livechat_db_connect_sync(db_path: str):
+    import sqlite3
+
+    conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+    except Exception:
+        pass
+    try:
+        conn.execute('PRAGMA synchronous=NORMAL;')
+    except Exception:
+        pass
+    _livechat_db_init_sync(conn)
+    return conn
+
+def _livechat_db_insert_sync(event_ref: str, payload: Dict[str, Any]) -> int:
+    ref = (event_ref or '').strip()
+    if not ref:
+        return 0
+
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    lock_path = db_path + '.livechat.lock'
+    try:
+        with FileLock(lock_path):
+            conn = _livechat_db_connect_sync(db_path)
+            created_at = int(time.time() * 1000)
+            client_msg_id = str(payload.get('clientMsgId') or payload.get('client_msg_id') or '').strip() or str(uuid.uuid4())
+            payload_json = json.dumps(payload, ensure_ascii=False)
+            try:
+                conn.execute(
+                    f"INSERT INTO {_LIVECHAT_DB_TABLE} (event_ref, created_at, client_msg_id, payload_json) VALUES (?,?,?,?)",
+                    (ref, created_at, client_msg_id, payload_json),
+                )
+                row_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+                conn.commit()
+                return int(row_id or 0)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        return 0
+
+def _livechat_db_fetch_history_sync(event_ref: str, limit: int) -> Tuple[int, List[Dict[str, Any]]]:
+    ref = (event_ref or '').strip()
+    if not ref:
+        return 0, []
+
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    try:
+        conn = _livechat_db_connect_sync(db_path)
+        rows = conn.execute(
+            f"SELECT id, payload_json FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=? ORDER BY id DESC LIMIT ?",
+            (ref, int(limit)),
+        ).fetchall()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return 0, []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    rows = list(reversed(rows or []))
+    msgs: List[Dict[str, Any]] = []
+    last_id = 0
+    for rid, payload_json in rows:
+        try:
+            rid_int = int(rid or 0)
+            last_id = max(last_id, rid_int)
+        except Exception:
+            pass
+        try:
+            obj = json.loads(payload_json) if payload_json else None
+            if isinstance(obj, dict):
+                msgs.append(obj)
+        except Exception:
+            pass
+    return last_id, msgs
+
+
+def _livechat_db_clear_event_sync(event_ref: str) -> int:
+    """Delete all persisted livechat messages for a given BeeStreamed event_ref.
+
+    We clear per-event history when a new stream session starts so a reused event_ref
+    doesn't replay the previous session's chat.
+    """
+    ref = (event_ref or "").strip()
+    if not ref:
+        return 0
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    lock_path = db_path + ".livechat.lock"
+    deleted = 0
+    try:
+        with FileLock(lock_path):
+            conn = _livechat_db_connect_sync(db_path)
+            try:
+                cur = conn.execute(f"DELETE FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=?", (ref,))
+                conn.commit()
+                try:
+                    deleted = int(cur.rowcount or 0)
+                except Exception:
+                    deleted = 0
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        return 0
+    return deleted
+
+
+def _livechat_db_fetch_after_sync(event_ref: str, after_id: int, limit: int = 80) -> Tuple[int, List[Dict[str, Any]]]:
+    ref = (event_ref or '').strip()
+    if not ref:
+        return int(after_id or 0), []
+
+    db_path = _get_companion_mappings_db_path(for_write=False)
+    try:
+        conn = _livechat_db_connect_sync(db_path)
+        rows = conn.execute(
+            f"SELECT id, payload_json FROM {_LIVECHAT_DB_TABLE} WHERE event_ref=? AND id>? ORDER BY id ASC LIMIT ?",
+            (ref, int(after_id or 0), int(limit)),
+        ).fetchall()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return int(after_id or 0), []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    msgs: List[Dict[str, Any]] = []
+    last_id = int(after_id or 0)
+    for rid, payload_json in (rows or []):
+        try:
+            rid_int = int(rid or 0)
+            last_id = max(last_id, rid_int)
+        except Exception:
+            pass
+        try:
+            obj = json.loads(payload_json) if payload_json else None
+            if isinstance(obj, dict):
+                msgs.append(obj)
+        except Exception:
+            pass
+    return last_id, msgs
+
+async def _livechat_poll_db(websocket: WebSocket, event_ref: str, after_id: int) -> None:
+    last_id = int(after_id or 0)
+    try:
+        while True:
+            await asyncio.sleep(_LIVECHAT_DB_POLL_INTERVAL_SEC)
+            new_last, msgs = await run_in_threadpool(_livechat_db_fetch_after_sync, event_ref, last_id, 80)
+            if not msgs:
+                last_id = max(last_id, int(new_last or 0))
+                continue
+            last_id = max(last_id, int(new_last or 0))
+            for m in msgs:
+                try:
+                    await websocket.send_text(json.dumps(m, ensure_ascii=False))
+                except Exception:
+                    return
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
 
 class LiveChatSendRequest(BaseModel):
     eventRef: str = ""
     clientMsgId: Optional[str] = None
+
+    # Accept either 'role' or 'senderRole' from older/newer clients.
     role: Optional[str] = None
     senderRole: Optional[str] = None
+
+    # Display name
     name: Optional[str] = None
+
+    # Accept either 'text' or 'message' from older/newer clients.
     text: Optional[str] = None
     message: Optional[str] = None
+
+    # Accept either 'memberId' or 'senderId' from older/newer clients.
     memberId: Optional[str] = None
     senderId: Optional[str] = None
+
     ts: Optional[float] = None
 
-def _lk_livechat_db_connect() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(_LK_LIVECHAT_DB_PATH) or "/home", exist_ok=True)
-    conn = sqlite3.connect(_LK_LIVECHAT_DB_PATH, timeout=_LK_LIVECHAT_DB_TIMEOUT_S, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-    except Exception:
-        pass
-    return conn
 
-def _lk_livechat_db_init_sync() -> None:
-    try:
-        conn = _lk_livechat_db_connect()
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS livekit_livechat_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    room TEXT NOT NULL,
-                    ts REAL NOT NULL,
-                    payload_json TEXT NOT NULL
-                );
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_livekit_livechat_room_id ON livekit_livechat_messages(room, id);")
-            conn.commit()
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"[livekit_livechat] DB init error: {e!r}")
+@app.websocket("/stream/beestreamed/livechat/{event_ref}")
+async def beestreamed_livechat_ws(websocket: WebSocket, event_ref: str):
+    event_ref = (event_ref or "").strip()
+    await websocket.accept()
 
-def _lk_livechat_db_insert_sync(room: str, payload: Dict[str, Any]) -> int:
-    conn = _lk_livechat_db_connect()
-    try:
-        ts = float(payload.get("ts") or time.time())
-        payload = dict(payload)
-        payload["ts"] = ts
-        payload_json = json.dumps(payload, ensure_ascii=False)
-        cur = conn.execute(
-            "INSERT INTO livekit_livechat_messages(room, ts, payload_json) VALUES(?,?,?)",
-            (room, ts, payload_json),
-        )
-        conn.commit()
-        return int(cur.lastrowid or 0)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def _lk_livechat_db_fetch_history_sync(room: str, limit: int) -> Tuple[int, List[Dict[str, Any]]]:
-    conn = _lk_livechat_db_connect()
-    try:
-        lim = int(limit or _LK_LIVECHAT_HISTORY_LIMIT)
-        rows = conn.execute(
-            "SELECT id, payload_json FROM livekit_livechat_messages WHERE room=? ORDER BY id DESC LIMIT ?",
-            (room, lim),
-        ).fetchall()
-        rows = list(reversed(rows))
-        out: List[Dict[str, Any]] = []
-        last_id = 0
-        for r in rows:
-            try:
-                last_id = max(last_id, int(r["id"] or 0))
-            except Exception:
-                pass
-            try:
-                out.append(json.loads(r["payload_json"]))
-            except Exception:
-                pass
-        return last_id, out
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def _lk_livechat_db_fetch_since_sync(room: str, since_id: int, limit: int) -> List[Tuple[int, Dict[str, Any]]]:
-    conn = _lk_livechat_db_connect()
-    try:
-        sid = int(since_id or 0)
-        lim = int(limit or _LK_LIVECHAT_POLL_BATCH_LIMIT)
-        rows = conn.execute(
-            "SELECT id, payload_json FROM livekit_livechat_messages WHERE room=? AND id>? ORDER BY id ASC LIMIT ?",
-            (room, sid, lim),
-        ).fetchall()
-        out: List[Tuple[int, Dict[str, Any]]] = []
-        for r in rows:
-            try:
-                msg_id = int(r["id"] or 0)
-            except Exception:
-                continue
-            try:
-                payload = json.loads(r["payload_json"])
-            except Exception:
-                continue
-            out.append((msg_id, payload))
-        return out
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def _lk_livechat_register(room: str, ws: WebSocket, meta: Dict[str, Any]) -> None:
-    with _LK_LIVECHAT_LOCK:
-        _LK_LIVECHAT_CLIENTS.setdefault(room, set()).add(ws)
-        _LK_LIVECHAT_CLIENT_META[ws] = dict(meta)
-
-def _lk_livechat_unregister(ws: WebSocket) -> None:
-    with _LK_LIVECHAT_LOCK:
-        meta = _LK_LIVECHAT_CLIENT_META.pop(ws, None) or {}
-        room = str(meta.get("room") or "")
-        if room and room in _LK_LIVECHAT_CLIENTS:
-            try:
-                _LK_LIVECHAT_CLIENTS[room].discard(ws)
-                if not _LK_LIVECHAT_CLIENTS[room]:
-                    _LK_LIVECHAT_CLIENTS.pop(room, None)
-            except Exception:
-                pass
-
-async def _lk_livechat_broadcast(room: str, payload: Dict[str, Any], *, db_id: Optional[int] = None) -> None:
-    # Broadcast only within this worker. Cross-worker delivery happens via DB polling.
-    if db_id is not None:
-        payload = dict(payload)
-        payload["_db_id"] = int(db_id)
-    with _LK_LIVECHAT_LOCK:
-        clients = list(_LK_LIVECHAT_CLIENTS.get(room, set()))
-    if not clients:
-        return
-    msg = json.dumps(payload, ensure_ascii=False)
-    for ws in clients:
-        try:
-            await ws.send_text(msg)
-            # Keep the poll cursor in sync so we don't echo the same DB row again.
-            if db_id is not None:
-                try:
-                    meta = _LK_LIVECHAT_CLIENT_META.get(ws) or {}
-                    meta["last_db_id"] = max(int(meta.get("last_db_id") or 0), int(db_id))
-                except Exception:
-                    pass
-        except Exception:
-            try:
-                await ws.close()
-            except Exception:
-                pass
-            _lk_livechat_unregister(ws)
-
-async def _lk_livechat_poll_db(ws: WebSocket) -> None:
-    # Poll the DB for new messages for this websocket's room.
-    while True:
-        meta = _LK_LIVECHAT_CLIENT_META.get(ws)
-        if not meta:
-            return
-        room = str(meta.get("room") or "")
-        if not room:
-            return
-        last_db_id = int(meta.get("last_db_id") or 0)
-        try:
-            rows = await run_in_threadpool(_lk_livechat_db_fetch_since_sync, room, last_db_id, _LK_LIVECHAT_POLL_BATCH_LIMIT)
-        except Exception:
-            rows = []
-        if rows:
-            for msg_id, payload in rows:
-                try:
-                    await ws.send_text(json.dumps(payload, ensure_ascii=False))
-                    meta = _LK_LIVECHAT_CLIENT_META.get(ws) or meta
-                    meta["last_db_id"] = max(int(meta.get("last_db_id") or 0), int(msg_id))
-                except Exception:
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                    _lk_livechat_unregister(ws)
-                    return
-        await asyncio.sleep(_LK_LIVECHAT_POLL_INTERVAL_S)
-
-def _lk_livechat_canonical_message(room: str, *, text: str, role: str, name: str, sender_id: str, client_msg_id: str = "") -> Dict[str, Any]:
-    return {
-        "type": "chat",
-        "eventRef": room,
-        "text": text,
-        "clientMsgId": client_msg_id or str(uuid.uuid4()),
-        "ts": time.time(),
-        "senderId": sender_id,
-        "senderRole": role,
-        "name": name,
-    }
-
-def _lk_livechat_norm_role(raw: str) -> str:
-    r = (raw or "").strip().lower()
-    if r in {"host","viewer","member","system","ai"}:
-        return r
-    if not r:
-        return "viewer"
-    return r
-
-@app.on_event("startup")
-async def _startup_init_livekit_livechat() -> None:
-    try:
-        await run_in_threadpool(_lk_livechat_db_init_sync)
-    except Exception:
-        pass
-
-async def _lk_livechat_ws_handler(websocket: WebSocket, room: str) -> None:
-    room = (room or "").strip()
-    if not room:
+    if not event_ref:
         await websocket.close(code=1008)
         return
 
-    qs = dict(websocket.query_params)
-    member_id = str(qs.get("memberId") or "").strip()
-    role = _lk_livechat_norm_role(str(qs.get("role") or "").strip() or "viewer")
-    name = str(qs.get("name") or "").strip()
-    if not name:
-        name = "Host" if role == "host" else "Viewer"
+    # Capture identity from connection query params.
+    qs = websocket.query_params
+    member_id = (qs.get("memberId") or qs.get("member_id") or qs.get("senderId") or qs.get("sender_id") or "").strip()
+    role = _normalize_livechat_role(qs.get("role") or "")
+    name = (qs.get("name") or "").strip()
 
-    await websocket.accept()
+    # Register socket + identity
+    with _LIVECHAT_LOCK:
+        _LIVECHAT_CLIENTS.setdefault(event_ref, set()).add(websocket)
+        _LIVECHAT_CLIENT_META[websocket] = {
+            "eventRef": event_ref,
+            "memberId": member_id,
+            "role": role,
+            "name": name,
+        }
+        history: List[Dict[str, Any]] = []  # per-worker; DB history is fetched below
 
-    meta = {"room": room, "memberId": member_id, "role": role, "name": name, "last_db_id": 0}
-    _lk_livechat_register(room, websocket, meta)
-
-    # Send recent history first.
-    try:
-        last_id, history = await run_in_threadpool(_lk_livechat_db_fetch_history_sync, room, _LK_LIVECHAT_HISTORY_LIMIT)
-    except Exception:
-        last_id, history = 0, []
-
-    try:
-        m = _LK_LIVECHAT_CLIENT_META.get(websocket) or meta
-        m["last_db_id"] = max(int(m.get("last_db_id") or 0), int(last_id or 0))
-    except Exception:
-        pass
-
-    if history:
-        for item in history:
-            try:
-                await websocket.send_text(json.dumps(item, ensure_ascii=False))
-            except Exception:
-                _lk_livechat_unregister(websocket)
-                try:
-                    await websocket.close()
-                except Exception:
-                    pass
-                return
-
+    # Shared DB history (cross-worker).
+    last_db_id, history = await run_in_threadpool(_livechat_db_fetch_history_sync, event_ref, _LIVECHAT_DB_HISTORY_LIMIT)
     poll_task: Optional[asyncio.Task] = None
-    try:
-        poll_task = asyncio.create_task(_lk_livechat_poll_db(websocket))
 
+    # Send recent history to the newly connected client.
+    if history:
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {"type": "history", "eventRef": event_ref, "messages": history, "ts": time.time()},
+                    ensure_ascii=False,
+                )
+            )
+        except Exception:
+            pass
+
+    # Poll shared DB for messages inserted by other API workers and mirror them to this websocket.
+    try:
+        poll_task = asyncio.create_task(_livechat_poll_db(websocket, event_ref, last_db_id))
+    except Exception:
+        poll_task = None
+
+    try:
         while True:
             raw = await websocket.receive_text()
             try:
-                data = json.loads(raw)
+                incoming = json.loads(raw)
+                if not isinstance(incoming, dict):
+                    incoming = {"text": str(incoming)}
             except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
+                incoming = {"text": raw}
 
-            msg_type = str(data.get("type") or "").strip().lower()
+            msg_type = str(incoming.get("type") or "chat").strip().lower()
+
+            # Optional ping/pong
             if msg_type == "ping":
                 try:
-                    await websocket.send_text(json.dumps({"type": "pong"}, ensure_ascii=False))
+                    await websocket.send_text(json.dumps({"type": "pong", "ts": time.time()}))
                 except Exception:
                     pass
                 continue
 
-            text = str(data.get("text") or data.get("message") or "").strip()
-            if not text:
+            # We only broadcast chat messages.
+            if msg_type not in ("chat", "message"):
                 continue
 
-            sender_role = _lk_livechat_norm_role(str(data.get("senderRole") or data.get("role") or role))
-            sender_name = str(data.get("name") or name).strip() or name
-            sender_id = str(data.get("senderId") or data.get("memberId") or member_id).strip()
-            client_msg_id = str(data.get("clientMsgId") or "").strip()
+            text_val = incoming.get("text")
+            if text_val is None or str(text_val).strip() == "":
+                text_val = incoming.get("message") or incoming.get("content") or ""
+            text_val = str(text_val).strip()
+            if not text_val:
+                continue
 
-            payload = _lk_livechat_canonical_message(
-                room,
-                text=text,
-                role=sender_role,
-                name=sender_name,
-                sender_id=sender_id,
-                client_msg_id=client_msg_id,
+            # Accept both clientMsgId (preferred) and legacy clientId fields.
+            client_msg_id = (
+                str(
+                    incoming.get("clientMsgId")
+                    or incoming.get("client_msg_id")
+                    or incoming.get("clientId")
+                    or incoming.get("client_id")
+                    or ""
+                ).strip()
+                or str(uuid.uuid4())
             )
 
+            ts_in = incoming.get("ts")
             try:
-                db_id = await run_in_threadpool(_lk_livechat_db_insert_sync, room, payload)
+                ts = float(ts_in) if ts_in is not None else time.time()
             except Exception:
-                db_id = None
+                ts = time.time()
 
-            await _lk_livechat_broadcast(room, payload, db_id=db_id)
+            out: Dict[str, Any] = {
+                "type": "chat",
+                "eventRef": event_ref,
+                "text": text_val,
+                "clientMsgId": client_msg_id,
+                "ts": ts,
+                "senderId": member_id,
+                "senderRole": role,
+                "name": name,
+            }
+
+            _livechat_push_history(event_ref, out)
+            await run_in_threadpool(_livechat_db_insert_sync, event_ref, out)
+            await _livechat_broadcast(event_ref, out)
+
     except WebSocketDisconnect:
         pass
     except Exception:
+        # Keep the server resilient: drop the connection silently.
         pass
     finally:
         try:
-            if poll_task:
+            if poll_task is not None:
                 poll_task.cancel()
         except Exception:
             pass
-        _lk_livechat_unregister(websocket)
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+
+        with _LIVECHAT_LOCK:
+            s = _LIVECHAT_CLIENTS.get(event_ref, set())
+            try:
+                s.discard(websocket)
+            except Exception:
+                pass
+            _LIVECHAT_CLIENT_META.pop(websocket, None)
+            if not s:
+                _LIVECHAT_CLIENTS.pop(event_ref, None)
+                _LIVECHAT_HISTORY.pop(event_ref, None)
 
 
-async def _lk_livechat_http_send(req: LiveChatSendRequest) -> Dict[str, Any]:
-    room = (req.eventRef or "").strip()
-    if not room:
+@app.post("/stream/beestreamed/livechat/send")
+async def beestreamed_livechat_send(req: LiveChatSendRequest):
+    event_ref = (req.eventRef or "").strip()
+    if not event_ref:
         raise HTTPException(status_code=400, detail="eventRef is required")
 
-    text = str(req.text or req.message or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="text is required")
+    text_val = str((req.text or req.message or "")).strip()
+    if not text_val:
+        return {"ok": True}
 
-    role = _lk_livechat_norm_role(str(req.senderRole or req.role or "viewer"))
-    name = str(req.name or "").strip()
-    if not name:
-        name = "Host" if role == "host" else "Viewer"
+    sender_id = str((req.senderId or req.memberId or "")).strip()
+    sender_role = _normalize_livechat_role(req.senderRole or req.role or "viewer")
+    name = str((req.name or "")).strip()
 
-    sender_id = str(req.senderId or req.memberId or "").strip()
-    client_msg_id = str(req.clientMsgId or "").strip()
+    try:
+        ts = float(req.ts) if req.ts is not None else time.time()
+    except Exception:
+        ts = time.time()
 
-    payload = _lk_livechat_canonical_message(
-        room,
-        text=text,
-        role=role,
-        name=name,
-        sender_id=sender_id,
-        client_msg_id=client_msg_id,
-    )
+    payload: Dict[str, Any] = {
+        "type": "chat",
+        "eventRef": event_ref,
+        "clientMsgId": (req.clientMsgId or str(uuid.uuid4())),
+        "text": text_val,
+        "ts": ts,
+        "senderId": sender_id,
+        "senderRole": sender_role,
+        "name": name,
+    }
 
-    # If caller provided an explicit ts, respect it.
-    if req.ts:
+    _livechat_push_history(event_ref, payload)
+    await run_in_threadpool(_livechat_db_insert_sync, event_ref, payload)
+    await _livechat_broadcast(event_ref, payload)
+    return {"ok": True}
+
+# ---------------------------------------------------------------------------
+# IMPORTANT:
+# - BeeStreamed tokens MUST NOT be exposed to the browser. The frontend calls this endpoint,
+#   and the API performs BeeStreamed authentication server-side.
+# - Authentication format per BeeStreamed docs:
+#     Authorization: Basic base64_encode({token_id}:{secret_key})
+# - Start WebRTC stream endpoint:
+#     POST https://api.beestreamed.com/events/[EVENT REF]/startwebrtcstream
+#
+# Docs: https://docs.beestreamed.com/introduction (API Overview / Authentication)
+
+
+def _extract_beestreamed_event_ref_from_url(stream_url: str) -> str:
+    """Best-effort extraction of BeeStreamed event_ref from a viewer URL.
+
+    This is intentionally flexible because BeeStreamed viewer URLs can be customized.
+    We attempt, in order:
+      1) query string parameters: event_ref / eventRef
+      2) last path segment that looks like an alphanumeric ref (6-32 chars)
+    """
+    u = (stream_url or "").strip()
+    if not u:
+        return ""
+
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return ""
+
+    try:
+        qs = parse_qs(parsed.query or "")
+        for k in ("event_ref", "eventRef", "event", "ref"):
+            v = qs.get(k)
+            if v and isinstance(v, list) and v[0]:
+                cand = str(v[0]).strip()
+                if re.fullmatch(r"[A-Za-z0-9]{6,32}", cand):
+                    return cand
+    except Exception:
+        pass
+
+    # Path fallback
+    try:
+        segments = [s for s in (parsed.path or "").split("/") if s]
+        for seg in reversed(segments):
+            seg = seg.strip()
+            if re.fullmatch(r"[A-Za-z0-9]{6,32}", seg):
+                return seg
+    except Exception:
+        pass
+
+    return ""
+
+
+@app.post("/stream/beestreamed/start")
+async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
+    """Start a BeeStreamed WebRTC stream for the configured event.
+
+    Body (JSON):
+      {
+        "stream_url": "https://..."     (optional; used to derive event_ref)
+        "event_ref": "abcd12345678"    (optional; overrides URL parsing)
+      }
+
+    Env vars (server-side only):
+      STREAM_TOKEN_ID
+      STREAM_SECRET_KEY
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    stream_url = str(raw.get("stream_url") or raw.get("streamUrl") or "").strip()
+    event_ref = str(raw.get("event_ref") or raw.get("eventRef") or "").strip()
+
+    if not event_ref:
+        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
+
+    # Optional server-side fallback (useful when the viewer URL does not contain the event_ref).
+    if not event_ref:
+        event_ref = (os.getenv("STREAM_EVENT_REF", "") or "").strip()
+
+    if not event_ref:
+        raise HTTPException(
+            status_code=400,
+            detail="BeeStreamed event_ref is required (provide event_ref, STREAM_EVENT_REF, or a stream_url containing it).",
+        )
+
+    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
+    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
+
+    if not token_id or not secret_key:
+        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
+
+    # BeeStreamed auth header: Basic base64(token_id:secret_key)
+    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
+    headers = {"Authorization": f"Basic {basic}"}
+
+    api_url = f"https://api.beestreamed.com/events/{event_ref}/startwebrtcstream"
+
+    import requests  # type: ignore
+
+    try:
+        r = requests.post(api_url, headers=headers, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed request failed: {e!r}")
+
+    if r.status_code >= 400:
+        msg = (r.text or "").strip()
+        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed error {r.status_code}: {msg[:500]}")
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {"message": (r.text or "").strip(), "status": r.status_code}
+
+    return {"ok": True, "event_ref": event_ref, "beestreamed": data}
+
+# ---------------------------------------------------------------------------
+# BeeStreamed embed + host gating (white-label friendly)
+#
+# Goals:
+# - Each "Human / Stream" companion has a stable event_ref (preferably stored in the SQLite mapping DB).
+# - Only the Human Companion (host) can start/stop the WebRTC stream.
+# - Everyone else can open the embed and will see a "waiting for host" experience until the host starts.
+#
+# Notes:
+# - host_member_id can be stored per companion in the mapping DB as `host_member_id`.
+# - If `host_member_id` is missing for DulceMoon/Dulce, we fall back to a known host id (single human companion).
+# - If `event_ref` is missing, ONLY the host will create it (via BeeStreamed API) and we will best-effort persist it.
+# ---------------------------------------------------------------------------
+
+DULCE_HOST_MEMBER_ID_FALLBACK = "1dc3fe06-c351-4678-8fe4-6a4b1350c556"
+
+def _beestreamed_api_base() -> str:
+    return (os.getenv("BEESTREAMED_API_BASE", "") or "https://api.beestreamed.com").strip().rstrip("/")
+
+def _beestreamed_public_event_url(event_ref: str) -> str:
+    # BeeStreamed public event page (works as an embeddable viewer page in an iframe).
+    base = (os.getenv("BEESTREAMED_PUBLIC_EVENT_BASE", "") or "https://beestreamed.com/event").strip().rstrip("/")
+    return f"{base}?id={event_ref}"
+
+@app.get("/stream/beestreamed/embed/{event_ref}", response_class=HTMLResponse)
+async def beestreamed_embed_page(event_ref: str):
+    """Render a BeeStreamed event inside a sandboxed iframe.
+
+    Why this exists:
+      - The BeeStreamed viewer UI can include actions that open a pop-out / new window.
+      - By wrapping the viewer in a sandboxed iframe WITHOUT `allow-popups`, those actions
+        are prevented and the experience stays within the iframe container.
+    """
+    event_ref = (event_ref or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="event_ref is required")
+
+    viewer_url = _beestreamed_public_event_url(event_ref)
+
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Live Stream</title>
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }}
+      .frame {{
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }}
+    </style>
+  </head>
+  <body>
+    <iframe
+      class="frame"
+      src="{viewer_url}"
+      title="Live Stream"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+      referrerpolicy="no-referrer-when-downgrade"
+      allow="autoplay; fullscreen; picture-in-picture; microphone; camera"
+      allowfullscreen
+    ></iframe>
+  </body>
+</html>"""
+
+    # No caching: viewer state is time-sensitive.
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
+
+
+def _beestreamed_auth_headers() -> Dict[str, str]:
+    token_id = (os.getenv("STREAM_TOKEN_ID", "") or "").strip()
+    secret_key = (os.getenv("STREAM_SECRET_KEY", "") or "").strip()
+    if not token_id or not secret_key:
+        raise HTTPException(status_code=500, detail="STREAM_TOKEN_ID / STREAM_SECRET_KEY are not configured")
+
+    basic = base64.b64encode(f"{token_id}:{secret_key}".encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {basic}", "Content-Type": "application/json"}
+
+def _beestreamed_create_event_sync(embed_domain: str = "") -> str:
+    import requests  # type: ignore
+
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    # Create an event
+    try:
+        r = requests.post(f"{api_base}/events", headers=headers, json={}, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BeeStreamed create event failed: {e!r}")
+
+    if r.status_code >= 400:
+        msg = (r.text or "").strip()
+        raise HTTPException(status_code=r.status_code, detail=f"BeeStreamed create event error {r.status_code}: {msg[:500]}")
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+
+    event_ref = (data.get("event_ref") or data.get("eventRef") or data.get("id") or "").strip()
+    if not event_ref:
+        raise HTTPException(status_code=502, detail="BeeStreamed create event did not return an event_ref")
+
+    # Best-effort: set embed domain on the event so the iframe host is allowed.
+    # If this fails, we continue — the embed may still work depending on BeeStreamed account settings.
+    embed_domain = (embed_domain or "").strip()
+    if embed_domain:
         try:
-            payload["ts"] = float(req.ts)
+            requests.patch(
+                f"{api_base}/events/{event_ref}",
+                headers=headers,
+                json={"event_embed_domain": embed_domain},
+                timeout=20,
+            )
         except Exception:
             pass
 
-    db_id = await run_in_threadpool(_lk_livechat_db_insert_sync, room, payload)
-    await _lk_livechat_broadcast(room, payload, db_id=db_id)
+    return event_ref
 
-    return {"ok": True, "eventRef": room, "db_id": db_id}
 
+def _beestreamed_schedule_now_sync(event_ref: str, *, title: str = "", embed_domain: str = "") -> None:
+    """Best-effort: set the event date to 'now' so the event is effectively scheduled immediately.
+
+    BeeStreamed docs: PATCH /events/[EVENT REF] supports `date` (formatted) and `title`.
+    Examples in the docs show date like "YYYY-MM-DD HH:MM:SS". citeturn3view1turn3view0
+    """
+    import requests  # type: ignore
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        return
+
+    payload = {}
+    # Use UTC to avoid timezone ambiguity across API hosts.
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    payload["date"] = now_str
+
+    if (title or "").strip():
+        payload["title"] = (title or "").strip()
+
+    # Some BeeStreamed accounts may accept embed domain as a field; we keep this best-effort.
+    # If not supported, BeeStreamed will ignore or reject; we swallow failures.
+    if (embed_domain or "").strip():
+        payload["event_embed_domain"] = (embed_domain or "").strip()
+
+    try:
+        requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload, timeout=20)
+    except Exception:
+        pass
+
+def _beestreamed_start_webrtc_sync(event_ref: str) -> Dict[str, Any]:
+    import requests  # type: ignore
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        return {"ok": False, "error": "event_ref required"}
+
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    try:
+        r = requests.post(f"{api_base}/events/{ref}/startwebrtcstream", headers=headers, timeout=20)
+        return {
+            "ok": (r.status_code // 100 == 2),
+            "status_code": r.status_code,
+            "body": (r.text or ""),
+            "authMode": "basic",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "authMode": "basic"}
+def _beestreamed_stop_webrtc_sync(event_ref: str) -> Dict[str, Any]:
+    """Stop the BeeStreamed WebRTC stream and fully end the event.
+
+    IMPORTANT:
+      - The *Stop* action in our UI must end the live stream in BeeStreamed (no manual "End Live").
+      - We do this in two steps:
+          1) POST /events/{event_ref}/stopwebrtcstream
+          2) PATCH /events/{event_ref} with status = "done"
+
+    Auth:
+      - Server-side Basic auth using STREAM_TOKEN_ID / STREAM_SECRET_KEY.
+      - Tokens are never exposed to the browser.
+    """
+    import requests  # type: ignore
+
+    ref = (event_ref or "").strip()
+    if not ref:
+        return {"ok": False, "error": "event_ref required"}
+
+    api_base = _beestreamed_api_base()
+    headers = _beestreamed_auth_headers()
+
+    # 1) Stop WebRTC stream
+    try:
+        r = requests.post(f"{api_base}/events/{ref}/stopwebrtcstream", headers=headers, timeout=20)
+    except Exception as e:
+        return {"ok": False, "error": f"stopwebrtcstream request failed: {e!r}"}
+
+    stop_ok = (r.status_code // 100 == 2)
+    res: Dict[str, Any] = {
+        "stop_ok": stop_ok,
+        "stop_status_code": r.status_code,
+        "stop_body": (r.text or "")[:1200],
+    }
+    if not stop_ok:
+        res["ok"] = False
+        return res
+
+    # 2) Finalize/End the event (equivalent to BeeStreamed UI "End Live")
+    # NOTE: We use exact "done" (lowercase) and include both `status` and `Status` keys defensively.
+    payload = {"status": "done", "Status": "done"}
+    try:
+        r2 = requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload, timeout=20)
+        end_ok = (r2.status_code // 100 == 2)
+        res.update(
+            {
+                "end_ok": end_ok,
+                "end_status_code": r2.status_code,
+                "end_body": (r2.text or "")[:1200],
+            }
+        )
+
+        # 3) BeeStreamed recommends setting the event back to idle if you want to reuse the same event_ref.
+        # We attempt this as a best-effort step after ending the live session.
+        if end_ok:
+            payload_idle = {"status": "idle", "Status": "idle"}
+            try:
+                r3 = requests.patch(f"{api_base}/events/{ref}", headers=headers, json=payload_idle, timeout=20)
+                idle_ok = (r3.status_code // 100 == 2)
+                res.update(
+                    {
+                        "idle_ok": idle_ok,
+                        "idle_status_code": r3.status_code,
+                        "idle_body": (r3.text or "")[:1200],
+                    }
+                )
+            except Exception as e:
+                res.update({"idle_ok": False, "idle_error": f"idle patch failed: {e!r}"})
+
+        # Ending the live session is the primary requirement for stop.
+        # We still include idle_ok diagnostics, but ok tracks end_ok so the UI can recover cleanly.
+        res["ok"] = bool(end_ok)
+        return res
+    except Exception as e:
+        res.update({"end_ok": False, "end_error": f"end-event patch failed: {e!r}", "ok": False})
+        return res
 def _resolve_host_member_id(brand: str, avatar: str, mapping: Optional[Dict[str, Any]]) -> str:
     host = ""
     if mapping:
@@ -2042,7 +2300,7 @@ def _set_session_active(brand: str, avatar: str, active: bool, event_ref: Option
 #
 # session_active (0/1) remains the truth source for "is a live session active?"
 # session_kind indicates WHAT kind of session is active: "stream" or "conference".
-# session_room is used for conference providers (LiveKit room name).
+# session_room is used for conference providers (Jitsi room name).
 # =============================================================================
 
 def _sanitize_room_token(raw: str, *, max_len: int = 128) -> str:
@@ -2169,7 +2427,7 @@ def _ensure_livekit_columns_best_effort() -> None:
     """Ensure LiveKit-specific columns exist in companion_mappings.
 
     This is NON-DESTRUCTIVE: it only adds columns if missing and never drops any
-    existing (including legacy) columns.
+    existing (including BeeStreamed) columns.
     """
     try:
         db_path = _get_companion_mappings_db_path(for_write=True)
@@ -2268,11 +2526,316 @@ def _set_livekit_fields_best_effort(
     except Exception:
         return False
 
+class BeeStreamedStartEmbedRequest(BaseModel):
+    brand: str
+    avatar: str
+    embedDomain: Optional[str] = None
+    memberId: Optional[str] = None
+
+class BeeStreamedStopEmbedRequest(BaseModel):
+    brand: str
+    avatar: str
+    memberId: Optional[str] = None
+    eventRef: Optional[str] = None
+
+class BeeStreamedCreateEventRequest(BaseModel):
+    """Create a BeeStreamed event for a specific (brand, avatar) mapping.
+
+    Only the user whose memberId matches the mapping's host_member_id may create/start the event.
+    Credentials are taken from env on the API host:
+      - STREAM_TOKEN_ID
+      - STREAM_SECRET_KEY
+    """
+    brand: str
+    avatar: str
+    memberId: str
+    embedDomain: Optional[str] = None
+    startStream: bool = True
+
+
+class BeeStreamedEmbedUrlRequest(BaseModel):
+    """Resolve a BeeStreamed embed URL that stays inside our iframe wrapper.
+
+    Accepts either:
+      - eventRef / event_ref, OR
+      - streamUrl / stream_url (we'll try to parse the event ref out of it)
+    """
+    eventRef: Optional[str] = None
+    streamUrl: Optional[str] = None
+
+
+@app.post("/stream/beestreamed/start_embed")
+async def beestreamed_start_embed(req: BeeStreamedStartEmbedRequest):
+    mapping = _lookup_companion_mapping(req.brand, req.avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="No mapping for that brand/avatar")
+
+    resolved_brand = mapping.get("brand") or req.brand
+    resolved_avatar = mapping.get("avatar") or req.avatar
+
+    # Guardrail: BeeStreamed is ONLY for Human companions configured for Stream video.
+    live_lc = str(mapping.get("live") or "").strip().lower()
+    ctype_lc = str(mapping.get("companion_type") or "").strip().lower()
+    cap_lc = str(mapping.get("channel_cap") or "").strip().lower()
+
+    if live_lc != "stream" or ctype_lc != "human" or cap_lc != "video":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "BeeStreamed is only valid for Human companions with channel_cap=Video and live=Stream",
+                "brand": str(resolved_brand),
+                "avatar": str(resolved_avatar),
+                "companion_type": str(mapping.get("companion_type") or ""),
+                "channel_cap": str(mapping.get("channel_cap") or ""),
+                "live": str(mapping.get("live") or ""),
+            },
+        )
+
+    # Host auth: only the configured host can START the stream.
+    host_id = (mapping.get("host_member_id") or "").strip()
+    member_id = (req.memberId or "").strip()
+    is_host = bool(host_id) and bool(member_id) and (host_id.lower() == member_id.lower())
+
+    # We intentionally track "session active" in-memory so viewers can JOIN after the host has started,
+    # without needing to be the host themselves.
+    session_active = _is_session_active(resolved_brand, resolved_avatar)
+
+    # Always read the latest persisted event_ref (this is the value viewers must use to join).
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar) or ""
+    embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
+
+    # Viewer path: allow join only when the host has started a session.
+    if not is_host:
+        if not session_active or not event_ref:
+            return {
+                "ok": True,
+                "status": "waiting",
+                "canStart": False,
+                "isHost": False,
+                "sessionActive": bool(session_active),
+                "eventRef": event_ref,
+                "embedUrl": embed_url,
+                "message": f"Waiting on {resolved_avatar} to start event",
+            }
+
+        return {
+            "ok": True,
+            "status": "started",
+            "canStart": False,
+            "isHost": False,
+            "sessionActive": True,
+            "eventRef": event_ref,
+            "embedUrl": embed_url,
+            "message": "",
+        }
+
+    # Host path: ensure an event_ref exists, then start WebRTC.
+    if not event_ref:
+        event_ref = _beestreamed_create_event_sync(req.embedDomain)
+        embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+
+    # Ensure event is scheduled "now" and bound to the correct embed domain (prevents pop-out issues).
+    _beestreamed_schedule_now_sync(
+        event_ref,
+        title=f"{resolved_brand} {resolved_avatar}",
+        embed_domain=req.embedDomain,
+    )
+
+    start_res = _beestreamed_start_webrtc_sync(event_ref)
+
+    # BeeStreamed occasionally returns 404 for a stale event ref. Recreate once and retry.
+    if (not start_res.get("ok")) and (start_res.get("status_code") == 404):
+        event_ref = _beestreamed_create_event_sync(req.embedDomain)
+        embed_url = f"/stream/beestreamed/embed/{event_ref}" if event_ref else ""
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+        _beestreamed_schedule_now_sync(
+            event_ref,
+            title=f"{resolved_brand} {resolved_avatar}",
+            embed_domain=req.embedDomain,
+        )
+        start_res = _beestreamed_start_webrtc_sync(event_ref)
+
+    if not start_res.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"BeeStreamed start_webrtc failed: {start_res.get('error') or start_res.get('body') or start_res}",
+        )
+
+
+    # If we're starting a new session on a reused event_ref, clear any persisted livechat rows
+    # so the new session doesn't replay the previous session's chat history.
+    if (not session_active) and event_ref:
+        try:
+            deleted = await run_in_threadpool(_livechat_db_clear_event_sync, event_ref)
+            if deleted:
+                _dlog("Cleared prior livechat history", {"event_ref": event_ref, "deleted": deleted})
+        except Exception as e:
+            _dlog("Failed clearing livechat history (ignored)", {"event_ref": event_ref, "err": str(e)})
+
+    _set_session_active(resolved_brand, resolved_avatar, active=True, event_ref=event_ref)
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="stream", room="")
+
+    return {
+        "ok": True,
+        "status": "started",
+        "canStart": True,
+        "isHost": True,
+        "sessionActive": True,
+        "eventRef": event_ref,
+        "embedUrl": embed_url,
+        "message": "",
+    }
+@app.post("/stream/beestreamed/create_event")
+async def beestreamed_create_event(req: BeeStreamedCreateEventRequest):
+    """Create (and optionally start) a BeeStreamed event for a configured companion.
+
+    Authorization rule:
+      - Only the host (memberId == host_member_id in voice_video_mappings.sqlite3) may create/start.
+      - Everyone else gets a "waiting" response.
+    """
+    brand = (req.brand or "").strip()
+    avatar = (req.avatar or "").strip()
+    member_id = (req.memberId or "").strip()
+
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
+
+    resolved_brand = str(mapping.get("brand") or brand).strip()
+    resolved_avatar = str(mapping.get("avatar") or avatar).strip()
+
+    live = str(mapping.get("live") or "").strip().lower()
+    if "stream" not in live:
+        raise HTTPException(status_code=400, detail="This companion is not configured for stream")
+
+    comp_type = str(mapping.get("companion_type") or "").strip()
+    if comp_type and comp_type.lower() != "human":
+        raise HTTPException(status_code=400, detail="This companion is not configured as a Human livestream")
+
+    host_id = _resolve_host_member_id(resolved_brand, resolved_avatar, mapping)
+    is_host = bool(host_id and member_id and member_id == host_id)
+
+    if not is_host:
+        existing_ref = str(mapping.get("event_ref") or "").strip()
+        return {
+            "ok": True,
+            "status": "waiting_for_host",
+            "canStart": False,
+            "isHost": False,
+            "eventRef": existing_ref,
+            "embedUrl": f"/stream/beestreamed/embed/{existing_ref}" if existing_ref else "",
+            "message": f"Waiting on {resolved_avatar} to start event",
+        }
+
+    # Host path: reuse existing event_ref if present, else create and persist.
+    event_ref = str(mapping.get("event_ref") or "").strip()
+    created_in_this_call = False
+    if not event_ref:
+        created_in_this_call = True
+        event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
+        _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+
+    if bool(req.startStream):
+        def _start_event(_ref: str) -> None:
+            _beestreamed_schedule_now_sync(_ref, title=f"{resolved_avatar} Live", embed_domain=(req.embedDomain or "").strip())
+            _beestreamed_start_webrtc_sync(_ref)
+
+        try:
+            _start_event(event_ref)
+        except HTTPException as e:
+            if int(getattr(e, "status_code", 0) or 0) == 404:
+                if created_in_this_call:
+                    import time as _time
+
+                    _time.sleep(1.0)
+                    _start_event(event_ref)
+                else:
+                    event_ref = _beestreamed_create_event_sync((req.embedDomain or "").strip())
+                    _persist_event_ref_best_effort(resolved_brand, resolved_avatar, event_ref)
+                    _start_event(event_ref)
+            else:
+                raise
+
+    return {
+        "ok": True,
+        "status": "started",
+        "canStart": True,
+        "isHost": True,
+        "eventRef": event_ref,
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
+        "message": "",
+    }
+
+
+
+@app.get("/stream/beestreamed/status")
+async def beestreamed_status(brand: str, avatar: str):
+    """Return current BeeStreamed mapping state for a companion (does not start anything)."""
+    brand = (brand or "").strip()
+    avatar = (avatar or "").strip()
+    if not brand or not avatar:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand, avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Companion mapping not found")
+
+    resolved_brand = mapping.get("brand") or brand
+    resolved_avatar = mapping.get("avatar") or avatar
+
+    # Use DB as the source of truth for event_ref.
+    # When the app runs with multiple workers, each worker has its own in-memory
+    # mapping cache; without this DB read, pollers can observe different eventRef values.
+    event_ref = _read_event_ref_from_db(resolved_brand, resolved_avatar)
+    mapping["event_ref"] = event_ref
+
+    active = bool(_is_session_active(resolved_brand, resolved_avatar))
+
+    session_kind, session_room = _read_session_kind_room(resolved_brand, resolved_avatar)
+
+    # Back-compat: older DBs won't have session_kind; treat an active session as a stream.
+
+    if active and not session_kind:
+
+        session_kind = "stream"
+
+
+    return {
+
+        "ok": True,
+
+        "eventRef": event_ref,
+
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}" if event_ref else "",
+
+        "hostMemberId": str(mapping.get("host_member_id") or "").strip(),
+
+        "companionType": str(mapping.get("companion_type") or "").strip(),
+
+        "live": str(mapping.get("live") or "").strip(),
+
+        "sessionActive": active,
+
+        "sessionKind": session_kind,
+
+        "sessionRoom": session_room,
+    }
+
+
+    
+
+
+
 @app.get("/stream/livekit/status_legacy")
 async def livekit_status(brand: str, avatar: str):
     """Return current LiveKit mapping state for a companion (does not start anything).
 
-    Mirrors the legacy status shape but sources LiveKit-specific fields from DB.
+    Mirrors /stream/beestreamed/status but sources LiveKit-specific fields from DB.
     """
     brand = (brand or "").strip()
     avatar = (avatar or "").strip()
@@ -2358,26 +2921,216 @@ async def livekit_status(brand: str, avatar: str):
 
 @app.post("/stream/livekit/livechat/send")
 async def livekit_livechat_send(req: LiveChatSendRequest):
-    """Send a LiveKit live-chat message via the shared chat pipeline."""
-    return await _lk_livechat_http_send(req)
+    """Alias LiveKit chat send to the existing livechat pipeline (room is eventRef)."""
+    return await beestreamed_livechat_send(req)
 
 
 @app.websocket("/stream/livekit/livechat/{event_ref}")
 async def livekit_livechat_ws(websocket: WebSocket, event_ref: str):
-    """LiveKit live-chat websocket."""
-    return await _lk_livechat_ws_handler(websocket, event_ref)
+    """Alias LiveKit chat websocket to the existing livechat pipeline."""
+    return await beestreamed_livechat_ws(websocket, event_ref)
 
 
 @app.post("/conference/livekit/livechat/send")
 async def conference_livekit_livechat_send(req: LiveChatSendRequest):
-    """Send a LiveKit conference live-chat message."""
-    return await _lk_livechat_http_send(req)
+    """Conference LiveKit chat send (same pipeline as stream)."""
+    return await beestreamed_livechat_send(req)
 
 
 @app.websocket("/conference/livekit/livechat/{event_ref}")
 async def conference_livekit_livechat_ws(websocket: WebSocket, event_ref: str):
-    """LiveKit conference live-chat websocket."""
-    return await _lk_livechat_ws_handler(websocket, event_ref)
+    """Conference LiveKit chat websocket (same pipeline as stream)."""
+    return await beestreamed_livechat_ws(websocket, event_ref)
+
+@app.post("/stream/beestreamed/embed_url")
+async def beestreamed_embed_url(req: BeeStreamedEmbedUrlRequest):
+    """Return an embeddable URL that *cannot* pop out of the iframe.
+
+    This is useful when the frontend already has an eventRef (or a BeeStreamed viewer URL)
+    and only needs the safe wrapper URL for the iframe container.
+    """
+    event_ref = (req.eventRef or "").strip()
+    stream_url = (req.streamUrl or "").strip()
+
+    if not event_ref and stream_url:
+        event_ref = _extract_beestreamed_event_ref_from_url(stream_url)
+
+    if not event_ref:
+        raise HTTPException(status_code=400, detail="eventRef (or a streamUrl containing it) is required")
+
+    return {
+        "ok": True,
+        "eventRef": event_ref,
+        "embedUrl": f"/stream/beestreamed/embed/{event_ref}",
+    }
+@app.post("/stream/beestreamed/stop_embed")
+async def beestreamed_stop_embed(req: BeeStreamedStopEmbedRequest):
+    """Stop a BeeStreamed stream session.
+
+    - Only the configured host may actually stop/end the stream.
+    - Viewers may call this endpoint (e.g., when closing the iframe) but it won't stop the stream.
+    """
+    mapping = _lookup_companion_mapping(req.brand, req.avatar)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="No mapping for that brand/avatar")
+
+    resolved_brand = mapping.get("brand") or req.brand
+    resolved_avatar = mapping.get("avatar") or req.avatar
+
+    host_id = (mapping.get("host_member_id") or "").strip()
+    member_id = (req.memberId or "").strip()
+    is_host = bool(host_id) and bool(member_id) and (host_id.lower() == member_id.lower())
+
+    # Prefer explicit eventRef from the client; fall back to DB.
+    event_ref = (req.eventRef or "").strip() or (_read_event_ref_from_db(resolved_brand, resolved_avatar) or "").strip()
+
+    if not is_host:
+        return {
+            "ok": True,
+            "status": "not_host",
+            "isHost": False,
+            "canStop": False,
+            "sessionActive": bool(_is_session_active(resolved_brand, resolved_avatar)),
+            "eventRef": event_ref,
+            "message": "",
+        }
+
+    if not event_ref:
+        # If the host tries to stop without an eventRef, mark the session inactive anyway.
+        _set_session_active(resolved_brand, resolved_avatar, active=False)
+
+        _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+        _set_livekit_fields_best_effort(resolved_brand, resolved_avatar, record_egress_id=None, hls_egress_id=None, hls_url=None)
+        return {
+            "ok": True,
+            "status": "no_event_ref",
+            "isHost": True,
+            "canStop": True,
+            "sessionActive": False,
+            "eventRef": "",
+            "message": "No eventRef to stop.",
+        }
+
+
+    # Idempotence: remember whether the session was actually active before stopping, so we don't
+    # spam duplicate system lines if stop is called multiple times.
+    was_active = bool(_is_session_active(resolved_brand, resolved_avatar))
+
+    stop_res = _beestreamed_stop_webrtc_sync(event_ref)
+    if not stop_res.get("ok"):
+        raise HTTPException(status_code=502, detail=f"BeeStreamed stop failed: {stop_res}")
+
+    _set_session_active(resolved_brand, resolved_avatar, active=False, event_ref=event_ref)
+
+
+    _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+    # Best-effort: notify any connected shared-live-chat clients.
+    if was_active:
+        try:
+            # 1) Force clients to exit live-chat mode cleanly.
+            await _livechat_broadcast(
+                event_ref,
+                {"type": "session_ended", "eventRef": event_ref, "ts": time.time()},
+            )
+
+            # 2) Also emit a visible system line into the chat history/UI.
+            sys_msg: Dict[str, Any] = {
+                "type": "chat",
+                "eventRef": event_ref,
+                "text": "Host ended the live stream.",
+                "clientMsgId": str(uuid.uuid4()),
+                "ts": time.time(),
+                "senderId": "",
+                "senderRole": "system",
+                "name": "System",
+            }
+            _livechat_push_history(event_ref, sys_msg)
+            await run_in_threadpool(_livechat_db_insert_sync, event_ref, sys_msg)
+            await _livechat_broadcast(event_ref, sys_msg)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "status": "stopped",
+        "isHost": True,
+        "canStop": True,
+        "sessionActive": False,
+        "eventRef": event_ref,
+        "message": "",
+    }
+
+
+# =============================================================================
+# Jitsi Conference (one-on-one) session control
+#
+# The front-end embeds Jitsi Meet (External API) when session_active=1 AND
+# session_kind == "conference". Viewers never call /start (host-only).
+# =============================================================================
+
+class JitsiConferenceStartRequest(BaseModel):
+  brand: str
+  avatar: str
+  memberId: str = ""
+  displayName: str = ""
+
+
+class JitsiConferenceStopRequest(BaseModel):
+  brand: str
+  avatar: str
+  memberId: str = ""
+
+
+@app.post("/conference/jitsi/start")
+async def jitsi_conference_start(req: JitsiConferenceStartRequest):
+  resolved_brand = (req.brand or "").strip()
+  resolved_avatar = (req.avatar or "").strip()
+  if not resolved_brand or not resolved_avatar:
+    raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+  if not mapping:
+    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+  host_member_id = str(mapping.get("host_member_id") or "").strip()
+  caller_member_id = str(req.memberId or "").strip()
+
+  if not host_member_id or caller_member_id != host_member_id:
+    raise HTTPException(status_code=403, detail="Only the host can start the conference.")
+
+  # Stable, per-companion room name (shared across sessions)
+  room = _sanitize_room_token(f"{resolved_brand}-{resolved_avatar}")
+
+  # Persist state for multi-worker viewers
+  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="conference", room=room)
+  _set_session_active(resolved_brand, resolved_avatar, True, event_ref=None)
+
+  return {"ok": True, "sessionActive": True, "sessionKind": "conference", "sessionRoom": room}
+
+
+@app.post("/conference/jitsi/stop")
+async def jitsi_conference_stop(req: JitsiConferenceStopRequest):
+  resolved_brand = (req.brand or "").strip()
+  resolved_avatar = (req.avatar or "").strip()
+  if not resolved_brand or not resolved_avatar:
+    raise HTTPException(status_code=400, detail="brand and avatar are required.")
+
+  mapping = _lookup_companion_mapping(resolved_brand, resolved_avatar)
+  if not mapping:
+    raise HTTPException(status_code=404, detail="Unknown brand/avatar mapping.")
+
+  host_member_id = str(mapping.get("host_member_id") or "").strip()
+  caller_member_id = str(req.memberId or "").strip()
+
+  if not host_member_id or caller_member_id != host_member_id:
+    raise HTTPException(status_code=403, detail="Only the host can stop the conference.")
+
+  _set_session_active(resolved_brand, resolved_avatar, False, event_ref=None)
+  # Clear kind/room so next Play click re-prompts host
+  _set_session_kind_room_best_effort(resolved_brand, resolved_avatar, kind="", room="")
+
+  return {"ok": True, "sessionActive": False, "sessionKind": "", "sessionRoom": ""}
 
 def _safe_int(val: Any) -> Optional[int]:
     """Parse an int from strings like '60', ' 60 ', or 'PayGoMinutes: 60'. Returns None if missing/invalid."""
@@ -2665,9 +3418,7 @@ def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name
 
         return ok, {
             "minutes_used": int(used_seconds // 60),
-            "minutes_allowed": int(allowed_seconds // 60),
-            "minutes_included": int(minutes_allowed),
-            "minutes_purchased": int((purchased_seconds or 0.0) // 60),
+            "minutes_allowed": int(minutes_allowed),
             "minutes_remaining": int(remaining_seconds // 60),
             "identity_key": identity_key,
         }
@@ -2732,9 +3483,7 @@ def _usage_peek_sync(
         ok = remaining_seconds > 0.0
         return ok, {
             "minutes_used": int(used_seconds // 60),
-            "minutes_allowed": int(allowed_seconds // 60),
-            "minutes_included": int(minutes_allowed),
-            "minutes_purchased": int((purchased_seconds or 0.0) // 60),
+            "minutes_allowed": int(minutes_allowed),
             "minutes_remaining": int(remaining_seconds // 60),
             "identity_key": identity_key,
         }
@@ -2801,858 +3550,13 @@ def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any
 
 
 def _normalize_mode(raw: str) -> str:
-    """
-    Normalizes the UI "mode pill" / session_state.mode into a directory token.
-
-    Accepted values include:
-      - friend / friendship
-      - romantic / romance
-      - intimate, explicit, adult, 18+
-      - labels like "Intimate (18+)" (mapped to "intimate")
-
-    Returned value is always one of: friend | romantic | intimate
-    """
     t = (raw or "").strip().lower()
-    if not t:
-        return "friend"
-
-    # Handle labels such as "Intimate (18+)" by substring matching.
-    if ("intimate" in t) or ("explicit" in t) or ("adult" in t) or ("18" in t):
+    # allow some synonyms from older frontend builds
+    if t in {"explicit", "intimate", "18+", "adult"}:
         return "intimate"
-    if ("romantic" in t) or ("romance" in t):
+    if t in {"romance", "romantic"}:
         return "romantic"
-    if "friend" in t:
-        return "friend"
-
     return "friend"
-
-
-def _brand_content_dir(brand: str, mode: str) -> str:
-    """Return the filesystem directory for the given brand + mode content folder."""
-    brand_in = (brand or "").strip()
-    mode_in = _normalize_mode(mode)
-    folder = mode_in if mode_in in ("friend", "romantic", "intimate") else "friend"
-
-    # Try exact brand folder first, then slugified, then core brand fallback.
-    candidates: List[str] = []
-    if brand_in:
-        candidates.append(os.path.join(BRAND_CONTENT_ROOT, brand_in, "content", "mode", folder))
-        slug = ""
-        try:
-            slug = _slugify_segment(brand_in)
-        except Exception:
-            slug = ""
-        if slug and slug != brand_in:
-            candidates.append(os.path.join(BRAND_CONTENT_ROOT, slug, "content", "mode", folder))
-
-    candidates.append(os.path.join(BRAND_CONTENT_ROOT, "Elaralo", "content", "mode", folder))
-
-    for p in candidates:
-        try:
-            if p and os.path.isdir(p):
-                return p
-        except Exception:
-            continue
-
-    return candidates[0] if candidates else ""
-
-
-def _safe_sqlite_dt(s: Any) -> Optional[datetime]:
-    if not s:
-        return None
-    ss = str(s).strip()
-    if not ss:
-        return None
-    # Common SQLite timestamp formats: "YYYY-MM-DD HH:MM:SS" (UTC-ish)
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f"):
-        try:
-            return datetime.strptime(ss, fmt)
-        except Exception:
-            pass
-    return None
-
-
-def _parse_content_filename(name: str) -> Dict[str, str]:
-    """Parse <9seq>-<desc>-<photo|video>-<begin|sequence|end>.<ext> into fields."""
-    filename = (name or "").strip()
-    base = os.path.basename(filename)
-    stem, _ext = os.path.splitext(base)
-    parts = [p for p in stem.split("-") if p != ""]
-    out = {
-        "filename": base,
-        "sequence": "",
-        "description": "",
-        "media_type_token": "",
-        "stage": "",
-    }
-    if not parts:
-        return out
-    out["sequence"] = parts[0]
-    if len(parts) >= 2:
-        out["stage"] = (parts[-1] or "").strip().lower()
-    if len(parts) >= 3:
-        out["media_type_token"] = (parts[-2] or "").strip().lower()
-    if len(parts) >= 4:
-        desc_parts = parts[1:-2]
-        out["description"] = " ".join([p.strip() for p in desc_parts if p.strip()])
-    return out
-
-
-def _guess_content_type(path: str) -> str:
-    ctype, _ = mimetypes.guess_type(path)
-    return (ctype or "application/octet-stream").strip() or "application/octet-stream"
-
-
-def _find_file_by_sequence(folder_path: str, seq9: str) -> Optional[str]:
-    """Return a filename in folder_path whose basename starts with '<seq9>-'. Deterministic pick."""
-    try:
-        entries = os.listdir(folder_path)
-    except Exception:
-        return None
-
-    prefix = f"{seq9}-"
-    matches: List[str] = []
-    for fn in entries:
-        try:
-            if not fn or fn.startswith("."):
-                continue
-            full = os.path.join(folder_path, fn)
-            if not os.path.isfile(full):
-                continue
-            if fn.startswith(prefix):
-                matches.append(fn)
-        except Exception:
-            continue
-
-    if not matches:
-        return None
-    matches.sort()
-    return matches[0]
-
-
-def _find_next_content_file(folder_path: str, seq_int: int, *, require_begin: bool) -> Optional[str]:
-    """Return the file whose prefix matches the exact next 9-digit sequence.
-
-    Spec requirement: next content = last_sequence + 1 (no skipping).
-    """
-    seq_i = max(0, int(seq_int or 0))
-    seq9 = f"{seq_i:09d}"
-    fn = _find_file_by_sequence(folder_path, seq9)
-    if not fn:
-        return None
-    if require_begin:
-        meta = _parse_content_filename(fn)
-        if meta.get("stage") != "begin":
-            return None
-    return fn
-
-
-def _user_content_db_path_sync() -> str:
-    # Prefer the already-selected writable mapping DB copy (same DB the host override uses).
-    p = str(_COMPANION_MAPPINGS_SOURCE or "").strip()
-    if p and os.path.exists(p):
-        return p
-
-    # Fallback: locate a mapping DB and ensure a writable copy.
-    for cand in _candidate_mapping_db_paths():
-        try:
-            if cand and os.path.exists(cand):
-                return _ensure_writable_db_copy(cand)
-        except Exception:
-            continue
-
-    return ""
-
-
-
-def _user_content_history_member_id_is_unique(conn: sqlite3.Connection) -> bool:
-    """
-    Returns True if the current user_content_history table has a UNIQUE index on member_id.
-    This existed in an earlier schema but must be removed (member_id is not unique).
-    """
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_content_history'")
-        if not cur.fetchone():
-            return False
-
-        cur.execute("PRAGMA index_list('user_content_history')")
-        for row in cur.fetchall() or []:
-            # PRAGMA index_list columns: seq, name, unique, origin, partial
-            try:
-                idx_name = str(row[1])
-                is_unique = int(row[2]) == 1
-            except Exception:
-                continue
-            if not is_unique:
-                continue
-
-            try:
-                cur.execute(f'PRAGMA index_info("{idx_name}")')
-                cols = [str(r[2]) for r in cur.fetchall() or [] if r and len(r) > 2 and r[2]]
-                cols_lc = [c.lower() for c in cols]
-                if cols_lc == ["member_id"]:
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        return False
-    return False
-
-
-def _migrate_user_content_history_drop_member_unique(conn: sqlite3.Connection) -> None:
-    """
-    Rebuilds user_content_history without UNIQUE(member_id).
-    SQLite can't drop a UNIQUE constraint in-place, so we rename and recreate.
-    """
-    cur = conn.cursor()
-    cur.execute("BEGIN")
-    try:
-        cur.execute("ALTER TABLE user_content_history RENAME TO user_content_history_old")
-
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS user_content_history (
-  user_content_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
-  user_type VARCHAR(25), --member or visitor
-  member_id TEXT,
-  content_folder VARCHAR(25), --directory: friend, romantic, or intimate
-  content_name TEXT,  --filename:  nine digit sequence-content description-content type (photo or video)-begin or sequence or end
-  content_sequence VARCHAR(25) --example: 000000001
-);"""
-        )
-
-        # Copy common columns
-        cur.execute('PRAGMA table_info("user_content_history_old")')
-        old_cols = [str(r[1]) for r in cur.fetchall() or [] if r and len(r) > 1 and r[1]]
-        cur.execute('PRAGMA table_info("user_content_history")')
-        new_cols = [str(r[1]) for r in cur.fetchall() or [] if r and len(r) > 1 and r[1]]
-        new_lc = {c.lower(): c for c in new_cols}
-
-        common = [c for c in old_cols if c.lower() in new_lc]
-        if common:
-            cols_sql = ", ".join([f'"{new_lc[c.lower()]}"' for c in common])
-            cur.execute(f'INSERT INTO "user_content_history" ({cols_sql}) SELECT {cols_sql} FROM "user_content_history_old"')
-
-        cur.execute("DROP TABLE user_content_history_old")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
-
-def _ensure_user_content_history_table(conn: sqlite3.Connection) -> None:
-    """
-    Ensure user_content_history exists (and migrate away legacy UNIQUE(member_id)).
-    """
-    # Migrate if needed
-    try:
-        if _user_content_history_member_id_is_unique(conn):
-            _migrate_user_content_history_drop_member_unique(conn)
-    except Exception as e:
-        print(f"[content] WARNING: user_content_history migration failed: {e}")
-
-    cur = conn.cursor()
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS user_content_history (
-  user_content_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
-  user_type VARCHAR(25), --member or visitor
-  member_id TEXT,
-  content_folder VARCHAR(25), --directory: friend, romantic, or intimate
-  content_name TEXT,  --filename:  nine digit sequence-content description-content type (photo or video)-begin or sequence or end
-  content_sequence VARCHAR(25) --example: 000000001
-);"""
-    )
-
-    # Helpful index for lookups (optional but recommended)
-    try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memberid_mode_seqence ON user_content_history(member_id, content_folder, content_sequence)")
-    except Exception:
-        pass
-
-    conn.commit()
-
-
-def _fetch_recent_user_content_rows(
-    conn: sqlite3.Connection,
-    *,
-    member_id: str,
-    content_folder: str,
-    limit: int = 200,
-) -> List[sqlite3.Row]:
-    mid = (member_id or "").strip()
-    folder = (content_folder or "").strip().lower()
-    if not mid or not folder:
-        return []
-    try:
-        lim = max(1, min(int(limit or 200), 1000))
-    except Exception:
-        lim = 200
-
-    cur = conn.cursor()
-    cur.execute(
-        """SELECT user_content_history_id, create_datetime, user_type, member_id, content_folder, content_name, content_sequence
-           FROM user_content_history
-           WHERE member_id=? AND lower(content_folder)=lower(?)
-           ORDER BY create_datetime DESC, user_content_history_id DESC
-           LIMIT ?""",
-        (mid, folder, lim),
-    )
-    return cur.fetchall() or []
-
-
-def _insert_user_content_row(
-    conn: sqlite3.Connection,
-    *,
-    user_type: str,
-    member_id: str,
-    content_folder: str,
-    content_name: str,
-    content_sequence: str,
-) -> None:
-    mid = (member_id or "").strip()
-    folder = (content_folder or "").strip().lower()
-    cname = (content_name or "").strip()
-    cseq = (content_sequence or "").strip()
-    if not mid or not folder or not cname or not cseq:
-        return
-
-    conn.execute(
-        "INSERT INTO user_content_history (user_type, member_id, content_folder, content_name, content_sequence) VALUES (?,?,?,?,?)",
-        ((user_type or "").strip() or "visitor", mid, folder, cname, cseq),
-    )
-    conn.commit()
-
-
-def _usage_last_credit_at_sync(identity_key: str) -> int:
-    try:
-        with _USAGE_LOCK:
-            store = _load_usage_store()
-            rec = store.get(identity_key)
-            if not isinstance(rec, dict):
-                return 0
-            try:
-                return int(rec.get("last_credit_at") or 0)
-            except Exception:
-                return 0
-    except Exception:
-        return 0
-
-
-
-def _maybe_pick_and_record_user_content_sync(
-    *,
-    identity_key: str,
-    member_id_for_history: str,
-    user_type: str,
-    brand: str,
-    mode: str,
-    last_credit_at: int,
-) -> Optional[Dict[str, Any]]:
-    """
-    Return a content delivery payload (and persist history in SQLite) when eligible, else None.
-
-    IMPORTANT:
-      - This does NOT check the "trigger minute" (9, 19, 29, ...) nor the per-session dedupe minute.
-        The /chat handler (and host override handlers) should only call this when it is time.
-      - member_id_for_history is the Wix memberId when present; otherwise we fall back to identity_key.
-    """
-    mode_norm = _normalize_mode(mode)
-    if mode_norm not in ("friend", "romantic", "intimate"):
-        mode_norm = "friend"
-
-    folder_path = _brand_content_dir(brand, mode_norm)
-    if not folder_path or not os.path.isdir(folder_path):
-        return {"__skip_reason": "missing_content_dir", "__skip_detail": str(folder_path or "")}
-
-    db_path = _user_content_db_path_sync()
-    if not db_path:
-        return {"__skip_reason": "missing_content_db_path", "__skip_detail": ""}
-
-    now_utc = datetime.utcnow()
-    credit_ts = int(last_credit_at or 0)
-    credit_dt = datetime.utcfromtimestamp(credit_ts) if credit_ts > 0 else None
-
-    history_key = (member_id_for_history or "").strip() or (identity_key or "").strip()
-    if not history_key:
-        return {"__skip_reason": "missing_history_key", "__skip_detail": ""}
-
-    with _USER_CONTENT_LOCK:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            _ensure_user_content_history_table(conn)
-
-            rows = _fetch_recent_user_content_rows(conn, member_id=history_key, content_folder=mode_norm, limit=250)
-            last_row = rows[0] if rows else None
-
-            last_seq_int = 0
-            last_stage = ""
-            if last_row is not None:
-                try:
-                    last_seq_int = int(str(last_row["content_sequence"] or "0").strip() or "0")
-                except Exception:
-                    last_seq_int = 0
-                try:
-                    last_stage = (_parse_content_filename(str(last_row["content_name"] or "")).get("stage") or "").strip().lower()
-                except Exception:
-                    last_stage = ""
-
-            # Determine the start of the current/most-recent eligibility window.
-            # - friend: last delivery timestamp
-            # - romantic/intimate: timestamp of the most recent "begin" in the current/last set
-            window_start: Optional[datetime] = None
-            if mode_norm == "friend":
-                if last_row is not None:
-                    window_start = _safe_sqlite_dt(last_row["create_datetime"])
-            else:
-                for r in rows:
-                    try:
-                        st = (_parse_content_filename(str(r["content_name"] or "")).get("stage") or "").strip().lower()
-                    except Exception:
-                        st = ""
-                    if st == "begin":
-                        window_start = _safe_sqlite_dt(r["create_datetime"])
-                        break
-                if window_start is None and last_row is not None:
-                    window_start = _safe_sqlite_dt(last_row["create_datetime"])
-
-            window_expired = True
-            if window_start:
-                try:
-                    window_expired = (now_utc - window_start).total_seconds() >= float(CONTENT_ELIGIBILITY_WINDOW_SECONDS or 0)
-                except Exception:
-                    window_expired = True
-
-            credit_after_window = bool(credit_dt and window_start and credit_dt > window_start)
-
-            # Decide whether we are starting a new 24h-eligible window.
-            start_new_window = False
-            if mode_norm == "friend":
-                # Friend: exactly 1 item per 24h, unless minutes were credited (PayGo/upgrade) since last item.
-                start_new_window = (last_row is None) or window_expired or credit_after_window
-                if not start_new_window:
-                    return {
-                        "__skip_reason": "ineligible_window",
-                        "__skip_detail": f"window_seconds={CONTENT_ELIGIBILITY_WINDOW_SECONDS} last_drop_ts={last_drop_ts} last_credit_at={last_credit_at}",
-                    }
-            else:
-                # Romantic/Intimate:
-                # - A "set" starts with a "begin" file and ends with an "end" file.
-                # - A new set is allowed once per 24h after the "begin" timestamp, unless minutes were credited
-                #   after the last set began (this resets the 24h clock).
-                if last_row is None:
-                    start_new_window = True
-                elif window_expired:
-                    start_new_window = True
-                elif (last_stage or "") == "end":
-                    # Set is complete; allow a new one only if credit has reset the timer.
-                    if not credit_after_window:
-                        return {
-                            "__skip_reason": "ineligible_need_credit_reset",
-                            "__skip_detail": f"window_seconds={CONTENT_ELIGIBILITY_WINDOW_SECONDS} last_drop_ts={last_drop_ts} last_credit_at={last_credit_at}",
-                        }
-
-                    start_new_window = True
-                else:
-                    # Mid-set (begin/sequence...): continue regardless of credit resets.
-                    start_new_window = False
-
-            # Determine next file sequence (always increments).
-            next_seq_int = 1 if last_row is None else max(1, int(last_seq_int) + 1)
-
-            # For a new romantic/intimate window, require the next file to be a "begin".
-            require_begin = bool(start_new_window and mode_norm in ("romantic", "intimate"))
-            fn = _find_next_content_file(folder_path, next_seq_int, require_begin=require_begin)
-            if not fn:
-                return {
-                    "__skip_reason": "no_next_content_file",
-                    "__skip_detail": f"seq={next_seq_int} require_begin={require_begin}",
-                }
-
-            full_path = os.path.join(folder_path, fn)
-            meta = _parse_content_filename(fn)
-            seq9 = meta.get("sequence") or f"{next_seq_int:09d}"
-            stage = (meta.get("stage") or "").lower()
-            media_token = (meta.get("media_type_token") or "").lower()
-            desc = meta.get("description") or ""
-
-            # Persist history row (one row per delivered file).
-            _insert_user_content_row(
-                conn,
-                user_type=user_type,
-                member_id=history_key,
-                content_folder=mode_norm,
-                content_name=fn,
-                content_sequence=seq9,
-            )
-
-            # Build message + attachment payload for frontend.
-            ctype = _guess_content_type(full_path)
-            try:
-                fsize = int(os.path.getsize(full_path))
-            except Exception:
-                fsize = 0
-
-            # Human-friendly description
-            human_desc = (desc or "").strip()
-            if human_desc:
-                human_desc = re.sub(r"\s+", " ", human_desc).strip()
-
-            noun = "photo" if (media_token == "photo" or ctype.startswith("image/")) else "video" if (media_token == "video" or ctype.startswith("video/")) else "content"
-            if mode_norm == "friend":
-                msg = f"Here's a {noun} for you{': ' + human_desc if human_desc else ''}."
-            else:
-                # Romantic / Intimate: small consistent tone, no explicit text here (content itself is in file).
-                prefix = "A little something for us"
-                if mode_norm == "intimate":
-                    prefix = "Something just for us"
-                msg = f"{prefix}{': ' + human_desc if human_desc else ''}."
-
-            # Content is served by backend route /content/mode/{mode}/{brand}/{filename}
-            brand_seg = (brand or "").strip() or "Elaralo"
-            rel_url = f"/content/mode/{quote(mode_norm)}/{quote(brand_seg)}/{quote(fn)}"
-
-            attachment = {
-                "url": rel_url,
-                "name": fn,
-                "size": fsize,
-                "contentType": ctype,
-            }
-
-            return {
-                "folder": mode_norm,
-                "sequence": seq9,
-                "stage": stage,
-                "message": msg,
-                "attachment": attachment,
-            }
-        finally:
-            conn.close()
-
-
-
-
-def _content_is_trigger_minute(minutes_used: int) -> bool:
-    '''
-    True when minutes_used is exactly a trigger minute: 9, 19, 29, 39, ...
-
-    NOTE: We still use a more forgiving "due minute" mechanism below so we don't miss
-    a trigger if minutes jump (e.g., 8 -> 10 due to max-per-turn billing).
-    '''
-    try:
-        mu = int(minutes_used or 0)
-    except Exception:
-        return False
-    if mu < 9:
-        return False
-    return ((mu - 9) % 10) == 0
-
-
-def _content_due_trigger_minute(minutes_used: int, last_sent_minute: int) -> Optional[int]:
-    '''
-    Returns the trigger minute we should deliver now, or None if nothing is due.
-
-    Intended behavior:
-      - Triggers at 9, 19, 29, 39, ...
-      - If minutes jump over an exact trigger (ex: 8 -> 10), deliver the missed trigger (9).
-      - If we're far behind (ex: last_sent=-1 and minutes_used=80), do NOT spam multiple
-        content drops; deliver only the most recent trigger <= minutes_used.
-    '''
-    try:
-        mu_now = int(minutes_used or 0)
-    except Exception:
-        mu_now = 0
-
-    try:
-        last_sent = int(last_sent_minute or -1)
-    except Exception:
-        last_sent = -1
-
-    if mu_now < 9:
-        return None
-
-    # Next expected trigger after last_sent (or first trigger at 9).
-    next_trigger = 9 if last_sent < 9 else (last_sent + 10)
-
-    if mu_now < next_trigger:
-        return None
-
-    # If we're behind by >= 10 minutes (meaning we missed at least one trigger interval),
-    # deliver only the most recent trigger <= mu_now to avoid rapid catch-up spam.
-    if (mu_now - next_trigger) >= 10:
-        latest_trigger = mu_now - ((mu_now - 9) % 10)
-        if latest_trigger <= last_sent:
-            return None
-        return latest_trigger
-
-    # Normal case: we're at/just past the next trigger.
-    if next_trigger <= last_sent:
-        return None
-    return next_trigger
-
-
-
-
-async def _maybe_schedule_mode_content_drop(
-    *,
-    session_id: str,
-    identity_key: str,
-    session_state_out: Dict[str, Any],
-    minutes_used: int,
-    effective_mode: str,
-    override_active: bool,
-) -> Optional[Dict[str, Any]]:
-    """
-    Schedules mode-based content drops at minutes 9, 19, 29, 39, ...
-
-    Behavior:
-      - If override_active is False (AI chat): returns a content payload to include in /chat response,
-        and also emits a relay event (kind='user_content') so host/member transcripts stay consistent.
-      - If override_active is True (Host override): queues a relay event (kind='content_pending') to the host,
-        stores the pending payload server-side, and returns None (member does not see the content until host pushes).
-
-    The selection cursor and eligibility window are persisted in SQLite (user_content_history).
-    """
-    try:
-        mu_now = int(minutes_used or 0)
-    except Exception:
-        mu_now = 0
-
-    # Dedupe across:
-    #   - session_state (member side)
-    #   - server-side override session record (covers host-side charging/sends)
-    last_sent_state = None
-    try:
-        last_sent_state = session_state_out.get("content_last_sent_minute", session_state_out.get("contentLastSentMinute"))
-    except Exception:
-        last_sent_state = None
-
-    try:
-        last_sent_state_i = int(last_sent_state) if last_sent_state is not None else -1
-    except Exception:
-        last_sent_state_i = -1
-
-    last_sent_server_i = -1
-    try:
-        rec = _ai_override_get_session(session_id) or {}
-        last_sent_server_i = int(rec.get("content_last_sent_minute") or -1)
-    except Exception:
-        last_sent_server_i = -1
-
-    last_sent_i = max(last_sent_state_i, last_sent_server_i)
-
-    # Next scheduled trigger minute (9, 19, 29, ...) based on what was last sent.
-    next_trigger = 9 if last_sent_i < 9 else (last_sent_i + 10)
-
-    # Host-override pre-window (T-1 -> T):
-    # If the Host has overridden AI chat any time in the minute leading up to the next scheduled drop,
-    # we queue the drop to the Host immediately (so the Host can optionally share it at the drop time).
-    # We still "charge" the drop to the scheduled trigger minute for dedupe/scheduling.
-    if override_active and mu_now >= (next_trigger - 1) and mu_now < next_trigger:
-        mu = next_trigger
-    else:
-        # Determine which trigger minute is due (forgiving of minute-jumps).
-        mu = _content_due_trigger_minute(mu_now, last_sent_i)
-        if mu is None:
-            return None
-
-
-    # Brand for content directory and content serving route
-    try:
-        brand_for_content, _ = _brand_avatar_from_session_state(session_state_out)
-    except Exception:
-        brand_for_content = str(session_state_out.get("brand") or session_state_out.get("rebranding") or "Elaralo").strip() or "Elaralo"
-
-    def _skiplog_once(reason: str, detail: str = "") -> None:
-        """Log a single diagnostic line once per trigger minute when a drop was due but skipped."""
-        try:
-            trig = int(mu)
-        except Exception:
-            return
-
-        # Dedupe (client session_state + server override session record)
-        try:
-            last_state = int((session_state_out or {}).get("contentLastSkipLogMinute") or -1)
-        except Exception:
-            last_state = -1
-
-        rec2 = _ai_override_get_session(session_id) if session_id else None
-        try:
-            last_server = int((rec2 or {}).get("content_last_skip_log_minute") or -1)
-        except Exception:
-            last_server = -1
-
-        if trig <= max(last_state, last_server):
-            return
-
-        ident_short = (identity_key or "")[:12]
-        try:
-            mu_now_i = int(mu_now)
-        except Exception:
-            mu_now_i = -1
-
-        try:
-            logger.info(
-                "[content] drop skipped reason=%s brand=%s mode=%s trigger_minute=%s minutes_used=%s identity=%s detail=%s",
-                reason,
-                brand_for_content,
-                effective_mode,
-                trig,
-                mu_now_i,
-                ident_short,
-                (detail or "")[:240],
-            )
-        except Exception:
-            return
-
-        try:
-            session_state_out["contentLastSkipLogMinute"] = trig
-        except Exception:
-            pass
-
-        if rec2 is not None:
-            rec2["content_last_skip_log_minute"] = trig
-            try:
-                _ai_override_persist()
-            except Exception:
-                pass
-
-    member_for_history = _extract_member_id(session_state_out) or ""
-    history_key = (member_for_history or "").strip() or (identity_key or "").strip()
-    if not history_key:
-        _skiplog_once("missing_history_key")
-        return None
-
-    utype = "member" if (member_for_history or "").strip() else "visitor"
-
-    # Credit resets the 24h window
-    try:
-        credit_at = await run_in_threadpool(_usage_last_credit_at_sync, identity_key)
-    except Exception:
-        credit_at = 0
-
-    payload = await run_in_threadpool(
-        _maybe_pick_and_record_user_content_sync,
-        identity_key=identity_key,
-        member_id_for_history=history_key,
-        user_type=utype,
-        brand=brand_for_content,
-        mode=effective_mode,
-        last_credit_at=int(credit_at or 0),
-    )
-    # Skip-reason sentinel from the picker (allows a single, explicit skip log line).
-    if isinstance(payload, dict) and payload.get("__skip_reason"):
-        _skiplog_once(str(payload.get("__skip_reason") or "skipped"), str(payload.get("__skip_detail") or ""))
-        return None
-
-    if not isinstance(payload, dict) or not payload:
-        _skiplog_once("picker_returned_empty")
-        return None
-
-    # Diagnostic log line (helps confirm scheduling/selection without exposing private content).
-    try:
-        att_dbg = payload.get("attachment") or {}
-        fn_dbg = str(att_dbg.get("name") or "").strip()
-        logger.info(
-            "[content] scheduled drop brand=%s mode=%s trigger_minute=%s minutes_used=%s file=%s",
-            str(brand_for_content),
-            str(effective_mode),
-            int(mu),
-            int(mu_now),
-            fn_dbg,
-        )
-    except Exception:
-        pass
-
-    # Mark dedupe in both session_state and server record.
-    try:
-        session_state_out["content_last_sent_minute"] = mu
-        session_state_out["contentLastSentMinute"] = mu
-    except Exception:
-        pass
-
-    try:
-        with _AI_OVERRIDE_LOCK:
-            rec = _AI_OVERRIDE_SESSIONS.get(session_id)
-            if not isinstance(rec, dict):
-                rec = {"session_id": session_id, "seq": 0, "events": [], "override_active": False, "host_ack_seq": 0}
-            rec["content_last_sent_minute"] = mu
-            _AI_OVERRIDE_SESSIONS[session_id] = rec
-            _ai_override_persist()
-    except Exception:
-        pass
-
-    # Host override: queue for host as "pending content".
-    if override_active:
-        token = f"{_normalize_mode(effective_mode)}:{payload.get('sequence') or ''}:{mu}"
-
-        # Persist pending payload in the server record so the host can "push" later.
-        try:
-            with _AI_OVERRIDE_LOCK:
-                rec = _AI_OVERRIDE_SESSIONS.get(session_id)
-                if not isinstance(rec, dict):
-                    rec = {"session_id": session_id, "seq": 0, "events": [], "override_active": True, "host_ack_seq": 0}
-                pending = rec.get("pending_content")
-                if not isinstance(pending, dict):
-                    pending = {}
-                if token not in pending:
-                    pending[token] = {
-                        "token": token,
-                        "trigger_minute": mu,
-                        "content": payload,
-                        "created_ts": time.time(),
-                    }
-                    rec["pending_content"] = pending
-                    _AI_OVERRIDE_SESSIONS[session_id] = rec
-                    _ai_override_persist()
-        except Exception:
-            pass
-
-        # Emit a host-only relay event which the host UI uses to show a modal.
-        try:
-            msg = str(payload.get("message") or "").strip()
-            att = payload.get("attachment") or {}
-            url = str(att.get("url") or "").strip()
-            name = str(att.get("name") or "").strip()
-            fallback_txt = msg + ("\n\n" if msg and url else "") + (f"Attachment: {name or 'content'}\n{url}" if url else "")
-            _ai_override_append_event(
-                session_id,
-                role="system",
-                content=fallback_txt or "New scheduled content is ready to send.",
-                sender="system",
-                audience="host",
-                kind="content_pending",
-                payload={"token": token, "trigger_minute": mu, "content": payload},
-            )
-        except Exception:
-            pass
-
-        return None
-
-    # Normal AI chat: deliver to member and also emit to transcript store.
-    try:
-        msg = str(payload.get("message") or "").strip()
-        att = payload.get("attachment") or {}
-        url = str(att.get("url") or "").strip()
-        name = str(att.get("name") or "").strip()
-        relay_txt = msg + ("\n\n" if msg and url else "") + (f"Attachment: {name}\n{url}" if url else "")
-        _ai_override_append_event(
-            session_id,
-            role="assistant",
-            content=relay_txt,
-            sender="ai",
-            audience="host",
-            kind="user_content",
-            payload=payload,
-        )
-    except Exception:
-        pass
-
-    return payload
-
-
 
 
 def _detect_mode_switch_from_text(text: str) -> Optional[str]:
@@ -3732,7 +3636,6 @@ def _is_minutes_balance_question(text: str) -> bool:
         "time remaining",
         "time left",
         "how many minutes",
-        "how many more minutes",
         "how much time",
         "minutes balance",
         "balance minutes",
@@ -3817,32 +3720,13 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
         or session_state.get("companionName")
         or session_state.get("companion_name")
     )
-    name = comp.get("first_name") or "Companion"
+    name = comp.get("first_name") or "Elara"
 
     lines = [
         f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
         "You speak naturally and conversationally.",
         "You prioritize consent, safety, and emotional connection.",
-        "If the user shares image attachments, you can view them and describe what you see.",
     ]
-
-    # Host-specified interaction guidelines (persisted). These take precedence over defaults.
-    try:
-        brand = str(session_state.get("brand") or session_state.get("rebranding") or "").strip()
-        avatar = str(
-            session_state.get("avatar")
-            or session_state.get("companionName")
-            or session_state.get("companion_name")
-            or session_state.get("companion")
-            or ""
-        ).strip()
-
-        host_guidelines = _get_host_guidelines_text(brand, avatar)
-        if host_guidelines:
-            lines.insert(1, f"HOST GUIDELINES (highest priority; override all defaults): {host_guidelines}")
-    except Exception:
-        pass
-
 
     if mode == "romantic":
         lines.append("You may be affectionate and flirty while remaining respectful.")
@@ -3856,142 +3740,195 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
 
     return " ".join(lines)
 
-# --- Attachments / Vision support ---
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
-_ATTACHMENT_BLOCK_RE = re.compile(r"(?:^|\n)Attachment:\s*(?P<name>[^\n]+)\n(?P<url>\S+)", re.IGNORECASE)
-
-def _extract_attachments_from_text(content: str) -> tuple[str, list[dict[str, str]]]:
-    """
-    Extract attachment blocks injected by the frontend:
-
-        Attachment: filename.png
-        https://...
-
-    Returns: (cleaned_text_without_blocks, attachments=[{name,url}, ...])
-    """
-    if not content:
-        return "", []
-    attachments: list[dict[str, str]] = []
-
-    def _repl(m: re.Match) -> str:
-        name = str(m.group("name") or "").strip()
-        url = str(m.group("url") or "").strip()
-        # Trim common trailing punctuation
-        url = url.rstrip(").,;")
-        attachments.append({"name": name, "url": url})
-        return ""
-
-    cleaned = _ATTACHMENT_BLOCK_RE.sub(_repl, content)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned, attachments
-
-def _is_image_attachment(name: str, url: str) -> bool:
-    probe = (name or "").strip().lower()
-    try:
-        from urllib.parse import urlparse
-        path = urlparse(url or "").path.lower()
-    except Exception:
-        path = (url or "").lower()
-
-    for ext in _IMAGE_EXTS:
-        if probe.endswith(ext) or path.endswith(ext):
-            return True
-    return False
-
-def _messages_contain_images(openai_messages: List[Dict[str, Any]]) -> bool:
-    for m in openai_messages or []:
-        c = m.get("content")
-        if isinstance(c, list):
-            for part in c:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    return True
-    return False
-
 
 def _to_openai_messages(
-    messages: List[Dict[str, Any]],
+    messages: List[Dict[str, str]],
     session_state: dict,
     *,
     mode: str,
-    intimate_allowed: bool = False,
-    system_blocks: Optional[List[str]] = None,
-    debug: bool = False,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    base_system = _build_persona_system_prompt(
-        session_state=session_state,
-        mode=mode,
-        intimate_allowed=intimate_allowed,
-    )
-    out.append({"role": "system", "content": base_system})
-    for block in system_blocks or []:
-        if block:
-            out.append({"role": "system", "content": block})
+    intimate_allowed: bool,
+    debug: bool
+):
+    sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
+    _dbg(debug, "SYSTEM PROMPT:", sys)
 
-    for m in messages or []:
-        role = str(m.get("role") or "user")
-        content = m.get("content", "")
-
-        # Frontend injects attachments as text blocks. Convert image attachments into multimodal parts.
-        if role == "user" and isinstance(content, str):
-            cleaned_text, attachments = _extract_attachments_from_text(content)
-            image_urls: list[str] = []
-            non_image: list[dict[str, str]] = []
-
-            for att in attachments:
-                name = str(att.get("name") or "").strip()
-                url = str(att.get("url") or "").strip()
-                if not (name or url):
-                    continue
-                if url and _is_image_attachment(name, url):
-                    image_urls.append(url)
-                else:
-                    non_image.append({"name": name, "url": url})
-
-            text = (cleaned_text or "").strip()
-            if non_image:
-                extra_lines: list[str] = []
-                for a in non_image:
-                    nm = (a.get("name") or "attachment").strip()
-                    uu = (a.get("url") or "").strip()
-                    extra_lines.append(f"- {nm}: {uu}" if uu else f"- {nm}")
-                extra = "\n".join(extra_lines).strip()
-                if extra:
-                    text = f"{text}\n\nAttachments:\n{extra}" if text else f"Attachments:\n{extra}"
-
-            if image_urls:
-                parts: list[dict[str, Any]] = []
-                if text:
-                    parts.append({"type": "text", "text": text})
-                for url in image_urls:
-                    parts.append({"type": "image_url", "image_url": {"url": url}})
-                out.append({"role": role, "content": parts})
-                if debug:
-                    logger.info("Vision: converted %d image attachment(s) into image_url parts.", len(image_urls))
-            else:
-                out.append({"role": role, "content": text})
-        else:
-            # Preserve any non-string payloads (future-proofing).
-            out.append({"role": role, "content": content if content is not None else ""})
-
+    out = [{"role": "system", "content": sys}]
+    for m in messages:
+        if m.get("role") in ("user", "assistant"):
+            out.append({"role": m["role"], "content": m.get("content", "")})
     return out
 
 
+# ---------------------------------------------------------------------
+# LLM latency optimizations
+#   (1) Reuse OpenAI/xAI clients + underlying HTTP connection pooling.
+#   (2) Optional server-side streaming for xAI (assemble full text).
+#   (3) Prompt compaction (handled later in /chat flow).
+#   (4) Cache onboarding/system blocks (handled later).
+#   (5) Separate priming endpoint /llm/warm (implemented later).
+# ---------------------------------------------------------------------
 
-def _call_gpt4o(messages: List[Dict[str, Any]]) -> str:
+_LLM_CLIENT_LOCK = threading.RLock()
+_OPENAI_CLIENT = None
+_XAI_CLIENT = None
+_OPENAI_SUMMARY_CLIENTS: Dict[str, Any] = {}
+_SHARED_HTTP_CLIENT = None
+
+
+def _get_shared_http_client():
+    """Best-effort shared httpx client for connection pooling.
+
+    Works with OpenAI Python SDK v1.x (DefaultHttpxClient). If unavailable,
+    we fall back to SDK defaults (still correct, just less optimal).
+    """
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is not None:
+        return _SHARED_HTTP_CLIENT
+
+    try:
+        from openai import DefaultHttpxClient
+
+        # Use SDK defaults; the main win is a shared keep-alive pool.
+        _SHARED_HTTP_CLIENT = DefaultHttpxClient()
+        return _SHARED_HTTP_CLIENT
+    except Exception:
+        _SHARED_HTTP_CLIENT = None
+        return None
+
+
+def _make_openai_client(*, api_key: str, base_url: Optional[str] = None, timeout: Optional[float] = None):
     from openai import OpenAI
+
+    kwargs: Dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    if timeout is not None:
+        kwargs["timeout"] = float(timeout)
+
+    http_client = _get_shared_http_client()
+    if http_client is not None:
+        kwargs["http_client"] = http_client
+
+    return OpenAI(**kwargs)
+
+
+def _get_openai_client():
+    global _OPENAI_CLIENT
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
+    with _LLM_CLIENT_LOCK:
+        if _OPENAI_CLIENT is None:
+            _OPENAI_CLIENT = _make_openai_client(api_key=api_key)
+        return _OPENAI_CLIENT
+
+
+def _get_openai_summary_client(timeout_s: float):
+    """Summary client with a specific timeout, still reusing the shared HTTP pool."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    # Bucket by rounded timeout so we don't create many clients.
+    key = f"{float(timeout_s):.3f}"
+    with _LLM_CLIENT_LOCK:
+        c = _OPENAI_SUMMARY_CLIENTS.get(key)
+        if c is None:
+            c = _make_openai_client(api_key=api_key, timeout=float(timeout_s))
+            _OPENAI_SUMMARY_CLIENTS[key] = c
+        return c
+
+
+def _get_xai_client():
+    global _XAI_CLIENT
+
+    api_key = (os.getenv("XAI_API_KEY", "") or os.getenv("XAI_API_TOKEN", "") or "").strip()
+    if not api_key:
+        raise RuntimeError("XAI_API_KEY is not set")
+
+    with _LLM_CLIENT_LOCK:
+        if _XAI_CLIENT is None:
+            _XAI_CLIENT = _make_openai_client(api_key=api_key, base_url=_xai_base_url())
+        return _XAI_CLIENT
+
+
+def _extract_text_from_chat_completion(resp: Any) -> str:
+    try:
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        try:
+            return (resp["choices"][0]["message"]["content"] or "").strip()
+        except Exception:
+            return ""
+
+
+def _extract_text_from_stream_chunk(chunk: Any) -> str:
+    """Extract incremental text from a streaming chunk across SDK variants."""
+    try:
+        choice0 = chunk.choices[0]
+        delta = getattr(choice0, "delta", None)
+        if isinstance(delta, dict):
+            return str(delta.get("content") or "")
+        return str(getattr(delta, "content", "") or "")
+    except Exception:
+        try:
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            return str(delta.get("content") or "")
+        except Exception:
+            return ""
+
+
+def _chat_completion_text(
+    client: Any,
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: Optional[int] = None,
+    stream: bool = False,
+) -> str:
+    """Return the full assistant text. If stream=True, assemble tokens from chunks."""
+    params: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
+    }
+    if max_tokens is not None:
+        params["max_tokens"] = int(max_tokens)
+
+    if not stream:
+        resp = client.chat.completions.create(**params)
+        return _extract_text_from_chat_completion(resp)
+
+    # Best-effort streaming: if the provider/SDK rejects stream, fall back to non-stream.
+    try:
+        params["stream"] = True
+        chunks = client.chat.completions.create(**params)
+        parts: List[str] = []
+        for ch in chunks:
+            t = _extract_text_from_stream_chunk(ch)
+            if t:
+                parts.append(t)
+        return ("".join(parts) or "").strip()
+    except TypeError:
+        resp = client.chat.completions.create(**{k: v for k, v in params.items() if k != "stream"})
+        return _extract_text_from_chat_completion(resp)
+    except Exception:
+        resp = client.chat.completions.create(**{k: v for k, v in params.items() if k != "stream"})
+        return _extract_text_from_chat_completion(resp)
+
+
+def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
+    client = _get_openai_client()
+    return _chat_completion_text(
+        client,
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
-        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
+        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8") or "0.8"),
+        stream=False,
     )
-    return (resp.choices[0].message.content or "").strip()
 
 
 
@@ -4018,21 +3955,20 @@ def _xai_base_url() -> str:
     return url
 
 
-def _call_xai_chat(messages: List[Dict[str, Any]]) -> str:
+def _call_xai_chat(messages: List[Dict[str, str]]) -> str:
     """Call xAI (OpenAI-compatible) chat completions endpoint."""
-    from openai import OpenAI
+    client = _get_xai_client()
 
-    api_key = (os.getenv("XAI_API_KEY", "") or os.getenv("XAI_API_TOKEN", "") or "").strip()
-    if not api_key:
-        raise RuntimeError("XAI_API_KEY is not set")
+    stream_env = (os.getenv("XAI_STREAM", "1") or "1").strip().lower()
+    use_stream = stream_env not in ("0", "false", "no", "off")
 
-    client = OpenAI(api_key=api_key, base_url=_xai_base_url())
-    resp = client.chat.completions.create(
+    return _chat_completion_text(
+        client,
         model=(os.getenv("XAI_MODEL", "") or "grok-4").strip(),
         messages=messages,
         temperature=float(os.getenv("XAI_TEMPERATURE", os.getenv("OPENAI_TEMPERATURE", "0.8")) or "0.8"),
+        stream=use_stream,
     )
-    return (resp.choices[0].message.content or "").strip()
 
 
 def _extract_in_session_summaries(session_state: Dict[str, Any]) -> List[str]:
@@ -4148,23 +4084,74 @@ def _filter_history_for_safe_mode(messages: List[Dict[str, str]]) -> Tuple[List[
     )
     return kept, note
 
+
+def _clamp_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return str(text or "")
+    t = str(text or "")
+    if len(t) <= max_chars:
+        return t
+    if max_chars <= 1:
+        return "…"
+    return t[: max_chars - 1] + "…"
+
+
+def _compact_llm_messages(messages: List[Dict[str, str]], *, provider_switched: bool) -> List[Dict[str, str]]:
+    """Server-side guardrail to keep prompts bounded.
+
+    Frontend already trims history, but this prevents occasional oversized requests
+    (attachments, long copy/paste, etc.) from regressing latency.
+
+    Rules:
+      - Keep the leading contiguous system block prefix intact.
+      - Keep only the last N non-system messages (N smaller on provider switch).
+      - Clamp individual message content length.
+    """
+    if not messages:
+        return messages
+
+    max_body = int(os.getenv("LLM_MAX_BODY_MESSAGES", "34") or "34")
+    max_body_on_switch = int(os.getenv("LLM_MAX_BODY_MESSAGES_ON_SWITCH", "22") or "22")
+    max_chars = int(os.getenv("LLM_MESSAGE_MAX_CHARS", "4000") or "4000")
+
+    n_keep = max_body_on_switch if provider_switched else max_body
+    if n_keep <= 0:
+        n_keep = 12
+
+    # Split contiguous system prefix (persona + injected system blocks).
+    i = 0
+    while i < len(messages) and str(messages[i].get("role") or "") == "system":
+        i += 1
+    sys_prefix = messages[:i]
+    body = messages[i:]
+
+    # Clamp content.
+    def clamp_msg(m: Dict[str, str]) -> Dict[str, str]:
+        role = str(m.get("role") or "")
+        content = _clamp_text(m.get("content") or "", max_chars)
+        return {"role": role, "content": content}
+
+    sys_prefix = [clamp_msg(m) for m in sys_prefix]
+    body = [clamp_msg(m) for m in body]
+
+    if len(body) > n_keep:
+        body = body[-n_keep:]
+
+    return sys_prefix + body
+
 def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
     """Summarization call with conservative limits for reliability."""
-    from openai import OpenAI
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-
     timeout_s = float(os.getenv("SAVE_SUMMARY_OPENAI_TIMEOUT_S", "25") or "25")
-    client = OpenAI(api_key=api_key, timeout=timeout_s)
-    resp = client.chat.completions.create(
+    client = _get_openai_summary_client(timeout_s)
+
+    return _chat_completion_text(
+        client,
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
         temperature=float(os.getenv("SAVE_SUMMARY_TEMPERATURE", "0.2") or "0.2"),
         max_tokens=int(os.getenv("SAVE_SUMMARY_MAX_TOKENS", "350") or "350"),
+        stream=False,
     )
-    return (resp.choices[0].message.content or "").strip()
 
 
 # ---------------------------------------------------------------------
@@ -4200,6 +4187,12 @@ _PUBLIC_SITE_FETCH_TIMEOUT_S = float(os.getenv("PUBLIC_SITE_FETCH_TIMEOUT_S", "1
 _PUBLIC_SITE_MAX_PAGES = int(os.getenv("PUBLIC_SITE_MAX_PAGES", "4") or "4")  # homepage + up to N-1 internal pages
 _PUBLIC_SITE_MAX_BYTES = int(os.getenv("PUBLIC_SITE_MAX_BYTES", "1500000") or "1500000")
 _PUBLIC_SITE_MAX_CHARS_FOR_SUMMARY = int(os.getenv("PUBLIC_SITE_MAX_CHARS_FOR_SUMMARY", "25000") or "25000")
+
+# In-memory cache for onboarding + public site system blocks.
+# This avoids repeated SQLite reads + string building on every turn.
+_HCO_BLOCKS_CACHE_TTL_S = int(os.getenv("HCO_BLOCKS_CACHE_TTL_S", "300") or "300")
+_HCO_BLOCKS_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+_HCO_BLOCKS_CACHE_LOCK = threading.RLock()
 
 
 def _avatar_from_session_state(session_state: Dict[str, Any]) -> str:
@@ -4290,12 +4283,12 @@ def _fetch_onboarding_join_for_avatar_sync(avatar: str) -> Optional[Dict[str, An
                 FROM    {_HCO_TABLE} a,
                         {mapping_table} b
                 WHERE   a.companion_id = b.id
-                  AND   (lower(b.avatar) = lower(?) OR lower(b.avatar) LIKE lower(?) || '-%')
+                  AND   lower(b.avatar) = lower(?)
                 ORDER BY COALESCE(a.ingested_at, 0) DESC,
                          COALESCE(a.created_date, '') DESC
                 LIMIT 1;
                 """,
-                (a, a),
+                (a,),
             )
         else:
             # Fallback to name match (useful if onboarding table doesn't yet have companion_id)
@@ -4310,12 +4303,12 @@ def _fetch_onboarding_join_for_avatar_sync(avatar: str) -> Optional[Dict[str, An
                 FROM    {_HCO_TABLE} a,
                         {mapping_table} b
                 WHERE   lower(a.first_name) = lower(?)
-                  AND   (lower(b.avatar) = lower(?) OR lower(b.avatar) LIKE lower(?) || '-%')
+                  AND   lower(b.avatar) = lower(?)
                 ORDER BY COALESCE(a.ingested_at, 0) DESC,
                          COALESCE(a.created_date, '') DESC
                 LIMIT 1;
                 """,
-                (a, a, a),
+                (a, a),
             )
 
         row = cur.fetchone()
@@ -4347,7 +4340,6 @@ def _build_onboarding_system_block(joined: Dict[str, Any]) -> str:
     We intentionally do NOT include PII fields like email/phone/birthday.
     """
     avatar = _pick_first(joined, "avatar", "first_name") or "Companion"
-    website = _website_url_from_joined(joined)
 
     def f(*cand: str) -> str:
         return _pick_first(joined, *cand)
@@ -4377,7 +4369,6 @@ def _build_onboarding_system_block(joined: Dict[str, Any]) -> str:
     lines = [
         f"AI Representative onboarding context for {avatar} (internal guidance):",
         f"You are speaking *as* {avatar}. Use these preferences as style/boundary guidance.",
-        ("- Website: " + website) if website else "",
         "Do NOT mention forms/SQLite/imports. Do NOT quote these bullets verbatim.",
     ]
 
@@ -4635,74 +4626,25 @@ def _get_public_site_summary_cached_sync(url: str, avatar: str) -> str:
 
 
 def _website_url_from_joined(joined: Dict[str, Any]) -> str:
-    """Extract and normalize a public website URL from the onboarding row."""
-    if not joined:
-        return ""
+    """Extract a public website URL from the onboarding row."""
+    url = _pick_first(joined, "personal_website", "Personal Website", "website", "site")
+    if url:
+        return url
 
-    # 1) Known/common column names (we keep this intentionally broad).
-    url = _pick_first(
-        joined,
-        "personal_website",
-        "Personal Website",
-        "personalWebsite",
-        "website_url",
-        "Website URL",
-        "website",
-        "Website",
-        "public_website",
-        "Public Website",
-        "homepage",
-        "Homepage",
-        "home_page",
-        "Home Page",
-        "site",
-        "Site",
-        "url",
-        "URL",
-        "domain",
-        "Domain",
-    )
+    # If raw_json exists, try it too
+    raw = joined.get("raw_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                for k in ("Personal Website", "personal_website", "website", "site"):
+                    v = obj.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+        except Exception:
+            pass
 
-    # 2) Heuristic scan (covers custom schemas like "companion_website", etc.)
-    if not url:
-        for k, v in joined.items():
-            kl = str(k).strip().lower()
-            if kl in {"upgrade_url", "upgradeurl"}:
-                continue
-            if any(tok in kl for tok in ("website", "homepage", "home_page", "site", "domain")):
-                if isinstance(v, str) and v.strip():
-                    url = v.strip()
-                    break
-
-    # 3) Fallback: website inside raw_json
-    if not url:
-        raw_json = joined.get("raw_json")
-        if isinstance(raw_json, str) and raw_json.strip():
-            try:
-                obj = json.loads(raw_json)
-                if isinstance(obj, dict):
-                    for k in ("personal_website", "website_url", "website", "site", "url", "homepage", "domain"):
-                        v = obj.get(k)
-                        if isinstance(v, str) and v.strip():
-                            url = v.strip()
-                            break
-            except Exception:
-                pass
-
-    if not url:
-        return ""
-
-    url = str(url).strip().strip('"').strip("'")
-    if not url:
-        return ""
-
-    # Normalize scheme: fetchers do better with an explicit scheme.
-    if url.startswith("www."):
-        url = "https://" + url
-    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
-        url = "https://" + url
-
-    return url
+    return ""
 
 
 def _build_public_site_system_block(avatar: str, url: str, summary: str) -> str:
@@ -4714,6 +4656,54 @@ def _build_public_site_system_block(avatar: str, url: str, summary: str) -> str:
         "Do NOT include private contact info.\n"
         f"{summary}"
     )
+
+
+def _get_hco_system_blocks_cached_sync(avatar: str) -> List[str]:
+    """Return system blocks derived from onboarding + public website.
+
+    This is a hot-path helper for /chat and /llm/warm.
+    Uses an in-memory TTL cache to avoid repeated SQLite joins + string building.
+    """
+    a = (avatar or "").strip()
+    if not a:
+        return []
+
+    key = a.lower()
+    now = time.time()
+
+    with _HCO_BLOCKS_CACHE_LOCK:
+        ent = _HCO_BLOCKS_CACHE.get(key)
+        if ent:
+            ts, blocks = ent
+            if (now - float(ts)) < float(_HCO_BLOCKS_CACHE_TTL_S):
+                return list(blocks or [])
+
+    joined = _fetch_onboarding_join_for_avatar_sync(a)
+    blocks: List[str] = []
+
+    if joined:
+        # Only inject for human/rep companions
+        ctype = (str(joined.get("companion_type") or "") or "").strip().lower()
+        if ctype in ("human", "representative", "rep", "ai_representative", ""):
+            ob = _build_onboarding_system_block(joined)
+            if ob:
+                blocks.append(ob)
+
+            website_url = _website_url_from_joined(joined)
+            if website_url:
+                try:
+                    summary = _get_public_site_summary_cached_sync(website_url, joined.get("avatar") or a)
+                except Exception:
+                    summary = ""
+
+                pb = _build_public_site_system_block(joined.get("avatar") or a, website_url, summary)
+                if pb:
+                    blocks.append(pb)
+
+    with _HCO_BLOCKS_CACHE_LOCK:
+        _HCO_BLOCKS_CACHE[key] = (now, list(blocks))
+
+    return blocks
 
 
 
@@ -4992,32 +4982,14 @@ def _normalize_tts_text(
     avatar = (avatar or "").strip()
     mapping_phonetic = (mapping_phonetic or "").strip()
     if avatar and mapping_phonetic:
-        # Support both display-name and descriptive-key avatar formats.
-        raw = str(avatar).strip()
-        targets = [raw]
-        if "-" in raw:
-            targets.append(raw.split("-", 1)[0].strip())
-        if " " in raw:
-            targets.append(raw.split(" ", 1)[0].strip())
-
-        seen: set[str] = set()
-        uniq: list[str] = []
-        for t in targets:
-            tl = t.lower()
-            if t and tl not in seen:
-                seen.add(tl)
-                uniq.append(t)
-
-        for t in uniq:
-            # Handle CamelCase concatenations (e.g., "DulceMoon") by inserting a space before replacement.
-            s = re.sub(
-                rf"(?i)(?<![A-Za-z0-9]){re.escape(t)}(?=[A-Z])",
-                mapping_phonetic + " ",
-                s,
-            )
-            # Word-boundary replacement (normal case)
-            s = _apply_phonetic_word_boundary(s, t, mapping_phonetic)
-
+        # Handle CamelCase concatenations (e.g., "DulceMoon") by inserting a space.
+        s = re.sub(
+            rf"(?i)(?<![A-Za-z0-9]){re.escape(avatar)}(?=[A-Z])",
+            mapping_phonetic + " ",
+            s,
+        )
+        # Word-boundary replacement (normal case)
+        s = _apply_phonetic_word_boundary(s, avatar, mapping_phonetic)
 
     # 5) Optional brand phonetic (future-proof; not currently required).
     brand_phonetic = (brand_phonetic or "").strip()
@@ -5040,7 +5012,7 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = 
             if avatar:
                 m = _lookup_companion_mapping(brand, avatar) or {}
                 phon = (m.get("phonetic") or "").strip()
-            text = _normalize_tts_text(text, brand=brand, avatar=avatar, mapping_phonetic=phon)
+            text = _normalize_tts_text(text, brand=brand, avatar=avatar, phonetic=phon)
     except Exception:
         # Never fail TTS due to normalization
         pass
@@ -5270,7 +5242,7 @@ def _tts_cache_peek_sync(voice_id: str, text: str) -> Optional[str]:
 # ----------------------------
 #
 # Requirements:
-# - Uploads are NOT allowed during legacy shared-live sessions.
+# - Uploads are NOT allowed during Shared Live (BeeStreamed) sessions.
 # - The frontend uploads raw bytes (no multipart) to avoid python-multipart dependency.
 # - We return a read-only SAS URL so the sender/receiver can open the attachment.
 # - Container name: "uploads" (override via UPLOADS_CONTAINER env var).
@@ -5695,7 +5667,7 @@ async def chat(request: Request):
         memory_key = None
 
     # Helper to build responses consistently and optionally include audio_url.
-    async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any], content: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
         # Ensure the frontend can reflect whether a human host takeover is active.
         try:
             state_out = dict(state_out)
@@ -5716,16 +5688,13 @@ async def chat(request: Request):
                 state_out = dict(state_out)
                 state_out["tts_error"] = f"{type(e).__name__}: {e}"
 
-        out = {
+        return {
             "session_id": session_id,
             "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
             "reply": reply,
             "session_state": state_out,
             "audio_url": audio_url,       # NEW (optional)
         }
-        if isinstance(content, dict) and content:
-            out["content"] = content
-        return out
 
     # If the user is asking about their remaining minutes, answer deterministically
     # (no OpenAI call). This also works when minutes are exhausted.
@@ -5760,36 +5729,7 @@ async def chat(request: Request):
             payg_increment_minutes=pay_go_minutes,
             payg_price_text=payg_price_text_override,
         )
-        content_payload = None
-        try:
-            scheduled = _maybe_schedule_mode_content_drop(
-                session_id=session_id,
-                session_state_out=session_state_out,
-                usage_info=usage_info,
-                identity_key=identity_key,
-                debug=debug,
-            )
-            if scheduled:
-                token, delivery = scheduled
-                content_payload = delivery
-                _dbg(debug, f"User content drop: scheduled token={token} kind={delivery.get('kind')} mode={delivery.get('mode')} brand={delivery.get('brand')}")
-                try:
-                    _relay_emit(
-                        session_id,
-                        {
-                            "kind": "content_pending",
-                            "token": token,
-                            "mode": delivery.get("mode"),
-                            "brand": delivery.get("brand"),
-                            "sentAt": int(time.time()),
-                        },
-                    )
-                except Exception as e:
-                    _dbg(debug, f"User content drop: relay emit failed: {e!r}")
-        except Exception as e:
-            _dbg(debug, f"User content drop: schedule failed: {e!r}")
-
-        return await _respond(reply, STATUS_SAFE, session_state_out, content=content_payload)
+        return await _respond(reply, STATUS_SAFE, session_state_out)
 
     # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
@@ -5961,23 +5901,6 @@ async def chat(request: Request):
             or session_state_out.get("companionName")
             or session_state_out.get("companion_name")
         )
-
-        # Scheduled mode-based content must still be triggered even during host override.
-        # When override is active, content is queued to the host (host modal) and only sent to the member
-        # when the host explicitly pushes it.
-        try:
-            mu_now = int(usage_info.get("minutes_used") or 0)
-            await _maybe_schedule_mode_content_drop(
-                session_id=session_id,
-                identity_key=identity_key,
-                session_state_out=session_state_out,
-                minutes_used=mu_now,
-                effective_mode=effective_mode,
-                override_active=True,
-            )
-        except Exception:
-            pass
-
         return await _respond(
             "",
             STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
@@ -6014,36 +5937,13 @@ async def chat(request: Request):
         avatar_name = _avatar_from_session_state(session_state)
 
         extra_system_blocks: List[str] = []
-        joined = None
         if avatar_name:
-            joined = await run_in_threadpool(_fetch_onboarding_join_for_avatar_sync, avatar_name)
-
-        if joined:
-            ctype = str(joined.get("companion_type") or "").strip().lower()
-            # Only inject onboarding/site context for Human/Representative companions by default.
-            if ctype in ("human", "representative", "rep", ""):
-                onboarding_block = _build_onboarding_system_block(joined)
-                if onboarding_block:
-                    extra_system_blocks.append(onboarding_block)
-
-                website_url = _website_url_from_joined(joined)
-                if website_url:
-                    public_summary = await run_in_threadpool(
-                        _get_public_site_summary_cached_sync,
-                        website_url,
-                        (joined.get("avatar") or avatar_name or "Companion"),
-                    )
-                    public_block = _build_public_site_system_block(
-                        (joined.get("avatar") or avatar_name or "Companion"),
-                        website_url,
-                        public_summary,
-                    )
-                    if public_block:
-                        extra_system_blocks.append(public_block)
-            else:
-                _dbg(debug, f"[hco] companion_type={ctype}; skipping onboarding/site injection")
+            # Cached: avoids repeated SQLite joins + string building.
+            extra_system_blocks = await run_in_threadpool(_get_hco_system_blocks_cached_sync, avatar_name)
+            if not extra_system_blocks:
+                _dbg(debug, f"[hco] no onboarding/site blocks for avatar={avatar_name!r}")
         else:
-            _dbg(debug, f"[hco] no onboarding row found for avatar={avatar_name!r}")
+            _dbg(debug, "[hco] no avatar in session_state; skipping onboarding/site injection")
 
         # Inject these blocks immediately after the base persona system prompt
         insert_at = 1
@@ -6080,6 +5980,8 @@ async def chat(request: Request):
             insert_at += 1
 
         if safe_saved_summary:
+            max_saved_chars = int(os.getenv("LLM_SAVED_SUMMARY_MAX_CHARS", "2500") or "2500")
+            safe_saved_summary = _clamp_text(safe_saved_summary, max_saved_chars)
             llm_messages.insert(
                 insert_at,
                 {
@@ -6090,7 +5992,10 @@ async def chat(request: Request):
             insert_at += 1
 
         if in_session_summaries:
-            joined_summaries = "\n- " + "\n- ".join([s for s in in_session_summaries if (s or '').strip()])
+            item_max = int(os.getenv("LLM_IN_SESSION_SUMMARY_ITEM_MAX_CHARS", "900") or "900")
+            joined_summaries = "\n- " + "\n- ".join([
+                _clamp_text(s, item_max) for s in in_session_summaries if (s or '').strip()
+            ])
             llm_messages.insert(
                 insert_at,
                 {
@@ -6104,18 +6009,14 @@ async def chat(request: Request):
             llm_messages.insert(insert_at, {"role": "system", "content": handoff_note})
             insert_at += 1
 
-        try:
-            if llm_provider == "xai":
-                assistant_reply = _call_xai_chat(llm_messages)
-            else:
-                assistant_reply = _call_gpt4o(llm_messages)
-        except Exception as e:
-            # If the user attached images and the xAI model rejects multimodal input, fall back to OpenAI vision.
-            if llm_provider == "xai" and _messages_contain_images(llm_messages):
-                logger.warning("xAI chat failed for multimodal input; falling back to OpenAI. error=%r", e)
-                assistant_reply = _call_gpt4o(llm_messages)
-            else:
-                raise
+        # Final server-side compaction pass (frontend already trims, but this prevents
+        # occasional oversized payloads from regressing latency).
+        llm_messages = _compact_llm_messages(llm_messages, provider_switched=provider_switched)
+
+        if llm_provider == "xai":
+            assistant_reply = _call_xai_chat(llm_messages)
+        else:
+            assistant_reply = _call_gpt4o(llm_messages)
     except Exception as e:
         _dbg(debug, "LLM call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
@@ -6152,36 +6053,108 @@ async def chat(request: Request):
         or session_state_out.get("companion_name")
     )
 
-    # ---------------------------------------------------------
-    # Mode-pill scheduled content drops (filesystem + SQLite)
-    # - Trigger minutes: 9, 19, 29, 39, ...
-    # - Folder: /home/site/brand/<brandName>/content/mode/<mode>/
-    # - Eligibility: once per 24h (friend = 1 item; romantic/intimate = begin..end series)
-    # - Purchase/upgrade resets eligibility (via usage.last_credit_at)
-    # ---------------------------------------------------------
-
-    content_payload: Optional[Dict[str, Any]] = None
-    try:
-        mu_now = int(usage_info.get("minutes_used") or 0)
-        content_payload = await _maybe_schedule_mode_content_drop(
-            session_id=session_id,
-            identity_key=identity_key,
-            session_state_out=session_state_out,
-            minutes_used=mu_now,
-            effective_mode=effective_mode,
-            override_active=False,
-        )
-    except Exception:
-        # Never allow content delivery errors to break chat.
-        content_payload = None
-
-
     return await _respond(
         assistant_reply,
         STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
         session_state_out,
-        content=content_payload,
     )
+
+
+# -----------------------------------------------------------------------------
+# (5) Separate priming call to reduce first-token latency on provider switches
+# -----------------------------------------------------------------------------
+
+_LLM_WARM_LOCK = threading.RLock()
+_LLM_WARM_LAST: Dict[str, float] = {}
+
+
+def _normalize_mode_slug(mode: str) -> str:
+    m = (mode or "").strip().lower()
+    if m.startswith("intimate"):
+        return "intimate"
+    if m.startswith("romantic"):
+        return "romantic"
+    return "friend"
+
+
+@app.post("/llm/warm")
+async def llm_warm(raw: Dict[str, Any] = Body(...)):
+    """Warm the target provider using the same system/background blocks.
+
+    This endpoint is intentionally side-effect free. Frontend can fire-and-forget
+    when mode/provider is about to switch.
+    """
+    session_state = raw.get("session_state") or raw.get("sessionState") or {}
+    if not isinstance(session_state, dict):
+        session_state = {}
+
+    mode = _normalize_mode_slug(str(raw.get("mode") or session_state.get("mode") or "friend"))
+    provider = str(raw.get("provider") or session_state.get("llm_provider") or "").strip().lower()
+    if provider not in ("openai", "xai"):
+        provider = "xai" if mode == "intimate" else "openai"
+
+    avatar_name = _avatar_from_session_state(session_state)
+    brand = str(session_state.get("brand") or "").strip().lower()
+
+    warm_ttl_s = float(os.getenv("LLM_WARM_TTL_S", "45") or "45")
+    warm_key = f"{provider}|{mode}|{brand}|{(avatar_name or '').strip().lower()}"
+
+    now = time.time()
+    with _LLM_WARM_LOCK:
+        last = float(_LLM_WARM_LAST.get(warm_key, 0.0) or 0.0)
+        if (now - last) < warm_ttl_s:
+            return {"ok": True, "skipped": True, "provider": provider, "mode": mode}
+        _LLM_WARM_LAST[warm_key] = now
+
+    intimate_allowed = bool(session_state.get("explicit_consented") or session_state.get("romance_consented"))
+    if mode != "intimate":
+        intimate_allowed = False
+
+    # Build the same system prompt blocks (persona + onboarding + site context).
+    system_prompt = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
+    warm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+    if avatar_name:
+        try:
+            blocks = await run_in_threadpool(_get_hco_system_blocks_cached_sync, avatar_name)
+            for b in blocks or []:
+                if (b or "").strip():
+                    warm_messages.append({"role": "system", "content": b})
+        except Exception:
+            pass
+
+    # Tiny user ping; keep max_tokens minimal.
+    warm_messages.append({"role": "user", "content": "."})
+    warm_messages = _compact_llm_messages(warm_messages, provider_switched=True)
+
+    try:
+        if provider == "xai":
+            client = _get_xai_client()
+            stream_env = (os.getenv("XAI_STREAM", "1") or "1").strip().lower()
+            use_stream = stream_env not in ("0", "false", "no", "off")
+            _chat_completion_text(
+                client,
+                model=(os.getenv("XAI_MODEL", "") or "grok-4").strip(),
+                messages=warm_messages,
+                temperature=0.0,
+                max_tokens=1,
+                stream=use_stream,
+            )
+        else:
+            client = _get_openai_client()
+            _chat_completion_text(
+                client,
+                model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+                messages=warm_messages,
+                temperature=0.0,
+                max_tokens=1,
+                stream=False,
+            )
+    except Exception as e:
+        # Never fail the UI because warming didn't work.
+        return {"ok": False, "provider": provider, "mode": mode, "error": f"{type(e).__name__}: {e}"}
+
+    return {"ok": True, "provider": provider, "mode": mode}
 
 
 
@@ -6346,8 +6319,6 @@ def _ai_override_touch_from_chat(
         rec["member_id"] = str(member_id or "").strip()
         rec["identity_key"] = str(identity_key or "").strip()
         rec["companion_key"] = companion_key
-        # Track the user's current mode pill for scheduled content delivery.
-        rec["mode_pill"] = _normalize_mode(str(session_state.get("mode") or ""))
         rec["last_seen"] = float(now)
 
         # Usage context (needed for host messages to continue charging and for paywall messages)
@@ -6382,7 +6353,6 @@ def _ai_override_append_event(
     sender: str,
     audience: str = "all",
     kind: str = "message",
-    payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     sid = (session_id or "").strip()
     if not sid:
@@ -6406,8 +6376,6 @@ def _ai_override_append_event(
             "audience": str(audience or "all").strip() or "all",
             "kind": str(kind or "message").strip() or "message",
         }
-        if isinstance(payload, dict) and payload:
-            ev["payload"] = payload
 
         events = rec.get("events")
         if not isinstance(events, list):
@@ -6648,11 +6616,7 @@ def _ai_override_best_summary(rec: Dict[str, Any]) -> Tuple[str, str]:
 # This is intentionally simple; durable storage / retrieval strategy can be evolved
 # incrementally without changing the frontend contract.
 _CHAT_SUMMARY_STORE: Dict[str, Dict[str, Any]] = {}
-_CHAT_SUMMARY_FILE = (os.getenv("CHAT_SUMMARY_FILE", "") or "").strip()
-# Default to a persisted location on Azure App Service so summaries survive multi-worker deployments.
-# (Azure: any data outside '/home' is not persisted.)
-if not _CHAT_SUMMARY_FILE:
-    _CHAT_SUMMARY_FILE = "/home/chat_summaries.json"
+_CHAT_SUMMARY_FILE = os.getenv("CHAT_SUMMARY_FILE", "")
 _CHAT_SUMMARY_FILE_MTIME: float = 0.0
 
 # Lock for cross-worker file refresh/write coordination (best-effort).
@@ -7166,7 +7130,7 @@ async def journal_append(request: Request):
 #     ...
 
 # =============================================================================
-# LiveKit (replaces legacy stream + conference providers)
+# LiveKit (replaces BeeStreamed + Jitsi for stream + conference)
 #
 # Supports:
 # - Persistent roomName per (brand, avatar) (stored in the existing event_ref column when present)
@@ -8836,14 +8800,6 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
 
         # Some Wix payloads use shape B: { "data": { instanceId, eventType, identity, data } }
         d0 = envelope_obj.get("data")
-        # Some Wix JWTs wrap the envelope/event JSON under the "data" claim as a *string*.
-        # Try to JSON-decode it so the unwrapping logic below can see eventType/instanceId/etc.
-        if isinstance(d0, str):
-            try:
-                d0_parsed = json.loads(d0)
-                d0 = d0_parsed
-            except Exception:
-                pass
         if isinstance(d0, dict) and ("data" in d0) and ("eventType" in d0 or "instanceId" in d0 or "identity" in d0 or "webhookId" in d0):
             envelope_obj = d0
 
@@ -8865,8 +8821,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                     identity_raw = cur.get("identity")
                 inner = cur.get("data")
             else:
-                # If this looks like a JWT wrapper (e.g. {"data": "...", "iat": ..., "exp": ...}), unwrap one level.
-                inner = cur.get("data") if isinstance(cur, dict) and ("data" in cur) else cur
+                inner = cur
 
             # Parse JSON-string inner payloads
             if isinstance(inner, str):
@@ -9168,14 +9123,6 @@ class HostAiChatsSendRequest(BaseModel):
     text: str = ""
 
 
-class HostAiChatsPushContentRequest(BaseModel):
-    brand: str = ""
-    avatar: str = ""
-    memberId: str = ""
-    session_id: str = ""
-    token: str = ""
-
-
 class HostAiChatsPollRequest(BaseModel):
     brand: str = ""
     avatar: str = ""
@@ -9382,119 +9329,7 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
         kind="message",
     )
 
-    # Scheduled mode-based content must still trigger while the host is chatting (same usage clock).
-    try:
-        rec2 = _ai_override_get_session(sid) or {}
-        mode_pill = str((rec2 or {}).get("mode_pill") or "friend")
-        state_stub: Dict[str, Any] = {
-            "brand": str(req.brand or "").strip(),
-            "avatar": str(req.avatar or "").strip(),
-            "memberId": str(req.memberId or "").strip(),
-            "mode": mode_pill,
-            "companion": str((rec2 or {}).get("companion_key") or "").strip(),
-        }
-        await _maybe_schedule_mode_content_drop(
-            session_id=sid,
-            identity_key=identity_key,
-            session_state_out=state_stub,
-            minutes_used=int(usage_info.get("minutes_used") or 0),
-            effective_mode=mode_pill,
-            override_active=True,
-        )
-    except Exception:
-        pass
-
     return {"ok": True, "session_id": sid, "override_active": True, "usage_info": usage_info}
-
-
-
-
-@app.post("/host/ai-chats/push-content")
-async def host_ai_chats_push_content(req: HostAiChatsPushContentRequest):
-    """
-    Host-only: push a previously scheduled content item (queued while override was active)
-    into the shared transcript so the member sees it as an AI Companion message.
-    """
-    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
-    sid = (req.session_id or "").strip()
-    token = (req.token or "").strip()
-
-    if not sid:
-        raise HTTPException(status_code=400, detail="session_id is required")
-    if not token:
-        raise HTTPException(status_code=400, detail="token is required")
-
-    rec = _ai_override_get_session(sid) or {}
-    if not isinstance(rec, dict):
-        raise HTTPException(status_code=404, detail="Unknown session_id")
-
-    bound_host = str(rec.get("override_host_member_id") or "").strip()
-    if bound_host and bound_host != host_id:
-        raise HTTPException(status_code=403, detail="This session is owned by a different host")
-
-    content_payload: Optional[Dict[str, Any]] = None
-    with _AI_OVERRIDE_LOCK:
-        r = _AI_OVERRIDE_SESSIONS.get(sid)
-        if not isinstance(r, dict):
-            raise HTTPException(status_code=404, detail="Unknown session_id")
-
-        pending = r.get("pending_content")
-        if not isinstance(pending, dict):
-            pending = {}
-
-        item = pending.get(token)
-        if not item:
-            raise HTTPException(status_code=404, detail="No pending content for this token")
-
-        if isinstance(item, dict) and isinstance(item.get("content"), dict):
-            content_payload = item.get("content")
-        elif isinstance(item, dict):
-            # Back-compat if stored directly as payload
-            content_payload = {k: v for k, v in item.items() if k not in ("created_ts", "trigger_minute", "token")}
-        else:
-            content_payload = None
-
-        # Remove from pending once pushed.
-        pending.pop(token, None)
-        r["pending_content"] = pending
-
-        pushed = r.get("pushed_content_tokens")
-        if not isinstance(pushed, list):
-            pushed = []
-        if token not in pushed:
-            pushed.append(token)
-        # Cap memory
-        if len(pushed) > 2000:
-            pushed = pushed[-2000:]
-        r["pushed_content_tokens"] = pushed
-
-        _AI_OVERRIDE_SESSIONS[sid] = r
-        _ai_override_persist()
-
-    if not isinstance(content_payload, dict) or not content_payload:
-        raise HTTPException(status_code=500, detail="Pending content payload was malformed")
-
-    # Emit to both member+host transcript. Sender is 'ai' so the UI labels it as <companionName>.
-    msg = str(content_payload.get("message") or "").strip()
-    att = content_payload.get("attachment") if isinstance(content_payload.get("attachment"), dict) else {}
-    url = str((att or {}).get("url") or "").strip()
-    name = str((att or {}).get("name") or "content").strip()
-    relay_txt = msg
-    if url:
-        relay_txt = (relay_txt + ("\n\n" if relay_txt else "") + f"Attachment: {name}\n{url}").strip()
-
-    _ai_override_append_event(
-        sid,
-        role="assistant",
-        content=relay_txt or msg or " ",
-        sender="ai",
-        audience="all",
-        kind="user_content",
-        payload=content_payload,
-    )
-
-    return {"ok": True, "session_id": sid, "token": token}
-
 
 
 @app.post("/host/ai-chats/poll")
@@ -9581,41 +9416,3 @@ async def chat_relay_poll(req: ChatRelayPollRequest):
     polled["ok"] = True
     polled["session_id"] = sid
     return polled
-
-
-# ---------------------------------------------------------------------------
-# Serve brand/mode user content from the filesystem
-# ---------------------------------------------------------------------------
-
-@app.get("/content/mode/{mode}/{brand}/{filename}")
-async def get_brand_mode_content(mode: str, brand: str, filename: str) -> Response:
-    """
-    Serves files from:
-      /home/site/brand/<brandName>/content/mode/<friend|romantic|intimate>/<filename>
-
-    This is used by the frontend when the backend schedules mode-based content drops.
-    """
-    mode_norm = _normalize_mode(mode)
-    if mode_norm not in ("friend", "romantic", "intimate"):
-        raise HTTPException(status_code=400, detail="invalid mode")
-
-    # Defensive: no path traversal.
-    fn = (filename or "").strip()
-    if not fn or fn != os.path.basename(fn) or ".." in fn or "/" in fn or "\\" in fn:
-        raise HTTPException(status_code=400, detail="invalid filename")
-
-    brand_in = (brand or "").strip() or "Elaralo"
-    content_dir = _brand_content_dir(brand_in, mode_norm)
-    if not content_dir or not os.path.isdir(content_dir):
-        raise HTTPException(status_code=404, detail="content folder not found")
-
-    full_path = os.path.join(content_dir, fn)
-    if not os.path.isfile(full_path):
-        raise HTTPException(status_code=404, detail="content not found")
-
-    media_type = _guess_content_type(full_path)
-    headers = {
-        # Cache OK: files are immutable by name (sequence prefix).
-        "Cache-Control": "public, max-age=3600",
-    }
-    return FileResponse(full_path, media_type=media_type, filename=fn, headers=headers)
