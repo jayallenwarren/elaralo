@@ -374,6 +374,34 @@ async def usage_status(request: Request):
     }
 
 
+@app.get("/admin/usage/debug")
+async def admin_usage_debug(request: Request):
+    """Restricted admin debug endpoint for persisted usage/minutes state.
+
+    Security:
+      - Requires header "X-Admin-Token" matching env var USAGE_ADMIN_TOKEN.
+
+    Query params:
+      - member_id / memberId (optional): if provided, returns a detailed view for that member.
+      - limit (optional): if member_id is omitted, returns the most recently updated rows (default 25, max 200).
+    """
+    token = (request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token") or "").strip()
+    if not USAGE_ADMIN_TOKEN or token != USAGE_ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    member_id = (request.query_params.get("member_id") or request.query_params.get("memberId") or "").strip()
+    limit_raw = (request.query_params.get("limit") or "").strip()
+    try:
+        limit_i = int(limit_raw) if limit_raw else 25
+    except Exception:
+        limit_i = 25
+    limit_i = max(1, min(limit_i, 200))
+
+    now = time.time()
+    result = await run_in_threadpool(_usage_admin_debug_sync, member_id, limit_i, now)
+    return result
+
+
 @app.get("/ready")
 def ready():
     """
@@ -9774,6 +9802,23 @@ def _usage_db_ensure_member_row(
     if (not is_trial) and stored_cycle_days > 0:
         cycle_len = float(stored_cycle_days) * 86400.0
         if (float(now) - float(cycle_start)) >= cycle_len:
+            # Carry over remaining seconds from the previous cycle into the new cycle (rollover).
+            try:
+                old_free_min = int(row["free_minutes_total"] or 0)
+            except Exception:
+                old_free_min = 0
+            try:
+                old_purchased_s = float(row["purchased_seconds"] or 0.0)
+            except Exception:
+                old_purchased_s = 0.0
+            try:
+                old_used_s = float(row["used_seconds"] or 0.0)
+            except Exception:
+                old_used_s = 0.0
+
+            old_total_s = max(0.0, float(old_free_min) * 60.0 + float(old_purchased_s))
+            carryover_seconds = max(0.0, float(old_total_s) - float(old_used_s))
+
             conn.execute(
                 """
                 UPDATE member_usage_minutes
@@ -9783,7 +9828,7 @@ def _usage_db_ensure_member_row(
                        plan_signature = ?,
                        free_minutes_total = ?,
                        used_seconds = 0,
-                       purchased_seconds = 0,
+                       purchased_seconds = ?,
                        restart_grace = 0,
                        update_reason = ?,
                        update_datetime = CURRENT_TIMESTAMP
@@ -9795,6 +9840,7 @@ def _usage_db_ensure_member_row(
                     plan_name,
                     requested_sig,
                     int(requested_free_minutes),
+                    float(carryover_seconds),
                     "cycle_reset",
                     member_id,
                 ),
@@ -9860,6 +9906,102 @@ def _usage_info_from_row(row: sqlite3.Row) -> Dict[str, Any]:
         "minutes_exhausted": remaining_seconds <= 0.0,
         "update_reason": str(row["update_reason"] or ""),
     }
+
+
+def _usage_admin_debug_sync(member_id: str, limit: int, now: float) -> Dict[str, Any]:
+    """Sync helper for /admin/usage/debug (runs in threadpool).
+
+    If member_id is provided, returns a detailed record including raw DB row fields and computed totals.
+    If member_id is empty, returns the most recently updated rows (limited) for triage.
+    """
+    conn = _usage_db_connect()
+    _usage_db_ensure_schema(conn)
+
+    member_id_norm = _normalize_usage_member_id(member_id) if member_id else ""
+    if member_id_norm:
+        row = _usage_db_get_row(conn, member_id_norm)
+        if row is None:
+            return {"ok": False, "error": "not_found", "member_id": member_id_norm, "db_path": _usage_db_path()}
+
+        raw_row = {k: row[k] for k in row.keys()}
+        info = _usage_info_from_row(row)
+
+        try:
+            cycle_start = float(row["cycle_start_epoch"] or 0.0)
+        except Exception:
+            cycle_start = 0.0
+        try:
+            cycle_days = int(row["cycle_days"] or 0)
+        except Exception:
+            cycle_days = 0
+
+        cycle_end = cycle_start + float(cycle_days) * 86400.0 if cycle_start and cycle_days > 0 else None
+        reset_in_seconds = max(0.0, float(cycle_end - now)) if cycle_end else None
+
+        # Provide seconds-level totals for debugging (minutes are floored in _usage_info_from_row).
+        free_minutes_total = int(row["free_minutes_total"] or 0)
+        purchased_seconds = float(row["purchased_seconds"] or 0.0)
+        used_seconds = float(row["used_seconds"] or 0.0)
+        total_seconds = max(0.0, float(free_minutes_total) * 60.0 + purchased_seconds)
+        used_seconds_c = min(total_seconds, max(0.0, used_seconds))
+        remaining_seconds = max(0.0, total_seconds - used_seconds_c)
+
+        return {
+            "ok": True,
+            "db_path": _usage_db_path(),
+            "now_epoch": now,
+            "member_id": member_id_norm,
+            "raw_row": raw_row,
+            "computed": {
+                **info,
+                "plan_signature": str(row["plan_signature"] or ""),
+                "free_minutes_total": free_minutes_total,
+                "purchased_seconds": purchased_seconds,
+                "used_seconds": used_seconds,
+                "total_seconds": total_seconds,
+                "remaining_seconds": remaining_seconds,
+                "cycle_end_epoch": cycle_end,
+                "reset_in_seconds": reset_in_seconds,
+            },
+        }
+
+    # No member_id -> list recent rows
+    try:
+        lim = int(limit)
+    except Exception:
+        lim = 25
+    lim = max(1, min(lim, 200))
+
+    rows = conn.execute(
+        "SELECT * FROM member_usage_minutes ORDER BY update_datetime DESC, create_datetime DESC LIMIT ?;",
+        (lim,),
+    ).fetchall()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            info = _usage_info_from_row(r)
+        except Exception:
+            info = {}
+        try:
+            raw_row = {k: r[k] for k in r.keys()}
+        except Exception:
+            raw_row = {}
+        items.append(
+            {
+                "member_id": str(r["member_id"]),
+                "update_datetime": str(r["update_datetime"] or ""),
+                "update_reason": str(r["update_reason"] or ""),
+                "plan_name": str(r["plan_name"] or ""),
+                "plan_signature": str(r["plan_signature"] or ""),
+                "minutes_allowed": info.get("minutes_allowed"),
+                "minutes_used": info.get("minutes_used"),
+                "minutes_remaining": info.get("minutes_remaining"),
+                "raw_row": raw_row,
+            }
+        )
+
+    return {"ok": True, "db_path": _usage_db_path(), "now_epoch": now, "count": len(items), "rows": items}
 
 
 # --- Override legacy usage functions to use SQLite table state ---
