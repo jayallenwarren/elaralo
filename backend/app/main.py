@@ -9438,3 +9438,685 @@ async def chat_relay_poll(req: ChatRelayPollRequest):
     polled["ok"] = True
     polled["session_id"] = sid
     return polled
+
+
+# ============================
+# v7.21 - Minutes consistency hardening (SQLite-backed state)
+# ============================
+# Goal:
+#  - Persist minute budgeting and cycle state per member_id (including non-member ids)
+#  - Prevent regressions where "remaining > total" or totals drift due to repeated parsing
+#  - Apply free_minutes from rebrandingKey ONLY once per cycle per member (or when plan upgrades)
+#  - PayGo purchases ALWAYS increase total time (purchased seconds) and are tracked with update_reason
+
+import os
+import time
+import sqlite3
+import tempfile
+import threading
+from typing import Optional, Dict, Any, Tuple
+
+_USAGE_DB_LOCK = threading.Lock()
+_USAGE_DB_READY = False
+
+def _usage_db_path() -> str:
+    """
+    Returns a persisted SQLite path for usage state.
+
+    We intentionally store this outside the packaged app directory so it persists across deploys.
+    """
+    env_path = (os.getenv("USAGE_SQLITE_PATH") or os.getenv("USAGE_DB_PATH") or "").strip()
+    if env_path:
+        return env_path
+
+    # Azure App Service persists /home. Prefer /home/site if present.
+    for cand in ("/home/site/usage_minutes.sqlite3", "/home/usage_minutes.sqlite3"):
+        try:
+            os.makedirs(os.path.dirname(cand), exist_ok=True)
+            return cand
+        except Exception:
+            continue
+
+    return os.path.join(tempfile.gettempdir(), "usage_minutes.sqlite3")
+
+
+def _normalize_usage_member_id(identity_key: str) -> str:
+    """
+    Normalizes an identity_key into the member_id value stored in the DB.
+
+    - legacy keys look like: "member::<uuid>"
+    - for non-members, we may also see: "Anon:<...>" or "ip::<addr>"
+    """
+    k = str(identity_key or "").strip()
+    if not k:
+        return ""
+    low = k.lower()
+    if low.startswith("member::"):
+        return k.split("::", 1)[1].strip()
+    return k
+
+
+def _usage_db_connect() -> sqlite3.Connection:
+    path = _usage_db_path()
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except Exception:
+        pass
+    return conn
+
+
+def _usage_db_ensure_schema(conn: sqlite3.Connection) -> None:
+    global _USAGE_DB_READY
+    if _USAGE_DB_READY:
+        return
+    with _USAGE_DB_LOCK:
+        if _USAGE_DB_READY:
+            return
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS member_usage_minutes (
+              member_id TEXT PRIMARY KEY,
+              create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+              update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+              cycle_start_epoch REAL,
+              cycle_days INTEGER,
+              plan_name TEXT,
+              plan_signature TEXT,
+              free_minutes_total INTEGER,
+              purchased_seconds REAL DEFAULT 0,
+              used_seconds REAL DEFAULT 0,
+              last_seen_epoch REAL,
+              restart_grace INTEGER DEFAULT 0,
+              update_reason TEXT
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_member_usage_minutes_cycle ON member_usage_minutes(cycle_start_epoch);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_member_usage_minutes_plan ON member_usage_minutes(plan_name);")
+        conn.commit()
+        _USAGE_DB_READY = True
+
+
+def _usage_db_get_row(conn: sqlite3.Connection, member_id: str) -> Optional[sqlite3.Row]:
+    cur = conn.execute("SELECT * FROM member_usage_minutes WHERE member_id = ?;", (member_id,))
+    return cur.fetchone()
+
+
+def _usage_db_set_update_reason(conn: sqlite3.Connection, member_id: str, reason: str) -> None:
+    conn.execute(
+        """
+        UPDATE member_usage_minutes
+           SET update_reason = ?,
+               update_datetime = CURRENT_TIMESTAMP
+         WHERE member_id = ?;
+        """,
+        (reason, member_id),
+    )
+
+
+def _usage_db_upsert_init(
+    conn: sqlite3.Connection,
+    member_id: str,
+    now: float,
+    cycle_days: int,
+    plan_name: str,
+    plan_signature: str,
+    free_minutes_total: int,
+    used_seconds: float = 0.0,
+    purchased_seconds: float = 0.0,
+    last_seen_epoch: Optional[float] = None,
+    restart_grace: int = 0,
+    update_reason: str = "init",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO member_usage_minutes
+        (member_id, cycle_start_epoch, cycle_days, plan_name, plan_signature, free_minutes_total,
+         used_seconds, purchased_seconds, last_seen_epoch, restart_grace, update_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(member_id) DO UPDATE SET
+          cycle_start_epoch=excluded.cycle_start_epoch,
+          cycle_days=excluded.cycle_days,
+          plan_name=excluded.plan_name,
+          plan_signature=excluded.plan_signature,
+          free_minutes_total=excluded.free_minutes_total,
+          used_seconds=excluded.used_seconds,
+          purchased_seconds=excluded.purchased_seconds,
+          last_seen_epoch=COALESCE(member_usage_minutes.last_seen_epoch, excluded.last_seen_epoch),
+          restart_grace=excluded.restart_grace,
+          update_reason=excluded.update_reason,
+          update_datetime=CURRENT_TIMESTAMP;
+        """,
+        (
+            member_id,
+            float(now),
+            int(cycle_days),
+            plan_name,
+            plan_signature,
+            int(free_minutes_total),
+            float(used_seconds),
+            float(purchased_seconds),
+            float(last_seen_epoch) if last_seen_epoch is not None else None,
+            int(restart_grace),
+            update_reason,
+        ),
+    )
+
+
+def _usage_db_maybe_migrate_from_json(conn: sqlite3.Connection, member_id: str) -> bool:
+    """
+    One-time best-effort migration from the legacy /home/elaralo_usage.json store.
+    We only migrate if:
+      - row doesn't exist yet, AND
+      - the json store contains a record for either:
+          a) member::<member_id>
+          b) member_id as-is
+    """
+    try:
+        # legacy store is used by earlier builds
+        store = _load_usage_store()  
+        if not isinstance(store, dict):
+            return False
+    except Exception:
+        return False
+
+    legacy_keys = []
+    if member_id:
+        legacy_keys.append(f"member::{member_id}")
+        legacy_keys.append(member_id)
+
+    rec = None
+    for k in legacy_keys:
+        v = store.get(k)
+        if isinstance(v, dict):
+            rec = v
+            break
+    if not isinstance(rec, dict):
+        return False
+
+    try:
+        cycle_start = float(rec.get("cycle_start") or 0.0) or time.time()
+        cycle_days = int(rec.get("cycle_days") or USAGE_CYCLE_DAYS)  
+        plan_name = str(rec.get("plan_name") or "").strip()
+        free_minutes_total = int(rec.get("minutes_allowed") or 0) if rec.get("minutes_allowed") is not None else 0
+        used_seconds = float(rec.get("used_seconds") or 0.0)
+        purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+        last_seen = rec.get("last_seen")
+        last_seen_epoch = float(last_seen) if last_seen is not None else None
+        restart_grace = int(rec.get("restart_grace") or 0)
+        plan_signature = str(rec.get("plan_signature") or "").strip() or f"{plan_name}|{free_minutes_total}|{cycle_days}"
+    except Exception:
+        return False
+
+    _usage_db_upsert_init(
+        conn,
+        member_id=member_id,
+        now=cycle_start,
+        cycle_days=cycle_days,
+        plan_name=plan_name,
+        plan_signature=plan_signature,
+        free_minutes_total=free_minutes_total,
+        used_seconds=used_seconds,
+        purchased_seconds=purchased_seconds,
+        last_seen_epoch=last_seen_epoch,
+        restart_grace=restart_grace,
+        update_reason="migrated_from_json",
+    )
+    return True
+
+
+def _usage_db_ensure_member_row(
+    conn: sqlite3.Connection,
+    identity_key: str,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int],
+    cycle_days_override: Optional[int],
+    now: float,
+    allow_create: bool = True,
+) -> sqlite3.Row:
+    """
+    Ensures a DB row exists and performs any eligibility updates that are allowed to change totals:
+      - cycle reset (once per cycle)
+      - plan upgrade/change (when signature changes)
+
+    IMPORTANT: We do NOT change totals just because the payload is re-sent;
+               totals are only updated on init, cycle reset, plan change, or paygo credit.
+    """
+    member_id = _normalize_usage_member_id(identity_key)
+    if not member_id:
+        # Should never happen, but avoid NULL keys.
+        member_id = f"unknown::{hash(identity_key)}"
+
+    requested_cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS)  
+    if requested_cycle_days < 0:
+        requested_cycle_days = int(USAGE_CYCLE_DAYS)  
+
+    if minutes_allowed_override is not None:
+        requested_free_minutes = int(minutes_allowed_override)
+    else:
+        if is_trial:
+            requested_free_minutes = int(TRIAL_MINUTES)  
+        else:
+            requested_free_minutes = int(_included_minutes_for_plan(plan_name))  
+
+    # Clamp free minutes to a sane floor.
+    if requested_free_minutes < 0:
+        requested_free_minutes = 0
+
+    # Plan signature: anything that should cause a "plan change" update.
+    # We include:
+    #  - trial flag
+    #  - plan name
+    #  - free minutes (from rebrandingKey override or plan map)
+    #  - cycle length
+    requested_sig = f"{int(bool(is_trial))}|{plan_name}|{requested_free_minutes}|{requested_cycle_days}"
+
+    row = _usage_db_get_row(conn, member_id)
+
+    if row is None and allow_create:
+        # Best-effort migration from the legacy JSON store.
+        try:
+            _usage_db_maybe_migrate_from_json(conn, member_id)
+        except Exception:
+            pass
+        row = _usage_db_get_row(conn, member_id)
+
+    if row is None and allow_create:
+        _usage_db_upsert_init(
+            conn,
+            member_id=member_id,
+            now=now,
+            cycle_days=requested_cycle_days,
+            plan_name=plan_name,
+            plan_signature=requested_sig,
+            free_minutes_total=requested_free_minutes,
+            used_seconds=0.0,
+            purchased_seconds=0.0,
+            last_seen_epoch=None,
+            restart_grace=0,
+            update_reason="init",
+        )
+        row = _usage_db_get_row(conn, member_id)
+
+    if row is None:
+        raise RuntimeError("Unable to initialize usage row")
+
+    # Cycle reset: applies only for non-trial accounts with cycle_days > 0.
+    try:
+        cycle_start = float(row["cycle_start_epoch"] or 0.0) or float(now)
+    except Exception:
+        cycle_start = float(now)
+
+    try:
+        stored_cycle_days = int(row["cycle_days"] or 0) or requested_cycle_days
+    except Exception:
+        stored_cycle_days = requested_cycle_days
+
+    # Normalize stored cycle days if missing
+    if stored_cycle_days <= 0:
+        stored_cycle_days = requested_cycle_days
+
+    # Refresh plan metadata if the upstream signature changed (upgrade / plan change).
+    stored_sig = str(row["plan_signature"] or "").strip()
+
+    # Perform cycle reset before plan change so the next cycle starts clean.
+    if (not is_trial) and stored_cycle_days > 0:
+        cycle_len = float(stored_cycle_days) * 86400.0
+        if (float(now) - float(cycle_start)) >= cycle_len:
+            conn.execute(
+                """
+                UPDATE member_usage_minutes
+                   SET cycle_start_epoch = ?,
+                       cycle_days = ?,
+                       plan_name = ?,
+                       plan_signature = ?,
+                       free_minutes_total = ?,
+                       used_seconds = 0,
+                       purchased_seconds = 0,
+                       restart_grace = 0,
+                       update_reason = ?,
+                       update_datetime = CURRENT_TIMESTAMP
+                 WHERE member_id = ?;
+                """,
+                (
+                    float(now),
+                    int(requested_cycle_days),
+                    plan_name,
+                    requested_sig,
+                    int(requested_free_minutes),
+                    "cycle_reset",
+                    member_id,
+                ),
+            )
+            row = _usage_db_get_row(conn, member_id)
+            stored_sig = requested_sig
+
+    # Plan upgrade/change mid-cycle: update free minutes (does not reset used or purchases).
+    # This is the only other way the "total available minutes" can change automatically.
+    if stored_sig != requested_sig:
+        conn.execute(
+            """
+            UPDATE member_usage_minutes
+               SET cycle_days = ?,
+                   plan_name = ?,
+                   plan_signature = ?,
+                   free_minutes_total = ?,
+                   update_reason = ?,
+                   update_datetime = CURRENT_TIMESTAMP
+             WHERE member_id = ?;
+            """,
+            (
+                int(requested_cycle_days),
+                plan_name,
+                requested_sig,
+                int(requested_free_minutes),
+                "plan_change_or_upgrade",
+                member_id,
+            ),
+        )
+        row = _usage_db_get_row(conn, member_id)
+
+    if row is None:
+        raise RuntimeError("Usage row missing after updates")
+    return row
+
+
+def _usage_info_from_row(row: sqlite3.Row) -> Dict[str, Any]:
+    free_minutes_total = int(row["free_minutes_total"] or 0)
+    purchased_seconds = float(row["purchased_seconds"] or 0.0)
+    used_seconds = float(row["used_seconds"] or 0.0)
+
+    total_seconds = max(0.0, float(free_minutes_total) * 60.0 + purchased_seconds)
+    used_seconds = min(total_seconds, max(0.0, used_seconds))
+    remaining_seconds = max(0.0, total_seconds - used_seconds)
+
+    minutes_included = max(0, int(free_minutes_total))
+    minutes_purchased = max(0, int(purchased_seconds // 60))
+    minutes_total = max(minutes_included + minutes_purchased, int((used_seconds + remaining_seconds) // 60))
+
+    return {
+        "member_id": str(row["member_id"]),
+        "cycle_start_epoch": row["cycle_start_epoch"],
+        "cycle_days": int(row["cycle_days"] or 0),
+        "plan_name": str(row["plan_name"] or ""),
+        "minutes_included": minutes_included,
+        "minutes_purchased": minutes_purchased,
+        # Keep legacy field name used by frontend: minutes_allowed == TOTAL budget in minutes.
+        "minutes_allowed": max(0, int(total_seconds // 60)),
+        "minutes_total": minutes_total,
+        "minutes_used": max(0, int(used_seconds // 60)),
+        "minutes_remaining": max(0, int(remaining_seconds // 60)),
+        "minutes_exhausted": remaining_seconds <= 0.0,
+        "update_reason": str(row["update_reason"] or ""),
+    }
+
+
+# --- Override legacy usage functions to use SQLite table state ---
+
+def _usage_credit_minutes_sync(identity_key: str, add_minutes: int) -> Dict[str, Any]:
+    """
+    Credits purchased minutes (PayGo) to the DB-backed usage state.
+
+    Important behaviors:
+      - This ALWAYS increases purchased_seconds (no caps).
+      - It sets restart_grace so we don't bill the gap between purchase and next chat turn.
+      - It logs update_reason='paygo_credit'.
+    """
+    member_id = _normalize_usage_member_id(identity_key)
+    if not member_id:
+        member_id = str(identity_key or "").strip()
+
+    try:
+        add_minutes_i = int(add_minutes)
+    except Exception:
+        add_minutes_i = 0
+
+    if add_minutes_i <= 0:
+        return {"ok": False, "error": "add_minutes must be > 0"}
+
+    now = time.time()
+    add_seconds = float(add_minutes_i) * 60.0
+
+    with _USAGE_LOCK:  
+        conn = _usage_db_connect()
+        try:
+            _usage_db_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE;")
+
+            # Ensure row exists (plan metadata may be unknown here; we keep existing if present).
+            row = _usage_db_get_row(conn, member_id)
+            if row is None:
+                _usage_db_upsert_init(
+                    conn,
+                    member_id=member_id,
+                    now=now,
+                    cycle_days=int(USAGE_CYCLE_DAYS),  
+                    plan_name="",
+                    plan_signature=f"0||0|{int(USAGE_CYCLE_DAYS)}",  
+                    free_minutes_total=0,
+                    used_seconds=0.0,
+                    purchased_seconds=0.0,
+                    last_seen_epoch=None,
+                    restart_grace=0,
+                    update_reason="init_for_paygo_credit",
+                )
+                row = _usage_db_get_row(conn, member_id)
+
+            purchased_seconds = float(row["purchased_seconds"] or 0.0) if row is not None else 0.0
+            new_purchased = max(0.0, purchased_seconds + add_seconds)
+
+            conn.execute(
+                """
+                UPDATE member_usage_minutes
+                   SET purchased_seconds = ?,
+                       restart_grace = 1,
+                       update_reason = ?,
+                       update_datetime = CURRENT_TIMESTAMP
+                 WHERE member_id = ?;
+                """,
+                (float(new_purchased), "paygo_credit", member_id),
+            )
+            conn.commit()
+
+            row2 = _usage_db_get_row(conn, member_id)
+            if row2 is None:
+                return {"ok": True, "member_id": member_id, "added_minutes": add_minutes_i}
+            info = _usage_info_from_row(row2)
+            info.update({"ok": True, "added_minutes": add_minutes_i})
+            return info
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _usage_charge_and_check_sync(
+    identity_key: str,
+    *,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int],
+    cycle_days_override: Optional[int],
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    DB-backed usage charging.
+
+    We charge time based on wall-clock delta between turns, with an idle grace period,
+    and a max-billable cap per request. Totals (free minutes + purchases) are persisted
+    per member_id and only change on:
+      - init
+      - cycle reset
+      - plan upgrade/change
+      - paygo credit
+    """
+    now = time.time()
+
+    # Normalize legacy identity keys (member::<id>) to member_id for the DB.
+    member_id = _normalize_usage_member_id(identity_key)
+    if not member_id:
+        member_id = str(identity_key or "").strip()
+
+    with _USAGE_LOCK:  
+        conn = _usage_db_connect()
+        try:
+            _usage_db_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE;")
+
+            row = _usage_db_ensure_member_row(
+                conn,
+                identity_key=identity_key,
+                is_trial=bool(is_trial),
+                plan_name=str(plan_name or "").strip(),
+                minutes_allowed_override=minutes_allowed_override,
+                cycle_days_override=cycle_days_override,
+                now=now,
+                allow_create=True,
+            )
+
+            free_minutes_total = int(row["free_minutes_total"] or 0)
+            purchased_seconds = float(row["purchased_seconds"] or 0.0)
+            used_seconds = float(row["used_seconds"] or 0.0)
+
+            allowed_seconds = max(0.0, float(free_minutes_total) * 60.0 + purchased_seconds)
+            used_seconds = min(allowed_seconds, max(0.0, used_seconds))
+
+            last_seen = row["last_seen_epoch"]
+            restart_grace = int(row["restart_grace"] or 0)
+
+            delta = 0.0
+            if restart_grace:
+                # Do not bill the gap after a PayGo credit.
+                conn.execute(
+                    """
+                    UPDATE member_usage_minutes
+                       SET restart_grace = 0,
+                           update_datetime = CURRENT_TIMESTAMP
+                     WHERE member_id = ?;
+                    """,
+                    (member_id,),
+                )
+                delta = 0.0
+            else:
+                if last_seen is None:
+                    delta = 0.0
+                else:
+                    try:
+                        delta = float(now) - float(last_seen)
+                    except Exception:
+                        delta = 0.0
+
+                # Idle grace: if the user was away for a while, don't bill the gap.
+                try:
+                    if delta > float(USAGE_IDLE_GRACE_SECONDS):  
+                        delta = 0.0
+                except Exception:
+                    pass
+
+                # Cap per request for safety.
+                try:
+                    cap = float(USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST)  
+                    if delta > cap:
+                        delta = cap
+                except Exception:
+                    pass
+
+                if delta < 0:
+                    delta = 0.0
+
+            new_used = min(allowed_seconds, used_seconds + float(delta))
+
+            conn.execute(
+                """
+                UPDATE member_usage_minutes
+                   SET used_seconds = ?,
+                       last_seen_epoch = ?,
+                       update_datetime = CURRENT_TIMESTAMP
+                 WHERE member_id = ?;
+                """,
+                (float(new_used), float(now), member_id),
+            )
+            conn.commit()
+
+            row2 = _usage_db_get_row(conn, member_id)
+            if row2 is None:
+                ok = allowed_seconds > new_used
+                return ok, {"minutes_used": int(new_used // 60), "minutes_allowed": int(allowed_seconds // 60), "minutes_remaining": int(max(0.0, allowed_seconds - new_used) // 60)}
+            info = _usage_info_from_row(row2)
+
+            ok = bool(info.get("minutes_remaining", 0) > 0)
+            # Maintain legacy key name expected elsewhere in the app.
+            info["identity_key"] = member_id
+            return ok, info
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _usage_peek_sync(
+    identity_key: str,
+    *,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int],
+    cycle_days_override: Optional[int],
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Returns current minute balance WITHOUT charging additional time.
+    Still performs eligible maintenance that may affect totals:
+      - init (if missing)
+      - cycle reset
+      - plan upgrade/change
+    """
+    now = time.time()
+
+    member_id = _normalize_usage_member_id(identity_key)
+    if not member_id:
+        member_id = str(identity_key or "").strip()
+
+    with _USAGE_LOCK:  
+        conn = _usage_db_connect()
+        try:
+            _usage_db_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE;")
+
+            row = _usage_db_ensure_member_row(
+                conn,
+                identity_key=identity_key,
+                is_trial=bool(is_trial),
+                plan_name=str(plan_name or "").strip(),
+                minutes_allowed_override=minutes_allowed_override,
+                cycle_days_override=cycle_days_override,
+                now=now,
+                allow_create=True,
+            )
+
+            conn.commit()
+
+            row2 = _usage_db_get_row(conn, member_id)
+            if row2 is None:
+                return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": member_id}
+
+            info = _usage_info_from_row(row2)
+            ok = bool(info.get("minutes_remaining", 0) > 0)
+            info["identity_key"] = member_id
+            return ok, info
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
