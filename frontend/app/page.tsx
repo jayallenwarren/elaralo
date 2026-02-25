@@ -1488,12 +1488,43 @@ export default function Page() {
 
   const sessionIdRef = useRef<string | null>(null);
 
-// Brief startup overlay (covers the iframe on initial refresh)
+// Brief startup overlay (covers the iframe on initial refresh).
+// Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
+// until the companionName has been received from the Wix MEMBER_PLAN payload.
 const [startupOverlayOpen, setStartupOverlayOpen] = useState<boolean>(true);
+const [startupOverlayName, setStartupOverlayName] = useState<string>("");
+const startupOverlayTimerRef = useRef<number | null>(null);
+const startupOverlayStartedRef = useRef<boolean>(false);
+
+const armStartupOverlay = useCallback((name: string) => {
+  const nm = String(name || "").trim();
+  if (!nm) return;
+
+  // Set the display name (used by the overlay message).
+  setStartupOverlayName(nm);
+
+  // Start the 800ms countdown once (first time we learn the companion name from Wix).
+  if (startupOverlayStartedRef.current) return;
+  startupOverlayStartedRef.current = true;
+
+  if (startupOverlayTimerRef.current) {
+    window.clearTimeout(startupOverlayTimerRef.current);
+    startupOverlayTimerRef.current = null;
+  }
+
+  startupOverlayTimerRef.current = window.setTimeout(() => {
+    setStartupOverlayOpen(false);
+    startupOverlayTimerRef.current = null;
+  }, 800);
+}, []);
 
 useEffect(() => {
-  const t = window.setTimeout(() => setStartupOverlayOpen(false), 800);
-  return () => window.clearTimeout(t);
+  return () => {
+    if (startupOverlayTimerRef.current) {
+      window.clearTimeout(startupOverlayTimerRef.current);
+      startupOverlayTimerRef.current = null;
+    }
+  };
 }, []);
 
 
@@ -6868,6 +6899,7 @@ useEffect(() => {
         const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
+        armStartupOverlay(parsed.first || DEFAULT_COMPANION_NAME);
 
         // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
         setSessionState((prev) => ({
@@ -6880,6 +6912,7 @@ useEffect(() => {
         setCompanionKeyRaw("");
         setCompanionKey("");
         setCompanionName(DEFAULT_COMPANION_NAME);
+        armStartupOverlay(DEFAULT_COMPANION_NAME);
 
         setSessionState((prev) => ({
           ...prev,
@@ -9497,23 +9530,25 @@ const modePillControls = (
       pointerEvents: "all",
     }}
   >
-    <div
-      style={{
-        padding: "12px 16px",
-        borderRadius: 14,
-        background: "rgba(17,24,39,0.92)",
-        color: "#fff",
-        border: "1px solid rgba(255,255,255,0.18)",
-        boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
-        fontSize: 16,
-        fontWeight: 700,
-        letterSpacing: 0.2,
-        maxWidth: "min(92vw, 520px)",
-        textAlign: "center",
-      }}
-    >
-      ...waiting on {String(companionName || DEFAULT_COMPANION_NAME || "Companion").trim()}
-    </div>
+    {startupOverlayName ? (
+      <div
+        style={{
+          padding: "12px 16px",
+          borderRadius: 14,
+          background: "rgba(17,24,39,0.92)",
+          color: "#fff",
+          border: "1px solid rgba(255,255,255,0.18)",
+          boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
+          fontSize: 16,
+          fontWeight: 700,
+          letterSpacing: 0.2,
+          maxWidth: "min(92vw, 520px)",
+          textAlign: "center",
+        }}
+      >
+        ...waiting on {startupOverlayName}
+      </div>
+    ) : null}
   </div>
 ) : null}
       {/* Hidden audio element for audio-only TTS (mic mode) */}
