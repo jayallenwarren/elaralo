@@ -2632,6 +2632,7 @@ const [hostGuidelinesText, setHostGuidelinesText] = useState<string>("");
 const [hostGuidelinesSaved, setHostGuidelinesSaved] = useState<string>("");
 const [hostGuidelinesLoading, setHostGuidelinesLoading] = useState<boolean>(false);
 const [hostGuidelinesError, setHostGuidelinesError] = useState<string>("");
+const [hostGuidelinesStatus, setHostGuidelinesStatus] = useState<string>("");
 
 const loadHostGuidelines = useCallback(async () => {
   try {
@@ -2645,6 +2646,7 @@ const loadHostGuidelines = useCallback(async () => {
 
     setHostGuidelinesLoading(true);
     setHostGuidelinesError("");
+    setHostGuidelinesStatus("Loading…");
 
     const res = await fetch(`${API_BASE}/host/companion-guidelines/get`, {
       method: "POST",
@@ -2662,9 +2664,11 @@ const loadHostGuidelines = useCallback(async () => {
 
     setHostGuidelinesSaved(text);
     setHostGuidelinesText(text);
+    setHostGuidelinesStatus("Loaded");
     setHostGuidelinesLoading(false);
   } catch (e: any) {
     setHostGuidelinesLoading(false);
+    setHostGuidelinesStatus("");
     setHostGuidelinesError(String(e?.message || e || "Failed to load guidelines"));
   }
 }, [API_BASE, isHost, companyName, companionName]);
@@ -2681,6 +2685,7 @@ const saveHostGuidelines = useCallback(async () => {
 
     setHostGuidelinesLoading(true);
     setHostGuidelinesError("");
+    setHostGuidelinesStatus("Saving…");
 
     const res = await fetch(`${API_BASE}/host/companion-guidelines/set`, {
       method: "POST",
@@ -2698,9 +2703,11 @@ const saveHostGuidelines = useCallback(async () => {
 
     setHostGuidelinesSaved(text);
     setHostGuidelinesText(text);
+    setHostGuidelinesStatus("Saved");
     setHostGuidelinesLoading(false);
   } catch (e: any) {
     setHostGuidelinesLoading(false);
+    setHostGuidelinesStatus("");
     setHostGuidelinesError(String(e?.message || e || "Failed to save guidelines"));
   }
 }, [API_BASE, isHost, companyName, companionName, hostGuidelinesText]);
@@ -11382,7 +11389,12 @@ const modePillControls = (
             <div style={{ marginTop: 12 }}>
               <textarea
                 value={hostGuidelinesText}
-                onChange={(e) => setHostGuidelinesText(e.target.value)}
+                onChange={(e) => {
+                  setHostGuidelinesText(e.target.value);
+                  if (hostGuidelinesStatus === "Saved" || hostGuidelinesStatus === "Loaded") {
+                    setHostGuidelinesStatus("");
+                  }
+                }}
                 placeholder="Examples: Off-limits topics, preferred terms of endearment (e.g., call viewers “papi”), tone/style constraints…"
                 style={{
                   width: "100%",
@@ -11401,6 +11413,10 @@ const modePillControls = (
               ) : null}
 
               <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
+                {hostGuidelinesStatus ? (
+                  <span style={{ fontWeight: 700, opacity: 0.95 }}>{hostGuidelinesStatus}</span>
+                ) : null}
+                {hostGuidelinesStatus ? " • " : null}
                 Saved: {hostGuidelinesSaved ? "Yes" : "No"} • Characters: {String(hostGuidelinesText || "").length}
               </div>
             </div>
