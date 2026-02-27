@@ -258,6 +258,7 @@ type RelayEvent = {
 type HostActiveChat = {
   session_id: string;
   member_id: string;
+  user_name?: string;
   brand?: string;
   avatar?: string;
   last_seen?: number;
@@ -2626,6 +2627,13 @@ useEffect(() => {
 const [hostSendText, setHostSendText] = useState<string>("");
 const [hostNotice, setHostNotice] = useState<string>("");
 
+// Host Console STT (speech-to-text) for host messages during override
+const [hostSttRecording, setHostSttRecording] = useState<boolean>(false);
+const [hostSttError, setHostSttError] = useState<string>("");
+const hostSttRecorderRef = useRef<MediaRecorder | null>(null);
+const hostSttStreamRef = useRef<MediaStream | null>(null);
+const hostSttChunksRef = useRef<BlobPart[]>([]);
+
 // Host: companion-level interaction guideline overrides (persisted; highest priority)
 const [hostGuidelinesOpen, setHostGuidelinesOpen] = useState<boolean>(false);
 const [hostGuidelinesText, setHostGuidelinesText] = useState<string>("");
@@ -4363,6 +4371,14 @@ useEffect(() => {
 
   const [loading, setLoading] = useState(false);
 
+  // Used to safely queue STT auto-sends while a response is still being prepared.
+  // (Prevents STT transcripts from getting dropped when send() is blocked by loading=true.)
+  const loadingRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    loadingRef.current = Boolean(loading);
+  }, [loading]);
+
 
 // Host console polling (list + selected transcript)
 useEffect(() => {
@@ -4642,6 +4658,120 @@ const hostSendMessage = async () => {
     setHostNotice(String(e?.message || e || "Failed to send host message"));
   }
 };
+
+
+// Host STT (speech-to-text) using backend transcription (/stt/transcribe)
+// - Click to start recording, click again to stop & transcribe.
+// - Fills the host message box with the transcript (host can edit, then Send).
+const hostStopStt = useCallback(async () => {
+  try {
+    const rec = hostSttRecorderRef.current;
+    if (rec && rec.state !== "inactive") {
+      try {
+        rec.stop();
+      } catch {}
+    }
+  } catch {}
+}, []);
+
+const hostStartStt = useCallback(async () => {
+  try {
+    if (hostSttRecording) return;
+    setHostSttError("");
+
+    if (!API_BASE) throw new Error("API base not configured");
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      throw new Error("Microphone is not available in this browser");
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    hostSttStreamRef.current = stream;
+    hostSttChunksRef.current = [];
+
+    const mr = new MediaRecorder(stream);
+    const mimeType = String((mr as any)?.mimeType || "audio/webm");
+    hostSttRecorderRef.current = mr;
+
+    mr.ondataavailable = (e: any) => {
+      try {
+        if (e?.data && e.data.size > 0) hostSttChunksRef.current.push(e.data);
+      } catch {}
+    };
+
+    mr.onstop = async () => {
+      try {
+        setHostSttRecording(false);
+
+        const chunks = hostSttChunksRef.current || [];
+        hostSttChunksRef.current = [];
+
+        // stop tracks
+        try {
+          (hostSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
+            try {
+              t.stop();
+            } catch {}
+          });
+        } catch {}
+        hostSttStreamRef.current = null;
+
+        const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
+        if (!blob || blob.size < 1) return;
+
+        const form = new FormData();
+        const fname = mimeType.includes("mp4")
+          ? "host_audio.mp4"
+          : mimeType.includes("wav")
+            ? "host_audio.wav"
+            : "host_audio.webm";
+        form.append("file", blob, fname);
+
+        const res = await fetch(`${API_BASE}/stt/transcribe`, {
+          method: "POST",
+          body: form,
+        });
+
+        const data: any = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const detail = String(data?.detail || data?.error || `HTTP ${res.status}`);
+          throw new Error(detail);
+        }
+
+        const text = String(data?.text || "").trim();
+        if (!text) return;
+
+        setHostSendText((prev) => {
+          const p = String(prev || "").trim();
+          return p ? `${p} ${text}` : text;
+        });
+      } catch (e: any) {
+        setHostSttError(String(e?.message || e || "STT failed"));
+      }
+    };
+
+    mr.start();
+    setHostSttRecording(true);
+  } catch (e: any) {
+    setHostSttRecording(false);
+    setHostSttError(String(e?.message || e || "Microphone permission was blocked."));
+    try {
+      (hostSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
+        try {
+          t.stop();
+        } catch {}
+      });
+    } catch {}
+    hostSttStreamRef.current = null;
+  }
+}, [API_BASE, hostSttRecording]);
+
+// Safety: stop host recorder if host console closes or session changes.
+useEffect(() => {
+  if (!hostConsoleOpen || !hostSelectedSessionId) {
+    if (hostSttRecording) hostStopStt();
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [hostConsoleOpen, hostSelectedSessionId]);
 
 
   const hostPushPendingContent = async (token: string) => {
@@ -7035,6 +7165,18 @@ const brandKey = safeBrandKey(rawBrand);
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
 const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
 
+// Viewer/User display name for host readability (used in Host Console + summaries).
+// Do NOT prompt here; this must be safe during normal chat.
+const userDisplayNameForBackend = (() => {
+  const explicit = String(viewerLiveChatName || "").trim();
+  if (explicit) return explicit;
+  const raw = String(memberIdForBackend || "").trim();
+  const cleaned = raw.replace(/^Anon:\s*/i, "").trim();
+  const base = cleaned || raw;
+  const shortId = base ? base.slice(0, 4) : "";
+  return `Viewer - ${shortId || "Anon"}`;
+})();
+
 // If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
 // from the rebranding key so backend quota comes from the mapped Elaralo plan.
 
@@ -7070,6 +7212,11 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   RebrandingKey: (rebrandingKeyForBackend || "").trim(),
   // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
   rebranding: (rebranding || "").trim(),
+
+  // User display name (optional). Backend uses this ONLY for Host Console readability.
+  user_name: userDisplayNameForBackend,
+  username: userDisplayNameForBackend,
+  display_name: userDisplayNameForBackend,
 };
 
     const trimmedForChat = trimMessagesForChat(nextMessages);
@@ -7799,6 +7946,16 @@ if (streamSessionActive) {
     sendRef.current = send;
   }, [send]);
 
+  // If STT auto-send fires while loading=true, we queue it and flush once loading clears.
+  const sttDeferredQueueRef = useRef<string[]>([]);
+  useEffect(() => {
+    if (loading) return;
+    if (!sttDeferredQueueRef.current.length) return;
+    const next = sttDeferredQueueRef.current.shift();
+    if (next) void sendRef.current(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading]);
+
 
 // ---------------------------------------------------------------------
 // Flush queued viewer/host messages once the host stops streaming.
@@ -8306,6 +8463,12 @@ useEffect(() => {
       setSttFinal(text);
       sttFinalRef.current = text;
 
+      // If send() is currently blocked by loading=true, queue the STT transcript.
+      if (loadingRef.current) {
+        sttDeferredQueueRef.current.push(text);
+        return;
+      }
+
       await send(text);
     } catch (e) {
       setSttError(e?.message || "STT failed.");
@@ -8389,6 +8552,13 @@ const pauseSpeechToText = useCallback(() => {
       sttFinalRef.current = "";
       sttInterimRef.current = "";
       setInput("");
+
+      // If a response is still being prepared, STT auto-send would be dropped.
+      // Queue it and flush once loading clears.
+      if (loadingRef.current) {
+        sttDeferredQueueRef.current.push(text);
+        return;
+      }
 
       void sendRef.current(text);
     }, 2000);
@@ -11587,7 +11757,9 @@ const modePillControls = (
             {hostActiveChats.map((c) => {
               const isSelected = c.session_id === hostSelectedSessionId;
               const memberLabel =
-                (c.member_id || "").trim() || "anonymous / visitor";
+                (String((c as any).user_name || "").trim() ||
+                  (c.member_id || "").trim() ||
+                  "anonymous / visitor");
               const mins =
                 typeof c.minutes_remaining === "number"
                   ? c.minutes_remaining
@@ -11722,13 +11894,22 @@ const modePillControls = (
 
             {hostSelectedEvents.map((ev, idx) => {
               const sender = String((ev as any).sender || "");
+              const selected = hostActiveChats.find(
+                (c) => c.session_id === hostSelectedSessionId
+              );
+              const userName = String(
+                (ev as any).user_name || (selected as any)?.user_name || ""
+              ).trim();
+              const companionLabel = String(
+                (companionName || DEFAULT_COMPANION_NAME) ?? ""
+              ).trim();
               const label =
                 sender === "user"
-                  ? "User"
+                  ? (userName || "User")
                   : sender === "host"
-                    ? "Host"
+                    ? `${companionLabel} (Host)`
                     : sender === "ai" || sender === "xai"
-                      ? "AI"
+                      ? (companionLabel || "AI")
                       : "System";
 
               return (
@@ -11744,7 +11925,51 @@ const modePillControls = (
             })}
           </div>
 
-          <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+          {hostSttError ? (
+            <div style={{ fontSize: 12, color: "#ffb3b3", marginTop: 8 }}>
+              {hostSttError}
+            </div>
+          ) : null}
+
+          <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "stretch" }}>
+            {(() => {
+              const selected = hostActiveChats.find(
+                (c) => c.session_id === hostSelectedSessionId
+              );
+              const overrideOn = Boolean(selected?.override_active);
+              const sttDisabled = !hostSelectedSessionId || !overrideOn;
+
+              return (
+                <button
+                  onClick={() => {
+                    if (sttDisabled) return;
+                    if (hostSttRecording) hostStopStt();
+                    else hostStartStt();
+                  }}
+                  disabled={sttDisabled}
+                  title={
+                    sttDisabled
+                      ? "Enable override to use STT"
+                      : hostSttRecording
+                        ? "Stop recording"
+                        : "Start recording"
+                  }
+                  style={{
+                    width: 44,
+                    borderRadius: 12,
+                    border: "1px solid rgba(255,255,255,0.22)",
+                    background: hostSttRecording
+                      ? "rgba(255,0,0,0.25)"
+                      : "rgba(0,0,0,0.22)",
+                    color: "white",
+                    cursor: sttDisabled ? "not-allowed" : "pointer",
+                    opacity: sttDisabled ? 0.55 : 1,
+                  }}
+                >
+                  {hostSttRecording ? "■" : "🎤"}
+                </button>
+              );
+            })()}
             <textarea
               value={hostSendText}
               onChange={(e) => setHostSendText(e.target.value)}

@@ -6381,6 +6381,7 @@ def _ai_override_touch_from_chat(
 
     brand, avatar = _brand_avatar_from_session_state(session_state)
     member_id = _extract_member_id(session_state) or ""
+    user_name = _extract_user_name(session_state)
     companion_key = _normalize_companion_key(_extract_companion_raw(session_state))
 
     # In-session digests from the frontend (optional).
@@ -6398,12 +6399,18 @@ def _ai_override_touch_from_chat(
                 "override_started_at": None,
                 "override_host_member_id": "",
                 "host_ack_seq": 0,
+                # Optional viewer/user display name for host readability
+                "user_name": "",
+                "user_name_updated_at": None,
             }
 
         rec["session_id"] = sid
         rec["brand"] = brand
         rec["avatar"] = avatar
         rec["member_id"] = str(member_id or "").strip()
+        if user_name:
+            rec["user_name"] = str(user_name).strip()
+            rec["user_name_updated_at"] = float(now)
         rec["identity_key"] = str(identity_key or "").strip()
         rec["companion_key"] = companion_key
         rec["last_seen"] = float(now)
@@ -6463,6 +6470,15 @@ def _ai_override_append_event(
             "audience": str(audience or "all").strip() or "all",
             "kind": str(kind or "message").strip() or "message",
         }
+
+        # Include user display name on user-authored events (host console readability)
+        try:
+            if str(ev.get("sender") or "").strip() == "user":
+                un = str(rec.get("user_name") or "").strip()
+                if un:
+                    ev["user_name"] = un
+        except Exception:
+            pass
 
         events = rec.get("events")
         if not isinstance(events, list):
@@ -6803,6 +6819,40 @@ def _extract_companion_raw(session_state: Dict[str, Any]) -> str:
         or ""
     )
     return str(companion).strip() if companion is not None else ""
+
+
+def _extract_user_name(session_state: Dict[str, Any]) -> str:
+    """Best-effort extraction of a viewer/user display name.
+
+    This is used ONLY for Host Console readability (labels + summaries).
+    It does not affect identity/authorization.
+
+    Frontend can supply this via session_state using any of these keys.
+    """
+
+    candidates = (
+        "user_name",
+        "username",
+        "userName",
+        "display_name",
+        "displayName",
+        "viewer_name",
+        "viewerName",
+        "live_chat_name",
+        "liveChatName",
+    )
+
+    for k in candidates:
+        try:
+            v = session_state.get(k)
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                return s
+        except Exception:
+            continue
+    return ""
 
 
 def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
@@ -9420,10 +9470,22 @@ async def host_ai_chats_active(req: HostAiChatsActiveRequest):
 
         summary, summary_source = _ai_override_best_summary(rec)
 
+        # Host console readability: surface the viewer's chosen display name.
+        user_name = str(rec.get("user_name") or "").strip()
+        if user_name:
+            # Make sure the summary snippet visibly includes the username.
+            if summary:
+                first_line = str(summary).splitlines()[0].strip() if isinstance(summary, str) else ""
+                if first_line != user_name:
+                    summary = f"{user_name}\n{summary}"
+            else:
+                summary = user_name
+
         sessions_out.append(
             {
                 "session_id": str(rec.get("session_id") or "").strip(),
                 "member_id": str(rec.get("member_id") or "").strip(),
+                "user_name": user_name,
                 "brand": str(rec.get("brand") or "").strip(),
                 "avatar": str(rec.get("avatar") or "").strip(),
                 "companion_key": str(rec.get("companion_key") or "").strip(),
