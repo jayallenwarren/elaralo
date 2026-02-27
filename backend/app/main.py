@@ -4265,6 +4265,18 @@ def _avatar_from_session_state(session_state: Dict[str, Any]) -> str:
     return ""
 
 
+
+
+def _brand_from_session_state(session_state: Dict[str, Any]) -> str:
+    """Extract brand/rebranding name from session_state."""
+    raw = (
+        _session_get_str(session_state, "brand", "companyName", "company_name")
+        or _session_get_str(session_state, "rebranding", "rebrand", "rebrandingName")
+        or ""
+    )
+    return str(raw or "").strip()
+
+
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     cur = conn.cursor()
     cur.execute(
@@ -6000,6 +6012,31 @@ async def chat(request: Request):
         for block in extra_system_blocks:
             llm_messages.insert(insert_at, {"role": "system", "content": block})
             insert_at += 1
+
+        # Host companion guidelines (highest priority).
+        # These are authored by the human companion (host) and should override onboarding text if conflicts exist.
+        brand_name = _brand_from_session_state(session_state)
+        host_guidelines = ""
+        if brand_name and avatar_name:
+            try:
+                host_guidelines = await run_in_threadpool(_get_companion_guidelines_sync, brand_name, avatar_name)
+            except Exception:
+                host_guidelines = ""
+        if host_guidelines:
+            llm_messages.insert(
+                insert_at,
+                {
+                    "role": "system",
+                    "content": (
+                        "Host AI guidelines (highest priority; set by the companion's human host). "
+                        "If these guidelines conflict with other persona/onboarding text, follow THESE guidelines. "
+                        "Always still follow platform safety policies.\n\n"
+                        + str(host_guidelines).strip()
+                    ),
+                },
+            )
+            insert_at += 1
+
 
         # Memory policy: do not guess about prior conversations.
         # - If a saved summary is injected, you may use ONLY that as cross-session context.
@@ -9203,6 +9240,153 @@ def _require_host_member(brand: str, avatar: str, member_id: str) -> str:
         raise HTTPException(status_code=403, detail="Host access denied")
     return host_id
 
+# =============================================================================
+# Host Companion Guidelines (persisted)
+# =============================================================================
+#
+# The Host (human companion) can edit high-priority interaction guidelines for the AI Companion.
+# These guidelines are:
+#   - stored server-side (SQLite under /home/site)
+#   - retrievable/editable ONLY by the configured host_member_id for the companion mapping
+#   - injected into EVERY AI chat turn (both OpenAI + xAI) as a high-priority system message
+#
+# Frontend expects:
+#   POST /host/companion-guidelines/get  { brand, avatar, memberId }
+#   POST /host/companion-guidelines/set  { brand, avatar, memberId, guidelines }
+#
+_GUIDELINES_DB_PATH = (os.getenv("COMPANION_GUIDELINES_DB_PATH") or "").strip()
+if not _GUIDELINES_DB_PATH:
+    _base = "/home/site" if os.path.isdir("/home/site") else ("/home" if os.path.isdir("/home") else "/tmp")
+    _GUIDELINES_DB_PATH = os.path.join(_base, "companion_guidelines.sqlite3")
+
+_GUIDELINES_DB_LOCK = threading.RLock()
+
+def _guidelines_db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(_GUIDELINES_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _guidelines_db_init_sync() -> None:
+    with _GUIDELINES_DB_LOCK:
+        conn = _guidelines_db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS companion_guidelines (
+                  companion_guidelines_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  brand TEXT NOT NULL,
+                  avatar TEXT NOT NULL,
+                  host_member_id TEXT,
+                  guidelines TEXT,
+                  UNIQUE(brand, avatar)
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def _get_companion_guidelines_sync(brand: str, avatar: str) -> str:
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return ""
+    with _GUIDELINES_DB_LOCK:
+        conn = _guidelines_db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT guidelines
+                FROM companion_guidelines
+                WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)
+                ORDER BY update_datetime DESC, companion_guidelines_id DESC
+                LIMIT 1
+                """,
+                (b, a),
+            )
+            row = cur.fetchone()
+            if not row:
+                return ""
+            return str(row[0] or "").strip()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def _set_companion_guidelines_sync(brand: str, avatar: str, host_member_id: str, guidelines: str) -> str:
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    h = (host_member_id or "").strip()
+    text = str(guidelines or "").strip()
+
+    if not b or not a:
+        raise ValueError("brand and avatar are required")
+
+    with _GUIDELINES_DB_LOCK:
+        conn = _guidelines_db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO companion_guidelines (brand, avatar, host_member_id, guidelines)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(brand, avatar) DO UPDATE SET
+                  host_member_id=excluded.host_member_id,
+                  guidelines=excluded.guidelines,
+                  update_datetime=CURRENT_TIMESTAMP
+                """,
+                (b, a, h, text),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return text
+
+try:
+    _guidelines_db_init_sync()
+except Exception as e:
+    logger.warning("Companion guidelines DB init failed: %s", e)
+
+class HostCompanionGuidelinesGetRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+
+class HostCompanionGuidelinesSetRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    guidelines: str = ""
+
+@app.post("/host/companion-guidelines/get")
+async def host_companion_guidelines_get(req: HostCompanionGuidelinesGetRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    b = (req.brand or "").strip()
+    a = (req.avatar or "").strip()
+    text = await run_in_threadpool(_get_companion_guidelines_sync, b, a)
+    return {"ok": True, "hostMemberId": host_id, "guidelines": text}
+
+@app.post("/host/companion-guidelines/set")
+async def host_companion_guidelines_set(req: HostCompanionGuidelinesSetRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    b = (req.brand or "").strip()
+    a = (req.avatar or "").strip()
+    text = await run_in_threadpool(_set_companion_guidelines_sync, b, a, host_id, req.guidelines)
+    return {"ok": True, "hostMemberId": host_id, "guidelines": text}
+
+
+
 
 @app.post("/host/ai-chats/active")
 async def host_ai_chats_active(req: HostAiChatsActiveRequest):
@@ -10261,4 +10445,3 @@ def _usage_peek_sync(
                 conn.close()
             except Exception:
                 pass
-
