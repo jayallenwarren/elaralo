@@ -258,7 +258,6 @@ type RelayEvent = {
 type HostActiveChat = {
   session_id: string;
   member_id: string;
-  user_name?: string;
   brand?: string;
   avatar?: string;
   last_seen?: number;
@@ -1217,14 +1216,13 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   const soft = t.trim();
 
   const wantsFriend =
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\bfriend\b/.test(soft) ||
-    /\bfriend mode\b/.test(soft);
+    /\b(switch|set|turn|go|back)\b.*\bfriend\b/.test(soft) || /\bfriend mode\b/.test(soft);
 
   const wantsRomantic =
     // "romantic mode" / "romance mode"
     /\b(romantic|romance) mode\b/.test(soft) ||
     // switch/set/back/go/turn ... romantic
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(romantic|romance)\b/.test(soft) ||
+    /\b(switch|set|turn|go|back)\b.*\b(romantic|romance)\b/.test(soft) ||
     // natural phrasing users actually type
     /\b(let['’]?s|lets)\b.*\b(romantic|romance)\b/.test(soft) ||
     /\b(be|being|try|trying|have|having)\b.*\b(romantic|romance)\b/.test(soft) ||
@@ -1233,7 +1231,7 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
     /\btry romance again\b/.test(soft);
 
   const wantsIntimate =
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
+    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
     /\b(intimate|explicit) mode\b/.test(soft);
 
   if (wantsFriend) return { mode: "friend", cleaned: raw };
@@ -1476,99 +1474,6 @@ export default function Page() {
     }
   }, []);
 
-  // -----------------------
-  // Responsive layout mode: mobile / tablet / desktop
-  // Primary optimization target = mobile.
-  // -----------------------
-  type ViewportMode = "mobile" | "tablet" | "desktop";
-
-  const getViewportMode = useCallback((): ViewportMode => {
-    if (typeof window === "undefined") return "desktop";
-    const w = window.innerWidth || 1024;
-    if (w <= 640) return "mobile";
-    if (w <= 1024) return "tablet";
-    return "desktop";
-  }, []);
-
-  const [viewportMode, setViewportMode] = useState<ViewportMode>(() => {
-    if (typeof window === "undefined") return "desktop";
-    const w = window.innerWidth || 1024;
-    if (w <= 640) return "mobile";
-    if (w <= 1024) return "tablet";
-    return "desktop";
-  });
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const onResize = () => setViewportMode(getViewportMode());
-    onResize();
-    window.addEventListener("resize", onResize as any, { passive: true } as any);
-    window.addEventListener("orientationchange", onResize as any);
-    return () => {
-      window.removeEventListener("resize", onResize as any);
-      window.removeEventListener("orientationchange", onResize as any);
-    };
-  }, [getViewportMode]);
-
-  const isMobileUI = viewportMode === "mobile";
-  const isTabletUI = viewportMode === "tablet";
-
-  // Icon sizing: on mobile, force all icons to the same pixel size (13.5px).
-  const ICON_18 = isMobileUI ? 13.5 : 18;
-  const ICON_20 = isMobileUI ? 13.5 : 20;
-
-  // Keep icon buttons compact on mobile so the chat input and controls fit without scrolling.
-  // (Action buttons like Set Mode / Upgrade are shorter than the square icon buttons by default.)
-  const ICON_BTN_SIZE = isMobileUI ? 40 : 44;
-
-  const ui = useMemo(
-    () => {
-      if (viewportMode === "mobile") {
-        return {
-          avatar: 48,
-          title: 20,
-          meta: 12,
-          usageBarHeight: 10,
-          mainMaxWidth: "100%",
-          mainMargin: "12px auto",
-          mainPadding: "0 10px",
-        };
-      }
-      if (viewportMode === "tablet") {
-        return {
-          avatar: 56,
-          title: 22,
-          meta: 12,
-          usageBarHeight: 10,
-          mainMaxWidth: 980,
-          mainMargin: "18px auto",
-          mainPadding: "0 14px",
-        };
-      }
-      return {
-        avatar: 56,
-        title: 24,
-        meta: 13,
-        usageBarHeight: 8,
-        mainMaxWidth: 1120,
-        mainMargin: "24px auto",
-        mainPadding: "0 16px",
-      };
-    },
-    [viewportMode]
-  );
-
-  const mainContainerStyle = useMemo(
-    () =>
-      ({
-        maxWidth: ui.mainMaxWidth as any,
-        margin: ui.mainMargin,
-        padding: ui.mainPadding,
-        fontFamily: "system-ui",
-      } as React.CSSProperties),
-    [ui]
-  );
-
   // Normalize LiveKit server URL into ws/wss (client expects a websocket scheme)
   const normalizeLivekitWsUrl = useCallback((input: string): string => {
     const raw = String(input || "").trim();
@@ -1582,61 +1487,21 @@ export default function Page() {
 
   const sessionIdRef = useRef<string | null>(null);
 
-// Brief startup overlay (covers the iframe on initial refresh).
-// Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
-// until the companionName has been received from the Wix MEMBER_PLAN payload.
-const [startupOverlayOpen, setStartupOverlayOpen] = useState<boolean>(true);
-const [startupOverlayName, setStartupOverlayName] = useState<string>("");
-const startupOverlayTimerRef = useRef<number | null>(null);
-const startupOverlayStartedRef = useRef<boolean>(false);
-
-const armStartupOverlay = useCallback((name: string) => {
-  const nm = String(name || "").trim();
-  if (!nm) return;
-
-  // Set the display name (used by the overlay message).
-  setStartupOverlayName(nm);
-
-  // Start the 800ms countdown once (first time we learn the companion name from Wix).
-  if (startupOverlayStartedRef.current) return;
-  startupOverlayStartedRef.current = true;
-
-  if (startupOverlayTimerRef.current) {
-    window.clearTimeout(startupOverlayTimerRef.current);
-    startupOverlayTimerRef.current = null;
-  }
-
-  startupOverlayTimerRef.current = window.setTimeout(() => {
-    setStartupOverlayOpen(false);
-    startupOverlayTimerRef.current = null;
-  }, 800);
-}, []);
-
-useEffect(() => {
-  return () => {
-    if (startupOverlayTimerRef.current) {
-      window.clearTimeout(startupOverlayTimerRef.current);
-      startupOverlayTimerRef.current = null;
-    }
-  };
-}, []);
-
-
   // Keep the latest Wix memberId available for callbacks defined earlier in this file.
   // This avoids TypeScript/TDZ issues where a callback dependency array would otherwise
   // reference `memberId` before its declaration.
   const memberIdRef = useRef<string>("");
-	  // Keep the latest host memberId available for early callbacks (prevents TDZ issues).
-	  const hostMemberIdRef = useRef<string>("");
+    // Keep the latest host memberId available for early callbacks (prevents TDZ issues).
+    const hostMemberIdRef = useRef<string>("");
 
   // Wix member id (empty for visitors). Declared early so it can be referenced
   // safely in dependency arrays above (prevents TS "used before its declaration").
   const [memberId, setMemberId] = useState<string>("");
 
   const autoJoinStreamRef = useRef<boolean>(false);
-	// Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
-	const stopInProgressRef = useRef<boolean>(false);
-	const sessionActiveRef = useRef<boolean>(false);
+  // Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
+  const stopInProgressRef = useRef<boolean>(false);
+  const sessionActiveRef = useRef<boolean>(false);
   const streamOptOutRef = useRef<boolean>(false);
   const conferenceOptOutRef = useRef<boolean>(false);
 
@@ -2127,13 +1992,6 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
 
   // For rebrands, show the rebranding site's plan label when Wix provides it (e.g., "Supreme").
   const [planLabelOverride, setPlanLabelOverride] = useState<string>("");
-
-  // Wix postMessage can arrive multiple times (init + periodic refreshes). We only want the Wix-provided
-  // modePill to choose the *initial* mode (or a *changed* mode) — it must not continuously override
-  // user-initiated mode switches inside the chat.
-  const wixLastRequestedModeRef = useRef<Mode | null>(null);
-  const wixLastFingerprintRef = useRef<string>("");
-  const wixAppliedModeOnceRef = useRef<boolean>(false);
 
   // Upgrade URL (defaults to env; overridden by RebrandingKey when present)
   const upgradeUrl = useMemo(() => {
@@ -2685,19 +2543,19 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   useEffect(() => {
     sessionActiveRef.current = sessionActive;
   }, [sessionActive]);
-	  const mappedHostMemberId = useMemo(() => {
-	    const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
-	    return String(v || "");
-	  }, [companionMapping]);
+    const mappedHostMemberId = useMemo(() => {
+      const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
+      return String(v || "");
+    }, [companionMapping]);
 
-	  // Treat "host" as the *membership* that owns this companion.
-	  // IMPORTANT: do NOT derive host-ness from `livekitRole` because `livekitRole` is updated asynchronously
-	  // and the Host must never be prompted for a viewer username.
-	  const isHost = Boolean(memberId && mappedHostMemberId && memberId === mappedHostMemberId);
-	  const isViewer = Boolean(memberId && mappedHostMemberId && memberId !== mappedHostMemberId);
-	  useEffect(() => {
-	    hostMemberIdRef.current = String(mappedHostMemberId || "");
-	  }, [mappedHostMemberId]);
+    // Treat "host" as the *membership* that owns this companion.
+    // IMPORTANT: do NOT derive host-ness from `livekitRole` because `livekitRole` is updated asynchronously
+    // and the Host must never be prompted for a viewer username.
+    const isHost = Boolean(memberId && mappedHostMemberId && memberId === mappedHostMemberId);
+    const isViewer = Boolean(memberId && mappedHostMemberId && memberId !== mappedHostMemberId);
+    useEffect(() => {
+      hostMemberIdRef.current = String(mappedHostMemberId || "");
+    }, [mappedHostMemberId]);
 
 
 // ----------------------------
@@ -2720,20 +2578,12 @@ useEffect(() => {
 const [hostSendText, setHostSendText] = useState<string>("");
 const [hostNotice, setHostNotice] = useState<string>("");
 
-// Host Console STT (speech-to-text) for host messages during override
-const [hostSttRecording, setHostSttRecording] = useState<boolean>(false);
-const [hostSttError, setHostSttError] = useState<string>("");
-const hostSttRecorderRef = useRef<MediaRecorder | null>(null);
-const hostSttStreamRef = useRef<MediaStream | null>(null);
-const hostSttChunksRef = useRef<BlobPart[]>([]);
-
 // Host: companion-level interaction guideline overrides (persisted; highest priority)
 const [hostGuidelinesOpen, setHostGuidelinesOpen] = useState<boolean>(false);
 const [hostGuidelinesText, setHostGuidelinesText] = useState<string>("");
 const [hostGuidelinesSaved, setHostGuidelinesSaved] = useState<string>("");
 const [hostGuidelinesLoading, setHostGuidelinesLoading] = useState<boolean>(false);
 const [hostGuidelinesError, setHostGuidelinesError] = useState<string>("");
-const [hostGuidelinesStatus, setHostGuidelinesStatus] = useState<string>("");
 
 const loadHostGuidelines = useCallback(async () => {
   try {
@@ -2747,7 +2597,6 @@ const loadHostGuidelines = useCallback(async () => {
 
     setHostGuidelinesLoading(true);
     setHostGuidelinesError("");
-    setHostGuidelinesStatus("Loading…");
 
     const res = await fetch(`${API_BASE}/host/companion-guidelines/get`, {
       method: "POST",
@@ -2765,11 +2614,9 @@ const loadHostGuidelines = useCallback(async () => {
 
     setHostGuidelinesSaved(text);
     setHostGuidelinesText(text);
-    setHostGuidelinesStatus("Loaded");
     setHostGuidelinesLoading(false);
   } catch (e: any) {
     setHostGuidelinesLoading(false);
-    setHostGuidelinesStatus("");
     setHostGuidelinesError(String(e?.message || e || "Failed to load guidelines"));
   }
 }, [API_BASE, isHost, companyName, companionName]);
@@ -2786,7 +2633,6 @@ const saveHostGuidelines = useCallback(async () => {
 
     setHostGuidelinesLoading(true);
     setHostGuidelinesError("");
-    setHostGuidelinesStatus("Saving…");
 
     const res = await fetch(`${API_BASE}/host/companion-guidelines/set`, {
       method: "POST",
@@ -2804,11 +2650,9 @@ const saveHostGuidelines = useCallback(async () => {
 
     setHostGuidelinesSaved(text);
     setHostGuidelinesText(text);
-    setHostGuidelinesStatus("Saved");
     setHostGuidelinesLoading(false);
   } catch (e: any) {
     setHostGuidelinesLoading(false);
-    setHostGuidelinesStatus("");
     setHostGuidelinesError(String(e?.message || e || "Failed to save guidelines"));
   }
 }, [API_BASE, isHost, companyName, companionName, hostGuidelinesText]);
@@ -2818,15 +2662,15 @@ const saveHostGuidelines = useCallback(async () => {
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
-	const livekitPendingUnique = useMemo(() => {
-		const byKey = new Map<string, any>();
-		for (const r of livekitPending || []) {
-			const key = String(r?.memberId || r?.requestId || "");
-			if (!key) continue;
-			if (!byKey.has(key)) byKey.set(key, r);
-		}
-		return Array.from(byKey.values());
-	}, [livekitPending]);
+  const livekitPendingUnique = useMemo(() => {
+    const byKey = new Map<string, any>();
+    for (const r of livekitPending || []) {
+      const key = String(r?.memberId || r?.requestId || "");
+      if (!key) continue;
+      if (!byKey.has(key)) byKey.set(key, r);
+    }
+    return Array.from(byKey.values());
+  }, [livekitPending]);
   // Viewers must press Play to join live streams.
   // We only reset the auto-join guard when a live stream ends.
   useEffect(() => {
@@ -3398,11 +3242,11 @@ if (liveProvider === "stream") {
   try {
     const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
 
-	    // Ask server to resolve room + determine host vs viewer.
-	    // NOTE: Never prompt the Host for a username.
-	    const displayNameForToken = isViewer
-	      ? String(ensureViewerLiveChatName() || viewerLiveChatName || "Viewer").trim()
-	      : String(companionName || "Host").trim();
+      // Ask server to resolve room + determine host vs viewer.
+      // NOTE: Never prompt the Host for a username.
+      const displayNameForToken = isViewer
+        ? String(ensureViewerLiveChatName() || viewerLiveChatName || "Viewer").trim()
+        : String(companionName || "Host").trim();
 
 const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       method: "POST",
@@ -4464,14 +4308,6 @@ useEffect(() => {
 
   const [loading, setLoading] = useState(false);
 
-  // Used to safely queue STT auto-sends while a response is still being prepared.
-  // (Prevents STT transcripts from getting dropped when send() is blocked by loading=true.)
-  const loadingRef = useRef<boolean>(false);
-
-  useEffect(() => {
-    loadingRef.current = Boolean(loading);
-  }, [loading]);
-
 
 // Host console polling (list + selected transcript)
 useEffect(() => {
@@ -4753,120 +4589,6 @@ const hostSendMessage = async () => {
 };
 
 
-// Host STT (speech-to-text) using backend transcription (/stt/transcribe)
-// - Click to start recording, click again to stop & transcribe.
-// - Fills the host message box with the transcript (host can edit, then Send).
-const hostStopStt = useCallback(async () => {
-  try {
-    const rec = hostSttRecorderRef.current;
-    if (rec && rec.state !== "inactive") {
-      try {
-        rec.stop();
-      } catch {}
-    }
-  } catch {}
-}, []);
-
-const hostStartStt = useCallback(async () => {
-  try {
-    if (hostSttRecording) return;
-    setHostSttError("");
-
-    if (!API_BASE) throw new Error("API base not configured");
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      throw new Error("Microphone is not available in this browser");
-    }
-
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    hostSttStreamRef.current = stream;
-    hostSttChunksRef.current = [];
-
-    const mr = new MediaRecorder(stream);
-    const mimeType = String((mr as any)?.mimeType || "audio/webm");
-    hostSttRecorderRef.current = mr;
-
-    mr.ondataavailable = (e: any) => {
-      try {
-        if (e?.data && e.data.size > 0) hostSttChunksRef.current.push(e.data);
-      } catch {}
-    };
-
-    mr.onstop = async () => {
-      try {
-        setHostSttRecording(false);
-
-        const chunks = hostSttChunksRef.current || [];
-        hostSttChunksRef.current = [];
-
-        // stop tracks
-        try {
-          (hostSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
-            try {
-              t.stop();
-            } catch {}
-          });
-        } catch {}
-        hostSttStreamRef.current = null;
-
-        const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
-        if (!blob || blob.size < 1) return;
-
-        const form = new FormData();
-        const fname = mimeType.includes("mp4")
-          ? "host_audio.mp4"
-          : mimeType.includes("wav")
-            ? "host_audio.wav"
-            : "host_audio.webm";
-        form.append("file", blob, fname);
-
-        const res = await fetch(`${API_BASE}/stt/transcribe`, {
-          method: "POST",
-          body: form,
-        });
-
-        const data: any = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          const detail = String(data?.detail || data?.error || `HTTP ${res.status}`);
-          throw new Error(detail);
-        }
-
-        const text = String(data?.text || "").trim();
-        if (!text) return;
-
-        setHostSendText((prev) => {
-          const p = String(prev || "").trim();
-          return p ? `${p} ${text}` : text;
-        });
-      } catch (e: any) {
-        setHostSttError(String(e?.message || e || "STT failed"));
-      }
-    };
-
-    mr.start();
-    setHostSttRecording(true);
-  } catch (e: any) {
-    setHostSttRecording(false);
-    setHostSttError(String(e?.message || e || "Microphone permission was blocked."));
-    try {
-      (hostSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
-        try {
-          t.stop();
-        } catch {}
-      });
-    } catch {}
-    hostSttStreamRef.current = null;
-  }
-}, [API_BASE, hostSttRecording]);
-
-// Safety: stop host recorder if host console closes or session changes.
-useEffect(() => {
-  if (!hostConsoleOpen || !hostSelectedSessionId) {
-    if (hostSttRecording) hostStopStt();
-  }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [hostConsoleOpen, hostSelectedSessionId]);
-
-
   const hostPushPendingContent = async (token: string) => {
     if (!hostSelectedSessionId) return;
 
@@ -4992,73 +4714,6 @@ useEffect(() => {
     if (mid) return mid;
     return getOrCreateAnonMemberId(brandKeyForAnon);
   }, [memberId, brandKeyForAnon]);
-
-
-  // ---------------------------------------------------------------------------
-  // LLM priming (warm-up) to reduce latency on provider switches (OpenAI <-> xAI)
-  // ---------------------------------------------------------------------------
-  const warmProvider = useMemo(() => {
-    return sessionState.mode === "intimate" && !!sessionState.explicit_consented ? "xai" : "openai";
-  }, [sessionState.mode, sessionState.explicit_consented]);
-
-  const warmKey = useMemo(() => {
-    const rawBrand = String(companyName || rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
-    const brandKey = safeBrandKey(rawBrand) || "core";
-    const avatarKey = String(companionName || DEFAULT_COMPANION_NAME).trim().toLowerCase();
-    return `${warmProvider}|${sessionState.mode}|${sessionState.explicit_consented ? "1" : "0"}|${brandKey}|${avatarKey}`;
-  }, [warmProvider, sessionState.mode, sessionState.explicit_consented, companyName, rebranding, companionName]);
-
-  const warmLastRef = useRef<{ key: string; at: number }>({ key: "", at: 0 });
-
-  const buildWarmSessionStateForBackend = useCallback((): SessionState => {
-    const rawBrand = String(companyName || rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
-    const brandKey = safeBrandKey(rawBrand);
-    const mid = String(memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
-    const companionForBackend =
-      String(companionKey || "").trim() || String(companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
-    const rebrandingKeyForBackend = String(rebrandingKey || "").trim();
-    const planNameForBackend = planName;
-
-    return {
-      ...sessionState,
-      memberId: mid,
-      member_id: mid,
-      brand: rawBrand,
-      avatar: String(companionName || companionForBackend).trim(),
-      companion: companionForBackend,
-      companionName: companionForBackend,
-      companion_name: companionForBackend,
-      planName: planNameForBackend,
-      plan_name: planNameForBackend,
-      rebrandingKey: rebrandingKeyForBackend,
-      rebranding_key: rebrandingKeyForBackend,
-      rebranding: String(rebranding || "").trim(),
-    };
-  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, rebrandingKey, planName]);
-
-  useEffect(() => {
-    if (!API_BASE) return;
-
-    // Throttle: only warm once per key per ~45s.
-    const now = Date.now();
-    const prev = warmLastRef.current;
-    if (prev.key === warmKey && now - prev.at < 45_000) return;
-    warmLastRef.current = { key: warmKey, at: now };
-
-    const payload = {
-      provider: warmProvider,
-      mode: sessionState.mode,
-      session_state: buildWarmSessionStateForBackend(),
-    };
-
-    try {
-      fetch(`${API_BASE}/llm/warm`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
-    } catch (e) {}
-  }, [warmKey, warmProvider, sessionState.mode, buildWarmSessionStateForBackend]);
 
 
   // PayGo top-up email (stored per brand so the user doesn't have to retype it)
@@ -5255,36 +4910,6 @@ useEffect(() => {
       // ignore
     }
   }, [API_BASE, companionKey, companionName, memberId, planName, planLabelOverride, rebrandingKey, rebranding]);
-
-  // Keep the on-screen usage meter in sync even when there are no new turns.
-  // This endpoint is non-charging (status only), so it is safe to poll.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (!API_BASE) return;
-
-    let cancelled = false;
-
-    const tick = () => {
-      if (cancelled) return;
-
-      // Avoid background polling when the tab is hidden to reduce load on mobile.
-      try {
-        if (typeof document !== "undefined" && document.visibilityState && document.visibilityState !== "visible") {
-          return;
-        }
-      } catch {}
-
-      void refreshUsageStatusOnce();
-    };
-
-    tick();
-    const id = window.setInterval(tick, 30000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [API_BASE, refreshUsageStatusOnce]);
-
 
   // CTA: Encourage visitors to become members for a smoother top-up experience (no email entry).
   // We intentionally keep the non-member flow more tedious (email required), but provide a clear upgrade path.
@@ -6155,20 +5780,20 @@ const startConferenceSession = useCallback(async () => {
     setLivekitMicEnabled(true);
   setLivekitCameraEnabled(true);
 
-	    // Host: prime A/V permissions on the Play click (iOS/Safari requirement).
-	    // Viewers are subscribe-only for now, so we do NOT require mic/cam permissions to request access.
-	    if (isHost) {
-	      const ok = await requestLivekitAvPermissions({
-	        audio: true,
-	        video: true,
-	        reason: "starting a Private conference",
-	      });
-	      if (!ok) {
-	        setAvatarStatus("error");
-	        setAvatarError("Microphone and camera permissions are required to host the private conference.");
-	        return;
-	      }
-	    }
+      // Host: prime A/V permissions on the Play click (iOS/Safari requirement).
+      // Viewers are subscribe-only for now, so we do NOT require mic/cam permissions to request access.
+      if (isHost) {
+        const ok = await requestLivekitAvPermissions({
+          audio: true,
+          video: true,
+          reason: "starting a Private conference",
+        });
+        if (!ok) {
+          setAvatarStatus("error");
+          setAvatarError("Microphone and camera permissions are required to host the private conference.");
+          return;
+        }
+      }
 
     // Viewers request to join a private session. The host must admit them.
     if (!isHost) {
@@ -6225,14 +5850,14 @@ const startConferenceSession = useCallback(async () => {
       setMessages((prev) => prev.filter((m) => !m?.meta?.liveChat));
       liveChatSeenIdsRef.current = new Set();
 
-	      try {
-	        const requestedDisplayName = String(
-	          ensureViewerLiveChatName({
-	            promptText: "Please enter your name to enter the the session",
-	          }) ||
-	            viewerLiveChatName ||
-	            "",
-	        ).trim();
+        try {
+          const requestedDisplayName = String(
+            ensureViewerLiveChatName({
+              promptText: "Please enter your name to enter the the session",
+            }) ||
+              viewerLiveChatName ||
+              "",
+          ).trim();
 
         const resp = await fetch(`${API_BASE}/livekit/join_request`, {
           method: "POST",
@@ -7159,7 +6784,6 @@ useEffect(() => {
         const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
-        armStartupOverlay(parsed.first || DEFAULT_COMPANION_NAME);
 
         // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
         setSessionState((prev) => ({
@@ -7172,7 +6796,6 @@ useEffect(() => {
         setCompanionKeyRaw("");
         setCompanionKey("");
         setCompanionName(DEFAULT_COMPANION_NAME);
-        armStartupOverlay(DEFAULT_COMPANION_NAME);
 
         setSessionState((prev) => ({
           ...prev,
@@ -7211,34 +6834,12 @@ useEffect(() => {
 
       const wixRequestedMode: Mode | null = modeFromModePill(incomingModePillRaw);
 
-      // Wix can post MEMBER_PLAN more than once (init + periodic refresh). We must not continuously
-      // override user-driven mode switches inside the chat. We only force-apply Wix modePill when:
-      //   - this is the first MEMBER_PLAN we processed, OR
-      //   - the plan context changed (new member/plan/rebrandingKey), OR
-      //   - Wix actually changed the modePill value.
-      const fp = `${incomingMemberId || ""}|${String(effectivePlan || "").trim()}|${String(rawRebrandingKey || "").trim()}`;
-      const isPlanRefresh = fp !== wixLastFingerprintRef.current;
-      wixLastFingerprintRef.current = fp;
-
-      const wixModeChanged = Boolean(
-        wixRequestedMode && wixRequestedMode !== wixLastRequestedModeRef.current
-      );
-      if (wixRequestedMode) {
-        wixLastRequestedModeRef.current = wixRequestedMode;
-      }
-
-      const shouldForceWixMode = Boolean(
-        wixRequestedMode &&
-          nextAllowed.includes(wixRequestedMode) &&
-          (!wixAppliedModeOnceRef.current || isPlanRefresh || wixModeChanged)
-      );
-      wixAppliedModeOnceRef.current = true;
-
       setSessionState((prev) => {
         let nextMode: Mode = prev.mode;
 
-        // Force-apply Wix modePill only on init / plan refresh / Wix mode change.
-        if (shouldForceWixMode) {
+        // Requirement: if Wix provides a modePill and it is allowed by the Elaralo entitlement plan,
+        // it MUST be the selected mode pill on load/plan refresh (regardless of the previously-stored mode).
+        if (wixRequestedMode && nextAllowed.includes(wixRequestedMode)) {
           nextMode = wixRequestedMode;
         } else {
           // Otherwise, preserve the previous mode if allowed; if not allowed, fall back.
@@ -7280,25 +6881,13 @@ const companionForBackend =
 
 
 // NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+  // - `rebranding` (legacy) is not guaranteed to be present in this build.
+  // - Use RebrandingKey as the single source of truth for brand identity.
+  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
 const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
-
-// Viewer/User display name for host readability (used in Host Console + summaries).
-// Do NOT prompt here; this must be safe during normal chat.
-const userDisplayNameForBackend = (() => {
-  const explicit = String(viewerLiveChatName || "").trim();
-  if (explicit) return explicit;
-  const raw = String(memberIdForBackend || "").trim();
-  const cleaned = raw.replace(/^Anon:\s*/i, "").trim();
-  const base = cleaned || raw;
-  const shortId = base ? base.slice(0, 4) : "";
-  return `Viewer - ${shortId || "Anon"}`;
-})();
 
 // If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
 // from the rebranding key so backend quota comes from the mapped Elaralo plan.
@@ -7335,11 +6924,6 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   RebrandingKey: (rebrandingKeyForBackend || "").trim(),
   // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
   rebranding: (rebranding || "").trim(),
-
-  // User display name (optional). Backend uses this ONLY for Host Console readability.
-  user_name: userDisplayNameForBackend,
-  username: userDisplayNameForBackend,
-  display_name: userDisplayNameForBackend,
 };
 
     const trimmedForChat = trimMessagesForChat(nextMessages);
@@ -7444,9 +7028,9 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
 
     
 // NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+  // - `rebranding` (legacy) is not guaranteed to be present in this build.
+  // - Use RebrandingKey as the single source of truth for brand identity.
+  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -7679,11 +7263,11 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     if (uploadingAttachment) return;
     if (!rawText && !hasAttachment) return;
 
-	    // Hard rule: no attachments during Live Stream sessions.
-	    if (sessionKind === "stream" && (uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
-	      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
-	      return;
-	    }
+      // Hard rule: no attachments during Live Stream sessions.
+      if (sessionKind === "stream" && (uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
+        try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
+        return;
+      }
 
     // If the user clears messages mid-flight, we "invalidate" any in-progress send()
     // so the assistant reply doesn't append into a cleared chat.
@@ -7715,20 +7299,12 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     // If detectedMode is intimate, keep/trigger pending overlay on response.
     let nextState: SessionState = sessionState;
     if (detectedMode) {
-      // Trigger/clear the pending consent overlay when switching modes via text.
-      const nextPending =
-        detectedMode === "intimate"
-          ? sessionState.explicit_consented
-            ? null
-            : "intimate"
-          : null;
-
+      // If we switch away from intimate while consent is pending, clear the pending flag
+      const nextPending = detectedMode === "intimate" ? sessionState.pending_consent : null;
       nextState = { ...sessionState, mode: detectedMode, pending_consent: nextPending };
 
-      // Keep UI status aligned with the pending consent state.
-      if (detectedMode === "intimate" && !sessionState.explicit_consented) {
-        setChatStatus("explicit_blocked");
-      } else if (detectedMode !== "intimate") {
+      // If user is switching away from intimate, also clear any explicit_blocked overlay state
+      if (detectedMode !== "intimate") {
         setChatStatus("safe");
       }
 
@@ -8069,16 +7645,6 @@ if (streamSessionActive) {
     sendRef.current = send;
   }, [send]);
 
-  // If STT auto-send fires while loading=true, we queue it and flush once loading clears.
-  const sttDeferredQueueRef = useRef<string[]>([]);
-  useEffect(() => {
-    if (loading) return;
-    if (!sttDeferredQueueRef.current.length) return;
-    const next = sttDeferredQueueRef.current.shift();
-    if (next) void sendRef.current(next);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading]);
-
 
 // ---------------------------------------------------------------------
 // Flush queued viewer/host messages once the host stops streaming.
@@ -8307,24 +7873,9 @@ useEffect(() => {
     liveProvider === "d-id" &&
     (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
 
-  const speechRecognitionSupported = useMemo(() => {
-    if (typeof window === "undefined") return false;
-    const w = window as any;
-    return !!(w.SpeechRecognition || w.webkitSpeechRecognition);
-  }, []);
-
-  const mediaRecorderSupported = useMemo(() => {
-    if (typeof window === "undefined") return false;
-    return typeof (window as any).MediaRecorder !== "undefined" && !!navigator?.mediaDevices?.getUserMedia;
-  }, []);
-
-  // Prefer backend STT when embedded (Web Speech is commonly blocked in iframes), on iOS (more stable),
-  // or when Web Speech isn't available. Keep Live Avatar mode on browser STT.
-  const useBackendStt =
-    backendSttAvailable &&
-    mediaRecorderSupported &&
-    !liveAvatarActive &&
-    (isIOS || isEmbedded || !speechRecognitionSupported);
+  // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
+  // Keep Live Avatar mode on browser STT (it is already stable across devices).
+  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -8601,12 +8152,6 @@ useEffect(() => {
       setSttFinal(text);
       sttFinalRef.current = text;
 
-      // If send() is currently blocked by loading=true, queue the STT transcript.
-      if (loadingRef.current) {
-        sttDeferredQueueRef.current.push(text);
-        return;
-      }
-
       await send(text);
     } catch (e) {
       setSttError(e?.message || "STT failed.");
@@ -8690,13 +8235,6 @@ const pauseSpeechToText = useCallback(() => {
       sttFinalRef.current = "";
       sttInterimRef.current = "";
       setInput("");
-
-      // If a response is still being prepared, STT auto-send would be dropped.
-      // Queue it and flush once loading clears.
-      if (loadingRef.current) {
-        sttDeferredQueueRef.current.push(text);
-        return;
-      }
 
       void sendRef.current(text);
     }, 2000);
@@ -9507,12 +9045,12 @@ const hostInStreamUi =
     avatarStatus === "reconnecting");
 
 const viewerInStreamUi = viewerHasJoinedStream;
-		// Attachments are disabled during Live Stream sessions, but should remain enabled for Live Private Conference.
-		const attachmentButtonDisabled =
-		  loading ||
-		  uploadingAttachment ||
-		  uploadsDisabled ||
-		  (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
+    // Attachments are disabled during Live Stream sessions, but should remain enabled for Live Private Conference.
+    const attachmentButtonDisabled =
+      loading ||
+      uploadingAttachment ||
+      uploadsDisabled ||
+      (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
 
 useEffect(() => {
   // Viewer STT must be disabled while in the LegacyStream stream UI to avoid transcribing the host audio.
@@ -9543,20 +9081,18 @@ const sttControls =
           void toggleSpeechToText();
         }}
         disabled={(liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ||
-                    // Viewer STT must be disabled while in the stream UI to avoid transcribing the host audio.
-                    viewerInStreamUi || (liveAvatarActive && sttEnabled)}
+                    viewerInStreamUi || (!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
         title="Audio"
         style={{
-          width: ICON_BTN_SIZE,
-          height: ICON_BTN_SIZE,
-          minWidth: ICON_BTN_SIZE,
+          width: 44,
+          height: 44,
+          minWidth: 44,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
           padding: 0,
           borderRadius: 10,
           border: "1px solid #111",
-          boxSizing: "border-box",
           background: sttEnabled ? "#b00020" : "#fff",
           color: sttEnabled ? "#fff" : "#111",
           cursor: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
@@ -9564,7 +9100,7 @@ const sttControls =
           fontWeight: 700,
         }}
       >
-        {sttEnabled ? <MicOnIcon size={ICON_20} /> : <MicOffIcon size={ICON_20} />}
+        {sttEnabled ? <MicOnIcon size={20} /> : <MicOffIcon size={20} />}
       </button>
 
       {!livekitUiActive && (
@@ -9575,12 +9111,11 @@ const sttControls =
           title="Stop"
           aria-label="Stop"
           style={{
-            width: ICON_BTN_SIZE,
-            height: ICON_BTN_SIZE,
-            minWidth: ICON_BTN_SIZE,
+            width: 44,
+            height: 44,
+            minWidth: 44,
             borderRadius: 10,
             border: "1px solid #111",
-            boxSizing: "border-box",
             background:
               sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
                 ? "#fff"
@@ -9600,7 +9135,7 @@ const sttControls =
             justifyContent: "center",
           }}
         >
-          <StopIcon size={ICON_18} />
+          <StopIcon />
         </button>
       )}
 </>
@@ -9840,104 +9375,8 @@ const modePillControls = (
     void ensureIphoneAudioContextUnlocked();
   }, [primeLocalTtsAudio, nudgeAudioSession, ensureIphoneAudioContextUnlocked]);
 
-  const usageMeterEl = useMemo(() => {
-    const used = Number((sessionState as any)?.minutes_used ?? (sessionState as any)?.minutesUsed ?? 0) || 0;
-    const remaining = Number((sessionState as any)?.minutes_remaining ?? (sessionState as any)?.minutesRemaining ?? 0) || 0;
-    const allowed = Number((sessionState as any)?.minutes_allowed ?? (sessionState as any)?.minutesAllowed ?? 0) || 0;
-    const total = (used + remaining) > 0 ? (used + remaining) : allowed;
-    if (!total || total <= 0) return null;
-
-    const pct = Math.max(0, Math.min(1, used / total));
-    const remainingComputed = remaining > 0 ? remaining : Math.max(0, total - used);
-    const pctLabel = `${Math.round(pct * 100)}%`;
-
-    return (
-      <div style={{ marginTop: 8, maxWidth: isMobileUI ? "100%" : 440 }}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "baseline",
-            justifyContent: "space-between",
-            gap: 10,
-            fontSize: 16,
-            color: "#666",
-          }}
-        >
-          <span style={{ fontWeight: 700 }}>Usage</span>
-          <span style={{ whiteSpace: "nowrap" }}>
-            {used} / {total} min • {remainingComputed} left
-          </span>
-        </div>
-
-        <div
-          role="progressbar"
-          aria-label={`Usage: ${used} of ${total} minutes`}
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={Math.round(pct * 100)}
-          style={{
-            marginTop: 4,
-            height: ui.usageBarHeight,
-            borderRadius: 999,
-            background: "rgba(0,0,0,0.12)",
-            overflow: "hidden",
-          }}
-          title={`${used}/${total} min (${pctLabel})`}
-        >
-          <div
-            style={{
-              width: `${Math.round(pct * 100)}%`,
-              height: "100%",
-              background: "rgba(0,0,0,0.65)",
-            }}
-          />
-        </div>
-      </div>
-    );
-  }, [
-    sessionState,
-    isMobileUI,
-    ui.meta,
-    ui.usageBarHeight,
-  ]);
-
   return (
-    <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={mainContainerStyle}>
-
-{startupOverlayOpen ? (
-  <div
-    style={{
-      position: "fixed",
-      inset: 0,
-      zIndex: 1000001,
-      background: "#fff",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      pointerEvents: "all",
-    }}
-  >
-    {startupOverlayName ? (
-      <div
-        style={{
-          padding: "12px 16px",
-          borderRadius: 14,
-          background: "#111827",
-          color: "#fff",
-          border: "1px solid rgba(255,255,255,0.18)",
-          boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
-          fontSize: 16,
-          fontWeight: 700,
-          letterSpacing: 0.2,
-          maxWidth: "min(92vw, 520px)",
-          textAlign: "center",
-        }}
-      >
-        ...waiting on {startupOverlayName}
-      </div>
-    ) : null}
-  </div>
-) : null}
+    <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       {/* Hidden audio element for audio-only TTS (mic mode) */}
       <audio ref={localTtsAudioRef} style={{ display: "none" }} />
       {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
@@ -10303,8 +9742,8 @@ const modePillControls = (
         </div>
       ) : null}
 
-      <header style={{ display: "flex", alignItems: isMobileUI ? "flex-start" : "center", gap: isMobileUI ? 10 : 12, marginBottom: isMobileUI ? 8 : 10, flexWrap: "wrap", rowGap: isMobileUI ? 6 : 0 }}>
-        <div aria-hidden onClick={secretDebugTap} style={{ width: ui.avatar, height: ui.avatar, borderRadius: "50%", overflow: "hidden" }}>
+      <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
           <img
             // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
             src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
@@ -10319,12 +9758,12 @@ const modePillControls = (
           />
         </div>
         <div>
-          <h1 style={{ margin: 0, fontSize: ui.title }}>{companyName}</h1>
-          <div style={{ fontSize: ui.meta, color: "#666" }}>
+          <h1 style={{ margin: 0, fontSize: 22 }}>{companyName}</h1>
+          <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
             <b>{displayPlanLabel(planName, memberId, planLabelOverride)}</b>
           </div>
-          <div style={{ fontSize: ui.meta, color: "#666" }}>
+          <div style={{ fontSize: 12, color: "#666" }}>
             Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
             {chatStatus === "explicit_allowed" ? (
               <span style={{ marginLeft: 8, color: "#0a7a2f" }}>• Consent: Allowed</span>
@@ -10332,8 +9771,6 @@ const modePillControls = (
               <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
             ) : null}
           </div>
-	          {/* On mobile, push usage to the bottom to maximize above-the-fold space. */}
-	          {!isMobileUI && usageMeterEl}
           {liveProvider === "stream" ? (
             <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
               {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
@@ -10368,7 +9805,7 @@ const modePillControls = (
                     fontWeight: 700,
                   }}
                 >
-					● {hostInStreamUi ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}` : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
+          ● {hostInStreamUi ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}` : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
                 </span>
               ) : null}
             </div>
@@ -10459,16 +9896,9 @@ const modePillControls = (
         }}
         disabled={liveProvider === "stream" ? (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) : false}
         style={{
-          width: ICON_BTN_SIZE,
-          height: ICON_BTN_SIZE,
-          minWidth: ICON_BTN_SIZE,
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: 0,
+          padding: "10px 14px",
           borderRadius: 10,
           border: "1px solid #111",
-          boxSizing: "border-box",
           background: "#fff",
           color: "#111",
           cursor:
@@ -10491,69 +9921,69 @@ const modePillControls = (
         title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
       >
         {liveProvider === "stream" ? (
-          <PlayIcon size={ICON_18} />
+          <PlayIcon />
         ) : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" ? (
-          <PauseIcon size={ICON_18} />
+          <PauseIcon />
         ) : (
-          <PlayIcon size={ICON_18} />
+          <PlayIcon />
         )}
       </button>
 
       
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
       {sttControls}
-	      {liveProvider === "stream" &&
-	        ((isHost &&
-	          ((sessionKind === "conference" && Boolean(livekitToken)) ||
-	            (sessionKind === "stream" && sessionActive))) ||
-	          (!isHost && sessionKind === "conference" && Boolean(livekitToken))) ? (	          <button
-	            type="button"
-	            onClick={async () => {
-	              const next = !livekitMicEnabled;
-	              if (next) {
-	                const ok = await requestLivekitAvPermissions({
-	                  audio: true,
-	                  video: sessionKind === "conference",
-	                  reason: "enabling microphone/camera",
-	                });
-	                if (!ok) return;
-	              }
-	              setLivekitMicEnabled(next);
-	              if (sessionKind === "conference") {
-	                setLivekitCameraEnabled(next);
-	              }
-	            }}
-	            style={{
-	              ...smallBtn,
-	              background: livekitMicEnabled ? "#1b5e20" : "#eee",
-	              color: livekitMicEnabled ? "#fff" : "#222",
-	            }}
-	            title={livekitMicEnabled ? "Mute Mic" : "Unmute Mic"}
-	          >
-	            🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
-	          </button>
-	        ) : null}
+        {liveProvider === "stream" &&
+          ((isHost &&
+            ((sessionKind === "conference" && Boolean(livekitToken)) ||
+              (sessionKind === "stream" && sessionActive))) ||
+            (!isHost && sessionKind === "conference" && Boolean(livekitToken))) ? (	          <button
+              type="button"
+              onClick={async () => {
+                const next = !livekitMicEnabled;
+                if (next) {
+                  const ok = await requestLivekitAvPermissions({
+                    audio: true,
+                    video: sessionKind === "conference",
+                    reason: "enabling microphone/camera",
+                  });
+                  if (!ok) return;
+                }
+                setLivekitMicEnabled(next);
+                if (sessionKind === "conference") {
+                  setLivekitCameraEnabled(next);
+                }
+              }}
+              style={{
+                ...smallBtn,
+                background: livekitMicEnabled ? "#1b5e20" : "#eee",
+                color: livekitMicEnabled ? "#fff" : "#222",
+              }}
+              title={livekitMicEnabled ? "Mute Mic" : "Unmute Mic"}
+            >
+              🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
+            </button>
+          ) : null}
 
-	      {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
-	        <button
-	          type="button"
-	          onClick={() => {
-	            setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
-	          }}
-	          style={{
-	            ...smallBtn,
-	            background: conferenceViewMode === "focus" ? "#111" : "#eee",
-	            color: conferenceViewMode === "focus" ? "#fff" : "#222",
-	          }}
-	          title={
-	            conferenceViewMode === "focus"
-	              ? "Show split view (both participants)"
-	              : "Show full view (other participant only)"
-	          }
-	        >
-	          {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
-	        </button>
-	      ) : null}
+        {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
+          <button
+            type="button"
+            onClick={() => {
+              setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
+            }}
+            style={{
+              ...smallBtn,
+              background: conferenceViewMode === "focus" ? "#111" : "#eee",
+              color: conferenceViewMode === "focus" ? "#fff" : "#222",
+            }}
+            title={
+              conferenceViewMode === "focus"
+                ? "Show split view (both participants)"
+                : "Show full view (other participant only)"
+            }
+          >
+            {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
+          </button>
+        ) : null}
 {liveProvider === "stream" &&
         ((isHost && sessionActive) ||
           (!isHost &&
@@ -10570,7 +10000,7 @@ const modePillControls = (
           }}
           title={isHost ? "Stop live session" : "Leave session"}
         >
-          <StopIcon size={ICON_18} />
+          <StopIcon />
         </button>
       ) : null}
 
@@ -10596,7 +10026,7 @@ const modePillControls = (
         </button>
       ) : null}
 
-      <div style={{ fontSize: ui.meta, color: "#666" }}>
+      <div style={{ fontSize: 12, color: "#666" }}>
         {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}:{" "}
         <b>{avatarStatus}</b>
         {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
@@ -10620,13 +10050,13 @@ const modePillControls = (
         >
           {showAvatarFrame ? (
             <div
-	              style={{
-	                flex:
-	                  liveProvider === "stream" && sessionKind === "conference"
-	                    ? "2 1 0"
-	                    : liveProvider === "stream" && !isHost
-	                      ? "2 1 0"
-	                      : "0 0 360px",
+                style={{
+                  flex:
+                    liveProvider === "stream" && sessionKind === "conference"
+                      ? "2 1 0"
+                      : liveProvider === "stream" && !isHost
+                        ? "2 1 0"
+                        : "0 0 360px",
                 minWidth: liveProvider === "stream" && !isHost ? 320 : 280,
                 maxWidth: "100%",
               }}
@@ -10647,11 +10077,11 @@ const modePillControls = (
                     token={livekitToken}
                     serverUrl={livekitServerUrl || LIVEKIT_URL}
                     connect={Boolean(livekitToken)}
-	                    audio={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
-	                    video={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
+                      audio={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
+                      video={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                     onConnected={() => {
-	                      // Host: once connected we treat the session as active.
-	                      if (isHost) setSessionActive(true);
+                        // Host: once connected we treat the session as active.
+                        if (isHost) setSessionActive(true);
                       // Conference: track that we've joined the room.
                       if (sessionKind === "conference") setConferenceJoined(true);
                     }}
@@ -10678,22 +10108,22 @@ const modePillControls = (
                       cameraEnabled={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                       onError={(msg) => setStreamNotice(msg)}
                     />
-	                    {sessionKind === "conference" ? (
-	                      <LiveKitPrivateConferenceStage viewMode={conferenceViewMode} />
-	                    ) : livekitRole === "viewer" && sessionKind === "stream" ? (
-	                      <LiveKitStreamViewerStage />
-	                    ) : (
-	                      <VideoConference
-	                        chatMessageFormatter={undefined as any}
-	                        onError={(e: any) => {
-	                          console.warn("LiveKit UI error", e);
-	                        }}
-	                      />
-	                    )}
+                      {sessionKind === "conference" ? (
+                        <LiveKitPrivateConferenceStage viewMode={conferenceViewMode} />
+                      ) : livekitRole === "viewer" && sessionKind === "stream" ? (
+                        <LiveKitStreamViewerStage />
+                      ) : (
+                        <VideoConference
+                          chatMessageFormatter={undefined as any}
+                          onError={(e: any) => {
+                            console.warn("LiveKit UI error", e);
+                          }}
+                        />
+                      )}
 
                     {livekitRole === "viewer" && (sessionKind === "stream" || sessionKind === "conference") ? null : <StartAudio label="Enable audio" />}
 
-						{livekitRole === "host" && livekitPendingUnique.length > 0 ? (
+            {livekitRole === "host" && livekitPendingUnique.length > 0 ? (
                       <div
                         style={{
                           position: "absolute",
@@ -10718,7 +10148,7 @@ const modePillControls = (
                         >
                           <div style={{ fontWeight: 700, marginBottom: 8 }}>Join Requests</div>
                           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-							{livekitPendingUnique.map((req) => (
+              {livekitPendingUnique.map((req) => (
                               <div
                                 key={req.requestId}
                                 style={{
@@ -10871,7 +10301,7 @@ const modePillControls = (
                   ) : null
                 ) : null}
 
-				{showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
+        {showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
                   <div
                     style={{
                       position: "absolute",
@@ -10901,13 +10331,13 @@ const modePillControls = (
 
           <div
                     style={{
-	                    flex: showAvatarFrame
-	                      ? (liveProvider === "stream" && sessionKind === "conference"
-	                          ? "1 1 0"
-	                          : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
-	                            ? "1 1 0"
-	                            : "2 1 0")
-	                      : "1 1 0",
+                      flex: showAvatarFrame
+                        ? (liveProvider === "stream" && sessionKind === "conference"
+                            ? "1 1 0"
+                            : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
+                              ? "1 1 0"
+                              : "2 1 0")
+                        : "1 1 0",
                       minWidth: 280,
                       height: conversationHeight,
                       display: "flex",
@@ -11011,11 +10441,10 @@ const modePillControls = (
                             title="Save"
                             aria-label="Save"
                             style={{
-                              width: ICON_BTN_SIZE,
-                              height: ICON_BTN_SIZE,
+                              width: 44,
+                              height: 44,
                               borderRadius: 10,
                               border: "1px solid #bbb",
-                              boxSizing: "border-box",
                               background: "#fff",
                               cursor: "pointer",
                               opacity: 1,
@@ -11024,7 +10453,7 @@ const modePillControls = (
                               justifyContent: "center",
                             }}
                           >
-                            <SaveIcon size={ICON_18} />
+                            <SaveIcon size={18} />
                           </button>
 
                           <button
@@ -11033,11 +10462,10 @@ const modePillControls = (
                             title="Clear"
                             aria-label="Delete"
                             style={{
-                              width: ICON_BTN_SIZE,
-                              height: ICON_BTN_SIZE,
+                              width: 44,
+                              height: 44,
                               borderRadius: 10,
                               border: "1px solid #bbb",
-                              boxSizing: "border-box",
                               background: "#fff",
                               cursor: "pointer",
                               opacity: 1,
@@ -11046,7 +10474,7 @@ const modePillControls = (
                               justifyContent: "center",
                             }}
                           >
-                            <TrashIcon size={ICON_18} />
+                            <TrashIcon size={18} />
                           </button>
 
                       {/* Attachment upload (images only) */}
@@ -11057,31 +10485,20 @@ const modePillControls = (
                         style={{ display: "none" }}
                         onChange={onAttachmentSelected}
                       />
-	                  <button
-	                    onClick={openUploadPicker}
-	                    disabled={attachmentButtonDisabled}
+                    <button
+                      onClick={openUploadPicker}
+                      disabled={attachmentButtonDisabled}
                         title={
                           uploadsDisabled || hostInStreamUi || viewerInStreamUi
                             ? "Attachments are disabled during Shared Live streaming."
                             : "Attach a file"
                         }
-	                    style={{
-	                      width: ICON_BTN_SIZE,
-	                      height: ICON_BTN_SIZE,
-	                      minWidth: ICON_BTN_SIZE,
-	                      padding: 0,
-	                      borderRadius: 10,
-	                      border: "1px solid #bbb",
-	                      boxSizing: "border-box",
-	                      display: "inline-flex",
-	                      alignItems: "center",
-	                      justifyContent: "center",
-	                      background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
-	                      cursor: attachmentButtonDisabled ? "not-allowed" : "pointer",
-	                      opacity: attachmentButtonDisabled ? 0.6 : 1,
-	                      lineHeight: "18px",
-	                      fontSize: 18,
-	                    }}
+                      className="rounded border border-gray-300 px-3 py-2 text-sm"
+                      style={{
+                        height: 44,
+                        minWidth: 44,
+                        background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
+                      }}
                         type="button"
                       >
                         {uploadingAttachment ? "⏳" : "📎"}
@@ -11229,12 +10646,9 @@ const modePillControls = (
 
                     </div>
 
-          	          {sttError ? (
-          	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-          	          ) : null}
-
-	          {/* Mobile: move the usage meter below the input box to maximize above-the-fold space. */}
-	          {isMobileUI ? usageMeterEl : null}
+                      {sttError ? (
+                        <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+                      ) : null}
 
                     {/* LiveKit Broadcast overlay (Host-only) */}
                     {showBroadcastButton && showBroadcasterOverlay ? (
@@ -11786,12 +11200,7 @@ const modePillControls = (
             <div style={{ marginTop: 12 }}>
               <textarea
                 value={hostGuidelinesText}
-                onChange={(e) => {
-                  setHostGuidelinesText(e.target.value);
-                  if (hostGuidelinesStatus === "Saved" || hostGuidelinesStatus === "Loaded") {
-                    setHostGuidelinesStatus("");
-                  }
-                }}
+                onChange={(e) => setHostGuidelinesText(e.target.value)}
                 placeholder="Examples: Off-limits topics, preferred terms of endearment (e.g., call viewers “papi”), tone/style constraints…"
                 style={{
                   width: "100%",
@@ -11810,10 +11219,6 @@ const modePillControls = (
               ) : null}
 
               <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
-                {hostGuidelinesStatus ? (
-                  <span style={{ fontWeight: 700, opacity: 0.95 }}>{hostGuidelinesStatus}</span>
-                ) : null}
-                {hostGuidelinesStatus ? " • " : null}
                 Saved: {hostGuidelinesSaved ? "Yes" : "No"} • Characters: {String(hostGuidelinesText || "").length}
               </div>
             </div>
@@ -11945,7 +11350,7 @@ const modePillControls = (
         style={{
           marginTop: 12,
           display: "grid",
-          gridTemplateColumns: isMobileUI ? "1fr" : isTabletUI ? "320px 1fr" : "360px 1fr",
+          gridTemplateColumns: "360px 1fr",
           gap: 12,
           height: "calc(min(860px, 92vh) - 170px)",
         }}
@@ -11984,9 +11389,7 @@ const modePillControls = (
             {hostActiveChats.map((c) => {
               const isSelected = c.session_id === hostSelectedSessionId;
               const memberLabel =
-                (String((c as any).user_name || "").trim() ||
-                  (c.member_id || "").trim() ||
-                  "anonymous / visitor");
+                (c.member_id || "").trim() || "anonymous / visitor";
               const mins =
                 typeof c.minutes_remaining === "number"
                   ? c.minutes_remaining
@@ -12121,22 +11524,13 @@ const modePillControls = (
 
             {hostSelectedEvents.map((ev, idx) => {
               const sender = String((ev as any).sender || "");
-              const selected = hostActiveChats.find(
-                (c) => c.session_id === hostSelectedSessionId
-              );
-              const userName = String(
-                (ev as any).user_name || (selected as any)?.user_name || ""
-              ).trim();
-              const companionLabel = String(
-                (companionName || DEFAULT_COMPANION_NAME) ?? ""
-              ).trim();
               const label =
                 sender === "user"
-                  ? (userName || "User")
+                  ? "User"
                   : sender === "host"
-                    ? `${companionLabel} (Host)`
+                    ? "Host"
                     : sender === "ai" || sender === "xai"
-                      ? (companionLabel || "AI")
+                      ? "AI"
                       : "System";
 
               return (
@@ -12152,57 +11546,7 @@ const modePillControls = (
             })}
           </div>
 
-          {hostSttError ? (
-            <div style={{ fontSize: 12, color: "#ffb3b3", marginTop: 8 }}>
-              {hostSttError}
-            </div>
-          ) : null}
-
-          <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "stretch" }}>
-            {(() => {
-              const selected = hostActiveChats.find(
-                (c) => c.session_id === hostSelectedSessionId
-              );
-              const overrideOn = Boolean(selected?.override_active);
-              const sttDisabled = !hostSelectedSessionId || !overrideOn;
-
-              return (
-                <button
-                  onClick={() => {
-                    if (sttDisabled) return;
-                    if (hostSttRecording) hostStopStt();
-                    else hostStartStt();
-                  }}
-                  disabled={sttDisabled}
-                  title={
-                    sttDisabled
-                      ? "Enable override to use STT"
-                      : hostSttRecording
-                        ? "Stop recording"
-                        : "Start recording"
-                  }
-                  style={{
-                    width: ICON_BTN_SIZE,
-                    height: ICON_BTN_SIZE,
-                    minWidth: ICON_BTN_SIZE,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    borderRadius: 12,
-                    border: "1px solid rgba(255,255,255,0.22)",
-                    boxSizing: "border-box",
-                    background: hostSttRecording
-                      ? "rgba(255,0,0,0.25)"
-                      : "rgba(0,0,0,0.22)",
-                    color: "white",
-                    cursor: sttDisabled ? "not-allowed" : "pointer",
-                    opacity: sttDisabled ? 0.55 : 1,
-                  }}
-                >
-                  {hostSttRecording ? "■" : "🎤"}
-                </button>
-              );
-            })()}
+          <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
             <textarea
               value={hostSendText}
               onChange={(e) => setHostSendText(e.target.value)}
