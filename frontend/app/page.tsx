@@ -1517,6 +1517,10 @@ export default function Page() {
   const ICON_18 = isMobileUI ? 13.5 : 18;
   const ICON_20 = isMobileUI ? 13.5 : 20;
 
+  // Keep icon buttons compact on mobile so the chat input and controls fit without scrolling.
+  // (Action buttons like Set Mode / Upgrade are shorter than the square icon buttons by default.)
+  const ICON_BTN_SIZE = isMobileUI ? 40 : 44;
+
   const ui = useMemo(
     () => {
       if (viewportMode === "mobile") {
@@ -8303,9 +8307,24 @@ useEffect(() => {
     liveProvider === "d-id" &&
     (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
 
-  // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
-  // Keep Live Avatar mode on browser STT (it is already stable across devices).
-  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
+  const speechRecognitionSupported = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    const w = window as any;
+    return !!(w.SpeechRecognition || w.webkitSpeechRecognition);
+  }, []);
+
+  const mediaRecorderSupported = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    return typeof (window as any).MediaRecorder !== "undefined" && !!navigator?.mediaDevices?.getUserMedia;
+  }, []);
+
+  // Prefer backend STT when embedded (Web Speech is commonly blocked in iframes), on iOS (more stable),
+  // or when Web Speech isn't available. Keep Live Avatar mode on browser STT.
+  const useBackendStt =
+    backendSttAvailable &&
+    mediaRecorderSupported &&
+    !liveAvatarActive &&
+    (isIOS || isEmbedded || !speechRecognitionSupported);
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -9215,31 +9234,19 @@ const speakGreetingIfNeeded = useCallback(
     useBackendStt,
   ]);
 
-    const toggleSpeechToText = useCallback(async () => {
-    // Toggle STT on/off.
-    // If a Live Avatar session is active, turning STT OFF will also stop the avatar because the
-    // Live Avatar experience requires an active mic.
-    if (sttEnabledRef.current) {
-      stopSpeechToText();
-      try {
-        stopLocalTtsPlayback();
-      } catch {}
-      if (liveAvatarActive) {
-        try {
-          await stopLiveAvatar();
-        } catch {}
+  const toggleSpeechToText = useCallback(async () => {
+    // In Live Avatar mode, mic is required. We don't allow toggling it off.
+    // If STT isn't running (permission denied or stopped), we try to start it again.
+    if (liveAvatarActive) {
+      if (!sttEnabledRef.current) {
+        await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
       }
       return;
     }
 
-    // Turn ON
-    if (liveAvatarActive) {
-      await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
-      return;
-    }
-
-    await startSpeechToText();
-  }, [liveAvatarActive, startSpeechToText, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
+    if (sttEnabledRef.current) stopSpeechToText();
+    else await startSpeechToText();
+  }, [liveAvatarActive, startSpeechToText, stopSpeechToText]);
 
   const stopHandsFreeSTT = useCallback(() => {
     // Cancel any in-flight local TTS work and advance epoch so late callbacks are ignored.
@@ -9508,11 +9515,11 @@ const viewerInStreamUi = viewerHasJoinedStream;
 		  (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
 
 useEffect(() => {
-  // STT must be disabled while in a Live Stream UI (host or viewer) to avoid transcribing live audio into AI chat.
-  if (!(viewerInStreamUi || hostInStreamUi)) return;
+  // Viewer STT must be disabled while in the LegacyStream stream UI to avoid transcribing the host audio.
+  if (!viewerInStreamUi) return;
   if (!sttEnabledRef.current) return;
   void stopSpeechToText();
-}, [viewerInStreamUi, hostInStreamUi, stopSpeechToText]);
+}, [viewerInStreamUi, stopSpeechToText]);
 
 const sttControls =
     liveProvider === "stream" && livekitToken
@@ -9523,27 +9530,37 @@ const sttControls =
       <button
         type="button"
         onClick={() => {
-          if (viewerInStreamUi || hostInStreamUi) return;
+          if (liveProvider === "stream") {
+                      if (
+                        streamCanStart &&
+                        Boolean(streamEventRef) &&
+                        (avatarStatus === "connected" || avatarStatus === "waiting")
+                      )
+                        return;
+                      // Viewer STT must be disabled while in the stream UI to avoid transcribing the host audio.
+                      if (!streamCanStart && avatarStatus !== "idle") return;
+                    }
           void toggleSpeechToText();
         }}
-
-disabled={viewerInStreamUi || hostInStreamUi}
-
-title="Audio"
+        disabled={(liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ||
+                    // Viewer STT must be disabled while in the stream UI to avoid transcribing the host audio.
+                    viewerInStreamUi || (liveAvatarActive && sttEnabled)}
+        title="Audio"
         style={{
-          width: 44,
-          height: 44,
-          minWidth: 44,
+          width: ICON_BTN_SIZE,
+          height: ICON_BTN_SIZE,
+          minWidth: ICON_BTN_SIZE,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
           padding: 0,
           borderRadius: 10,
           border: "1px solid #111",
+          boxSizing: "border-box",
           background: sttEnabled ? "#b00020" : "#fff",
           color: sttEnabled ? "#fff" : "#111",
-          cursor: viewerInStreamUi || hostInStreamUi ? "not-allowed" : "pointer",
-          opacity: viewerInStreamUi || hostInStreamUi ? 0.6 : 1,
+          cursor: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
+          opacity: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? 0.6 : 1,
           fontWeight: 700,
         }}
       >
@@ -9558,11 +9575,12 @@ title="Audio"
           title="Stop"
           aria-label="Stop"
           style={{
-            width: 44,
-            height: 44,
-            minWidth: 44,
+            width: ICON_BTN_SIZE,
+            height: ICON_BTN_SIZE,
+            minWidth: ICON_BTN_SIZE,
             borderRadius: 10,
             border: "1px solid #111",
+            boxSizing: "border-box",
             background:
               sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
                 ? "#fff"
@@ -9821,6 +9839,67 @@ const modePillControls = (
     void nudgeAudioSession();
     void ensureIphoneAudioContextUnlocked();
   }, [primeLocalTtsAudio, nudgeAudioSession, ensureIphoneAudioContextUnlocked]);
+
+  const usageMeterEl = useMemo(() => {
+    const used = Number((sessionState as any)?.minutes_used ?? (sessionState as any)?.minutesUsed ?? 0) || 0;
+    const remaining = Number((sessionState as any)?.minutes_remaining ?? (sessionState as any)?.minutesRemaining ?? 0) || 0;
+    const allowed = Number((sessionState as any)?.minutes_allowed ?? (sessionState as any)?.minutesAllowed ?? 0) || 0;
+    const total = (used + remaining) > 0 ? (used + remaining) : allowed;
+    if (!total || total <= 0) return null;
+
+    const pct = Math.max(0, Math.min(1, used / total));
+    const remainingComputed = remaining > 0 ? remaining : Math.max(0, total - used);
+    const pctLabel = `${Math.round(pct * 100)}%`;
+
+    return (
+      <div style={{ marginTop: 8, maxWidth: isMobileUI ? "100%" : 440 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "baseline",
+            justifyContent: "space-between",
+            gap: 10,
+            fontSize: 16,
+            color: "#666",
+          }}
+        >
+          <span style={{ fontWeight: 700 }}>Usage</span>
+          <span style={{ whiteSpace: "nowrap" }}>
+            {used} / {total} min • {remainingComputed} left
+          </span>
+        </div>
+
+        <div
+          role="progressbar"
+          aria-label={`Usage: ${used} of ${total} minutes`}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(pct * 100)}
+          style={{
+            marginTop: 4,
+            height: ui.usageBarHeight,
+            borderRadius: 999,
+            background: "rgba(0,0,0,0.12)",
+            overflow: "hidden",
+          }}
+          title={`${used}/${total} min (${pctLabel})`}
+        >
+          <div
+            style={{
+              width: `${Math.round(pct * 100)}%`,
+              height: "100%",
+              background: "rgba(0,0,0,0.65)",
+            }}
+          />
+        </div>
+      </div>
+    );
+  }, [
+    sessionState,
+    isMobileUI,
+    ui.meta,
+    ui.usageBarHeight,
+  ]);
 
   return (
     <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={mainContainerStyle}>
@@ -10253,61 +10332,8 @@ const modePillControls = (
               <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
             ) : null}
           </div>
-          {(() => {
-            const used = Number((sessionState as any)?.minutes_used ?? (sessionState as any)?.minutesUsed ?? 0) || 0;
-            const remaining = Number((sessionState as any)?.minutes_remaining ?? (sessionState as any)?.minutesRemaining ?? 0) || 0;
-            const allowed = Number((sessionState as any)?.minutes_allowed ?? (sessionState as any)?.minutesAllowed ?? 0) || 0;
-            const total = (used + remaining) > 0 ? (used + remaining) : allowed;
-            if (!total || total <= 0) return null;
-
-            const pct = Math.max(0, Math.min(1, used / total));
-            const remainingComputed = remaining > 0 ? remaining : Math.max(0, total - used);
-            const pctLabel = `${Math.round(pct * 100)}%`;
-
-            return (
-              <div style={{ marginTop: 8, maxWidth: isMobileUI ? "100%" : 440 }}>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "baseline",
-                    justifyContent: "space-between",
-                    gap: 10,
-                    fontSize: ui.meta,
-                    color: "#666",
-                  }}
-                >
-                  <span style={{ fontWeight: 700 }}>Usage</span>
-                  <span>
-                    {used} / {total} min • {remainingComputed} left
-                  </span>
-                </div>
-
-                <div
-                  role="progressbar"
-                  aria-label={`Usage: ${used} of ${total} minutes`}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={Math.round(pct * 100)}
-                  style={{
-                    marginTop: 4,
-                    height: ui.usageBarHeight,
-                    borderRadius: 999,
-                    background: "rgba(0,0,0,0.12)",
-                    overflow: "hidden",
-                  }}
-                  title={`${used}/${total} min (${pctLabel})`}
-                >
-                  <div
-                    style={{
-                      width: `${Math.round(pct * 100)}%`,
-                      height: "100%",
-                      background: "rgba(0,0,0,0.65)",
-                    }}
-                  />
-                </div>
-              </div>
-            );
-          })()}
+	          {/* On mobile, push usage to the bottom to maximize above-the-fold space. */}
+	          {!isMobileUI && usageMeterEl}
           {liveProvider === "stream" ? (
             <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
               {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
@@ -10433,15 +10459,16 @@ const modePillControls = (
         }}
         disabled={liveProvider === "stream" ? (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) : false}
         style={{
-          width: 44,
-          height: 44,
-          minWidth: 44,
+          width: ICON_BTN_SIZE,
+          height: ICON_BTN_SIZE,
+          minWidth: ICON_BTN_SIZE,
           display: "inline-flex",
           alignItems: "center",
           justifyContent: "center",
           padding: 0,
           borderRadius: 10,
           border: "1px solid #111",
+          boxSizing: "border-box",
           background: "#fff",
           color: "#111",
           cursor:
@@ -10984,10 +11011,11 @@ const modePillControls = (
                             title="Save"
                             aria-label="Save"
                             style={{
-                              width: 44,
-                              height: 44,
+                              width: ICON_BTN_SIZE,
+                              height: ICON_BTN_SIZE,
                               borderRadius: 10,
                               border: "1px solid #bbb",
+                              boxSizing: "border-box",
                               background: "#fff",
                               cursor: "pointer",
                               opacity: 1,
@@ -11005,10 +11033,11 @@ const modePillControls = (
                             title="Clear"
                             aria-label="Delete"
                             style={{
-                              width: 44,
-                              height: 44,
+                              width: ICON_BTN_SIZE,
+                              height: ICON_BTN_SIZE,
                               borderRadius: 10,
                               border: "1px solid #bbb",
+                              boxSizing: "border-box",
                               background: "#fff",
                               cursor: "pointer",
                               opacity: 1,
@@ -11037,12 +11066,13 @@ const modePillControls = (
                             : "Attach a file"
                         }
 	                    style={{
-	                      width: 44,
-	                      height: 44,
-	                      minWidth: 44,
+	                      width: ICON_BTN_SIZE,
+	                      height: ICON_BTN_SIZE,
+	                      minWidth: ICON_BTN_SIZE,
 	                      padding: 0,
 	                      borderRadius: 10,
 	                      border: "1px solid #bbb",
+	                      boxSizing: "border-box",
 	                      display: "inline-flex",
 	                      alignItems: "center",
 	                      justifyContent: "center",
@@ -11202,6 +11232,9 @@ const modePillControls = (
           	          {sttError ? (
           	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
           	          ) : null}
+
+	          {/* Mobile: move the usage meter below the input box to maximize above-the-fold space. */}
+	          {isMobileUI ? usageMeterEl : null}
 
                     {/* LiveKit Broadcast overlay (Host-only) */}
                     {showBroadcastButton && showBroadcasterOverlay ? (
@@ -12149,14 +12182,15 @@ const modePillControls = (
                         : "Start recording"
                   }
                   style={{
-                    width: 44,
-                    height: 44,
-                    minWidth: 44,
+                    width: ICON_BTN_SIZE,
+                    height: ICON_BTN_SIZE,
+                    minWidth: ICON_BTN_SIZE,
                     display: "inline-flex",
                     alignItems: "center",
                     justifyContent: "center",
                     borderRadius: 12,
                     border: "1px solid rgba(255,255,255,0.22)",
+                    boxSizing: "border-box",
                     background: hostSttRecording
                       ? "rgba(255,0,0,0.25)"
                       : "rgba(0,0,0,0.22)",
