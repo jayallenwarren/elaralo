@@ -1513,10 +1513,6 @@ export default function Page() {
   const isMobileUI = viewportMode === "mobile";
   const isTabletUI = viewportMode === "tablet";
 
-  // Icon sizing: on mobile, force all icons to the same pixel size (13.5px).
-  const ICON_18 = isMobileUI ? 13.5 : 18;
-  const ICON_20 = isMobileUI ? 13.5 : 20;
-
   const ui = useMemo(
     () => {
       if (viewportMode === "mobile") {
@@ -9543,7 +9539,7 @@ const sttControls =
           fontWeight: 700,
         }}
       >
-        {sttEnabled ? <MicOnIcon size={ICON_20} /> : <MicOffIcon size={ICON_20} />}
+        {sttEnabled ? <MicOnIcon size={20} /> : <MicOffIcon size={20} />}
       </button>
 
       {!livekitUiActive && (
@@ -9578,7 +9574,7 @@ const sttControls =
             justifyContent: "center",
           }}
         >
-          <StopIcon size={ICON_18} />
+          <StopIcon />
         </button>
       )}
 </>
@@ -9827,7 +9823,7 @@ const modePillControls = (
       position: "fixed",
       inset: 0,
       zIndex: 1000001,
-      background: "#fff",
+      background: "rgba(255,255,255,0.92)",
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
@@ -9839,7 +9835,7 @@ const modePillControls = (
         style={{
           padding: "12px 16px",
           borderRadius: 14,
-          background: "#111827",
+          background: "rgba(17,24,39,0.92)",
           color: "#fff",
           border: "1px solid rgba(255,255,255,0.18)",
           boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
@@ -10429,13 +10425,7 @@ const modePillControls = (
         }}
         disabled={liveProvider === "stream" ? (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) : false}
         style={{
-          width: 44,
-          height: 44,
-          minWidth: 44,
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: 0,
+          padding: "10px 14px",
           borderRadius: 10,
           border: "1px solid #111",
           background: "#fff",
@@ -10460,11 +10450,11 @@ const modePillControls = (
         title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
       >
         {liveProvider === "stream" ? (
-          <PlayIcon size={ICON_18} />
+          <PlayIcon />
         ) : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" ? (
-          <PauseIcon size={ICON_18} />
+          <PauseIcon />
         ) : (
-          <PlayIcon size={ICON_18} />
+          <PlayIcon />
         )}
       </button>
 
@@ -10539,7 +10529,7 @@ const modePillControls = (
           }}
           title={isHost ? "Stop live session" : "Leave session"}
         >
-          <StopIcon size={ICON_18} />
+          <StopIcon />
         </button>
       ) : null}
 
@@ -10992,7 +10982,7 @@ const modePillControls = (
                               justifyContent: "center",
                             }}
                           >
-                            <SaveIcon size={ICON_18} />
+                            <SaveIcon size={18} />
                           </button>
 
                           <button
@@ -11013,7 +11003,7 @@ const modePillControls = (
                               justifyContent: "center",
                             }}
                           >
-                            <TrashIcon size={ICON_18} />
+                            <TrashIcon size={18} />
                           </button>
 
                       {/* Attachment upload (images only) */}
@@ -11032,21 +11022,11 @@ const modePillControls = (
                             ? "Attachments are disabled during Shared Live streaming."
                             : "Attach a file"
                         }
+	                    className="rounded border border-gray-300 px-3 py-2 text-sm"
 	                    style={{
-	                      width: 44,
 	                      height: 44,
 	                      minWidth: 44,
-	                      padding: 0,
-	                      borderRadius: 10,
-	                      border: "1px solid #bbb",
-	                      display: "inline-flex",
-	                      alignItems: "center",
-	                      justifyContent: "center",
 	                      background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
-	                      cursor: attachmentButtonDisabled ? "not-allowed" : "pointer",
-	                      opacity: attachmentButtonDisabled ? 0.6 : 1,
-	                      lineHeight: "18px",
-	                      fontSize: 18,
 	                    }}
                         type="button"
                       >
@@ -12146,11 +12126,6 @@ const modePillControls = (
                   }
                   style={{
                     width: 44,
-                    height: 44,
-                    minWidth: 44,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
                     borderRadius: 12,
                     border: "1px solid rgba(255,255,255,0.22)",
                     background: hostSttRecording
