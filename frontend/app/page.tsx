@@ -1,11 +1,13 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import elaraLogo from "../public/elaralo-logo.png";
+
+
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
-import elaraLogo from "../public/elaralo-logo.png";
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
   <svg
     width={size}
@@ -64,21 +66,15 @@ const MicOffIcon = ({ size = 18 }: { size?: number }) => (
     focusable="false"
     style={{ display: "block" }}
   >
-    {/* Muted mic: lighter mic + slash */}
     <path
-      d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"
+      d="M19 11a7 7 0 0 1-1.62 4.5l-1.43-1.43A5 5 0 0 0 17 11h2zM12 14a3 3 0 0 0 3-3V8.41l-6 6A3 3 0 0 0 12 14zm7-9.19L4.81 19 3.39 17.58 7.17 13.8A5 5 0 0 1 7 12V11h2v1c0 .36.06.7.17 1.02l1.6-1.6A3 3 0 0 1 9 11V5a3 3 0 0 1 5.12-2.12L17.59 1.4 19 2.81 15.41 6.4V11c0 .36-.06.7-.17 1.02l3.76 3.76A7 7 0 0 0 19 11zm-7 13.89V21h-2v-2.08A7 7 0 0 1 5 11h2a5 5 0 0 0 4.29 4.92l.71-.71A3 3 0 0 1 11 14.7z"
       fill="currentColor"
-      opacity="0.35"
-    />
-    <path
-      d="M4 4l16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.4"
-      strokeLinecap="round"
     />
   </svg>
 );
+
+
+
 const TrashIcon = ({ size = 18 }: { size?: number }) => (
   <svg
     width={size}
@@ -215,64 +211,10 @@ type SessionState = {
   [k: string]: any;
 };
 
-type ContentDelivery = {
-  message?: string;
-  folder?: Mode;
-  sequence?: string;
-  stage?: string;
-  attachment?: UploadedAttachment;
-  // tolerate future additions from the backend without breaking builds
-  [k: string]: any;
-};
-
-type PendingContentItem = {
-  token: string;
-  triggerMinute?: number;
-  content: ContentDelivery;
-  createdTs?: number;
-};
-
-
 type ChatApiResponse = {
   reply: string;
   mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
   session_state?: Partial<SessionState>;
-  audio_url?: string;
-  content?: ContentDelivery;
-  // tolerate future additions from the backend without breaking builds
-  [k: string]: any;
-};
-
-
-type RelayEvent = {
-  seq: number;
-  ts: number;
-  role: "user" | "assistant" | "system";
-  content: string;
-  sender: "user" | "ai" | "xai" | "host" | "system" | string;
-  audience?: "all" | "user" | "host" | string;
-  kind?: string;
-  payload?: any;
-};
-
-type HostActiveChat = {
-  session_id: string;
-  member_id: string;
-  user_name?: string;
-  brand?: string;
-  avatar?: string;
-  last_seen?: number;
-  override_active?: boolean;
-  override_started_at?: number | null;
-  unread?: number;
-  summary?: string;
-  summary_source?: string;
-  usage_ok?: boolean;
-  minutes_used?: number;
-  minutes_allowed?: number;
-  minutes_remaining?: number;
-  plan_label?: string;
-  is_trial?: boolean;
 };
 
 type PlanName =
@@ -513,44 +455,6 @@ function trimMessagesForChat<T extends { role: string; content: any }>(messages:
   return hasSystem ? ([first, ...trimmedBody] as T[]) : (trimmedBody as T[]);
 }
 
-
-// -----------------------------------------------------------------------------
-// In-session conversation "summaries" (client-side digests)
-// - When older turns are trimmed before sending to /chat, we keep a compact digest
-//   in session_state so the backend can inject it as context.
-// - These digests are NOT the same as the explicit user-authorized /chat/save-summary.
-// -----------------------------------------------------------------------------
-const MAX_IN_SESSION_SUMMARY_CHUNKS = 8;
-const DIGEST_MAX_LINES = 12;
-const DIGEST_MAX_CHARS_PER_LINE = 220;
-
-function normalizeDigestLine(s: string): string {
-  return String(s || "").replace(/\s+/g, " ").trim();
-}
-
-function buildDigestFromDroppedMessages(dropped: Msg[]): string {
-  if (!Array.isArray(dropped) || dropped.length === 0) return "";
-  const lines: string[] = [];
-
-  for (let i = 0; i < dropped.length && lines.length < DIGEST_MAX_LINES; i++) {
-    const m = dropped[i];
-    if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
-
-    let c = normalizeDigestLine(String((m as any).content ?? ""));
-    if (!c) continue;
-
-    if (c.length > DIGEST_MAX_CHARS_PER_LINE) c = c.slice(0, DIGEST_MAX_CHARS_PER_LINE) + "…";
-    const senderLabel = m.role === "user" ? "User" : ((m as any)?.meta?.sender === "host" ? "Host" : "Assistant");
-    lines.push(`${senderLabel}: ${c}`);
-  }
-
-  const remaining = dropped.length - lines.length;
-  if (remaining > 0) lines.push(`(… ${remaining} earlier message(s) omitted)`);
-
-  return lines.join("\n");
-}
-
-
 const HEADSHOT_DIR = "/companion/headshot";
 
 // Resolve companion key/name for backend requests and TTS voice selection.
@@ -679,60 +583,6 @@ function joinUrlPrefix(prefix: string, path: string): string {
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-
-
-const API_BASE_TRIM = String(API_BASE || "").replace(/\/+$/, "");
-
-function absolutizeApiUrl(url: string): string {
-  const u = String(url || "").trim();
-  if (!u) return u;
-  if (/^https?:\/\//i.test(u)) return u;
-  if (!API_BASE_TRIM) return u;
-  const p = u.startsWith("/") ? u : `/${u}`;
-  return joinUrlPrefix(API_BASE_TRIM, p);
-}
-
-function normalizeUploadedAttachment(raw: any): UploadedAttachment | null {
-  if (!raw || typeof raw !== "object") return null;
-  const url = absolutizeApiUrl(String((raw as any).url || ""));
-  if (!url) return null;
-
-  const name = String((raw as any).name || "content");
-  const sizeNum = Number((raw as any).size ?? 0);
-  const size = Number.isFinite(sizeNum) && sizeNum >= 0 ? sizeNum : 0;
-
-  const ct = String((raw as any).contentType || (raw as any).content_type || "application/octet-stream");
-  const contentType = ct.trim() || "application/octet-stream";
-
-  const containerRaw = (raw as any).container;
-  const blobRaw = (raw as any).blobName ?? (raw as any).blob_name;
-
-  const container = containerRaw ? String(containerRaw) : undefined;
-  const blobName = blobRaw ? String(blobRaw) : undefined;
-
-  return { url, name, size, contentType, container, blobName };
-}
-
-function buildContentAssistantMsg(rawContent: any): Msg | null {
-  if (!rawContent || typeof rawContent !== "object") return null;
-  const att = normalizeUploadedAttachment((rawContent as any).attachment);
-  const message = String((rawContent as any).message || "").trim();
-  if (!att && !message) return null;
-
-  const meta: any = { sender: "ai" };
-  if (att) meta.attachment = att;
-  meta.contentDelivery = {
-    folder: String((rawContent as any).folder || ""),
-    sequence: String((rawContent as any).sequence || ""),
-    stage: String((rawContent as any).stage || ""),
-  };
-
-  return {
-    role: "assistant",
-    content: message || "",
-    meta,
-  };
-}
 
 function toWsBaseUrl(httpBase: string): string {
   const raw = String(httpBase || '').trim();
@@ -1217,14 +1067,13 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   const soft = t.trim();
 
   const wantsFriend =
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\bfriend\b/.test(soft) ||
-    /\bfriend mode\b/.test(soft);
+    /\b(switch|set|turn|go|back)\b.*\bfriend\b/.test(soft) || /\bfriend mode\b/.test(soft);
 
   const wantsRomantic =
     // "romantic mode" / "romance mode"
     /\b(romantic|romance) mode\b/.test(soft) ||
     // switch/set/back/go/turn ... romantic
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(romantic|romance)\b/.test(soft) ||
+    /\b(switch|set|turn|go|back)\b.*\b(romantic|romance)\b/.test(soft) ||
     // natural phrasing users actually type
     /\b(let['’]?s|lets)\b.*\b(romantic|romance)\b/.test(soft) ||
     /\b(be|being|try|trying|have|having)\b.*\b(romantic|romance)\b/.test(soft) ||
@@ -1233,7 +1082,7 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
     /\btry romance again\b/.test(soft);
 
   const wantsIntimate =
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
+    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
     /\b(intimate|explicit) mode\b/.test(soft);
 
   if (wantsFriend) return { mode: "friend", cleaned: raw };
@@ -1476,99 +1325,6 @@ export default function Page() {
     }
   }, []);
 
-  // -----------------------
-  // Responsive layout mode: mobile / tablet / desktop
-  // Primary optimization target = mobile.
-  // -----------------------
-  type ViewportMode = "mobile" | "tablet" | "desktop";
-
-  const getViewportMode = useCallback((): ViewportMode => {
-    if (typeof window === "undefined") return "desktop";
-    const w = window.innerWidth || 1024;
-    if (w <= 640) return "mobile";
-    if (w <= 1024) return "tablet";
-    return "desktop";
-  }, []);
-
-  const [viewportMode, setViewportMode] = useState<ViewportMode>(() => {
-    if (typeof window === "undefined") return "desktop";
-    const w = window.innerWidth || 1024;
-    if (w <= 640) return "mobile";
-    if (w <= 1024) return "tablet";
-    return "desktop";
-  });
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const onResize = () => setViewportMode(getViewportMode());
-    onResize();
-    window.addEventListener("resize", onResize as any, { passive: true } as any);
-    window.addEventListener("orientationchange", onResize as any);
-    return () => {
-      window.removeEventListener("resize", onResize as any);
-      window.removeEventListener("orientationchange", onResize as any);
-    };
-  }, [getViewportMode]);
-
-  const isMobileUI = viewportMode === "mobile";
-  const isTabletUI = viewportMode === "tablet";
-
-  // Icon sizing: on mobile, force all icons to the same pixel size (13.5px).
-  const ICON_18 = isMobileUI ? 13.5 : 18;
-  const ICON_20 = isMobileUI ? 13.5 : 20;
-
-  // Keep icon buttons compact on mobile so the chat input and controls fit without scrolling.
-  // (Action buttons like Set Mode / Upgrade are shorter than the square icon buttons by default.)
-  const ICON_BTN_SIZE = isMobileUI ? 40 : 44;
-
-  const ui = useMemo(
-    () => {
-      if (viewportMode === "mobile") {
-        return {
-          avatar: 48,
-          title: 20,
-          meta: 12,
-          usageBarHeight: 10,
-          mainMaxWidth: "100%",
-          mainMargin: "12px auto",
-          mainPadding: "0 10px",
-        };
-      }
-      if (viewportMode === "tablet") {
-        return {
-          avatar: 56,
-          title: 22,
-          meta: 12,
-          usageBarHeight: 10,
-          mainMaxWidth: 980,
-          mainMargin: "18px auto",
-          mainPadding: "0 14px",
-        };
-      }
-      return {
-        avatar: 56,
-        title: 24,
-        meta: 13,
-        usageBarHeight: 8,
-        mainMaxWidth: 1120,
-        mainMargin: "24px auto",
-        mainPadding: "0 16px",
-      };
-    },
-    [viewportMode]
-  );
-
-  const mainContainerStyle = useMemo(
-    () =>
-      ({
-        maxWidth: ui.mainMaxWidth as any,
-        margin: ui.mainMargin,
-        padding: ui.mainPadding,
-        fontFamily: "system-ui",
-      } as React.CSSProperties),
-    [ui]
-  );
-
   // Normalize LiveKit server URL into ws/wss (client expects a websocket scheme)
   const normalizeLivekitWsUrl = useCallback((input: string): string => {
     const raw = String(input || "").trim();
@@ -1582,61 +1338,21 @@ export default function Page() {
 
   const sessionIdRef = useRef<string | null>(null);
 
-// Brief startup overlay (covers the iframe on initial refresh).
-// Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
-// until the companionName has been received from the Wix MEMBER_PLAN payload.
-const [startupOverlayOpen, setStartupOverlayOpen] = useState<boolean>(true);
-const [startupOverlayName, setStartupOverlayName] = useState<string>("");
-const startupOverlayTimerRef = useRef<number | null>(null);
-const startupOverlayStartedRef = useRef<boolean>(false);
-
-const armStartupOverlay = useCallback((name: string) => {
-  const nm = String(name || "").trim();
-  if (!nm) return;
-
-  // Set the display name (used by the overlay message).
-  setStartupOverlayName(nm);
-
-  // Start the 800ms countdown once (first time we learn the companion name from Wix).
-  if (startupOverlayStartedRef.current) return;
-  startupOverlayStartedRef.current = true;
-
-  if (startupOverlayTimerRef.current) {
-    window.clearTimeout(startupOverlayTimerRef.current);
-    startupOverlayTimerRef.current = null;
-  }
-
-  startupOverlayTimerRef.current = window.setTimeout(() => {
-    setStartupOverlayOpen(false);
-    startupOverlayTimerRef.current = null;
-  }, 800);
-}, []);
-
-useEffect(() => {
-  return () => {
-    if (startupOverlayTimerRef.current) {
-      window.clearTimeout(startupOverlayTimerRef.current);
-      startupOverlayTimerRef.current = null;
-    }
-  };
-}, []);
-
-
   // Keep the latest Wix memberId available for callbacks defined earlier in this file.
   // This avoids TypeScript/TDZ issues where a callback dependency array would otherwise
   // reference `memberId` before its declaration.
   const memberIdRef = useRef<string>("");
-	  // Keep the latest host memberId available for early callbacks (prevents TDZ issues).
-	  const hostMemberIdRef = useRef<string>("");
+    // Keep the latest host memberId available for early callbacks (prevents TDZ issues).
+    const hostMemberIdRef = useRef<string>("");
 
   // Wix member id (empty for visitors). Declared early so it can be referenced
   // safely in dependency arrays above (prevents TS "used before its declaration").
   const [memberId, setMemberId] = useState<string>("");
 
   const autoJoinStreamRef = useRef<boolean>(false);
-	// Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
-	const stopInProgressRef = useRef<boolean>(false);
-	const sessionActiveRef = useRef<boolean>(false);
+  // Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
+  const stopInProgressRef = useRef<boolean>(false);
+  const sessionActiveRef = useRef<boolean>(false);
   const streamOptOutRef = useRef<boolean>(false);
   const conferenceOptOutRef = useRef<boolean>(false);
 
@@ -1994,11 +1710,6 @@ useEffect(() => {
       ((attType && attType.toLowerCase().startsWith("image/")) ||
         /\.(png|jpe?g|webp|gif)(\?|#|$)/i.test(attUrl));
 
-    const isVideo =
-      Boolean(attUrl) &&
-      ((attType && attType.toLowerCase().startsWith("video/")) ||
-        /\.(mp4|webm|ogg|mov)(\?|#|$)/i.test(attUrl));
-
     const stripScheme = (u: string) => (u || "").replace(/^https?:/i, "");
 
     const paygKey = rebrandingInfo?.payGoLink ? stripScheme(rebrandingInfo.payGoLink).toLowerCase() : "";
@@ -2069,8 +1780,8 @@ useEffect(() => {
 
     const attachmentNode = attUrl ? (
       <div style={{ marginTop: 6 }}>
-        {isImage ? (
-          <a href={attUrl} target="_blank" rel="noopener noreferrer">
+        <a href={attUrl} target="_blank" rel="noopener noreferrer">
+          {isImage ? (
             <img
               src={attUrl}
               alt={attName}
@@ -2082,33 +1793,10 @@ useEffect(() => {
                 display: "block",
               }}
             />
-          </a>
-        ) : isVideo ? (
-          <>
-            <video
-              src={attUrl}
-              controls
-              playsInline
-              preload="metadata"
-              style={{
-                maxWidth: 320,
-                maxHeight: 320,
-                borderRadius: 12,
-                border: "1px solid #e5e5e5",
-                display: "block",
-              }}
-            />
-            <div style={{ marginTop: 4 }}>
-              <a href={attUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "underline" }}>
-                {attName || "Open video"}
-              </a>
-            </div>
-          </>
-        ) : (
-          <a href={attUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "underline" }}>
-            {attName || "Open attachment"}
-          </a>
-        )}
+          ) : (
+            <span style={{ textDecoration: "underline" }}>{attName || "Open attachment"}</span>
+          )}
+        </a>
       </div>
     ) : null;
 
@@ -2127,13 +1815,6 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
 
   // For rebrands, show the rebranding site's plan label when Wix provides it (e.g., "Supreme").
   const [planLabelOverride, setPlanLabelOverride] = useState<string>("");
-
-  // Wix postMessage can arrive multiple times (init + periodic refreshes). We only want the Wix-provided
-  // modePill to choose the *initial* mode (or a *changed* mode) — it must not continuously override
-  // user-initiated mode switches inside the chat.
-  const wixLastRequestedModeRef = useRef<Mode | null>(null);
-  const wixLastFingerprintRef = useRef<string>("");
-  const wixAppliedModeOnceRef = useRef<boolean>(false);
 
   // Upgrade URL (defaults to env; overridden by RebrandingKey when present)
   const upgradeUrl = useMemo(() => {
@@ -2171,7 +1852,7 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   }, [upgradeUrl]);
 
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = (rebrandingName || (parseRebrandingKey(rebrandingKey || "")?.rebranding || "") || DEFAULT_COMPANY_NAME);
+  const companyName = (rebrandingName || DEFAULT_COMPANY_NAME);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
 
@@ -2186,40 +1867,40 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
 
   useEffect(() => {
-    // Keep state in sync with persistent storage as the user switches companions/brands.
-    // NOTE: In embedded/iframe contexts, localStorage may be partitioned or blocked; we keep fallbacks.
+    // Keep state in sync with localStorage as the user switches companions/brands.
+    // Fallback to sessionStorage if localStorage is blocked (common in some iframe/privacy modes).
     try {
       if (typeof window === "undefined") return;
 
-      const GLOBAL_LIVECHAT_KEY = "dm_livechat_username";
-
-      const tryGet = (k: string): string => {
-        try {
-          const v = window.localStorage.getItem(k);
-          if (v && String(v).trim()) return String(v).trim();
-        } catch {}
-        try {
-          const v2 = window.sessionStorage.getItem(k);
-          if (v2 && String(v2).trim()) return String(v2).trim();
-        } catch {}
-        return "";
-      };
-
-      let stored = tryGet(liveChatUsernameStorageKey) || tryGet(GLOBAL_LIVECHAT_KEY);
-
+      let stored = "";
+      try {
+        stored = String((() => {
+          try {
+            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
+            if (v && String(v).trim()) return v;
+          } catch (e) {}
+          try {
+            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
+            if (v2 && String(v2).trim()) return v2;
+          } catch (e) {}
+          return "";
+        })() || "").trim();
+      } catch (e) {
+        stored = "";
+      }
       if (!stored) {
         try {
-          const nm = String((window as any).name || "");
-          if (nm.startsWith("lcname:")) stored = nm.slice("lcname:".length).trim();
-        } catch {}
+          stored = String(window.sessionStorage.getItem(liveChatUsernameStorageKey) || "").trim();
+        } catch (e) {
+          stored = "";
+        }
       }
 
-      setViewerLiveChatName(String(stored || "").trim());
-    } catch {
+      setViewerLiveChatName(stored);
+    } catch (e) {
       setViewerLiveChatName("");
     }
   }, [liveChatUsernameStorageKey]);
-
 
   // LiveKit identity conventions used by the backend:
   //   - user:<memberId> when memberId is available
@@ -2388,35 +2069,25 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
       return cleaned;
     }
 
-    const systemId = getLivekitSystemIdentity();
-
-    const memberIdRaw = String(memberId || "").trim();
-    const memberIdClean = memberIdRaw.replace(/^Anon:\s*/i, "").trim();
-    const idForFallback = String(memberIdClean || memberIdRaw || systemId)
-      .replace(/^(user:|anon:)/i, "")
-      .replace(/^Anon:\s*/i, "")
-      .trim();
-    const shortId = idForFallback.slice(0, 4);
-    const fallbackName = `Viewer - ${shortId || "Anon"}`;
-
-    const suggested = "";
+    const suggested = "Viewer";
     const promptText =
-      opts?.promptText || "Choose a name to display during the live session:";
+      opts?.promptText || "Choose a username to display during the live session:";
     const name = window.prompt(promptText, suggested);
 
-    // Requirement: if the viewer does not enter a name (blank or cancel), use a stable fallback like "Viewer - 1234".
+    // Requirement: if the viewer does not enter a name (blank or cancel), use a LiveKit system identifier.
+    const systemId = getLivekitSystemIdentity();
 
     const cleaned =
       String(name ?? "")
         .replace(/[\r\n\t]+/g, " ")
         .replace(/\s+/g, " ")
         .trim()
-        .slice(0, 50) || fallbackName;
+        .slice(0, 50) || systemId;
 
     setViewerLiveChatName(cleaned);
     storeEverywhere(cleaned);
     return cleaned;
-  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, memberId, getLivekitSystemIdentity]);
+  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, getLivekitSystemIdentity]);
 
 
   const changeViewerLiveChatName = useCallback(() => {
@@ -2685,148 +2356,32 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   useEffect(() => {
     sessionActiveRef.current = sessionActive;
   }, [sessionActive]);
-	  const mappedHostMemberId = useMemo(() => {
-	    const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
-	    return String(v || "");
-	  }, [companionMapping]);
+    const mappedHostMemberId = useMemo(() => {
+      const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
+      return String(v || "");
+    }, [companionMapping]);
 
-	  // Treat "host" as the *membership* that owns this companion.
-	  // IMPORTANT: do NOT derive host-ness from `livekitRole` because `livekitRole` is updated asynchronously
-	  // and the Host must never be prompted for a viewer username.
-	  const isHost = Boolean(memberId && mappedHostMemberId && memberId === mappedHostMemberId);
-	  const isViewer = Boolean(memberId && mappedHostMemberId && memberId !== mappedHostMemberId);
-	  useEffect(() => {
-	    hostMemberIdRef.current = String(mappedHostMemberId || "");
-	  }, [mappedHostMemberId]);
-
-
-// ----------------------------
-// Host override console (AI chat takeover)
-// ----------------------------
-const [hostConsoleOpen, setHostConsoleOpen] = useState<boolean>(false);
-const [hostActiveChats, setHostActiveChats] = useState<HostActiveChat[]>([]);
-const [hostActiveLoading, setHostActiveLoading] = useState<boolean>(false);
-const [hostActiveError, setHostActiveError] = useState<string>("");
-const [hostSelectedSessionId, setHostSelectedSessionId] = useState<string>("");
-const [hostSelectedEvents, setHostSelectedEvents] = useState<RelayEvent[]>([]);
-const [hostPendingContent, setHostPendingContent] = useState<PendingContentItem[]>([]);
-const [hostPendingModalOpen, setHostPendingModalOpen] = useState<boolean>(false);
-const [hostPendingActionErr, setHostPendingActionErr] = useState<string | null>(null);
-const [hostPollSinceSeq, setHostPollSinceSeq] = useState<number>(0);
-const hostPollSinceSeqRef = useRef<number>(0);
-useEffect(() => {
-  hostPollSinceSeqRef.current = hostPollSinceSeq;
-}, [hostPollSinceSeq]);
-const [hostSendText, setHostSendText] = useState<string>("");
-const [hostNotice, setHostNotice] = useState<string>("");
-
-// Host Console STT (speech-to-text) for host messages during override
-const [hostSttRecording, setHostSttRecording] = useState<boolean>(false);
-const [hostSttError, setHostSttError] = useState<string>("");
-const hostSttRecorderRef = useRef<MediaRecorder | null>(null);
-const hostSttStreamRef = useRef<MediaStream | null>(null);
-const hostSttChunksRef = useRef<BlobPart[]>([]);
-
-// Host: companion-level interaction guideline overrides (persisted; highest priority)
-const [hostGuidelinesOpen, setHostGuidelinesOpen] = useState<boolean>(false);
-const [hostGuidelinesText, setHostGuidelinesText] = useState<string>("");
-const [hostGuidelinesSaved, setHostGuidelinesSaved] = useState<string>("");
-const [hostGuidelinesLoading, setHostGuidelinesLoading] = useState<boolean>(false);
-const [hostGuidelinesError, setHostGuidelinesError] = useState<string>("");
-const [hostGuidelinesStatus, setHostGuidelinesStatus] = useState<string>("");
-
-const loadHostGuidelines = useCallback(async () => {
-  try {
-    if (!isHost) return;
-    if (!API_BASE) return;
-
-    const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
-    if (!brand || !avatar || !memberId) return;
-
-    setHostGuidelinesLoading(true);
-    setHostGuidelinesError("");
-    setHostGuidelinesStatus("Loading…");
-
-    const res = await fetch(`${API_BASE}/host/companion-guidelines/get`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand, avatar, memberId }),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(txt || `HTTP ${res.status}`);
-    }
-
-    const data: any = await res.json().catch(() => ({}));
-    const text = String(data?.guidelines || "").trim();
-
-    setHostGuidelinesSaved(text);
-    setHostGuidelinesText(text);
-    setHostGuidelinesStatus("Loaded");
-    setHostGuidelinesLoading(false);
-  } catch (e: any) {
-    setHostGuidelinesLoading(false);
-    setHostGuidelinesStatus("");
-    setHostGuidelinesError(String(e?.message || e || "Failed to load guidelines"));
-  }
-}, [API_BASE, isHost, companyName, companionName]);
-
-const saveHostGuidelines = useCallback(async () => {
-  try {
-    if (!isHost) return;
-    if (!API_BASE) return;
-
-    const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
-    if (!brand || !avatar || !memberId) return;
-
-    setHostGuidelinesLoading(true);
-    setHostGuidelinesError("");
-    setHostGuidelinesStatus("Saving…");
-
-    const res = await fetch(`${API_BASE}/host/companion-guidelines/set`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand, avatar, memberId, guidelines: String(hostGuidelinesText || "") }),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(txt || `HTTP ${res.status}`);
-    }
-
-    const data: any = await res.json().catch(() => ({}));
-    const text = String(data?.guidelines || String(hostGuidelinesText || "")).trim();
-
-    setHostGuidelinesSaved(text);
-    setHostGuidelinesText(text);
-    setHostGuidelinesStatus("Saved");
-    setHostGuidelinesLoading(false);
-  } catch (e: any) {
-    setHostGuidelinesLoading(false);
-    setHostGuidelinesStatus("");
-    setHostGuidelinesError(String(e?.message || e || "Failed to save guidelines"));
-  }
-}, [API_BASE, isHost, companyName, companionName, hostGuidelinesText]);
-
-
+    // Treat "host" as the *membership* that owns this companion.
+    // IMPORTANT: do NOT derive host-ness from `livekitRole` because `livekitRole` is updated asynchronously
+    // and the Host must never be prompted for a viewer username.
+    const isHost = Boolean(memberId && mappedHostMemberId && memberId === mappedHostMemberId);
+    const isViewer = Boolean(memberId && mappedHostMemberId && memberId !== mappedHostMemberId);
+    useEffect(() => {
+      hostMemberIdRef.current = String(mappedHostMemberId || "");
+    }, [mappedHostMemberId]);
   const livekitRoleKnown = livekitRole !== "unknown";
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
-	const livekitPendingUnique = useMemo(() => {
-		const byKey = new Map<string, any>();
-		for (const r of livekitPending || []) {
-			const key = String(r?.memberId || r?.requestId || "");
-			if (!key) continue;
-			if (!byKey.has(key)) byKey.set(key, r);
-		}
-		return Array.from(byKey.values());
-	}, [livekitPending]);
+  const livekitPendingUnique = useMemo(() => {
+    const byKey = new Map<string, any>();
+    for (const r of livekitPending || []) {
+      const key = String(r?.memberId || r?.requestId || "");
+      if (!key) continue;
+      if (!byKey.has(key)) byKey.set(key, r);
+    }
+    return Array.from(byKey.values());
+  }, [livekitPending]);
   // Viewers must press Play to join live streams.
   // We only reset the auto-join guard when a live stream ends.
   useEffect(() => {
@@ -2838,7 +2393,7 @@ const saveHostGuidelines = useCallback(async () => {
   // Host: poll join requests while a LiveKit session is active.
   useEffect(() => {
     if (!isHost) return;
-    if (!API_BASE || !companyName || !companionName) return;
+    if (!sessionActive) return;
     let cancelled = false;
 
     const tick = async () => {
@@ -2855,33 +2410,9 @@ const saveHostGuidelines = useCallback(async () => {
           const identity = String(r?.memberId || r?.identity || r?.requestId || "").trim();
           return { ...r, viewerLabel: viewerLabel || "Viewer", identity };
         });
-        if (cancelled) return;
-
-        const now = Date.now();
-        setLivekitPending((prev) => {
-          const prior = Array.isArray(prev) ? prev : [];
-          const byKey = new Map<string, any>();
-
-          for (const r of prior) {
-            const key = String((r as any)?.requestId || (r as any)?.identity || (r as any)?.memberId || "").trim();
-            if (!key) continue;
-            byKey.set(key, r);
-          }
-
-          for (const r of annotated) {
-            const key = String((r as any)?.requestId || (r as any)?.identity || (r as any)?.memberId || "").trim();
-            if (!key) continue;
-            byKey.set(key, { ...(r as any), _seenAt: now });
-          }
-
-          const GRACE_MS = 10000;
-          const out = Array.from(byKey.values()).filter((r) => now - Number((r as any)?._seenAt || now) < GRACE_MS);
-
-          out.sort((a, b) => Number((b as any)?.ts || 0) - Number((a as any)?.ts || 0));
-          return out;
-        });
+        if (!cancelled) setLivekitPending(annotated);
       } catch {
-        // Do NOT clear pending requests on transient errors; keep last known list.
+        if (!cancelled) setLivekitPending([]);
       }
     };
 
@@ -3398,11 +2929,11 @@ if (liveProvider === "stream") {
   try {
     const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
 
-	    // Ask server to resolve room + determine host vs viewer.
-	    // NOTE: Never prompt the Host for a username.
-	    const displayNameForToken = isViewer
-	      ? String(ensureViewerLiveChatName() || viewerLiveChatName || "Viewer").trim()
-	      : String(companionName || "Host").trim();
+      // Ask server to resolve room + determine host vs viewer.
+      // NOTE: Never prompt the Host for a username.
+      const displayNameForToken = isViewer
+        ? String(ensureViewerLiveChatName() || viewerLiveChatName || "Viewer").trim()
+        : String(companionName || "Host").trim();
 
 const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       method: "POST",
@@ -4290,624 +3821,7 @@ const speakAssistantReply = useCallback(
   const [uploadError, setUploadError] = useState<string>("");
 
   const [messages, setMessages] = useState<Msg[]>([]);
-
-// Relay polling for host override (member side)
-const [relaySinceSeq, setRelaySinceSeq] = useState<number>(0);
-const relaySinceSeqRef = useRef<number>(0);
-useEffect(() => {
-  relaySinceSeqRef.current = relaySinceSeq;
-}, [relaySinceSeq]);
-
-
-// Member-side relay poll: receives host/system messages during a host override.
-useEffect(() => {
-  if (isHost) return;
-  if (!API_BASE) return;
-
-  const sid = sessionIdRef.current;
-  if (!sid) return;
-
-  let cancelled = false;
-  let timer: any = null;
-
-  const pollOnce = async () => {
-    try {
-      const shouldPoll =
-        (messagesRef.current?.length || 0) > 0 ||
-        Boolean((sessionStateRef.current as any)?.host_override_active);
-
-      if (!shouldPoll) return;
-
-      const rawBrand =
-        (parseRebrandingKey(rebrandingKey || "")?.rebranding ||
-          companyName ||
-          DEFAULT_COMPANY_NAME ||
-          "").trim();
-
-      const brandKey = safeBrandKey(rawBrand);
-      const memberIdForBackend =
-        (String(memberIdRef.current || "").trim() ||
-          getOrCreateAnonMemberId(brandKey) ||
-          "").trim();
-
-      const companionForBackend =
-        ((companionKey || "").trim() ||
-          (companionName || DEFAULT_COMPANION_NAME).trim() ||
-          DEFAULT_COMPANION_NAME).trim();
-
-      const pollSessionState: SessionState = {
-        ...(sessionStateRef.current as any),
-
-        memberId: memberIdForBackend,
-        member_id: memberIdForBackend,
-
-        companion: companionForBackend,
-        companionName: companionForBackend,
-        companion_name: companionForBackend,
-
-        // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
-        brand: (companyName || "").trim(),
-        avatar: (companionName || "").trim(),
-
-        rebrandingKey: stripTrialControlsFromRebrandingKey(rebrandingKey),
-        rebranding: rawBrand,
-      };
-
-      const res = await fetch(`${API_BASE}/chat/relay/poll`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sid,
-          since_seq: relaySinceSeqRef.current,
-          session_state: pollSessionState,
-        }),
-      });
-
-      if (!res.ok) return;
-      const data = (await res.json()) as {
-        events?: RelayEvent[];
-        next_since_seq?: number;
-        override_active?: boolean;
-      };
-
-      if (cancelled) return;
-
-      const nextSince =
-        typeof data.next_since_seq === "number"
-          ? data.next_since_seq
-          : relaySinceSeqRef.current;
-
-      if (nextSince !== relaySinceSeqRef.current) {
-        setRelaySinceSeq(nextSince);
-      }
-
-      if (typeof data.override_active === "boolean") {
-        setSessionState((prev) => ({
-          ...prev,
-          host_override_active: data.override_active,
-        }));
-      }
-
-      const evs = Array.isArray(data.events) ? data.events : [];
-      if (evs.length) {
-        setMessages((prev) => {
-          const out = [...prev];
-          for (const ev of evs) {
-            const sender = String((ev as any).sender || "");
-            const kind = String((ev as any).kind || "");
-            const role = String((ev as any).role || "");
-            const payload = (ev as any).payload;
-
-            // Host-pushed scheduled content (AI companion attachment)
-            if (kind === "user_content" && payload) {
-              const msg = buildContentAssistantMsg(payload as any);
-              if (msg) out.push(msg as any);
-              continue;
-            }
-
-            const content = String((ev as any).content || "");
-            if (!content.trim()) continue;
-
-            if (role === "system" || sender === "system" || kind.startsWith("override_")) {
-              out.push({
-                role: "assistant",
-                content,
-                meta: { sender: "system" },
-              } as any);
-              continue;
-            }
-
-            if (sender === "host") {
-              out.push({
-                role: "assistant",
-                content,
-                meta: { sender: "host" },
-              } as any);
-              continue;
-            }
-
-            // Fallback: still show as a system message.
-            out.push({
-              role: "assistant",
-              content,
-              meta: { sender: "system" },
-            } as any);
-          }
-          return out;
-        });
-      }
-    } catch {
-      // ignore
-    }
-  };
-
-  const tick = async () => {
-    if (cancelled) return;
-    await pollOnce();
-    timer = setTimeout(tick, 1200);
-  };
-
-  tick();
-
-  return () => {
-    cancelled = true;
-    if (timer) clearTimeout(timer);
-  };
-}, [
-  API_BASE,
-  isHost,
-  companyName,
-  companionName,
-  companionKey,
-  rebrandingKey,
-]);
-
   const [loading, setLoading] = useState(false);
-
-  // Used to safely queue STT auto-sends while a response is still being prepared.
-  // (Prevents STT transcripts from getting dropped when send() is blocked by loading=true.)
-  const loadingRef = useRef<boolean>(false);
-
-  useEffect(() => {
-    loadingRef.current = Boolean(loading);
-  }, [loading]);
-
-
-// Host console polling (list + selected transcript)
-useEffect(() => {
-  if (!hostConsoleOpen) return;
-  if (!isHost) return;
-  if (!API_BASE) return;
-
-  let cancelled = false;
-  let timer: any = null;
-
-  const fetchActive = async () => {
-    try {
-      const brand = (companyName || "").trim();
-      const avatar = (companionName || "").trim();
-      const memberId = String(memberIdRef.current || "").trim();
-
-      if (!brand || !avatar || !memberId) return;
-
-      // Keep loading indicator only when opening or when list is empty.
-      setHostActiveLoading((prev) => prev || hostActiveChats.length === 0);
-      setHostActiveError("");
-
-      const res = await fetch(`${API_BASE}/host/ai-chats/active`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brand,
-          avatar,
-          memberId,
-          limit: 50,
-        }),
-      });
-
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(txt || `HTTP ${res.status}`);
-      }
-
-      const data = (await res.json()) as {
-        ok?: boolean;
-        sessions?: HostActiveChat[];
-      };
-
-      if (cancelled) return;
-
-      const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-      setHostActiveChats(sessions);
-      setHostActiveLoading(false);
-    } catch (e: any) {
-      if (cancelled) return;
-      setHostActiveLoading(false);
-      setHostActiveError(String(e?.message || e || "Failed to load active chats"));
-    }
-  };
-
-  const tick = async () => {
-    if (cancelled) return;
-    await fetchActive();
-    timer = setTimeout(tick, 2000);
-  };
-
-  tick();
-
-  return () => {
-    cancelled = true;
-    if (timer) clearTimeout(timer);
-  };
-}, [API_BASE, hostConsoleOpen, isHost, companyName, companionName, hostActiveChats.length]);
-
-useEffect(() => {
-  if (!hostConsoleOpen) return;
-  if (!isHost) return;
-  if (!API_BASE) return;
-  if (!hostSelectedSessionId) return;
-
-  let cancelled = false;
-  let timer: any = null;
-
-  const pollSelected = async () => {
-    try {
-      const brand = (companyName || "").trim();
-      const avatar = (companionName || "").trim();
-      const memberId = String(memberIdRef.current || "").trim();
-
-      if (!brand || !avatar || !memberId) return;
-
-      const res = await fetch(`${API_BASE}/host/ai-chats/poll`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brand,
-          avatar,
-          memberId,
-          session_id: hostSelectedSessionId,
-          since_seq: hostPollSinceSeqRef.current,
-          mark_read: true,
-        }),
-      });
-
-      if (!res.ok) return;
-
-      const data = (await res.json()) as {
-        ok?: boolean;
-        events?: RelayEvent[];
-        next_since_seq?: number;
-        override_active?: boolean;
-        usage_info?: {
-          minutes_remaining?: number;
-          minutes_allowed?: number;
-          minutes_used?: number;
-        };
-      };
-
-      if (cancelled) return;
-
-      const evs = Array.isArray(data.events) ? data.events : [];
-      if (evs.length) {
-        setHostSelectedEvents((prev) => {
-          const out = [...prev, ...evs];
-          // Cap for UI safety.
-          return out.slice(-400);
-        });
-
-        // Queue pending scheduled content for the host (shown via modal).
-        const pendingPayloads = evs
-          .map((ev: RelayEvent) => (ev?.kind === "content_pending" ? (ev as any).payload : null))
-          .filter(Boolean) as any[];
-
-        if (pendingPayloads.length) {
-          setHostPendingContent((prev) => {
-            const seen = new Set(prev.map((p) => p.token));
-            const additions: PendingContentItem[] = [];
-
-            for (const p of pendingPayloads) {
-              const token = String(p?.token || "").trim();
-              const content = (p?.content || null) as ContentDelivery | null;
-
-              if (!token || !content) continue;
-              if (seen.has(token)) continue;
-              seen.add(token);
-
-              const triggerMinute =
-                typeof p?.trigger_minute === "number"
-                  ? p.trigger_minute
-                  : typeof p?.triggerMinute === "number"
-                  ? p.triggerMinute
-                  : undefined;
-
-              const createdTs =
-                typeof p?.created_ts === "number"
-                  ? p.created_ts
-                  : typeof p?.createdTs === "number"
-                  ? p.createdTs
-                  : undefined;
-
-              additions.push({ token, triggerMinute, createdTs, content });
-            }
-
-            return additions.length ? [...prev, ...additions] : prev;
-          });
-
-          setHostPendingModalOpen(true);
-        }
-      }
-
-      const nextSince =
-        typeof data.next_since_seq === "number"
-          ? data.next_since_seq
-          : hostPollSinceSeqRef.current;
-
-      if (nextSince !== hostPollSinceSeqRef.current) {
-        setHostPollSinceSeq(nextSince);
-      }
-
-      // If minutes are exhausted, backend will auto-end override and emit a system event.
-      if (data.override_active === false) {
-        // no-op; UI will reflect from list refresh
-      }
-    } catch {
-      // ignore
-    }
-  };
-
-  const tick = async () => {
-    if (cancelled) return;
-    await pollSelected();
-    timer = setTimeout(tick, 900);
-  };
-
-  tick();
-
-  return () => {
-    cancelled = true;
-    if (timer) clearTimeout(timer);
-  };
-}, [
-  API_BASE,
-  hostConsoleOpen,
-  isHost,
-  companyName,
-  companionName,
-  hostSelectedSessionId,
-]);
-
-const hostSelectSession = (sid: string) => {
-  setHostSelectedSessionId(sid);
-  setHostSelectedEvents([]);
-  setHostPendingContent([]);
-  setHostPendingModalOpen(false);
-  setHostPendingActionErr(null);
-  setHostPollSinceSeq(0);
-  setHostSendText("");
-  setHostNotice("");
-};
-
-const hostSetOverride = async (enabled: boolean) => {
-  try {
-    const brand = (companyName || "").trim();
-    const avatar = (companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
-    const session_id = String(hostSelectedSessionId || "").trim();
-
-    if (!brand || !avatar || !memberId || !session_id) return;
-
-    const res = await fetch(`${API_BASE}/host/ai-chats/override`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand, avatar, memberId, session_id, enabled }),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(txt || `HTTP ${res.status}`);
-    }
-
-    setHostNotice(enabled ? "Override enabled." : "Override ended.");
-  } catch (e: any) {
-    setHostNotice(String(e?.message || e || "Failed to set override"));
-  }
-};
-
-const hostSendMessage = async () => {
-  try {
-    const text = String(hostSendText || "").trim();
-    if (!text) return;
-
-    const brand = (companyName || "").trim();
-    const avatar = (companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
-    const session_id = String(hostSelectedSessionId || "").trim();
-
-    if (!brand || !avatar || !memberId || !session_id) return;
-
-    const res = await fetch(`${API_BASE}/host/ai-chats/send`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand, avatar, memberId, session_id, text }),
-    });
-
-    const data = await res.json().catch(() => ({} as any));
-
-    if (!res.ok) {
-      const txt = (data && (data.detail || data.message)) || `HTTP ${res.status}`;
-      throw new Error(String(txt));
-    }
-
-    if (data?.minutes_exhausted) {
-      setHostNotice("Member is out of minutes — override ended.");
-      setHostSendText("");
-      return;
-    }
-
-    setHostSendText("");
-    setHostNotice("");
-    // Poll loop will pick up the new message.
-  } catch (e: any) {
-    setHostNotice(String(e?.message || e || "Failed to send host message"));
-  }
-};
-
-
-// Host STT (speech-to-text) using backend transcription (/stt/transcribe)
-// - Click to start recording, click again to stop & transcribe.
-// - Fills the host message box with the transcript (host can edit, then Send).
-const hostStopStt = useCallback(async () => {
-  try {
-    const rec = hostSttRecorderRef.current;
-    if (rec && rec.state !== "inactive") {
-      try {
-        rec.stop();
-      } catch {}
-    }
-  } catch {}
-}, []);
-
-const hostStartStt = useCallback(async () => {
-  try {
-    if (hostSttRecording) return;
-    setHostSttError("");
-
-    if (!API_BASE) throw new Error("API base not configured");
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      throw new Error("Microphone is not available in this browser");
-    }
-
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    hostSttStreamRef.current = stream;
-    hostSttChunksRef.current = [];
-
-    const mr = new MediaRecorder(stream);
-    const mimeType = String((mr as any)?.mimeType || "audio/webm");
-    hostSttRecorderRef.current = mr;
-
-    mr.ondataavailable = (e: any) => {
-      try {
-        if (e?.data && e.data.size > 0) hostSttChunksRef.current.push(e.data);
-      } catch {}
-    };
-
-    mr.onstop = async () => {
-      try {
-        setHostSttRecording(false);
-
-        const chunks = hostSttChunksRef.current || [];
-        hostSttChunksRef.current = [];
-
-        // stop tracks
-        try {
-          (hostSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
-            try {
-              t.stop();
-            } catch {}
-          });
-        } catch {}
-        hostSttStreamRef.current = null;
-
-        const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
-        if (!blob || blob.size < 1) return;
-
-        const form = new FormData();
-        const fname = mimeType.includes("mp4")
-          ? "host_audio.mp4"
-          : mimeType.includes("wav")
-            ? "host_audio.wav"
-            : "host_audio.webm";
-        form.append("file", blob, fname);
-
-        const res = await fetch(`${API_BASE}/stt/transcribe`, {
-          method: "POST",
-          body: form,
-        });
-
-        const data: any = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          const detail = String(data?.detail || data?.error || `HTTP ${res.status}`);
-          throw new Error(detail);
-        }
-
-        const text = String(data?.text || "").trim();
-        if (!text) return;
-
-        setHostSendText((prev) => {
-          const p = String(prev || "").trim();
-          return p ? `${p} ${text}` : text;
-        });
-      } catch (e: any) {
-        setHostSttError(String(e?.message || e || "STT failed"));
-      }
-    };
-
-    mr.start();
-    setHostSttRecording(true);
-  } catch (e: any) {
-    setHostSttRecording(false);
-    setHostSttError(String(e?.message || e || "Microphone permission was blocked."));
-    try {
-      (hostSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
-        try {
-          t.stop();
-        } catch {}
-      });
-    } catch {}
-    hostSttStreamRef.current = null;
-  }
-}, [API_BASE, hostSttRecording]);
-
-// Safety: stop host recorder if host console closes or session changes.
-useEffect(() => {
-  if (!hostConsoleOpen || !hostSelectedSessionId) {
-    if (hostSttRecording) hostStopStt();
-  }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [hostConsoleOpen, hostSelectedSessionId]);
-
-
-  const hostPushPendingContent = async (token: string) => {
-    if (!hostSelectedSessionId) return;
-
-    setHostPendingActionErr(null);
-
-    try {
-      const brand = (companyName || "").trim();
-      const avatar = (companionName || "").trim();
-      const memberId = String(memberIdRef.current || "").trim();
-      const session_id = String(hostSelectedSessionId || "").trim();
-
-      if (!brand || !avatar || !memberId || !session_id) return;
-
-      const res = await fetch(`${API_BASE}/host/ai-chats/push-content`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          brand,
-          avatar,
-          memberId,
-          session_id,
-          token,
-        }),
-      });
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data?.ok) {
-        const detail = data?.detail || data?.error || `HTTP ${res.status}`;
-        throw new Error(String(detail));
-      }
-
-      setHostPendingContent((prev) => {
-        const next = prev.filter((p) => p.token !== token);
-        if (!next.length) setHostPendingModalOpen(false);
-        return next;
-      });
-    } catch (e: any) {
-      setHostPendingActionErr(e?.message || "Failed to push content");
-    }
-  };
-
-
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
   const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
   const [savingSummary, setSavingSummary] = useState(false);
@@ -4992,73 +3906,6 @@ useEffect(() => {
     if (mid) return mid;
     return getOrCreateAnonMemberId(brandKeyForAnon);
   }, [memberId, brandKeyForAnon]);
-
-
-  // ---------------------------------------------------------------------------
-  // LLM priming (warm-up) to reduce latency on provider switches (OpenAI <-> xAI)
-  // ---------------------------------------------------------------------------
-  const warmProvider = useMemo(() => {
-    return sessionState.mode === "intimate" && !!sessionState.explicit_consented ? "xai" : "openai";
-  }, [sessionState.mode, sessionState.explicit_consented]);
-
-  const warmKey = useMemo(() => {
-    const rawBrand = String(companyName || rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
-    const brandKey = safeBrandKey(rawBrand) || "core";
-    const avatarKey = String(companionName || DEFAULT_COMPANION_NAME).trim().toLowerCase();
-    return `${warmProvider}|${sessionState.mode}|${sessionState.explicit_consented ? "1" : "0"}|${brandKey}|${avatarKey}`;
-  }, [warmProvider, sessionState.mode, sessionState.explicit_consented, companyName, rebranding, companionName]);
-
-  const warmLastRef = useRef<{ key: string; at: number }>({ key: "", at: 0 });
-
-  const buildWarmSessionStateForBackend = useCallback((): SessionState => {
-    const rawBrand = String(companyName || rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
-    const brandKey = safeBrandKey(rawBrand);
-    const mid = String(memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
-    const companionForBackend =
-      String(companionKey || "").trim() || String(companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
-    const rebrandingKeyForBackend = String(rebrandingKey || "").trim();
-    const planNameForBackend = planName;
-
-    return {
-      ...sessionState,
-      memberId: mid,
-      member_id: mid,
-      brand: rawBrand,
-      avatar: String(companionName || companionForBackend).trim(),
-      companion: companionForBackend,
-      companionName: companionForBackend,
-      companion_name: companionForBackend,
-      planName: planNameForBackend,
-      plan_name: planNameForBackend,
-      rebrandingKey: rebrandingKeyForBackend,
-      rebranding_key: rebrandingKeyForBackend,
-      rebranding: String(rebranding || "").trim(),
-    };
-  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, rebrandingKey, planName]);
-
-  useEffect(() => {
-    if (!API_BASE) return;
-
-    // Throttle: only warm once per key per ~45s.
-    const now = Date.now();
-    const prev = warmLastRef.current;
-    if (prev.key === warmKey && now - prev.at < 45_000) return;
-    warmLastRef.current = { key: warmKey, at: now };
-
-    const payload = {
-      provider: warmProvider,
-      mode: sessionState.mode,
-      session_state: buildWarmSessionStateForBackend(),
-    };
-
-    try {
-      fetch(`${API_BASE}/llm/warm`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
-    } catch (e) {}
-  }, [warmKey, warmProvider, sessionState.mode, buildWarmSessionStateForBackend]);
 
 
   // PayGo top-up email (stored per brand so the user doesn't have to retype it)
@@ -5209,9 +4056,6 @@ useEffect(() => {
         companion: companionForBackend,
         companionName: companionForBackend,
         companion_name: companionForBackend,
-  // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
-  brand: (companyName || "").trim(),
-  avatar: (companionName || "").trim(),
 
         memberId: (memberIdForBackend || "").trim(),
         member_id: (memberIdForBackend || "").trim(),
@@ -5255,36 +4099,6 @@ useEffect(() => {
       // ignore
     }
   }, [API_BASE, companionKey, companionName, memberId, planName, planLabelOverride, rebrandingKey, rebranding]);
-
-  // Keep the on-screen usage meter in sync even when there are no new turns.
-  // This endpoint is non-charging (status only), so it is safe to poll.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (!API_BASE) return;
-
-    let cancelled = false;
-
-    const tick = () => {
-      if (cancelled) return;
-
-      // Avoid background polling when the tab is hidden to reduce load on mobile.
-      try {
-        if (typeof document !== "undefined" && document.visibilityState && document.visibilityState !== "visible") {
-          return;
-        }
-      } catch {}
-
-      void refreshUsageStatusOnce();
-    };
-
-    tick();
-    const id = window.setInterval(tick, 30000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [API_BASE, refreshUsageStatusOnce]);
-
 
   // CTA: Encourage visitors to become members for a smoother top-up experience (no email entry).
   // We intentionally keep the non-member flow more tedious (email required), but provide a clear upgrade path.
@@ -5666,48 +4480,6 @@ useEffect(() => {
     };
   }, [upgradeWatching, requestLatestMemberPlanFromParent]);
 
-
-  // Auto-recovery when chat minutes are exhausted:
-  //  - keep polling /usage/status so credited minutes unlock without refresh
-  //  - keep nudging the parent iframe to refresh MEMBER_PLAN (covers plan upgrades)
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const exhausted = Boolean((sessionStateRef.current as any)?.minutes_exhausted);
-    if (!exhausted) return;
-
-    // Start the upgrade watcher so MEMBER_PLAN refreshes continue even if the user upgraded in another tab.
-    try {
-      startUpgradeWatch("auto_minutes_exhausted");
-    } catch (e) {}
-
-    let cancelled = false;
-
-    const pollOnce = async () => {
-      if (cancelled) return;
-      try {
-        const stillExhausted = Boolean((sessionStateRef.current as any)?.minutes_exhausted);
-        if (!stillExhausted) return;
-
-        // Refresh backend usage/balance.
-        await refreshUsageStatusOnce();
-
-        // Also request the latest plan from the parent (Wix), if available.
-        try {
-          requestLatestMemberPlanFromParent("minutes_exhausted_poll");
-        } catch (e) {}
-      } catch (e) {}
-    };
-
-    pollOnce();
-    const t = window.setInterval(pollOnce, 4000);
-
-    return () => {
-      cancelled = true;
-      try { window.clearInterval(t); } catch (e) {}
-    };
-  }, [sessionState?.minutes_exhausted, refreshUsageStatusOnce, requestLatestMemberPlanFromParent, startUpgradeWatch]);
-
   // Stop upgrade polling once we detect a plan or login state change.
   useEffect(() => {
     if (!upgradeWatching) return;
@@ -5890,14 +4662,10 @@ useEffect(() => {
     // Once a user has joined a live experience, they should remain connected to shared chat
     // until they explicitly press Stop (host) or opt-out (viewer, private session only).
     const inStreamUi =
-      kind !== "conference" &&
-      !!eventRef &&
-      (isHost ? Boolean(sessionActive) : Boolean(viewerHasJoinedStream));
+      Boolean(sessionActive) && kind !== "conference" && !!eventRef;
 
     const inConferenceUi =
-      kind === "conference" &&
-      !!eventRef &&
-      (isHost ? Boolean(sessionActive) : Boolean(conferenceJoined));
+      (Boolean(sessionActive) || Boolean(conferenceJoined)) && kind === "conference" && !!eventRef;
 
     const inLiveChatUi = inStreamUi || inConferenceUi;
 
@@ -6024,7 +4792,6 @@ useEffect(() => {
     sessionRoom,
     companyName,
     conferenceJoined,
-    viewerHasJoinedStream,
   ]);
 
 
@@ -6041,12 +4808,6 @@ useEffect(() => {
         // Livestream viewers may only learn the active room via status polling (sessionRoom)
         // until they explicitly join.
         eventRef = String(streamEventRef || sessionRoom || "").trim();
-      }
-
-      // Viewers must be actively in the Live UI to send shared chat.
-      if (!isHost) {
-        if (kind === "conference" && !conferenceJoinedRef.current) return;
-        if (kind !== "conference" && !viewerHasJoinedStream) return;
       }
 
       if (!API_BASE || !eventRef) return;
@@ -6155,20 +4916,20 @@ const startConferenceSession = useCallback(async () => {
     setLivekitMicEnabled(true);
   setLivekitCameraEnabled(true);
 
-	    // Host: prime A/V permissions on the Play click (iOS/Safari requirement).
-	    // Viewers are subscribe-only for now, so we do NOT require mic/cam permissions to request access.
-	    if (isHost) {
-	      const ok = await requestLivekitAvPermissions({
-	        audio: true,
-	        video: true,
-	        reason: "starting a Private conference",
-	      });
-	      if (!ok) {
-	        setAvatarStatus("error");
-	        setAvatarError("Microphone and camera permissions are required to host the private conference.");
-	        return;
-	      }
-	    }
+      // Host: prime A/V permissions on the Play click (iOS/Safari requirement).
+      // Viewers are subscribe-only for now, so we do NOT require mic/cam permissions to request access.
+      if (isHost) {
+        const ok = await requestLivekitAvPermissions({
+          audio: true,
+          video: true,
+          reason: "starting a Private conference",
+        });
+        if (!ok) {
+          setAvatarStatus("error");
+          setAvatarError("Microphone and camera permissions are required to host the private conference.");
+          return;
+        }
+      }
 
     // Viewers request to join a private session. The host must admit them.
     if (!isHost) {
@@ -6225,14 +4986,14 @@ const startConferenceSession = useCallback(async () => {
       setMessages((prev) => prev.filter((m) => !m?.meta?.liveChat));
       liveChatSeenIdsRef.current = new Set();
 
-	      try {
-	        const requestedDisplayName = String(
-	          ensureViewerLiveChatName({
-	            promptText: "Please enter your name to enter the the session",
-	          }) ||
-	            viewerLiveChatName ||
-	            "",
-	        ).trim();
+        try {
+          const requestedDisplayName = String(
+            ensureViewerLiveChatName({
+              promptText: "Please enter your name to enter the the session",
+            }) ||
+              viewerLiveChatName ||
+              "",
+          ).trim();
 
         const resp = await fetch(`${API_BASE}/livekit/join_request`, {
           method: "POST",
@@ -6351,158 +5112,6 @@ const messagesRef = useRef<Msg[]>([]);
 useEffect(() => {
   messagesRef.current = messages;
 }, [messages]);
-
-// ---------------------------------------------------------------------------
-// Auto-save conversation summaries (requirements):
-// - every 6 turns
-// - when Host override starts
-// - when AI resumes after Host override ends
-// - after 120 seconds of inactivity
-// ---------------------------------------------------------------------------
-const autoSaveSummaryInFlightRef = useRef<boolean>(false);
-const autoSaveSummaryLastAtRef = useRef<number>(0);
-const autoSaveSummaryLastUserTurnsRef = useRef<number>(0);
-const autoSaveSummaryIdleTimerRef = useRef<number | null>(null);
-const autoSaveSummaryLastMsgLenRef = useRef<number>(0);
-
-const autoSaveChatSummary = useCallback(
-  async (reason: string) => {
-    try {
-      if (!API_BASE) return;
-
-      // Throttle: avoid spamming save-summary when multiple triggers fire in quick succession.
-      const now = Date.now();
-      if (autoSaveSummaryInFlightRef.current) return;
-      if (now - autoSaveSummaryLastAtRef.current < 3000) return;
-
-      const msgList = messagesRef.current || [];
-      if (!msgList.length) return;
-
-      autoSaveSummaryInFlightRef.current = true;
-
-      const memberIdForBackend = String(memberIdRef.current || "").trim();
-      const companionForBackend = String(companionKey || companionName || DEFAULT_COMPANION_NAME).trim();
-      const brandForBackend = String(companyName || "").trim();
-
-      const effectivePlanForBackend: PlanName = memberIdForBackend ? (planName as any) : "Trial";
-
-      const session_state = {
-        ...(sessionState || {}),
-        memberId: memberIdForBackend,
-        companion: companionForBackend,
-        companionName: companionForBackend,
-        companion_name: companionForBackend,
-        brand: brandForBackend,
-        avatar: String(companionName || "").trim(),
-        planName: effectivePlanForBackend,
-        plan_name: effectivePlanForBackend,
-        plan_label: String(planLabelOverride || "").trim(),
-      } as any;
-
-      const messagesForSummary = msgList
-        .filter((m) => {
-          const meta: any = (m as any)?.meta || {};
-          if (meta?.includeInAiContext === false) return false;
-          if (meta?.liveChat) return false;
-          return true;
-        })
-        .map((m) => ({ role: m.role, content: m.content }));
-
-      const res = await fetch(`${API_BASE}/chat/save-summary`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          memberId: memberIdForBackend,
-          session_state,
-          messages: messagesForSummary,
-          reason,
-        }),
-      });
-
-      // Treat non-2xx as non-fatal (auto-save is best-effort).
-      if (res.ok) {
-        autoSaveSummaryLastAtRef.current = now;
-      }
-    } catch {
-      // ignore
-    } finally {
-      autoSaveSummaryInFlightRef.current = false;
-    }
-  },
-  [
-    API_BASE,
-    companionKey,
-    companionName,
-    companyName,
-    planLabelOverride,
-    planName,
-    sessionState,
-  ],
-);
-
-// Every message append: schedule idle timer (120s).
-useEffect(() => {
-  const len = (messagesRef.current || []).length || 0;
-  if (!len) return;
-
-  autoSaveSummaryLastMsgLenRef.current = len;
-
-  if (autoSaveSummaryIdleTimerRef.current) {
-    window.clearTimeout(autoSaveSummaryIdleTimerRef.current);
-    autoSaveSummaryIdleTimerRef.current = null;
-  }
-
-  const startLen = len;
-  autoSaveSummaryIdleTimerRef.current = window.setTimeout(() => {
-    const curLen = (messagesRef.current || []).length || 0;
-    if (curLen !== startLen) return; // activity occurred
-    void autoSaveChatSummary("idle_120s");
-  }, 120000);
-
-  return () => {
-    if (autoSaveSummaryIdleTimerRef.current) {
-      window.clearTimeout(autoSaveSummaryIdleTimerRef.current);
-      autoSaveSummaryIdleTimerRef.current = null;
-    }
-  };
-}, [messages.length, autoSaveChatSummary]);
-
-// Every 6 user turns (user messages) once the assistant has replied.
-useEffect(() => {
-  const msgList = messagesRef.current || [];
-  if (!msgList.length) return;
-
-  const last = msgList[msgList.length - 1];
-  if (!last || last.role !== "assistant") return;
-
-  const userTurns = msgList.filter((m) => {
-    if (m.role !== "user") return false;
-    const meta: any = (m as any)?.meta || {};
-    if (meta?.includeInAiContext === false) return false;
-    if (meta?.liveChat) return false;
-    return true;
-  }).length;
-
-  if (!userTurns) return;
-  if (userTurns % 6 !== 0) return;
-  if (autoSaveSummaryLastUserTurnsRef.current === userTurns) return;
-
-  autoSaveSummaryLastUserTurnsRef.current = userTurns;
-  void autoSaveChatSummary(`turns_${userTurns}`);
-}, [messages.length, autoSaveChatSummary]);
-
-// Host override transitions: save immediately on start/end.
-const prevHostOverrideRef = useRef<boolean>(false);
-useEffect(() => {
-  const cur = Boolean((sessionState as any)?.host_override_active);
-  const prev = prevHostOverrideRef.current;
-
-  if (cur === prev) return;
-  prevHostOverrideRef.current = cur;
-
-  void autoSaveChatSummary(cur ? "host_override_enabled" : "host_override_ended_ai_resumed");
-}, [sessionState, autoSaveChatSummary]);
-
 
 const stopConferenceSession = useCallback(async () => {
   if (stopInProgressRef.current) return;
@@ -6914,9 +5523,6 @@ useEffect(() => {
   const sttRecoverTimerRef = useRef<number | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
-  const sttNotAllowedFailsRef = useRef<number>(0);
-  const sttLastNotAllowedAtRef = useRef<number>(0);
-  const sttEverStartedRef = useRef<boolean>(false);
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
@@ -6962,7 +5568,16 @@ useEffect(() => {
   const backendSttHasSpokenRef = useRef<boolean>(false);
 
 
-  const getEmbedHint = useCallback(() => "", []);
+  const getEmbedHint = useCallback(() => {
+    if (typeof window === "undefined") return "";
+    const hint =
+      " (If this page is embedded, ensure the embed/iframe allows microphone access.)";
+    try {
+      return window.self !== window.top ? hint : "";
+    } catch (e) {
+      return hint;
+    }
+  }, []);
 
 
   // Greeting once per browser session per companion
@@ -7150,7 +5765,6 @@ useEffect(() => {
         const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
-        armStartupOverlay(parsed.first || DEFAULT_COMPANION_NAME);
 
         // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
         setSessionState((prev) => ({
@@ -7163,7 +5777,6 @@ useEffect(() => {
         setCompanionKeyRaw("");
         setCompanionKey("");
         setCompanionName(DEFAULT_COMPANION_NAME);
-        armStartupOverlay(DEFAULT_COMPANION_NAME);
 
         setSessionState((prev) => ({
           ...prev,
@@ -7194,50 +5807,18 @@ useEffect(() => {
         (hasEntitledPlan ? "intimate" : "romantic");
 
       // Requirement: the *Elaralo* entitlement plan determines how many mode pills exist.
-      // The Wix `modePill` selects the initially-active mode (if allowed), but does NOT change how many pills are shown.
-
       const nextAllowed = allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan);
-
       setAllowedModes(nextAllowed);
-
-      const wixRequestedMode: Mode | null = modeFromModePill(incomingModePillRaw);
-
-      // Wix can post MEMBER_PLAN more than once (init + periodic refresh). We must not continuously
-      // override user-driven mode switches inside the chat. We only force-apply Wix modePill when:
-      //   - this is the first MEMBER_PLAN we processed, OR
-      //   - the plan context changed (new member/plan/rebrandingKey), OR
-      //   - Wix actually changed the modePill value.
-      const fp = `${incomingMemberId || ""}|${String(effectivePlan || "").trim()}|${String(rawRebrandingKey || "").trim()}`;
-      const isPlanRefresh = fp !== wixLastFingerprintRef.current;
-      wixLastFingerprintRef.current = fp;
-
-      const wixModeChanged = Boolean(
-        wixRequestedMode && wixRequestedMode !== wixLastRequestedModeRef.current
-      );
-      if (wixRequestedMode) {
-        wixLastRequestedModeRef.current = wixRequestedMode;
-      }
-
-      const shouldForceWixMode = Boolean(
-        wixRequestedMode &&
-          nextAllowed.includes(wixRequestedMode) &&
-          (!wixAppliedModeOnceRef.current || isPlanRefresh || wixModeChanged)
-      );
-      wixAppliedModeOnceRef.current = true;
 
       setSessionState((prev) => {
         let nextMode: Mode = prev.mode;
 
-        // Force-apply Wix modePill only on init / plan refresh / Wix mode change.
-        if (shouldForceWixMode) {
-          nextMode = wixRequestedMode;
-        } else {
-          // Otherwise, preserve the previous mode if allowed; if not allowed, fall back.
-          if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
-            nextMode = desiredStartMode;
-          } else if (!nextAllowed.includes(nextMode)) {
-            nextMode = "friend";
-          }
+        // If the previous mode is the default placeholder (Friend) or no longer allowed,
+        // snap to the brand-default start mode (if allowed).
+        if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
+          nextMode = desiredStartMode;
+        } else if (!nextAllowed.includes(nextMode)) {
+          nextMode = "friend";
         }
 
         if (nextMode === prev.mode) return prev;
@@ -7271,25 +5852,13 @@ const companionForBackend =
 
 
 // NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+  // - `rebranding` (legacy) is not guaranteed to be present in this build.
+  // - Use RebrandingKey as the single source of truth for brand identity.
+  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
 const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
-
-// Viewer/User display name for host readability (used in Host Console + summaries).
-// Do NOT prompt here; this must be safe during normal chat.
-const userDisplayNameForBackend = (() => {
-  const explicit = String(viewerLiveChatName || "").trim();
-  if (explicit) return explicit;
-  const raw = String(memberIdForBackend || "").trim();
-  const cleaned = raw.replace(/^Anon:\s*/i, "").trim();
-  const base = cleaned || raw;
-  const shortId = base ? base.slice(0, 4) : "";
-  return `Viewer - ${shortId || "Anon"}`;
-})();
 
 // If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
 // from the rebranding key so backend quota comes from the mapped Elaralo plan.
@@ -7304,10 +5873,6 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   // Backward/forward compatibility with any backend expecting different field names
   companionName: companionForBackend,
   companion_name: companionForBackend,
-  // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
-  brand: (companyName || "").trim(),
-  avatar: (companionName || "").trim(),
-
   // Member identity (from Wix)
   memberId: (memberIdForBackend || "").trim(),
   member_id: (memberIdForBackend || "").trim(),
@@ -7326,70 +5891,7 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   RebrandingKey: (rebrandingKeyForBackend || "").trim(),
   // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
   rebranding: (rebranding || "").trim(),
-
-  // User display name (optional). Backend uses this ONLY for Host Console readability.
-  user_name: userDisplayNameForBackend,
-  username: userDisplayNameForBackend,
-  display_name: userDisplayNameForBackend,
 };
-
-    const trimmedForChat = trimMessagesForChat(nextMessages);
-
-    // Build/extend in-session conversation digests when older turns are trimmed.
-    // These are kept in session_state and injected server-side so model switches remain coherent.
-    const droppedCount = Math.max(0, nextMessages.length - trimmedForChat.length);
-    const prevDroppedCountRaw =
-      (stateToSendWithCompanion as any).summary_dropped_count ??
-      (stateToSendWithCompanion as any).summaryDroppedCount ??
-      0;
-    const prevDroppedCount = Math.max(
-      0,
-      Math.min(Number(prevDroppedCountRaw || 0) || 0, nextMessages.length)
-    );
-
-    let stateForBackend: SessionState = stateToSendWithCompanion;
-
-    if (droppedCount > prevDroppedCount) {
-      const newlyDropped = nextMessages.slice(prevDroppedCount, droppedCount);
-      const digest = buildDigestFromDroppedMessages(newlyDropped);
-
-      const existing =
-        (stateToSendWithCompanion as any).conversation_summaries ??
-        (stateToSendWithCompanion as any).conversationSummaries ??
-        (stateToSendWithCompanion as any).chat_summaries ??
-        (stateToSendWithCompanion as any).chatSummaries ??
-        (stateToSendWithCompanion as any).summaries ??
-        (stateToSendWithCompanion as any).summary_chunks ??
-        (stateToSendWithCompanion as any).summaryChunks ??
-        [];
-
-      const list: string[] = Array.isArray(existing)
-        ? existing.slice().map((x: any) => String(x || ""))
-        : [];
-
-      if (digest) {
-        if (!list.length || list[list.length - 1] !== digest) list.push(digest);
-      }
-
-      while (list.length > MAX_IN_SESSION_SUMMARY_CHUNKS) list.shift();
-
-      stateForBackend = {
-        ...(stateToSendWithCompanion as any),
-        conversation_summaries: list,
-        conversationSummaries: list,
-        summary_dropped_count: droppedCount,
-        summaryDroppedCount: droppedCount,
-      };
-    } else if (droppedCount === 0 && prevDroppedCount > 0) {
-      // Likely a reset/clear; avoid leaking prior context into a new conversation.
-      stateForBackend = {
-        ...(stateToSendWithCompanion as any),
-        conversation_summaries: [],
-        conversationSummaries: [],
-        summary_dropped_count: 0,
-        summaryDroppedCount: 0,
-      };
-    }
 
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
@@ -7397,8 +5899,8 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
       body: JSON.stringify({
         session_id,
         wants_explicit,
-        session_state: stateForBackend,
-        messages: trimmedForChat.map((m) => {
+        session_state: stateToSendWithCompanion,
+        messages: trimMessagesForChat(nextMessages).map((m) => {
           let content = m.content || "";
           const att = m.meta?.attachment;
           if (att?.url) {
@@ -7435,9 +5937,9 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
 
     
 // NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+  // - `rebranding` (legacy) is not guaranteed to be present in this build.
+  // - Use RebrandingKey as the single source of truth for brand identity.
+  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -7670,11 +6172,11 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     if (uploadingAttachment) return;
     if (!rawText && !hasAttachment) return;
 
-	    // Hard rule: no attachments during Live Stream sessions.
-	    if (sessionKind === "stream" && (uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
-	      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
-	      return;
-	    }
+      // Hard rule: no attachments during Live Stream sessions.
+      if (sessionKind === "stream" && (uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
+        try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
+        return;
+      }
 
     // If the user clears messages mid-flight, we "invalidate" any in-progress send()
     // so the assistant reply doesn't append into a cleared chat.
@@ -7706,20 +6208,12 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     // If detectedMode is intimate, keep/trigger pending overlay on response.
     let nextState: SessionState = sessionState;
     if (detectedMode) {
-      // Trigger/clear the pending consent overlay when switching modes via text.
-      const nextPending =
-        detectedMode === "intimate"
-          ? sessionState.explicit_consented
-            ? null
-            : "intimate"
-          : null;
-
+      // If we switch away from intimate while consent is pending, clear the pending flag
+      const nextPending = detectedMode === "intimate" ? sessionState.pending_consent : null;
       nextState = { ...sessionState, mode: detectedMode, pending_consent: nextPending };
 
-      // Keep UI status aligned with the pending consent state.
-      if (detectedMode === "intimate" && !sessionState.explicit_consented) {
-        setChatStatus("explicit_blocked");
-      } else if (detectedMode !== "intimate") {
+      // If user is switching away from intimate, also clear any explicit_blocked overlay state
+      if (detectedMode !== "intimate") {
         setChatStatus("safe");
       }
 
@@ -7954,22 +6448,12 @@ if (streamSessionActive) {
       // When Live Avatar is active, we delay the assistant's text from appearing until
       // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");
-      const contentMsg = buildContentAssistantMsg((data as any).content);
       let assistantCommitted = false;
       const commitAssistantMessage = () => {
         if (assistantCommitted) return;
         assistantCommitted = true;
+        setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
 
-        const toAdd: Msg[] = [];
-        if (replyText.trim()) {
-          toAdd.push({ role: "assistant", content: replyText, meta: { sender: "ai" } });
-        }
-        if (contentMsg) {
-          toAdd.push(contentMsg);
-        }
-        if (!toAdd.length) return;
-
-        setMessages((prev) => [...prev, ...toAdd]);
       };
 
       // Guard against STT feedback: ignore any recognition results until after the avatar finishes speaking.
@@ -8019,11 +6503,9 @@ if (streamSessionActive) {
       // when Live Avatar is NOT speaking.
       const shouldUseLocalTts = !canLiveAvatarSpeak && sttEnabledRef.current;
 
-      const hasAssistantReply = Boolean(replyText.trim());
-
-      const speakPromise = (hasAssistantReply && canLiveAvatarSpeak
+      const speakPromise = (canLiveAvatarSpeak
         ? speakAssistantReply(replyText, hooks)
-        : hasAssistantReply && shouldUseLocalTts
+        : shouldUseLocalTts
           ? speakLocalTtsReply(replyText, voiceId, hooks)
           : (hooks.onDidNotSpeak(), Promise.resolve())
       ).catch(() => {
@@ -8059,16 +6541,6 @@ if (streamSessionActive) {
   useEffect(() => {
     sendRef.current = send;
   }, [send]);
-
-  // If STT auto-send fires while loading=true, we queue it and flush once loading clears.
-  const sttDeferredQueueRef = useRef<string[]>([]);
-  useEffect(() => {
-    if (loading) return;
-    if (!sttDeferredQueueRef.current.length) return;
-    const next = sttDeferredQueueRef.current.shift();
-    if (next) void sendRef.current(next);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading]);
 
 
 // ---------------------------------------------------------------------
@@ -8164,43 +6636,23 @@ const flushQueuedStreamMessages = useCallback(async () => {
       }
 
       const replyText = String((data as any).reply || "");
-      const contentMsg = buildContentAssistantMsg((data as any).content);
-      const replyMsg: Msg | null = replyText.trim()
-        ? { role: "assistant", content: replyText, meta: { sender: "ai" } }
-        : null;
 
       // If this queued message came from an out-of-session user, we rendered a placeholder
       // notice bubble at noticeIndex. Replace it in-place so chat ordering stays coherent.
       const noticeIndex = Number((item as any)?.noticeIndex ?? -1);
       setMessages((prev) => {
         if (!Array.isArray(prev)) return prev as any;
-
-        const next = prev.slice();
-
-        let replyToAppend: Msg | null = replyMsg;
-        let contentToAppend: Msg | null = contentMsg;
-
-        if (noticeIndex >= 0 && noticeIndex < next.length) {
-          if (replyMsg) {
-            next[noticeIndex] = replyMsg;
-            replyToAppend = null;
-          } else if (contentMsg) {
-            next[noticeIndex] = contentMsg;
-            contentToAppend = null;
-          }
+        if (noticeIndex >= 0 && noticeIndex < prev.length) {
+          const next = prev.slice();
+          next[noticeIndex] = { role: "assistant", content: replyText };
+          return next;
         }
-
-        const append: Msg[] = [];
-        if (replyToAppend) append.push(replyToAppend);
-        if (contentToAppend) append.push(contentToAppend);
-
-        return append.length ? [...next, ...append] : next;
+        // Fallback: append if index missing/out-of-range (or in-session member).
+        return [...prev, { role: "assistant", content: replyText }];
       });
 
       // Advance the backend history used for subsequent queued messages
-      history = [...callMsgs];
-      if (replyMsg) history.push(replyMsg);
-      if (contentMsg) history.push(contentMsg);
+      history = [...callMsgs, { role: "assistant", content: replyText }];
 
       // Remove the item only after successful processing
       streamDeferredQueueRef.current.shift();
@@ -8577,12 +7029,6 @@ useEffect(() => {
       setSttFinal(text);
       sttFinalRef.current = text;
 
-      // If send() is currently blocked by loading=true, queue the STT transcript.
-      if (loadingRef.current) {
-        sttDeferredQueueRef.current.push(text);
-        return;
-      }
-
       await send(text);
     } catch (e) {
       setSttError(e?.message || "STT failed.");
@@ -8667,13 +7113,6 @@ const pauseSpeechToText = useCallback(() => {
       sttInterimRef.current = "";
       setInput("");
 
-      // If a response is still being prepared, STT auto-send would be dropped.
-      // Queue it and flush once loading clears.
-      if (loadingRef.current) {
-        sttDeferredQueueRef.current.push(text);
-        return;
-      }
-
       void sendRef.current(text);
     }, 2000);
   }, [getCurrentSttText, clearSttSilenceTimer]);
@@ -8750,7 +7189,6 @@ const pauseSpeechToText = useCallback(() => {
       setSttRunning(true);
       setSttError(null);
 
-      sttEverStartedRef.current = true;
       micGrantedRef.current = true;
       setMicGranted(true);
       // reset audio-capture fail window on successful start
@@ -8758,7 +7196,7 @@ const pauseSpeechToText = useCallback(() => {
       sttLastAudioCaptureAtRef.current = 0;
     };
 
-        const scheduleRestart = () => {
+    rec.onend = () => {
       setSttRunning(false);
 
       if (!sttEnabledRef.current || sttPausedRef.current) return;
@@ -8782,8 +7220,6 @@ const pauseSpeechToText = useCallback(() => {
       }, baseDelay + ignoreDelay);
     };
 
-    rec.onend = scheduleRestart;
-
     rec.onerror = (event: any) => {
       const code = String(event?.error || "");
 
@@ -8792,24 +7228,6 @@ const pauseSpeechToText = useCallback(() => {
       }
 
       if (code === "not-allowed" || code === "service-not-allowed") {
-        const now = Date.now();
-        const hadMic = Boolean(micGrantedRef.current || sttEverStartedRef.current);
-
-        const withinWindow = now - sttLastNotAllowedAtRef.current < 15000;
-        sttLastNotAllowedAtRef.current = now;
-        sttNotAllowedFailsRef.current = withinWindow ? sttNotAllowedFailsRef.current + 1 : 1;
-
-        // If we've ever started successfully, treat this as transient and auto-recover.
-        if (hadMic && sttNotAllowedFailsRef.current <= 8) {
-          setSttError("Microphone temporarily unavailable. Retrying…" + getEmbedHint());
-          try {
-            rec.stop?.();
-          } catch {}
-          scheduleRestart();
-          return;
-        }
-
-        // Hard denial (initial block) or repeated failures: disable STT.
         sttEnabledRef.current = false;
         sttPausedRef.current = false;
         setSttEnabled(false);
@@ -8817,10 +7235,13 @@ const pauseSpeechToText = useCallback(() => {
         clearSttSilenceTimer();
         clearSttRestartTimer();
         clearSttRecoverTimer();
+        clearSttRecoverTimer();
         setSttError("Microphone permission was blocked." + getEmbedHint());
         try {
           rec.stop?.();
-        } catch {}
+        } catch (e) {
+          // ignore
+        }
         return;
       }
 
@@ -9483,12 +7904,12 @@ const hostInStreamUi =
     avatarStatus === "reconnecting");
 
 const viewerInStreamUi = viewerHasJoinedStream;
-		// Attachments are disabled during Live Stream sessions, but should remain enabled for Live Private Conference.
-		const attachmentButtonDisabled =
-		  loading ||
-		  uploadingAttachment ||
-		  uploadsDisabled ||
-		  (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
+    // Attachments are disabled during Live Stream sessions, but should remain enabled for Live Private Conference.
+    const attachmentButtonDisabled =
+      loading ||
+      uploadingAttachment ||
+      uploadsDisabled ||
+      (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
 
 useEffect(() => {
   // Viewer STT must be disabled while in the LegacyStream stream UI to avoid transcribing the host audio.
@@ -9519,20 +7940,13 @@ const sttControls =
           void toggleSpeechToText();
         }}
         disabled={(liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ||
-                    // Viewer STT must be disabled while in the stream UI to avoid transcribing the host audio.
-                    viewerInStreamUi || (liveAvatarActive && sttEnabled)}
+                    viewerInStreamUi || (!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
         title="Audio"
         style={{
-          width: ICON_BTN_SIZE,
-          height: ICON_BTN_SIZE,
-          minWidth: ICON_BTN_SIZE,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: 0,
+          width: 44,
+          minWidth: 44,
           borderRadius: 10,
           border: "1px solid #111",
-          boxSizing: "border-box",
           background: sttEnabled ? "#b00020" : "#fff",
           color: sttEnabled ? "#fff" : "#111",
           cursor: (liveProvider === "stream" && streamCanStart && Boolean(streamEventRef) && (avatarStatus === "connected" || avatarStatus === "waiting")) ? "not-allowed" : "pointer",
@@ -9540,43 +7954,27 @@ const sttControls =
           fontWeight: 700,
         }}
       >
-        {sttEnabled ? <MicOnIcon size={ICON_20} /> : <MicOffIcon size={ICON_20} />}
+        🎤
       </button>
 
-      {!livekitUiActive && (
+      {liveProvider !== "stream" && (
         <button
           type="button"
           onClick={handleStopClick}
           disabled={!(sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference)}
-          title="Stop"
-          aria-label="Stop"
           style={{
-            width: ICON_BTN_SIZE,
-            height: ICON_BTN_SIZE,
-            minWidth: ICON_BTN_SIZE,
-            borderRadius: 10,
-            border: "1px solid #111",
-            boxSizing: "border-box",
-            background:
-              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
-                ? "#fff"
-                : "#eee",
-            color: "#111",
-            cursor:
-              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
-                ? "pointer"
-                : "not-allowed",
-            opacity:
-              sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference
-                ? 1
-                : 0.6,
-            fontWeight: 800,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
+            border: "1px solid rgba(255,255,255,0.35)",
+            background: "transparent",
+            color: "#fff",
+            width: 44,
+            height: 44,
+            borderRadius: 12,
+            cursor: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? "pointer" : "not-allowed",
+            opacity: (sttEnabled || viewerCanStopStream || hostCanStopStream || viewerCanStopConference || hostCanStopConference) ? 1 : 0.45,
+            fontWeight: 700,
           }}
         >
-          <StopIcon size={ICON_18} />
+          ■
         </button>
       )}
 </>
@@ -9702,7 +8100,7 @@ const modePillControls = (
 
 
 
-          {false && (
+          {(!rebrandingKey || String(rebrandingKey).trim() === "") && (
             <button
               type="button"
               onClick={() => {
@@ -9816,104 +8214,8 @@ const modePillControls = (
     void ensureIphoneAudioContextUnlocked();
   }, [primeLocalTtsAudio, nudgeAudioSession, ensureIphoneAudioContextUnlocked]);
 
-  const usageMeterEl = useMemo(() => {
-    const used = Number((sessionState as any)?.minutes_used ?? (sessionState as any)?.minutesUsed ?? 0) || 0;
-    const remaining = Number((sessionState as any)?.minutes_remaining ?? (sessionState as any)?.minutesRemaining ?? 0) || 0;
-    const allowed = Number((sessionState as any)?.minutes_allowed ?? (sessionState as any)?.minutesAllowed ?? 0) || 0;
-    const total = (used + remaining) > 0 ? (used + remaining) : allowed;
-    if (!total || total <= 0) return null;
-
-    const pct = Math.max(0, Math.min(1, used / total));
-    const remainingComputed = remaining > 0 ? remaining : Math.max(0, total - used);
-    const pctLabel = `${Math.round(pct * 100)}%`;
-
-    return (
-      <div style={{ marginTop: 8, maxWidth: isMobileUI ? "100%" : 440 }}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "baseline",
-            justifyContent: "space-between",
-            gap: 10,
-            fontSize: 16,
-            color: "#666",
-          }}
-        >
-          <span style={{ fontWeight: 700 }}>Usage</span>
-          <span style={{ whiteSpace: "nowrap" }}>
-            {used} / {total} min • {remainingComputed} left
-          </span>
-        </div>
-
-        <div
-          role="progressbar"
-          aria-label={`Usage: ${used} of ${total} minutes`}
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={Math.round(pct * 100)}
-          style={{
-            marginTop: 4,
-            height: ui.usageBarHeight,
-            borderRadius: 999,
-            background: "rgba(0,0,0,0.12)",
-            overflow: "hidden",
-          }}
-          title={`${used}/${total} min (${pctLabel})`}
-        >
-          <div
-            style={{
-              width: `${Math.round(pct * 100)}%`,
-              height: "100%",
-              background: "rgba(0,0,0,0.65)",
-            }}
-          />
-        </div>
-      </div>
-    );
-  }, [
-    sessionState,
-    isMobileUI,
-    ui.meta,
-    ui.usageBarHeight,
-  ]);
-
   return (
-    <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={mainContainerStyle}>
-
-{startupOverlayOpen ? (
-  <div
-    style={{
-      position: "fixed",
-      inset: 0,
-      zIndex: 1000001,
-      background: "#fff",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      pointerEvents: "all",
-    }}
-  >
-    {startupOverlayName ? (
-      <div
-        style={{
-          padding: "12px 16px",
-          borderRadius: 14,
-          background: "#111827",
-          color: "#fff",
-          border: "1px solid rgba(255,255,255,0.18)",
-          boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
-          fontSize: 16,
-          fontWeight: 700,
-          letterSpacing: 0.2,
-          maxWidth: "min(92vw, 520px)",
-          textAlign: "center",
-        }}
-      >
-        ...waiting on {startupOverlayName}
-      </div>
-    ) : null}
-  </div>
-) : null}
+    <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       {/* Hidden audio element for audio-only TTS (mic mode) */}
       <audio ref={localTtsAudioRef} style={{ display: "none" }} />
       {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
@@ -9997,14 +8299,7 @@ const modePillControls = (
                 </div>
 
                 <input
-                  // NOTE: type="text" avoids any browser/device-level character filtering.
-                  // We validate the email on submit; do not restrict characters while typing.
-                  type="text"
-                  inputMode="email"
-                  autoComplete="email"
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  spellCheck={false}
+                  type="email"
                   value={topupEmail}
                   onChange={(e) => {
                     setTopupEmail(e.target.value);
@@ -10279,8 +8574,8 @@ const modePillControls = (
         </div>
       ) : null}
 
-      <header style={{ display: "flex", alignItems: isMobileUI ? "flex-start" : "center", gap: isMobileUI ? 10 : 12, marginBottom: isMobileUI ? 8 : 10, flexWrap: "wrap", rowGap: isMobileUI ? 6 : 0 }}>
-        <div aria-hidden onClick={secretDebugTap} style={{ width: ui.avatar, height: ui.avatar, borderRadius: "50%", overflow: "hidden" }}>
+      <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
           <img
             // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
             src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
@@ -10295,12 +8590,12 @@ const modePillControls = (
           />
         </div>
         <div>
-          <h1 style={{ margin: 0, fontSize: ui.title }}>{companyName}</h1>
-          <div style={{ fontSize: ui.meta, color: "#666" }}>
+          <h1 style={{ margin: 0, fontSize: 22 }}>{companyName}</h1>
+          <div style={{ fontSize: 12, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
             <b>{displayPlanLabel(planName, memberId, planLabelOverride)}</b>
           </div>
-          <div style={{ fontSize: ui.meta, color: "#666" }}>
+          <div style={{ fontSize: 12, color: "#666" }}>
             Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
             {chatStatus === "explicit_allowed" ? (
               <span style={{ marginLeft: 8, color: "#0a7a2f" }}>• Consent: Allowed</span>
@@ -10308,8 +8603,6 @@ const modePillControls = (
               <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
             ) : null}
           </div>
-	          {/* On mobile, push usage to the bottom to maximize above-the-fold space. */}
-	          {!isMobileUI && usageMeterEl}
           {liveProvider === "stream" ? (
             <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
               {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
@@ -10344,7 +8637,7 @@ const modePillControls = (
                     fontWeight: 700,
                   }}
                 >
-					● {hostInStreamUi ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}` : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
+          ● {hostInStreamUi ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}` : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
                 </span>
               ) : null}
             </div>
@@ -10435,16 +8728,9 @@ const modePillControls = (
         }}
         disabled={liveProvider === "stream" ? (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) : false}
         style={{
-          width: ICON_BTN_SIZE,
-          height: ICON_BTN_SIZE,
-          minWidth: ICON_BTN_SIZE,
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: 0,
+          padding: "10px 14px",
           borderRadius: 10,
           border: "1px solid #111",
-          boxSizing: "border-box",
           background: "#fff",
           color: "#111",
           cursor:
@@ -10467,69 +8753,69 @@ const modePillControls = (
         title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
       >
         {liveProvider === "stream" ? (
-          <PlayIcon size={ICON_18} />
+          <PlayIcon />
         ) : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" ? (
-          <PauseIcon size={ICON_18} />
+          <PauseIcon />
         ) : (
-          <PlayIcon size={ICON_18} />
+          <PlayIcon />
         )}
       </button>
 
       
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
       {sttControls}
-	      {liveProvider === "stream" &&
-	        ((isHost &&
-	          ((sessionKind === "conference" && Boolean(livekitToken)) ||
-	            (sessionKind === "stream" && sessionActive))) ||
-	          (!isHost && sessionKind === "conference" && Boolean(livekitToken))) ? (	          <button
-	            type="button"
-	            onClick={async () => {
-	              const next = !livekitMicEnabled;
-	              if (next) {
-	                const ok = await requestLivekitAvPermissions({
-	                  audio: true,
-	                  video: sessionKind === "conference",
-	                  reason: "enabling microphone/camera",
-	                });
-	                if (!ok) return;
-	              }
-	              setLivekitMicEnabled(next);
-	              if (sessionKind === "conference") {
-	                setLivekitCameraEnabled(next);
-	              }
-	            }}
-	            style={{
-	              ...smallBtn,
-	              background: livekitMicEnabled ? "#1b5e20" : "#eee",
-	              color: livekitMicEnabled ? "#fff" : "#222",
-	            }}
-	            title={livekitMicEnabled ? "Mute Mic" : "Unmute Mic"}
-	          >
-	            🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
-	          </button>
-	        ) : null}
+        {liveProvider === "stream" &&
+          ((isHost &&
+            ((sessionKind === "conference" && Boolean(livekitToken)) ||
+              (sessionKind === "stream" && sessionActive))) ||
+            (!isHost && sessionKind === "conference" && Boolean(livekitToken))) ? (	          <button
+              type="button"
+              onClick={async () => {
+                const next = !livekitMicEnabled;
+                if (next) {
+                  const ok = await requestLivekitAvPermissions({
+                    audio: true,
+                    video: sessionKind === "conference",
+                    reason: "enabling microphone/camera",
+                  });
+                  if (!ok) return;
+                }
+                setLivekitMicEnabled(next);
+                if (sessionKind === "conference") {
+                  setLivekitCameraEnabled(next);
+                }
+              }}
+              style={{
+                ...smallBtn,
+                background: livekitMicEnabled ? "#1b5e20" : "#eee",
+                color: livekitMicEnabled ? "#fff" : "#222",
+              }}
+              title={livekitMicEnabled ? "Mute Mic" : "Unmute Mic"}
+            >
+              🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
+            </button>
+          ) : null}
 
-	      {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
-	        <button
-	          type="button"
-	          onClick={() => {
-	            setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
-	          }}
-	          style={{
-	            ...smallBtn,
-	            background: conferenceViewMode === "focus" ? "#111" : "#eee",
-	            color: conferenceViewMode === "focus" ? "#fff" : "#222",
-	          }}
-	          title={
-	            conferenceViewMode === "focus"
-	              ? "Show split view (both participants)"
-	              : "Show full view (other participant only)"
-	          }
-	        >
-	          {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
-	        </button>
-	      ) : null}
+        {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
+          <button
+            type="button"
+            onClick={() => {
+              setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
+            }}
+            style={{
+              ...smallBtn,
+              background: conferenceViewMode === "focus" ? "#111" : "#eee",
+              color: conferenceViewMode === "focus" ? "#fff" : "#222",
+            }}
+            title={
+              conferenceViewMode === "focus"
+                ? "Show split view (both participants)"
+                : "Show full view (other participant only)"
+            }
+          >
+            {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
+          </button>
+        ) : null}
 {liveProvider === "stream" &&
         ((isHost && sessionActive) ||
           (!isHost &&
@@ -10546,7 +8832,7 @@ const modePillControls = (
           }}
           title={isHost ? "Stop live session" : "Leave session"}
         >
-          <StopIcon size={ICON_18} />
+          <StopIcon />
         </button>
       ) : null}
 
@@ -10572,7 +8858,7 @@ const modePillControls = (
         </button>
       ) : null}
 
-      <div style={{ fontSize: ui.meta, color: "#666" }}>
+      <div style={{ fontSize: 12, color: "#666" }}>
         {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}:{" "}
         <b>{avatarStatus}</b>
         {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
@@ -10596,13 +8882,13 @@ const modePillControls = (
         >
           {showAvatarFrame ? (
             <div
-	              style={{
-	                flex:
-	                  liveProvider === "stream" && sessionKind === "conference"
-	                    ? "2 1 0"
-	                    : liveProvider === "stream" && !isHost
-	                      ? "2 1 0"
-	                      : "0 0 360px",
+                style={{
+                  flex:
+                    liveProvider === "stream" && sessionKind === "conference"
+                      ? "2 1 0"
+                      : liveProvider === "stream" && !isHost
+                        ? "2 1 0"
+                        : "0 0 360px",
                 minWidth: liveProvider === "stream" && !isHost ? 320 : 280,
                 maxWidth: "100%",
               }}
@@ -10623,11 +8909,11 @@ const modePillControls = (
                     token={livekitToken}
                     serverUrl={livekitServerUrl || LIVEKIT_URL}
                     connect={Boolean(livekitToken)}
-	                    audio={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
-	                    video={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
+                      audio={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
+                      video={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                     onConnected={() => {
-	                      // Host: once connected we treat the session as active.
-	                      if (isHost) setSessionActive(true);
+                        // Host: once connected we treat the session as active.
+                        if (isHost) setSessionActive(true);
                       // Conference: track that we've joined the room.
                       if (sessionKind === "conference") setConferenceJoined(true);
                     }}
@@ -10654,22 +8940,22 @@ const modePillControls = (
                       cameraEnabled={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                       onError={(msg) => setStreamNotice(msg)}
                     />
-	                    {sessionKind === "conference" ? (
-	                      <LiveKitPrivateConferenceStage viewMode={conferenceViewMode} />
-	                    ) : livekitRole === "viewer" && sessionKind === "stream" ? (
-	                      <LiveKitStreamViewerStage />
-	                    ) : (
-	                      <VideoConference
-	                        chatMessageFormatter={undefined as any}
-	                        onError={(e: any) => {
-	                          console.warn("LiveKit UI error", e);
-	                        }}
-	                      />
-	                    )}
+                      {sessionKind === "conference" ? (
+                        <LiveKitPrivateConferenceStage viewMode={conferenceViewMode} />
+                      ) : livekitRole === "viewer" && sessionKind === "stream" ? (
+                        <LiveKitStreamViewerStage />
+                      ) : (
+                        <VideoConference
+                          chatMessageFormatter={undefined as any}
+                          onError={(e: any) => {
+                            console.warn("LiveKit UI error", e);
+                          }}
+                        />
+                      )}
 
                     {livekitRole === "viewer" && (sessionKind === "stream" || sessionKind === "conference") ? null : <StartAudio label="Enable audio" />}
 
-						{livekitRole === "host" && livekitPendingUnique.length > 0 ? (
+            {livekitRole === "host" && livekitPendingUnique.length > 0 ? (
                       <div
                         style={{
                           position: "absolute",
@@ -10694,7 +8980,7 @@ const modePillControls = (
                         >
                           <div style={{ fontWeight: 700, marginBottom: 8 }}>Join Requests</div>
                           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-							{livekitPendingUnique.map((req) => (
+              {livekitPendingUnique.map((req) => (
                               <div
                                 key={req.requestId}
                                 style={{
@@ -10847,7 +9133,7 @@ const modePillControls = (
                   ) : null
                 ) : null}
 
-				{showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
+        {showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
                   <div
                     style={{
                       position: "absolute",
@@ -10877,13 +9163,13 @@ const modePillControls = (
 
           <div
                     style={{
-	                    flex: showAvatarFrame
-	                      ? (liveProvider === "stream" && sessionKind === "conference"
-	                          ? "1 1 0"
-	                          : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
-	                            ? "1 1 0"
-	                            : "2 1 0")
-	                      : "1 1 0",
+                      flex: showAvatarFrame
+                        ? (liveProvider === "stream" && sessionKind === "conference"
+                            ? "1 1 0"
+                            : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
+                              ? "1 1 0"
+                              : "2 1 0")
+                        : "1 1 0",
                       minWidth: 280,
                       height: conversationHeight,
                       display: "flex",
@@ -10902,41 +9188,16 @@ const modePillControls = (
                         background: "#fff",
                       }}
                     >
-
-                      {!isHost && Boolean((sessionState as any)?.host_override_active) ? (
-                        <div
-                          style={{
-                            padding: "10px 12px",
-                            borderRadius: 10,
-                            border: "1px solid rgba(255,255,255,0.18)",
-                            background: "rgba(0,0,0,0.25)",
-                            marginBottom: 10,
-                            fontSize: 14,
-                          }}
-                        >
-                          <b>Host override active.</b> You are now chatting with a human companion.
-                        </div>
-                      ) : null}
-
                       {(livekitUiActive
                         ? messages.filter((x: any) => Boolean((x as any)?.meta?.liveChat))
                         : messages.filter((x: any) => !Boolean((x as any)?.meta?.liveChat))
                       ).map((m, i) => {
                         const meta: any = (m as any).meta;
-                        
-                        const isHostMsg =
-                          m.role === "assistant" && String(meta?.sender || "") === "host";
-                        const isSystemMsg =
-                          m.role === "assistant" && String(meta?.sender || "") === "system";
                         const displayName =
                           meta?.liveChat && meta?.name
                             ? String(meta.name)
                             : m.role === "assistant"
-                            ? isSystemMsg
-                              ? "System"
-                              : isHostMsg
-                                ? `${(companionName || DEFAULT_COMPANION_NAME)} (Host)`
-                                : (companionName || DEFAULT_COMPANION_NAME)
+                            ? (companionName || DEFAULT_COMPANION_NAME)
                             : "You";
 
                         return (
@@ -10959,39 +9220,16 @@ const modePillControls = (
 
                     <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>
                       {/** Input line with mode pills moved to the right (layout-only). */}
-
-{isHost ? (
-  <button
-    type="button"
-    onClick={() => {
-      setHostConsoleOpen(true);
-      setHostNotice("");
-    }}
-    style={{
-      padding: "10px 12px",
-      borderRadius: 10,
-      border: "1px solid rgba(255,255,255,0.35)",
-      background: "rgba(0,0,0,0.22)",
-      color: "white",
-      cursor: "pointer",
-    }}
-    title="Host console (AI chat takeover)"
-  >
-    Host Console
-  </button>
-) : null}
-
                       <button
                             type="button"
                             onClick={requestSaveChatSummary}
                             title="Save"
                             aria-label="Save"
                             style={{
-                              width: ICON_BTN_SIZE,
-                              height: ICON_BTN_SIZE,
+                              width: 44,
+                              height: 44,
                               borderRadius: 10,
                               border: "1px solid #bbb",
-                              boxSizing: "border-box",
                               background: "#fff",
                               cursor: "pointer",
                               opacity: 1,
@@ -11000,7 +9238,7 @@ const modePillControls = (
                               justifyContent: "center",
                             }}
                           >
-                            <SaveIcon size={ICON_18} />
+                            <SaveIcon size={18} />
                           </button>
 
                           <button
@@ -11009,11 +9247,10 @@ const modePillControls = (
                             title="Clear"
                             aria-label="Delete"
                             style={{
-                              width: ICON_BTN_SIZE,
-                              height: ICON_BTN_SIZE,
+                              width: 44,
+                              height: 44,
                               borderRadius: 10,
                               border: "1px solid #bbb",
-                              boxSizing: "border-box",
                               background: "#fff",
                               cursor: "pointer",
                               opacity: 1,
@@ -11022,7 +9259,7 @@ const modePillControls = (
                               justifyContent: "center",
                             }}
                           >
-                            <TrashIcon size={ICON_18} />
+                            <TrashIcon size={18} />
                           </button>
 
                       {/* Attachment upload (images only) */}
@@ -11033,31 +9270,20 @@ const modePillControls = (
                         style={{ display: "none" }}
                         onChange={onAttachmentSelected}
                       />
-	                  <button
-	                    onClick={openUploadPicker}
-	                    disabled={attachmentButtonDisabled}
+                    <button
+                      onClick={openUploadPicker}
+                      disabled={attachmentButtonDisabled}
                         title={
                           uploadsDisabled || hostInStreamUi || viewerInStreamUi
                             ? "Attachments are disabled during Shared Live streaming."
                             : "Attach a file"
                         }
-	                    style={{
-	                      width: ICON_BTN_SIZE,
-	                      height: ICON_BTN_SIZE,
-	                      minWidth: ICON_BTN_SIZE,
-	                      padding: 0,
-	                      borderRadius: 10,
-	                      border: "1px solid #bbb",
-	                      boxSizing: "border-box",
-	                      display: "inline-flex",
-	                      alignItems: "center",
-	                      justifyContent: "center",
-	                      background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
-	                      cursor: attachmentButtonDisabled ? "not-allowed" : "pointer",
-	                      opacity: attachmentButtonDisabled ? 0.6 : 1,
-	                      lineHeight: "18px",
-	                      fontSize: 18,
-	                    }}
+                      className="rounded border border-gray-300 px-3 py-2 text-sm"
+                      style={{
+                        height: 44,
+                        minWidth: 44,
+                        background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
+                      }}
                         type="button"
                       >
                         {uploadingAttachment ? "⏳" : "📎"}
@@ -11178,7 +9404,7 @@ const modePillControls = (
                             ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
                             : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
                             ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
-                            : "Click microphone or type message to talk with me…"
+                            : "Type a message…"
                         }
                         style={{
                           flex: 1,
@@ -11205,12 +9431,9 @@ const modePillControls = (
 
                     </div>
 
-          	          {sttError ? (
-          	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-          	          ) : null}
-
-	          {/* Mobile: move the usage meter below the input box to maximize above-the-fold space. */}
-	          {isMobileUI ? usageMeterEl : null}
+                      {sttError ? (
+                        <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+                      ) : null}
 
                     {/* LiveKit Broadcast overlay (Host-only) */}
                     {showBroadcastButton && showBroadcasterOverlay ? (
@@ -11378,7 +9601,7 @@ const modePillControls = (
             </div>
             <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
               Saving stores a server-side summary of this conversation for future reference across your devices.
-              By selecting <b>Yes, save</b>, you authorize your AI companion to store chat summary data associated with your
+              By selecting <b>Yes, save</b>, you authorize AI Elara to store chat summary data associated with your
               account for later use.
               <div style={{ marginTop: 8 }}>
                 All audio, video, and mic listening have been stopped. You can resume manually using the controls
@@ -11540,23 +9763,6 @@ const modePillControls = (
                   prevSessionActiveRef.current = false;
 
                   setMessages([]);
-                  // Also reset any in-session summary digests so we don't leak old context into a new conversation.
-                  setSessionState((prev) => ({
-                    ...(prev as any),
-                    conversation_summaries: [],
-                    conversationSummaries: [],
-                    summary_dropped_count: 0,
-                    summaryDroppedCount: 0,
-                  }));
-                  try {
-                    sessionStateRef.current = {
-                      ...(sessionStateRef.current as any),
-                      conversation_summaries: [],
-                      conversationSummaries: [],
-                      summary_dropped_count: 0,
-                      summaryDroppedCount: 0,
-                    } as any;
-                  } catch (e) {}
                   setInput("");
                   try { if (inputElRef.current) inputElRef.current.value = ""; } catch (e) {}
                   setShowClearMessagesConfirm(false);
@@ -11580,648 +9786,6 @@ const modePillControls = (
           </div>
         </div>
       )}
-
-
-{/* Host console overlay (AI chat takeover) */}
-{hostConsoleOpen && isHost ? (
-  <div
-    style={{
-      position: "fixed",
-      inset: 0,
-      background: "rgba(0,0,0,0.55)",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: 16,
-      zIndex: 50,
-    }}
-    onClick={() => setHostConsoleOpen(false)}
-  >
-    <div
-      style={{
-        width: "min(1200px, 100%)",
-        maxHeight: "min(860px, 92vh)",
-        overflow: "hidden",
-        background: "rgba(20,20,24,0.98)",
-        border: "1px solid rgba(255,255,255,0.22)",
-        borderRadius: 14,
-        padding: 14,
-        color: "white",
-      }}
-      onClick={(e) => e.stopPropagation()}
-    >
-
-      {hostPendingModalOpen && hostPendingContent.length > 0 ? (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            zIndex: 60,
-            background: "rgba(0,0,0,0.65)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-          }}
-          onClick={() => setHostPendingModalOpen(false)}
-        >
-          <div
-            style={{
-              width: "min(760px, 100%)",
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
-              <div>
-                <div style={{ fontWeight: 700, fontSize: 16 }}>Scheduled content ready</div>
-                <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
-                  This session is overridden. Push when you’re ready{" "}
-                  {hostPendingContent.length > 1 ? `(${hostPendingContent.length} queued)` : ""}.
-                </div>
-              </div>
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "transparent",
-                  borderRadius: 8,
-                  padding: "6px 10px",
-                  cursor: "pointer",
-                }}
-                onClick={() => setHostPendingModalOpen(false)}
-              >
-                ✕
-              </button>
-            </div>
-
-            <div style={{ marginTop: 12 }}>
-              {(() => {
-                const item = hostPendingContent[0];
-                const msg = item?.content ? buildContentAssistantMsg(item.content) : null;
-
-                return (
-                  <div>
-                    <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 8 }}>
-                      {item?.content?.stage ? `Stage: ${item.content.stage}` : ""}
-                      {typeof item?.triggerMinute === "number" ? ` • Trigger minute: ${item.triggerMinute}` : ""}
-                    </div>
-
-                    <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 10, padding: 12 }}>
-                      {msg ? renderMsgContent(msg) : <div style={{ fontSize: 13, opacity: 0.8 }}>No preview available.</div>}
-                    </div>
-                  </div>
-                );
-              })()}
-            </div>
-
-            {hostPendingActionErr ? (
-              <div style={{ marginTop: 10, color: "#b00020", fontSize: 13 }}>{hostPendingActionErr}</div>
-            ) : null}
-
-            <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "transparent",
-                  borderRadius: 10,
-                  padding: "10px 12px",
-                  cursor: "pointer",
-                }}
-                onClick={() => setHostPendingModalOpen(false)}
-              >
-                Later
-              </button>
-
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "rgba(0,0,0,0.06)",
-                  borderRadius: 10,
-                  padding: "10px 12px",
-                  cursor: "pointer",
-                }}
-                onClick={() => hostPushPendingContent(hostPendingContent[0].token)}
-              >
-                Push to chat
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {/* Host guidelines modal */}
-      {hostGuidelinesOpen ? (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            zIndex: 65,
-            background: "rgba(0,0,0,0.65)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-          }}
-          onClick={() => setHostGuidelinesOpen(false)}
-        >
-          <div
-            style={{
-              width: "min(820px, 100%)",
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
-              <div>
-                <div style={{ fontWeight: 800, fontSize: 16 }}>AI interaction guidelines</div>
-                <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
-                  These rules are stored for this companion and applied to all future chats.
-                  If they conflict with default onboarding, <b>these guidelines take precedence</b>.
-                </div>
-              </div>
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "transparent",
-                  borderRadius: 8,
-                  padding: "6px 10px",
-                  cursor: "pointer",
-                }}
-                onClick={() => setHostGuidelinesOpen(false)}
-              >
-                ✕
-              </button>
-            </div>
-
-            <div style={{ marginTop: 12 }}>
-              <textarea
-                value={hostGuidelinesText}
-                onChange={(e) => {
-                  setHostGuidelinesText(e.target.value);
-                  if (hostGuidelinesStatus === "Saved" || hostGuidelinesStatus === "Loaded") {
-                    setHostGuidelinesStatus("");
-                  }
-                }}
-                placeholder="Examples: Off-limits topics, preferred terms of endearment (e.g., call viewers “papi”), tone/style constraints…"
-                style={{
-                  width: "100%",
-                  minHeight: 220,
-                  borderRadius: 10,
-                  border: "1px solid rgba(0,0,0,0.18)",
-                  padding: 12,
-                  fontSize: 14,
-                  lineHeight: 1.4,
-                  outline: "none",
-                  resize: "vertical",
-                }}
-              />
-              {hostGuidelinesError ? (
-                <div style={{ marginTop: 10, color: "#b00020", fontSize: 13 }}>{hostGuidelinesError}</div>
-              ) : null}
-
-              <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
-                {hostGuidelinesStatus ? (
-                  <span style={{ fontWeight: 700, opacity: 0.95 }}>{hostGuidelinesStatus}</span>
-                ) : null}
-                {hostGuidelinesStatus ? " • " : null}
-                Saved: {hostGuidelinesSaved ? "Yes" : "No"} • Characters: {String(hostGuidelinesText || "").length}
-              </div>
-            </div>
-
-            <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "transparent",
-                  borderRadius: 10,
-                  padding: "10px 12px",
-                  cursor: "pointer",
-                }}
-                onClick={() => {
-                  // Revert draft to last saved value
-                  setHostGuidelinesText(hostGuidelinesSaved || "");
-                }}
-                disabled={hostGuidelinesLoading}
-              >
-                Revert
-              </button>
-
-              <button
-                style={{
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: "rgba(0,0,0,0.06)",
-                  borderRadius: 10,
-                  padding: "10px 12px",
-                  cursor: "pointer",
-                }}
-                onClick={() => void saveHostGuidelines()}
-                disabled={hostGuidelinesLoading}
-              >
-                {hostGuidelinesLoading ? "Saving…" : "Save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 12,
-        }}
-      >
-        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          <div style={{ fontSize: 18, fontWeight: 700 }}>
-            Host Console
-          </div>
-          <div style={{ fontSize: 12, opacity: 0.82 }}>
-            {companyName} · {companionName || DEFAULT_COMPANION_NAME}
-          </div>
-        </div>
-
-        <button
-          type="button"
-          onClick={() => {
-            setHostGuidelinesError("");
-            setHostGuidelinesOpen(true);
-            void loadHostGuidelines();
-          }}
-          style={{
-            border: "1px solid rgba(0,0,0,0.12)",
-            background: "rgba(0,0,0,0.04)",
-            borderRadius: 10,
-            padding: "8px 10px",
-            cursor: "pointer",
-            fontSize: 12,
-            marginRight: 8,
-          }}
-          title="Edit AI companion interaction guidelines (persisted)"
-        >
-          AI Guidelines
-        </button>
-
-        {hostPendingContent.length > 0 ? (
-          <button
-            type="button"
-            onClick={() => {
-              setHostPendingActionErr(null);
-              setHostPendingModalOpen(true);
-            }}
-            style={{
-              border: "1px solid rgba(0,0,0,0.12)",
-              background: "rgba(0,0,0,0.04)",
-              borderRadius: 10,
-              padding: "8px 10px",
-              cursor: "pointer",
-              fontSize: 12,
-              marginRight: 8,
-            }}
-          >
-            Pending ({hostPendingContent.length})
-          </button>
-        ) : null}
-
-        <button
-          type="button"
-          onClick={() => setHostConsoleOpen(false)}
-          style={{
-            padding: "8px 10px",
-            borderRadius: 10,
-            border: "1px solid rgba(255,255,255,0.28)",
-            background: "rgba(0,0,0,0.28)",
-            color: "white",
-            cursor: "pointer",
-          }}
-        >
-          Close
-        </button>
-      </div>
-
-      {hostActiveError ? (
-        <div style={{ marginTop: 10, color: "#ffb3b3", fontSize: 13 }}>
-          {hostActiveError}
-        </div>
-      ) : null}
-
-      {hostNotice ? (
-        <div style={{ marginTop: 10, color: "#fff1b3", fontSize: 13 }}>
-          {hostNotice}
-        </div>
-      ) : null}
-
-      <div
-        style={{
-          marginTop: 12,
-          display: "grid",
-          gridTemplateColumns: isMobileUI ? "1fr" : isTabletUI ? "320px 1fr" : "360px 1fr",
-          gap: 12,
-          height: "calc(min(860px, 92vh) - 170px)",
-        }}
-      >
-        {/* Left: Active chats */}
-        <div
-          style={{
-            border: "1px solid rgba(255,255,255,0.16)",
-            borderRadius: 12,
-            padding: 10,
-            overflow: "auto",
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: 10,
-              marginBottom: 10,
-            }}
-          >
-            <div style={{ fontWeight: 700 }}>Active chats</div>
-            <div style={{ fontSize: 12, opacity: 0.8 }}>
-              {hostActiveLoading ? "Loading…" : `${hostActiveChats.length}`}
-            </div>
-          </div>
-
-          {hostActiveChats.length === 0 && !hostActiveLoading ? (
-            <div style={{ fontSize: 13, opacity: 0.8 }}>
-              No active sessions detected yet.
-            </div>
-          ) : null}
-
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {hostActiveChats.map((c) => {
-              const isSelected = c.session_id === hostSelectedSessionId;
-              const memberLabel =
-                (String((c as any).user_name || "").trim() ||
-                  (c.member_id || "").trim() ||
-                  "anonymous / visitor");
-              const mins =
-                typeof c.minutes_remaining === "number"
-                  ? c.minutes_remaining
-                  : undefined;
-
-              return (
-                <button
-                  key={c.session_id}
-                  type="button"
-                  onClick={() => hostSelectSession(c.session_id)}
-                  style={{
-                    textAlign: "left",
-                    padding: "10px 10px",
-                    borderRadius: 12,
-                    border: isSelected
-                      ? "1px solid rgba(255,255,255,0.55)"
-                      : "1px solid rgba(255,255,255,0.14)",
-                    background: isSelected
-                      ? "rgba(255,255,255,0.10)"
-                      : "rgba(0,0,0,0.20)",
-                    color: "white",
-                    cursor: "pointer",
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                    <div style={{ fontWeight: 700, fontSize: 13 }}>
-                      {memberLabel}
-                    </div>
-                    <div style={{ fontSize: 12, opacity: 0.85 }}>
-                      {typeof c.unread === "number" && c.unread > 0
-                        ? `• ${c.unread} new`
-                        : ""}
-                    </div>
-                  </div>
-
-                  <div style={{ display: "flex", gap: 10, marginTop: 6, fontSize: 12, opacity: 0.85 }}>
-                    <div>
-                      {c.override_active ? "Override: ON" : "Override: off"}
-                    </div>
-                    {typeof mins === "number" ? <div>Minutes: {mins}</div> : null}
-                  </div>
-
-                  {c.summary ? (
-                    <div style={{ marginTop: 8, fontSize: 12, opacity: 0.9, whiteSpace: "pre-wrap" }}>
-                      {c.summary}
-                    </div>
-                  ) : (
-                    <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7 }}>
-                      (No summary yet)
-                    </div>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Right: Selected transcript + controls */}
-        <div
-          style={{
-            border: "1px solid rgba(255,255,255,0.16)",
-            borderRadius: 12,
-            padding: 10,
-            display: "flex",
-            flexDirection: "column",
-            overflow: "hidden",
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-            <div style={{ fontWeight: 700 }}>
-              {hostSelectedSessionId ? "Session" : "Select a session"}
-            </div>
-
-            {hostSelectedSessionId ? (
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                {(() => {
-                  const selected = hostActiveChats.find(
-                    (c) => c.session_id === hostSelectedSessionId
-                  );
-                  const overrideOn = Boolean(selected?.override_active);
-                  return (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => hostSetOverride(!overrideOn)}
-                        style={{
-                          padding: "8px 10px",
-                          borderRadius: 10,
-                          border: "1px solid rgba(255,255,255,0.28)",
-                          background: overrideOn
-                            ? "rgba(120,255,170,0.18)"
-                            : "rgba(0,0,0,0.28)",
-                          color: "white",
-                          cursor: "pointer",
-                        }}
-                        title="Toggle host override for this session"
-                      >
-                        {overrideOn ? "End override" : "Enable override"}
-                      </button>
-                    </>
-                  );
-                })()}
-              </div>
-            ) : null}
-          </div>
-
-          {hostSelectedSessionId ? (
-            <div style={{ fontSize: 12, opacity: 0.78, marginTop: 6 }}>
-              {hostSelectedSessionId}
-            </div>
-          ) : null}
-
-          <div
-            style={{
-              marginTop: 10,
-              flex: 1,
-              overflow: "auto",
-              borderRadius: 10,
-              border: "1px solid rgba(255,255,255,0.12)",
-              padding: 10,
-              background: "rgba(0,0,0,0.20)",
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
-            {hostSelectedSessionId && hostSelectedEvents.length === 0 ? (
-              <div style={{ fontSize: 13, opacity: 0.75 }}>
-                Waiting for messages…
-              </div>
-            ) : null}
-
-            {hostSelectedEvents.map((ev, idx) => {
-              const sender = String((ev as any).sender || "");
-              const selected = hostActiveChats.find(
-                (c) => c.session_id === hostSelectedSessionId
-              );
-              const userName = String(
-                (ev as any).user_name || (selected as any)?.user_name || ""
-              ).trim();
-              const companionLabel = String(
-                (companionName || DEFAULT_COMPANION_NAME) ?? ""
-              ).trim();
-              const label =
-                sender === "user"
-                  ? (userName || "User")
-                  : sender === "host"
-                    ? `${companionLabel} (Host)`
-                    : sender === "ai" || sender === "xai"
-                      ? (companionLabel || "AI")
-                      : "System";
-
-              return (
-                <div key={`${(ev as any).seq || idx}`} style={{ fontSize: 13, lineHeight: 1.35 }}>
-                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 2 }}>
-                    {label}
-                  </div>
-                  <div style={{ whiteSpace: "pre-wrap" }}>
-                    {String((ev as any).content || "")}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {hostSttError ? (
-            <div style={{ fontSize: 12, color: "#ffb3b3", marginTop: 8 }}>
-              {hostSttError}
-            </div>
-          ) : null}
-
-          <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "stretch" }}>
-            {(() => {
-              const selected = hostActiveChats.find(
-                (c) => c.session_id === hostSelectedSessionId
-              );
-              const overrideOn = Boolean(selected?.override_active);
-              const sttDisabled = !hostSelectedSessionId || !overrideOn;
-
-              return (
-                <button
-                  onClick={() => {
-                    if (sttDisabled) return;
-                    if (hostSttRecording) hostStopStt();
-                    else hostStartStt();
-                  }}
-                  disabled={sttDisabled}
-                  title={
-                    sttDisabled
-                      ? "Enable override to use STT"
-                      : hostSttRecording
-                        ? "Stop recording"
-                        : "Start recording"
-                  }
-                  style={{
-                    width: ICON_BTN_SIZE,
-                    height: ICON_BTN_SIZE,
-                    minWidth: ICON_BTN_SIZE,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    borderRadius: 12,
-                    border: "1px solid rgba(255,255,255,0.22)",
-                    boxSizing: "border-box",
-                    background: hostSttRecording
-                      ? "rgba(255,0,0,0.25)"
-                      : "rgba(0,0,0,0.22)",
-                    color: "white",
-                    cursor: sttDisabled ? "not-allowed" : "pointer",
-                    opacity: sttDisabled ? 0.55 : 1,
-                  }}
-                >
-                  {hostSttRecording ? "■" : "🎤"}
-                </button>
-              );
-            })()}
-            <textarea
-              value={hostSendText}
-              onChange={(e) => setHostSendText(e.target.value)}
-              placeholder="Send a host message…"
-              style={{
-                flex: 1,
-                minHeight: 44,
-                maxHeight: 140,
-                resize: "vertical",
-                padding: "10px 10px",
-                borderRadius: 12,
-                border: "1px solid rgba(255,255,255,0.22)",
-                background: "rgba(0,0,0,0.22)",
-                color: "white",
-                outline: "none",
-                fontSize: 14,
-              }}
-              disabled={!hostSelectedSessionId}
-            />
-
-            <button
-              type="button"
-              onClick={hostSendMessage}
-              style={{
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid rgba(255,255,255,0.28)",
-                background: "rgba(0,0,0,0.28)",
-                color: "white",
-                cursor: "pointer",
-                minWidth: 92,
-              }}
-              disabled={!hostSelectedSessionId || !hostSendText.trim()}
-            >
-              Send
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-) : null}
-
 
 {/* Consent overlay */}
       {showConsentOverlay && (
