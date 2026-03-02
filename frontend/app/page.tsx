@@ -1513,9 +1513,9 @@ export default function Page() {
   const isMobileUI = viewportMode === "mobile";
   const isTabletUI = viewportMode === "tablet";
 
-  // Icon sizing: reduce by 25% on mobile for better density.
+  // Icon sizing: on mobile, force all icons to the same pixel size (13.5px).
   const ICON_18 = isMobileUI ? 13.5 : 18;
-  const ICON_20 = isMobileUI ? 15 : 20;
+  const ICON_20 = isMobileUI ? 13.5 : 20;
 
   const ui = useMemo(
     () => {
