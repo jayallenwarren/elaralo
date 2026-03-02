@@ -1513,6 +1513,10 @@ export default function Page() {
   const isMobileUI = viewportMode === "mobile";
   const isTabletUI = viewportMode === "tablet";
 
+  // Icon sizing: reduce by 25% on mobile for better density.
+  const ICON_18 = isMobileUI ? 13.5 : 18;
+  const ICON_20 = isMobileUI ? 15 : 20;
+
   const ui = useMemo(
     () => {
       if (viewportMode === "mobile") {
@@ -9539,7 +9543,7 @@ const sttControls =
           fontWeight: 700,
         }}
       >
-        {sttEnabled ? <MicOnIcon size={20} /> : <MicOffIcon size={20} />}
+        {sttEnabled ? <MicOnIcon size={ICON_20} /> : <MicOffIcon size={ICON_20} />}
       </button>
 
       {!livekitUiActive && (
@@ -9574,7 +9578,7 @@ const sttControls =
             justifyContent: "center",
           }}
         >
-          <StopIcon />
+          <StopIcon size={ICON_18} />
         </button>
       )}
 </>
@@ -9823,7 +9827,7 @@ const modePillControls = (
       position: "fixed",
       inset: 0,
       zIndex: 1000001,
-      background: "rgba(255,255,255,0.92)",
+      background: "#fff",
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
@@ -9835,7 +9839,7 @@ const modePillControls = (
         style={{
           padding: "12px 16px",
           borderRadius: 14,
-          background: "rgba(17,24,39,0.92)",
+          background: "#111827",
           color: "#fff",
           border: "1px solid rgba(255,255,255,0.18)",
           boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
@@ -10450,11 +10454,11 @@ const modePillControls = (
         title={viewerHasJoinedStream ? "Already joined. Press Stop to leave." : "Video"}
       >
         {liveProvider === "stream" ? (
-          <PlayIcon />
+          <PlayIcon size={ICON_18} />
         ) : avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting" ? (
-          <PauseIcon />
+          <PauseIcon size={ICON_18} />
         ) : (
-          <PlayIcon />
+          <PlayIcon size={ICON_18} />
         )}
       </button>
 
@@ -10529,7 +10533,7 @@ const modePillControls = (
           }}
           title={isHost ? "Stop live session" : "Leave session"}
         >
-          <StopIcon />
+          <StopIcon size={ICON_18} />
         </button>
       ) : null}
 
@@ -10982,7 +10986,7 @@ const modePillControls = (
                               justifyContent: "center",
                             }}
                           >
-                            <SaveIcon size={18} />
+                            <SaveIcon size={ICON_18} />
                           </button>
 
                           <button
@@ -11003,7 +11007,7 @@ const modePillControls = (
                               justifyContent: "center",
                             }}
                           >
-                            <TrashIcon size={18} />
+                            <TrashIcon size={ICON_18} />
                           </button>
 
                       {/* Attachment upload (images only) */}
