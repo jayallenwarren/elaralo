@@ -10429,7 +10429,13 @@ const modePillControls = (
         }}
         disabled={liveProvider === "stream" ? (viewerHasJoinedStream || (avatarStatus !== "idle" && avatarStatus !== "error")) : false}
         style={{
-          padding: "10px 14px",
+          width: 44,
+          height: 44,
+          minWidth: 44,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 0,
           borderRadius: 10,
           border: "1px solid #111",
           background: "#fff",
@@ -11026,11 +11032,21 @@ const modePillControls = (
                             ? "Attachments are disabled during Shared Live streaming."
                             : "Attach a file"
                         }
-	                    className="rounded border border-gray-300 px-3 py-2 text-sm"
 	                    style={{
+	                      width: 44,
 	                      height: 44,
 	                      minWidth: 44,
+	                      padding: 0,
+	                      borderRadius: 10,
+	                      border: "1px solid #bbb",
+	                      display: "inline-flex",
+	                      alignItems: "center",
+	                      justifyContent: "center",
 	                      background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
+	                      cursor: attachmentButtonDisabled ? "not-allowed" : "pointer",
+	                      opacity: attachmentButtonDisabled ? 0.6 : 1,
+	                      lineHeight: "18px",
+	                      fontSize: 18,
 	                    }}
                         type="button"
                       >
@@ -12130,6 +12146,11 @@ const modePillControls = (
                   }
                   style={{
                     width: 44,
+                    height: 44,
+                    minWidth: 44,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
                     borderRadius: 12,
                     border: "1px solid rgba(255,255,255,0.22)",
                     background: hostSttRecording
