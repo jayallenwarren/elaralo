@@ -1585,19 +1585,20 @@ export default function Page() {
 // Brief startup overlay (covers the iframe on initial refresh).
 // Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
 // until the companionName has been received from the Wix MEMBER_PLAN payload.
+const STARTUP_OVERLAY_MS = 800;
+// Hard cap: do not block the UI for more than ~2s if the Wix payload / companion name arrives late.
+const STARTUP_OVERLAY_MAX_WAIT_MS = 1200;
+
+// Brief startup overlay (covers the iframe on initial refresh).
+// Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
+// until the companionName has been received from the Wix MEMBER_PLAN payload.
 const [startupOverlayOpen, setStartupOverlayOpen] = useState<boolean>(true);
 const [startupOverlayName, setStartupOverlayName] = useState<string>("");
 const startupOverlayTimerRef = useRef<number | null>(null);
+const startupOverlayHardCapTimerRef = useRef<number | null>(null);
 const startupOverlayStartedRef = useRef<boolean>(false);
 
-const armStartupOverlay = useCallback((name: string) => {
-  const nm = String(name || "").trim();
-  if (!nm) return;
-
-  // Set the display name (used by the overlay message).
-  setStartupOverlayName(nm);
-
-  // Start the 800ms countdown once (first time we learn the companion name from Wix).
+const startStartupOverlayCountdown = useCallback(() => {
   if (startupOverlayStartedRef.current) return;
   startupOverlayStartedRef.current = true;
 
@@ -1609,17 +1610,55 @@ const armStartupOverlay = useCallback((name: string) => {
   startupOverlayTimerRef.current = window.setTimeout(() => {
     setStartupOverlayOpen(false);
     startupOverlayTimerRef.current = null;
-  }, 800);
+  }, STARTUP_OVERLAY_MS);
 }, []);
 
+const armStartupOverlay = useCallback(
+  (name: string) => {
+    const nm = String(name || "").trim();
+
+    // Set the display name (used by the overlay message). If name is still missing, we keep the message hidden.
+    if (nm) setStartupOverlayName(nm);
+
+    // Once we receive the companion payload, we can stop the hard-cap timer.
+    if (startupOverlayHardCapTimerRef.current) {
+      window.clearTimeout(startupOverlayHardCapTimerRef.current);
+      startupOverlayHardCapTimerRef.current = null;
+    }
+
+    // Start the 800ms countdown once (first time we learn the companion name from Wix).
+    // If the name is not yet available, we keep the overlay (message hidden) until the hard-cap triggers.
+    if (!nm) return;
+
+    startStartupOverlayCountdown();
+  },
+  [startStartupOverlayCountdown],
+);
+
 useEffect(() => {
+  // Hard cap: if the payload is delayed, start the countdown anyway (without showing an incorrect name).
+  // This prevents the overlay from blocking the UI for 15-20s on slow/late payload delivery.
+  if (startupOverlayHardCapTimerRef.current) {
+    window.clearTimeout(startupOverlayHardCapTimerRef.current);
+    startupOverlayHardCapTimerRef.current = null;
+  }
+
+  startupOverlayHardCapTimerRef.current = window.setTimeout(() => {
+    if (!startupOverlayOpen) return;
+    startStartupOverlayCountdown();
+  }, STARTUP_OVERLAY_MAX_WAIT_MS);
+
   return () => {
     if (startupOverlayTimerRef.current) {
       window.clearTimeout(startupOverlayTimerRef.current);
       startupOverlayTimerRef.current = null;
     }
+    if (startupOverlayHardCapTimerRef.current) {
+      window.clearTimeout(startupOverlayHardCapTimerRef.current);
+      startupOverlayHardCapTimerRef.current = null;
+    }
   };
-}, []);
+}, [startupOverlayOpen, startStartupOverlayCountdown]);
 
 
   // Keep the latest Wix memberId available for callbacks defined earlier in this file.
@@ -8298,9 +8337,17 @@ useEffect(() => {
     liveProvider === "d-id" &&
     (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
 
+  const speechRecognitionSupported = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    const w: any = window as any;
+    return Boolean(w.SpeechRecognition || w.webkitSpeechRecognition);
+  }, []);
+
   // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
+  // If SpeechRecognition is unavailable (common on iOS), use backend STT even when embedded so the user can grant mic access.
   // Keep Live Avatar mode on browser STT (it is already stable across devices).
-  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
+  const useBackendStt =
+    isIOS && backendSttAvailable && !liveAvatarActive && (!isEmbedded || !speechRecognitionSupported);
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -8696,7 +8743,11 @@ const pauseSpeechToText = useCallback(() => {
       return true;
     } catch (e) {
       console.warn("Mic permission denied/unavailable:", e);
-      setSttError(getEmbedHint());
+      setSttError(
+        isIOS
+          ? "Microphone access is blocked for this site. Enable it in iOS Safari settings (aA > Website Settings > Microphone > Allow) and reload."
+          : "Microphone permission was blocked.",
+      );
 
       const name = e?.name || "";
       // If backend STT can't access the mic (common in some embedded contexts),
@@ -8817,7 +8868,11 @@ const pauseSpeechToText = useCallback(() => {
         clearSttSilenceTimer();
         clearSttRestartTimer();
         clearSttRecoverTimer();
-        setSttError("Microphone permission was blocked." + getEmbedHint());
+        setSttError(
+          isIOS
+            ? "Microphone access is blocked. Enable it in iOS Safari settings (aA > Website Settings > Microphone > Allow) and reload."
+            : "Microphone permission was blocked." + getEmbedHint(),
+        );
         try {
           rec.stop?.();
         } catch {}
