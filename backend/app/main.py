@@ -374,6 +374,34 @@ async def usage_status(request: Request):
     }
 
 
+@app.get("/admin/usage/debug")
+async def admin_usage_debug(request: Request):
+    """Restricted admin debug endpoint for persisted usage/minutes state.
+
+    Security:
+      - Requires header "X-Admin-Token" matching env var USAGE_ADMIN_TOKEN.
+
+    Query params:
+      - member_id / memberId (optional): if provided, returns a detailed view for that member.
+      - limit (optional): if member_id is omitted, returns the most recently updated rows (default 25, max 200).
+    """
+    token = (request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token") or "").strip()
+    if not USAGE_ADMIN_TOKEN or token != USAGE_ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    member_id = (request.query_params.get("member_id") or request.query_params.get("memberId") or "").strip()
+    limit_raw = (request.query_params.get("limit") or "").strip()
+    try:
+        limit_i = int(limit_raw) if limit_raw else 25
+    except Exception:
+        limit_i = 25
+    limit_i = max(1, min(limit_i, 200))
+
+    now = time.time()
+    result = await run_in_threadpool(_usage_admin_debug_sync, member_id, limit_i, now)
+    return result
+
+
 @app.get("/ready")
 def ready():
     """
@@ -3306,7 +3334,12 @@ def _usage_status_message(
 
     # Include a small breakdown for clarity.
     if m_allowed > 0 or m_used > 0:
-        lines.append(f"Used: {m_used} of {m_allowed} minutes.")
+        # minutes_allowed can represent the plan-included minutes, while minutes_remaining
+        # already reflects any top-ups. Compute a total budget so we never show
+        # confusing outputs like "Used: 93 of 30 minutes."
+        m_total = max(m_used + m_rem, m_allowed)
+        lines.append(f"Used: {m_used} of {m_total} minutes.")
+
 
     if (not is_trial) and int(cycle_days or 0) > 0:
         lines.append(f"Your usage cycle resets every {int(cycle_days)} days.")
@@ -3579,6 +3612,9 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     # friend
     if any(p in t for p in [
         "switch to friend",
+        "change to friend",
+        "move to friend",
+        "make it friend",
         "go to friend",
         "back to friend",
         "friend mode",
@@ -3591,9 +3627,12 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     # romantic
     if any(p in t for p in [
         "switch to romantic",
+        "change to romantic",
+        "move to romantic",
         "go to romantic",
         "back to romantic",
         "romantic mode",
+        "romance mode",
         "set romantic",
         "set mode to romantic",
         "turn on romantic",
@@ -3604,6 +3643,8 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     # intimate/explicit
     if any(p in t for p in [
         "switch to intimate",
+        "change to intimate",
+        "move to intimate",
         "go to intimate",
         "back to intimate",
         "intimate mode",
@@ -3615,6 +3656,8 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
         "set explicit",
         "set mode to explicit",
         "turn on explicit",
+        "adult mode",
+        "18+ mode",
     ]):
         return "intimate"
 
@@ -3676,8 +3719,12 @@ def _looks_intimate(text: str) -> bool:
     return any(
         k in t
         for k in [
-            "explicit", "intimate", "nsfw", "sex", "nude", "porn",
-            "fuck", "cock", "pussy", "blowjob", "anal", "orgasm",
+            # Mode / intent
+            "explicit", "intimate", "nsfw", "adult", "18+",
+            # Common explicit content terms (kept intentionally simple: substring match)
+            "sex", "sexy", "nude", "naked", "porn",
+            "fuck", "fucking", "cock", "dick", "penis", "pussy", "vagina",
+            "blowjob", "oral", "anal", "orgasm", "cum",
         ]
     )
 
@@ -3759,40 +3806,399 @@ def _to_openai_messages(
     return out
 
 
-def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
+# ---------------------------------------------------------------------
+# LLM latency optimizations
+#   (1) Reuse OpenAI/xAI clients + underlying HTTP connection pooling.
+#   (2) Optional server-side streaming for xAI (assemble full text).
+#   (3) Prompt compaction (handled later in /chat flow).
+#   (4) Cache onboarding/system blocks (handled later).
+#   (5) Separate priming endpoint /llm/warm (implemented later).
+# ---------------------------------------------------------------------
+
+_LLM_CLIENT_LOCK = threading.RLock()
+_OPENAI_CLIENT = None
+_XAI_CLIENT = None
+_OPENAI_SUMMARY_CLIENTS: Dict[str, Any] = {}
+_SHARED_HTTP_CLIENT = None
+
+
+def _get_shared_http_client():
+    """Best-effort shared httpx client for connection pooling.
+
+    Works with OpenAI Python SDK v1.x (DefaultHttpxClient). If unavailable,
+    we fall back to SDK defaults (still correct, just less optimal).
+    """
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is not None:
+        return _SHARED_HTTP_CLIENT
+
+    try:
+        from openai import DefaultHttpxClient
+
+        # Use SDK defaults; the main win is a shared keep-alive pool.
+        _SHARED_HTTP_CLIENT = DefaultHttpxClient()
+        return _SHARED_HTTP_CLIENT
+    except Exception:
+        _SHARED_HTTP_CLIENT = None
+        return None
+
+
+def _make_openai_client(*, api_key: str, base_url: Optional[str] = None, timeout: Optional[float] = None):
     from openai import OpenAI
+
+    kwargs: Dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    if timeout is not None:
+        kwargs["timeout"] = float(timeout)
+
+    http_client = _get_shared_http_client()
+    if http_client is not None:
+        kwargs["http_client"] = http_client
+
+    return OpenAI(**kwargs)
+
+
+def _get_openai_client():
+    global _OPENAI_CLIENT
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
+    with _LLM_CLIENT_LOCK:
+        if _OPENAI_CLIENT is None:
+            _OPENAI_CLIENT = _make_openai_client(api_key=api_key)
+        return _OPENAI_CLIENT
+
+
+def _get_openai_summary_client(timeout_s: float):
+    """Summary client with a specific timeout, still reusing the shared HTTP pool."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    # Bucket by rounded timeout so we don't create many clients.
+    key = f"{float(timeout_s):.3f}"
+    with _LLM_CLIENT_LOCK:
+        c = _OPENAI_SUMMARY_CLIENTS.get(key)
+        if c is None:
+            c = _make_openai_client(api_key=api_key, timeout=float(timeout_s))
+            _OPENAI_SUMMARY_CLIENTS[key] = c
+        return c
+
+
+def _get_xai_client():
+    global _XAI_CLIENT
+
+    api_key = (os.getenv("XAI_API_KEY", "") or os.getenv("XAI_API_TOKEN", "") or "").strip()
+    if not api_key:
+        raise RuntimeError("XAI_API_KEY is not set")
+
+    with _LLM_CLIENT_LOCK:
+        if _XAI_CLIENT is None:
+            _XAI_CLIENT = _make_openai_client(api_key=api_key, base_url=_xai_base_url())
+        return _XAI_CLIENT
+
+
+def _extract_text_from_chat_completion(resp: Any) -> str:
+    try:
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        try:
+            return (resp["choices"][0]["message"]["content"] or "").strip()
+        except Exception:
+            return ""
+
+
+def _extract_text_from_stream_chunk(chunk: Any) -> str:
+    """Extract incremental text from a streaming chunk across SDK variants."""
+    try:
+        choice0 = chunk.choices[0]
+        delta = getattr(choice0, "delta", None)
+        if isinstance(delta, dict):
+            return str(delta.get("content") or "")
+        return str(getattr(delta, "content", "") or "")
+    except Exception:
+        try:
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            return str(delta.get("content") or "")
+        except Exception:
+            return ""
+
+
+def _chat_completion_text(
+    client: Any,
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: Optional[int] = None,
+    stream: bool = False,
+) -> str:
+    """Return the full assistant text. If stream=True, assemble tokens from chunks."""
+    params: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
+    }
+    if max_tokens is not None:
+        params["max_tokens"] = int(max_tokens)
+
+    if not stream:
+        resp = client.chat.completions.create(**params)
+        return _extract_text_from_chat_completion(resp)
+
+    # Best-effort streaming: if the provider/SDK rejects stream, fall back to non-stream.
+    try:
+        params["stream"] = True
+        chunks = client.chat.completions.create(**params)
+        parts: List[str] = []
+        for ch in chunks:
+            t = _extract_text_from_stream_chunk(ch)
+            if t:
+                parts.append(t)
+        return ("".join(parts) or "").strip()
+    except TypeError:
+        resp = client.chat.completions.create(**{k: v for k, v in params.items() if k != "stream"})
+        return _extract_text_from_chat_completion(resp)
+    except Exception:
+        resp = client.chat.completions.create(**{k: v for k, v in params.items() if k != "stream"})
+        return _extract_text_from_chat_completion(resp)
+
+
+def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
+    client = _get_openai_client()
+    return _chat_completion_text(
+        client,
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
-        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
+        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8") or "0.8"),
+        stream=False,
     )
-    return (resp.choices[0].message.content or "").strip()
 
 
+
+
+
+# ----------------------------
+# Multi-provider LLM routing
+#   - Friend/Romantic -> OpenAI
+#   - Intimate (18+) -> xAI
+# ----------------------------
+
+def _xai_base_url() -> str:
+    """Return a normalized base_url for xAI OpenAI-compatible endpoint."""
+    raw = (os.getenv("XAI_BASE_URL", "") or os.getenv("XAI_API_BASE", "") or "https://api.x.ai/v1").strip()
+    if not raw:
+        return "https://api.x.ai/v1"
+    url = raw.rstrip("/")
+    # Accept either "https://api.x.ai" or "https://api.x.ai/v1"
+    if url.endswith("/v1"):
+        return url
+    # If someone sets just https://api.x.ai, append /v1
+    if url.endswith("api.x.ai"):
+        return url + "/v1"
+    return url
+
+
+def _call_xai_chat(messages: List[Dict[str, str]]) -> str:
+    """Call xAI (OpenAI-compatible) chat completions endpoint."""
+    client = _get_xai_client()
+
+    stream_env = (os.getenv("XAI_STREAM", "1") or "1").strip().lower()
+    use_stream = stream_env not in ("0", "false", "no", "off")
+
+    return _chat_completion_text(
+        client,
+        model=(os.getenv("XAI_MODEL", "") or "grok-4").strip(),
+        messages=messages,
+        temperature=float(os.getenv("XAI_TEMPERATURE", os.getenv("OPENAI_TEMPERATURE", "0.8")) or "0.8"),
+        stream=use_stream,
+    )
+
+
+def _extract_in_session_summaries(session_state: Dict[str, Any]) -> List[str]:
+    """Extract any in-session summaries provided by the frontend/state machine.
+
+    This function is intentionally permissive about key names to support gradual rollout.
+    """
+    if not isinstance(session_state, dict):
+        return []
+
+    keys = [
+        "conversation_summaries",
+        "conversationSummaries",
+        "chat_summaries",
+        "chatSummaries",
+        "summaries",
+        "summary_chunks",
+        "summaryChunks",
+    ]
+
+    out: List[str] = []
+    for k in keys:
+        v = session_state.get(k)
+        if not v:
+            continue
+
+        if isinstance(v, str):
+            s = v.strip()
+            if s:
+                out.append(s)
+            continue
+
+        if isinstance(v, dict):
+            s = v.get("summary") or v.get("text") or v.get("content")
+            if isinstance(s, str) and s.strip():
+                out.append(s.strip())
+            continue
+
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, str):
+                    s = item.strip()
+                    if s:
+                        out.append(s)
+                elif isinstance(item, dict):
+                    s = item.get("summary") or item.get("text") or item.get("content")
+                    if isinstance(s, str) and s.strip():
+                        out.append(s.strip())
+
+    # De-dupe while preserving order (most recent items are typically appended last)
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for s in out:
+        if s in seen:
+            continue
+        seen.add(s)
+        deduped.append(s)
+
+    max_items = int(os.getenv("IN_SESSION_SUMMARY_MAX_ITEMS", "8") or "8")
+    if max_items > 0 and len(deduped) > max_items:
+        deduped = deduped[-max_items:]
+    return deduped
+
+
+def _sanitize_summary_for_safe_mode(text: str) -> str:
+    """Sanitize a summary for Friend/Romantic (OpenAI) context.
+
+    If the summary appears intimate/explicit, replace it with a high-level, non-explicit note.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if _looks_intimate(t):
+        return (
+            "Earlier conversation included an Intimate (18+) segment with consent. "
+            "Details are intentionally omitted in Friend/Romantic mode."
+        )
+
+    max_chars = int(os.getenv("SAFE_MODE_SUMMARY_MAX_CHARS", "2500") or "2500")
+    if max_chars > 0 and len(t) > max_chars:
+        t = t[:max_chars] + " …"
+    return t
+
+
+def _filter_history_for_safe_mode(messages: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    """Filter out intimate/explicit messages before sending to a safe-mode model (OpenAI).
+
+    Returns (filtered_messages, handoff_note).
+    """
+    if not messages:
+        return messages, None
+
+    kept: List[Dict[str, str]] = []
+    omitted = 0
+
+    for m in messages:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = str(m.get("content") or "")
+        if _looks_intimate(content):
+            omitted += 1
+            continue
+        kept.append({"role": role, "content": content})
+
+    if omitted <= 0:
+        return messages, None
+
+    note = (
+        f"Context note: {omitted} earlier message(s) from an Intimate (18+) segment were omitted because the current mode is Friend/Romantic. "
+        "Assume consent had been established and an intimate conversation occurred, but do not reference explicit details. "
+        "Continue naturally from the remaining chat context and any provided summaries."
+    )
+    return kept, note
+
+
+def _clamp_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return str(text or "")
+    t = str(text or "")
+    if len(t) <= max_chars:
+        return t
+    if max_chars <= 1:
+        return "…"
+    return t[: max_chars - 1] + "…"
+
+
+def _compact_llm_messages(messages: List[Dict[str, str]], *, provider_switched: bool) -> List[Dict[str, str]]:
+    """Server-side guardrail to keep prompts bounded.
+
+    Frontend already trims history, but this prevents occasional oversized requests
+    (attachments, long copy/paste, etc.) from regressing latency.
+
+    Rules:
+      - Keep the leading contiguous system block prefix intact.
+      - Keep only the last N non-system messages (N smaller on provider switch).
+      - Clamp individual message content length.
+    """
+    if not messages:
+        return messages
+
+    max_body = int(os.getenv("LLM_MAX_BODY_MESSAGES", "34") or "34")
+    max_body_on_switch = int(os.getenv("LLM_MAX_BODY_MESSAGES_ON_SWITCH", "22") or "22")
+    max_chars = int(os.getenv("LLM_MESSAGE_MAX_CHARS", "4000") or "4000")
+
+    n_keep = max_body_on_switch if provider_switched else max_body
+    if n_keep <= 0:
+        n_keep = 12
+
+    # Split contiguous system prefix (persona + injected system blocks).
+    i = 0
+    while i < len(messages) and str(messages[i].get("role") or "") == "system":
+        i += 1
+    sys_prefix = messages[:i]
+    body = messages[i:]
+
+    # Clamp content.
+    def clamp_msg(m: Dict[str, str]) -> Dict[str, str]:
+        role = str(m.get("role") or "")
+        content = _clamp_text(m.get("content") or "", max_chars)
+        return {"role": role, "content": content}
+
+    sys_prefix = [clamp_msg(m) for m in sys_prefix]
+    body = [clamp_msg(m) for m in body]
+
+    if len(body) > n_keep:
+        body = body[-n_keep:]
+
+    return sys_prefix + body
 
 def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
     """Summarization call with conservative limits for reliability."""
-    from openai import OpenAI
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-
     timeout_s = float(os.getenv("SAVE_SUMMARY_OPENAI_TIMEOUT_S", "25") or "25")
-    client = OpenAI(api_key=api_key, timeout=timeout_s)
-    resp = client.chat.completions.create(
+    client = _get_openai_summary_client(timeout_s)
+
+    return _chat_completion_text(
+        client,
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
         temperature=float(os.getenv("SAVE_SUMMARY_TEMPERATURE", "0.2") or "0.2"),
         max_tokens=int(os.getenv("SAVE_SUMMARY_MAX_TOKENS", "350") or "350"),
+        stream=False,
     )
-    return (resp.choices[0].message.content or "").strip()
 
 
 # ---------------------------------------------------------------------
@@ -3829,6 +4235,12 @@ _PUBLIC_SITE_MAX_PAGES = int(os.getenv("PUBLIC_SITE_MAX_PAGES", "4") or "4")  # 
 _PUBLIC_SITE_MAX_BYTES = int(os.getenv("PUBLIC_SITE_MAX_BYTES", "1500000") or "1500000")
 _PUBLIC_SITE_MAX_CHARS_FOR_SUMMARY = int(os.getenv("PUBLIC_SITE_MAX_CHARS_FOR_SUMMARY", "25000") or "25000")
 
+# In-memory cache for onboarding + public site system blocks.
+# This avoids repeated SQLite reads + string building on every turn.
+_HCO_BLOCKS_CACHE_TTL_S = int(os.getenv("HCO_BLOCKS_CACHE_TTL_S", "300") or "300")
+_HCO_BLOCKS_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+_HCO_BLOCKS_CACHE_LOCK = threading.RLock()
+
 
 def _avatar_from_session_state(session_state: Dict[str, Any]) -> str:
     """Extract avatar/companion first name from session_state."""
@@ -3851,6 +4263,18 @@ def _avatar_from_session_state(session_state: Dict[str, Any]) -> str:
         return s.split("-", 1)[0].strip()
 
     return ""
+
+
+
+
+def _brand_from_session_state(session_state: Dict[str, Any]) -> str:
+    """Extract brand/rebranding name from session_state."""
+    raw = (
+        _session_get_str(session_state, "brand", "companyName", "company_name")
+        or _session_get_str(session_state, "rebranding", "rebrand", "rebrandingName")
+        or ""
+    )
+    return str(raw or "").strip()
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -4291,6 +4715,54 @@ def _build_public_site_system_block(avatar: str, url: str, summary: str) -> str:
         "Do NOT include private contact info.\n"
         f"{summary}"
     )
+
+
+def _get_hco_system_blocks_cached_sync(avatar: str) -> List[str]:
+    """Return system blocks derived from onboarding + public website.
+
+    This is a hot-path helper for /chat and /llm/warm.
+    Uses an in-memory TTL cache to avoid repeated SQLite joins + string building.
+    """
+    a = (avatar or "").strip()
+    if not a:
+        return []
+
+    key = a.lower()
+    now = time.time()
+
+    with _HCO_BLOCKS_CACHE_LOCK:
+        ent = _HCO_BLOCKS_CACHE.get(key)
+        if ent:
+            ts, blocks = ent
+            if (now - float(ts)) < float(_HCO_BLOCKS_CACHE_TTL_S):
+                return list(blocks or [])
+
+    joined = _fetch_onboarding_join_for_avatar_sync(a)
+    blocks: List[str] = []
+
+    if joined:
+        # Only inject for human/rep companions
+        ctype = (str(joined.get("companion_type") or "") or "").strip().lower()
+        if ctype in ("human", "representative", "rep", "ai_representative", ""):
+            ob = _build_onboarding_system_block(joined)
+            if ob:
+                blocks.append(ob)
+
+            website_url = _website_url_from_joined(joined)
+            if website_url:
+                try:
+                    summary = _get_public_site_summary_cached_sync(website_url, joined.get("avatar") or a)
+                except Exception:
+                    summary = ""
+
+                pb = _build_public_site_system_block(joined.get("avatar") or a, website_url, summary)
+                if pb:
+                    blocks.append(pb)
+
+    with _HCO_BLOCKS_CACHE_LOCK:
+        _HCO_BLOCKS_CACHE[key] = (now, list(blocks))
+
+    return blocks
 
 
 
@@ -5135,12 +5607,18 @@ async def chat(request: Request):
     # even when minutes are exhausted (no OpenAI call).
     probe_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
     probe_text = ((probe_last_user.get("content") if probe_last_user else "") or "").strip()
-    is_minutes_balance_query = _is_minutes_balance_question(probe_text)
+    probe_mode_switch = _detect_mode_switch_from_text(probe_text)
+    is_minutes_balance_query = _is_minutes_balance_question(probe_text) and not bool(probe_mode_switch)
+
 
     if not usage_ok and not is_minutes_balance_query:
         minutes_allowed = int(
             usage_info.get("minutes_allowed")
-            or (minutes_allowed_override if minutes_allowed_override is not None else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits)))
+            or (
+                minutes_allowed_override
+                if minutes_allowed_override is not None
+                else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits))
+            )
             or 0
         )
         session_state_out = dict(session_state)
@@ -5152,6 +5630,52 @@ async def chat(request: Request):
                 "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
             }
         )
+
+        # If a host takeover was active, end it and notify the host (minutes are exhausted).
+        try:
+            _ai_override_touch_from_chat(
+                session_id=session_id,
+                session_state=session_state,
+                identity_key=identity_key,
+                is_trial=is_trial,
+                plan_name_for_limits=plan_name_for_limits,
+                plan_label_for_messages=plan_label_for_messages,
+                minutes_allowed_override=minutes_allowed_override,
+                cycle_days_override=cycle_days_override,
+                upgrade_url=upgrade_link_override,
+                payg_pay_url=pay_go_link_override,
+                payg_minutes=pay_go_minutes,
+                payg_price_text=payg_price_text_override,
+            )
+            if probe_text:
+                _ai_override_append_event(
+                    session_id,
+                    role="user",
+                    content=probe_text,
+                    sender="user",
+                    audience="all",
+                    kind="message",
+                )
+
+            if _ai_override_is_active(session_id):
+                _ai_override_append_event(
+                    session_id,
+                    role="system",
+                    content="Member is out of chat minutes. Host override ended.",
+                    sender="system",
+                    audience="host",
+                    kind="minutes_exhausted",
+                )
+                _ai_override_set_active(
+                    session_id,
+                    enabled=False,
+                    host_member_id=str((_ai_override_get_session(session_id) or {}).get("override_host_member_id") or ""),
+                    reason="member_out_of_minutes",
+                )
+        except Exception:
+            pass
+
+        # Member should always see the standard pay/upgrade message.
         reply = _usage_paywall_message(
             is_trial=is_trial,
             plan_name=plan_label_for_messages,
@@ -5161,6 +5685,10 @@ async def chat(request: Request):
             payg_increment_minutes=pay_go_minutes,
             payg_price_text=payg_price_text_override,
         )
+
+        # Surface override flag to the UI even on paywalls.
+        session_state_out["host_override_active"] = False
+
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
@@ -5168,6 +5696,7 @@ async def chat(request: Request):
             "session_state": session_state_out,
             "audio_url": None,
         }
+
 
 # Best-effort retrieval of a previously saved chat summary.
     # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
@@ -5199,6 +5728,13 @@ async def chat(request: Request):
 
     # Helper to build responses consistently and optionally include audio_url.
     async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
+        # Ensure the frontend can reflect whether a human host takeover is active.
+        try:
+            state_out = dict(state_out)
+            state_out["host_override_active"] = bool(_ai_override_is_active(session_id))
+        except Exception:
+            pass
+
         audio_url: Optional[str] = None
         if voice_id and (reply or "").strip():
             try:
@@ -5329,7 +5865,9 @@ async def chat(request: Request):
 
     # Start consent if intimate requested but not allowed
     require_consent = bool(getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True))
-    if require_consent and user_requesting_intimate and not intimate_allowed:
+    # Always gate Intimate (18+) behind explicit consent. This avoids silently ignoring
+    # a user-requested mode switch when consent has not yet been granted.
+    if user_requesting_intimate and not intimate_allowed:
         session_state_out = dict(session_state)
         session_state_out["pending_consent"] = "intimate"
         session_state_out["mode"] = "intimate"
@@ -5350,10 +5888,98 @@ async def chat(request: Request):
         f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending} voice_id={'yes' if voice_id else 'no'}",
     )
 
-    # call model
+    # call model (provider-routing: Intimate -> xAI, Friend/Romantic -> OpenAI)
+    llm_provider = "xai" if effective_mode == "intimate" else "openai"
+
+    # Detect provider switches so we can encourage the model to rely on summaries for continuity.
+    prev_provider = str(
+        session_state.get("llm_provider")
+        or session_state.get("model_provider")
+        or session_state.get("provider")
+        or ""
+    ).strip().lower()
+    provider_switched = bool(prev_provider) and (prev_provider != llm_provider)
+
+    # In Friend/Romantic mode, never send explicit/intimate content to OpenAI.
+    # If the browser is still holding prior Intimate messages, omit them and provide a safe handoff note.
+    history_for_llm = messages
+    handoff_note: str | None = None
+    if llm_provider == "openai":
+        history_for_llm, handoff_note = _filter_history_for_safe_mode(messages)
+
+    # Summaries:
+    # - saved_summary is server-side cross-session memory (if user authorized)
+    # - in_session_summaries are optional summaries collected during the current chat flow
+    safe_saved_summary = saved_summary
+    if llm_provider == "openai" and safe_saved_summary:
+        safe_saved_summary = _sanitize_summary_for_safe_mode(safe_saved_summary)
+
+    in_session_summaries = _extract_in_session_summaries(session_state)
+
+    # ----------------------------
+    # Host override (human companion takeover)
+    # ----------------------------
+    # Track this session for host visibility and, if overridden, bypass the LLM.
     try:
-        openai_messages = _to_openai_messages(
-            messages,
+        _ai_override_touch_from_chat(
+            session_id=session_id,
+            session_state=session_state,
+            identity_key=identity_key,
+            is_trial=is_trial,
+            plan_name_for_limits=plan_name_for_limits,
+            plan_label_for_messages=plan_label_for_messages,
+            minutes_allowed_override=minutes_allowed_override,
+            cycle_days_override=cycle_days_override,
+            upgrade_url=upgrade_link_override,
+            payg_pay_url=pay_go_link_override,
+            payg_minutes=pay_go_minutes,
+            payg_price_text=payg_price_text_override,
+        )
+
+        # Append the newest user message for the host transcript.
+        if user_text:
+            _ai_override_append_event(
+                session_id,
+                role="user",
+                content=user_text,
+                sender="user",
+                audience="all",
+                kind="message",
+            )
+    except Exception:
+        pass
+
+    # If the host has taken over this session, do NOT call OpenAI/xAI.
+    if _ai_override_is_active(session_id):
+        session_state_out = dict(session_state)
+        session_state_out["mode"] = effective_mode
+        session_state_out["pending_consent"] = None if intimate_allowed else session_state_out.get("pending_consent")
+        session_state_out["llm_provider"] = "host"
+        session_state_out["model_provider"] = "host"
+        session_state_out["model"] = "host"
+        session_state_out["host_override_active"] = True
+        session_state_out["companion_meta"] = _parse_companion_meta(
+            session_state_out.get("companion")
+            or session_state_out.get("companionName")
+            or session_state_out.get("companion_name")
+        )
+        return await _respond(
+            "",
+            STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
+            session_state_out,
+        )
+
+    if llm_provider == "openai" and in_session_summaries:
+        sanitized: List[str] = []
+        for s in in_session_summaries:
+            ss = _sanitize_summary_for_safe_mode(s)
+            if ss:
+                sanitized.append(ss)
+        in_session_summaries = sanitized
+
+    try:
+        llm_messages = _to_openai_messages(
+            history_for_llm,
             session_state,
             mode=effective_mode,
             intimate_allowed=intimate_allowed,
@@ -5373,42 +5999,44 @@ async def chat(request: Request):
         avatar_name = _avatar_from_session_state(session_state)
 
         extra_system_blocks: List[str] = []
-        joined = None
         if avatar_name:
-            joined = await run_in_threadpool(_fetch_onboarding_join_for_avatar_sync, avatar_name)
-
-        if joined:
-            ctype = str(joined.get("companion_type") or "").strip().lower()
-            # Only inject onboarding/site context for Human/Representative companions by default.
-            if ctype in ("human", "representative", "rep", ""):
-                onboarding_block = _build_onboarding_system_block(joined)
-                if onboarding_block:
-                    extra_system_blocks.append(onboarding_block)
-
-                website_url = _website_url_from_joined(joined)
-                if website_url:
-                    public_summary = await run_in_threadpool(
-                        _get_public_site_summary_cached_sync,
-                        website_url,
-                        (joined.get("avatar") or avatar_name or "Companion"),
-                    )
-                    public_block = _build_public_site_system_block(
-                        (joined.get("avatar") or avatar_name or "Companion"),
-                        website_url,
-                        public_summary,
-                    )
-                    if public_block:
-                        extra_system_blocks.append(public_block)
-            else:
-                _dbg(debug, f"[hco] companion_type={ctype}; skipping onboarding/site injection")
+            # Cached: avoids repeated SQLite joins + string building.
+            extra_system_blocks = await run_in_threadpool(_get_hco_system_blocks_cached_sync, avatar_name)
+            if not extra_system_blocks:
+                _dbg(debug, f"[hco] no onboarding/site blocks for avatar={avatar_name!r}")
         else:
-            _dbg(debug, f"[hco] no onboarding row found for avatar={avatar_name!r}")
+            _dbg(debug, "[hco] no avatar in session_state; skipping onboarding/site injection")
 
         # Inject these blocks immediately after the base persona system prompt
         insert_at = 1
         for block in extra_system_blocks:
-            openai_messages.insert(insert_at, {"role": "system", "content": block})
+            llm_messages.insert(insert_at, {"role": "system", "content": block})
             insert_at += 1
+
+        # Host companion guidelines (highest priority).
+        # These are authored by the human companion (host) and should override onboarding text if conflicts exist.
+        brand_name = _brand_from_session_state(session_state)
+        host_guidelines = ""
+        if brand_name and avatar_name:
+            try:
+                host_guidelines = await run_in_threadpool(_get_companion_guidelines_sync, brand_name, avatar_name)
+            except Exception:
+                host_guidelines = ""
+        if host_guidelines:
+            llm_messages.insert(
+                insert_at,
+                {
+                    "role": "system",
+                    "content": (
+                        "Host AI guidelines (highest priority; set by the companion's human host). "
+                        "If these guidelines conflict with other persona/onboarding text, follow THESE guidelines. "
+                        "Always still follow platform safety policies.\n\n"
+                        + str(host_guidelines).strip()
+                    ),
+                },
+            )
+            insert_at += 1
+
 
         # Memory policy: do not guess about prior conversations.
         # - If a saved summary is injected, you may use ONLY that as cross-session context.
@@ -5421,26 +6049,90 @@ async def chat(request: Request):
             "Capability rule: Your replies may be spoken aloud in this app (audio TTS and/or a live avatar). "
             "Do not say you lack text-to-speech; instead explain that you generate text and the platform voices it."
         )
-        openai_messages.insert(insert_at, {"role": "system", "content": memory_policy})
+        llm_messages.insert(insert_at, {"role": "system", "content": memory_policy})
         insert_at += 1
 
-        if saved_summary:
-            openai_messages.insert(
+        if provider_switched:
+            llm_messages.insert(
                 insert_at,
                 {
                     "role": "system",
-                    "content": "Saved conversation summary (user-authorized, for reference across devices):\n" + saved_summary,
+                    "content": (
+                        f"System routing note: The app switched the underlying model provider to {('xAI' if llm_provider == 'xai' else 'OpenAI')} "
+                        f"because the user is now in {effective_mode.title()} mode. "
+                        "Review any provided summaries and continue seamlessly while respecting the current mode's boundaries."
+                    ),
                 },
             )
+            insert_at += 1
 
-        assistant_reply = _call_gpt4o(openai_messages)
+        if safe_saved_summary:
+            max_saved_chars = int(os.getenv("LLM_SAVED_SUMMARY_MAX_CHARS", "2500") or "2500")
+            safe_saved_summary = _clamp_text(safe_saved_summary, max_saved_chars)
+            llm_messages.insert(
+                insert_at,
+                {
+                    "role": "system",
+                    "content": "Saved conversation summary (user-authorized, for reference across devices):\n" + safe_saved_summary,
+                },
+            )
+            insert_at += 1
+
+        if in_session_summaries:
+            item_max = int(os.getenv("LLM_IN_SESSION_SUMMARY_ITEM_MAX_CHARS", "900") or "900")
+            joined_summaries = "\n- " + "\n- ".join([
+                _clamp_text(s, item_max) for s in in_session_summaries if (s or '').strip()
+            ])
+            llm_messages.insert(
+                insert_at,
+                {
+                    "role": "system",
+                    "content": "In-session conversation summaries (most recent last):" + joined_summaries,
+                },
+            )
+            insert_at += 1
+
+        if handoff_note:
+            llm_messages.insert(insert_at, {"role": "system", "content": handoff_note})
+            insert_at += 1
+
+        # Final server-side compaction pass (frontend already trims, but this prevents
+        # occasional oversized payloads from regressing latency).
+        llm_messages = _compact_llm_messages(llm_messages, provider_switched=provider_switched)
+
+        if llm_provider == "xai":
+            assistant_reply = _call_xai_chat(llm_messages)
+        else:
+            assistant_reply = _call_gpt4o(llm_messages)
     except Exception as e:
-        _dbg(debug, "OpenAI call failed:", repr(e))
-        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {e}")
+        _dbg(debug, "LLM call failed:", repr(e))
+        raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
 
-    # echo back session_state (ensure correct mode)
+    
+    # Record the AI reply in the relay so the host can preview ongoing chats.
+    try:
+        if assistant_reply and str(assistant_reply).strip():
+            _ai_override_append_event(
+                session_id,
+                role="assistant",
+                content=str(assistant_reply),
+                sender=("xai" if llm_provider == "xai" else "ai"),
+                audience="all",
+                kind="message",
+            )
+    except Exception:
+        pass
+
+# echo back session_state (ensure correct mode)
     session_state_out = dict(session_state)
     session_state_out["mode"] = effective_mode
+    # Surface the active provider/model to the frontend (SessionState.model exists already).
+    session_state_out["llm_provider"] = llm_provider
+    session_state_out["model_provider"] = llm_provider  # back-compat alias
+    if llm_provider == "xai":
+        session_state_out["model"] = (os.getenv("XAI_MODEL", "") or "grok-4").strip()
+    else:
+        session_state_out["model"] = (os.getenv("OPENAI_MODEL", "") or "gpt-4o").strip()
     session_state_out["pending_consent"] = None if intimate_allowed else session_state_out.get("pending_consent")
     session_state_out["companion_meta"] = _parse_companion_meta(
         session_state_out.get("companion")
@@ -5454,6 +6146,571 @@ async def chat(request: Request):
         session_state_out,
     )
 
+
+# -----------------------------------------------------------------------------
+# (5) Separate priming call to reduce first-token latency on provider switches
+# -----------------------------------------------------------------------------
+
+_LLM_WARM_LOCK = threading.RLock()
+_LLM_WARM_LAST: Dict[str, float] = {}
+
+
+def _normalize_mode_slug(mode: str) -> str:
+    m = (mode or "").strip().lower()
+    if m.startswith("intimate"):
+        return "intimate"
+    if m.startswith("romantic"):
+        return "romantic"
+    return "friend"
+
+
+@app.post("/llm/warm")
+async def llm_warm(raw: Dict[str, Any] = Body(...)):
+    """Warm the target provider using the same system/background blocks.
+
+    This endpoint is intentionally side-effect free. Frontend can fire-and-forget
+    when mode/provider is about to switch.
+    """
+    session_state = raw.get("session_state") or raw.get("sessionState") or {}
+    if not isinstance(session_state, dict):
+        session_state = {}
+
+    mode = _normalize_mode_slug(str(raw.get("mode") or session_state.get("mode") or "friend"))
+    provider = str(raw.get("provider") or session_state.get("llm_provider") or "").strip().lower()
+    if provider not in ("openai", "xai"):
+        provider = "xai" if mode == "intimate" else "openai"
+
+    avatar_name = _avatar_from_session_state(session_state)
+    brand = str(session_state.get("brand") or "").strip().lower()
+
+    warm_ttl_s = float(os.getenv("LLM_WARM_TTL_S", "45") or "45")
+    warm_key = f"{provider}|{mode}|{brand}|{(avatar_name or '').strip().lower()}"
+
+    now = time.time()
+    with _LLM_WARM_LOCK:
+        last = float(_LLM_WARM_LAST.get(warm_key, 0.0) or 0.0)
+        if (now - last) < warm_ttl_s:
+            return {"ok": True, "skipped": True, "provider": provider, "mode": mode}
+        _LLM_WARM_LAST[warm_key] = now
+
+    intimate_allowed = bool(session_state.get("explicit_consented") or session_state.get("romance_consented"))
+    if mode != "intimate":
+        intimate_allowed = False
+
+    # Build the same system prompt blocks (persona + onboarding + site context).
+    system_prompt = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
+    warm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+    if avatar_name:
+        try:
+            blocks = await run_in_threadpool(_get_hco_system_blocks_cached_sync, avatar_name)
+            for b in blocks or []:
+                if (b or "").strip():
+                    warm_messages.append({"role": "system", "content": b})
+        except Exception:
+            pass
+
+    # Tiny user ping; keep max_tokens minimal.
+    warm_messages.append({"role": "user", "content": "."})
+    warm_messages = _compact_llm_messages(warm_messages, provider_switched=True)
+
+    try:
+        if provider == "xai":
+            client = _get_xai_client()
+            stream_env = (os.getenv("XAI_STREAM", "1") or "1").strip().lower()
+            use_stream = stream_env not in ("0", "false", "no", "off")
+            _chat_completion_text(
+                client,
+                model=(os.getenv("XAI_MODEL", "") or "grok-4").strip(),
+                messages=warm_messages,
+                temperature=0.0,
+                max_tokens=1,
+                stream=use_stream,
+            )
+        else:
+            client = _get_openai_client()
+            _chat_completion_text(
+                client,
+                model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+                messages=warm_messages,
+                temperature=0.0,
+                max_tokens=1,
+                stream=False,
+            )
+    except Exception as e:
+        # Never fail the UI because warming didn't work.
+        return {"ok": False, "provider": provider, "mode": mode, "error": f"{type(e).__name__}: {e}"}
+
+    return {"ok": True, "provider": provider, "mode": mode}
+
+
+
+
+# =============================================================================
+# HOST OVERRIDE (Human Companion takeover of AI chat)
+#
+# Use-case:
+#   - When the logged-in user's memberId == host_member_id (per brand+avatar mapping),
+#     the host may "override" AI chat and directly message members/visitors.
+#   - While override is active for a session_id:
+#       * /chat will NOT call the LLM (OpenAI/xAI). It will log the user's message
+#         and return an empty reply (frontend polls for host messages).
+#       * Minutes are still charged (same usage clock as AI chat).
+#   - When minutes are exhausted during a host takeover:
+#       * The member receives the standard paywall message.
+#       * Override is ended automatically.
+#       * The host is notified that the member is out of minutes.
+#
+# Notes:
+#   - This implementation is intentionally lightweight: in-memory store + optional
+#     JSON persistence for single-instance Azure App Service deployments.
+#   - Session isolation: keyed by session_id (stored in browser sessionStorage).
+# =============================================================================
+
+_AI_OVERRIDE_LOCK = threading.RLock()
+_AI_OVERRIDE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+_AI_OVERRIDE_ACTIVE_WINDOW_S = int(os.getenv("AI_OVERRIDE_ACTIVE_WINDOW_S", "1800") or "1800")  # 30m
+_AI_OVERRIDE_MAX_EVENTS = int(os.getenv("AI_OVERRIDE_MAX_EVENTS", "800") or "800")
+_AI_OVERRIDE_FILE = (os.getenv("AI_OVERRIDE_FILE", "") or "").strip()
+_AI_OVERRIDE_FILE_MTIME: float = 0.0
+
+
+def _ai_override_load() -> None:
+    global _AI_OVERRIDE_FILE_MTIME
+    if not _AI_OVERRIDE_FILE:
+        return
+    try:
+        if not os.path.isfile(_AI_OVERRIDE_FILE):
+            return
+        with open(_AI_OVERRIDE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            with _AI_OVERRIDE_LOCK:
+                _AI_OVERRIDE_SESSIONS.clear()
+                for k, v in data.items():
+                    if isinstance(k, str) and isinstance(v, dict):
+                        _AI_OVERRIDE_SESSIONS[k] = v
+        try:
+            _AI_OVERRIDE_FILE_MTIME = os.stat(_AI_OVERRIDE_FILE).st_mtime
+        except Exception:
+            pass
+    except Exception:
+        return
+
+
+def _ai_override_persist() -> None:
+    global _AI_OVERRIDE_FILE_MTIME
+    if not _AI_OVERRIDE_FILE:
+        return
+    try:
+        tmp = _AI_OVERRIDE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_AI_OVERRIDE_SESSIONS, f, ensure_ascii=False)
+        os.replace(tmp, _AI_OVERRIDE_FILE)
+        try:
+            _AI_OVERRIDE_FILE_MTIME = os.stat(_AI_OVERRIDE_FILE).st_mtime
+        except Exception:
+            pass
+    except Exception:
+        return
+
+
+def _ai_override_refresh_if_needed() -> None:
+    if not _AI_OVERRIDE_FILE:
+        return
+    try:
+        if not os.path.isfile(_AI_OVERRIDE_FILE):
+            return
+        mtime = os.stat(_AI_OVERRIDE_FILE).st_mtime
+        if mtime and mtime > _AI_OVERRIDE_FILE_MTIME + 1e-6:
+            _ai_override_load()
+    except Exception:
+        return
+
+
+# best-effort load at startup
+_ai_override_load()
+
+
+def _brand_avatar_from_session_state(session_state: Dict[str, Any]) -> Tuple[str, str]:
+    # Prefer explicit brand/avatar fields set by the frontend.
+    brand = str(session_state.get("brand") or session_state.get("companyName") or session_state.get("company") or "").strip()
+    avatar = str(session_state.get("avatar") or "").strip()
+
+    # Fallbacks:
+    if not avatar:
+        avatar = str(session_state.get("companionName") or session_state.get("companion") or session_state.get("companion_name") or "").strip()
+    if not brand:
+        # Use legacy single-field rebranding if present.
+        brand = str(session_state.get("rebranding") or "").strip()
+
+    return brand, avatar
+
+
+def _ai_override_get_session(session_id: str) -> Optional[Dict[str, Any]]:
+    sid = (session_id or "").strip()
+    if not sid:
+        return None
+    _ai_override_refresh_if_needed()
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if isinstance(rec, dict):
+            return rec
+    return None
+
+
+def _ai_override_touch_from_chat(
+    *,
+    session_id: str,
+    session_state: Dict[str, Any],
+    identity_key: str,
+    is_trial: bool,
+    plan_name_for_limits: str,
+    plan_label_for_messages: str,
+    minutes_allowed_override: Optional[int],
+    cycle_days_override: Optional[int],
+    upgrade_url: str,
+    payg_pay_url: str,
+    payg_minutes: Optional[int],
+    payg_price_text: str,
+) -> Dict[str, Any]:
+    sid = (session_id or "").strip()
+    if not sid:
+        return {}
+
+    brand, avatar = _brand_avatar_from_session_state(session_state)
+    member_id = _extract_member_id(session_state) or ""
+    user_name = _extract_user_name(session_state)
+    companion_key = _normalize_companion_key(_extract_companion_raw(session_state))
+
+    # In-session digests from the frontend (optional).
+    in_session = _extract_in_session_summaries(session_state)
+
+    now = time.time()
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if not isinstance(rec, dict):
+            rec = {
+                "session_id": sid,
+                "seq": 0,
+                "events": [],
+                "override_active": False,
+                "override_started_at": None,
+                "override_host_member_id": "",
+                "host_ack_seq": 0,
+                # Optional viewer/user display name for host readability
+                "user_name": "",
+                "user_name_updated_at": None,
+            }
+
+        rec["session_id"] = sid
+        rec["brand"] = brand
+        rec["avatar"] = avatar
+        rec["member_id"] = str(member_id or "").strip()
+        if user_name:
+            rec["user_name"] = str(user_name).strip()
+            rec["user_name_updated_at"] = float(now)
+        rec["identity_key"] = str(identity_key or "").strip()
+        rec["companion_key"] = companion_key
+        rec["last_seen"] = float(now)
+
+        # Usage context (needed for host messages to continue charging and for paywall messages)
+        rec["usage_ctx"] = {
+            "is_trial": bool(is_trial),
+            "plan_name_for_limits": str(plan_name_for_limits or "").strip(),
+            "plan_label_for_messages": str(plan_label_for_messages or "").strip(),
+            "minutes_allowed_override": minutes_allowed_override,
+            "cycle_days_override": cycle_days_override,
+            "upgrade_url": str(upgrade_url or "").strip(),
+            "payg_pay_url": str(payg_pay_url or "").strip(),
+            "payg_minutes": payg_minutes,
+            "payg_price_text": str(payg_price_text or "").strip(),
+        }
+
+        # Summaries for host preview
+        if in_session:
+            rec["in_session_summaries"] = in_session
+        rec["summary_key"] = _summary_store_key(session_state, sid)
+
+        _AI_OVERRIDE_SESSIONS[sid] = rec
+        _ai_override_persist()
+
+        return rec
+
+
+def _ai_override_append_event(
+    session_id: str,
+    *,
+    role: str,
+    content: str,
+    sender: str,
+    audience: str = "all",
+    kind: str = "message",
+) -> Dict[str, Any]:
+    sid = (session_id or "").strip()
+    if not sid:
+        return {}
+
+    now = time.time()
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if not isinstance(rec, dict):
+            rec = {"session_id": sid, "seq": 0, "events": [], "override_active": False, "host_ack_seq": 0}
+
+        seq = int(rec.get("seq") or 0) + 1
+        rec["seq"] = seq
+
+        ev = {
+            "seq": seq,
+            "ts": float(now),
+            "role": str(role or "").strip() or "system",
+            "content": str(content or ""),
+            "sender": str(sender or "").strip() or "system",
+            "audience": str(audience or "all").strip() or "all",
+            "kind": str(kind or "message").strip() or "message",
+        }
+
+        # Include user display name on user-authored events (host console readability)
+        try:
+            if str(ev.get("sender") or "").strip() == "user":
+                un = str(rec.get("user_name") or "").strip()
+                if un:
+                    ev["user_name"] = un
+        except Exception:
+            pass
+
+        events = rec.get("events")
+        if not isinstance(events, list):
+            events = []
+        events.append(ev)
+
+        # Trim
+        max_events = max(50, int(_AI_OVERRIDE_MAX_EVENTS or 0))
+        if len(events) > max_events:
+            events = events[-max_events:]
+
+            # Rebase host_ack_seq so unread counts don't explode after trimming.
+            try:
+                min_seq = int(events[0].get("seq") or 0)
+                if int(rec.get("host_ack_seq") or 0) < min_seq:
+                    rec["host_ack_seq"] = min_seq - 1
+            except Exception:
+                pass
+
+        rec["events"] = events
+        rec["last_seen"] = float(now)
+
+        _AI_OVERRIDE_SESSIONS[sid] = rec
+        _ai_override_persist()
+
+        return ev
+
+
+def _ai_override_is_active(session_id: str) -> bool:
+    rec = _ai_override_get_session(session_id)
+    if not isinstance(rec, dict):
+        return False
+    return bool(rec.get("override_active") is True)
+
+
+def _ai_override_set_active(
+    session_id: str,
+    *,
+    enabled: bool,
+    host_member_id: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    sid = (session_id or "").strip()
+    if not sid:
+        return {}
+
+    now = time.time()
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if not isinstance(rec, dict):
+            rec = {"session_id": sid, "seq": 0, "events": [], "override_active": False, "host_ack_seq": 0}
+
+        rec["override_active"] = bool(enabled)
+        rec["override_host_member_id"] = str(host_member_id or "").strip()
+        rec["override_started_at"] = float(now) if enabled else None
+        rec["last_seen"] = float(now)
+
+        _AI_OVERRIDE_SESSIONS[sid] = rec
+        _ai_override_persist()
+
+    # Emit a system event so the member UI can show a banner.
+    if enabled:
+        _ai_override_append_event(
+            sid,
+            role="system",
+            content="Host override enabled — you are now chatting with a human companion.",
+            sender="system",
+            audience="all",
+            kind="override_on",
+        )
+    else:
+        msg = "Host override ended — AI companion chat will continue."
+        if reason:
+            msg = f"Host override ended ({reason})."
+        _ai_override_append_event(
+            sid,
+            role="system",
+            content=msg,
+            sender="system",
+            audience="all",
+            kind="override_off",
+        )
+
+    return _ai_override_get_session(sid) or {}
+
+
+def _ai_override_list_active_sessions(brand: str, avatar: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+    now = time.time()
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+
+    _ai_override_refresh_if_needed()
+
+    out: List[Dict[str, Any]] = []
+    with _AI_OVERRIDE_LOCK:
+        items = list(_AI_OVERRIDE_SESSIONS.values())
+
+    for rec in items:
+        if not isinstance(rec, dict):
+            continue
+        last_seen = float(rec.get("last_seen") or 0.0)
+        if not last_seen or (now - last_seen) > float(_AI_OVERRIDE_ACTIVE_WINDOW_S or 0):
+            continue
+        if b and str(rec.get("brand") or "").strip() != b:
+            continue
+        if a and str(rec.get("avatar") or "").strip() != a:
+            continue
+        out.append(rec)
+
+    out.sort(key=lambda r: float(r.get("last_seen") or 0.0), reverse=True)
+    return out[: max(1, min(int(limit or 50), 200))]
+
+
+def _ai_override_poll(
+    session_id: str,
+    *,
+    since_seq: int,
+    audience: str,
+    mark_host_read: bool = False,
+) -> Dict[str, Any]:
+    sid = (session_id or "").strip()
+    rec = _ai_override_get_session(sid) or {}
+    if not isinstance(rec, dict):
+        return {"events": [], "next_since_seq": int(since_seq or 0), "override_active": False}
+
+    try:
+        since_i = int(since_seq or 0)
+    except Exception:
+        since_i = 0
+
+    events = rec.get("events")
+    if not isinstance(events, list):
+        events = []
+
+    # Filter by seq and audience
+    wanted: List[Dict[str, Any]] = []
+    max_seq = since_i
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        seq = int(ev.get("seq") or 0)
+        if seq <= since_i:
+            continue
+        ev_aud = str(ev.get("audience") or "all").strip() or "all"
+        if ev_aud != "all" and ev_aud != audience:
+            continue
+        wanted.append(ev)
+        if seq > max_seq:
+            max_seq = seq
+
+    if mark_host_read and audience == "host":
+        with _AI_OVERRIDE_LOCK:
+            rec2 = _AI_OVERRIDE_SESSIONS.get(sid)
+            if isinstance(rec2, dict):
+                rec2["host_ack_seq"] = max(int(rec2.get("host_ack_seq") or 0), int(max_seq or 0))
+                _AI_OVERRIDE_SESSIONS[sid] = rec2
+                _ai_override_persist()
+
+    return {
+        "events": wanted,
+        "next_since_seq": int(max_seq or since_i),
+        "override_active": bool(rec.get("override_active") is True),
+        "override_started_at": rec.get("override_started_at"),
+    }
+
+
+def _ai_override_unread_for_host(rec: Dict[str, Any]) -> int:
+    try:
+        host_ack = int(rec.get("host_ack_seq") or 0)
+    except Exception:
+        host_ack = 0
+    events = rec.get("events")
+    if not isinstance(events, list):
+        return 0
+    c = 0
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        seq = int(ev.get("seq") or 0)
+        if seq <= host_ack:
+            continue
+        if str(ev.get("sender") or "") == "user":
+            c += 1
+    return c
+
+
+def _ai_override_best_summary(rec: Dict[str, Any]) -> Tuple[str, str]:
+    # 1) Saved summary (user-authorized)
+    try:
+        key = str(rec.get("summary_key") or "").strip()
+        if key:
+            _refresh_summary_store_if_needed()
+            ss = _CHAT_SUMMARY_STORE.get(key) or {}
+            s = ss.get("summary")
+            if isinstance(s, str) and s.strip():
+                return s.strip(), "saved_summary"
+    except Exception:
+        pass
+
+    # 2) In-session digests (client-side)
+    try:
+        digs = rec.get("in_session_summaries")
+        if isinstance(digs, list) and digs:
+            last = str(digs[-1] or "").strip()
+            if last:
+                return last, "in_session_digest"
+    except Exception:
+        pass
+
+    # 3) Fallback: last few events
+    try:
+        events = rec.get("events")
+        if isinstance(events, list) and events:
+            tail = events[-6:]
+            lines: List[str] = []
+            for ev in tail:
+                if not isinstance(ev, dict):
+                    continue
+                role = str(ev.get("role") or "").strip() or "system"
+                sender = str(ev.get("sender") or "").strip() or role
+                c = str(ev.get("content") or "").strip()
+                if not c:
+                    continue
+                if len(c) > 240:
+                    c = c[:240] + "…"
+                lines.append(f"{sender}: {c}")
+            if lines:
+                return "\n".join(lines), "recent_messages"
+    except Exception:
+        pass
+
+    return "", "none"
 
 # ----------------------------
 # SAVE CHAT SUMMARY
@@ -5562,6 +6819,40 @@ def _extract_companion_raw(session_state: Dict[str, Any]) -> str:
         or ""
     )
     return str(companion).strip() if companion is not None else ""
+
+
+def _extract_user_name(session_state: Dict[str, Any]) -> str:
+    """Best-effort extraction of a viewer/user display name.
+
+    This is used ONLY for Host Console readability (labels + summaries).
+    It does not affect identity/authorization.
+
+    Frontend can supply this via session_state using any of these keys.
+    """
+
+    candidates = (
+        "user_name",
+        "username",
+        "userName",
+        "display_name",
+        "displayName",
+        "viewer_name",
+        "viewerName",
+        "live_chat_name",
+        "liveChatName",
+    )
+
+    for k in candidates:
+        try:
+            v = session_state.get(k)
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                return s
+        except Exception:
+            continue
+    return ""
 
 
 def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
@@ -7940,3 +9231,1292 @@ async def wix_paymentlinks_webhook(request: Request):
         _wix_process_paymentlink_webhook_sync(decoded)
 
     return {"ok": True}
+
+
+# =============================================================================
+# Host Override API
+# =============================================================================
+
+class HostAiChatsActiveRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    limit: int = 50
+
+
+class HostAiChatsOverrideRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    session_id: str = ""
+    enabled: bool = False
+
+
+class HostAiChatsSendRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    session_id: str = ""
+    text: str = ""
+
+
+class HostAiChatsPollRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    session_id: str = ""
+    since_seq: int = 0
+    mark_read: bool = True
+
+
+class ChatRelayPollRequest(BaseModel):
+    session_id: str = ""
+    since_seq: int = 0
+    session_state: Dict[str, Any] = {}
+
+
+def _require_host_member(brand: str, avatar: str, member_id: str) -> str:
+    brand_s = (brand or "").strip()
+    avatar_s = (avatar or "").strip()
+    caller = (member_id or "").strip()
+    if not brand_s or not avatar_s:
+        raise HTTPException(status_code=400, detail="brand and avatar are required")
+
+    mapping = _lookup_companion_mapping(brand_s, avatar_s) or {}
+    host_id = str(mapping.get("host_member_id") or mapping.get("hostMemberId") or "").strip()
+    if not host_id:
+        raise HTTPException(status_code=404, detail="No host_member_id configured for this companion mapping")
+    if not caller or caller != host_id:
+        raise HTTPException(status_code=403, detail="Host access denied")
+    return host_id
+
+# =============================================================================
+# Host Companion Guidelines (persisted)
+# =============================================================================
+#
+# The Host (human companion) can edit high-priority interaction guidelines for the AI Companion.
+# These guidelines are:
+#   - stored server-side (SQLite under /home/site)
+#   - retrievable/editable ONLY by the configured host_member_id for the companion mapping
+#   - injected into EVERY AI chat turn (both OpenAI + xAI) as a high-priority system message
+#
+# Frontend expects:
+#   POST /host/companion-guidelines/get  { brand, avatar, memberId }
+#   POST /host/companion-guidelines/set  { brand, avatar, memberId, guidelines }
+#
+_GUIDELINES_DB_PATH = (os.getenv("COMPANION_GUIDELINES_DB_PATH") or "").strip()
+if not _GUIDELINES_DB_PATH:
+    _base = "/home/site" if os.path.isdir("/home/site") else ("/home" if os.path.isdir("/home") else "/tmp")
+    _GUIDELINES_DB_PATH = os.path.join(_base, "companion_guidelines.sqlite3")
+
+_GUIDELINES_DB_LOCK = threading.RLock()
+
+def _guidelines_db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(_GUIDELINES_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _guidelines_db_init_sync() -> None:
+    with _GUIDELINES_DB_LOCK:
+        conn = _guidelines_db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS companion_guidelines (
+                  companion_guidelines_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  brand TEXT NOT NULL,
+                  avatar TEXT NOT NULL,
+                  host_member_id TEXT,
+                  guidelines TEXT,
+                  UNIQUE(brand, avatar)
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def _get_companion_guidelines_sync(brand: str, avatar: str) -> str:
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not b or not a:
+        return ""
+    with _GUIDELINES_DB_LOCK:
+        conn = _guidelines_db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT guidelines
+                FROM companion_guidelines
+                WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)
+                ORDER BY update_datetime DESC, companion_guidelines_id DESC
+                LIMIT 1
+                """,
+                (b, a),
+            )
+            row = cur.fetchone()
+            if not row:
+                return ""
+            return str(row[0] or "").strip()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def _set_companion_guidelines_sync(brand: str, avatar: str, host_member_id: str, guidelines: str) -> str:
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    h = (host_member_id or "").strip()
+    text = str(guidelines or "").strip()
+
+    if not b or not a:
+        raise ValueError("brand and avatar are required")
+
+    with _GUIDELINES_DB_LOCK:
+        conn = _guidelines_db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO companion_guidelines (brand, avatar, host_member_id, guidelines)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(brand, avatar) DO UPDATE SET
+                  host_member_id=excluded.host_member_id,
+                  guidelines=excluded.guidelines,
+                  update_datetime=CURRENT_TIMESTAMP
+                """,
+                (b, a, h, text),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return text
+
+try:
+    _guidelines_db_init_sync()
+except Exception as e:
+    logger.warning("Companion guidelines DB init failed: %s", e)
+
+class HostCompanionGuidelinesGetRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+
+class HostCompanionGuidelinesSetRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    guidelines: str = ""
+
+@app.post("/host/companion-guidelines/get")
+async def host_companion_guidelines_get(req: HostCompanionGuidelinesGetRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    b = (req.brand or "").strip()
+    a = (req.avatar or "").strip()
+    text = await run_in_threadpool(_get_companion_guidelines_sync, b, a)
+    return {"ok": True, "hostMemberId": host_id, "guidelines": text}
+
+@app.post("/host/companion-guidelines/set")
+async def host_companion_guidelines_set(req: HostCompanionGuidelinesSetRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    b = (req.brand or "").strip()
+    a = (req.avatar or "").strip()
+    text = await run_in_threadpool(_set_companion_guidelines_sync, b, a, host_id, req.guidelines)
+    return {"ok": True, "hostMemberId": host_id, "guidelines": text}
+
+
+
+
+@app.post("/host/ai-chats/active")
+async def host_ai_chats_active(req: HostAiChatsActiveRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+
+    recs = _ai_override_list_active_sessions(req.brand, req.avatar, limit=int(req.limit or 50))
+
+    sessions_out: List[Dict[str, Any]] = []
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+
+        ctx = rec.get("usage_ctx") or {}
+        if not isinstance(ctx, dict):
+            ctx = {}
+
+        identity_key = str(rec.get("identity_key") or "").strip()
+        usage_ok = True
+        usage_info: Dict[str, Any] = {}
+        if identity_key:
+            try:
+                usage_ok, usage_info = _usage_peek_sync(
+                    identity_key,
+                    is_trial=bool(ctx.get("is_trial") is True),
+                    plan_name=str(ctx.get("plan_name_for_limits") or "").strip(),
+                    minutes_allowed_override=ctx.get("minutes_allowed_override", None),
+                    cycle_days_override=ctx.get("cycle_days_override", None),
+                )
+            except Exception:
+                usage_ok, usage_info = True, {}
+
+        summary, summary_source = _ai_override_best_summary(rec)
+
+        # Host console readability: surface the viewer's chosen display name.
+        user_name = str(rec.get("user_name") or "").strip()
+        if user_name:
+            # Make sure the summary snippet visibly includes the username.
+            if summary:
+                first_line = str(summary).splitlines()[0].strip() if isinstance(summary, str) else ""
+                if first_line != user_name:
+                    summary = f"{user_name}\n{summary}"
+            else:
+                summary = user_name
+
+        sessions_out.append(
+            {
+                "session_id": str(rec.get("session_id") or "").strip(),
+                "member_id": str(rec.get("member_id") or "").strip(),
+                "user_name": user_name,
+                "brand": str(rec.get("brand") or "").strip(),
+                "avatar": str(rec.get("avatar") or "").strip(),
+                "companion_key": str(rec.get("companion_key") or "").strip(),
+                "last_seen": float(rec.get("last_seen") or 0.0),
+                "override_active": bool(rec.get("override_active") is True),
+                "override_started_at": rec.get("override_started_at"),
+                "unread": int(_ai_override_unread_for_host(rec)),
+                "summary": summary,
+                "summary_source": summary_source,
+                "usage_ok": bool(usage_ok),
+                "minutes_used": int(usage_info.get("minutes_used") or 0),
+                "minutes_allowed": int(usage_info.get("minutes_allowed") or 0),
+                "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
+                "plan_label": str(ctx.get("plan_label_for_messages") or "").strip(),
+                "is_trial": bool(ctx.get("is_trial") is True),
+            }
+        )
+
+    return {"ok": True, "hostMemberId": host_id, "sessions": sessions_out, "now": _now_ts()}
+
+
+@app.post("/host/ai-chats/override")
+async def host_ai_chats_override(req: HostAiChatsOverrideRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    sid = (req.session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    # Ensure the session record exists even if the host toggles override early.
+    rec = _ai_override_get_session(sid)
+    if not isinstance(rec, dict):
+        with _AI_OVERRIDE_LOCK:
+            _AI_OVERRIDE_SESSIONS[sid] = {"session_id": sid, "seq": 0, "events": [], "override_active": False, "host_ack_seq": 0}
+            _ai_override_persist()
+
+    out = _ai_override_set_active(sid, enabled=bool(req.enabled), host_member_id=host_id)
+    return {"ok": True, "session_id": sid, "override_active": bool(out.get("override_active") is True), "hostMemberId": host_id}
+
+
+@app.post("/host/ai-chats/send")
+async def host_ai_chats_send(req: HostAiChatsSendRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    sid = (req.session_id or "").strip()
+    text = (req.text or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    rec = _ai_override_get_session(sid) or {}
+    if not isinstance(rec, dict):
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    if not bool(rec.get("override_active") is True):
+        raise HTTPException(status_code=409, detail="Host override is not active for this session")
+
+    ctx = rec.get("usage_ctx") or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+
+    identity_key = str(rec.get("identity_key") or "").strip()
+    if not identity_key:
+        raise HTTPException(status_code=400, detail="Missing identity key for this session (member has not chatted yet)")
+
+    # Charge minutes while the host is active (same usage clock as AI chat).
+    try:
+        usage_ok, usage_info = _usage_charge_and_check_sync(
+            identity_key,
+            is_trial=bool(ctx.get("is_trial") is True),
+            plan_name=str(ctx.get("plan_name_for_limits") or "").strip(),
+            minutes_allowed_override=ctx.get("minutes_allowed_override", None),
+            cycle_days_override=ctx.get("cycle_days_override", None),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Usage enforcement failed: {type(e).__name__}: {e}")
+
+    if not usage_ok:
+        # Member is out of minutes: send paywall to member and end override.
+        minutes_allowed = int(
+            usage_info.get("minutes_allowed")
+            or (
+                ctx.get("minutes_allowed_override")
+                if ctx.get("minutes_allowed_override") is not None
+                else (TRIAL_MINUTES if bool(ctx.get("is_trial") is True) else _included_minutes_for_plan(str(ctx.get("plan_name_for_limits") or "").strip()))
+            )
+            or 0
+        )
+
+        paywall = _usage_paywall_message(
+            is_trial=bool(ctx.get("is_trial") is True),
+            plan_name=str(ctx.get("plan_label_for_messages") or "").strip() or str(ctx.get("plan_name_for_limits") or "").strip(),
+            minutes_allowed=minutes_allowed,
+            upgrade_url=str(ctx.get("upgrade_url") or "").strip(),
+            payg_pay_url=str(ctx.get("payg_pay_url") or "").strip(),
+            payg_increment_minutes=ctx.get("payg_minutes", None),
+            payg_price_text=str(ctx.get("payg_price_text") or "").strip(),
+        )
+
+        # Member sees paywall.
+        _ai_override_append_event(
+            sid,
+            role="assistant",
+            content=paywall,
+            sender="system",
+            audience="user",
+            kind="paywall",
+        )
+
+        # Host sees termination notice.
+        _ai_override_append_event(
+            sid,
+            role="system",
+            content="Member is out of chat minutes. Host override ended.",
+            sender="system",
+            audience="host",
+            kind="minutes_exhausted",
+        )
+
+        _ai_override_set_active(sid, enabled=False, host_member_id=host_id, reason="member_out_of_minutes")
+
+        return {
+            "ok": False,
+            "minutes_exhausted": True,
+            "session_id": sid,
+            "override_active": False,
+            "usage_info": usage_info,
+            "paywall": paywall,
+        }
+
+    # Normal host message.
+    _ai_override_append_event(
+        sid,
+        role="assistant",
+        content=text,
+        sender="host",
+        audience="all",
+        kind="message",
+    )
+
+    return {"ok": True, "session_id": sid, "override_active": True, "usage_info": usage_info}
+
+
+@app.post("/host/ai-chats/poll")
+async def host_ai_chats_poll(req: HostAiChatsPollRequest):
+    _require_host_member(req.brand, req.avatar, req.memberId)
+    sid = (req.session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    out = _ai_override_poll(
+        sid,
+        since_seq=int(req.since_seq or 0),
+        audience="host",
+        mark_host_read=bool(req.mark_read),
+    )
+
+    rec = _ai_override_get_session(sid) or {}
+    ctx = rec.get("usage_ctx") if isinstance(rec, dict) else {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+
+    identity_key = str((rec or {}).get("identity_key") or "").strip() if isinstance(rec, dict) else ""
+    usage_info: Dict[str, Any] = {}
+    if identity_key:
+        try:
+            _ok, usage_info = _usage_peek_sync(
+                identity_key,
+                is_trial=bool(ctx.get("is_trial") is True),
+                plan_name=str(ctx.get("plan_name_for_limits") or "").strip(),
+                minutes_allowed_override=ctx.get("minutes_allowed_override", None),
+                cycle_days_override=ctx.get("cycle_days_override", None),
+            )
+        except Exception:
+            usage_info = {}
+
+    return {"ok": True, "session_id": sid, **out, "usage_info": usage_info}
+
+
+@app.post("/chat/relay/poll")
+async def chat_relay_poll(req: ChatRelayPollRequest):
+    sid = (req.session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    rec = _ai_override_get_session(sid) or {}
+    if not isinstance(rec, dict):
+        return {"ok": True, "session_id": sid, "events": [], "next_since_seq": int(req.since_seq or 0), "override_active": False}
+
+    # Soft identity check: only enforce when both sides present.
+    try:
+        caller_member = _extract_member_id(req.session_state or {}) or ""
+        stored_member = str(rec.get("member_id") or "").strip()
+        if stored_member and caller_member and stored_member != caller_member:
+            raise HTTPException(status_code=403, detail="Session access denied")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    polled = _ai_override_poll(
+        sid,
+        since_seq=int(req.since_seq or 0),
+        audience="user",
+        mark_host_read=False,
+    )
+
+    # Member only needs out-of-band messages:
+    #   - host replies
+    #   - system notices (override on/off, paywalls, etc.)
+    events = polled.get("events") or []
+    filtered: List[Dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        sender = str(ev.get("sender") or "").strip()
+        kind = str(ev.get("kind") or "").strip()
+        if sender in ("host", "system"):
+            filtered.append(ev)
+            continue
+        if kind in ("override_on", "override_off", "paywall", "minutes_exhausted"):
+            filtered.append(ev)
+
+    polled["events"] = filtered
+    polled["ok"] = True
+    polled["session_id"] = sid
+    return polled
+
+
+# ============================
+# v7.21 - Minutes consistency hardening (SQLite-backed state)
+# ============================
+# Goal:
+#  - Persist minute budgeting and cycle state per member_id (including non-member ids)
+#  - Prevent regressions where "remaining > total" or totals drift due to repeated parsing
+#  - Apply free_minutes from rebrandingKey ONLY once per cycle per member (or when plan upgrades)
+#  - PayGo purchases ALWAYS increase total time (purchased seconds) and are tracked with update_reason
+
+import os
+import time
+import sqlite3
+import tempfile
+import threading
+from typing import Optional, Dict, Any, Tuple
+
+_USAGE_DB_LOCK = threading.Lock()
+_USAGE_DB_READY = False
+
+def _usage_db_path() -> str:
+    """
+    Returns a persisted SQLite path for usage state.
+
+    We intentionally store this outside the packaged app directory so it persists across deploys.
+    """
+    env_path = (os.getenv("USAGE_SQLITE_PATH") or os.getenv("USAGE_DB_PATH") or "").strip()
+    if env_path:
+        return env_path
+
+    # Azure App Service persists /home. Prefer /home/site if present.
+    for cand in ("/home/site/usage_minutes.sqlite3", "/home/usage_minutes.sqlite3"):
+        try:
+            os.makedirs(os.path.dirname(cand), exist_ok=True)
+            return cand
+        except Exception:
+            continue
+
+    return os.path.join(tempfile.gettempdir(), "usage_minutes.sqlite3")
+
+
+def _normalize_usage_member_id(identity_key: str) -> str:
+    """
+    Normalizes an identity_key into the member_id value stored in the DB.
+
+    - legacy keys look like: "member::<uuid>"
+    - for non-members, we may also see: "Anon:<...>" or "ip::<addr>"
+    """
+    k = str(identity_key or "").strip()
+    if not k:
+        return ""
+    low = k.lower()
+    if low.startswith("member::"):
+        return k.split("::", 1)[1].strip()
+    return k
+
+
+def _usage_db_connect() -> sqlite3.Connection:
+    path = _usage_db_path()
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except Exception:
+        pass
+    return conn
+
+
+def _usage_db_ensure_schema(conn: sqlite3.Connection) -> None:
+    global _USAGE_DB_READY
+    if _USAGE_DB_READY:
+        return
+    with _USAGE_DB_LOCK:
+        if _USAGE_DB_READY:
+            return
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS member_usage_minutes (
+              member_id TEXT PRIMARY KEY,
+              create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+              update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+              cycle_start_epoch REAL,
+              cycle_days INTEGER,
+              plan_name TEXT,
+              plan_signature TEXT,
+              free_minutes_total INTEGER,
+              purchased_seconds REAL DEFAULT 0,
+              used_seconds REAL DEFAULT 0,
+              last_seen_epoch REAL,
+              restart_grace INTEGER DEFAULT 0,
+              update_reason TEXT
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_member_usage_minutes_cycle ON member_usage_minutes(cycle_start_epoch);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_member_usage_minutes_plan ON member_usage_minutes(plan_name);")
+        conn.commit()
+        _USAGE_DB_READY = True
+
+
+def _usage_db_get_row(conn: sqlite3.Connection, member_id: str) -> Optional[sqlite3.Row]:
+    cur = conn.execute("SELECT * FROM member_usage_minutes WHERE member_id = ?;", (member_id,))
+    return cur.fetchone()
+
+
+def _usage_db_set_update_reason(conn: sqlite3.Connection, member_id: str, reason: str) -> None:
+    conn.execute(
+        """
+        UPDATE member_usage_minutes
+           SET update_reason = ?,
+               update_datetime = CURRENT_TIMESTAMP
+         WHERE member_id = ?;
+        """,
+        (reason, member_id),
+    )
+
+
+def _usage_db_upsert_init(
+    conn: sqlite3.Connection,
+    member_id: str,
+    now: float,
+    cycle_days: int,
+    plan_name: str,
+    plan_signature: str,
+    free_minutes_total: int,
+    used_seconds: float = 0.0,
+    purchased_seconds: float = 0.0,
+    last_seen_epoch: Optional[float] = None,
+    restart_grace: int = 0,
+    update_reason: str = "init",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO member_usage_minutes
+        (member_id, cycle_start_epoch, cycle_days, plan_name, plan_signature, free_minutes_total,
+         used_seconds, purchased_seconds, last_seen_epoch, restart_grace, update_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(member_id) DO UPDATE SET
+          cycle_start_epoch=excluded.cycle_start_epoch,
+          cycle_days=excluded.cycle_days,
+          plan_name=excluded.plan_name,
+          plan_signature=excluded.plan_signature,
+          free_minutes_total=excluded.free_minutes_total,
+          used_seconds=excluded.used_seconds,
+          purchased_seconds=excluded.purchased_seconds,
+          last_seen_epoch=COALESCE(member_usage_minutes.last_seen_epoch, excluded.last_seen_epoch),
+          restart_grace=excluded.restart_grace,
+          update_reason=excluded.update_reason,
+          update_datetime=CURRENT_TIMESTAMP;
+        """,
+        (
+            member_id,
+            float(now),
+            int(cycle_days),
+            plan_name,
+            plan_signature,
+            int(free_minutes_total),
+            float(used_seconds),
+            float(purchased_seconds),
+            float(last_seen_epoch) if last_seen_epoch is not None else None,
+            int(restart_grace),
+            update_reason,
+        ),
+    )
+
+
+def _usage_db_maybe_migrate_from_json(conn: sqlite3.Connection, member_id: str) -> bool:
+    """
+    One-time best-effort migration from the legacy /home/elaralo_usage.json store.
+    We only migrate if:
+      - row doesn't exist yet, AND
+      - the json store contains a record for either:
+          a) member::<member_id>
+          b) member_id as-is
+    """
+    try:
+        # legacy store is used by earlier builds
+        store = _load_usage_store()  
+        if not isinstance(store, dict):
+            return False
+    except Exception:
+        return False
+
+    legacy_keys = []
+    if member_id:
+        legacy_keys.append(f"member::{member_id}")
+        legacy_keys.append(member_id)
+
+    rec = None
+    for k in legacy_keys:
+        v = store.get(k)
+        if isinstance(v, dict):
+            rec = v
+            break
+    if not isinstance(rec, dict):
+        return False
+
+    try:
+        cycle_start = float(rec.get("cycle_start") or 0.0) or time.time()
+        cycle_days = int(rec.get("cycle_days") or USAGE_CYCLE_DAYS)  
+        plan_name = str(rec.get("plan_name") or "").strip()
+        free_minutes_total = int(rec.get("minutes_allowed") or 0) if rec.get("minutes_allowed") is not None else 0
+        used_seconds = float(rec.get("used_seconds") or 0.0)
+        purchased_seconds = float(rec.get("purchased_seconds") or 0.0)
+        last_seen = rec.get("last_seen")
+        last_seen_epoch = float(last_seen) if last_seen is not None else None
+        restart_grace = int(rec.get("restart_grace") or 0)
+        plan_signature = str(rec.get("plan_signature") or "").strip() or f"{plan_name}|{free_minutes_total}|{cycle_days}"
+    except Exception:
+        return False
+
+    _usage_db_upsert_init(
+        conn,
+        member_id=member_id,
+        now=cycle_start,
+        cycle_days=cycle_days,
+        plan_name=plan_name,
+        plan_signature=plan_signature,
+        free_minutes_total=free_minutes_total,
+        used_seconds=used_seconds,
+        purchased_seconds=purchased_seconds,
+        last_seen_epoch=last_seen_epoch,
+        restart_grace=restart_grace,
+        update_reason="migrated_from_json",
+    )
+    return True
+
+
+def _usage_db_ensure_member_row(
+    conn: sqlite3.Connection,
+    identity_key: str,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int],
+    cycle_days_override: Optional[int],
+    now: float,
+    allow_create: bool = True,
+) -> sqlite3.Row:
+    """
+    Ensures a DB row exists and performs any eligibility updates that are allowed to change totals:
+      - cycle reset (once per cycle)
+      - plan upgrade/change (when signature changes)
+
+    IMPORTANT: We do NOT change totals just because the payload is re-sent;
+               totals are only updated on init, cycle reset, plan change, or paygo credit.
+    """
+    member_id = _normalize_usage_member_id(identity_key)
+    if not member_id:
+        # Should never happen, but avoid NULL keys.
+        member_id = f"unknown::{hash(identity_key)}"
+
+    requested_cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS)  
+    if requested_cycle_days < 0:
+        requested_cycle_days = int(USAGE_CYCLE_DAYS)  
+
+    if minutes_allowed_override is not None:
+        requested_free_minutes = int(minutes_allowed_override)
+    else:
+        if is_trial:
+            requested_free_minutes = int(TRIAL_MINUTES)  
+        else:
+            requested_free_minutes = int(_included_minutes_for_plan(plan_name))  
+
+    # Clamp free minutes to a sane floor.
+    if requested_free_minutes < 0:
+        requested_free_minutes = 0
+
+    # Plan signature: anything that should cause a "plan change" update.
+    # We include:
+    #  - trial flag
+    #  - plan name
+    #  - free minutes (from rebrandingKey override or plan map)
+    #  - cycle length
+    requested_sig = f"{int(bool(is_trial))}|{plan_name}|{requested_free_minutes}|{requested_cycle_days}"
+
+    row = _usage_db_get_row(conn, member_id)
+
+    if row is None and allow_create:
+        # Best-effort migration from the legacy JSON store.
+        try:
+            _usage_db_maybe_migrate_from_json(conn, member_id)
+        except Exception:
+            pass
+        row = _usage_db_get_row(conn, member_id)
+
+    if row is None and allow_create:
+        _usage_db_upsert_init(
+            conn,
+            member_id=member_id,
+            now=now,
+            cycle_days=requested_cycle_days,
+            plan_name=plan_name,
+            plan_signature=requested_sig,
+            free_minutes_total=requested_free_minutes,
+            used_seconds=0.0,
+            purchased_seconds=0.0,
+            last_seen_epoch=None,
+            restart_grace=0,
+            update_reason="init",
+        )
+        row = _usage_db_get_row(conn, member_id)
+
+    if row is None:
+        raise RuntimeError("Unable to initialize usage row")
+
+        # Cycle reset: applies for any account with cycle_days > 0.
+    try:
+        cycle_start = float(row["cycle_start_epoch"] or 0.0) or float(now)
+    except Exception:
+        cycle_start = float(now)
+
+    try:
+        stored_cycle_days = int(row["cycle_days"] or 0) or requested_cycle_days
+    except Exception:
+        stored_cycle_days = requested_cycle_days
+
+    # Normalize stored cycle days if missing
+    if stored_cycle_days <= 0:
+        stored_cycle_days = requested_cycle_days
+
+    # Refresh plan metadata if the upstream signature changed (upgrade / plan change).
+    stored_sig = str(row["plan_signature"] or "").strip()
+
+    # Perform cycle reset before plan change so the next cycle starts clean.
+    if stored_cycle_days > 0:
+        cycle_len = float(stored_cycle_days) * 86400.0
+        if (float(now) - float(cycle_start)) >= cycle_len:
+            # Carryover rules:
+            #   - Paid plans: carry over ALL unused minutes (included + purchased).
+            #   - Free Trial: carry over ONLY unused purchased minutes; unused free minutes do NOT carry over.
+            try:
+                old_free_min = int(row["free_minutes_total"] or 0)
+            except Exception:
+                old_free_min = 0
+            try:
+                old_purchased_s = float(row["purchased_seconds"] or 0.0)
+            except Exception:
+                old_purchased_s = 0.0
+            try:
+                old_used_s = float(row["used_seconds"] or 0.0)
+            except Exception:
+                old_used_s = 0.0
+
+            old_free_s = max(0.0, float(old_free_min) * 60.0)
+
+            if bool(is_trial):
+                # Assume free minutes are consumed first, then purchased minutes.
+                purchased_used_s = max(0.0, float(old_used_s) - float(old_free_s))
+                if purchased_used_s > float(old_purchased_s):
+                    purchased_used_s = float(old_purchased_s)
+                carryover_seconds = max(0.0, float(old_purchased_s) - float(purchased_used_s))
+                cycle_reason = "cycle_reset_trial_free_rollover_zero"
+            else:
+                old_total_s = max(0.0, float(old_free_s) + float(old_purchased_s))
+                carryover_seconds = max(0.0, float(old_total_s) - float(old_used_s))
+                cycle_reason = "cycle_reset"
+
+            conn.execute(
+                """
+                UPDATE member_usage_minutes
+                   SET cycle_start_epoch = ?,
+                       cycle_days = ?,
+                       plan_name = ?,
+                       plan_signature = ?,
+                       free_minutes_total = ?,
+                       used_seconds = 0,
+                       purchased_seconds = ?,
+                       restart_grace = 0,
+                       update_reason = ?,
+                       update_datetime = CURRENT_TIMESTAMP
+                 WHERE member_id = ?;
+                """,
+                (
+                    float(now),
+                    int(requested_cycle_days),
+                    plan_name,
+                    requested_sig,
+                    int(requested_free_minutes),
+                    float(carryover_seconds),
+                    cycle_reason,
+                    member_id,
+                ),
+            )
+            row = _usage_db_get_row(conn, member_id)
+            stored_sig = requested_sig
+
+    # Plan upgrade/change mid-cycle: update free minutes (does not reset used or purchases).
+    # This is the only other way the "total available minutes" can change automatically.
+    if stored_sig != requested_sig:
+        conn.execute(
+            """
+            UPDATE member_usage_minutes
+               SET cycle_days = ?,
+                   plan_name = ?,
+                   plan_signature = ?,
+                   free_minutes_total = ?,
+                   update_reason = ?,
+                   update_datetime = CURRENT_TIMESTAMP
+             WHERE member_id = ?;
+            """,
+            (
+                int(requested_cycle_days),
+                plan_name,
+                requested_sig,
+                int(requested_free_minutes),
+                "plan_change_or_upgrade",
+                member_id,
+            ),
+        )
+        row = _usage_db_get_row(conn, member_id)
+
+    if row is None:
+        raise RuntimeError("Usage row missing after updates")
+    return row
+
+
+def _usage_info_from_row(row: sqlite3.Row) -> Dict[str, Any]:
+    free_minutes_total = int(row["free_minutes_total"] or 0)
+    purchased_seconds = float(row["purchased_seconds"] or 0.0)
+    used_seconds = float(row["used_seconds"] or 0.0)
+
+    total_seconds = max(0.0, float(free_minutes_total) * 60.0 + purchased_seconds)
+    used_seconds = min(total_seconds, max(0.0, used_seconds))
+    remaining_seconds = max(0.0, total_seconds - used_seconds)
+
+    minutes_included = max(0, int(free_minutes_total))
+    minutes_purchased = max(0, int(purchased_seconds // 60))
+    minutes_total = max(minutes_included + minutes_purchased, int((used_seconds + remaining_seconds) // 60))
+
+    return {
+        "member_id": str(row["member_id"]),
+        "cycle_start_epoch": row["cycle_start_epoch"],
+        "cycle_days": int(row["cycle_days"] or 0),
+        "plan_name": str(row["plan_name"] or ""),
+        "minutes_included": minutes_included,
+        "minutes_purchased": minutes_purchased,
+        # Keep legacy field name used by frontend: minutes_allowed == TOTAL budget in minutes.
+        "minutes_allowed": max(0, int(total_seconds // 60)),
+        "minutes_total": minutes_total,
+        "minutes_used": max(0, int(used_seconds // 60)),
+        "minutes_remaining": max(0, int(remaining_seconds // 60)),
+        "minutes_exhausted": remaining_seconds <= 0.0,
+        "update_reason": str(row["update_reason"] or ""),
+    }
+
+
+def _usage_admin_debug_sync(member_id: str, limit: int, now: float) -> Dict[str, Any]:
+    """Sync helper for /admin/usage/debug (runs in threadpool).
+
+    If member_id is provided, returns a detailed record including raw DB row fields and computed totals.
+    If member_id is empty, returns the most recently updated rows (limited) for triage.
+    """
+    conn = _usage_db_connect()
+    _usage_db_ensure_schema(conn)
+
+    member_id_norm = _normalize_usage_member_id(member_id) if member_id else ""
+    if member_id_norm:
+        row = _usage_db_get_row(conn, member_id_norm)
+        if row is None:
+            return {"ok": False, "error": "not_found", "member_id": member_id_norm, "db_path": _usage_db_path()}
+
+        raw_row = {k: row[k] for k in row.keys()}
+        info = _usage_info_from_row(row)
+
+        try:
+            cycle_start = float(row["cycle_start_epoch"] or 0.0)
+        except Exception:
+            cycle_start = 0.0
+        try:
+            cycle_days = int(row["cycle_days"] or 0)
+        except Exception:
+            cycle_days = 0
+
+        cycle_end = cycle_start + float(cycle_days) * 86400.0 if cycle_start and cycle_days > 0 else None
+        reset_in_seconds = max(0.0, float(cycle_end - now)) if cycle_end else None
+
+        # Provide seconds-level totals for debugging (minutes are floored in _usage_info_from_row).
+        free_minutes_total = int(row["free_minutes_total"] or 0)
+        purchased_seconds = float(row["purchased_seconds"] or 0.0)
+        used_seconds = float(row["used_seconds"] or 0.0)
+        total_seconds = max(0.0, float(free_minutes_total) * 60.0 + purchased_seconds)
+        used_seconds_c = min(total_seconds, max(0.0, used_seconds))
+        remaining_seconds = max(0.0, total_seconds - used_seconds_c)
+
+        return {
+            "ok": True,
+            "db_path": _usage_db_path(),
+            "now_epoch": now,
+            "member_id": member_id_norm,
+            "raw_row": raw_row,
+            "computed": {
+                **info,
+                "plan_signature": str(row["plan_signature"] or ""),
+                "free_minutes_total": free_minutes_total,
+                "purchased_seconds": purchased_seconds,
+                "used_seconds": used_seconds,
+                "total_seconds": total_seconds,
+                "remaining_seconds": remaining_seconds,
+                "cycle_end_epoch": cycle_end,
+                "reset_in_seconds": reset_in_seconds,
+            },
+        }
+
+    # No member_id -> list recent rows
+    try:
+        lim = int(limit)
+    except Exception:
+        lim = 25
+    lim = max(1, min(lim, 200))
+
+    rows = conn.execute(
+        "SELECT * FROM member_usage_minutes ORDER BY update_datetime DESC, create_datetime DESC LIMIT ?;",
+        (lim,),
+    ).fetchall()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            info = _usage_info_from_row(r)
+        except Exception:
+            info = {}
+        try:
+            raw_row = {k: r[k] for k in r.keys()}
+        except Exception:
+            raw_row = {}
+        items.append(
+            {
+                "member_id": str(r["member_id"]),
+                "update_datetime": str(r["update_datetime"] or ""),
+                "update_reason": str(r["update_reason"] or ""),
+                "plan_name": str(r["plan_name"] or ""),
+                "plan_signature": str(r["plan_signature"] or ""),
+                "minutes_allowed": info.get("minutes_allowed"),
+                "minutes_used": info.get("minutes_used"),
+                "minutes_remaining": info.get("minutes_remaining"),
+                "raw_row": raw_row,
+            }
+        )
+
+    return {"ok": True, "db_path": _usage_db_path(), "now_epoch": now, "count": len(items), "rows": items}
+
+
+# --- Override legacy usage functions to use SQLite table state ---
+
+def _usage_credit_minutes_sync(identity_key: str, add_minutes: int) -> Dict[str, Any]:
+    """
+    Credits purchased minutes (PayGo) to the DB-backed usage state.
+
+    Important behaviors:
+      - This ALWAYS increases purchased_seconds (no caps).
+      - It sets restart_grace so we don't bill the gap between purchase and next chat turn.
+      - It logs update_reason='paygo_credit'.
+    """
+    member_id = _normalize_usage_member_id(identity_key)
+    if not member_id:
+        member_id = str(identity_key or "").strip()
+
+    try:
+        add_minutes_i = int(add_minutes)
+    except Exception:
+        add_minutes_i = 0
+
+    if add_minutes_i <= 0:
+        return {"ok": False, "error": "add_minutes must be > 0"}
+
+    now = time.time()
+    add_seconds = float(add_minutes_i) * 60.0
+
+    with _USAGE_LOCK:  
+        conn = _usage_db_connect()
+        try:
+            _usage_db_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE;")
+
+            # Ensure row exists (plan metadata may be unknown here; we keep existing if present).
+            row = _usage_db_get_row(conn, member_id)
+            if row is None:
+                _usage_db_upsert_init(
+                    conn,
+                    member_id=member_id,
+                    now=now,
+                    cycle_days=int(USAGE_CYCLE_DAYS),  
+                    plan_name="",
+                    plan_signature=f"0||0|{int(USAGE_CYCLE_DAYS)}",  
+                    free_minutes_total=0,
+                    used_seconds=0.0,
+                    purchased_seconds=0.0,
+                    last_seen_epoch=None,
+                    restart_grace=0,
+                    update_reason="init_for_paygo_credit",
+                )
+                row = _usage_db_get_row(conn, member_id)
+
+            purchased_seconds = float(row["purchased_seconds"] or 0.0) if row is not None else 0.0
+            new_purchased = max(0.0, purchased_seconds + add_seconds)
+
+            conn.execute(
+                """
+                UPDATE member_usage_minutes
+                   SET purchased_seconds = ?,
+                       restart_grace = 1,
+                       update_reason = ?,
+                       update_datetime = CURRENT_TIMESTAMP
+                 WHERE member_id = ?;
+                """,
+                (float(new_purchased), "paygo_credit", member_id),
+            )
+            conn.commit()
+
+            row2 = _usage_db_get_row(conn, member_id)
+            if row2 is None:
+                return {"ok": True, "member_id": member_id, "added_minutes": add_minutes_i}
+            info = _usage_info_from_row(row2)
+            info.update({"ok": True, "added_minutes": add_minutes_i})
+            return info
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _usage_charge_and_check_sync(
+    identity_key: str,
+    *,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int],
+    cycle_days_override: Optional[int],
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    DB-backed usage charging.
+
+    We charge time based on wall-clock delta between turns, with an idle grace period,
+    and a max-billable cap per request. Totals (free minutes + purchases) are persisted
+    per member_id and only change on:
+      - init
+      - cycle reset
+      - plan upgrade/change
+      - paygo credit
+    """
+    now = time.time()
+
+    # Normalize legacy identity keys (member::<id>) to member_id for the DB.
+    member_id = _normalize_usage_member_id(identity_key)
+    if not member_id:
+        member_id = str(identity_key or "").strip()
+
+    with _USAGE_LOCK:  
+        conn = _usage_db_connect()
+        try:
+            _usage_db_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE;")
+
+            row = _usage_db_ensure_member_row(
+                conn,
+                identity_key=identity_key,
+                is_trial=bool(is_trial),
+                plan_name=str(plan_name or "").strip(),
+                minutes_allowed_override=minutes_allowed_override,
+                cycle_days_override=cycle_days_override,
+                now=now,
+                allow_create=True,
+            )
+
+            free_minutes_total = int(row["free_minutes_total"] or 0)
+            purchased_seconds = float(row["purchased_seconds"] or 0.0)
+            used_seconds = float(row["used_seconds"] or 0.0)
+
+            allowed_seconds = max(0.0, float(free_minutes_total) * 60.0 + purchased_seconds)
+            used_seconds = min(allowed_seconds, max(0.0, used_seconds))
+
+            last_seen = row["last_seen_epoch"]
+            restart_grace = int(row["restart_grace"] or 0)
+
+            delta = 0.0
+            if restart_grace:
+                # Do not bill the gap after a PayGo credit.
+                conn.execute(
+                    """
+                    UPDATE member_usage_minutes
+                       SET restart_grace = 0,
+                           update_datetime = CURRENT_TIMESTAMP
+                     WHERE member_id = ?;
+                    """,
+                    (member_id,),
+                )
+                delta = 0.0
+            else:
+                if last_seen is None:
+                    delta = 0.0
+                else:
+                    try:
+                        delta = float(now) - float(last_seen)
+                    except Exception:
+                        delta = 0.0
+
+                # Idle grace: if the user was away for a while, don't bill the gap.
+                try:
+                    if delta > float(USAGE_IDLE_GRACE_SECONDS):  
+                        delta = 0.0
+                except Exception:
+                    pass
+
+                # Cap per request for safety.
+                try:
+                    cap = float(USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST)  
+                    if delta > cap:
+                        delta = cap
+                except Exception:
+                    pass
+
+                if delta < 0:
+                    delta = 0.0
+
+            new_used = min(allowed_seconds, used_seconds + float(delta))
+
+            conn.execute(
+                """
+                UPDATE member_usage_minutes
+                   SET used_seconds = ?,
+                       last_seen_epoch = ?,
+                       update_datetime = CURRENT_TIMESTAMP
+                 WHERE member_id = ?;
+                """,
+                (float(new_used), float(now), member_id),
+            )
+            conn.commit()
+
+            row2 = _usage_db_get_row(conn, member_id)
+            if row2 is None:
+                ok = allowed_seconds > new_used
+                return ok, {"minutes_used": int(new_used // 60), "minutes_allowed": int(allowed_seconds // 60), "minutes_remaining": int(max(0.0, allowed_seconds - new_used) // 60)}
+            info = _usage_info_from_row(row2)
+
+            ok = bool(info.get("minutes_remaining", 0) > 0)
+            # Maintain legacy key name expected elsewhere in the app.
+            info["identity_key"] = member_id
+            return ok, info
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _usage_peek_sync(
+    identity_key: str,
+    *,
+    is_trial: bool,
+    plan_name: str,
+    minutes_allowed_override: Optional[int],
+    cycle_days_override: Optional[int],
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Returns current minute balance WITHOUT charging additional time.
+    Still performs eligible maintenance that may affect totals:
+      - init (if missing)
+      - cycle reset
+      - plan upgrade/change
+    """
+    now = time.time()
+
+    member_id = _normalize_usage_member_id(identity_key)
+    if not member_id:
+        member_id = str(identity_key or "").strip()
+
+    with _USAGE_LOCK:  
+        conn = _usage_db_connect()
+        try:
+            _usage_db_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE;")
+
+            row = _usage_db_ensure_member_row(
+                conn,
+                identity_key=identity_key,
+                is_trial=bool(is_trial),
+                plan_name=str(plan_name or "").strip(),
+                minutes_allowed_override=minutes_allowed_override,
+                cycle_days_override=cycle_days_override,
+                now=now,
+                allow_create=True,
+            )
+
+            conn.commit()
+
+            row2 = _usage_db_get_row(conn, member_id)
+            if row2 is None:
+                return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": member_id}
+
+            info = _usage_info_from_row(row2)
+            ok = bool(info.get("minutes_remaining", 0) > 0)
+            info["identity_key"] = member_id
+            return ok, info
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
