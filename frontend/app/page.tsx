@@ -2774,6 +2774,17 @@ const [hostGuidelinesLoading, setHostGuidelinesLoading] = useState<boolean>(fals
 const [hostGuidelinesError, setHostGuidelinesError] = useState<string>("");
 const [hostGuidelinesStatus, setHostGuidelinesStatus] = useState<string>("");
 
+// Host: Session Insights (history across all visitors/members)
+const [hostInsightsOpen, setHostInsightsOpen] = useState<boolean>(false);
+const [hostInsightsUsers, setHostInsightsUsers] = useState<Array<{ memberId: string; userName?: string; lastSeen?: string; summaryCount?: number; lastSummary?: string }>>([]);
+const [hostInsightsSelectedMemberId, setHostInsightsSelectedMemberId] = useState<string>("");
+const [hostInsightsSummaries, setHostInsightsSummaries] = useState<Array<{ createDatetime: string; sessionId: string; reason?: string; summary: string }>>([]);
+const [hostInsightsQuestion, setHostInsightsQuestion] = useState<string>("");
+const [hostInsightsAnswer, setHostInsightsAnswer] = useState<string>("");
+const [hostInsightsLoading, setHostInsightsLoading] = useState<boolean>(false);
+const [hostInsightsError, setHostInsightsError] = useState<string>("");
+
+
 const loadHostGuidelines = useCallback(async () => {
   try {
     if (!isHost) return;
@@ -2851,6 +2862,78 @@ const saveHostGuidelines = useCallback(async () => {
     setHostGuidelinesError(String(e?.message || e || "Failed to save guidelines"));
   }
 }, [API_BASE, isHost, companyName, companionName, hostGuidelinesText]);
+
+
+const loadHostInsightsUsers = useCallback(async () => {
+  if (!API_BASE || !isHost || !companyName || !companionName || !memberId) return;
+  setHostInsightsLoading(true);
+  setHostInsightsError("");
+  try {
+    const res = await fetch(`${API_BASE}/host/session-insights/users`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ brand: companyName, avatar: companionName, memberId }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+    setHostInsightsUsers(Array.isArray(json?.users) ? json.users : []);
+  } catch (e: any) {
+    setHostInsightsError(e?.message || String(e));
+  } finally {
+    setHostInsightsLoading(false);
+  }
+}, [API_BASE, isHost, companyName, companionName, memberId]);
+
+const loadHostInsightsSummaries = useCallback(
+  async (targetMemberId: string) => {
+    if (!API_BASE || !isHost || !companyName || !companionName || !memberId) return;
+    setHostInsightsLoading(true);
+    setHostInsightsError("");
+    try {
+      const res = await fetch(`${API_BASE}/host/session-insights/summaries`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ brand: companyName, avatar: companionName, memberId, targetMemberId }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+      setHostInsightsSummaries(Array.isArray(json?.summaries) ? json.summaries : []);
+    } catch (e: any) {
+      setHostInsightsError(e?.message || String(e));
+    } finally {
+      setHostInsightsLoading(false);
+    }
+  },
+  [API_BASE, isHost, companyName, companionName, memberId]
+);
+
+const askHostInsights = useCallback(async () => {
+  if (!API_BASE || !isHost || !companyName || !companionName || !memberId) return;
+  const q = (hostInsightsQuestion || "").trim();
+  if (!q) return;
+  setHostInsightsLoading(true);
+  setHostInsightsError("");
+  try {
+    const res = await fetch(`${API_BASE}/host/session-insights/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        brand: companyName,
+        avatar: companionName,
+        memberId,
+        question: q,
+        targetMemberId: hostInsightsSelectedMemberId || undefined,
+      }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+    setHostInsightsAnswer(String(json?.answer || ""));
+  } catch (e: any) {
+    setHostInsightsError(e?.message || String(e));
+  } finally {
+    setHostInsightsLoading(false);
+  }
+}, [API_BASE, isHost, companyName, companionName, memberId, hostInsightsQuestion, hostInsightsSelectedMemberId]);
 
 
   const livekitRoleKnown = livekitRole !== "unknown";
@@ -11883,6 +11966,316 @@ const modePillControls = (
             </div>
           </div>
         </div>
+       ) : null}
+
+      {hostInsightsOpen ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 999999,
+            background: "rgba(0,0,0,0.46)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 14,
+          }}
+          onClick={() => setHostInsightsOpen(false)}
+        >
+          <div
+            style={{
+              width: "min(980px, 96vw)",
+              maxHeight: "92vh",
+              overflow: "hidden",
+              background: "white",
+              borderRadius: 14,
+              padding: 14,
+              boxShadow: "0 18px 60px rgba(0,0,0,0.28)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 10,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <div style={{ fontSize: 16, fontWeight: 750 }}>Session Insights</div>
+                <div style={{ fontSize: 12, opacity: 0.78 }}>
+                  Ask Dulce about historical session summaries for members/visitors.
+                </div>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => void loadHostInsightsUsers()}
+                  style={{
+                    border: "1px solid rgba(0,0,0,0.14)",
+                    background: "rgba(0,0,0,0.04)",
+                    borderRadius: 10,
+                    padding: "8px 10px",
+                    cursor: "pointer",
+                    fontSize: 12,
+                  }}
+                  disabled={hostInsightsLoading}
+                >
+                  {hostInsightsLoading ? "Loading…" : "Refresh"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setHostInsightsOpen(false)}
+                  style={{
+                    border: "1px solid rgba(0,0,0,0.14)",
+                    background: "transparent",
+                    borderRadius: 10,
+                    padding: "8px 10px",
+                    cursor: "pointer",
+                    fontSize: 12,
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+
+            {hostInsightsError ? (
+              <div
+                style={{
+                  border: "1px solid rgba(180,0,0,0.25)",
+                  background: "rgba(180,0,0,0.06)",
+                  borderRadius: 12,
+                  padding: 10,
+                  fontSize: 12,
+                  whiteSpace: "pre-wrap",
+                }}
+              >
+                {hostInsightsError}
+              </div>
+            ) : null}
+
+            <div
+              style={{
+                display: "flex",
+                gap: 12,
+                alignItems: "stretch",
+                flex: "1 1 auto",
+                minHeight: 0,
+                flexWrap: "wrap",
+              }}
+            >
+              {/* Users */}
+              <div
+                style={{
+                  flex: "1 1 260px",
+                  minWidth: 240,
+                  border: "1px solid rgba(0,0,0,0.10)",
+                  borderRadius: 12,
+                  padding: 10,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 8,
+                  minHeight: 0,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.82 }}>Members / Visitors</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setHostInsightsSelectedMemberId("");
+                      void loadHostInsightsSummaries("");
+                    }}
+                    style={{
+                      border: "1px solid rgba(0,0,0,0.14)",
+                      background: "transparent",
+                      borderRadius: 10,
+                      padding: "6px 8px",
+                      cursor: "pointer",
+                      fontSize: 11,
+                    }}
+                    title="Show recent summaries across all members"
+                    disabled={hostInsightsLoading}
+                  >
+                    Recent
+                  </button>
+                </div>
+
+                <div style={{ overflowY: "auto", minHeight: 0 }}>
+                  {hostInsightsUsers.length === 0 ? (
+                    <div style={{ fontSize: 12, opacity: 0.7, padding: 8 }}>
+                      No saved session summaries found yet.
+                    </div>
+                  ) : (
+                    hostInsightsUsers.map((u) => {
+                      const selected = hostInsightsSelectedMemberId === u.memberId;
+                      return (
+                        <button
+                          key={u.memberId}
+                          type="button"
+                          onClick={() => {
+                            setHostInsightsSelectedMemberId(u.memberId);
+                            void loadHostInsightsSummaries(u.memberId);
+                          }}
+                          style={{
+                            width: "100%",
+                            textAlign: "left",
+                            border: selected ? "1px solid rgba(0,120,255,0.40)" : "1px solid rgba(0,0,0,0.08)",
+                            background: selected ? "rgba(0,120,255,0.06)" : "rgba(0,0,0,0.02)",
+                            borderRadius: 12,
+                            padding: 10,
+                            cursor: "pointer",
+                            marginBottom: 8,
+                          }}
+                        >
+                          <div style={{ fontSize: 12, fontWeight: 750, marginBottom: 2 }}>
+                            {u.userName || u.memberId}
+                          </div>
+                          <div style={{ fontSize: 11, opacity: 0.72, marginBottom: 2 }}>
+                            {u.memberId}
+                          </div>
+                          <div style={{ fontSize: 11, opacity: 0.72 }}>
+                            {(u.summaryCount || 0) > 0 ? `${u.summaryCount} summaries` : ""}
+                            {u.lastSeen ? ` · ${u.lastSeen}` : ""}
+                          </div>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+              {/* Summaries + Ask */}
+              <div
+                style={{
+                  flex: "2 1 420px",
+                  minWidth: 280,
+                  border: "1px solid rgba(0,0,0,0.10)",
+                  borderRadius: 12,
+                  padding: 10,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 10,
+                  minHeight: 0,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.82 }}>
+                    {hostInsightsSelectedMemberId ? `Summaries: ${hostInsightsSelectedMemberId}` : "Recent summaries (all)"}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setHostInsightsAnswer("");
+                      setHostInsightsQuestion("");
+                    }}
+                    style={{
+                      border: "1px solid rgba(0,0,0,0.14)",
+                      background: "transparent",
+                      borderRadius: 10,
+                      padding: "6px 8px",
+                      cursor: "pointer",
+                      fontSize: 11,
+                    }}
+                    disabled={hostInsightsLoading}
+                    title="Clear question and answer"
+                  >
+                    Clear
+                  </button>
+                </div>
+
+                <div
+                  style={{
+                    border: "1px solid rgba(0,0,0,0.08)",
+                    background: "rgba(0,0,0,0.02)",
+                    borderRadius: 12,
+                    padding: 10,
+                    overflowY: "auto",
+                    minHeight: 120,
+                    maxHeight: 220,
+                    fontSize: 12,
+                    whiteSpace: "pre-wrap",
+                  }}
+                >
+                  {hostInsightsSummaries.length === 0 ? (
+                    <div style={{ opacity: 0.7 }}>No summaries loaded.</div>
+                  ) : (
+                    hostInsightsSummaries.map((s, idx) => (
+                      <div key={`${s.sessionId || ""}-${idx}`} style={{ marginBottom: 10 }}>
+                        <div style={{ fontSize: 11, opacity: 0.72, marginBottom: 2 }}>
+                          {s.createDatetime}
+                          {s.sessionId ? ` · ${s.sessionId}` : ""}
+                          {s.reason ? ` · ${s.reason}` : ""}
+                        </div>
+                        <div>{s.summary}</div>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.82 }}>Ask Dulce</div>
+                  <textarea
+                    value={hostInsightsQuestion}
+                    onChange={(e) => setHostInsightsQuestion(e.target.value)}
+                    placeholder={
+                      hostInsightsSelectedMemberId
+                        ? "Ask about this member/visitor’s past sessions…"
+                        : "Ask about all members/visitors’ past sessions…"
+                    }
+                    style={{
+                      width: "100%",
+                      minHeight: 64,
+                      maxHeight: 120,
+                      resize: "vertical",
+                      border: "1px solid rgba(0,0,0,0.14)",
+                      borderRadius: 12,
+                      padding: 10,
+                      fontSize: 13,
+                      outline: "none",
+                    }}
+                    disabled={hostInsightsLoading}
+                  />
+
+                  <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+                    <button
+                      type="button"
+                      onClick={() => void askHostInsights()}
+                      style={{
+                        border: "1px solid rgba(0,0,0,0.18)",
+                        background: "rgba(0,0,0,0.06)",
+                        borderRadius: 10,
+                        padding: "10px 12px",
+                        cursor: "pointer",
+                        fontSize: 12,
+                      }}
+                      disabled={hostInsightsLoading || !(hostInsightsQuestion || "").trim()}
+                    >
+                      {hostInsightsLoading ? "Asking…" : "Ask"}
+                    </button>
+                  </div>
+                </div>
+
+                {hostInsightsAnswer ? (
+                  <div
+                    style={{
+                      border: "1px solid rgba(0,0,0,0.10)",
+                      background: "rgba(0,0,0,0.02)",
+                      borderRadius: 12,
+                      padding: 10,
+                      fontSize: 13,
+                      whiteSpace: "pre-wrap",
+                      overflowY: "auto",
+                      maxHeight: 220,
+                    }}
+                  >
+                    {hostInsightsAnswer}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       <div
@@ -11921,6 +12314,31 @@ const modePillControls = (
           title="Edit AI companion interaction guidelines (persisted)"
         >
           AI Guidelines
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setHostInsightsError("");
+            setHostInsightsAnswer("");
+            setHostInsightsQuestion("");
+            setHostInsightsSelectedMemberId("");
+            setHostInsightsSummaries([]);
+            setHostInsightsOpen(true);
+            void loadHostInsightsUsers();
+          }}
+          style={{
+            border: "1px solid rgba(0,0,0,0.12)",
+            background: "rgba(0,0,0,0.04)",
+            borderRadius: 10,
+            padding: "8px 10px",
+            cursor: "pointer",
+            fontSize: 12,
+            marginRight: 8,
+          }}
+          title="Ask Dulce about historical session summaries for visitors/members"
+        >
+          Session Insights
         </button>
 
         {hostPendingContent.length > 0 ? (

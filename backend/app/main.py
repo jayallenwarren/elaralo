@@ -654,6 +654,115 @@ import shutil
 import tempfile
 from urllib.parse import urlparse, parse_qs
 
+
+# ---------------------------------------------------------------------------
+# Unified SQLite DB: econnect.sqlite3
+# ---------------------------------------------------------------------------
+# Consolidates these historical DB files into a single persisted SQLite DB:
+#   - voice_video_mappings.sqlite3
+#   - companion_guidelines.sqlite3
+#   - usage_minutes.sqlite3
+#
+# Default location (Azure persisted storage): /home/site/econnect.sqlite3
+# Override via env:
+#   - ECONNECT_SQLITE_PATH (preferred)
+#   - ECONNECT_DB_PATH (legacy alias)
+#
+# Notes:
+# - On first boot after consolidation, we seed econnect.sqlite3 by copying the
+#   best available voice_video_mappings.sqlite3 (prefer /home/site if present),
+#   then other subsystems create/migrate their tables inside econnect.
+
+_ECONNECT_DB_LOCK = threading.Lock()
+_ECONNECT_DB_PATH_CACHED: Optional[str] = None
+
+
+def _econnect_db_path() -> str:
+    """Return the unified SQLite DB path (persisted when possible)."""
+    global _ECONNECT_DB_PATH_CACHED
+    if _ECONNECT_DB_PATH_CACHED:
+        return _ECONNECT_DB_PATH_CACHED
+
+    env = (os.getenv("ECONNECT_SQLITE_PATH", "") or os.getenv("ECONNECT_DB_PATH", "") or "").strip()
+    if env:
+        _ECONNECT_DB_PATH_CACHED = env
+        return env
+
+    home_site = "/home/site"
+    if os.path.isdir(home_site) and os.access(home_site, os.W_OK):
+        path = os.path.join(home_site, "econnect.sqlite3")
+    else:
+        path = os.path.join(tempfile.gettempdir(), "econnect.sqlite3")
+
+    _ECONNECT_DB_PATH_CACHED = path
+    return path
+
+
+def _candidate_voice_video_seed_db_paths() -> List[str]:
+    """Candidate paths to seed econnect.sqlite3 with the voice/video mapping DB."""
+    base_dir = os.path.dirname(__file__)
+    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
+    candidates = [
+        os.path.join("/home/site", "voice_video_mappings.sqlite3"),
+        env_path,
+        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
+        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
+    ]
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in candidates:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _ensure_econnect_db_seeded() -> str:
+    """Ensure econnect.sqlite3 exists; if missing, seed it from voice_video_mappings.sqlite3."""
+    path = _econnect_db_path()
+
+    with _ECONNECT_DB_LOCK:
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 1024:
+                return path
+        except Exception:
+            # If stat fails, just continue and attempt to open/create.
+            pass
+
+        # Make sure parent directory exists.
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+
+        if not os.path.exists(path) or os.path.getsize(path) <= 1024:
+            seeded = False
+            for src in _candidate_voice_video_seed_db_paths():
+                try:
+                    if src and os.path.exists(src) and os.path.getsize(src) > 1024:
+                        shutil.copy2(src, path)
+                        seeded = True
+                        break
+                except Exception:
+                    continue
+
+            if not seeded:
+                # Create an empty DB so other subsystems can create their tables.
+                try:
+                    conn = sqlite3.connect(path)
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+
+        return path
+
 _COMPANION_MAPPINGS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _COMPANION_MAPPINGS_LOADED_AT: float | None = None
 _COMPANION_MAPPINGS_SOURCE: str = ""
@@ -665,13 +774,16 @@ def _norm_key(s: str) -> str:
 
 
 def _candidate_mapping_db_paths() -> List[str]:
-    base_dir = os.path.dirname(__file__)
-    env_path = (os.getenv("VOICE_VIDEO_DB_PATH", "") or "").strip()
-    candidates = [
-        env_path,
-        os.path.join(base_dir, "voice_video_mappings.sqlite3"),
-        os.path.join(base_dir, "data", "voice_video_mappings.sqlite3"),
-    ]
+    """Candidate DB paths for companion mapping lookups.
+
+    The API now uses the unified econnect.sqlite3 DB. We keep legacy candidate
+    paths as a fallback so a fresh deployment can seed econnect from an
+    existing voice_video_mappings.sqlite3.
+
+    Order matters: we always try econnect first.
+    """
+    econnect = _ensure_econnect_db_seeded()
+    candidates = [econnect] + _candidate_voice_video_seed_db_paths()
     # keep unique, preserve order
     out: List[str] = []
     seen: set[str] = set()
@@ -2486,6 +2598,50 @@ def _ensure_livekit_columns_best_effort() -> None:
                     pass
 
             conn.commit()
+            # One-time migration: legacy companion_guidelines.sqlite3 -> econnect.sqlite3
+            # We only import rows that do NOT already exist in econnect, to avoid
+            # overwriting newer host edits.
+            try:
+                dest_path = _ensure_econnect_db_seeded()
+                legacy_path = (_LEGACY_GUIDELINES_DB_PATH or "").strip()
+                if (
+                    legacy_path
+                    and os.path.exists(legacy_path)
+                    and os.path.abspath(legacy_path) != os.path.abspath(dest_path)
+                ):
+                    lconn = sqlite3.connect(legacy_path)
+                    try:
+                        lcur = lconn.cursor()
+                        lcur.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='companion_guidelines' LIMIT 1;"
+                        )
+                        if lcur.fetchone() is not None:
+                            lcur.execute(
+                                "SELECT brand, avatar, host_member_id, guidelines FROM companion_guidelines"
+                            )
+                            legacy_rows = lcur.fetchall() or []
+                            for (lb, la, lh, lg) in legacy_rows:
+                                try:
+                                    cur.execute(
+                                        "SELECT 1 FROM companion_guidelines WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
+                                        (lb, la),
+                                    )
+                                    if cur.fetchone() is None:
+                                        cur.execute(
+                                            "INSERT INTO companion_guidelines (brand, avatar, host_member_id, guidelines) VALUES (?, ?, ?, ?)",
+                                            (lb, la, lh, lg),
+                                        )
+                                except Exception:
+                                    continue
+                            conn.commit()
+                    finally:
+                        try:
+                            lconn.close()
+                        except Exception:
+                            pass
+            except Exception:
+                # Never fail API startup due to migration.
+                pass
         finally:
             conn.close()
     except Exception:
@@ -4765,6 +4921,111 @@ def _get_hco_system_blocks_cached_sync(avatar: str) -> List[str]:
     return blocks
 
 
+# ---------------------------------------------------------------------------
+# Chat summary history (per save) in econnect.sqlite3
+# ---------------------------------------------------------------------------
+# We keep the in-memory / disk JSON summary store for quick "previous summary"
+# retrieval, but we also persist every saved summary snapshot into SQLite so the
+# Host Console can query historical sessions across all visitors/members.
+
+_CHAT_SUMMARY_HISTORY_LOCK = threading.RLock()
+_CHAT_SUMMARY_HISTORY_READY = False
+
+
+def _summary_history_db_connect() -> sqlite3.Connection:
+    db_path = _ensure_econnect_db_seeded()
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _summary_history_ensure_schema(conn: Optional[sqlite3.Connection] = None) -> None:
+    global _CHAT_SUMMARY_HISTORY_READY
+    if _CHAT_SUMMARY_HISTORY_READY:
+        return
+
+    with _CHAT_SUMMARY_HISTORY_LOCK:
+        if _CHAT_SUMMARY_HISTORY_READY:
+            return
+
+        close_conn = False
+        if conn is None:
+            conn = _summary_history_db_connect()
+            close_conn = True
+
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_summary_history (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  create_datetime DATETIME NOT NULL DEFAULT (datetime('now')),
+                  brand TEXT NOT NULL,
+                  avatar TEXT NOT NULL,
+                  member_id TEXT NOT NULL,
+                  user_name TEXT,
+                  session_id TEXT,
+                  reason TEXT,
+                  summary TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_brand_avatar_dt ON chat_summary_history(brand, avatar, create_datetime);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_member_dt ON chat_summary_history(member_id, create_datetime);"
+            )
+            conn.commit()
+            _CHAT_SUMMARY_HISTORY_READY = True
+        finally:
+            if close_conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+def _summary_history_insert(
+    *,
+    brand: str,
+    avatar: str,
+    member_id: str,
+    user_name: str,
+    session_id: str,
+    reason: str,
+    summary: str,
+) -> None:
+    try:
+        conn = _summary_history_db_connect()
+        try:
+            _summary_history_ensure_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO chat_summary_history (
+                  brand, avatar, member_id, user_name, session_id, reason, summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    (brand or ""),
+                    (avatar or ""),
+                    (member_id or ""),
+                    (user_name or ""),
+                    (session_id or ""),
+                    (reason or ""),
+                    (summary or ""),
+                ),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        # Never fail a chat request if analytics/history persistence fails.
+        pass
+
+
 
 def _normalize_payload(raw: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]], Dict[str, Any], bool]:
     sid = raw.get("session_id") or raw.get("sid")
@@ -6981,11 +7242,26 @@ async def save_chat_summary(request: Request):
         "saved_at": _now_ts(),
         "session_id": session_id,
         "member_id": session_state.get("memberId") or session_state.get("member_id"),
+        "user_name": _extract_user_name(session_state),
         "companion": session_state.get("companion") or session_state.get("companionName") or session_state.get("companion_name"),
         "summary": summary,
     }
     _CHAT_SUMMARY_STORE[key] = record
     _persist_summary_store()
+
+    # Persist each saved summary snapshot for Host session insights
+    try:
+        _summary_history_insert(
+            brand=str(session_state.get("brand") or ""),
+            avatar=str(session_state.get("avatar") or ""),
+            member_id=str(session_state.get("memberId") or session_state.get("member_id") or ""),
+            user_name=_extract_user_name(session_state),
+            session_id=session_id,
+            reason=reason,
+            summary=summary,
+        )
+    except Exception:
+        pass
 
     return {"ok": True, "summary": summary, "saved_at": record["saved_at"], "key": key}
 
@@ -9304,15 +9580,20 @@ def _require_host_member(brand: str, avatar: str, member_id: str) -> str:
 #   POST /host/companion-guidelines/get  { brand, avatar, memberId }
 #   POST /host/companion-guidelines/set  { brand, avatar, memberId, guidelines }
 #
-_GUIDELINES_DB_PATH = (os.getenv("COMPANION_GUIDELINES_DB_PATH") or "").strip()
-if not _GUIDELINES_DB_PATH:
+# Legacy standalone companion_guidelines.sqlite3 (migration source only).
+_LEGACY_GUIDELINES_DB_PATH = (os.getenv("COMPANION_GUIDELINES_DB_PATH") or "").strip()
+if not _LEGACY_GUIDELINES_DB_PATH:
     _base = "/home/site" if os.path.isdir("/home/site") else ("/home" if os.path.isdir("/home") else "/tmp")
-    _GUIDELINES_DB_PATH = os.path.join(_base, "companion_guidelines.sqlite3")
+    _LEGACY_GUIDELINES_DB_PATH = os.path.join(_base, "companion_guidelines.sqlite3")
+
+# Unified DB (reads/writes go here)
+_GUIDELINES_DB_PATH = _econnect_db_path()
 
 _GUIDELINES_DB_LOCK = threading.RLock()
 
 def _guidelines_db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_GUIDELINES_DB_PATH, check_same_thread=False)
+    db_path = _ensure_econnect_db_seeded()
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -9663,6 +9944,229 @@ async def host_ai_chats_poll(req: HostAiChatsPollRequest):
 
     return {"ok": True, "session_id": sid, **out, "usage_info": usage_info}
 
+# ---------------------------------------------------------------------------
+# Host Session Insights (historical summaries)
+# ---------------------------------------------------------------------------
+
+class HostSessionInsightsUsersRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    limit: int = 100
+
+class HostSessionInsightsSummariesRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    targetMemberId: str = ""  # optional
+    limit: int = 50
+
+class HostSessionInsightsAskRequest(BaseModel):
+    brand: str = ""
+    avatar: str = ""
+    memberId: str = ""
+    question: str = ""
+    targetMemberId: str = ""  # optional
+    limit: int = 80
+
+
+def _host_insights_list_users_sync(brand: str, avatar: str, limit: int = 100) -> List[Dict[str, Any]]:
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    lim = max(1, min(int(limit or 100), 500))
+
+    conn = _summary_history_db_connect()
+    try:
+        _summary_history_ensure_schema(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              member_id,
+              MAX(create_datetime) AS last_seen,
+              COUNT(*) AS summary_count,
+              (
+                SELECT user_name
+                FROM chat_summary_history h2
+                WHERE h2.brand = ? AND h2.avatar = ? AND h2.member_id = h.member_id
+                ORDER BY h2.create_datetime DESC, h2.id DESC
+                LIMIT 1
+              ) AS user_name,
+              (
+                SELECT summary
+                FROM chat_summary_history h3
+                WHERE h3.brand = ? AND h3.avatar = ? AND h3.member_id = h.member_id
+                ORDER BY h3.create_datetime DESC, h3.id DESC
+                LIMIT 1
+              ) AS last_summary
+            FROM chat_summary_history h
+            WHERE h.brand = ? AND h.avatar = ?
+            GROUP BY member_id
+            ORDER BY last_seen DESC
+            LIMIT ?;
+            """,
+            (b, a, b, a, b, a, lim),
+        )
+
+        out: List[Dict[str, Any]] = []
+        for row in cur.fetchall() or []:
+            out.append(
+                {
+                    "memberId": str(row[0] or "").strip(),
+                    "lastSeen": str(row[1] or "").strip(),
+                    "summaryCount": int(row[2] or 0),
+                    "userName": str(row[3] or "").strip(),
+                    "lastSummary": str(row[4] or "").strip(),
+                }
+            )
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _host_insights_list_summaries_sync(
+    brand: str, avatar: str, target_member_id: str = "", limit: int = 50
+) -> List[Dict[str, Any]]:
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    tm = (target_member_id or "").strip()
+    lim = max(1, min(int(limit or 50), 500))
+
+    conn = _summary_history_db_connect()
+    try:
+        _summary_history_ensure_schema(conn)
+        cur = conn.cursor()
+        if tm:
+            cur.execute(
+                """
+                SELECT create_datetime, session_id, reason, summary
+                FROM chat_summary_history
+                WHERE brand = ? AND avatar = ? AND member_id = ?
+                ORDER BY create_datetime DESC, id DESC
+                LIMIT ?;
+                """,
+                (b, a, tm, lim),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT create_datetime, session_id, reason, summary
+                FROM chat_summary_history
+                WHERE brand = ? AND avatar = ?
+                ORDER BY create_datetime DESC, id DESC
+                LIMIT ?;
+                """,
+                (b, a, lim),
+            )
+
+        out: List[Dict[str, Any]] = []
+        for row in cur.fetchall() or []:
+            out.append(
+                {
+                    "createDatetime": str(row[0] or "").strip(),
+                    "sessionId": str(row[1] or "").strip(),
+                    "reason": str(row[2] or "").strip(),
+                    "summary": str(row[3] or "").strip(),
+                }
+            )
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host/session-insights/users")
+async def host_session_insights_users(req: HostSessionInsightsUsersRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    users = await run_in_threadpool(_host_insights_list_users_sync, req.brand, req.avatar, int(req.limit or 100))
+    return {"ok": True, "hostMemberId": host_id, "users": users}
+
+
+@app.post("/host/session-insights/summaries")
+async def host_session_insights_summaries(req: HostSessionInsightsSummariesRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    rows = await run_in_threadpool(
+        _host_insights_list_summaries_sync,
+        req.brand,
+        req.avatar,
+        (req.targetMemberId or ""),
+        int(req.limit or 50),
+    )
+    return {"ok": True, "hostMemberId": host_id, "summaries": rows}
+
+
+@app.post("/host/session-insights/ask")
+async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
+    host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+
+    target_member = (req.targetMemberId or "").strip()
+
+    # Gather context.
+    if target_member:
+        summaries = await run_in_threadpool(
+            _host_insights_list_summaries_sync,
+            req.brand,
+            req.avatar,
+            target_member,
+            max(10, min(int(req.limit or 60), 120)),
+        )
+        context = {
+            "scope": "single_member",
+            "target_member_id": target_member,
+            "summaries": summaries,
+        }
+    else:
+        users = await run_in_threadpool(
+            _host_insights_list_users_sync,
+            req.brand,
+            req.avatar,
+            max(10, min(int(req.limit or 80), 200)),
+        )
+        # Provide a light-weight overview (last summary per member) to keep tokens down.
+        context = {
+            "scope": "all_members_overview",
+            "members": users,
+        }
+
+        companion_label = (req.avatar or "").strip() or "your AI Companion"
+    system = (
+        f"You are {companion_label}, the AI Companion. You are helping the HOST review historical session summaries. "
+        "You will be given a JSON object containing saved session summaries. "
+        "Answer the host's question using ONLY the provided summaries. "
+        "If the summaries do not contain enough information, say so clearly. "
+        "If asked to list members/visitors, produce a clean bullet list. "
+        "Do not fabricate names, details, or events that are not in the summaries."
+    )
+
+    user_msg = {
+        "question": question,
+        "data": context,
+    }
+
+    try:
+        answer = await _call_gpt4o(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user_msg, ensure_ascii=False)},
+            ],
+            temperature=0.2,
+            max_tokens=700,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to answer: {type(e).__name__}: {e}")
+
+    return {"ok": True, "hostMemberId": host_id, "answer": str(answer or "")} 
+
+
 
 @app.post("/chat/relay/poll")
 async def chat_relay_poll(req: ChatRelayPollRequest):
@@ -9733,41 +10237,27 @@ from typing import Optional, Dict, Any, Tuple
 _USAGE_DB_LOCK = threading.Lock()
 _USAGE_DB_READY = False
 
+# Legacy standalone usage_minutes.sqlite3 (migration source only)
+_LEGACY_USAGE_DB_PATH = (os.getenv("USAGE_SQLITE_PATH") or os.getenv("USAGE_DB_PATH") or "").strip()
+if not _LEGACY_USAGE_DB_PATH:
+    _base = "/home/site" if os.path.isdir("/home/site") else "/home"
+    # Accept both spellings to be resilient to historical typos
+    cand1 = os.path.join(_base, "usage_minutes.sqlite3")
+    cand2 = os.path.join(_base, "usage_minutes.sqllite3")
+    if os.path.exists(cand1):
+        _LEGACY_USAGE_DB_PATH = cand1
+    elif os.path.exists(cand2):
+        _LEGACY_USAGE_DB_PATH = cand2
+    else:
+        _LEGACY_USAGE_DB_PATH = cand1
+
 def _usage_db_path() -> str:
+    """Returns the unified SQLite path for usage state (econnect.sqlite3).
+
+    The usage/minutes subsystem no longer writes to a standalone usage_minutes.sqlite3.
+    _LEGACY_USAGE_DB_PATH is retained only as a migration source.
     """
-    Returns a persisted SQLite path for usage state.
-
-    We intentionally store this outside the packaged app directory so it persists across deploys.
-    """
-    env_path = (os.getenv("USAGE_SQLITE_PATH") or os.getenv("USAGE_DB_PATH") or "").strip()
-    if env_path:
-        return env_path
-
-    # Azure App Service persists /home. Prefer /home/site if present.
-    for cand in ("/home/site/usage_minutes.sqlite3", "/home/usage_minutes.sqlite3"):
-        try:
-            os.makedirs(os.path.dirname(cand), exist_ok=True)
-            return cand
-        except Exception:
-            continue
-
-    return os.path.join(tempfile.gettempdir(), "usage_minutes.sqlite3")
-
-
-def _normalize_usage_member_id(identity_key: str) -> str:
-    """
-    Normalizes an identity_key into the member_id value stored in the DB.
-
-    - legacy keys look like: "member::<uuid>"
-    - for non-members, we may also see: "Anon:<...>" or "ip::<addr>"
-    """
-    k = str(identity_key or "").strip()
-    if not k:
-        return ""
-    low = k.lower()
-    if low.startswith("member::"):
-        return k.split("::", 1)[1].strip()
-    return k
+    return _ensure_econnect_db_seeded()
 
 
 def _usage_db_connect() -> sqlite3.Connection:
@@ -9817,6 +10307,74 @@ def _usage_db_ensure_schema(conn: sqlite3.Connection) -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_member_usage_minutes_cycle ON member_usage_minutes(cycle_start_epoch);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_member_usage_minutes_plan ON member_usage_minutes(plan_name);")
+        # One-time migration: legacy usage_minutes.sqlite3 -> econnect.sqlite3
+        # We only import rows that do NOT already exist in econnect, to avoid
+        # overwriting newer server-side state.
+        try:
+            dest_path = _ensure_econnect_db_seeded()
+            legacy_path = (_LEGACY_USAGE_DB_PATH or "").strip()
+            if (
+                legacy_path
+                and os.path.exists(legacy_path)
+                and os.path.abspath(legacy_path) != os.path.abspath(dest_path)
+            ):
+                lconn = sqlite3.connect(legacy_path)
+                lconn.row_factory = sqlite3.Row
+                try:
+                    lcur = lconn.cursor()
+                    lcur.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='member_usage_minutes' LIMIT 1;"
+                    )
+                    if lcur.fetchone() is not None:
+                        legacy_rows = lconn.execute("SELECT * FROM member_usage_minutes;").fetchall() or []
+                        for r in legacy_rows:
+                            try:
+                                member_id = r["member_id"]
+                                # Skip if already present
+                                if conn.execute(
+                                    "SELECT 1 FROM member_usage_minutes WHERE member_id = ? LIMIT 1;",
+                                    (member_id,),
+                                ).fetchone() is not None:
+                                    continue
+
+                                conn.execute(
+                                    """
+                                    INSERT INTO member_usage_minutes (
+                                      member_id, create_datetime, update_datetime,
+                                      cycle_start_epoch, cycle_days,
+                                      plan_name, plan_signature,
+                                      free_minutes_total,
+                                      purchased_seconds, used_seconds,
+                                      last_seen_epoch, restart_grace,
+                                      update_reason
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                                    """,
+                                    (
+                                        member_id,
+                                        r["create_datetime"] if "create_datetime" in r.keys() else None,
+                                        r["update_datetime"] if "update_datetime" in r.keys() else None,
+                                        r["cycle_start_epoch"] if "cycle_start_epoch" in r.keys() else None,
+                                        r["cycle_days"] if "cycle_days" in r.keys() else None,
+                                        r["plan_name"] if "plan_name" in r.keys() else None,
+                                        r["plan_signature"] if "plan_signature" in r.keys() else None,
+                                        r["free_minutes_total"] if "free_minutes_total" in r.keys() else None,
+                                        r["purchased_seconds"] if "purchased_seconds" in r.keys() else 0,
+                                        r["used_seconds"] if "used_seconds" in r.keys() else 0,
+                                        r["last_seen_epoch"] if "last_seen_epoch" in r.keys() else None,
+                                        r["restart_grace"] if "restart_grace" in r.keys() else 0,
+                                        r["update_reason"] if "update_reason" in r.keys() else None,
+                                    ),
+                                )
+                            except Exception:
+                                continue
+                finally:
+                    try:
+                        lconn.close()
+                    except Exception:
+                        pass
+        except Exception:
+            # Never fail API startup due to migration.
+            pass
         conn.commit()
         _USAGE_DB_READY = True
 
