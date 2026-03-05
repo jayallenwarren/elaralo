@@ -10260,6 +10260,23 @@ def _usage_db_path() -> str:
     return _ensure_econnect_db_seeded()
 
 
+def _normalize_usage_member_id(identity_key: str) -> str:
+    """Normalize an identity key into the member_id value stored in SQLite.
+
+    Notes:
+    - Legacy identity keys may look like: "member::<uuid>".
+    - Non-member identities may include values like "Anon:<...>" or "ip::<addr>".
+    - We intentionally keep non-member prefixes (e.g., "Anon:") so identities remain stable.
+    """
+    k = str(identity_key or "").strip()
+    if not k:
+        return ""
+    low = k.lower()
+    if low.startswith("member::"):
+        return k.split("::", 1)[1].strip()
+    return k
+
+
 def _usage_db_connect() -> sqlite3.Connection:
     path = _usage_db_path()
     conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
