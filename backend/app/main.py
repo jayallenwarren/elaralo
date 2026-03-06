@@ -10636,7 +10636,7 @@ def _content_roll_window_if_needed(
     cycle_id: str,
     cycle_used_seconds: float,
 ) -> Dict[str, Any]:
-    state = _content_state_get(conn, member_key, folder)
+    state = _content_state_get(conn, member_id, folder)
 
     window_start = float(state.get("window_start_epoch") or 0) or None
     window_cycle_id = str(state.get("window_cycle_id") or "")
@@ -10653,7 +10653,7 @@ def _content_roll_window_if_needed(
     if window_start is None or expired:
         _content_state_upsert(
             conn,
-            member_key,
+            member_id,
             folder,
             {
                 "window_start_epoch": now_epoch,
@@ -10673,7 +10673,7 @@ def _content_roll_window_if_needed(
             },
         )
         conn.commit()
-        state = _content_state_get(conn, member_key, folder)
+        state = _content_state_get(conn, member_id, folder)
 
     # Coerce base fields.
     if not state.get("window_cycle_id"):
