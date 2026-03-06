@@ -5977,12 +5977,34 @@ async def chat(request: Request):
         # Surface override flag to the UI even on paywalls.
         session_state_out["host_override_active"] = False
 
+        # Even if the member is paywalled, scheduled/retroactive content delivery must still occur.
+        delivered_content: Optional[Dict[str, Any]] = None
+        try:
+            prior_mode = (session_state.get("mode") or "friend")
+            brand_slug_for_content = _content_brand_slug(session_state_out) or _content_brand_slug(session_state)
+            folder_for_content = _content_resolve_folder(brand_slug_for_content, prior_mode)
+            if folder_for_content and brand_slug_for_content:
+                delivered_content = await _content_deliver_to_user_if_due(
+                    session_id=session_id,
+                    member_key=identity_key,
+                    brand_slug=brand_slug_for_content,
+                    folder=folder_for_content,
+                    cycle_id=str(usage_info.get("cycle_start_epoch") or ""),
+                    cycle_used_seconds=float(usage_info.get("used_seconds") or 0.0),
+                    base_url=str(request.base_url),
+                    now_epoch=time.time(),
+                    assistant_chat_active=True,
+                )
+        except Exception:
+            delivered_content = None
+
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
             "reply": reply,
             "session_state": session_state_out,
             "audio_url": None,
+            "content": delivered_content,
         }
 
 
@@ -10546,27 +10568,56 @@ def _content_db_ensure_schema(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
-def _content_parse_filename(filename: str) -> Dict[str, str]:
-    name = os.path.basename(filename)
-    stem = name.rsplit(".", 1)[0]
-    parts = stem.split("-")
+def _content_parse_filename(name: str) -> Dict[str, str]:
+    """Parse branded content filenames.
+
+    Canonical format:
+        <SEQ>-<DESCRIPTION>-<TYPE>-<STAGE>.<ext>
+
+    Business rules rely on:
+      - DESCRIPTION = 2nd hyphen-delimited field
+      - TYPE = 3rd hyphen-delimited field (Photo/Video)
+
+    Some assets may have double extensions (e.g. .png.jpg). We strip everything after the first dot.
+    """
+    if not name:
+        return {}
+
+    # Robustly strip extensions (handles double extensions like .png.jpg)
+    stem = name.split(".")[0]
+    parts = [p.strip() for p in stem.split("-") if p.strip()]
     if len(parts) < 3:
-        return {
-            "sequence": "",
-            "title": stem,
-            "kind": "image" if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) else "video",
-            "stage": "",
-        }
-    seq = parts[0].strip()
-    content_type = parts[-2].strip() if len(parts) >= 3 else ""
-    stage = parts[-1].strip() if len(parts) >= 4 else ""
-    title = "-".join([p.strip() for p in parts[1:-2] if p.strip()]) or stem
+        return {}
 
-    kind = "image"
-    if content_type.lower() == "video" or name.lower().endswith((".mp4", ".mov", ".webm")):
+    seq = parts[0]
+
+    # Canonical fields
+    description = parts[1] if len(parts) >= 2 else ""
+    type_field3 = parts[2] if len(parts) >= 3 else ""
+
+    # Backwards-compatible inference (more robust if extra hyphens ever appear)
+    stage = parts[-1] if len(parts) >= 4 else ""
+    type_from_end = parts[-2] if len(parts) >= 4 else type_field3
+
+    # Title shown to host / metadata; preserve old behavior (join middle parts)
+    title = "-".join(parts[1:-2]).replace("_", " ").strip() if len(parts) >= 4 else description
+
+    kind = "unknown"
+    ct = (type_from_end or type_field3 or "").lower()
+    if ct in ("photo", "image", "pic", "jpeg", "jpg", "png"):
+        kind = "image"
+    elif ct in ("video", "mp4", "mov", "webm", "m4v"):
         kind = "video"
-    return {"sequence": seq, "title": title, "kind": kind, "stage": stage}
 
+    return {
+        "sequence": seq,
+        "description": (description or title or stem).strip(),
+        "title": (title or description or stem).strip(),
+        "kind": kind,
+        "stage": stage.strip(),
+        # Human-facing type string (prefer 3rd hyphen field)
+        "content_type": (type_field3 or type_from_end).strip(),
+    }
 
 def _content_list_files(brand_slug: str, folder: str) -> List[str]:
     base = f"/home/site/brand/{brand_slug}/content/mode/{folder}"
@@ -10874,134 +10925,266 @@ def _content_queue_pending_for_host(
 
 
 def _content_deliver_to_user_if_due(
-    *,
-    request: Request,
-    member_id: str,
+    session_id: str,
     brand_slug: str,
+    member_key: str,
     folder: str,
     cycle_id: str,
-    cycle_used_seconds: float,
-    now_epoch: float,
+    cycle_used_seconds: int,
+    base_url: str,
+    now_epoch: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Deliver content directly to the user (AI chat mode). Returns ContentDelivery dict if delivered."""
+    """Deliver scheduled content when due.
 
-    conn = _content_db_connect()
-    member_key = f"{brand_slug}::{member_id}" if brand_slug else member_id
+    v7.41 change: add **retroactive catch-up**.
+    If usage minutes have already passed one or more scheduled trigger times but there is
+    **no matching entry** in user_content_history for that trigger (+/- 1 minute), we
+    immediately release the missing content (one item per request).
+
+    This prevents silent scheduler regressions from blocking delivery.
+
+    Host takeover business rule:
+      - If host override is active, content is delivered to the host 1 minute early.
+      - Content is considered delivered once the host has received it.
+    """
+
+    def _history_has_trigger(conn, member_id: str, content_folder: str, scheduled_minute: int, window_start_epoch: float, tol: int = 1) -> bool:
+        try:
+            lo = int(scheduled_minute) - int(tol)
+            hi = int(scheduled_minute) + int(tol)
+            # Constrain to the current 12h window using window_start_epoch (best-effort).
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM user_content_history
+                WHERE member_id = ?
+                  AND content_folder = ?
+                  AND trigger_minute BETWEEN ? AND ?
+                  AND ( ? <= 0 OR create_datetime >= datetime(?, 'unixepoch') )
+                LIMIT 1
+                """,
+                (member_id, content_folder, lo, hi, float(window_start_epoch or 0.0), float(window_start_epoch or 0.0)),
+            ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
+    def _history_max_sequence(conn, member_id: str, content_folder: str, window_start_epoch: float) -> int:
+        try:
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(content_sequence), 0)
+                FROM user_content_history
+                WHERE member_id = ?
+                  AND content_folder = ?
+                  AND ( ? <= 0 OR create_datetime >= datetime(?, 'unixepoch') )
+                """,
+                (member_id, content_folder, float(window_start_epoch or 0.0), float(window_start_epoch or 0.0)),
+            ).fetchone()
+            return int(row[0] or 0)
+        except Exception:
+            return 0
+
     try:
+        conn = _econnect_conn()
         _content_db_ensure_schema(conn)
-        state = _content_roll_window_if_needed(
-            conn,
-            member_id=member_key,
-            folder=folder,
-            now_epoch=now_epoch,
-            cycle_id=cycle_id,
-            cycle_used_seconds=cycle_used_seconds,
-        )
+        _content_roll_window_if_needed(conn, member_key, folder, cycle_id, int(cycle_used_seconds or 0), now_epoch)
+        state = _content_state_get(conn, member_key, folder) or {}
 
-        # If complete, nothing.
+        # If we have a pending token (host has not yet received), do not release another yet.
+        if state.get("pending_token"):
+            return None
+
         if int(state.get("window_complete") or 0) == 1:
             return None
 
-        trig = _content_next_trigger_minute(state)
-        if trig is None:
+        deliver_to_host_first = False
+        try:
+            deliver_to_host_first = bool(_ai_override_is_active(session_id))
+        except Exception:
+            deliver_to_host_first = False
+
+        used_in_window = _content_window_used_seconds(state, int(cycle_used_seconds or 0))
+        used_minutes = int(used_in_window // 60)
+        window_start_epoch = float(state.get("window_start_epoch") or 0.0)
+
+        # Determine which scheduled triggers *should* have fired by now.
+        # Normal: 9, 19, 29, ...
+        # Host takeover: host gets content 1 minute early -> effective triggers 8, 18, 28, ...
+        due_scheduled_minutes: List[int] = []
+        if deliver_to_host_first:
+            if used_minutes >= 8:
+                due_count = 1 + (used_minutes - 8) // 10
+                due_scheduled_minutes = [9 + 10 * i for i in range(due_count)]
+        else:
+            if used_minutes >= 9:
+                due_count = 1 + (used_minutes - 9) // 10
+                due_scheduled_minutes = [9 + 10 * i for i in range(due_count)]
+
+        if not due_scheduled_minutes:
             return None
 
-        used_in_window = _content_window_used_seconds(state, cycle_used_seconds)
-        if used_in_window < int(trig) * 60:
+        # Find the first missing scheduled trigger (retroactive catch-up).
+        missing_scheduled: Optional[int] = None
+        for sm in due_scheduled_minutes:
+            if not _history_has_trigger(conn, member_key, folder, int(sm), window_start_epoch, tol=1):
+                missing_scheduled = int(sm)
+                break
+
+        if missing_scheduled is None:
             return None
 
-        # If there was a host-pending item but override is no longer active, discard it.
-        if state.get("pending_token"):
-            _content_state_upsert(
-                conn,
-                member_key,
-                folder,
-                {
-                    "pending_token": None,
-                    "pending_trigger_minute": None,
-                    "pending_file_name": None,
-                    "pending_sequence": None,
-                    "pending_stage": None,
-                    "pending_kind": None,
-                    "pending_created_epoch": None,
-                    "updated_epoch": now_epoch,
-                },
-            )
-            conn.commit()
-            state = _content_state_get(conn, member_key, folder)
+        effective_trigger_minute = max(0, missing_scheduled - 1) if deliver_to_host_first else missing_scheduled
 
-        next_file = _content_pick_next_file(brand_slug, folder, state.get("last_sequence"))
-        if not next_file:
+        # Second guard on seconds precision.
+        if used_in_window < int(effective_trigger_minute) * 60:
             return None
-        meta = _content_parse_filename(next_file)
-        seq = meta.get("sequence") or ""
-        stage = meta.get("stage") or ""
-        kind = meta.get("kind") or "image"
 
-        url = str(request.url_for("content_file", brand=brand_slug, mode=folder, filename=next_file))
-        content = {
-            "kind": "video" if kind == "video" else "image",
-            "url": url,
-            "title": meta.get("title") or next_file,
-            "fileName": next_file,
-            "triggerMinute": int(trig),
+        # Pick the next file based on what has actually been recorded in history for this window.
+        last_seq = _history_max_sequence(conn, member_key, folder, window_start_epoch)
+        fn = _content_pick_next_file(brand_slug, folder, last_seq)
+        if not fn:
+            # No more content; mark complete.
+            try:
+                state = dict(state)
+                state["window_complete"] = 1
+                _content_state_upsert(conn, state)
+            except Exception:
+                pass
+            return None
+
+        info = _content_parse_filename(fn)
+        content_type = str(info.get("type") or "")
+        content_stage = str(info.get("stage") or "")
+        content_title = str(info.get("title") or "")
+        seq = int(info.get("sequence") or 0)
+
+        content_url = f"{base_url}/content/{brand_slug}/{folder}/{fn}"
+        content: Dict[str, Any] = {
+            "sequence": seq,
+            "filename": fn,
+            "type": content_type,
+            "stage": content_stage,
+            "title": content_title,
+            "url": content_url,
         }
 
-        token = uuid.uuid4().hex
-        delivered_via = "ai_chat"
-
-        # Persist history (best effort).
+        # UI expects a `content` object with `attachment` + `message`.
+        # Announce using DESCRIPTION (2nd field) and TYPE (3rd field) from the filename.
         try:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO user_content_history
-                (token, member_id, content_folder, trigger_minute, content_sequence, content_name, content_type, content_stage, content_url, delivered_via)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    token,
-                    member_key,
-                    folder,
-                    int(trig),
-                    seq,
-                    next_file,
-                    kind,
-                    stage,
-                    url,
-                    delivered_via,
-                ),
+            announce_desc = (meta.get("description") or content_title or "").strip()
+            announce_type = (meta.get("content_type") or "").strip()
+            if not announce_type:
+                announce_type = "Photo" if content_type == "photo" else "Video" if content_type == "video" else str(content_type).title()
+
+            if announce_desc:
+                content["message"] = f"Delivering {announce_type}: {announce_desc}."
+            else:
+                content["message"] = f"Delivering {announce_type}."
+
+            mime, _enc = mimetypes.guess_type(fn)
+            if not mime:
+                mime = "video/mp4" if content_type == "video" else "image/jpeg" if content_type == "photo" else "application/octet-stream"
+
+            content["attachment"] = {
+                "url": content_url,
+                "name": fn,
+                "contentType": mime,
+                "size": None,
+                "container": "brand_content",
+                "blobName": f"{folder}/{fn}",
+            }
+        except Exception:
+            pass
+
+        now = float(now_epoch or time.time())
+
+        # Host takeover path: stage content as pending for host and emit a host event.
+        if deliver_to_host_first:
+            token = uuid.uuid4().hex
+            try:
+                state = dict(state)
+                state["pending_token"] = token
+                state["pending_for_host"] = 1
+                state["pending_trigger_minute"] = int(effective_trigger_minute)
+                state["pending_content_json"] = json.dumps(content, ensure_ascii=False)
+                state["pending_created_epoch"] = now
+                _content_state_upsert(conn, state)
+            except Exception:
+                # If we cannot persist pending state, fail closed (no duplicate spam).
+                return None
+
+            try:
+                _ai_override_append_event(
+                    session_id,
+                    role="assistant",
+                    content="",
+                    sender="system",
+                    audience="host",
+                    kind="content_pending",
+                    payload={
+                        "token": token,
+                        "member_id": member_key,
+                        "content_folder": folder,
+                        "trigger_minute": int(effective_trigger_minute),
+                        "content": content,
+                    },
+                )
+            except Exception:
+                pass
+
+            return None
+
+        # Auto-delivery path: deliver to user immediately + write history + advance state.
+        token = uuid.uuid4().hex
+        try:
+            _content_history_insert(
+                conn,
+                token,
+                member_key,
+                folder,
+                int(effective_trigger_minute),
+                seq,
+                fn,
+                content_type,
+                content_stage,
+                content_url,
+                "auto",
             )
         except Exception:
-            pass
+            # If history insert fails, do not update state (prevents losing the content).
+            return None
 
-        # Update state
-        new_sent_count = int(state.get("window_sent_count") or 0) + 1
-        complete = 0
-        if folder == "friend":
-            complete = 1
-        elif str(stage or "").strip().lower() == "end":
-            complete = 1
-
-        _content_state_upsert(
-            conn,
-            member_key,
-            folder,
-            {
-                "last_sequence": seq,
-                "last_stage": stage,
-                "last_trigger_minute": int(trig),
-                "window_sent_count": new_sent_count,
-                "window_complete": complete,
-                "updated_epoch": now_epoch,
-            },
-        )
-        conn.commit()
-        return content
-    finally:
         try:
-            conn.close()
+            state = dict(state)
+            state["last_sequence"] = seq
+            state["last_trigger_minute"] = int(effective_trigger_minute)
+            state["window_sent_count"] = int(state.get("window_sent_count") or 0) + 1
+
+            # Mark complete if this is an End stage, or if friend mode is single-shot.
+            if folder == "friend" or (content_stage or "").strip().lower() == "end":
+                state["window_complete"] = 1
+
+            # Clear any pending fields just in case.
+            state["pending_token"] = ""
+            state["pending_for_host"] = 0
+            state["pending_trigger_minute"] = 0
+            state["pending_content_json"] = ""
+            state["pending_created_epoch"] = 0.0
+
+            _content_state_upsert(conn, state)
         except Exception:
             pass
+
+        return {
+            "token": token,
+            "trigger_minute": int(effective_trigger_minute),
+            "folder": folder,
+            **content,
+        }
+
+    except Exception:
+        return None
 
 
 def _content_mark_host_received(payload: Dict[str, Any]) -> None:
