@@ -10720,7 +10720,7 @@ def _content_roll_window_if_needed(
             {
                 "window_start_epoch": now_epoch,
                 "window_cycle_id": str(cycle_id or ""),
-                "window_base_used_seconds": float(cycle_used_seconds or 0),
+                "window_base_used_seconds": 0.0,
                 "window_sent_count": 0,
                 "window_complete": 0,
                 "last_trigger_minute": None,
@@ -10762,10 +10762,17 @@ def _content_next_trigger_minute(state: Dict[str, Any]) -> Optional[int]:
 
 
 def _content_window_used_seconds(state: Dict[str, Any], cycle_used_seconds: float) -> float:
-    base = float(state.get("window_base_used_seconds") or 0)
-    used = float(cycle_used_seconds or 0) - base
+    """Compute scheduler used seconds.
+
+    Content delivery triggers are based on *cumulative usage seconds within the current usage cycle*
+    (9 minutes, then every +10 minutes). This must work even if the scheduler first runs late
+    (e.g., the first invocation happens at paywall).
+
+    We therefore use cycle_used_seconds directly and ignore window_base_used_seconds.
+    """
+    used = float(cycle_used_seconds or 0.0)
     if used < 0:
-        used = 0
+        used = 0.0
     return used
 
 
@@ -11006,7 +11013,15 @@ def _content_deliver_to_user_if_due(
 
         used_in_window = _content_window_used_seconds(state, int(cycle_used_seconds or 0))
         used_minutes = int(used_in_window // 60)
+        # Prefer the cycle start epoch (passed in as cycle_id) as the history window start.
+        # This keeps retroactive delivery accurate even when the scheduler first runs mid-cycle.
+        try:
+            _cycle_start_epoch = float(cycle_id or 0)
+        except Exception:
+            _cycle_start_epoch = 0.0
         window_start_epoch = float(state.get("window_start_epoch") or 0.0)
+        if _cycle_start_epoch > 0:
+            window_start_epoch = _cycle_start_epoch
 
         # Determine which scheduled triggers *should* have fired by now.
         # Normal: 9, 19, 29, ...
@@ -11068,12 +11083,11 @@ def _content_deliver_to_user_if_due(
             "title": content_title,
             "url": content_url,
         }
-
         # UI expects a `content` object with `attachment` + `message`.
         # Announce using DESCRIPTION (2nd field) and TYPE (3rd field) from the filename.
         try:
-            announce_desc = (meta.get("description") or content_title or "").strip()
-            announce_type = (meta.get("content_type") or "").strip()
+            announce_desc = (info.get("description") or content_title or "").strip()
+            announce_type = (info.get("content_type") or "").strip()
             if not announce_type:
                 announce_type = "Photo" if content_type == "photo" else "Video" if content_type == "video" else str(content_type).title()
 
@@ -11090,12 +11104,24 @@ def _content_deliver_to_user_if_due(
                 "url": content_url,
                 "name": fn,
                 "contentType": mime,
-                "size": None,
+                "size": 0,
                 "container": "brand_content",
                 "blobName": f"{folder}/{fn}",
             }
         except Exception:
-            pass
+            # Absolute failsafe: the frontend will not render without message/attachment.
+            mime, _enc = mimetypes.guess_type(fn)
+            if not mime:
+                mime = "application/octet-stream"
+            content["message"] = "Delivering scheduled content."
+            content["attachment"] = {
+                "url": content_url,
+                "name": fn,
+                "contentType": mime,
+                "size": 0,
+                "container": "brand_content",
+                "blobName": f"{folder}/{fn}",
+            }
 
         now = float(now_epoch or time.time())
 
