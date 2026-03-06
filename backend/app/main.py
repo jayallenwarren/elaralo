@@ -11783,6 +11783,15 @@ def _usage_info_from_row(row: sqlite3.Row) -> Dict[str, Any]:
         "minutes_total": minutes_total,
         "minutes_used": max(0, int(used_seconds // 60)),
         "minutes_remaining": max(0, int(remaining_seconds // 60)),
+        # Seconds-level fields (used by scheduled content delivery + debugging).
+        "used_seconds": used_seconds,
+        "remaining_seconds": remaining_seconds,
+        "total_seconds": total_seconds,
+        "purchased_seconds": purchased_seconds,
+        # Aliases used by older scheduler code paths.
+        "cycle_used_seconds": used_seconds,
+        "cycle_remaining_seconds": remaining_seconds,
+        "cycle_total_seconds": total_seconds,
         "minutes_exhausted": remaining_seconds <= 0.0,
         "update_reason": str(row["update_reason"] or ""),
     }
