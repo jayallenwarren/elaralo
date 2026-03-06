@@ -10453,6 +10453,17 @@ def _content_folder_for_mode(mode: str) -> str:
     return "friend"
 
 
+def _content_resolve_folder(brand_slug: str, mode: str) -> str:
+    """Resolve the on-disk content folder for a given mode.
+
+    We accept `brand_slug` for future brand-specific overrides, but today all brands
+    share the same disk layout: /home/site/brand/<brand>/content/mode/<mode>/.
+    """
+
+    _ = brand_slug  # reserved for future per-brand routing
+    return _content_folder_for_mode(mode)
+
+
 def _content_db_connect() -> sqlite3.Connection:
     # Content state is stored in the unified econnect.sqlite3
     path = _ensure_econnect_db_seeded()
