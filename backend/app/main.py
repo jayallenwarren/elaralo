@@ -5990,8 +5990,10 @@ async def chat(request: Request):
         except Exception:
             pass
 
-        # Member should always see the standard pay/upgrade message.
-        reply = _usage_paywall_message(
+        # Member should normally see the standard pay/upgrade message.
+        # However, if retroactive scheduled content is due, that delivery must override the paywall
+        # on this turn so users can receive the missed content even after minutes are exhausted.
+        paywall_reply = _usage_paywall_message(
             is_trial=is_trial,
             plan_name=plan_label_for_messages,
             minutes_allowed=minutes_allowed,
@@ -6035,6 +6037,7 @@ async def chat(request: Request):
         except Exception:
             delivered_content = None
 
+        reply = "" if delivered_content else paywall_reply
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
@@ -11128,6 +11131,23 @@ def _content_deliver_to_user_if_due(
         except Exception:
             return 0
 
+    def _history_has_any_delivery(conn, member_id: str, content_folder: str, window_start_epoch: float) -> bool:
+        try:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM user_content_history
+                WHERE member_id = ?
+                  AND content_folder = ?
+                  AND ( ? <= 0 OR create_datetime >= datetime(?, 'unixepoch') )
+                LIMIT 1
+                """,
+                (member_id, content_folder, float(window_start_epoch or 0.0), float(window_start_epoch or 0.0)),
+            ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
     conn: Optional[sqlite3.Connection] = None
     now = float(now_epoch or time.time())
     try:
@@ -11142,7 +11162,63 @@ def _content_deliver_to_user_if_due(
             cycle_used_seconds=float(cycle_used_seconds or 0.0),
         ) or {}
 
-        if state.get("pending_token"):
+        try:
+            cycle_start_epoch = float(cycle_id or 0)
+        except Exception:
+            cycle_start_epoch = 0.0
+        window_start_epoch = float(state.get("window_start_epoch") or 0.0)
+        if cycle_start_epoch > 0:
+            window_start_epoch = cycle_start_epoch
+
+        pending_token = str(state.get("pending_token") or "").strip()
+        history_any = _history_has_any_delivery(conn, member_key, folder, window_start_epoch)
+        pending_token_live = False
+        if pending_token:
+            try:
+                pending_token_live = bool(_ai_override_has_token_event(session_id, pending_token, "content_pending"))
+            except Exception:
+                pending_token_live = False
+
+        # Recovery path for older regression states:
+        # if state says content was already delivered/queued but there is no delivery history
+        # in econnect.sqlite3 for this member/folder/window, trust history as the source of truth
+        # and reset the stale state so retroactive content can still be delivered.
+        stale_state = (not history_any) and (
+            int(state.get("window_complete") or 0) == 1
+            or int(state.get("window_sent_count") or 0) > 0
+            or bool(str(state.get("last_sequence") or "").strip())
+            or bool(str(state.get("last_trigger_minute") or "").strip())
+            or (bool(pending_token) and not pending_token_live)
+        )
+        if stale_state:
+            _content_state_upsert(
+                conn,
+                member_key,
+                folder,
+                {
+                    "window_sent_count": 0,
+                    "window_complete": 0,
+                    "last_sequence": None,
+                    "last_stage": None,
+                    "last_trigger_minute": None,
+                    "pending_token": None,
+                    "pending_trigger_minute": None,
+                    "pending_file_name": None,
+                    "pending_sequence": None,
+                    "pending_stage": None,
+                    "pending_kind": None,
+                    "pending_created_epoch": None,
+                    "updated_epoch": now,
+                },
+            )
+            conn.commit()
+            state = _content_state_get(conn, member_key, folder) or {}
+            pending_token = ""
+            window_start_epoch = float(state.get("window_start_epoch") or window_start_epoch or 0.0)
+            if cycle_start_epoch > 0:
+                window_start_epoch = cycle_start_epoch
+
+        if pending_token:
             return None
 
         if int(state.get("window_complete") or 0) == 1:
@@ -11156,11 +11232,7 @@ def _content_deliver_to_user_if_due(
 
         used_in_window = _content_window_used_seconds(state, float(cycle_used_seconds or 0.0))
         used_minutes = int(used_in_window // 60)
-        try:
-            cycle_start_epoch = float(cycle_id or 0)
-        except Exception:
-            cycle_start_epoch = 0.0
-        window_start_epoch = float(state.get("window_start_epoch") or 0.0)
+        window_start_epoch = float(state.get("window_start_epoch") or window_start_epoch or 0.0)
         if cycle_start_epoch > 0:
             window_start_epoch = cycle_start_epoch
 

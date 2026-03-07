@@ -5316,6 +5316,54 @@ useEffect(() => {
     setUpgradeWatching(false);
   }, []);
 
+  const applyUsageStatusSnapshot = useCallback((raw: any) => {
+    if (!raw || typeof raw !== "object") return false;
+
+    const hasSnapshot = [
+      "minutes_remaining",
+      "minutesRemaining",
+      "minutes_allowed",
+      "minutesAllowed",
+      "minutes_used",
+      "minutesUsed",
+      "minutes_total",
+      "minutesTotal",
+      "minutes_exhausted",
+      "minutesExhausted",
+    ].some((k) => Object.prototype.hasOwnProperty.call(raw, k));
+
+    if (!hasSnapshot) return false;
+
+    const remaining = Number(raw?.minutes_remaining ?? raw?.minutesRemaining ?? 0) || 0;
+    const allowed = Number(raw?.minutes_allowed ?? raw?.minutesAllowed ?? 0) || 0;
+    const total = Number(raw?.minutes_total ?? raw?.minutesTotal ?? allowed ?? 0) || 0;
+    const usedFallback = total > 0 ? Math.max(0, total - remaining) : 0;
+    const used = Number(raw?.minutes_used ?? raw?.minutesUsed ?? usedFallback) || 0;
+    const exhausted =
+      typeof raw?.minutes_exhausted === "boolean"
+        ? raw.minutes_exhausted
+        : typeof raw?.minutesExhausted === "boolean"
+          ? raw.minutesExhausted
+          : remaining <= 0;
+
+    setSessionState((prev) => ({
+      ...(prev as any),
+      minutes_exhausted: exhausted,
+      minutes_remaining: remaining,
+      minutes_allowed:
+        allowed > 0
+          ? allowed
+          : Number((prev as any)?.minutes_allowed ?? (prev as any)?.minutesAllowed ?? 0) || 0,
+      minutes_total:
+        total > 0
+          ? total
+          : Number((prev as any)?.minutes_total ?? (prev as any)?.minutesTotal ?? allowed ?? 0) || 0,
+      minutes_used: used,
+    }));
+
+    return true;
+  }, []);
+
   // After an upgrade (plan change), refresh the usage balance once so minutes/metering gates
   // update immediately without requiring a page refresh.
   const refreshUsageStatusOnce = useCallback(async () => {
@@ -5369,20 +5417,11 @@ useEffect(() => {
       if (!res.ok) return;
 
       const data: any = await res.json().catch(() => ({}));
-      const remaining = Number(data?.minutes_remaining ?? data?.minutesRemaining ?? 0) || 0;
-      if (remaining > 0) {
-        setSessionState((prev) => ({
-          ...(prev as any),
-          minutes_exhausted: false,
-          minutes_remaining: remaining,
-          minutes_allowed: Number(data?.minutes_allowed ?? (prev as any)?.minutes_allowed ?? 0) || 0,
-          minutes_used: Number(data?.minutes_used ?? (prev as any)?.minutes_used ?? 0) || 0,
-        }));
-      }
+      applyUsageStatusSnapshot(data);
     } catch (e) {
       // ignore
     }
-  }, [API_BASE, companionKey, companionName, memberId, planName, planLabelOverride, rebrandingKey, rebranding]);
+  }, [API_BASE, companionKey, companionName, memberId, planName, planLabelOverride, rebrandingKey, rebranding, applyUsageStatusSnapshot]);
 
   // Keep the on-screen usage meter in sync even when there are no new turns.
   // This endpoint is non-charging (status only), so it is safe to poll.
@@ -5701,19 +5740,11 @@ useEffect(() => {
 
         const data: any = await res.json().catch(() => ({}));
         const remaining = Number(data?.minutes_remaining ?? data?.minutesRemaining ?? 0) || 0;
+        applyUsageStatusSnapshot(data);
 
         if (remaining > 0) {
           setMemberTopupWatching(false);
           setMemberTopupError("");
-
-          // Reflect the updated balance in the session state (so the user can ask "minutes left" and see current values).
-          setSessionState((prev) => ({
-            ...(prev as any),
-            minutes_exhausted: false,
-            minutes_remaining: remaining,
-            minutes_allowed: Number(data?.minutes_allowed ?? (prev as any)?.minutes_allowed ?? 0) || 0,
-            minutes_used: Number(data?.minutes_used ?? (prev as any)?.minutes_used ?? 0) || 0,
-          }));
 
           // Add a lightweight assistant note so the user knows they can continue.
           setMessages((prev) => [
@@ -5737,7 +5768,7 @@ useEffect(() => {
       cancelled = true;
       try { window.clearInterval(t); } catch (e) {}
     };
-  }, [API_BASE, memberTopupWatching, memberTopupStartedAt, memberId, companionKey, companionName, planName, planLabelOverride, rebrandingKey, rebranding]);
+  }, [API_BASE, memberTopupWatching, memberTopupStartedAt, memberId, companionKey, companionName, planName, planLabelOverride, rebrandingKey, rebranding, applyUsageStatusSnapshot]);
 
 
   // Upgrade polling: while the user is in the upgrade flow, keep requesting the latest MEMBER_PLAN payload
