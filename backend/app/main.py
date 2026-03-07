@@ -6033,6 +6033,7 @@ async def chat(request: Request):
                     cycle_used_seconds=float(usage_info.get("used_seconds") or 0.0),
                     base_url=str(request.base_url),
                     now_epoch=time.time(),
+                    force_user_delivery=True,
                 )
         except Exception:
             delivered_content = None
@@ -10054,6 +10055,8 @@ async def host_ai_chats_push_content(req: HostAiChatsPushContentRequest):
     host_id = str(_ai_override_get_host(sid) or "")
     if host_id and host_id != str(req.memberId or "").strip():
         raise HTTPException(status_code=403, detail="host not authorized for this session")
+    if not bool(_ai_override_is_active(sid)):
+        raise HTTPException(status_code=409, detail="override not active")
 
     token = str(req.token or "").strip()
     content = req.content if isinstance(req.content, dict) else {}
@@ -11087,12 +11090,17 @@ def _content_deliver_to_user_if_due(
     cycle_used_seconds: int,
     base_url: str,
     now_epoch: Optional[float] = None,
+    force_user_delivery: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Deliver scheduled content when due.
 
     Supports retroactive catch-up and host-override early delivery.
     Scheduled triggers are always recorded using their canonical minute marks
     (9, 19, 29, ...) even when the host receives them 1 minute early.
+
+    When force_user_delivery=True, missed content is released directly to the user
+    before any paywall reply if it should already have been delivered either to the
+    host (8, 18, 28, ...) or to the user (9, 19, 29, ...).
     """
 
     def _history_has_trigger(conn, member_id: str, content_folder: str, scheduled_minute: int, window_start_epoch: float, tol: int = 1) -> bool:
@@ -11171,6 +11179,10 @@ def _content_deliver_to_user_if_due(
             window_start_epoch = cycle_start_epoch
 
         pending_token = str(state.get("pending_token") or "").strip()
+        try:
+            pending_trigger_minute = int(state.get("pending_trigger_minute") or 0)
+        except Exception:
+            pending_trigger_minute = 0
         history_any = _history_has_any_delivery(conn, member_key, folder, window_start_epoch)
         pending_token_live = False
         if pending_token:
@@ -11219,16 +11231,52 @@ def _content_deliver_to_user_if_due(
                 window_start_epoch = cycle_start_epoch
 
         if pending_token:
-            return None
+            pending_missing_history = not history_any
+            if pending_trigger_minute > 0:
+                pending_missing_history = not _history_has_trigger(
+                    conn,
+                    member_key,
+                    folder,
+                    pending_trigger_minute,
+                    window_start_epoch,
+                    tol=1,
+                )
+
+            if force_user_delivery and pending_missing_history:
+                _content_state_upsert(
+                    conn,
+                    member_key,
+                    folder,
+                    {
+                        "pending_token": None,
+                        "pending_trigger_minute": None,
+                        "pending_file_name": None,
+                        "pending_sequence": None,
+                        "pending_stage": None,
+                        "pending_kind": None,
+                        "pending_created_epoch": None,
+                        "updated_epoch": now,
+                    },
+                )
+                conn.commit()
+                state = _content_state_get(conn, member_key, folder) or {}
+                pending_token = ""
+                try:
+                    pending_trigger_minute = int(state.get("pending_trigger_minute") or 0)
+                except Exception:
+                    pending_trigger_minute = 0
+            else:
+                return None
 
         if int(state.get("window_complete") or 0) == 1:
             return None
 
         deliver_to_host_first = False
-        try:
-            deliver_to_host_first = bool(_ai_override_is_active(session_id))
-        except Exception:
-            deliver_to_host_first = False
+        if not force_user_delivery:
+            try:
+                deliver_to_host_first = bool(_ai_override_is_active(session_id))
+            except Exception:
+                deliver_to_host_first = False
 
         used_in_window = _content_window_used_seconds(state, float(cycle_used_seconds or 0.0))
         used_minutes = int(used_in_window // 60)
@@ -11237,7 +11285,11 @@ def _content_deliver_to_user_if_due(
             window_start_epoch = cycle_start_epoch
 
         due_scheduled_minutes: List[int] = []
-        if deliver_to_host_first:
+        if force_user_delivery:
+            if used_minutes >= 8:
+                due_count = 1 + (used_minutes - 8) // 10
+                due_scheduled_minutes = [9 + 10 * i for i in range(due_count)]
+        elif deliver_to_host_first:
             if used_minutes >= 8:
                 due_count = 1 + (used_minutes - 8) // 10
                 due_scheduled_minutes = [9 + 10 * i for i in range(due_count)]
@@ -11258,7 +11310,7 @@ def _content_deliver_to_user_if_due(
         if scheduled_trigger_minute is None:
             return None
 
-        release_gate_minute = max(0, scheduled_trigger_minute - 1) if deliver_to_host_first else scheduled_trigger_minute
+        release_gate_minute = max(0, scheduled_trigger_minute - 1) if (force_user_delivery or deliver_to_host_first) else scheduled_trigger_minute
         if used_in_window < int(release_gate_minute) * 60:
             return None
 
