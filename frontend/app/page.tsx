@@ -2209,6 +2209,28 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   }, [companyName, companionName]);
 
   const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
+  const [payloadUserDisplayName, setPayloadUserDisplayName] = useState<string>("");
+
+  const preferredViewerDisplayName = useMemo(() => {
+    const explicit = String(viewerLiveChatName || "").trim();
+    if (explicit) return explicit;
+    const payloadLabel = String(payloadUserDisplayName || "").trim();
+    if (payloadLabel) return payloadLabel;
+    return "";
+  }, [viewerLiveChatName, payloadUserDisplayName]);
+
+  const transcriptViewerLabel = useMemo(() => {
+    return preferredViewerDisplayName || "You";
+  }, [preferredViewerDisplayName]);
+
+  const buildHostReadableViewerName = useCallback((identityValue?: string) => {
+    if (preferredViewerDisplayName) return preferredViewerDisplayName;
+    const raw = String(identityValue || "").trim();
+    const cleaned = raw.replace(/^Anon:\s*/i, "").trim();
+    const base = cleaned || raw;
+    const shortId = base ? base.slice(0, 4) : "";
+    return `Viewer - ${shortId || "Anon"}`;
+  }, [preferredViewerDisplayName]);
 
   useEffect(() => {
     // Keep state in sync with persistent storage as the user switches companions/brands.
@@ -2274,6 +2296,9 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
 
     const current = String(viewerLiveChatName || "").trim();
     if (current) return current;
+
+    const payloadPreferred = String(payloadUserDisplayName || "").trim();
+    if (payloadPreferred) return payloadPreferred;
 
     // NOTE: In restrictive iframe environments (e.g., some mobile browsers), localStorage can be
     // unavailable or non-persistent. We therefore try: localStorage -> sessionStorage -> window.name.
@@ -2441,7 +2466,7 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     setViewerLiveChatName(cleaned);
     storeEverywhere(cleaned);
     return cleaned;
-  }, [viewerLiveChatName, liveChatUsernameStorageKey, companyName, companionName, companionKey, memberId, getLivekitSystemIdentity]);
+  }, [viewerLiveChatName, payloadUserDisplayName, liveChatUsernameStorageKey, companyName, companionName, companionKey, memberId, getLivekitSystemIdentity]);
 
 
   const changeViewerLiveChatName = useCallback(() => {
@@ -2760,6 +2785,13 @@ const [hostSttError, setHostSttError] = useState<string>("");
 const hostSttRecorderRef = useRef<MediaRecorder | null>(null);
 const hostSttStreamRef = useRef<MediaStream | null>(null);
 const hostSttChunksRef = useRef<BlobPart[]>([]);
+
+// Host Session Insights STT (speech-to-text) for the Ask Dulce question box.
+const [hostInsightsSttRecording, setHostInsightsSttRecording] = useState<boolean>(false);
+const [hostInsightsSttError, setHostInsightsSttError] = useState<string>("");
+const hostInsightsSttRecorderRef = useRef<MediaRecorder | null>(null);
+const hostInsightsSttStreamRef = useRef<MediaStream | null>(null);
+const hostInsightsSttChunksRef = useRef<BlobPart[]>([]);
 
 // Host: companion-level interaction guideline overrides (persisted; highest priority)
 const [hostGuidelinesOpen, setHostGuidelinesOpen] = useState<boolean>(false);
@@ -3518,7 +3550,7 @@ if (liveProvider === "stream") {
 	    // Ask server to resolve room + determine host vs viewer.
 	    // NOTE: Never prompt the Host for a username.
 	    const displayNameForToken = isViewer
-	      ? String(ensureViewerLiveChatName() || viewerLiveChatName || "Viewer").trim()
+	      ? String(ensureViewerLiveChatName() || preferredViewerDisplayName || "Viewer").trim()
 	      : String(companionName || "Host").trim();
 
 const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
@@ -4883,12 +4915,22 @@ const hostSendMessage = async () => {
 };
 
 
-// Host STT (speech-to-text) using backend transcription (/stt/transcribe)
-// - Click to start recording, click again to stop & transcribe.
-// - Fills the host message box with the transcript (host can edit, then Send).
-const hostStopStt = useCallback(async () => {
+// Shared modal STT (speech-to-text) using backend transcription (/stt/transcribe)
+// - Used by Host Console and Host Session Insights.
+// - Click once to start recording, click again to stop & transcribe.
+// - Appends the transcript into the target text box so the host can edit before submitting.
+type ModalSttController = {
+  setRecording: React.Dispatch<React.SetStateAction<boolean>>;
+  setError: React.Dispatch<React.SetStateAction<string>>;
+  recorderRef: React.MutableRefObject<MediaRecorder | null>;
+  streamRef: React.MutableRefObject<MediaStream | null>;
+  chunksRef: React.MutableRefObject<BlobPart[]>;
+  appendText: (text: string) => void;
+};
+
+const stopModalSttCapture = useCallback(async (recorderRef: React.MutableRefObject<MediaRecorder | null>) => {
   try {
-    const rec = hostSttRecorderRef.current;
+    const rec = recorderRef.current;
     if (rec && rec.state !== "inactive") {
       try {
         rec.stop();
@@ -4897,10 +4939,9 @@ const hostStopStt = useCallback(async () => {
   } catch {}
 }, []);
 
-const hostStartStt = useCallback(async () => {
+const startModalSttCapture = useCallback(async (ctrl: ModalSttController) => {
   try {
-    if (hostSttRecording) return;
-    setHostSttError("");
+    ctrl.setError("");
 
     if (!API_BASE) throw new Error("API base not configured");
     if (!navigator?.mediaDevices?.getUserMedia) {
@@ -4908,45 +4949,44 @@ const hostStartStt = useCallback(async () => {
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    hostSttStreamRef.current = stream;
-    hostSttChunksRef.current = [];
+    ctrl.streamRef.current = stream;
+    ctrl.chunksRef.current = [];
 
     const mr = new MediaRecorder(stream);
     const mimeType = String((mr as any)?.mimeType || "audio/webm");
-    hostSttRecorderRef.current = mr;
+    ctrl.recorderRef.current = mr;
 
     mr.ondataavailable = (e: any) => {
       try {
-        if (e?.data && e.data.size > 0) hostSttChunksRef.current.push(e.data);
+        if (e?.data && e.data.size > 0) ctrl.chunksRef.current.push(e.data);
       } catch {}
     };
 
     mr.onstop = async () => {
       try {
-        setHostSttRecording(false);
+        ctrl.setRecording(false);
 
-        const chunks = hostSttChunksRef.current || [];
-        hostSttChunksRef.current = [];
+        const chunks = ctrl.chunksRef.current || [];
+        ctrl.chunksRef.current = [];
 
-        // stop tracks
         try {
-          (hostSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
+          (ctrl.streamRef.current?.getTracks?.() || []).forEach((t) => {
             try {
               t.stop();
             } catch {}
           });
         } catch {}
-        hostSttStreamRef.current = null;
+        ctrl.streamRef.current = null;
 
         const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
         if (!blob || blob.size < 1) return;
 
         const form = new FormData();
         const fname = mimeType.includes("mp4")
-          ? "host_audio.mp4"
+          ? "host_modal_audio.mp4"
           : mimeType.includes("wav")
-            ? "host_audio.wav"
-            : "host_audio.webm";
+            ? "host_modal_audio.wav"
+            : "host_modal_audio.webm";
         form.append("file", blob, fname);
 
         const res = await fetch(`${API_BASE}/stt/transcribe`, {
@@ -4962,31 +5002,69 @@ const hostStartStt = useCallback(async () => {
 
         const text = String(data?.text || "").trim();
         if (!text) return;
-
-        setHostSendText((prev) => {
-          const p = String(prev || "").trim();
-          return p ? `${p} ${text}` : text;
-        });
+        ctrl.appendText(text);
       } catch (e: any) {
-        setHostSttError(String(e?.message || e || "STT failed"));
+        ctrl.setError(String(e?.message || e || "STT failed"));
       }
     };
 
     mr.start();
-    setHostSttRecording(true);
+    ctrl.setRecording(true);
   } catch (e: any) {
-    setHostSttRecording(false);
-    setHostSttError(String(e?.message || e || "Microphone permission was blocked."));
+    ctrl.setRecording(false);
+    ctrl.setError(String(e?.message || e || "Microphone permission was blocked."));
     try {
-      (hostSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
+      (ctrl.streamRef.current?.getTracks?.() || []).forEach((t) => {
         try {
           t.stop();
         } catch {}
       });
     } catch {}
-    hostSttStreamRef.current = null;
+    ctrl.streamRef.current = null;
   }
-}, [API_BASE, hostSttRecording]);
+}, [API_BASE]);
+
+const hostStopStt = useCallback(async () => {
+  await stopModalSttCapture(hostSttRecorderRef);
+}, [stopModalSttCapture]);
+
+const hostStartStt = useCallback(async () => {
+  if (hostSttRecording) return;
+  await startModalSttCapture({
+    setRecording: setHostSttRecording,
+    setError: setHostSttError,
+    recorderRef: hostSttRecorderRef,
+    streamRef: hostSttStreamRef,
+    chunksRef: hostSttChunksRef,
+    appendText: (text: string) => {
+      setHostSendText((prev) => {
+        const p = String(prev || "").trim();
+        return p ? `${p} ${text}` : text;
+      });
+    },
+  });
+}, [hostSttRecording, startModalSttCapture]);
+
+const hostInsightsStopStt = useCallback(async () => {
+  await stopModalSttCapture(hostInsightsSttRecorderRef);
+}, [stopModalSttCapture]);
+
+const hostInsightsStartStt = useCallback(async () => {
+  if (hostInsightsSttRecording) return;
+  await startModalSttCapture({
+    setRecording: setHostInsightsSttRecording,
+    setError: setHostInsightsSttError,
+    recorderRef: hostInsightsSttRecorderRef,
+    streamRef: hostInsightsSttStreamRef,
+    chunksRef: hostInsightsSttChunksRef,
+    appendText: (text: string) => {
+      setHostInsightsQuestion((prev) => {
+        const p = String(prev || "").trim();
+        return p ? `${p} ${text}` : text;
+      });
+    },
+  });
+}, [hostInsightsSttRecording, startModalSttCapture]);
 
 // Safety: stop host recorder if host console closes or session changes.
 useEffect(() => {
@@ -4996,6 +5074,13 @@ useEffect(() => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [hostConsoleOpen, hostSelectedSessionId]);
 
+// Safety: stop Session Insights recorder when the modal closes.
+useEffect(() => {
+  if (!hostInsightsOpen && hostInsightsSttRecording) {
+    hostInsightsStopStt();
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [hostInsightsOpen]);
 
   const hostPushPendingContent = async (token: string) => {
     if (!hostSelectedSessionId) return;
@@ -6100,7 +6185,7 @@ useEffect(() => {
 
     const role = isHost ? "host" : "viewer";
     const name =
-      role === "host" ? String(companionName || "Host") : String(viewerLiveChatName || "").trim() || "Viewer";
+      role === "host" ? String(companionName || "Host") : String(preferredViewerDisplayName || "").trim() || "Viewer";
     const memberIdForWs = String(memberIdForLiveChat || "").trim();
 
     if (
@@ -6201,7 +6286,7 @@ useEffect(() => {
     isHost,
     memberIdForLiveChat,
     companionName,
-    viewerLiveChatName,
+    preferredViewerDisplayName,
     appendLiveChatMessage,
     sessionKind,
     sessionRoom,
@@ -6240,7 +6325,7 @@ useEffect(() => {
       const name =
         role === 'host'
           ? (String(companionName || 'Host').trim() || 'Host')
-          : (String(viewerLiveChatName || '').trim() || (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer'));
+          : (String(preferredViewerDisplayName || '').trim() || (memberIdForLiveChat ? `Viewer-${memberIdForLiveChat.slice(-4)}` : 'Viewer'));
       // IMPORTANT:
       // - The server expects a stable `clientMsgId` so clients can de-dupe websocket echo/history.
       // - We also include `clientId` for back-compat with older builds.
@@ -6288,7 +6373,7 @@ useEffect(() => {
         // ignore
       }
     },
-    [API_BASE, streamEventRef, isHost, memberIdForLiveChat, companionName, viewerLiveChatName, sessionKind, sessionRoom, companyName],
+    [API_BASE, streamEventRef, isHost, memberIdForLiveChat, companionName, preferredViewerDisplayName, sessionKind, sessionRoom, companyName],
   );
 
   const [showBroadcasterOverlay, setShowBroadcasterOverlay] = useState<boolean>(false);
@@ -6413,7 +6498,7 @@ const startConferenceSession = useCallback(async () => {
 	          ensureViewerLiveChatName({
 	            promptText: "Please enter your name to enter the the session",
 	          }) ||
-	            viewerLiveChatName ||
+	            preferredViewerDisplayName ||
 	            "",
 	        ).trim();
 
@@ -6527,7 +6612,7 @@ const startConferenceSession = useCallback(async () => {
       setAvatarError(err?.message || "Network error starting private session.");
       setAvatarStatus("idle");
     }
-  }, [API_BASE, companyName, companionName, isHost, memberId, sanitizeRoomToken, viewerLiveChatName, requestLivekitAvPermissions]);
+  }, [API_BASE, companyName, companionName, isHost, memberId, sanitizeRoomToken, preferredViewerDisplayName, requestLivekitAvPermissions]);
 
 // Keep refs to the latest state for async flush logic (avoids stale closures).
 const messagesRef = useRef<Msg[]>([]);
@@ -7272,6 +7357,20 @@ useEffect(() => {
             : "";
       setMemberId(incomingMemberId);
 
+      const incomingDisplayName =
+        typeof (data as any).displayName === "string"
+          ? String((data as any).displayName).trim()
+          : typeof (data as any).display_name === "string"
+            ? String((data as any).display_name).trim()
+            : typeof (data as any).userName === "string"
+              ? String((data as any).userName).trim()
+              : typeof (data as any).user_name === "string"
+                ? String((data as any).user_name).trim()
+                : typeof (data as any).username === "string"
+                  ? String((data as any).username).trim()
+                  : "";
+      setPayloadUserDisplayName(incomingDisplayName);
+
       // When RebrandingKey is present, use ElaraloPlanMap for capability gating
       // (Wix planName may be the rebrand site's plan names like "Supreme").
       const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
@@ -7425,15 +7524,7 @@ const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(br
 
 // Viewer/User display name for host readability (used in Host Console + summaries).
 // Do NOT prompt here; this must be safe during normal chat.
-const userDisplayNameForBackend = (() => {
-  const explicit = String(viewerLiveChatName || "").trim();
-  if (explicit) return explicit;
-  const raw = String(memberIdForBackend || "").trim();
-  const cleaned = raw.replace(/^Anon:\s*/i, "").trim();
-  const base = cleaned || raw;
-  const shortId = base ? base.slice(0, 4) : "";
-  return `Viewer - ${shortId || "Anon"}`;
-})();
+const userDisplayNameForBackend = buildHostReadableViewerName(memberIdForBackend);
 
 // If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
 // from the rebranding key so backend quota comes from the mapped Elaralo plan.
@@ -7585,15 +7676,7 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
 
     const rebrandingKeyForBackend = (rebrandingKey || "");
 
-    const userDisplayNameForBackend = (() => {
-      const explicit = String(viewerLiveChatName || "").trim();
-      if (explicit) return explicit;
-      const raw = String(memberIdForBackend || "").trim();
-      const cleaned = raw.replace(/^Anon:\s*/i, "").trim();
-      const base = cleaned || raw;
-      const shortId = base ? base.slice(0, 4) : "";
-      return `Viewer - ${shortId || "Anon"}`;
-    })();
+    const userDisplayNameForBackend = buildHostReadableViewerName(memberIdForBackend);
 
     const stateToSendWithCompanion: SessionState = {
       ...stateToSend,
@@ -7961,7 +8044,7 @@ if (streamSessionActive) {
     const senderName =
       senderRole === "host"
         ? (String(companionName || "Host").trim() || "Host")
-        : (String(viewerLiveChatName || "").trim() ||
+        : (String(preferredViewerDisplayName || "").trim() ||
            (memberIdForLiveChat ? `Viewer-${String(memberIdForLiveChat).slice(-4)}` : "Viewer"));
 
     userMsg = {
@@ -10724,7 +10807,7 @@ const modePillControls = (
           aria-label="Change username"
           title="Change the name shown to others during the live session"
         >
-          {String(viewerLiveChatName || "").trim() ? "Change username" : "Set username"}
+          {String(preferredViewerDisplayName || "").trim() ? "Change username" : "Set username"}
         </button>
       ) : null}
 
@@ -11093,7 +11176,7 @@ const modePillControls = (
                               : isHostMsg
                                 ? `${(companionName || DEFAULT_COMPANION_NAME)} (Host)`
                                 : (companionName || DEFAULT_COMPANION_NAME)
-                            : "You";
+                            : transcriptViewerLabel;
 
                         return (
                           <div
@@ -12112,7 +12195,38 @@ const modePillControls = (
                     disabled={hostInsightsLoading}
                   />
 
-                  <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+                  {hostInsightsSttError ? (
+                    <div style={{ fontSize: 12, color: "#b00020" }}>
+                      {hostInsightsSttError}
+                    </div>
+                  ) : null}
+
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (hostInsightsSttRecording) hostInsightsStopStt();
+                        else hostInsightsStartStt();
+                      }}
+                      style={{
+                        border: "1px solid rgba(0,0,0,0.18)",
+                        background: hostInsightsSttRecording ? "rgba(180,0,0,0.08)" : "rgba(0,0,0,0.04)",
+                        borderRadius: 10,
+                        padding: "10px 12px",
+                        cursor: "pointer",
+                        fontSize: 12,
+                        color: "#111",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                      disabled={hostInsightsLoading}
+                      title={hostInsightsSttRecording ? "Stop recording" : "Record a question with speech-to-text"}
+                    >
+                      <span aria-hidden="true">{hostInsightsSttRecording ? "■" : "🎤"}</span>
+                      <span>{hostInsightsSttRecording ? "Stop mic" : "Speak question"}</span>
+                    </button>
+
                     <button
                       type="button"
                       onClick={() => void askHostInsights()}
