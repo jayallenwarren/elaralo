@@ -95,21 +95,6 @@ const TrashIcon = ({ size = 18 }: { size?: number }) => (
   </svg>
 );
 
-const SaveIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path
-      d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h11v5H7v2h10V4.41L19 6.41V19z"
-      fill="currentColor"
-    />
-  </svg>
-);
 
 function LiveKitHlsPlayer({ src }: { src: string }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -270,6 +255,7 @@ type HostActiveChat = {
   usage_ok?: boolean;
   minutes_used?: number;
   minutes_allowed?: number;
+  minutes_total?: number;
   minutes_remaining?: number;
   plan_label?: string;
   is_trial?: boolean;
@@ -2502,6 +2488,7 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
 
   // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
   const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
+  const [companionMappingResolved, setCompanionMappingResolved] = useState<boolean>(false);
 
   
   const [companionMappingError, setCompanionMappingError] = useState<string>("");
@@ -2509,6 +2496,8 @@ useEffect(() => {
     let cancelled = false;
 
     async function load() {
+      setCompanionMappingResolved(false);
+
       const brand = String(companyName || "").trim();
       const avatar = String(companionName || "").trim();
 
@@ -2516,12 +2505,14 @@ useEffect(() => {
       if (!brand || !avatar) {
         setCompanionMapping(null);
         setCompanionMappingError("Missing brand or avatar for companion mapping lookup.");
+        setCompanionMappingResolved(true);
         return;
       }
 
       if (!API_BASE) {
         setCompanionMapping(null);
         setCompanionMappingError("API_BASE is not configured; cannot load companion mapping.");
+        setCompanionMappingResolved(true);
         return;
       }
 
@@ -2541,6 +2532,7 @@ useEffect(() => {
           setCompanionMappingError(
             detail || `Companion mapping request failed (${res.status} ${res.statusText}).`
           );
+          setCompanionMappingResolved(true);
           return;
         }
 
@@ -2548,15 +2540,18 @@ useEffect(() => {
         if (!(json as any)?.found) {
           setCompanionMapping(null);
           setCompanionMappingError(`Companion mapping not found for brand='${brand}' avatar='${avatar}'.`);
+          setCompanionMappingResolved(true);
           return;
         }
 
         setCompanionMapping(json as CompanionMappingRow);
         setCompanionMappingError("");
+        setCompanionMappingResolved(true);
       } catch (e: any) {
         if (!cancelled) {
           setCompanionMapping(null);
           setCompanionMappingError(String(e?.message || e || "Failed to load companion mapping."));
+          setCompanionMappingResolved(true);
         }
       }
     }
@@ -2776,7 +2771,7 @@ const [hostGuidelinesStatus, setHostGuidelinesStatus] = useState<string>("");
 
 // Host: Session Insights (history across all visitors/members)
 const [hostInsightsOpen, setHostInsightsOpen] = useState<boolean>(false);
-const [hostInsightsUsers, setHostInsightsUsers] = useState<Array<{ memberId: string; userName?: string; lastSeen?: string; summaryCount?: number; lastSummary?: string }>>([]);
+const [hostInsightsUsers, setHostInsightsUsers] = useState<Array<{ memberId: string; userName?: string; lastSeen?: string; lastSeenEpoch?: number; summaryLastSeen?: string; summaryCount?: number; lastSummary?: string; minutesUsed?: number; minutesAllowed?: number; minutesRemaining?: number; minutesTotal?: number }>>([]);
 const [hostInsightsSelectedMemberId, setHostInsightsSelectedMemberId] = useState<string>("");
 const [hostInsightsSummaries, setHostInsightsSummaries] = useState<Array<{ createDatetime: string; sessionId: string; reason?: string; summary: string }>>([]);
 const [hostInsightsQuestion, setHostInsightsQuestion] = useState<string>("");
@@ -4229,9 +4224,22 @@ const playLocalTtsUrl = useCallback(
         return;
       }
 
+      // Re-assert the loud playback route immediately before local TTS starts.
+      try { boostAllTtsVolumes(); } catch (e) {}
+      try { await nudgeAudioSession(); } catch (e) {}
+      try { primeLocalTtsAudio(true); } catch (e) {}
+      try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
+
       await playLocalTtsUrl(audioUrl, hooks);
     },
-    [getTtsAudioUrl, playLocalTtsUrl]
+    [
+      getTtsAudioUrl,
+      playLocalTtsUrl,
+      boostAllTtsVolumes,
+      nudgeAudioSession,
+      primeLocalTtsAudio,
+      ensureIphoneAudioContextUnlocked,
+    ]
   );
 
 
@@ -5031,8 +5039,6 @@ useEffect(() => {
 
 
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
-  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
-  const [savingSummary, setSavingSummary] = useState(false);
   const clearEpochRef = useRef(0);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
@@ -6500,49 +6506,18 @@ const autoSaveChatSummary = useCallback(
       const msgList = messagesRef.current || [];
       if (!msgList.length) return;
 
-      autoSaveSummaryInFlightRef.current = true;
-
-      const memberIdForBackend = String(memberIdRef.current || "").trim();
-      const companionForBackend = String(companionKey || companionName || DEFAULT_COMPANION_NAME).trim();
-      const brandForBackend = String(companyName || "").trim();
-
-      const effectivePlanForBackend: PlanName = memberIdForBackend ? (planName as any) : "Trial";
-
-      const session_state = {
-        ...(sessionState || {}),
-        memberId: memberIdForBackend,
-        companion: companionForBackend,
-        companionName: companionForBackend,
-        companion_name: companionForBackend,
-        brand: brandForBackend,
-        avatar: String(companionName || "").trim(),
-        planName: effectivePlanForBackend,
-        plan_name: effectivePlanForBackend,
-        plan_label: String(planLabelOverride || "").trim(),
-      } as any;
-
-      const messagesForSummary = msgList
-        .filter((m) => {
-          const meta: any = (m as any)?.meta || {};
-          if (meta?.includeInAiContext === false) return false;
-          if (meta?.liveChat) return false;
-          return true;
-        })
-        .map((m) => ({ role: m.role, content: m.content }));
-
-      const res = await fetch(`${API_BASE}/chat/save-summary`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          memberId: memberIdForBackend,
-          session_state,
-          messages: messagesForSummary,
-          reason,
-        }),
+      const messagesForSummary = msgList.filter((m) => {
+        const meta: any = (m as any)?.meta || {};
+        if (meta?.includeInAiContext === false) return false;
+        if (meta?.liveChat) return false;
+        return true;
       });
 
-      // Treat non-2xx as non-fatal (auto-save is best-effort).
-      if (res.ok) {
+      if (!messagesForSummary.length) return;
+
+      autoSaveSummaryInFlightRef.current = true;
+      const resp = await callSaveChatSummary(messagesForSummary, sessionState, reason || "auto_save");
+      if (resp?.ok) {
         autoSaveSummaryLastAtRef.current = now;
       }
     } catch {
@@ -6551,15 +6526,7 @@ const autoSaveChatSummary = useCallback(
       autoSaveSummaryInFlightRef.current = false;
     }
   },
-  [
-    API_BASE,
-    companionKey,
-    companionName,
-    companyName,
-    planLabelOverride,
-    planName,
-    sessionState,
-  ],
+  [API_BASE, sessionState]
 );
 
 // Every message append: schedule idle timer (120s).
@@ -7540,7 +7507,7 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
     return (await res.json()) as ChatApiResponse;
   }
 
-  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
+  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState, reason: string = "manual_save"): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const session_id =
@@ -7555,45 +7522,53 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
 
     const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
 
-    
-// NOTE:
-	// - `rebranding` (legacy) is not guaranteed to be present in this build.
-	// - Use RebrandingKey as the single source of truth for brand identity.
-	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
-const brandKey = safeBrandKey(rawBrand);
+    const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+    const brandKey = safeBrandKey(rawBrand);
 
-// For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
-const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
+    // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
+    const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
 
-// If the user is entitled (has a real Wix memberId + active plan), strip the trial controls
-// from the rebranding key so backend quota comes from the mapped Elaralo plan.
-// For white-label, keep the full rebrandingKey intact so backend can apply minutes/mode/links overrides.
-const rebrandingKeyForBackend = (rebrandingKey || "");
+    const rebrandingKeyForBackend = (rebrandingKey || "");
 
-  const stateToSendWithCompanion: SessionState = {
+    const userDisplayNameForBackend = (() => {
+      const explicit = String(viewerLiveChatName || "").trim();
+      if (explicit) return explicit;
+      const raw = String(memberIdForBackend || "").trim();
+      const cleaned = raw.replace(/^Anon:\s*/i, "").trim();
+      const base = cleaned || raw;
+      const shortId = base ? base.slice(0, 4) : "";
+      return `Viewer - ${shortId || "Anon"}`;
+    })();
+
+    const stateToSendWithCompanion: SessionState = {
       ...stateToSend,
       companion: companionForBackend,
       companionName: companionForBackend,
       companion_name: companionForBackend,
+      brand: (companyName || "").trim(),
+      avatar: (companionName || "").trim(),
       planName: effectivePlanForBackend,
       plan_name: effectivePlanForBackend,
       plan: effectivePlanForBackend,
+      planLabelOverride: (planLabelOverride || "").trim(),
+      plan_label_override: (planLabelOverride || "").trim(),
       memberId: (memberIdForBackend || "").trim(),
       member_id: (memberIdForBackend || "").trim(),
-
-  // White-label handoff: pass RebrandingKey to backend so it can override Upgrade/PayGo URLs, minutes, etc.
-  rebrandingKey: (rebrandingKeyForBackend || "").trim(),
-  rebranding_key: (rebrandingKeyForBackend || "").trim(),
-  RebrandingKey: (rebrandingKeyForBackend || "").trim(),
-  // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
-  rebranding: (rebranding || "").trim(),
-};
+      rebrandingKey: (rebrandingKeyForBackend || "").trim(),
+      rebranding_key: (rebrandingKeyForBackend || "").trim(),
+      RebrandingKey: (rebrandingKeyForBackend || "").trim(),
+      rebranding: (rebranding || "").trim(),
+      user_name: userDisplayNameForBackend,
+      username: userDisplayNameForBackend,
+      display_name: userDisplayNameForBackend,
+    };
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id,
+        reason: (reason || "manual_save").trim(),
         session_state: stateToSendWithCompanion,
         messages: nextMessages.map((m) => {
           let content = m.content || "";
@@ -9109,8 +9084,8 @@ const greetInFlightRef = useRef(false);
 const speakGreetingIfNeeded = useCallback(
   async (mode: "live" | "audio") => {
     // Ensure the first audio-only TTS greeting uses the selected companion voice.
-    // If Wix hasn't provided plan/companion yet, defer until the handoff arrives.
-    if (mode === "audio" && !handoffReady) {
+    // If Wix hasn't provided plan/companion yet, or the DB voice mapping is still loading, defer.
+    if (mode === "audio" && (!handoffReady || !companionMappingResolved)) {
       pendingGreetingModeRef.current = "audio";
       return;
     }
@@ -9190,6 +9165,7 @@ const speakGreetingIfNeeded = useCallback(
     companionName,
     companionKey,
     companionMapping,
+    companionMappingResolved,
     handoffReady,
     pauseSpeechToText,
     resumeSpeechToText,
@@ -9207,6 +9183,10 @@ const speakGreetingIfNeeded = useCallback(
     if (!mode) return;
     if (!micGrantedRef.current) return;
 
+    if (mode === "audio") {
+      if (!handoffReady || !companionMappingResolved) return;
+    }
+
     // Live Avatar greeting must wait until the agent is fully connected.
     if (mode === "live") {
       if (avatarStatus !== "connected" || !didAgentMgrRef.current) return;
@@ -9215,15 +9195,15 @@ const speakGreetingIfNeeded = useCallback(
     // Clear first so we don't re-enter if something throws.
     pendingGreetingModeRef.current = null;
     await speakGreetingIfNeeded(mode);
-  }, [avatarStatus, speakGreetingIfNeeded]);
+  }, [avatarStatus, companionMappingResolved, handoffReady, speakGreetingIfNeeded]);
 
   // If the user started an audio-only experience before the Wix handoff arrived,
   // play the pending greeting once plan/companion information is available.
   useEffect(() => {
-    if (!handoffReady) return;
+    if (!handoffReady || !companionMappingResolved) return;
     if (!pendingGreetingModeRef.current) return;
     void maybePlayPendingGreeting();
-  }, [handoffReady, maybePlayPendingGreeting]);
+  }, [handoffReady, companionMappingResolved, maybePlayPendingGreeting]);
 
   // Auto-play the greeting once the Live Avatar is connected, but ONLY after the user has granted mic access.
   useEffect(() => {
@@ -9469,36 +9449,6 @@ setStreamEventRef("");
     setShowClearMessagesConfirm(true);
   }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
 
-  // Save Chat Summary (with confirmation)
-  const requestSaveChatSummary = useCallback(() => {
-    // REQUIREMENT: behave like Clear Messages with respect to media stability.
-    // We halt all communication immediately using the Stop button logic.
-    // The user will manually choose what to resume after selecting Yes/No.
-    // IMPORTANT: Unlike Clear, do NOT bump clearEpochRef or change loading state here;
-    // doing so can interfere with subsequent reply speaking.
-
-    try {
-      stopHandsFreeSTT();
-    } catch (e) {}
-
-    // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
-    try {
-      boostAllTtsVolumes();
-    } catch (e) {}
-    try {
-      void nudgeAudioSession();
-    } catch (e) {}
-
-    // Prime the hidden VIDEO element on this user gesture so audio-only TTS remains healthy.
-    try {
-      primeLocalTtsAudio(true);
-    } catch (e) {}
-    try {
-      void ensureIphoneAudioContextUnlocked();
-    } catch (e) {}
-
-    setShowSaveSummaryConfirm(true);
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
@@ -9958,11 +9908,12 @@ const modePillControls = (
     const used = Number((sessionState as any)?.minutes_used ?? (sessionState as any)?.minutesUsed ?? 0) || 0;
     const remaining = Number((sessionState as any)?.minutes_remaining ?? (sessionState as any)?.minutesRemaining ?? 0) || 0;
     const allowed = Number((sessionState as any)?.minutes_allowed ?? (sessionState as any)?.minutesAllowed ?? 0) || 0;
-    const total = (used + remaining) > 0 ? (used + remaining) : allowed;
-    if (!total || total <= 0) return null;
+    const total = Number((sessionState as any)?.minutes_total ?? (sessionState as any)?.minutesTotal ?? allowed ?? 0) || 0;
+    const stableTotal = total > 0 ? total : Math.max(allowed, used + remaining);
+    if (!stableTotal || stableTotal <= 0) return null;
 
-    const pct = Math.max(0, Math.min(1, used / total));
-    const remainingComputed = remaining > 0 ? remaining : Math.max(0, total - used);
+    const pct = Math.max(0, Math.min(1, used / stableTotal));
+    const remainingComputed = remaining > 0 ? remaining : Math.max(0, stableTotal - used);
     const pctLabel = `${Math.round(pct * 100)}%`;
 
     return (
@@ -9979,13 +9930,13 @@ const modePillControls = (
         >
           <span style={{ fontWeight: 700 }}>Usage</span>
           <span style={{ whiteSpace: "nowrap" }}>
-            {used} / {total} min • {remainingComputed} left
+            {used} / {stableTotal} min • {remainingComputed} left
           </span>
         </div>
 
         <div
           role="progressbar"
-          aria-label={`Usage: ${used} of ${total} minutes`}
+          aria-label={`Usage: ${used} of ${stableTotal} minutes`}
           aria-valuemin={0}
           aria-valuemax={100}
           aria-valuenow={Math.round(pct * 100)}
@@ -9996,7 +9947,7 @@ const modePillControls = (
             background: "rgba(0,0,0,0.12)",
             overflow: "hidden",
           }}
-          title={`${used}/${total} min (${pctLabel})`}
+          title={`${used}/${stableTotal} min (${pctLabel})`}
         >
           <div
             style={{
@@ -11119,28 +11070,6 @@ const modePillControls = (
   </button>
 ) : null}
 
-                      <button
-                            type="button"
-                            onClick={requestSaveChatSummary}
-                            title="Save"
-                            aria-label="Save"
-                            style={{
-                              width: ICON_BTN_SIZE,
-                              height: ICON_BTN_SIZE,
-                              borderRadius: 10,
-                              border: "1px solid #bbb",
-                              boxSizing: "border-box",
-                              background: "#fff",
-                              cursor: "pointer",
-                              opacity: 1,
-                              display: "inline-flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                            }}
-                          >
-                            <SaveIcon size={ICON_18} />
-                          </button>
-
                           <button
                             type="button"
                             onClick={requestClearMessages}
@@ -11484,141 +11413,6 @@ const modePillControls = (
       
         </div>
       </section>
-
-
-
-      {/* Save Chat Summary confirmation overlay */}
-      {showSaveSummaryConfirm && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.4)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-            zIndex: 10000,
-          }}
-        >
-          <div
-            style={{
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              maxWidth: 560,
-              width: "100%",
-              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
-            }}
-          >
-            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
-              Save chat summary?
-            </div>
-            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
-              Saving stores a server-side summary of this conversation for future reference across your devices.
-              By selecting <b>Yes, save</b>, you authorize your AI companion to store chat summary data associated with your
-              account for later use.
-              <div style={{ marginTop: 8 }}>
-                All audio, video, and mic listening have been stopped. You can resume manually using the controls
-                after closing this dialog.
-              </div>
-            </div>
-
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
-              <button
-                type="button"
-                onClick={() => {
-                  if (savingSummary) return;
-                  setShowSaveSummaryConfirm(false);
-                  // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
-                  try { boostAllTtsVolumes(); } catch (e) {}
-                  void restoreVolumesAfterClearCancel();
-                }}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  border: "1px solid #bbb",
-                  background: "#fff",
-                  cursor: savingSummary ? "not-allowed" : "pointer",
-                  opacity: savingSummary ? 0.65 : 1,
-                }}
-              >
-                No
-              </button>
-              <button
-                type="button"
-                onClick={async () => {
-                  if (savingSummary) return;
-                  setSavingSummary(true);
-                  const rawCompanionLabel = (
-                     (companionName || "").trim() ||
-                    (companionKey || "").trim() ||
-                    DEFAULT_COMPANION_NAME
-                  ).trim() || DEFAULT_COMPANION_NAME;
-
-                  // For user-facing messages, show only the companion's first name (no demographics).
-                  const companionForDisplay = (() => {
-                    const s = rawCompanionLabel;
-                    const afterNs = s.includes("::") ? (s.split("::").pop() || s) : s;
-                    const base = (afterNs.split("-")[0] || "").trim();
-                    return base || afterNs || DEFAULT_COMPANION_NAME;
-                  })();
-                  try {
-                    const payloadMessages = messages.slice();
-                    if (payloadMessages.length === 0) {
-                      setMessages((prev) => [
-                        ...prev,
-                        { role: "assistant", content: "There is nothing to save yet." },
-                      ]);
-                      setShowSaveSummaryConfirm(false);
-                      return;
-                    }
-
-                    const resp = await callSaveChatSummary(payloadMessages, sessionState);
-                    if (resp?.ok) {
-                      const keyHint = typeof resp?.key === "string" ? resp.key : "";
-                      const persistHint = keyHint.startsWith("session::")
-                        ? " (note: no memberId detected; memory will not persist across new sessions)"
-                        : "";
-                      setMessages((prev) => [
-                        ...prev,
-                        { role: "assistant", content: `Chat saved for ${companionForDisplay}.${persistHint}` },
-                      ]);
-                    } else {
-                      setMessages((prev) => [
-                        ...prev,
-                        { role: "assistant", content: `Chat NOT saved for ${companionForDisplay}${resp?.error_code ? ` (reason: ${resp.error_code})` : ""}.` },
-                      ]);
-                    }
-                  } catch (e) {
-                    setMessages((prev) => [
-                      ...prev,
-                      { role: "assistant", content: `Save failed for ${companionForDisplay}: ${String(e?.message || e)}` },
-                    ]);
-                  } finally {
-                    setSavingSummary(false);
-                    setShowSaveSummaryConfirm(false);
-                    // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
-                    try { boostAllTtsVolumes(); } catch (e) {}
-                    void restoreVolumesAfterClearCancel();
-                  }
-                }}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
-                  color: "#fff",
-                  cursor: savingSummary ? "not-allowed" : "pointer",
-                  opacity: savingSummary ? 0.7 : 1,
-                }}
-              >
-                {savingSummary ? "Saving…" : "Yes, save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Clear Messages confirmation overlay */}
       {showClearMessagesConfirm && (
@@ -12135,8 +11929,19 @@ const modePillControls = (
                             {u.memberId}
                           </div>
                           <div style={{ fontSize: 11, opacity: 0.72 }}>
-                            {(u.summaryCount || 0) > 0 ? `${u.summaryCount} summaries` : ""}
-                            {u.lastSeen ? ` · ${u.lastSeen}` : ""}
+                            {`${u.summaryCount || 0} summaries`}
+                            {u.summaryLastSeen ? ` · Latest summary ${u.summaryLastSeen}` : ""}
+                          </div>
+                          <div style={{ fontSize: 11, opacity: 0.72 }}>
+                            {(() => {
+                              const totalMinutes = Number(u.minutesTotal ?? u.minutesAllowed ?? 0) || 0;
+                              const usedMinutes = Number(u.minutesUsed ?? 0) || 0;
+                              const remainingMinutes = Number(u.minutesRemaining ?? Math.max(0, totalMinutes - usedMinutes)) || 0;
+                              const usageLabel = totalMinutes > 0
+                                ? `Usage ${usedMinutes}/${totalMinutes} min • ${remainingMinutes} left`
+                                : "Usage unavailable";
+                              return `${usageLabel}${u.lastSeen ? ` · Last active ${u.lastSeen}` : ""}`;
+                            })()}
                           </div>
                         </button>
                       );
