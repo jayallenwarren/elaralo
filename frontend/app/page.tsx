@@ -11849,6 +11849,7 @@ const modePillControls = (
               maxHeight: "92vh",
               overflow: "hidden",
               background: "white",
+              color: "#111",
               borderRadius: 14,
               padding: 14,
               boxShadow: "0 18px 60px rgba(0,0,0,0.28)",
@@ -12066,6 +12067,7 @@ const modePillControls = (
                     minHeight: 120,
                     maxHeight: 220,
                     fontSize: 12,
+                    color: "#111",
                     whiteSpace: "pre-wrap",
                   }}
                 >
@@ -12104,6 +12106,7 @@ const modePillControls = (
                       borderRadius: 12,
                       padding: 10,
                       fontSize: 13,
+                      color: "#111",
                       outline: "none",
                     }}
                     disabled={hostInsightsLoading}
@@ -12136,6 +12139,7 @@ const modePillControls = (
                       borderRadius: 12,
                       padding: 10,
                       fontSize: 13,
+                      color: "#111",
                       whiteSpace: "pre-wrap",
                       overflowY: "auto",
                       maxHeight: 220,
