@@ -8,6 +8,7 @@ import json
 import hashlib
 import base64
 import mimetypes
+import math
 import asyncio
 import threading
 from datetime import datetime, timedelta
@@ -265,8 +266,12 @@ async def content_file(brand: str, mode: str, filename: str):
     if not filename or any(x in filename for x in ("..", "/", "\\")):
         raise HTTPException(status_code=400, detail="invalid filename")
 
-    base = f"/home/site/brand/{brand_slug}/content/mode/{folder}"
-    path = os.path.join(base, filename)
+    base = _content_resolve_mode_dir(brand_slug, folder)
+    if not base:
+        raise HTTPException(status_code=404, detail="content not found")
+
+    resolved_name = _content_resolve_existing_filename(base, filename) or filename
+    path = os.path.join(base, resolved_name)
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="content not found")
 
@@ -390,15 +395,19 @@ async def usage_status(request: Request):
         cycle_days_override=cycle_days_override,
     )
 
-    minutes_remaining = int(usage_info.get("minutes_remaining") or 0)
+    remaining_seconds = float(usage_info.get("remaining_seconds") or 0.0)
+    minutes_remaining = int(usage_info.get("minutes_remaining") or _usage_minutes_remaining_display(remaining_seconds) or 0)
     return {
         "ok": bool(usage_ok),
         "minutes_used": int(usage_info.get("minutes_used") or 0),
         "minutes_allowed": int(usage_info.get("minutes_allowed") or 0),
         "minutes_total": int(usage_info.get("minutes_total") or usage_info.get("minutes_allowed") or 0),
         "minutes_remaining": minutes_remaining,
-        "minutes_exhausted": minutes_remaining <= 0,
+        "minutes_exhausted": remaining_seconds <= 0.0,
         "identity_key": str(usage_info.get("identity_key") or identity_key),
+        "used_seconds": float(usage_info.get("used_seconds") or 0.0),
+        "remaining_seconds": remaining_seconds,
+        "total_seconds": float(usage_info.get("total_seconds") or 0.0),
     }
 
 
@@ -5956,13 +5965,17 @@ async def chat(request: Request):
             or 0
         )
         session_state_out = dict(session_state)
+        remaining_seconds_for_state = float(usage_info.get("remaining_seconds") or 0.0)
         session_state_out.update(
             {
-                "minutes_exhausted": True,
+                "minutes_exhausted": remaining_seconds_for_state <= 0.0,
                 "minutes_used": int(usage_info.get("minutes_used") or 0),
                 "minutes_allowed": int(minutes_allowed),
                 "minutes_total": int(usage_info.get("minutes_total") or minutes_allowed or 0),
-                "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
+                "minutes_remaining": int(usage_info.get("minutes_remaining") or _usage_minutes_remaining_display(remaining_seconds_for_state) or 0),
+                "used_seconds": float(usage_info.get("used_seconds") or 0.0),
+                "remaining_seconds": remaining_seconds_for_state,
+                "total_seconds": float(usage_info.get("total_seconds") or 0.0),
             }
         )
 
@@ -6138,13 +6151,17 @@ async def chat(request: Request):
         effective_cycle_days = int(cycle_days_override) if cycle_days_override is not None else int(USAGE_CYCLE_DAYS or 0)
 
         session_state_out = dict(session_state)
+        remaining_seconds_for_state = float(usage_info.get("remaining_seconds") or 0.0)
         session_state_out.update(
             {
-                "minutes_exhausted": minutes_remaining <= 0,
+                "minutes_exhausted": remaining_seconds_for_state <= 0.0,
                 "minutes_used": minutes_used,
                 "minutes_allowed": minutes_allowed,
                 "minutes_total": int(usage_info.get("minutes_total") or minutes_allowed or 0),
                 "minutes_remaining": minutes_remaining,
+                "used_seconds": float(usage_info.get("used_seconds") or 0.0),
+                "remaining_seconds": remaining_seconds_for_state,
+                "total_seconds": float(usage_info.get("total_seconds") or 0.0),
             }
         )
         # Ensure mode is always present for the frontend.
@@ -10249,7 +10266,10 @@ async def host_ai_chats_active(req: HostAiChatsActiveRequest):
                 "minutes_used": int(usage_info.get("minutes_used") or 0),
                 "minutes_allowed": int(usage_info.get("minutes_allowed") or 0),
                 "minutes_total": int(usage_info.get("minutes_total") or usage_info.get("minutes_allowed") or 0),
-                "minutes_remaining": int(usage_info.get("minutes_remaining") or 0),
+                "minutes_remaining": int(usage_info.get("minutes_remaining") or _usage_minutes_remaining_display(float(usage_info.get("remaining_seconds") or 0.0)) or 0),
+                "used_seconds": float(usage_info.get("used_seconds") or 0.0),
+                "remaining_seconds": float(usage_info.get("remaining_seconds") or 0.0),
+                "total_seconds": float(usage_info.get("total_seconds") or 0.0),
                 "plan_label": str(ctx.get("plan_label_for_messages") or "").strip(),
                 "is_trial": bool(ctx.get("is_trial") is True),
             }
@@ -11648,8 +11668,122 @@ def _content_history_has_any_delivery(
 
 
 
+def _content_root_candidates() -> List[str]:
+    roots: List[str] = []
+    env_roots = [
+        os.getenv("CONTENT_BRAND_ROOT", ""),
+        os.getenv("BRAND_CONTENT_ROOT", ""),
+    ]
+    defaults = [
+        "/home/site/brand",
+        "/home/site/wwwroot/brand",
+        "/home/brand",
+    ]
+    for raw in env_roots + defaults:
+        path = str(raw or "").strip()
+        if not path:
+            continue
+        if path not in roots:
+            roots.append(path)
+    return roots
+
+
+def _content_slug_equivalent(actual_name: str, requested_slug: str) -> bool:
+    actual = str(actual_name or "").strip()
+    requested = str(requested_slug or "").strip()
+    if not actual or not requested:
+        return False
+    if actual == requested:
+        return True
+    if actual.lower() == requested.lower():
+        return True
+    if _safe_slug(actual) == requested:
+        return True
+    actual_compact = re.sub(r"[^a-z0-9]+", "", _safe_slug(actual))
+    requested_compact = re.sub(r"[^a-z0-9]+", "", requested.lower())
+    return bool(actual_compact and requested_compact and actual_compact == requested_compact)
+
+
+def _content_brand_dir_candidates(brand_slug: str) -> List[str]:
+    slug = _safe_slug(brand_slug)
+    dirs: List[str] = []
+    seen: Set[str] = set()
+    for root in _content_root_candidates():
+        if not os.path.isdir(root):
+            continue
+        exact = os.path.join(root, slug)
+        if os.path.isdir(exact):
+            real = os.path.realpath(exact)
+            if real not in seen:
+                seen.add(real)
+                dirs.append(exact)
+        try:
+            entries = os.listdir(root)
+        except Exception:
+            entries = []
+        for entry in entries:
+            full = os.path.join(root, entry)
+            if not os.path.isdir(full):
+                continue
+            if not _content_slug_equivalent(entry, slug):
+                continue
+            real = os.path.realpath(full)
+            if real in seen:
+                continue
+            seen.add(real)
+            dirs.append(full)
+    return dirs
+
+
+def _content_mode_dir_candidates(brand_dir: str, folder: str) -> List[str]:
+    folder_slug = _safe_slug(folder)
+    candidates = [
+        os.path.join(brand_dir, "content", "mode", folder_slug),
+        os.path.join(brand_dir, "content", folder_slug),
+        os.path.join(brand_dir, folder_slug),
+        os.path.join(brand_dir, "Content", "mode", folder_slug),
+        os.path.join(brand_dir, "Content", folder_slug),
+    ]
+    out: List[str] = []
+    seen: Set[str] = set()
+    for cand in candidates:
+        real = os.path.realpath(cand)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(cand)
+    return out
+
+
+def _content_resolve_mode_dir(brand_slug: str, folder: str) -> str:
+    for brand_dir in _content_brand_dir_candidates(brand_slug):
+        for cand in _content_mode_dir_candidates(brand_dir, folder):
+            if os.path.isdir(cand):
+                return cand
+    return ""
+
+
+def _content_resolve_existing_filename(base_dir: str, filename: str) -> str:
+    if not base_dir or not filename:
+        return ""
+    direct = os.path.join(base_dir, filename)
+    if os.path.isfile(direct):
+        return filename
+    want = str(filename or "").strip().lower()
+    try:
+        entries = os.listdir(base_dir)
+    except Exception:
+        entries = []
+    for entry in entries:
+        if str(entry or "").lower() == want and os.path.isfile(os.path.join(base_dir, entry)):
+            return entry
+    return ""
+
+
 def _content_list_files(brand_slug: str, folder: str) -> List[str]:
-    base = f"/home/site/brand/{brand_slug}/content/mode/{folder}"
+    base = _content_resolve_mode_dir(brand_slug, folder)
+    if not base:
+        return []
     try:
         entries = os.listdir(base)
     except Exception:
@@ -11661,7 +11795,7 @@ def _content_list_files(brand_slug: str, folder: str) -> List[str]:
         full = os.path.join(base, fn)
         if os.path.isfile(full):
             files.append(fn)
-    # Sort by leading 9-digit sequence if present.
+    # Sort by leading numeric prefix if present.
     def _seq_key(fn: str) -> int:
         try:
             prefix = fn.split("-", 1)[0]
@@ -12976,6 +13110,13 @@ def _usage_db_ensure_member_row(
     return row
 
 
+def _usage_minutes_remaining_display(remaining_seconds: float) -> int:
+    remaining = max(0.0, float(remaining_seconds or 0.0))
+    if remaining <= 0.0:
+        return 0
+    return max(1, int(math.ceil(remaining / 60.0)))
+
+
 def _usage_info_from_row(row: sqlite3.Row) -> Dict[str, Any]:
     free_minutes_total = int(row["free_minutes_total"] or 0)
     purchased_seconds = float(row["purchased_seconds"] or 0.0)
@@ -13000,7 +13141,7 @@ def _usage_info_from_row(row: sqlite3.Row) -> Dict[str, Any]:
         "minutes_allowed": max(0, int(total_seconds // 60)),
         "minutes_total": minutes_total,
         "minutes_used": max(0, int(used_seconds // 60)),
-        "minutes_remaining": max(0, int(remaining_seconds // 60)),
+        "minutes_remaining": _usage_minutes_remaining_display(remaining_seconds),
         # Seconds-level fields (used by scheduled content delivery + debugging).
         "used_seconds": used_seconds,
         "remaining_seconds": remaining_seconds,
@@ -13300,11 +13441,12 @@ def _usage_charge_and_check_sync(
 
             row2 = _usage_db_get_row(conn, member_id)
             if row2 is None:
-                ok = allowed_seconds > new_used
-                return ok, {"minutes_used": int(new_used // 60), "minutes_allowed": int(allowed_seconds // 60), "minutes_remaining": int(max(0.0, allowed_seconds - new_used) // 60)}
+                remaining_seconds = max(0.0, allowed_seconds - new_used)
+                ok = remaining_seconds > 0.0
+                return ok, {"minutes_used": int(new_used // 60), "minutes_allowed": int(allowed_seconds // 60), "minutes_remaining": _usage_minutes_remaining_display(remaining_seconds), "used_seconds": float(new_used), "remaining_seconds": float(remaining_seconds), "total_seconds": float(allowed_seconds)}
             info = _usage_info_from_row(row2)
 
-            ok = bool(info.get("minutes_remaining", 0) > 0)
+            ok = float(info.get("remaining_seconds") or 0.0) > 0.0
             # Maintain legacy key name expected elsewhere in the app.
             info["identity_key"] = member_id
             return ok, info
@@ -13360,7 +13502,7 @@ def _usage_peek_sync(
                 return True, {"minutes_used": 0, "minutes_allowed": 0, "minutes_remaining": 0, "identity_key": member_id}
 
             info = _usage_info_from_row(row2)
-            ok = bool(info.get("minutes_remaining", 0) > 0)
+            ok = float(info.get("remaining_seconds") or 0.0) > 0.0
             info["identity_key"] = member_id
             return ok, info
         finally:

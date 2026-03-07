@@ -5247,7 +5247,10 @@ useEffect(() => {
     // Only start watching if the backend has told us minutes are exhausted.
     // Otherwise, we could falsely interpret a non-zero balance as "payment credited".
     const mr = Number((sessionStateRef.current as any)?.minutes_remaining ?? (sessionStateRef.current as any)?.minutesRemaining ?? 0) || 0;
-    const exhausted = Boolean((sessionStateRef.current as any)?.minutes_exhausted ?? (sessionStateRef.current as any)?.minutesExhausted) || mr <= 0;
+    const remainingSeconds = Number((sessionStateRef.current as any)?.remaining_seconds ?? (sessionStateRef.current as any)?.remainingSeconds ?? NaN);
+    const exhausted =
+      Boolean((sessionStateRef.current as any)?.minutes_exhausted ?? (sessionStateRef.current as any)?.minutesExhausted) ||
+      (Number.isFinite(remainingSeconds) ? remainingSeconds <= 0 : mr <= 0);
     if (!exhausted) return;
 
     setMemberTopupError("");
@@ -5330,26 +5333,44 @@ useEffect(() => {
       "minutesTotal",
       "minutes_exhausted",
       "minutesExhausted",
+      "remaining_seconds",
+      "remainingSeconds",
+      "used_seconds",
+      "usedSeconds",
+      "total_seconds",
+      "totalSeconds",
     ].some((k) => Object.prototype.hasOwnProperty.call(raw, k));
 
     if (!hasSnapshot) return false;
 
-    const remaining = Number(raw?.minutes_remaining ?? raw?.minutesRemaining ?? 0) || 0;
+    const remainingSecondsRaw = Number(raw?.remaining_seconds ?? raw?.remainingSeconds ?? NaN);
+    const hasRemainingSeconds = Number.isFinite(remainingSecondsRaw);
+    const remainingFromSeconds = hasRemainingSeconds
+      ? Math.max(0, Math.ceil(Math.max(0, remainingSecondsRaw) / 60))
+      : 0;
+    const remainingExplicit = Number(raw?.minutes_remaining ?? raw?.minutesRemaining ?? NaN);
+    const remaining = Number.isFinite(remainingExplicit)
+      ? Math.max(0, remainingExplicit)
+      : remainingFromSeconds;
     const allowed = Number(raw?.minutes_allowed ?? raw?.minutesAllowed ?? 0) || 0;
     const total = Number(raw?.minutes_total ?? raw?.minutesTotal ?? allowed ?? 0) || 0;
     const usedFallback = total > 0 ? Math.max(0, total - remaining) : 0;
     const used = Number(raw?.minutes_used ?? raw?.minutesUsed ?? usedFallback) || 0;
+    const usedSeconds = Number(raw?.used_seconds ?? raw?.usedSeconds ?? NaN);
+    const totalSeconds = Number(raw?.total_seconds ?? raw?.totalSeconds ?? NaN);
     const exhausted =
       typeof raw?.minutes_exhausted === "boolean"
         ? raw.minutes_exhausted
         : typeof raw?.minutesExhausted === "boolean"
           ? raw.minutesExhausted
-          : remaining <= 0;
+          : hasRemainingSeconds
+            ? remainingSecondsRaw <= 0
+            : remaining <= 0;
 
     setSessionState((prev) => ({
       ...(prev as any),
       minutes_exhausted: exhausted,
-      minutes_remaining: remaining,
+      minutes_remaining: exhausted ? 0 : remaining,
       minutes_allowed:
         allowed > 0
           ? allowed
@@ -5359,6 +5380,9 @@ useEffect(() => {
           ? total
           : Number((prev as any)?.minutes_total ?? (prev as any)?.minutesTotal ?? allowed ?? 0) || 0,
       minutes_used: used,
+      remaining_seconds: Number.isFinite(remainingSecondsRaw) ? remainingSecondsRaw : (prev as any)?.remaining_seconds,
+      used_seconds: Number.isFinite(usedSeconds) ? usedSeconds : (prev as any)?.used_seconds,
+      total_seconds: Number.isFinite(totalSeconds) ? totalSeconds : (prev as any)?.total_seconds,
     }));
 
     return true;
@@ -9938,13 +9962,25 @@ const modePillControls = (
   const usageMeterEl = useMemo(() => {
     const used = Number((sessionState as any)?.minutes_used ?? (sessionState as any)?.minutesUsed ?? 0) || 0;
     const remaining = Number((sessionState as any)?.minutes_remaining ?? (sessionState as any)?.minutesRemaining ?? 0) || 0;
+    const remainingSeconds = Number((sessionState as any)?.remaining_seconds ?? (sessionState as any)?.remainingSeconds ?? NaN);
     const allowed = Number((sessionState as any)?.minutes_allowed ?? (sessionState as any)?.minutesAllowed ?? 0) || 0;
     const total = Number((sessionState as any)?.minutes_total ?? (sessionState as any)?.minutesTotal ?? allowed ?? 0) || 0;
     const stableTotal = total > 0 ? total : Math.max(allowed, used + remaining);
     if (!stableTotal || stableTotal <= 0) return null;
 
-    const pct = Math.max(0, Math.min(1, used / stableTotal));
-    const remainingComputed = remaining > 0 ? remaining : Math.max(0, stableTotal - used);
+    const exhausted = Boolean((sessionState as any)?.minutes_exhausted ?? (sessionState as any)?.minutesExhausted);
+    const remainingFromSeconds = Number.isFinite(remainingSeconds)
+      ? Math.max(0, Math.ceil(Math.max(0, remainingSeconds) / 60))
+      : 0;
+    const remainingComputed = exhausted
+      ? 0
+      : remaining > 0
+        ? remaining
+        : remainingFromSeconds > 0
+          ? remainingFromSeconds
+          : Math.max(0, stableTotal - used);
+    const usedDisplay = exhausted ? stableTotal : Math.min(stableTotal, Math.max(used, stableTotal - remainingComputed));
+    const pct = Math.max(0, Math.min(1, usedDisplay / stableTotal));
     const pctLabel = `${Math.round(pct * 100)}%`;
 
     return (
@@ -9961,7 +9997,7 @@ const modePillControls = (
         >
           <span style={{ fontWeight: 700 }}>Usage</span>
           <span style={{ whiteSpace: "nowrap" }}>
-            {used} / {stableTotal} min • {remainingComputed} left
+            {usedDisplay} / {stableTotal} min • {remainingComputed} left
           </span>
         </div>
 
