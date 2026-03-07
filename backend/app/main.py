@@ -11059,103 +11059,205 @@ def _content_db_connect() -> sqlite3.Connection:
     return _econnect_conn()
 
 
+def _content_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (str(table_name or "").strip(),),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _content_table_columns(conn: sqlite3.Connection, table_name: str) -> Set[str]:
+    if not _content_table_exists(conn, table_name):
+        return set()
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except Exception:
+        return set()
+    cols: Set[str] = set()
+    for row in rows:
+        name = None
+        try:
+            if isinstance(row, sqlite3.Row):
+                name = row["name"]
+            elif len(row) > 1:
+                name = row[1]
+        except Exception:
+            name = None
+        if name:
+            cols.add(str(name).strip())
+    return cols
+
+
+def _content_ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
+    cols = _content_table_columns(conn, table_name)
+    if str(column_name or "").strip() in cols:
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+
+
+def _content_ensure_state_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_content_state (
+          member_id TEXT NOT NULL,
+          content_folder TEXT NOT NULL,
+          window_start_epoch REAL,
+          window_cycle_id TEXT,
+          window_base_used_seconds REAL,
+          window_sent_count INTEGER DEFAULT 0,
+          window_complete INTEGER DEFAULT 0,
+          last_sequence TEXT,
+          last_stage TEXT,
+          last_trigger_minute INTEGER,
+          pending_token TEXT,
+          pending_trigger_minute INTEGER,
+          pending_file_name TEXT,
+          pending_sequence TEXT,
+          pending_stage TEXT,
+          pending_kind TEXT,
+          pending_created_epoch REAL,
+          updated_epoch REAL,
+          PRIMARY KEY (member_id, content_folder)
+        );
+        """
+    )
+    for name, coldef in [
+        ("window_start_epoch", "window_start_epoch REAL"),
+        ("window_cycle_id", "window_cycle_id TEXT"),
+        ("window_base_used_seconds", "window_base_used_seconds REAL"),
+        ("window_sent_count", "window_sent_count INTEGER DEFAULT 0"),
+        ("window_complete", "window_complete INTEGER DEFAULT 0"),
+        ("last_sequence", "last_sequence TEXT"),
+        ("last_stage", "last_stage TEXT"),
+        ("last_trigger_minute", "last_trigger_minute INTEGER"),
+        ("pending_token", "pending_token TEXT"),
+        ("pending_trigger_minute", "pending_trigger_minute INTEGER"),
+        ("pending_file_name", "pending_file_name TEXT"),
+        ("pending_sequence", "pending_sequence TEXT"),
+        ("pending_stage", "pending_stage TEXT"),
+        ("pending_kind", "pending_kind TEXT"),
+        ("pending_created_epoch", "pending_created_epoch REAL"),
+        ("updated_epoch", "updated_epoch REAL"),
+    ]:
+        _content_ensure_column(conn, "user_content_state", name, coldef)
+
+
+def _content_ensure_history_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_content_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          token TEXT,
+          member_id TEXT NOT NULL,
+          content_folder TEXT NOT NULL,
+          trigger_minute INTEGER,
+          content_sequence TEXT,
+          content_name TEXT,
+          content_type TEXT,
+          content_stage TEXT,
+          content_url TEXT,
+          delivered_via TEXT,
+          create_datetime datetime DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    for name, coldef in [
+        ("token", "token TEXT"),
+        ("member_id", "member_id TEXT"),
+        ("content_folder", "content_folder TEXT"),
+        ("trigger_minute", "trigger_minute INTEGER"),
+        ("content_sequence", "content_sequence TEXT"),
+        ("content_name", "content_name TEXT"),
+        ("content_type", "content_type TEXT"),
+        ("content_stage", "content_stage TEXT"),
+        ("content_url", "content_url TEXT"),
+        ("delivered_via", "delivered_via TEXT"),
+        ("create_datetime", "create_datetime TEXT"),
+    ]:
+        _content_ensure_column(conn, "user_content_history", name, coldef)
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_user_content_history_token
+        ON user_content_history(token)
+        WHERE token IS NOT NULL;
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_content_history_member
+        ON user_content_history(member_id, content_folder, create_datetime);
+        """
+    )
+
+
+def _content_ensure_claims_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_content_claims (
+          token TEXT PRIMARY KEY,
+          member_id TEXT NOT NULL,
+          content_folder TEXT NOT NULL,
+          cycle_id TEXT NOT NULL,
+          trigger_minute INTEGER NOT NULL,
+          content_sequence TEXT,
+          content_name TEXT,
+          content_kind TEXT,
+          content_stage TEXT,
+          content_url TEXT,
+          claim_state TEXT NOT NULL,
+          claimed_via TEXT,
+          session_id TEXT,
+          created_epoch REAL,
+          updated_epoch REAL,
+          delivered_epoch REAL,
+          UNIQUE(member_id, content_folder, cycle_id, trigger_minute)
+        );
+        """
+    )
+    for name, coldef in [
+        ("member_id", "member_id TEXT"),
+        ("content_folder", "content_folder TEXT"),
+        ("cycle_id", "cycle_id TEXT"),
+        ("trigger_minute", "trigger_minute INTEGER"),
+        ("content_sequence", "content_sequence TEXT"),
+        ("content_name", "content_name TEXT"),
+        ("content_kind", "content_kind TEXT"),
+        ("content_stage", "content_stage TEXT"),
+        ("content_url", "content_url TEXT"),
+        ("claim_state", "claim_state TEXT"),
+        ("claimed_via", "claimed_via TEXT"),
+        ("session_id", "session_id TEXT"),
+        ("created_epoch", "created_epoch REAL"),
+        ("updated_epoch", "updated_epoch REAL"),
+        ("delivered_epoch", "delivered_epoch REAL"),
+    ]:
+        _content_ensure_column(conn, "user_content_claims", name, coldef)
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_content_claims_member_cycle
+        ON user_content_claims(member_id, content_folder, cycle_id, trigger_minute);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_content_claims_state
+        ON user_content_claims(member_id, content_folder, cycle_id, claim_state, trigger_minute);
+        """
+    )
+
 
 def _content_db_ensure_schema(conn: sqlite3.Connection) -> None:
     with _CONTENT_DB_LOCK:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_content_state (
-              member_id TEXT NOT NULL,
-              content_folder TEXT NOT NULL,
-              window_start_epoch REAL,
-              window_cycle_id TEXT,
-              window_base_used_seconds REAL,
-              window_sent_count INTEGER DEFAULT 0,
-              window_complete INTEGER DEFAULT 0,
-              last_sequence TEXT,
-              last_stage TEXT,
-              last_trigger_minute INTEGER,
-              pending_token TEXT,
-              pending_trigger_minute INTEGER,
-              pending_file_name TEXT,
-              pending_sequence TEXT,
-              pending_stage TEXT,
-              pending_kind TEXT,
-              pending_created_epoch REAL,
-              updated_epoch REAL,
-              PRIMARY KEY (member_id, content_folder)
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_content_history (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              token TEXT,
-              member_id TEXT NOT NULL,
-              content_folder TEXT NOT NULL,
-              trigger_minute INTEGER,
-              content_sequence TEXT,
-              content_name TEXT,
-              content_type TEXT,
-              content_stage TEXT,
-              content_url TEXT,
-              delivered_via TEXT,
-              create_datetime datetime DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        # Idempotency for delivered items.
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_content_history_token
-            ON user_content_history(token)
-            WHERE token IS NOT NULL;
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_user_content_history_member
-            ON user_content_history(member_id, content_folder, create_datetime);
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_content_claims (
-              token TEXT PRIMARY KEY,
-              member_id TEXT NOT NULL,
-              content_folder TEXT NOT NULL,
-              cycle_id TEXT NOT NULL,
-              trigger_minute INTEGER NOT NULL,
-              content_sequence TEXT,
-              content_name TEXT,
-              content_kind TEXT,
-              content_stage TEXT,
-              content_url TEXT,
-              claim_state TEXT NOT NULL,
-              claimed_via TEXT,
-              session_id TEXT,
-              created_epoch REAL,
-              updated_epoch REAL,
-              delivered_epoch REAL,
-              UNIQUE(member_id, content_folder, cycle_id, trigger_minute)
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_user_content_claims_member_cycle
-            ON user_content_claims(member_id, content_folder, cycle_id, trigger_minute);
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_user_content_claims_state
-            ON user_content_claims(member_id, content_folder, cycle_id, claim_state, trigger_minute);
-            """
-        )
+        _content_ensure_state_schema(conn)
+        _content_ensure_history_schema(conn)
+        _content_ensure_claims_schema(conn)
         conn.commit()
-
 
 
 def _content_history_insert(
@@ -11171,25 +11273,42 @@ def _content_history_insert(
     content_url: str,
     delivered_via: str,
 ) -> None:
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO user_content_history
-        (token, member_id, content_folder, trigger_minute, content_sequence, content_name, content_type, content_stage, content_url, delivered_via)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(token or "").strip(),
-            str(member_id or "").strip(),
-            str(content_folder or "").strip(),
-            int(trigger_minute or 0),
-            str(content_sequence or "").strip(),
-            str(content_name or "").strip(),
-            str(content_type or "").strip(),
-            str(content_stage or "").strip(),
-            str(content_url or "").strip(),
-            str(delivered_via or "").strip(),
-        ),
-    )
+    cols = _content_table_columns(conn, "user_content_history")
+    if not cols:
+        return
+
+    now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    values: Dict[str, Any] = {
+        "token": str(token or "").strip(),
+        "member_id": str(member_id or "").strip(),
+        "content_folder": str(content_folder or "").strip(),
+        "trigger_minute": int(trigger_minute or 0),
+        "content_sequence": str(content_sequence or "").strip(),
+        "content_name": str(content_name or "").strip(),
+        "content_type": str(content_type or "").strip(),
+        "content_stage": str(content_stage or "").strip(),
+        "content_url": str(content_url or "").strip(),
+        "delivered_via": str(delivered_via or "").strip(),
+        "create_datetime": now_utc,
+    }
+    ordered = [name for name in [
+        "token",
+        "member_id",
+        "content_folder",
+        "trigger_minute",
+        "content_sequence",
+        "content_name",
+        "content_type",
+        "content_stage",
+        "content_url",
+        "delivered_via",
+        "create_datetime",
+    ] if name in cols]
+    if not ordered:
+        return
+    placeholders = ", ".join(["?"] * len(ordered))
+    sql = f"INSERT OR IGNORE INTO user_content_history ({', '.join(ordered)}) VALUES ({placeholders})"
+    conn.execute(sql, tuple(values[name] for name in ordered))
 
 
 def _content_parse_filename(name: str) -> Dict[str, str]:
@@ -11301,6 +11420,8 @@ def _content_claim_get(
     cycle_id: str,
     trigger_minute: int,
 ) -> Dict[str, Any]:
+    if not _content_table_exists(conn, "user_content_claims"):
+        return {}
     row = conn.execute(
         """
         SELECT *
@@ -11324,6 +11445,8 @@ def _content_claim_has_any(
     content_folder: str,
     cycle_id: str,
 ) -> bool:
+    if not _content_table_exists(conn, "user_content_claims"):
+        return False
     row = conn.execute(
         """
         SELECT 1
@@ -11353,29 +11476,33 @@ def _content_history_row_for_trigger(
     window_start_epoch: float,
     tol: int = 1,
 ) -> Dict[str, Any]:
-    lo = int(scheduled_minute) - int(tol)
-    hi = int(scheduled_minute) + int(tol)
-    row = conn.execute(
-        """
-        SELECT *
-        FROM user_content_history
-        WHERE member_id = ?
-          AND content_folder = ?
-          AND trigger_minute BETWEEN ? AND ?
-          AND ( ? <= 0 OR create_datetime >= datetime(?, 'unixepoch') )
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (
-            str(member_id or "").strip(),
-            str(content_folder or "").strip(),
-            lo,
-            hi,
-            float(window_start_epoch or 0.0),
-            float(window_start_epoch or 0.0),
-        ),
-    ).fetchone()
-    return dict(row) if row else {}
+    cols = _content_table_columns(conn, "user_content_history")
+    if not cols or "member_id" not in cols or "content_folder" not in cols:
+        return {}
+
+    where = ["member_id = ?", "content_folder = ?"]
+    params: List[Any] = [
+        str(member_id or "").strip(),
+        str(content_folder or "").strip(),
+    ]
+
+    if "trigger_minute" in cols:
+        lo = int(scheduled_minute) - int(tol)
+        hi = int(scheduled_minute) + int(tol)
+        where.append("trigger_minute BETWEEN ? AND ?")
+        params.extend([lo, hi])
+
+    if float(window_start_epoch or 0.0) > 0 and "create_datetime" in cols:
+        where.append("create_datetime >= datetime(?, 'unixepoch')")
+        params.append(float(window_start_epoch or 0.0))
+
+    order_col = "id" if "id" in cols else "rowid"
+    sql = f"SELECT * FROM user_content_history WHERE {' AND '.join(where)} ORDER BY {order_col} DESC LIMIT 1"
+    try:
+        row = conn.execute(sql, tuple(params)).fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
 
 
 def _content_claim_get_or_backfill(
@@ -11387,6 +11514,9 @@ def _content_claim_get_or_backfill(
     trigger_minute: int,
     window_start_epoch: float,
 ) -> Dict[str, Any]:
+    if not _content_table_exists(conn, "user_content_claims"):
+        _content_ensure_claims_schema(conn)
+
     claim = _content_claim_get(conn, member_id, content_folder, cycle_id, trigger_minute)
     if claim:
         return claim
@@ -11458,6 +11588,9 @@ def _content_claim_get_or_backfill(
         "claim_state": claim_state,
         "claimed_via": delivered_via or "history_backfill",
         "session_id": "",
+        "created_epoch": now_epoch,
+        "updated_epoch": now_epoch,
+        "delivered_epoch": now_epoch,
     }
 
 
@@ -11480,6 +11613,8 @@ def _content_claim_upsert(
     now_epoch: float,
     delivered_epoch: Optional[float] = None,
 ) -> Dict[str, Any]:
+    if not _content_table_exists(conn, "user_content_claims"):
+        _content_ensure_claims_schema(conn)
     conn.execute(
         """
         INSERT INTO user_content_claims
@@ -11620,26 +11755,29 @@ def _content_history_max_sequence(
     content_folder: str,
     window_start_epoch: float,
 ) -> int:
+    cols = _content_table_columns(conn, "user_content_history")
+    if not cols or "content_sequence" not in cols or "member_id" not in cols or "content_folder" not in cols:
+        return 0
+    where = ["member_id = ?", "content_folder = ?"]
+    params: List[Any] = [
+        str(member_id or "").strip(),
+        str(content_folder or "").strip(),
+    ]
+    if float(window_start_epoch or 0.0) > 0 and "create_datetime" in cols:
+        where.append("create_datetime >= datetime(?, 'unixepoch')")
+        params.append(float(window_start_epoch or 0.0))
     try:
         row = conn.execute(
-            """
+            f"""
             SELECT COALESCE(MAX(CAST(content_sequence AS INTEGER)), 0)
             FROM user_content_history
-            WHERE member_id = ?
-              AND content_folder = ?
-              AND ( ? <= 0 OR create_datetime >= datetime(?, 'unixepoch') )
+            WHERE {' AND '.join(where)}
             """,
-            (
-                str(member_id or "").strip(),
-                str(content_folder or "").strip(),
-                float(window_start_epoch or 0.0),
-                float(window_start_epoch or 0.0),
-            ),
+            tuple(params),
         ).fetchone()
         return int(row[0] or 0)
     except Exception:
         return 0
-
 
 
 def _content_history_has_any_delivery(
@@ -11648,24 +11786,27 @@ def _content_history_has_any_delivery(
     content_folder: str,
     window_start_epoch: float,
 ) -> bool:
+    cols = _content_table_columns(conn, "user_content_history")
+    if not cols or "member_id" not in cols or "content_folder" not in cols:
+        return False
+    where = ["member_id = ?", "content_folder = ?"]
+    params: List[Any] = [
+        str(member_id or "").strip(),
+        str(content_folder or "").strip(),
+    ]
+    if float(window_start_epoch or 0.0) > 0 and "create_datetime" in cols:
+        where.append("create_datetime >= datetime(?, 'unixepoch')")
+        params.append(float(window_start_epoch or 0.0))
     row = conn.execute(
-        """
+        f"""
         SELECT 1
         FROM user_content_history
-        WHERE member_id = ?
-          AND content_folder = ?
-          AND ( ? <= 0 OR create_datetime >= datetime(?, 'unixepoch') )
+        WHERE {' AND '.join(where)}
         LIMIT 1
         """,
-        (
-            str(member_id or "").strip(),
-            str(content_folder or "").strip(),
-            float(window_start_epoch or 0.0),
-            float(window_start_epoch or 0.0),
-        ),
+        tuple(params),
     ).fetchone()
     return row is not None
-
 
 
 def _content_root_candidates() -> List[str]:
@@ -12085,8 +12226,8 @@ def _content_queue_pending_for_host(
                     member_key,
                     folder,
                     {
-                        "window_complete": 1,
-                        "updated_epoch": now,
+                        "window_complete": 0,
+                        **_content_clear_pending_fields(now),
                     },
                 )
                 conn.commit()
@@ -12333,8 +12474,8 @@ def _content_deliver_to_user_if_due(
                 member_key,
                 folder,
                 {
-                    "window_complete": 1,
-                    "updated_epoch": now,
+                    "window_complete": 0,
+                    **_content_clear_pending_fields(now),
                 },
             )
             conn.commit()
