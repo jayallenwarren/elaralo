@@ -9300,6 +9300,222 @@ def _save_topup_store(store: Dict[str, Any]) -> None:
     os.replace(tmp, _TOPUP_STORE_PATH)
 
 
+_PAYGO_AUDIT_LOCK = threading.RLock()
+
+
+def _paygo_audit_compact_json(value: Any, *, max_len: int = 16000) -> str:
+    try:
+        txt = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        try:
+            txt = str(value)
+        except Exception:
+            txt = ""
+    txt = txt or ""
+    if len(txt) > max_len:
+        txt = txt[:max_len]
+    return txt
+
+
+def _paygo_audit_db_init_sync() -> None:
+    with _PAYGO_AUDIT_LOCK:
+        conn = _econnect_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paygo_webhook_audit (
+                  paygo_webhook_audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  request_id TEXT,
+                  instance_id TEXT,
+                  event_id TEXT,
+                  event_type TEXT,
+                  slug TEXT,
+                  entity_fqdn TEXT,
+                  payment_id TEXT,
+                  order_number TEXT,
+                  paylink_id TEXT,
+                  buyer_email TEXT,
+                  contact_id TEXT,
+                  member_id TEXT,
+                  identity_key TEXT,
+                  identity_source TEXT,
+                  amount REAL,
+                  minutes INTEGER,
+                  status TEXT,
+                  failure_reason TEXT,
+                  note TEXT,
+                  remote_addr TEXT,
+                  user_agent TEXT,
+                  raw_body_bytes INTEGER,
+                  raw_body_sha256 TEXT,
+                  request_headers_json TEXT,
+                  payload_json TEXT
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paygo_audit_request_id ON paygo_webhook_audit(request_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paygo_audit_payment_id ON paygo_webhook_audit(payment_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paygo_audit_order_number ON paygo_webhook_audit(order_number);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paygo_audit_member_id ON paygo_webhook_audit(member_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paygo_audit_buyer_email ON paygo_webhook_audit(buyer_email);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paygo_audit_event_id ON paygo_webhook_audit(event_id);")
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _paygo_audit_insert_request_sync(
+    request_id: str,
+    *,
+    remote_addr: str = "",
+    user_agent: str = "",
+    raw_body_bytes: int = 0,
+    raw_body_sha256: str = "",
+    request_headers: Optional[Dict[str, Any]] = None,
+    status: str = "RECEIVED",
+    note: str = "",
+) -> None:
+    rid = (request_id or "").strip()
+    if not rid:
+        return
+    _paygo_audit_db_init_sync()
+    with _PAYGO_AUDIT_LOCK:
+        conn = _econnect_conn()
+        try:
+            conn.execute(
+                """
+                INSERT INTO paygo_webhook_audit (
+                  request_id, remote_addr, user_agent, raw_body_bytes, raw_body_sha256,
+                  request_headers_json, status, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rid,
+                    (remote_addr or "").strip(),
+                    (user_agent or "").strip(),
+                    int(raw_body_bytes or 0),
+                    (raw_body_sha256 or "").strip(),
+                    _paygo_audit_compact_json(request_headers or {}),
+                    (status or "RECEIVED").strip()[:80],
+                    (note or "").strip()[:2000],
+                ),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _paygo_audit_update_request_sync(request_id: str, **fields: Any) -> None:
+    rid = (request_id or "").strip()
+    if not rid:
+        return
+    _paygo_audit_db_init_sync()
+    allowed = {
+        "instance_id", "event_id", "event_type", "slug", "entity_fqdn", "payment_id",
+        "order_number", "paylink_id", "buyer_email", "contact_id", "member_id",
+        "identity_key", "identity_source", "amount", "minutes", "status",
+        "failure_reason", "note", "payload_json",
+    }
+    sets = ["update_datetime=CURRENT_TIMESTAMP"]
+    vals: List[Any] = []
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        sets.append(f"{key}=?")
+        if key == "payload_json":
+            vals.append(_paygo_audit_compact_json(value))
+        elif key in ("amount",):
+            try:
+                vals.append(float(value) if value is not None else None)
+            except Exception:
+                vals.append(None)
+        elif key in ("minutes",):
+            try:
+                vals.append(int(value) if value is not None else None)
+            except Exception:
+                vals.append(None)
+        else:
+            vals.append(("" if value is None else str(value))[:16000])
+    if len(sets) == 1:
+        return
+    vals.append(rid)
+    with _PAYGO_AUDIT_LOCK:
+        conn = _econnect_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"UPDATE paygo_webhook_audit SET {', '.join(sets)} WHERE request_id = ?", vals)
+            if int(cur.rowcount or 0) <= 0:
+                conn.execute("INSERT INTO paygo_webhook_audit (request_id, status) VALUES (?, ?)", (rid, "UPSERT_CREATE"))
+                conn.execute(f"UPDATE paygo_webhook_audit SET {', '.join(sets)} WHERE request_id = ?", vals)
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _paygo_audit_query_sync(
+    *,
+    member_id: str = "",
+    payment_id: str = "",
+    order_number: str = "",
+    buyer_email: str = "",
+    limit: int = 50,
+) -> Dict[str, Any]:
+    _paygo_audit_db_init_sync()
+    clauses = []
+    params: List[Any] = []
+    if member_id:
+        clauses.append("member_id = ?")
+        params.append((member_id or "").strip())
+    if payment_id:
+        clauses.append("payment_id = ?")
+        params.append((payment_id or "").strip())
+    if order_number:
+        clauses.append("order_number = ?")
+        params.append((order_number or "").strip())
+    if buyer_email:
+        clauses.append("lower(buyer_email) = lower(?)")
+        params.append((buyer_email or "").strip())
+    where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    limit_i = max(1, min(int(limit or 50), 500))
+    with _PAYGO_AUDIT_LOCK:
+        conn = _econnect_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT paygo_webhook_audit_id, create_datetime, update_datetime,
+                       request_id, instance_id, event_id, event_type, slug, entity_fqdn,
+                       payment_id, order_number, paylink_id, buyer_email, contact_id, member_id,
+                       identity_key, identity_source, amount, minutes, status, failure_reason, note,
+                       remote_addr, user_agent, raw_body_bytes, raw_body_sha256
+                  FROM paygo_webhook_audit
+                  {where_sql}
+                 ORDER BY paygo_webhook_audit_id DESC
+                 LIMIT ?
+                """,
+                params + [limit_i],
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            return {"ok": True, "count": len(rows), "rows": rows}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _normalize_email(email: str) -> str:
     return (email or "").strip().lower()
 
@@ -9860,6 +10076,29 @@ def _extract_payment_link_id(payment_obj: Dict[str, Any]) -> str:
     return str(v).strip() if v else ""
 
 
+def _extract_payment_order_number(payment_obj: Dict[str, Any]) -> str:
+    try:
+        reg = payment_obj.get("regularPaymentLinkPayment") or {}
+        if isinstance(reg, dict):
+            for key in ("orderNumber", "order_number", "orderNo", "order_id", "orderId"):
+                v = reg.get(key)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+    except Exception:
+        pass
+    ext = payment_obj.get("extendedFields") or {}
+    if isinstance(ext, dict):
+        for key in ("orderNumber", "order_number", "orderNo", "order_id", "orderId"):
+            v = ext.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    for key in ("orderNumber", "order_number", "orderNo", "order_id", "orderId"):
+        v = payment_obj.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
 def _ledger_acquire_processing(payment_id: str, event_id: str) -> bool:
     """
     Returns True if we acquired processing for this payment_id, False if already credited/in-progress.
@@ -9994,38 +10233,72 @@ def _complete_pending_by_email(email_norm: str, *, payment_id: str, minutes_adde
         _save_topup_store(store)
 
 
-def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
+def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any], *, request_id: str = "") -> None:
     """
     Process Wix payment-links webhooks for PayGo top-ups.
 
-    Wix REST webhooks arrive as a JWT. After decoding, we commonly see an "envelope" object like:
-
-      { "instanceId": "...", "eventType": "...", "identity": "<stringified JSON>", "data": "<stringified JSON>" }
-
-    In practice, Wix (and some Wix tooling) may NEST this envelope one more level, for example:
-      - decoded = { instanceId, eventType, identity, data: "<JSON of another envelope>" }
-      - decoded = { data: { instanceId, eventType, identity, data: "<JSON of event>" } }
-
-    This handler unwraps up to a few levels until it reaches the actual EVENT JSON (a dict that contains
-    top-level fields such as: id, entityFqdn, slug, entityId, createdEvent/updatedEvent).
+    Enhancements in v8.11:
+      - persist a durable SQLite audit trail for every webhook request
+      - record the resolved order number / paylink / email / contact / member identity
+      - fall back to member lookup by loginEmail when memberId + contactId are absent
     """
+    event_type = ""
+    instance_id = ""
+    event_id = ""
+    entity_fqdn = ""
+    slug = ""
+    payment_id = ""
+    paylink_id = ""
+    order_number = ""
+    email_norm = ""
+    contact_id = ""
+    member_id = ""
+    identity_source = ""
+    credited_identity_key = ""
+    identity_type = ""
+    amount: Optional[float] = None
+    minutes_to_credit: Optional[int] = None
+    data_obj: Dict[str, Any] = {}
+
+    def _audit(status: str, failure_reason: str = "", note: str = "") -> None:
+        if not request_id:
+            return
+        try:
+            _paygo_audit_update_request_sync(
+                request_id,
+                instance_id=instance_id,
+                event_id=event_id,
+                event_type=event_type,
+                slug=slug,
+                entity_fqdn=entity_fqdn,
+                payment_id=payment_id,
+                order_number=order_number,
+                paylink_id=paylink_id,
+                buyer_email=email_norm,
+                contact_id=contact_id,
+                member_id=member_id,
+                identity_key=credited_identity_key,
+                identity_source=identity_source,
+                amount=amount,
+                minutes=minutes_to_credit,
+                status=status,
+                failure_reason=failure_reason,
+                note=note,
+                payload_json=data_obj if data_obj else decoded,
+            )
+        except Exception:
+            pass
+
     try:
-        # ---- Unwrap the JWT envelope(s) until we reach the event JSON dict ----
         envelope_obj: Dict[str, Any] = decoded if isinstance(decoded, dict) else {}
 
-        # Some Wix payloads use shape B: { "data": { instanceId, eventType, identity, data } }
         d0 = envelope_obj.get("data")
         if isinstance(d0, dict) and ("data" in d0) and ("eventType" in d0 or "instanceId" in d0 or "identity" in d0 or "webhookId" in d0):
             envelope_obj = d0
 
-        event_type = ""
-        instance_id = ""
         identity_raw: Any = None
 
         cur: Any = envelope_obj
-        data_obj: Dict[str, Any] = {}
-
-        # Iterate a few times to handle occasional nesting: envelope -> envelope -> event
         for _depth in range(4):
             if isinstance(cur, dict) and ("data" in cur) and ("eventType" in cur or "instanceId" in cur or "identity" in cur or "webhookId" in cur):
                 if cur.get("eventType"):
@@ -10038,7 +10311,6 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             else:
                 inner = cur
 
-            # Parse JSON-string inner payloads
             if isinstance(inner, str):
                 try:
                     inner_parsed: Any = json.loads(inner)
@@ -10047,7 +10319,6 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             else:
                 inner_parsed = inner
 
-            # If we landed on another envelope, keep unwrapping
             if isinstance(inner_parsed, dict) and ("data" in inner_parsed) and (
                 "eventType" in inner_parsed or "instanceId" in inner_parsed or "identity" in inner_parsed or "webhookId" in inner_parsed
             ):
@@ -10057,7 +10328,8 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             data_obj = inner_parsed if isinstance(inner_parsed, dict) else {}
             break
 
-        # ---- Parse identity JSON (stringified JSON inside envelope["identity"]) ----
+        _audit("ENVELOPE_PARSED")
+
         if isinstance(identity_raw, str):
             try:
                 identity_obj = json.loads(identity_raw)
@@ -10068,13 +10340,11 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
         else:
             identity_obj = {}
 
-        # ---- Event metadata is at top-level of data_obj for payment link payment events ----
         event_id = str(data_obj.get("id") or "").strip()
         entity_fqdn = str(data_obj.get("entityFqdn") or "").strip()
         slug = str(data_obj.get("slug") or "").strip()
         payment_id = str(data_obj.get("entityId") or "").strip()
 
-        # Fallbacks (rare) if entityId isn't present
         if not payment_id:
             for k in ("createdEvent", "updatedEvent"):
                 ev = data_obj.get(k)
@@ -10087,6 +10357,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                             break
 
         if not payment_id:
+            _audit("FAILED", "MISSING_PAYMENT_ID", "Webhook payload did not contain entityId")
             logger.warning(
                 "Wix webhook: missing payment entityId (eventType=%s slug=%s keys=%s)",
                 event_type,
@@ -10095,9 +10366,8 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             )
             return
 
-        # Ignore non-payment entities (e.g. payment link entity events)
-        expected_fqdn = "wix.paymentlinks.payments.v1.payment_link_payment"
-        if entity_fqdn and entity_fqdn != expected_fqdn:
+        if entity_fqdn and entity_fqdn != "wix.paymentlinks.payments.v1.payment_link_payment":
+            _audit("IGNORED", note=f"Ignored entity_fqdn={entity_fqdn}")
             logger.info(
                 "Wix webhook ignored (entityFqdn=%s slug=%s entityId=%s eventType=%s)",
                 entity_fqdn,
@@ -10107,11 +10377,12 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             )
             return
 
-        # Acquire processing for this payment_id (idempotency)
         if not _ledger_acquire_processing(payment_id, event_id):
+            _audit("SKIPPED", note="Duplicate credit or in-progress processing")
             return
 
-        # ---- Prefer embedded entity to avoid REST calls ----
+        _audit("LEDGER_ACQUIRED")
+
         payment_obj: Optional[Dict[str, Any]] = None
         created_ev = data_obj.get("createdEvent")
         if isinstance(created_ev, dict):
@@ -10122,14 +10393,12 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
         if payment_obj is None:
             updated_ev = data_obj.get("updatedEvent")
             if isinstance(updated_ev, dict):
-                # updatedEvent formats vary; try common keys
                 for k in ("currentEntity", "entity", "newEntity"):
                     ent = updated_ev.get(k)
                     if isinstance(ent, dict):
                         payment_obj = ent
                         break
 
-        # If still missing, query Wix API by payment_id
         if payment_obj is None:
             for attempt in range(3):
                 payment_obj = _wix_query_payment_link_payment(payment_id, instance_id)
@@ -10139,22 +10408,23 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
 
         if not payment_obj:
             _ledger_mark_failed(payment_id, "QUERY_PAYMENT_FAILED")
+            _audit("FAILED", "QUERY_PAYMENT_FAILED", "Unable to load payment record from Wix")
             return
 
         paylink_id = _extract_payment_link_id(payment_obj)
-        if _PAYG_PAYLINK_IDS and paylink_id and paylink_id not in _PAYG_PAYLINK_IDS:
-            _ledger_mark_failed(payment_id, f"UNRELATED_PAYLINK:{paylink_id}")
-            return
-
+        order_number = _extract_payment_order_number(payment_obj)
         email_norm = _extract_payment_email(payment_obj)
         amount = _extract_payment_amount(payment_obj)
 
-        # Determine identity to credit
+        if _PAYG_PAYLINK_IDS and paylink_id and paylink_id not in _PAYG_PAYLINK_IDS:
+            _ledger_mark_failed(payment_id, f"UNRELATED_PAYLINK:{paylink_id}")
+            _audit("FAILED", f"UNRELATED_PAYLINK:{paylink_id}", "Pay link not in PAYG_PAYLINK_IDS allowlist")
+            return
+
         identity_type = str(identity_obj.get("identityType") or "").upper()
         member_id = str(identity_obj.get("memberId") or "").strip()
         identity_source = "jwt_identity.memberId" if member_id else ""
 
-        # Fallback: if identity doesn't include memberId, try extendedFields.memberId on the payment entity
         if not member_id:
             try:
                 ext = payment_obj.get("extendedFields") or {}
@@ -10167,7 +10437,6 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-        # Fallback: resolve memberId via the buyer contactId (members have distinct memberId and contactId)
         contact_id = _extract_payment_contact_id(payment_obj)
         if not member_id and contact_id:
             mid2 = _wix_query_member_by_contact_id(contact_id, instance_id)
@@ -10176,13 +10445,23 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                 identity_source = "members.query(contactId)"
                 logger.info("Resolved memberId via contactId: contactId=%s memberId=%s", contact_id, member_id)
 
+        if not member_id and email_norm:
+            mid3 = _wix_query_member_by_login_email(email_norm, instance_id)
+            if mid3:
+                member_id = mid3
+                identity_source = "members.query(loginEmail)"
+                logger.info("Resolved memberId via loginEmail: email=%s memberId=%s", email_norm, member_id)
+
+        _audit("IDENTITY_RESOLVED")
+
         try:
             logger.info(
-                "Wix webhook parsed payment: event_id=%s slug=%s payment_id=%s paylink_id=%s amount=%s identityType=%s hasMemberId=%s hasEmail=%s",
+                "Wix webhook parsed payment: event_id=%s slug=%s payment_id=%s paylink_id=%s order_number=%s amount=%s identityType=%s hasMemberId=%s hasEmail=%s",
                 (event_id or "")[:8],
                 slug,
                 payment_id,
                 paylink_id,
+                order_number,
                 amount,
                 identity_type,
                 bool(member_id),
@@ -10191,7 +10470,6 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-        credited_identity_key = ""
         minutes_to_credit = int(PAYG_INCREMENT_MINUTES or 0)
 
         if member_id:
@@ -10200,22 +10478,22 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
         else:
             if not email_norm:
                 _ledger_mark_failed(payment_id, "NO_EMAIL_AND_NO_MEMBERID")
+                _audit("FAILED", "NO_EMAIL_AND_NO_MEMBERID", "No memberId or buyer email available on payment")
                 return
 
             pending = _topup_get_active_pending_by_email(email_norm)
             if not pending:
                 _ledger_mark_failed(payment_id, f"NO_PENDING_FOR_EMAIL:{email_norm}")
+                _audit("FAILED", f"NO_PENDING_FOR_EMAIL:{email_norm}", "Memberless payment had no matching pending email intent")
                 return
 
             identity_source = "pendingEmail"
-
-            # Optional price check
             expected_price = pending.get("priceNum")
             if expected_price is not None and amount is not None:
                 try:
                     if abs(float(expected_price) - float(amount)) > 0.05:
                         _ledger_mark_failed(payment_id, "AMOUNT_MISMATCH")
-                        # Leave pending as-is (still pending) so user can retry or you can resolve manually.
+                        _audit("FAILED", "AMOUNT_MISMATCH", f"Expected {expected_price} but saw {amount}")
                         return
                 except Exception:
                     pass
@@ -10225,17 +10503,19 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
 
         if not credited_identity_key:
             _ledger_mark_failed(payment_id, "MISSING_IDENTITY_KEY")
+            _audit("FAILED", "MISSING_IDENTITY_KEY", "Resolved member/payment state did not yield an identity key")
             return
         if minutes_to_credit <= 0:
             _ledger_mark_failed(payment_id, "INVALID_MINUTES")
+            _audit("FAILED", "INVALID_MINUTES", f"minutes_to_credit={minutes_to_credit}")
             return
 
         credit_res = _usage_credit_minutes_sync(credited_identity_key, int(minutes_to_credit))
         if not credit_res.get("ok"):
             _ledger_mark_failed(payment_id, "CREDIT_FAILED")
+            _audit("FAILED", "CREDIT_FAILED", _paygo_audit_compact_json(credit_res, max_len=2000))
             return
 
-        # Mark ledger + pending
         _ledger_mark_credited(payment_id, paylink_id=paylink_id, identity_key=credited_identity_key, minutes=int(minutes_to_credit), identity_source=identity_source)
         if not member_id and email_norm:
             _complete_pending_by_email(
@@ -10245,13 +10525,13 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
                 credited_identity_key=credited_identity_key,
             )
 
+        _audit("CREDITED", note="Minutes credited successfully")
 
-        # Diagnostic (non-PII) line to trace how we mapped the payment to an identity key.
-        # Logged at WARNING so it shows up in common Azure log-stream filters.
         logger.warning(
-            "PayGo credit diag: payment_id=%s paylink_id=%s minutes=%s identity_source=%s identity_type=%s member_tail=%s contact_tail=%s credited_tail=%s",
+            "PayGo credit diag: payment_id=%s paylink_id=%s order_number=%s minutes=%s identity_source=%s identity_type=%s member_tail=%s contact_tail=%s credited_tail=%s",
             payment_id,
             paylink_id,
+            order_number,
             minutes_to_credit,
             (identity_source or ""),
             identity_type,
@@ -10261,15 +10541,17 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any]) -> None:
         )
 
         logger.info(
-            "Wix payment credited minutes=%s identity=%s payment_id=%s paylink_id=%s slug=%s",
+            "Wix payment credited minutes=%s identity=%s payment_id=%s paylink_id=%s order_number=%s slug=%s",
             minutes_to_credit,
             credited_identity_key,
             payment_id,
             paylink_id,
+            order_number,
             slug,
         )
 
     except Exception as e:
+        _audit("FAILED", "EXCEPTION", str(e))
         logger.warning("Wix webhook processing exception: %s", e)
 
 
@@ -10279,12 +10561,36 @@ async def wix_paymentlinks_webhook(request: Request):
     """
     Wix webhook callback URL.
     Wix sends the webhook payload as a JWT in the request body.
-    We verify + decode the JWT, then process in a background thread and return 200 quickly.
+    We verify + decode the JWT, persist a durable audit row, then process in a
+    background thread and return 200 quickly.
     """
     raw = await request.body()
     token = (raw.decode("utf-8", errors="ignore") or "").strip()
 
-    # Some webhook test tools send JSON like {"jwt":"..."}; support that too.
+    request_id = str(uuid.uuid4())
+    try:
+        hdrs = {k: v for k, v in request.headers.items()}
+    except Exception:
+        hdrs = {}
+    try:
+        raw_sha = hashlib.sha256(raw or b"").hexdigest() if raw is not None else ""
+    except Exception:
+        raw_sha = ""
+
+    try:
+        _paygo_audit_insert_request_sync(
+            request_id,
+            remote_addr=_get_client_ip(request) or "",
+            user_agent=(request.headers.get("user-agent") or "").strip(),
+            raw_body_bytes=len(raw or b""),
+            raw_body_sha256=raw_sha,
+            request_headers=hdrs,
+            status="RECEIVED",
+            note="Webhook request accepted by FastAPI",
+        )
+    except Exception:
+        pass
+
     if token.startswith("{") and token.endswith("}"):
         try:
             obj = json.loads(token)
@@ -10294,21 +10600,58 @@ async def wix_paymentlinks_webhook(request: Request):
             pass
 
     if not token or "." not in token:
+        try:
+            _paygo_audit_update_request_sync(request_id, status="FAILED", failure_reason="EXPECTED_JWT", note="Expected signed JWT in request body")
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail="Expected JWT in request body")
 
     try:
         decoded = _wix_decode_webhook_jwt(token)
+        try:
+            _paygo_audit_update_request_sync(request_id, status="JWT_DECODED", payload_json=decoded)
+        except Exception:
+            pass
     except Exception as e:
+        try:
+            _paygo_audit_update_request_sync(request_id, status="FAILED", failure_reason="JWT_INVALID", note=str(e))
+        except Exception:
+            pass
         logger.warning("Wix webhook JWT verify/decode failed: %s", e)
         raise HTTPException(status_code=401, detail="Invalid webhook token")
 
-    # Process asynchronously (to respond quickly).
     try:
-        threading.Thread(target=_wix_process_paymentlink_webhook_sync, args=(decoded,), daemon=True).start()
+        threading.Thread(target=_wix_process_paymentlink_webhook_sync, args=(decoded,), kwargs={"request_id": request_id}, daemon=True).start()
     except Exception:
-        _wix_process_paymentlink_webhook_sync(decoded)
+        _wix_process_paymentlink_webhook_sync(decoded, request_id=request_id)
 
-    return {"ok": True}
+    return {"ok": True, "request_id": request_id}
+
+
+@app.get("/admin/paygo/audit")
+async def admin_paygo_audit(request: Request):
+    token = (request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token") or "").strip()
+    if not USAGE_ADMIN_TOKEN or token != USAGE_ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    member_id = (request.query_params.get("member_id") or request.query_params.get("memberId") or "").strip()
+    payment_id = (request.query_params.get("payment_id") or request.query_params.get("paymentId") or "").strip()
+    order_number = (request.query_params.get("order_number") or request.query_params.get("orderNumber") or "").strip()
+    buyer_email = (request.query_params.get("buyer_email") or request.query_params.get("buyerEmail") or request.query_params.get("email") or "").strip()
+    try:
+        limit = int((request.query_params.get("limit") or "50").strip() or 50)
+    except Exception:
+        limit = 50
+
+    result = await run_in_threadpool(
+        _paygo_audit_query_sync,
+        member_id=member_id,
+        payment_id=payment_id,
+        order_number=order_number,
+        buyer_email=buyer_email,
+        limit=limit,
+    )
+    return result
 
 
 # =============================================================================
