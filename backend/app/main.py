@@ -6812,6 +6812,25 @@ def _ai_override_db_ensure_schema(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS ai_override_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id TEXT NOT NULL,
+              seq INTEGER NOT NULL,
+              ts REAL,
+              role TEXT,
+              content TEXT,
+              sender TEXT,
+              audience TEXT,
+              kind TEXT,
+              user_name TEXT,
+              payload_json TEXT,
+              created_epoch REAL,
+              UNIQUE(session_id, seq)
+            );
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_ai_override_sessions_brand_avatar_seen
             ON ai_override_sessions(brand, avatar, last_seen);
             """
@@ -6820,6 +6839,18 @@ def _ai_override_db_ensure_schema(conn: sqlite3.Connection) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_ai_override_sessions_active_seen
             ON ai_override_sessions(override_active, last_seen);
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_override_events_session_seq
+            ON ai_override_events(session_id, seq);
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_override_events_session_sender_seq
+            ON ai_override_events(session_id, sender, seq);
             """
         )
         conn.commit()
@@ -6842,6 +6873,231 @@ def _ai_override_db_row_to_rec(row: sqlite3.Row) -> Dict[str, Any]:
     rec.pop("in_session_summaries_json", None)
     rec["override_active"] = bool(int(rec.get("override_active") or 0))
     return rec
+
+
+def _ai_override_db_row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
+    ev = dict(row) if row else {}
+    if not ev:
+        return {}
+    payload_text = ev.pop("payload_json", None)
+    if payload_text:
+        try:
+            ev["payload"] = json.loads(str(payload_text))
+        except Exception:
+            ev["payload"] = None
+    return ev
+
+
+def _ai_override_db_append_event(
+    session_id: str,
+    *,
+    role: str,
+    content: str,
+    sender: str,
+    audience: str,
+    kind: str = "message",
+    user_name: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {}
+
+    now = time.time()
+    payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
+    conn = _ai_override_db_connect()
+    try:
+        _ai_override_db_ensure_schema(conn)
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        row = cur.execute(
+            "SELECT seq FROM ai_override_sessions WHERE session_id=? LIMIT 1",
+            (sid,),
+        ).fetchone()
+        if row is None:
+            cur.execute(
+                """
+                INSERT INTO ai_override_sessions
+                (session_id, seq, override_active, host_ack_seq, last_seen, updated_epoch)
+                VALUES (?, 0, 0, 0, ?, ?)
+                """,
+                (sid, now, now),
+            )
+            current_seq = 0
+        else:
+            current_seq = int(row["seq"] or 0)
+
+        next_seq = current_seq + 1
+        cur.execute(
+            "UPDATE ai_override_sessions SET seq=?, last_seen=?, updated_epoch=? WHERE session_id=?",
+            (next_seq, now, now, sid),
+        )
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO ai_override_events
+            (session_id, seq, ts, role, content, sender, audience, kind, user_name, payload_json, created_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sid,
+                next_seq,
+                now,
+                str(role or "").strip(),
+                str(content or ""),
+                str(sender or "").strip(),
+                str(audience or "all").strip() or "all",
+                str(kind or "message").strip() or "message",
+                str(user_name or "").strip() or None,
+                payload_json,
+                now,
+            ),
+        )
+        conn.commit()
+        ev: Dict[str, Any] = {
+            "seq": next_seq,
+            "ts": now,
+            "role": str(role or "").strip(),
+            "content": str(content or ""),
+            "sender": str(sender or "").strip(),
+            "audience": str(audience or "all").strip() or "all",
+            "kind": str(kind or "message").strip() or "message",
+        }
+        if user_name:
+            ev["user_name"] = str(user_name).strip()
+        if payload is not None:
+            ev["payload"] = payload
+        return ev
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _ai_override_db_list_events(
+    session_id: str,
+    *,
+    since_seq: int = 0,
+    audience: str = "",
+    max_rows: int = 800,
+) -> List[Dict[str, Any]]:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return []
+
+    conn = _ai_override_db_connect()
+    try:
+        _ai_override_db_ensure_schema(conn)
+        params: List[Any] = [sid, int(since_seq or 0)]
+        sql = """
+            SELECT session_id, seq, ts, role, content, sender, audience, kind, user_name, payload_json
+            FROM ai_override_events
+            WHERE session_id=? AND seq>?
+        """
+        aud = str(audience or "").strip()
+        if aud:
+            sql += " AND (audience='all' OR audience=?)"
+            params.append(aud)
+        sql += " ORDER BY seq ASC"
+        rows = conn.execute(sql, params).fetchall() or []
+        out = [_ai_override_db_row_to_event(row) for row in rows]
+        if max_rows and len(out) > int(max_rows):
+            out = out[-int(max_rows):]
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _ai_override_db_count_unread_for_host(session_id: str, host_ack_seq: int) -> int:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return 0
+    conn = _ai_override_db_connect()
+    try:
+        _ai_override_db_ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM ai_override_events
+            WHERE session_id=? AND seq>? AND sender='user'
+            """,
+            (sid, int(host_ack_seq or 0)),
+        ).fetchone()
+        return int((row["c"] if row and "c" in row.keys() else row[0]) or 0) if row else 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _ai_override_db_recent_tail(session_id: str, limit: int = 6) -> List[Dict[str, Any]]:
+    sid = str(session_id or "").strip()
+    lim = max(1, min(int(limit or 6), 100))
+    if not sid:
+        return []
+    conn = _ai_override_db_connect()
+    try:
+        _ai_override_db_ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT session_id, seq, ts, role, content, sender, audience, kind, user_name, payload_json
+            FROM ai_override_events
+            WHERE session_id=?
+            ORDER BY seq DESC
+            LIMIT ?
+            """,
+            (sid, lim),
+        ).fetchall() or []
+        out = [_ai_override_db_row_to_event(row) for row in rows]
+        out.reverse()
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _ai_override_db_events_for_sessions(session_ids: List[str], *, max_per_session: int = 24) -> Dict[str, List[Dict[str, Any]]]:
+    sids = [str(s or "").strip() for s in session_ids if str(s or "").strip()]
+    if not sids:
+        return {}
+    lim = max(1, min(int(max_per_session or 24), 100))
+    conn = _ai_override_db_connect()
+    try:
+        _ai_override_db_ensure_schema(conn)
+        placeholders = ",".join(["?"] * len(sids))
+        rows = conn.execute(
+            f"""
+            SELECT session_id, seq, ts, role, content, sender, audience, kind, user_name, payload_json
+            FROM ai_override_events
+            WHERE session_id IN ({placeholders})
+              AND kind='message'
+              AND sender IN ('user','ai','xai','host')
+            ORDER BY session_id ASC, seq ASC
+            """,
+            sids,
+        ).fetchall() or []
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            ev = _ai_override_db_row_to_event(row)
+            sid = str(ev.get("session_id") or "").strip()
+            if not sid:
+                continue
+            bucket = out.setdefault(sid, [])
+            bucket.append(ev)
+            if len(bucket) > lim:
+                del bucket[: len(bucket) - lim]
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _ai_override_db_upsert_session(rec: Dict[str, Any]) -> None:
@@ -7160,36 +7416,37 @@ def _ai_override_append_event(
 ) -> Dict[str, Any]:
     """Append an event to an override session.
 
-    The frontend relies on `kind` plus an optional structured `payload`.
-    Existing callers that don't pass `payload` continue to work.
+    The event stream is written durably to SQLite so Host Console / Session Insights
+    can see both user and companion messages across multiple workers. Memory/file state
+    is still updated as a best-effort hot cache for the currently serving worker.
     """
 
-    base_rec = _ai_override_db_get_session(session_id) or {}
-    with _AI_OVERRIDE_LOCK:
-        rec = _AI_OVERRIDE_SESSIONS.get(session_id)
-        if isinstance(rec, dict) and isinstance(base_rec, dict):
-            rec = _ai_override_merge_records(rec, base_rec) or dict(rec)
-        elif not isinstance(rec, dict):
-            rec = dict(base_rec) if isinstance(base_rec, dict) else {
-                "session_id": session_id,
-                "host_member_id": None,
-                "active": False,
-                "created": time.time(),
-                "events": [],
-                "seq": 0,
-                "mode": "friend",
-                "host_guidelines": "",
-                "override_active": False,
-                "host_ack_seq": 0,
-            }
-            _AI_OVERRIDE_SESSIONS[session_id] = rec
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {}
 
-        rec["seq"] = int(rec.get("seq") or 0) + 1
-        ts = time.time()
-        rec["last_seen"] = ts
-        rec["updated_epoch"] = ts
-        ev: Dict[str, Any] = {
-            "seq": rec["seq"],
+    base_rec = _ai_override_db_get_session(sid) or {}
+    fallback_now = time.time()
+    ev: Dict[str, Any]
+
+    try:
+        ev = _ai_override_db_append_event(
+            sid,
+            role=role,
+            content=content,
+            sender=sender,
+            audience=audience,
+            kind=kind,
+            user_name=user_name,
+            payload=payload,
+        )
+        event_seq = int(ev.get("seq") or 0)
+        ts = float(ev.get("ts") or fallback_now)
+    except Exception:
+        event_seq = 0
+        ts = fallback_now
+        ev = {
+            "seq": 0,
             "ts": ts,
             "role": role,
             "content": content,
@@ -7202,7 +7459,41 @@ def _ai_override_append_event(
         if payload is not None:
             ev["payload"] = payload
 
-        rec.setdefault("events", []).append(ev)
+    with _AI_OVERRIDE_LOCK:
+        rec = _AI_OVERRIDE_SESSIONS.get(sid)
+        if isinstance(rec, dict) and isinstance(base_rec, dict):
+            rec = _ai_override_merge_records(rec, base_rec) or dict(rec)
+        elif not isinstance(rec, dict):
+            rec = dict(base_rec) if isinstance(base_rec, dict) else {
+                "session_id": sid,
+                "host_member_id": None,
+                "active": False,
+                "created": ts,
+                "events": [],
+                "seq": 0,
+                "mode": "friend",
+                "host_guidelines": "",
+                "override_active": False,
+                "host_ack_seq": 0,
+            }
+            _AI_OVERRIDE_SESSIONS[sid] = rec
+
+        rec["seq"] = max(int(rec.get("seq") or 0), int(event_seq or 0))
+        rec["last_seen"] = ts
+        rec["updated_epoch"] = ts
+        events = rec.setdefault("events", [])
+        if not isinstance(events, list):
+            events = []
+            rec["events"] = events
+        if event_seq and not any(int((existing or {}).get("seq") or 0) == event_seq for existing in events if isinstance(existing, dict)):
+            events.append(ev)
+        elif not event_seq:
+            rec["seq"] = int(rec.get("seq") or 0) + 1
+            ev["seq"] = rec["seq"]
+            events.append(ev)
+        # Cap the hot cache to keep per-worker memory bounded.
+        if len(events) > 600:
+            rec["events"] = events[-600:]
         _ai_override_persist_locked()
         out = dict(rec)
 
@@ -7345,25 +7636,38 @@ def _ai_override_poll(
     except Exception:
         since_i = 0
 
+    wanted: List[Dict[str, Any]] = []
+    seen_seqs: set[int] = set()
+
+    try:
+        for ev in _ai_override_db_list_events(sid, since_seq=since_i, audience=audience, max_rows=800):
+            if not isinstance(ev, dict):
+                continue
+            seq = int(ev.get("seq") or 0)
+            if seq <= since_i or seq in seen_seqs:
+                continue
+            wanted.append(ev)
+            seen_seqs.add(seq)
+    except Exception:
+        pass
+
     events = rec.get("events")
     if not isinstance(events, list):
         events = []
-
-    # Filter by seq and audience
-    wanted: List[Dict[str, Any]] = []
-    max_seq = since_i
     for ev in events:
         if not isinstance(ev, dict):
             continue
         seq = int(ev.get("seq") or 0)
-        if seq <= since_i:
+        if seq <= since_i or seq in seen_seqs:
             continue
         ev_aud = str(ev.get("audience") or "all").strip() or "all"
         if ev_aud != "all" and ev_aud != audience:
             continue
         wanted.append(ev)
-        if seq > max_seq:
-            max_seq = seq
+        seen_seqs.add(seq)
+
+    wanted.sort(key=lambda item: int(item.get("seq") or 0))
+    max_seq = max([since_i] + [int(ev.get("seq") or 0) for ev in wanted])
 
     if mark_host_read and audience == "host":
         with _AI_OVERRIDE_LOCK:
@@ -7396,6 +7700,14 @@ def _ai_override_unread_for_host(rec: Dict[str, Any]) -> int:
         host_ack = int(rec.get("host_ack_seq") or 0)
     except Exception:
         host_ack = 0
+
+    sid = str(rec.get("session_id") or "").strip()
+    if sid:
+        try:
+            return _ai_override_db_count_unread_for_host(sid, host_ack)
+        except Exception:
+            pass
+
     events = rec.get("events")
     if not isinstance(events, list):
         return 0
@@ -7437,6 +7749,10 @@ def _ai_override_best_summary(rec: Dict[str, Any]) -> Tuple[str, str]:
     # 3) Fallback: last few events
     try:
         events = rec.get("events")
+        if not isinstance(events, list) or not events:
+            sid = str(rec.get("session_id") or "").strip()
+            if sid:
+                events = _ai_override_db_recent_tail(sid, limit=6)
         if isinstance(events, list) and events:
             tail = events[-6:]
             lines: List[str] = []
@@ -10749,7 +11065,7 @@ def _host_insights_list_summaries_sync(
         if tm:
             cur.execute(
                 """
-                SELECT create_datetime, session_id, reason, summary
+                SELECT create_datetime, session_id, reason, summary, user_name
                 FROM chat_summary_history
                 WHERE brand = ? AND avatar = ? AND member_id = ?
                 ORDER BY create_datetime DESC, id DESC
@@ -10760,7 +11076,7 @@ def _host_insights_list_summaries_sync(
         else:
             cur.execute(
                 """
-                SELECT create_datetime, session_id, reason, summary
+                SELECT create_datetime, session_id, reason, summary, user_name
                 FROM chat_summary_history
                 WHERE brand = ? AND avatar = ?
                 ORDER BY create_datetime DESC, id DESC
@@ -10769,22 +11085,48 @@ def _host_insights_list_summaries_sync(
                 (b, a, lim),
             )
 
-        out: List[Dict[str, Any]] = []
+        base_rows: List[Dict[str, Any]] = []
+        session_ids: List[str] = []
         for row in cur.fetchall() or []:
-            out.append(
+            sid = str(row[1] or "").strip()
+            base_rows.append(
                 {
                     "createDatetime": str(row[0] or "").strip(),
-                    "sessionId": str(row[1] or "").strip(),
+                    "sessionId": sid,
                     "reason": str(row[2] or "").strip(),
                     "summary": str(row[3] or "").strip(),
+                    "userName": str(row[4] or "").strip(),
                 }
             )
-        return out
+            if sid:
+                session_ids.append(sid)
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+    transcript_map: Dict[str, List[Dict[str, Any]]] = {}
+    if session_ids:
+        try:
+            transcript_map = _ai_override_db_events_for_sessions(session_ids, max_per_session=24)
+        except Exception:
+            transcript_map = {}
+
+    out: List[Dict[str, Any]] = []
+    for row in base_rows:
+        sid = str(row.get("sessionId") or "").strip()
+        out.append(
+            {
+                "createDatetime": str(row.get("createDatetime") or "").strip(),
+                "sessionId": sid,
+                "reason": str(row.get("reason") or "").strip(),
+                "summary": str(row.get("summary") or "").strip(),
+                "userName": str(row.get("userName") or "").strip(),
+                "messages": transcript_map.get(sid, []),
+            }
+        )
+    return out
 
 
 @app.post("/host/session-insights/users")
