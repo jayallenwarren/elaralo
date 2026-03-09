@@ -4952,8 +4952,26 @@ const startModalSttCapture = useCallback(async (ctrl: ModalSttController) => {
     ctrl.streamRef.current = stream;
     ctrl.chunksRef.current = [];
 
-    const mr = new MediaRecorder(stream);
-    const mimeType = String((mr as any)?.mimeType || "audio/webm");
+    let preferredMimeType = "";
+    try {
+      const candidates = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+        "audio/mp4;codecs=mp4a.40.2",
+        "audio/aac",
+        "audio/wav",
+      ];
+      for (const c of candidates) {
+        if (typeof MediaRecorder !== "undefined" && (MediaRecorder as any).isTypeSupported?.(c)) {
+          preferredMimeType = c;
+          break;
+        }
+      }
+    } catch {}
+
+    const mr = new MediaRecorder(stream, preferredMimeType ? { mimeType: preferredMimeType } : undefined);
+    const mimeType = String((mr as any)?.mimeType || preferredMimeType || "audio/webm");
     ctrl.recorderRef.current = mr;
 
     mr.ondataavailable = (e: any) => {
@@ -4981,22 +4999,31 @@ const startModalSttCapture = useCallback(async (ctrl: ModalSttController) => {
         const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
         if (!blob || blob.size < 1) return;
 
-        const form = new FormData();
-        const fname = mimeType.includes("mp4")
-          ? "host_modal_audio.mp4"
-          : mimeType.includes("wav")
-            ? "host_modal_audio.wav"
-            : "host_modal_audio.webm";
-        form.append("file", blob, fname);
+        const apiBase = String(API_BASE || "").replace(/\/+$/, "");
+        const contentType = String(blob.type || mimeType || "audio/webm").trim() || "application/octet-stream";
 
-        const res = await fetch(`${API_BASE}/stt/transcribe`, {
+        // IMPORTANT: /stt/transcribe expects RAW audio bytes in the request body,
+        // not multipart/form-data. Host modal STT must match the main chat STT path.
+        const res = await fetch(`${apiBase}/stt/transcribe`, {
           method: "POST",
-          body: form,
+          headers: {
+            "Content-Type": contentType,
+            Accept: "application/json",
+          },
+          body: blob,
         });
 
-        const data: any = await res.json().catch(() => ({}));
+        let data: any = null;
+        let rawText = "";
+        try {
+          rawText = await res.text();
+          data = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          data = null;
+        }
+
         if (!res.ok) {
-          const detail = String(data?.detail || data?.error || `HTTP ${res.status}`);
+          const detail = String(data?.detail || data?.error || rawText || `HTTP ${res.status}`);
           throw new Error(detail);
         }
 
