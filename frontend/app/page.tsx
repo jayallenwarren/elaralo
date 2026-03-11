@@ -261,6 +261,25 @@ type HostActiveChat = {
   is_trial?: boolean;
 };
 
+type HostInsightsTranscriptMessage = {
+  seq?: number;
+  ts?: number;
+  role?: string;
+  sender?: string;
+  content?: string;
+  kind?: string;
+  user_name?: string;
+};
+
+type HostInsightsSummaryItem = {
+  createDatetime: string;
+  sessionId: string;
+  reason?: string;
+  summary: string;
+  userName?: string;
+  messages?: HostInsightsTranscriptMessage[];
+};
+
 type PlanName =
   | "Trial"
   | "Friend"
@@ -2787,11 +2806,23 @@ const hostSttStreamRef = useRef<MediaStream | null>(null);
 const hostSttChunksRef = useRef<BlobPart[]>([]);
 
 // Host Session Insights STT (speech-to-text) for the Ask Dulce question box.
+const [hostInsightsSttEnabled, setHostInsightsSttEnabled] = useState<boolean>(false);
 const [hostInsightsSttRecording, setHostInsightsSttRecording] = useState<boolean>(false);
 const [hostInsightsSttError, setHostInsightsSttError] = useState<string>("");
+const hostInsightsSttEnabledRef = useRef<boolean>(false);
+useEffect(() => {
+  hostInsightsSttEnabledRef.current = hostInsightsSttEnabled;
+}, [hostInsightsSttEnabled]);
+const hostInsightsSttBusyRef = useRef<boolean>(false);
+const hostInsightsSttAbortRequestedRef = useRef<boolean>(false);
 const hostInsightsSttRecorderRef = useRef<MediaRecorder | null>(null);
 const hostInsightsSttStreamRef = useRef<MediaStream | null>(null);
 const hostInsightsSttChunksRef = useRef<BlobPart[]>([]);
+const hostInsightsSttAudioCtxRef = useRef<AudioContext | null>(null);
+const hostInsightsSttRafRef = useRef<number | null>(null);
+const hostInsightsSttHardStopTimerRef = useRef<number | null>(null);
+const hostInsightsSttLastVoiceAtRef = useRef<number>(0);
+const hostInsightsSttHasSpokenRef = useRef<boolean>(false);
 
 // Host: companion-level interaction guideline overrides (persisted; highest priority)
 const [hostGuidelinesOpen, setHostGuidelinesOpen] = useState<boolean>(false);
@@ -2805,7 +2836,7 @@ const [hostGuidelinesStatus, setHostGuidelinesStatus] = useState<string>("");
 const [hostInsightsOpen, setHostInsightsOpen] = useState<boolean>(false);
 const [hostInsightsUsers, setHostInsightsUsers] = useState<Array<{ memberId: string; userName?: string; lastSeen?: string; lastSeenEpoch?: number; summaryLastSeen?: string; summaryCount?: number; lastSummary?: string; minutesUsed?: number; minutesAllowed?: number; minutesRemaining?: number; minutesTotal?: number }>>([]);
 const [hostInsightsSelectedMemberId, setHostInsightsSelectedMemberId] = useState<string>("");
-const [hostInsightsSummaries, setHostInsightsSummaries] = useState<Array<{ createDatetime: string; sessionId: string; reason?: string; summary: string }>>([]);
+const [hostInsightsSummaries, setHostInsightsSummaries] = useState<HostInsightsSummaryItem[]>([]);
 const [hostInsightsQuestion, setHostInsightsQuestion] = useState<string>("");
 const [hostInsightsAnswer, setHostInsightsAnswer] = useState<string>("");
 const [hostInsightsLoading, setHostInsightsLoading] = useState<boolean>(false);
@@ -2934,10 +2965,10 @@ const loadHostInsightsSummaries = useCallback(
   [API_BASE, isHost, companyName, companionName, memberId]
 );
 
-const askHostInsights = useCallback(async () => {
-  if (!API_BASE || !isHost || !companyName || !companionName || !memberId) return;
-  const q = (hostInsightsQuestion || "").trim();
-  if (!q) return;
+const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
+  if (!API_BASE || !isHost || !companyName || !companionName || !memberId) return false;
+  const q = String(rawQuestion || "").trim();
+  if (!q) return false;
   setHostInsightsLoading(true);
   setHostInsightsError("");
   try {
@@ -2955,12 +2986,20 @@ const askHostInsights = useCallback(async () => {
     const json = await res.json().catch(() => ({}));
     if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
     setHostInsightsAnswer(String(json?.answer || ""));
+    return true;
   } catch (e: any) {
     setHostInsightsError(e?.message || String(e));
+    return false;
   } finally {
     setHostInsightsLoading(false);
   }
-}, [API_BASE, isHost, companyName, companionName, memberId, hostInsightsQuestion, hostInsightsSelectedMemberId]);
+}, [API_BASE, isHost, companyName, companionName, memberId, hostInsightsSelectedMemberId]);
+
+const askHostInsights = useCallback(async () => {
+  const q = (hostInsightsQuestion || "").trim();
+  if (!q) return;
+  await submitHostInsightsQuestion(q);
+}, [hostInsightsQuestion, submitHostInsightsQuestion]);
 
 
   const livekitRoleKnown = livekitRole !== "unknown";
@@ -4939,6 +4978,38 @@ const stopModalSttCapture = useCallback(async (recorderRef: React.MutableRefObje
   } catch {}
 }, []);
 
+const transcribeModalAudioBlob = useCallback(async (blob: Blob): Promise<string> => {
+  if (!blob || blob.size < 1) return "";
+  const apiBase = String(API_BASE || "").replace(/\/+$/, "");
+  if (!apiBase) throw new Error("API base not configured");
+  const contentType = String(blob.type || "audio/webm").trim() || "application/octet-stream";
+
+  const res = await fetch(`${apiBase}/stt/transcribe`, {
+    method: "POST",
+    headers: {
+      "Content-Type": contentType,
+      Accept: "application/json",
+    },
+    body: blob,
+  });
+
+  let data: any = null;
+  let rawText = "";
+  try {
+    rawText = await res.text();
+    data = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    data = null;
+  }
+
+  if (!res.ok) {
+    const detail = String(data?.detail || data?.error || rawText || `HTTP ${res.status}`);
+    throw new Error(detail);
+  }
+
+  return String(data?.text || "").trim();
+}, [API_BASE]);
+
 const startModalSttCapture = useCallback(async (ctrl: ModalSttController) => {
   try {
     ctrl.setError("");
@@ -4997,37 +5068,7 @@ const startModalSttCapture = useCallback(async (ctrl: ModalSttController) => {
         ctrl.streamRef.current = null;
 
         const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
-        if (!blob || blob.size < 1) return;
-
-        const apiBase = String(API_BASE || "").replace(/\/+$/, "");
-        const contentType = String(blob.type || mimeType || "audio/webm").trim() || "application/octet-stream";
-
-        // IMPORTANT: /stt/transcribe expects RAW audio bytes in the request body,
-        // not multipart/form-data. Host modal STT must match the main chat STT path.
-        const res = await fetch(`${apiBase}/stt/transcribe`, {
-          method: "POST",
-          headers: {
-            "Content-Type": contentType,
-            Accept: "application/json",
-          },
-          body: blob,
-        });
-
-        let data: any = null;
-        let rawText = "";
-        try {
-          rawText = await res.text();
-          data = rawText ? JSON.parse(rawText) : null;
-        } catch {
-          data = null;
-        }
-
-        if (!res.ok) {
-          const detail = String(data?.detail || data?.error || rawText || `HTTP ${res.status}`);
-          throw new Error(detail);
-        }
-
-        const text = String(data?.text || "").trim();
+        const text = await transcribeModalAudioBlob(blob);
         if (!text) return;
         ctrl.appendText(text);
       } catch (e: any) {
@@ -5049,7 +5090,7 @@ const startModalSttCapture = useCallback(async (ctrl: ModalSttController) => {
     } catch {}
     ctrl.streamRef.current = null;
   }
-}, [API_BASE]);
+}, [transcribeModalAudioBlob]);
 
 const hostStopStt = useCallback(async () => {
   await stopModalSttCapture(hostSttRecorderRef);
@@ -5072,26 +5113,221 @@ const hostStartStt = useCallback(async () => {
   });
 }, [hostSttRecording, startModalSttCapture]);
 
+const cleanupHostInsightsSttResources = useCallback(() => {
+  try {
+    if (hostInsightsSttHardStopTimerRef.current) {
+      window.clearTimeout(hostInsightsSttHardStopTimerRef.current);
+      hostInsightsSttHardStopTimerRef.current = null;
+    }
+  } catch {}
+
+  try {
+    if (hostInsightsSttRafRef.current !== null) {
+      cancelAnimationFrame(hostInsightsSttRafRef.current);
+      hostInsightsSttRafRef.current = null;
+    }
+  } catch {}
+
+  try {
+    if (hostInsightsSttAudioCtxRef.current) {
+      hostInsightsSttAudioCtxRef.current.close().catch?.(() => {});
+      hostInsightsSttAudioCtxRef.current = null;
+    }
+  } catch {}
+
+  try {
+    (hostInsightsSttStreamRef.current?.getTracks?.() || []).forEach((t) => {
+      try {
+        t.stop();
+      } catch {}
+    });
+  } catch {}
+  hostInsightsSttStreamRef.current = null;
+  hostInsightsSttRecorderRef.current = null;
+  hostInsightsSttChunksRef.current = [];
+  hostInsightsSttHasSpokenRef.current = false;
+  hostInsightsSttLastVoiceAtRef.current = 0;
+}, []);
+
 const hostInsightsStopStt = useCallback(async () => {
-  await stopModalSttCapture(hostInsightsSttRecorderRef);
-}, [stopModalSttCapture]);
+  hostInsightsSttAbortRequestedRef.current = true;
+  setHostInsightsSttEnabled(false);
+  hostInsightsSttEnabledRef.current = false;
+  try {
+    const rec = hostInsightsSttRecorderRef.current;
+    if (rec && rec.state !== "inactive") {
+      try {
+        rec.stop();
+      } catch {}
+    }
+  } catch {}
+  cleanupHostInsightsSttResources();
+  setHostInsightsSttRecording(false);
+}, [cleanupHostInsightsSttResources]);
+
+const hostInsightsStartSttOnce = useCallback(async () => {
+  if (!hostInsightsSttEnabledRef.current) return;
+  if (hostInsightsSttBusyRef.current) return;
+
+  hostInsightsSttBusyRef.current = true;
+  hostInsightsSttAbortRequestedRef.current = false;
+  hostInsightsSttChunksRef.current = [];
+  hostInsightsSttHasSpokenRef.current = false;
+  hostInsightsSttLastVoiceAtRef.current = performance.now();
+  setHostInsightsSttError("");
+  setHostInsightsSttRecording(true);
+
+  try {
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      throw new Error("Microphone is not available in this browser");
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      } as any,
+    });
+    hostInsightsSttStreamRef.current = stream;
+
+    let preferredMimeType = "";
+    try {
+      const candidates = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+        "audio/mp4;codecs=mp4a.40.2",
+        "audio/aac",
+        "audio/wav",
+      ];
+      for (const c of candidates) {
+        if (typeof MediaRecorder !== "undefined" && (MediaRecorder as any).isTypeSupported?.(c)) {
+          preferredMimeType = c;
+          break;
+        }
+      }
+    } catch {}
+
+    const rec = new MediaRecorder(stream, preferredMimeType ? { mimeType: preferredMimeType } : undefined);
+    hostInsightsSttRecorderRef.current = rec;
+    const mimeType = String((rec as any)?.mimeType || preferredMimeType || "audio/webm");
+
+    rec.ondataavailable = (e: any) => {
+      try {
+        if (e?.data && e.data.size > 0) hostInsightsSttChunksRef.current.push(e.data);
+      } catch {}
+    };
+
+    const blobPromise = new Promise<Blob>((resolve, reject) => {
+      rec.onstop = () => {
+        resolve(new Blob(hostInsightsSttChunksRef.current || [], { type: mimeType || "audio/webm" }));
+      };
+      (rec as any).onerror = (ev: any) => reject(ev?.error || new Error("Recorder error"));
+    });
+
+    try {
+      const Ctx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+      const ctx: AudioContext = new Ctx();
+      hostInsightsSttAudioCtxRef.current = ctx;
+      try {
+        await ctx.resume();
+      } catch {}
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      src.connect(analyser);
+      const data = new Uint8Array(analyser.fftSize);
+      const threshold = 0.02;
+      const minRecordMs = 350;
+      const maxRecordMs = 15000;
+      const silenceMs = 1800;
+      const startedAt = performance.now();
+
+      const tick = () => {
+        const recorder = hostInsightsSttRecorderRef.current;
+        if (!recorder) return;
+        if (!hostInsightsSttEnabledRef.current || hostInsightsSttAbortRequestedRef.current) {
+          try {
+            if (recorder.state !== "inactive") recorder.stop();
+          } catch {}
+          return;
+        }
+
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+          const v = (data[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / data.length);
+        const now = performance.now();
+
+        if (rms > threshold) {
+          hostInsightsSttLastVoiceAtRef.current = now;
+          hostInsightsSttHasSpokenRef.current = true;
+        }
+
+        const elapsed = now - startedAt;
+        const silentFor = now - hostInsightsSttLastVoiceAtRef.current;
+
+        if (elapsed >= maxRecordMs || (hostInsightsSttHasSpokenRef.current && elapsed > minRecordMs && silentFor >= silenceMs)) {
+          try {
+            if (recorder.state !== "inactive") recorder.stop();
+          } catch {}
+          return;
+        }
+
+        hostInsightsSttRafRef.current = requestAnimationFrame(tick);
+      };
+
+      hostInsightsSttRafRef.current = requestAnimationFrame(tick);
+    } catch {}
+
+    hostInsightsSttHardStopTimerRef.current = window.setTimeout(() => {
+      try {
+        const recorder = hostInsightsSttRecorderRef.current;
+        if (recorder && recorder.state !== "inactive") recorder.stop();
+      } catch {}
+    }, 16000);
+
+    rec.start(250);
+    const blob = await blobPromise;
+    const hadSpeech = hostInsightsSttHasSpokenRef.current;
+
+    cleanupHostInsightsSttResources();
+    setHostInsightsSttRecording(false);
+
+    if (hostInsightsSttAbortRequestedRef.current || !hostInsightsSttEnabledRef.current) return;
+    if (!hadSpeech || !blob || blob.size < 2048) return;
+
+    const text = await transcribeModalAudioBlob(blob);
+    if (!text) return;
+
+    setHostInsightsQuestion(text);
+    await submitHostInsightsQuestion(text);
+  } catch (e: any) {
+    setHostInsightsSttError(String(e?.message || e || "STT failed"));
+  } finally {
+    cleanupHostInsightsSttResources();
+    setHostInsightsSttRecording(false);
+    hostInsightsSttBusyRef.current = false;
+    if (hostInsightsSttEnabledRef.current && !hostInsightsSttAbortRequestedRef.current) {
+      window.setTimeout(() => {
+        void hostInsightsStartSttOnce();
+      }, 250);
+    }
+  }
+}, [cleanupHostInsightsSttResources, submitHostInsightsQuestion, transcribeModalAudioBlob]);
 
 const hostInsightsStartStt = useCallback(async () => {
-  if (hostInsightsSttRecording) return;
-  await startModalSttCapture({
-    setRecording: setHostInsightsSttRecording,
-    setError: setHostInsightsSttError,
-    recorderRef: hostInsightsSttRecorderRef,
-    streamRef: hostInsightsSttStreamRef,
-    chunksRef: hostInsightsSttChunksRef,
-    appendText: (text: string) => {
-      setHostInsightsQuestion((prev) => {
-        const p = String(prev || "").trim();
-        return p ? `${p} ${text}` : text;
-      });
-    },
-  });
-}, [hostInsightsSttRecording, startModalSttCapture]);
+  if (hostInsightsSttEnabledRef.current) return;
+  setHostInsightsSttError("");
+  setHostInsightsSttEnabled(true);
+  hostInsightsSttEnabledRef.current = true;
+  hostInsightsSttAbortRequestedRef.current = false;
+  void hostInsightsStartSttOnce();
+}, [hostInsightsStartSttOnce]);
 
 // Safety: stop host recorder if host console closes or session changes.
 useEffect(() => {
@@ -5103,11 +5339,11 @@ useEffect(() => {
 
 // Safety: stop Session Insights recorder when the modal closes.
 useEffect(() => {
-  if (!hostInsightsOpen && hostInsightsSttRecording) {
+  if (!hostInsightsOpen && (hostInsightsSttRecording || hostInsightsSttEnabled)) {
     hostInsightsStopStt();
   }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [hostInsightsOpen]);
+}, [hostInsightsOpen, hostInsightsSttRecording, hostInsightsSttEnabled]);
 
   const hostPushPendingContent = async (token: string) => {
     if (!hostSelectedSessionId) return;
@@ -12073,7 +12309,15 @@ const modePillControls = (
                   </button>
                 </div>
 
-                <div style={{ overflowY: "auto", minHeight: 0 }}>
+                <div
+                  style={{
+                    overflowY: "auto",
+                    minHeight: 0,
+                    flex: "1 1 auto",
+                    WebkitOverflowScrolling: "touch",
+                    overscrollBehavior: "contain",
+                  }}
+                >
                   {hostInsightsUsers.length === 0 ? (
                     <div style={{ fontSize: 12, opacity: 0.7, padding: 8 }}>
                       No saved session summaries found yet.
@@ -12176,24 +12420,66 @@ const modePillControls = (
                     overflowY: "auto",
                     minHeight: 120,
                     maxHeight: 220,
+                    flex: "0 1 220px",
                     fontSize: 12,
                     color: "#111",
                     whiteSpace: "pre-wrap",
+                    WebkitOverflowScrolling: "touch",
+                    overscrollBehavior: "contain",
                   }}
                 >
                   {hostInsightsSummaries.length === 0 ? (
                     <div style={{ opacity: 0.7 }}>No summaries loaded.</div>
                   ) : (
-                    hostInsightsSummaries.map((s, idx) => (
-                      <div key={`${s.sessionId || ""}-${idx}`} style={{ marginBottom: 10 }}>
-                        <div style={{ fontSize: 11, opacity: 0.72, marginBottom: 2 }}>
-                          {s.createDatetime}
-                          {s.sessionId ? ` · ${s.sessionId}` : ""}
-                          {s.reason ? ` · ${s.reason}` : ""}
+                    hostInsightsSummaries.map((s, idx) => {
+                      const summaryText = String(s.summary || "").trim();
+                      const transcript = Array.isArray(s.messages) ? s.messages : [];
+                      return (
+                        <div key={`${s.sessionId || ""}-${idx}`} style={{ marginBottom: 12, paddingBottom: 10, borderBottom: "1px solid rgba(0,0,0,0.06)" }}>
+                          <div style={{ fontSize: 11, opacity: 0.72, marginBottom: 4 }}>
+                            {s.createDatetime}
+                            {s.sessionId ? ` · ${s.sessionId}` : ""}
+                            {s.reason ? ` · ${s.reason}` : ""}
+                          </div>
+
+                          {summaryText ? (
+                            <div style={{ marginBottom: transcript.length ? 8 : 0, whiteSpace: "pre-wrap" }}>
+                              {summaryText}
+                            </div>
+                          ) : null}
+
+                          {transcript.length ? (
+                            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                              {transcript.map((m, midx) => {
+                                const sender = String(m.sender || "").trim();
+                                const viewerName = String(m.user_name || s.userName || "").trim() || "User";
+                                const companionLabel = String((companionName || DEFAULT_COMPANION_NAME) ?? "").trim() || "AI";
+                                const label =
+                                  sender === "user"
+                                    ? viewerName
+                                    : sender === "host"
+                                      ? `${companionLabel} (Host)`
+                                      : sender === "ai" || sender === "xai"
+                                        ? companionLabel
+                                        : "System";
+                                return (
+                                  <div key={`${s.sessionId || idx}-${m.seq || midx}`} style={{ paddingLeft: 6, borderLeft: "2px solid rgba(0,0,0,0.08)" }}>
+                                    <div style={{ fontSize: 11, fontWeight: 700, opacity: 0.78, marginBottom: 2 }}>
+                                      {label}
+                                    </div>
+                                    <div style={{ whiteSpace: "pre-wrap" }}>
+                                      {String(m.content || "").trim() || <span style={{ opacity: 0.55 }}>(empty)</span>}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : !summaryText ? (
+                            <div style={{ opacity: 0.7 }}>No transcript or summary available.</div>
+                          ) : null}
                         </div>
-                        <div>{s.summary}</div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
 
@@ -12219,7 +12505,7 @@ const modePillControls = (
                       color: "#111",
                       outline: "none",
                     }}
-                    disabled={hostInsightsLoading}
+                    disabled={hostInsightsLoading || hostInsightsSttEnabled}
                   />
 
                   {hostInsightsSttError ? (
@@ -12228,16 +12514,22 @@ const modePillControls = (
                     </div>
                   ) : null}
 
+                  {hostInsightsSttEnabled ? (
+                    <div style={{ fontSize: 11, opacity: 0.72 }}>
+                      Hands-free STT is on. Speak naturally and Dulce will ask automatically after a short pause. Press Stop mic to switch back to typing.
+                    </div>
+                  ) : null}
+
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                     <button
                       type="button"
                       onClick={() => {
-                        if (hostInsightsSttRecording) hostInsightsStopStt();
+                        if (hostInsightsSttEnabled) hostInsightsStopStt();
                         else hostInsightsStartStt();
                       }}
                       style={{
                         border: "1px solid rgba(0,0,0,0.18)",
-                        background: hostInsightsSttRecording ? "rgba(180,0,0,0.08)" : "rgba(0,0,0,0.04)",
+                        background: hostInsightsSttEnabled ? "rgba(180,0,0,0.08)" : "rgba(0,0,0,0.04)",
                         borderRadius: 10,
                         padding: "10px 12px",
                         cursor: "pointer",
@@ -12247,11 +12539,19 @@ const modePillControls = (
                         alignItems: "center",
                         gap: 8,
                       }}
-                      disabled={hostInsightsLoading}
-                      title={hostInsightsSttRecording ? "Stop recording" : "Record a question with speech-to-text"}
+                      disabled={hostInsightsLoading && !hostInsightsSttEnabled}
+                      title={hostInsightsSttEnabled ? "Stop hands-free speech-to-text and switch back to typing" : "Start hands-free speech-to-text"}
                     >
-                      <span aria-hidden="true">{hostInsightsSttRecording ? "■" : "🎤"}</span>
-                      <span>{hostInsightsSttRecording ? "Stop mic" : "Speak question"}</span>
+                      <span aria-hidden="true">{hostInsightsSttEnabled ? "■" : "🎤"}</span>
+                      <span>
+                        {hostInsightsSttEnabled
+                          ? hostInsightsSttRecording
+                            ? "Stop mic"
+                            : hostInsightsLoading
+                              ? "Working…"
+                              : "Mic on"
+                          : "Speak question"}
+                      </span>
                     </button>
 
                     <button
@@ -12265,7 +12565,7 @@ const modePillControls = (
                         cursor: "pointer",
                         fontSize: 12,
                       }}
-                      disabled={hostInsightsLoading || !(hostInsightsQuestion || "").trim()}
+                      disabled={hostInsightsLoading || hostInsightsSttEnabled || !(hostInsightsQuestion || "").trim()}
                     >
                       {hostInsightsLoading ? "Asking…" : "Ask"}
                     </button>
@@ -12283,7 +12583,11 @@ const modePillControls = (
                       color: "#111",
                       whiteSpace: "pre-wrap",
                       overflowY: "auto",
-                      maxHeight: 220,
+                      minHeight: 140,
+                      maxHeight: 260,
+                      flex: "1 1 180px",
+                      WebkitOverflowScrolling: "touch",
+                      overscrollBehavior: "contain",
                     }}
                   >
                     {hostInsightsAnswer}
