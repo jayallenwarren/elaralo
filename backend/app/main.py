@@ -8141,6 +8141,41 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
 # Frontend should POST the recorded Blob directly:
 #   fetch(`${API_BASE}/stt/transcribe`, { method:"POST", headers:{ "Content-Type": blob.type }, body: blob })
 #
+def _stt_ext_from_content_type(content_type: str) -> str:
+    ct = str(content_type or "").lower().strip()
+    if "webm" in ct:
+        return "webm"
+    if "ogg" in ct:
+        return "ogg"
+    if "mp4" in ct or "m4a" in ct or "aac" in ct:
+        return "mp4"
+    if "wav" in ct:
+        return "wav"
+    if "mpeg" in ct or "mp3" in ct:
+        return "mp3"
+    return "bin"
+
+
+def _stt_transcribe_sync(audio_bytes: bytes, content_type: str) -> str:
+    if not audio_bytes or len(audio_bytes) < 16:
+        raise ValueError("No audio received")
+
+    ext = _stt_ext_from_content_type(content_type)
+    bio = io.BytesIO(audio_bytes)
+    bio.name = f"stt.{ext}"
+
+    client = _get_openai_client()
+    stt_model = getattr(settings, "STT_MODEL", None) or os.getenv("STT_MODEL", "").strip() or "whisper-1"
+    resp = client.audio.transcriptions.create(
+        model=stt_model,
+        file=bio,
+    )
+    text = getattr(resp, "text", None)
+    if text is None and isinstance(resp, dict):
+        text = resp.get("text")
+    return str(text or "").strip()
+
+
 @app.post("/stt/transcribe")
 async def stt_transcribe(request: Request):
     if not settings.OPENAI_API_KEY:
@@ -8152,40 +8187,19 @@ async def stt_transcribe(request: Request):
     if not audio_bytes or len(audio_bytes) < 16:
         raise HTTPException(status_code=400, detail="No audio received")
 
-    # Infer file extension for OpenAI transcription.
-    if "webm" in content_type:
-        ext = "webm"
-    elif "ogg" in content_type:
-        ext = "ogg"
-    elif "mp4" in content_type or "m4a" in content_type or "aac" in content_type:
-        ext = "mp4"
-    elif "wav" in content_type:
-        ext = "wav"
-    else:
-        # Fallback; OpenAI can often still detect format, but providing a filename helps.
-        ext = "bin"
-
-    bio = io.BytesIO(audio_bytes)
-    bio.name = f"stt.{ext}"
-
     try:
-        # Use the same OpenAI client used elsewhere in this service.
-        # `settings.STT_MODEL` can be set; fallback is whisper-1.
-        stt_model = getattr(settings, "STT_MODEL", None) or "whisper-1"
-        resp = client.audio.transcriptions.create(
-            model=stt_model,
-            file=bio,
-        )
-        text = getattr(resp, "text", None)
-        if text is None and isinstance(resp, dict):
-            text = resp.get("text")
-        if not text:
-            text = ""
-        return {"text": str(text).strip()}
+        text = await run_in_threadpool(_stt_transcribe_sync, audio_bytes, content_type)
+        return {"text": text}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
+        try:
+            print(f"[stt] transcription failed content_type={content_type!r} bytes={len(audio_bytes)} err={type(e).__name__}: {e}")
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"STT transcription failed: {type(e).__name__}: {e}")
 
 
 
