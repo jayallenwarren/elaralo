@@ -4073,10 +4073,28 @@ def _make_openai_client(*, api_key: str, base_url: Optional[str] = None, timeout
     return OpenAI(**kwargs)
 
 
+def _resolve_openai_api_key() -> str:
+    """Resolve the OpenAI key from env first, then from settings if present.
+
+    Some deployed layouts expose OPENAI_API_KEY only via environment variables,
+    while others also mirror it onto the imported settings object. STT/TTS/LLM
+    paths should all use one shared resolver so they behave consistently.
+    """
+    raw = os.getenv("OPENAI_API_KEY")
+    if raw:
+        raw = str(raw).strip()
+    if not raw:
+        try:
+            raw = str(getattr(settings, "OPENAI_API_KEY", "") or "").strip()
+        except Exception:
+            raw = ""
+    return str(raw or "").strip()
+
+
 def _get_openai_client():
     global _OPENAI_CLIENT
 
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = _resolve_openai_api_key()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -4088,7 +4106,7 @@ def _get_openai_client():
 
 def _get_openai_summary_client(timeout_s: float):
     """Summary client with a specific timeout, still reusing the shared HTTP pool."""
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = _resolve_openai_api_key()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -8178,16 +8196,18 @@ def _stt_transcribe_sync(audio_bytes: bytes, content_type: str) -> str:
 
 @app.post("/stt/transcribe")
 async def stt_transcribe(request: Request):
-    if not settings.OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
-
-    content_type = (request.headers.get("content-type") or "").lower().strip()
-    audio_bytes = await request.body()
-
-    if not audio_bytes or len(audio_bytes) < 16:
-        raise HTTPException(status_code=400, detail="No audio received")
-
+    content_type = ""
+    audio_bytes = b""
     try:
+        if not _resolve_openai_api_key():
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+
+        content_type = (request.headers.get("content-type") or "").lower().strip()
+        audio_bytes = await request.body()
+
+        if not audio_bytes or len(audio_bytes) < 16:
+            raise HTTPException(status_code=400, detail="No audio received")
+
         text = await run_in_threadpool(_stt_transcribe_sync, audio_bytes, content_type)
         return {"text": text}
     except ValueError as e:
