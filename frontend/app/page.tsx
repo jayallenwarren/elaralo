@@ -7507,9 +7507,9 @@ useEffect(() => {
 
   function showUpgradeMessage(requestedMode: Mode) {
     const modeLabel = MODE_LABELS[requestedMode];
-    const msg =
-      `The requested mode (${modeLabel}) isn't available on your current plan. ` +
-      `Please upgrade here: ${upgradeUrl} (or click the Upgrade button in the top-right).`;
+    const msg = requestedMode === "intimate"
+      ? `Intimate (18+) isn't available on your current plan. Please upgrade or purchase Pay as You Go here: ${upgradeUrl} (or click the Upgrade button in the top-right).`
+      : `The requested mode (${modeLabel}) isn't available on your current plan. Please upgrade here: ${upgradeUrl} (or click the Upgrade button in the top-right).`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
@@ -13050,6 +13050,12 @@ const modePillControls = (
               <button
                 onClick={() => {
                   // Ensure backend receives pending_consent + intimate mode
+                  if (!allowedModes.includes("intimate")) {
+                    showUpgradeMessage("intimate");
+                    setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: false, mode: prev.mode === "intimate" ? "friend" : prev.mode }));
+                    setChatStatus("idle");
+                    return;
+                  }
                   setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
                   send("Yes", { pending_consent: "intimate", mode: "intimate" });
                 }}
@@ -13066,6 +13072,12 @@ const modePillControls = (
 
               <button
                 onClick={() => {
+                  if (!allowedModes.includes("intimate")) {
+                    showUpgradeMessage("intimate");
+                    setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: false, mode: prev.mode === "intimate" ? "friend" : prev.mode }));
+                    setChatStatus("idle");
+                    return;
+                  }
                   setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
                   send("No", { pending_consent: "intimate", mode: "intimate" });
                 }}
