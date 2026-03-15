@@ -13053,7 +13053,7 @@ const modePillControls = (
                   if (!allowedModes.includes("intimate")) {
                     showUpgradeMessage("intimate");
                     setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: false, mode: prev.mode === "intimate" ? "friend" : prev.mode }));
-                    setChatStatus("idle");
+                    setChatStatus("safe");
                     return;
                   }
                   setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
@@ -13075,7 +13075,7 @@ const modePillControls = (
                   if (!allowedModes.includes("intimate")) {
                     showUpgradeMessage("intimate");
                     setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: false, mode: prev.mode === "intimate" ? "friend" : prev.mode }));
-                    setChatStatus("idle");
+                    setChatStatus("safe");
                     return;
                   }
                   setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));

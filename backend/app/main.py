@@ -3425,16 +3425,6 @@ def _included_minutes_for_plan(plan_name: str) -> int:
     # Unknown / not provided -> 0 included minutes
     return 0
 
-def _plan_allows_intimate(*, is_trial: bool, plan_name: str) -> bool:
-    if bool(is_trial):
-        return False
-    p = _normalize_plan_name_for_limits(plan_name).strip().lower()
-    return p in {
-        "intimate (18+)",
-        "pay as you go",
-    }
-
-
 def _get_client_ip(request: Request) -> str:
     # Azure front-ends commonly set x-forwarded-for with a comma-separated chain.
     xff = (request.headers.get("x-forwarded-for") or "").strip()
@@ -6224,9 +6214,7 @@ async def chat(request: Request):
     requested_intimate = (requested_mode == "intimate")
 
     # authoritative consent flag should live in session_state (works across gunicorn workers)
-    explicit_consented = bool(session_state.get("explicit_consented") is True)
-    plan_allows_intimate = _plan_allows_intimate(is_trial=is_trial, plan_name=plan_name_for_limits)
-    intimate_allowed = bool(explicit_consented and plan_allows_intimate)
+    intimate_allowed = bool(session_state.get("explicit_consented") is True)
 
     # if user is requesting intimate OR the UI is in intimate mode, treat as intimate request
     user_requesting_intimate = wants_explicit or requested_intimate or _looks_intimate(user_text)
@@ -6243,23 +6231,6 @@ async def chat(request: Request):
 
     pending = (session_state.get("pending_consent") or "")
     pending = pending.strip().lower() if isinstance(pending, str) else ""
-
-    if user_requesting_intimate and not plan_allows_intimate:
-        session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = None
-        session_state_out["explicit_consented"] = False
-        session_state_out["mode"] = "romantic" if ("romantic" in str(plan_name_for_limits or "").lower() or not is_trial) else "friend"
-        return await _respond(
-            _build_no_minutes_message(
-                upgrade_link=str(upgrade_link_override or UPGRADE_LINK),
-                pay_go_link=str(pay_go_link_override or PAYGO_LINK),
-                pay_go_price=float(pay_go_price) if pay_go_price is not None else float(PAYGO_PRICE),
-                is_trial=bool(is_trial),
-                plan_name=plan_label_for_messages,
-            ),
-            STATUS_PAYWALL,
-            session_state_out,
-        )
 
     def _grant_intimate(state_in: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(state_in)
