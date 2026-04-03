@@ -280,6 +280,74 @@ type HostInsightsSummaryItem = {
   messages?: HostInsightsTranscriptMessage[];
 };
 
+function mergeRelayEventsBySeq(prev: RelayEvent[], incoming: RelayEvent[]): RelayEvent[] {
+  const out: RelayEvent[] = [];
+  const seen = new Set<string>();
+
+  const push = (ev: RelayEvent) => {
+    if (!ev || typeof ev !== "object") return;
+    const seq = Number((ev as any)?.seq || 0);
+    const sender = String((ev as any)?.sender || "").trim();
+    const kind = String((ev as any)?.kind || "").trim();
+    const content = String((ev as any)?.content || "");
+    const payload = (() => {
+      try {
+        return JSON.stringify((ev as any)?.payload ?? null);
+      } catch {
+        return "";
+      }
+    })();
+    const key = seq > 0 ? `seq:${seq}` : `fallback:${sender}:${kind}:${content}:${payload}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(ev);
+  };
+
+  [...(prev || []), ...(incoming || [])].forEach(push);
+  out.sort((a, b) => Number((a as any)?.seq || 0) - Number((b as any)?.seq || 0));
+  return out.slice(-400);
+}
+
+function dedupeHostInsightsTranscript(messages: HostInsightsTranscriptMessage[]): HostInsightsTranscriptMessage[] {
+  const out: HostInsightsTranscriptMessage[] = [];
+  const seen = new Set<string>();
+  for (const m of messages || []) {
+    if (!m || typeof m !== "object") continue;
+    const seq = Number((m as any)?.seq || 0);
+    const sender = String((m as any)?.sender || "").trim();
+    const kind = String((m as any)?.kind || "").trim();
+    const content = String((m as any)?.content || "").trim();
+    const key = seq > 0 ? `seq:${seq}` : `fallback:${sender}:${kind}:${content}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(m);
+  }
+  return out;
+}
+
+function dedupeHostInsightsSummaries(items: HostInsightsSummaryItem[]): HostInsightsSummaryItem[] {
+  const out: HostInsightsSummaryItem[] = [];
+  const seen = new Set<string>();
+  for (const item of items || []) {
+    if (!item || typeof item !== "object") continue;
+    const transcript = dedupeHostInsightsTranscript(Array.isArray(item.messages) ? item.messages : []);
+    const transcriptSig = transcript
+      .map((m) => `${Number((m as any)?.seq || 0)}|${String((m as any)?.sender || "").trim()}|${String((m as any)?.content || "").trim()}`)
+      .join("\n");
+    const key = [
+      String(item.createDatetime || "").trim(),
+      String(item.sessionId || "").trim(),
+      String(item.reason || "").trim(),
+      String(item.summary || "").trim(),
+      transcriptSig,
+    ].join("||");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ ...item, messages: transcript });
+  }
+  return out;
+}
+
 type PlanName =
   | "Trial"
   | "Friend"
@@ -2850,7 +2918,7 @@ const loadHostGuidelines = useCallback(async () => {
 
     const brand = String(companyName || "").trim();
     const avatar = String(companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
+    const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     if (!brand || !avatar || !memberId) return;
 
     setHostGuidelinesLoading(true);
@@ -2889,7 +2957,7 @@ const saveHostGuidelines = useCallback(async () => {
 
     const brand = String(companyName || "").trim();
     const avatar = String(companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
+    const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     if (!brand || !avatar || !memberId) return;
 
     setHostGuidelinesLoading(true);
@@ -2955,7 +3023,7 @@ const loadHostInsightsSummaries = useCallback(
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
-      setHostInsightsSummaries(Array.isArray(json?.summaries) ? json.summaries : []);
+      setHostInsightsSummaries(dedupeHostInsightsSummaries(Array.isArray(json?.summaries) ? json.summaries : []));
     } catch (e: any) {
       setHostInsightsError(e?.message || String(e));
     } finally {
@@ -4687,7 +4755,7 @@ useEffect(() => {
     try {
       const brand = (companyName || "").trim();
       const avatar = (companionName || "").trim();
-      const memberId = String(memberIdRef.current || "").trim();
+      const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
 
       if (!brand || !avatar || !memberId) return;
 
@@ -4755,7 +4823,7 @@ useEffect(() => {
     try {
       const brand = (companyName || "").trim();
       const avatar = (companionName || "").trim();
-      const memberId = String(memberIdRef.current || "").trim();
+      const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
 
       if (!brand || !avatar || !memberId) return;
 
@@ -4790,11 +4858,7 @@ useEffect(() => {
 
       const evs = Array.isArray(data.events) ? data.events : [];
       if (evs.length) {
-        setHostSelectedEvents((prev) => {
-          const out = [...prev, ...evs];
-          // Cap for UI safety.
-          return out.slice(-400);
-        });
+        setHostSelectedEvents((prev) => mergeRelayEventsBySeq(prev, evs));
 
         // Queue pending scheduled content for the host (shown via modal).
         const pendingPayloads = evs
@@ -4892,7 +4956,7 @@ const hostSetOverride = async (enabled: boolean) => {
   try {
     const brand = (companyName || "").trim();
     const avatar = (companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
+    const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     const session_id = String(hostSelectedSessionId || "").trim();
 
     if (!brand || !avatar || !memberId || !session_id) return;
@@ -4921,7 +4985,7 @@ const hostSendMessage = async () => {
 
     const brand = (companyName || "").trim();
     const avatar = (companionName || "").trim();
-    const memberId = String(memberIdRef.current || "").trim();
+    const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     const session_id = String(hostSelectedSessionId || "").trim();
 
     if (!brand || !avatar || !memberId || !session_id) return;
@@ -4945,9 +5009,15 @@ const hostSendMessage = async () => {
       return;
     }
 
+    const appendedEvent = (data && typeof data === "object" ? (data as any).event : null) as RelayEvent | null;
+    if (appendedEvent && typeof appendedEvent === "object") {
+      setHostSelectedEvents((prev) => mergeRelayEventsBySeq(prev, [appendedEvent]));
+      const nextSeq = Number((appendedEvent as any)?.seq || 0);
+      if (nextSeq > 0) setHostPollSinceSeq((prev) => Math.max(prev, nextSeq));
+    }
+
     setHostSendText("");
-    setHostNotice("");
-    // Poll loop will pick up the new message.
+    setHostNotice("Host message sent.");
   } catch (e: any) {
     setHostNotice(String(e?.message || e || "Failed to send host message"));
   }
@@ -5353,7 +5423,7 @@ useEffect(() => {
     try {
       const brand = (companyName || "").trim();
       const avatar = (companionName || "").trim();
-      const memberId = String(memberIdRef.current || "").trim();
+      const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
       const session_id = String(hostSelectedSessionId || "").trim();
 
       if (!brand || !avatar || !memberId || !session_id) return;
@@ -12602,12 +12672,13 @@ const modePillControls = (
       <div
         style={{
           display: "flex",
-          alignItems: "center",
+          alignItems: "flex-start",
           justifyContent: "space-between",
           gap: 12,
+          flexWrap: "wrap",
         }}
       >
-        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: "1 1 180px" }}>
           <div style={{ fontSize: 18, fontWeight: 700 }}>
             Host Console
           </div>
@@ -12616,87 +12687,95 @@ const modePillControls = (
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            setHostGuidelinesError("");
-            setHostGuidelinesOpen(true);
-            void loadHostGuidelines();
-          }}
-          style={{
-            border: "1px solid rgba(0,0,0,0.12)",
-            background: "rgba(0,0,0,0.04)",
-            borderRadius: 10,
-            padding: "8px 10px",
-            cursor: "pointer",
-            fontSize: 12,
-            marginRight: 8,
-          }}
-          title="Edit AI companion interaction guidelines (persisted)"
-        >
-          AI Guidelines
-        </button>
-
-        <button
-          type="button"
-          onClick={() => {
-            setHostInsightsError("");
-            setHostInsightsAnswer("");
-            setHostInsightsQuestion("");
-            setHostInsightsSelectedMemberId("");
-            setHostInsightsSummaries([]);
-            setHostInsightsOpen(true);
-            void loadHostInsightsUsers();
-          }}
-          style={{
-            border: "1px solid rgba(0,0,0,0.12)",
-            background: "rgba(0,0,0,0.04)",
-            borderRadius: 10,
-            padding: "8px 10px",
-            cursor: "pointer",
-            fontSize: 12,
-            marginRight: 8,
-          }}
-          title="Ask Dulce about historical session summaries for visitors/members"
-        >
-          Session Insights
-        </button>
-
-        {hostPendingContent.length > 0 ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", justifyContent: "flex-end", flex: "1 1 420px" }}>
           <button
             type="button"
             onClick={() => {
-              setHostPendingActionErr(null);
-              setHostPendingModalOpen(true);
+              setHostGuidelinesError("");
+              setHostGuidelinesOpen(true);
+              void loadHostGuidelines();
             }}
             style={{
-              border: "1px solid rgba(0,0,0,0.12)",
-              background: "rgba(0,0,0,0.04)",
+              border: "1px solid rgba(64,160,255,0.45)",
+              background: "rgba(64,160,255,0.12)",
+              color: "#7bc0ff",
               borderRadius: 10,
-              padding: "8px 10px",
+              padding: "8px 12px",
               cursor: "pointer",
               fontSize: 12,
-              marginRight: 8,
+              fontWeight: 700,
+              whiteSpace: "nowrap",
+            }}
+            title="Edit AI companion interaction guidelines (persisted)"
+          >
+            AI Guidelines
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setHostInsightsError("");
+              setHostInsightsAnswer("");
+              setHostInsightsQuestion("");
+              setHostInsightsSelectedMemberId("");
+              setHostInsightsSummaries([]);
+              setHostInsightsOpen(true);
+              void loadHostInsightsUsers();
+            }}
+            style={{
+              border: "1px solid rgba(64,160,255,0.45)",
+              background: "rgba(64,160,255,0.12)",
+              color: "#7bc0ff",
+              borderRadius: 10,
+              padding: "8px 12px",
+              cursor: "pointer",
+              fontSize: 12,
+              fontWeight: 700,
+              whiteSpace: "nowrap",
+            }}
+            title="Ask Dulce about historical session summaries for visitors/members"
+          >
+            Session Insights
+          </button>
+
+          {hostPendingContent.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => {
+                setHostPendingActionErr(null);
+                setHostPendingModalOpen(true);
+              }}
+              style={{
+                border: "1px solid rgba(255,255,255,0.18)",
+                background: "rgba(255,255,255,0.06)",
+                color: "white",
+                borderRadius: 10,
+                padding: "8px 10px",
+                cursor: "pointer",
+                fontSize: 12,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Pending ({hostPendingContent.length})
+            </button>
+          ) : null}
+
+          <button
+            type="button"
+            onClick={() => setHostConsoleOpen(false)}
+            style={{
+              padding: "8px 10px",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.28)",
+              background: "rgba(0,0,0,0.28)",
+              color: "white",
+              cursor: "pointer",
+              whiteSpace: "nowrap",
             }}
           >
-            Pending ({hostPendingContent.length})
+            Close
           </button>
-        ) : null}
-
-        <button
-          type="button"
-          onClick={() => setHostConsoleOpen(false)}
-          style={{
-            padding: "8px 10px",
-            borderRadius: 10,
-            border: "1px solid rgba(255,255,255,0.28)",
-            background: "rgba(0,0,0,0.28)",
-            color: "white",
-            cursor: "pointer",
-          }}
-        >
-          Close
-        </button>
+        </div>
       </div>
 
       {hostActiveError ? (

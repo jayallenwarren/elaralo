@@ -7119,6 +7119,44 @@ def _ai_override_db_events_for_sessions(session_ids: List[str], *, max_per_sessi
             pass
 
 
+def _dedupe_override_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        seq = int(ev.get("seq") or 0)
+        sender = str(ev.get("sender") or "").strip()
+        kind = str(ev.get("kind") or "").strip()
+        content = str(ev.get("content") or "").strip()
+        key = f"seq:{seq}" if seq > 0 else f"fallback:{sender}:{kind}:{content}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ev)
+    return out
+
+
+def _host_insights_summary_signature(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    transcript = _dedupe_override_events(item.get("messages") if isinstance(item.get("messages"), list) else [])
+    transcript_sig = "\n".join(
+        f"{int(m.get('seq') or 0)}|{str(m.get('sender') or '').strip()}|{str(m.get('content') or '').strip()}"
+        for m in transcript
+        if isinstance(m, dict)
+    )
+    return "||".join(
+        [
+            str(item.get("createDatetime") or "").strip(),
+            str(item.get("sessionId") or "").strip(),
+            str(item.get("reason") or "").strip(),
+            str(item.get("summary") or "").strip(),
+            transcript_sig,
+        ]
+    )
+
+
 def _ai_override_db_upsert_session(rec: Dict[str, Any]) -> None:
     if not isinstance(rec, dict):
         return
@@ -11164,7 +11202,7 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
         }
 
     # Normal host message.
-    _ai_override_append_event(
+    appended_event = _ai_override_append_event(
         sid,
         role="assistant",
         content=text,
@@ -11173,7 +11211,16 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
         kind="message",
     )
 
-    return {"ok": True, "session_id": sid, "override_active": True, "usage_info": usage_info}
+    try:
+        rec = _ai_override_get_session(sid) or {}
+        if isinstance(rec, dict):
+            rec["last_seen"] = float(time.time())
+            rec["updated_epoch"] = float(time.time())
+            _ai_override_db_upsert_session(rec)
+    except Exception:
+        pass
+
+    return {"ok": True, "session_id": sid, "override_active": True, "usage_info": usage_info, "event": appended_event}
 
 
 
@@ -11492,18 +11539,23 @@ def _host_insights_list_summaries_sync(
             transcript_map = {}
 
     out: List[Dict[str, Any]] = []
+    seen_signatures: Set[str] = set()
     for row in base_rows:
         sid = str(row.get("sessionId") or "").strip()
-        out.append(
-            {
-                "createDatetime": str(row.get("createDatetime") or "").strip(),
-                "sessionId": sid,
-                "reason": str(row.get("reason") or "").strip(),
-                "summary": str(row.get("summary") or "").strip(),
-                "userName": str(row.get("userName") or "").strip(),
-                "messages": transcript_map.get(sid, []),
-            }
-        )
+        item = {
+            "createDatetime": str(row.get("createDatetime") or "").strip(),
+            "sessionId": sid,
+            "reason": str(row.get("reason") or "").strip(),
+            "summary": str(row.get("summary") or "").strip(),
+            "userName": str(row.get("userName") or "").strip(),
+            "messages": _dedupe_override_events(transcript_map.get(sid, [])),
+        }
+        sig = _host_insights_summary_signature(item)
+        if sig and sig in seen_signatures:
+            continue
+        if sig:
+            seen_signatures.add(sig)
+        out.append(item)
     return out
 
 
