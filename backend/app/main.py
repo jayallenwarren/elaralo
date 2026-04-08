@@ -1158,6 +1158,20 @@ def _load_companion_mappings_sync() -> None:
             "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
             "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
             "did_client_key": str(get_col("did_client_key", "DID_CLIENT_KEY", default="") or ""),
+            # Phase II / custom-avatar runtime fields (optional; safe to omit from DB).
+            "avatar_engine": str(get_col("avatar_engine", "Avatar_Engine", "avatarEngine", default="") or "").strip(),
+            "phase2_enabled": get_col("phase2_enabled", "Phase2_Enabled", "phase2Enabled", default=""),
+            "phase2_asset_root": str(get_col("phase2_asset_root", "Phase2_Asset_Root", "phase2AssetRoot", default="") or "").strip(),
+            "phase2_common_root": str(get_col("phase2_common_root", "Phase2_Common_Root", "phase2CommonRoot", default="") or "").strip(),
+            "phase2_vrm_url": str(get_col("phase2_vrm_url", "Phase2_VRM_URL", "phase2VrmUrl", default="") or "").strip(),
+            "phase2_idle_vrma_url": str(get_col("phase2_idle_vrma_url", "Phase2_IDLE_VRMA_URL", "phase2IdleVrmaUrl", default="") or "").strip(),
+            "phase2_talk_vrma_url": str(get_col("phase2_talk_vrma_url", "Phase2_TALK_VRMA_URL", "phase2TalkVrmaUrl", default="") or "").strip(),
+            "phase2_gesture_urls": get_col("phase2_gesture_urls", "Phase2_Gesture_URLs", "phase2GestureUrls", default=""),
+            "phase2_camera_fov": get_col("phase2_camera_fov", "Phase2_Camera_FOV", "phase2CameraFov", default=""),
+            "phase2_camera_position": get_col("phase2_camera_position", "Phase2_Camera_Position", "phase2CameraPosition", default=""),
+            "phase2_look_at": get_col("phase2_look_at", "Phase2_Look_At", "phase2LookAt", default=""),
+            "phase2_scale": get_col("phase2_scale", "Phase2_Scale", "phase2Scale", default=""),
+            "phase2_background": str(get_col("phase2_background", "Phase2_Background", "phase2Background", default="") or "").strip(),
             # Preserve common extra fields when present (helps debugging / future UIs).
             "companion_id": str(get_col("companion_id", "Companion_ID", "CompanionId", default="") or ""),
         }
@@ -1178,6 +1192,34 @@ def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any
         return None
 
     return _COMPANION_MAPPINGS.get((b, a))
+
+
+def _coerce_boolish(value: Any, default: Optional[bool] = None) -> Optional[bool]:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raw = str(value).strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on", "enabled", "phase2", "vrm", "3d", "custom"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "disabled", "phase1", "d-id", "did"}:
+        return False
+    return default
+
+
+def _jsonish(value: Any) -> Any:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except Exception:
+        return str(value)
 
 
 @app.on_event("startup")
@@ -1286,6 +1328,11 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
     live_out = "Stream" if live_lc == "stream" else "D-ID"
     ctype_out = "Human" if ctype_lc == "human" else "AI"
 
+    avatar_engine_raw = str(m.get("avatar_engine") or "").strip()
+    if not avatar_engine_raw:
+        avatar_engine_raw = "phase2-vrm" if ctype_lc == "ai" else ("stream" if live_lc == "stream" else "phase1-did")
+    phase2_enabled_out = _coerce_boolish(m.get("phase2_enabled"), default=(ctype_lc == "ai"))
+
     return {
         "found": True,
         "brand": str(m.get("brand") or b),
@@ -1303,6 +1350,32 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "didClientKey": str(m.get("did_client_key") or ""),
         "didAgentLink": str(m.get("did_agent_link") or ""),
         "didEmbedCode": str(m.get("did_embed_code") or ""),
+        "avatarEngine": avatar_engine_raw,
+        "avatar_engine": avatar_engine_raw,
+        "phase2Enabled": phase2_enabled_out,
+        "phase2_enabled": phase2_enabled_out,
+        "phase2AssetRoot": str(m.get("phase2_asset_root") or ""),
+        "phase2_asset_root": str(m.get("phase2_asset_root") or ""),
+        "phase2CommonRoot": str(m.get("phase2_common_root") or ""),
+        "phase2_common_root": str(m.get("phase2_common_root") or ""),
+        "phase2VrmUrl": str(m.get("phase2_vrm_url") or ""),
+        "phase2_vrm_url": str(m.get("phase2_vrm_url") or ""),
+        "phase2IdleVrmaUrl": str(m.get("phase2_idle_vrma_url") or ""),
+        "phase2_idle_vrma_url": str(m.get("phase2_idle_vrma_url") or ""),
+        "phase2TalkVrmaUrl": str(m.get("phase2_talk_vrma_url") or ""),
+        "phase2_talk_vrma_url": str(m.get("phase2_talk_vrma_url") or ""),
+        "phase2GestureUrls": _jsonish(m.get("phase2_gesture_urls")),
+        "phase2_gesture_urls": _jsonish(m.get("phase2_gesture_urls")),
+        "phase2CameraFov": m.get("phase2_camera_fov") if m.get("phase2_camera_fov") not in (None, "") else "",
+        "phase2_camera_fov": m.get("phase2_camera_fov") if m.get("phase2_camera_fov") not in (None, "") else "",
+        "phase2CameraPosition": _jsonish(m.get("phase2_camera_position")),
+        "phase2_camera_position": _jsonish(m.get("phase2_camera_position")),
+        "phase2LookAt": _jsonish(m.get("phase2_look_at")),
+        "phase2_look_at": _jsonish(m.get("phase2_look_at")),
+        "phase2Scale": m.get("phase2_scale") if m.get("phase2_scale") not in (None, "") else "",
+        "phase2_scale": m.get("phase2_scale") if m.get("phase2_scale") not in (None, "") else "",
+        "phase2Background": str(m.get("phase2_background") or ""),
+        "phase2_background": str(m.get("phase2_background") or ""),
         "phonetic": str(m.get("phonetic") or ""),
         "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
         "source": _COMPANION_MAPPINGS_SOURCE,
@@ -5241,6 +5314,54 @@ def _elevenlabs_tts_mp3_bytes(voice_id: str, text: str) -> bytes:
     return audio_bytes
 
 
+def _elevenlabs_tts_with_timestamps_sync(voice_id: str, text: str, brand: str = "", avatar: str = "") -> Dict[str, Any]:
+    import requests  # type: ignore
+
+    xi_api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not xi_api_key:
+        raise RuntimeError("ELEVENLABS_API_KEY is not configured")
+
+    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip() or "eleven_multilingual_v2"
+    output_format = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128").strip() or "mp3_44100_128"
+
+    try:
+        phon = ""
+        if brand and avatar:
+            m = _lookup_companion_mapping(brand, avatar) or {}
+            phon = (m.get("phonetic") or "").strip()
+        text = _normalize_tts_text(
+            text,
+            brand=brand,
+            avatar=avatar,
+            mapping_phonetic=phon,
+            brand_phonetic=None,
+        )
+    except Exception:
+        text = (text or "").strip()
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps?output_format={output_format}"
+    headers = {
+        "xi-api-key": xi_api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    body = {"text": text, "model_id": model_id}
+
+    r = requests.post(url, headers=headers, json=body, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs error {r.status_code}: {(r.text or '')[:400]}")
+
+    payload = r.json() or {}
+    if not payload.get("audio_base64"):
+        raise RuntimeError("ElevenLabs returned no audio_base64")
+
+    return {
+        "text": text,
+        "audio_base64": str(payload.get("audio_base64") or ""),
+        "alignment": payload.get("alignment") or {},
+        "normalized_alignment": payload.get("normalized_alignment") or payload.get("alignment") or {},
+        "mime_type": "audio/mpeg",
+    }
 
 
 def _azure_blob_sas_url(blob_name: str) -> str:
@@ -8186,6 +8307,53 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
 
     return {"audio_url": audio_url}
+
+
+@app.post("/tts/with-timestamps")
+async def tts_with_timestamps(request: Request) -> Dict[str, Any]:
+    """
+    Phase II helper for the web-based 3D avatar runtime.
+
+    Request JSON:
+      {
+        "session_id": "...",
+        "voice_id": "<ElevenLabsVoiceId>",
+        "brand": "Elaralo",
+        "avatar": "Jennifer",
+        "text": "..."
+      }
+
+    Response JSON:
+      {
+        "audio_base64": "...",
+        "alignment": {...},
+        "normalized_alignment": {...},
+        "mime_type": "audio/mpeg"
+      }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    session_id = (body.get("session_id") or body.get("sid") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=422, detail="session_id required")
+
+    voice_id = ((body.get("voice_id") or body.get("voiceId") or "")).strip()
+    text = (body.get("text") or "").strip()
+    brand = (body.get("brand") or "").strip()
+    avatar = (body.get("avatar") or "").strip()
+
+    if not voice_id or not text:
+        raise HTTPException(status_code=422, detail="voice_id and text are required")
+
+    try:
+        payload = await run_in_threadpool(_elevenlabs_tts_with_timestamps_sync, voice_id, text, brand, avatar)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS with timestamps failed: {type(e).__name__}: {e}")
+
+    return payload
 
 
 # --------------------------
