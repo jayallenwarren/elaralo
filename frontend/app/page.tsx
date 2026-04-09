@@ -5,10 +5,6 @@ import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, R
 import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
-import * as THREE from "three";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { VRM, VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
-import { VRMAnimationLoaderPlugin, createVRMAnimationClip, type VRMAnimation } from "@pixiv/three-vrm-animation";
 import elaraLogo from "../public/elaralo-logo.png";
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
   <svg
@@ -143,709 +139,6 @@ function LiveKitHlsPlayer({ src }: { src: string }) {
   );
 }
 
-
-
-type Phase2Alignment = {
-  characters: string[];
-  character_start_times_seconds: number[];
-  character_end_times_seconds: number[];
-};
-
-type Phase2GestureCue = {
-  type: string;
-  atSeconds: number;
-};
-
-type Phase2SpeechPacket = {
-  id: string;
-  text: string;
-  audioUrl: string;
-  mimeType: string;
-  alignment: Phase2Alignment;
-  gestures: Phase2GestureCue[];
-};
-
-type AvatarEngine = "" | "stream" | "phase2-vrm" | "phase1-did";
-
-type Phase2AvatarConfig = {
-  key: string;
-  label: string;
-  vrmUrl: string;
-  idleVrmaUrl: string;
-  talkVrmaUrl: string;
-  gestureVrmaUrls: Record<string, string>;
-  cameraFov?: number;
-  cameraPosition?: [number, number, number];
-  lookAtTarget?: [number, number, number];
-  backgroundColor?: string;
-  scale?: number;
-};
-
-type WordTiming = {
-  word: string;
-  start: number;
-  end: number;
-  startChar: number;
-  endChar: number;
-};
-
-function parseBoolish(value: any): boolean | null {
-  if (value === undefined || value === null || value === "") return null;
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-  const raw = String(value).trim().toLowerCase();
-  if (!raw) return null;
-  if (["1", "true", "yes", "y", "on", "enabled", "phase2", "vrm", "3d", "custom"].includes(raw)) return true;
-  if (["0", "false", "no", "n", "off", "disabled", "phase1", "d-id", "did"].includes(raw)) return false;
-  return null;
-}
-
-function normalizeCompanionSlug(value: string | null | undefined): string {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "avatar";
-}
-
-function resolvePublicAssetUrl(path: string | null | undefined): string {
-  const raw = String(path || "").trim();
-  if (!raw) return "";
-  if (/^(?:https?:)?\/\//i.test(raw)) return raw;
-  if (raw.startsWith("data:") || raw.startsWith("blob:")) return raw;
-  const base = String(APP_BASE_PATH || "").trim();
-  if (base && (raw === base || raw.startsWith(`${base}/`))) return raw;
-  const normalized = raw.startsWith("/") ? raw : `/${raw}`;
-  return joinUrlPrefix(APP_BASE_PATH, normalized);
-}
-
-function isCompanionHeadshotUrl(value: string | null | undefined): boolean {
-  const raw = String(value || "").trim();
-  if (!raw) return false;
-  return /\/companion\/headshot\//i.test(raw);
-}
-
-function deriveSiblingAssetUrlFromPublicImage(publicImageUrl: string | null | undefined, nextExt: string): string {
-  const raw = String(publicImageUrl || "").trim();
-  if (!raw) return "";
-  if (raw.startsWith("data:") || raw.startsWith("blob:")) return "";
-
-  const match = raw.match(/^([^?#]*)(.*)$/);
-  const pathOnly = match ? String(match[1] || "") : raw;
-  const suffix = match ? String(match[2] || "") : "";
-
-  const slash = pathOnly.lastIndexOf("/");
-  const dir = slash >= 0 ? pathOnly.slice(0, slash) : "";
-  const file = slash >= 0 ? pathOnly.slice(slash + 1) : pathOnly;
-  const decodedFile = (() => {
-    try {
-      return decodeURIComponent(file);
-    } catch (e) {
-      return file;
-    }
-  })();
-  if (!/\.(png|jpg|jpeg|webp)$/i.test(decodedFile)) return "";
-  const stem = stripExt(decodedFile);
-  const ext = String(nextExt || "").replace(/^\./, "").trim();
-  if (!stem || !ext) return "";
-  return `${dir ? `${dir}/` : ""}${encodeURIComponent(stem)}.${ext}${suffix}`;
-}
-
-function resolvePhase2SourcePublicImageUrl(
-  mapping: CompanionMappingRow | null,
-  resolvedAvatarSrc?: string | null,
-): string {
-  const explicit = resolvePublicAssetUrl(
-    String((mapping as any)?.public_image_url ?? (mapping as any)?.publicImageUrl ?? "").trim()
-  );
-  if (isCompanionHeadshotUrl(explicit)) return explicit;
-
-  const liveResolved = String(resolvedAvatarSrc || "").trim();
-  if (isCompanionHeadshotUrl(liveResolved)) return liveResolved;
-
-  return "";
-}
-
-function trimTrailingSlash(value: string | null | undefined): string {
-  return String(value || "").replace(/\/+$/, "");
-}
-
-function normalizeAvatarEngine(value: any): AvatarEngine {
-  const raw = String(value || "").trim().toLowerCase();
-  if (!raw) return "";
-  if (["stream", "livekit", "beestreamed"].includes(raw)) return "stream";
-  if (["phase1-did", "phase1", "did", "d-id"].includes(raw)) return "phase1-did";
-  if (["phase2-vrm", "phase2", "vrm", "3d", "custom"].includes(raw)) return "phase2-vrm";
-  return "";
-}
-
-function coerceStringArray(value: any): string[] {
-  if (value === undefined || value === null || value === "") return [];
-  if (Array.isArray(value)) return uniqueStrings(value.map((v) => String(v || "").trim()));
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) return [];
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) return uniqueStrings(parsed.map((v) => String(v || "").trim()));
-    } catch (e) {}
-    return [trimmed];
-  }
-  return [];
-}
-
-function safeJsonParse<T = any>(value: any, fallback: T): T {
-  if (value === undefined || value === null || value === "") return fallback;
-  if (typeof value === "object") return value as T;
-  try {
-    return JSON.parse(String(value)) as T;
-  } catch (e) {
-    return fallback;
-  }
-}
-
-function coerceTuple3(value: any, fallback: [number, number, number]): [number, number, number] {
-  if (Array.isArray(value) && value.length >= 3) {
-    const nums = value.slice(0, 3).map((v) => Number(v));
-    if (nums.every((n) => Number.isFinite(n))) return [nums[0], nums[1], nums[2]];
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = safeJsonParse<any>(value, null);
-    if (parsed) return coerceTuple3(parsed, fallback);
-    const nums = value.split(/[,\s]+/).map((v) => Number(v)).filter((n) => Number.isFinite(n));
-    if (nums.length >= 3) return [nums[0], nums[1], nums[2]];
-  }
-  return fallback;
-}
-
-function collectPhase2ConfigIssues(
-  mapping: CompanionMappingRow | null,
-  avatarName?: string | null,
-  resolvedPublicImageUrl?: string | null,
-): string[] {
-  const avatar = String(avatarName || mapping?.avatar || "").trim();
-  if (!avatar) return ["avatar"];
-
-  const companionType = String(mapping?.companion_type ?? mapping?.companionType ?? "").trim().toLowerCase();
-  if (companionType && companionType !== "ai") return [];
-
-  const avatarEngine = normalizeAvatarEngine((mapping as any)?.avatar_engine ?? (mapping as any)?.avatarEngine);
-  if (avatarEngine && avatarEngine !== "phase2-vrm") return [];
-
-  const explicitEnabled = parseBoolish((mapping as any)?.phase2_enabled ?? (mapping as any)?.phase2Enabled);
-  if (explicitEnabled === false) return [];
-
-  const explicitVrmUrl = String((mapping as any)?.phase2_vrm_url ?? (mapping as any)?.phase2VrmUrl ?? "").trim();
-  const publicImageUrl = resolvePhase2SourcePublicImageUrl(mapping, resolvedPublicImageUrl);
-  const derivedVrmUrl = !explicitVrmUrl ? deriveSiblingAssetUrlFromPublicImage(publicImageUrl, "vrm") : "";
-
-  const backendIssues = uniqueStrings(
-    coerceStringArray((mapping as any)?.phase2_missing_fields ?? (mapping as any)?.phase2MissingFields)
-  ).filter((issue) => {
-    const norm = String(issue || "").trim().toLowerCase();
-    if (!norm) return false;
-    if ((norm === "phase2_vrm_url" || norm === "phase2_vrm_url_or_public_image_url") && (explicitVrmUrl || derivedVrmUrl)) {
-      return false;
-    }
-    return true;
-  });
-
-  const localIssues: string[] = [];
-  if (!explicitVrmUrl && !derivedVrmUrl) {
-    localIssues.push("phase2_vrm_url or public_image_url (resolved companion headshot)");
-  }
-  if (!String((mapping as any)?.phase2_idle_vrma_url ?? (mapping as any)?.phase2IdleVrmaUrl ?? "").trim()) {
-    localIssues.push("phase2_idle_vrma_url");
-  }
-  if (!String((mapping as any)?.phase2_talk_vrma_url ?? (mapping as any)?.phase2TalkVrmaUrl ?? "").trim()) {
-    localIssues.push("phase2_talk_vrma_url");
-  }
-
-  return uniqueStrings([...backendIssues, ...localIssues]);
-}
-
-function buildWordTimings(alignment: Phase2Alignment): WordTiming[] {
-  const chars = alignment?.characters || [];
-  const starts = alignment?.character_start_times_seconds || [];
-  const ends = alignment?.character_end_times_seconds || [];
-  const words: WordTiming[] = [];
-  let current = "";
-  let startIdx = -1;
-  const flush = (endIdx: number) => {
-    if (!current || startIdx < 0 || endIdx < startIdx) return;
-    words.push({
-      word: current,
-      start: Number(starts[startIdx] || 0),
-      end: Number(ends[endIdx] || starts[endIdx] || starts[startIdx] || 0),
-      startChar: startIdx,
-      endChar: endIdx,
-    });
-    current = "";
-    startIdx = -1;
-  };
-
-  for (let i = 0; i < chars.length; i++) {
-    const ch = String(chars[i] || "");
-    if (/\s/.test(ch)) {
-      flush(i - 1);
-      continue;
-    }
-    if (startIdx < 0) startIdx = i;
-    current += ch;
-    if (/[.,!?;:]/.test(ch)) {
-      flush(i);
-    }
-  }
-  flush(chars.length - 1);
-  return words;
-}
-
-function buildRuleBasedGesturePlan(text: string, alignment: Phase2Alignment, availableGestures: Record<string, string>): Phase2GestureCue[] {
-  const words = buildWordTimings(alignment);
-  if (!words.length) return [];
-
-  const available = Object.keys(availableGestures || {});
-  const has = (token: string) => available.some((k) => k.toLowerCase().includes(token));
-  const pick = (...tokens: string[]) => {
-    for (const token of tokens) {
-      const key = available.find((k) => k.toLowerCase().includes(token.toLowerCase()));
-      if (key) return key;
-    }
-    return available[0] || "";
-  };
-
-  const cues: Phase2GestureCue[] = [];
-  const textLc = String(text || "").toLowerCase();
-  if (has("open") || has("emphasis")) {
-    const midIdx = Math.min(words.length - 1, Math.max(1, Math.floor(words.length * 0.22)));
-    const key = pick("open", "emphasis", "point", "nod");
-    if (key) cues.push({ type: key, atSeconds: Math.max(0.2, words[midIdx].start) });
-  }
-  if (/(\?|\bhow\b|\bwhat\b|\bwhy\b|\bwhen\b)/.test(textLc) && (has("shrug") || has("nod"))) {
-    const idx = Math.min(words.length - 1, Math.max(0, Math.floor(words.length * 0.55)));
-    const key = pick("shrug", "nod", "open");
-    if (key) cues.push({ type: key, atSeconds: words[idx].start });
-  }
-  if (/(\byes\b|\bdefinitely\b|\babsolutely\b|\bright\b)/.test(textLc) && has("nod")) {
-    const yesIdx = words.findIndex((w) => /^(yes|definitely|absolutely|right)[.!?,]*$/i.test(w.word));
-    const idx = yesIdx >= 0 ? yesIdx : Math.min(words.length - 1, Math.max(0, Math.floor(words.length * 0.75)));
-    cues.push({ type: pick("nod", "open"), atSeconds: words[idx].start });
-  }
-
-  const interval = Math.max(6, Math.floor(words.length / 3));
-  for (let i = interval; i < words.length; i += interval) {
-    const key = pick("open", "point", "nod", "shrug");
-    if (!key) break;
-    cues.push({ type: key, atSeconds: words[i].start });
-  }
-
-  const deduped: Phase2GestureCue[] = [];
-  let lastAt = -10;
-  for (const cue of cues.sort((a, b) => a.atSeconds - b.atSeconds)) {
-    if (!cue.type) continue;
-    if (cue.atSeconds - lastAt < 1.2) continue;
-    deduped.push(cue);
-    lastAt = cue.atSeconds;
-  }
-  return deduped.slice(0, 6);
-}
-
-function resolvePhase2AvatarConfig(
-  mapping: CompanionMappingRow | null,
-  avatarName: string | null | undefined,
-  resolvedPublicImageUrl?: string | null,
-): Phase2AvatarConfig | null {
-  const avatar = String(avatarName || mapping?.avatar || "").trim();
-  if (!avatar) return null;
-
-  const companionType = String(mapping?.companion_type ?? mapping?.companionType ?? "").trim().toLowerCase();
-  if (companionType && companionType !== "ai") return null;
-
-  const avatarEngine = normalizeAvatarEngine((mapping as any)?.avatar_engine ?? (mapping as any)?.avatarEngine);
-  if (avatarEngine && avatarEngine !== "phase2-vrm") return null;
-
-  const explicitEnabled = parseBoolish((mapping as any)?.phase2_enabled ?? (mapping as any)?.phase2Enabled);
-  if (explicitEnabled === false) return null;
-
-  const issues = collectPhase2ConfigIssues(mapping, avatar, resolvedPublicImageUrl);
-  if (issues.length) return null;
-
-  const sourcePublicImageUrl = resolvePhase2SourcePublicImageUrl(mapping, resolvedPublicImageUrl);
-  const explicitVrmUrl = resolvePublicAssetUrl(String((mapping as any)?.phase2_vrm_url ?? (mapping as any)?.phase2VrmUrl ?? "").trim());
-  const derivedVrmUrl = !explicitVrmUrl ? deriveSiblingAssetUrlFromPublicImage(sourcePublicImageUrl, "vrm") : "";
-
-  const gestures = safeJsonParse<Record<string, string>>((mapping as any)?.phase2_gesture_urls ?? (mapping as any)?.phase2GestureUrls, {} as Record<string, string>);
-  const gestureVrmaUrls: Record<string, string> = {};
-  Object.entries(gestures || {}).forEach(([key, value]) => {
-    const resolved = resolvePublicAssetUrl(String(value || "").trim());
-    if (resolved) gestureVrmaUrls[key] = resolved;
-  });
-
-  return {
-    key: normalizeCompanionSlug(avatar),
-    label: avatar,
-    vrmUrl: explicitVrmUrl || derivedVrmUrl,
-    idleVrmaUrl: resolvePublicAssetUrl(String((mapping as any)?.phase2_idle_vrma_url ?? (mapping as any)?.phase2IdleVrmaUrl ?? "").trim()),
-    talkVrmaUrl: resolvePublicAssetUrl(String((mapping as any)?.phase2_talk_vrma_url ?? (mapping as any)?.phase2TalkVrmaUrl ?? "").trim()),
-    gestureVrmaUrls,
-    cameraFov: Number((mapping as any)?.phase2_camera_fov ?? (mapping as any)?.phase2CameraFov ?? 35) || 35,
-    cameraPosition: coerceTuple3((mapping as any)?.phase2_camera_position ?? (mapping as any)?.phase2CameraPosition, [0, 1.42, 2.15]),
-    lookAtTarget: coerceTuple3((mapping as any)?.phase2_look_at ?? (mapping as any)?.phase2LookAt, [0, 1.35, 0]),
-    scale: Number((mapping as any)?.phase2_scale ?? (mapping as any)?.phase2Scale ?? 1) || 1,
-    backgroundColor: String((mapping as any)?.phase2_background ?? (mapping as any)?.phase2Background ?? "#000").trim() || "#000",
-  };
-}
-
-function upperBoundNumber(arr: number[], x: number): number {
-  let lo = 0;
-  let hi = arr.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if ((arr[mid] ?? 0) <= x) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-function base64ToObjectUrl(b64: string, mimeType: string): string {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const blob = new Blob([bytes], { type: mimeType || "audio/mpeg" });
-  return URL.createObjectURL(blob);
-}
-
-function Phase2AvatarViewport({
-  config,
-  active,
-  speech,
-  onReady,
-  onFatalError,
-}: {
-  config: Phase2AvatarConfig;
-  active: boolean;
-  speech: Phase2SpeechPacket | null;
-  onReady?: () => void;
-  onFatalError?: (message: string) => void;
-}) {
-  const mountRef = useRef<HTMLDivElement | null>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  const vrmRef = useRef<VRM | null>(null);
-  const mixerRef = useRef<THREE.AnimationMixer | null>(null);
-  const idleActionRef = useRef<THREE.AnimationAction | null>(null);
-  const talkActionRef = useRef<THREE.AnimationAction | null>(null);
-  const gestureActionsRef = useRef<Record<string, THREE.AnimationAction>>({});
-  const rafRef = useRef<number>(0);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const currentSpeechIdRef = useRef<string>("");
-  const triggeredGestureIndexesRef = useRef<Set<number>>(new Set());
-  const blinkStateRef = useRef({ nextAt: 0, amount: 0, closing: false });
-  const visemeStateRef = useRef({ aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 });
-  const speechRef = useRef<Phase2SpeechPacket | null>(null);
-  speechRef.current = speech;
-
-  useEffect(() => {
-    if (!active) return;
-    const mount = mountRef.current;
-    if (!mount) return;
-
-    let disposed = false;
-    let resizeObserver: ResizeObserver | null = null;
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(config.backgroundColor || "#000");
-    sceneRef.current = scene;
-
-    const camera = new THREE.PerspectiveCamera(config.cameraFov || 35, 1, 0.1, 100);
-    camera.position.set(...(config.cameraPosition || [0, 1.42, 2.15]));
-    camera.lookAt(...(config.lookAtTarget || [0, 1.35, 0]));
-    cameraRef.current = camera;
-
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
-    renderer.setPixelRatio(Math.min(typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1, 2));
-    try { (renderer as any).outputColorSpace = (THREE as any).SRGBColorSpace; } catch (e) {}
-    rendererRef.current = renderer;
-    mount.innerHTML = "";
-    mount.appendChild(renderer.domElement);
-
-    const ambient = new THREE.AmbientLight(0xffffff, 1.25);
-    scene.add(ambient);
-    const key = new THREE.DirectionalLight(0xffffff, 1.8);
-    key.position.set(2.2, 3.5, 2.5);
-    scene.add(key);
-    const rim = new THREE.DirectionalLight(0xffffff, 0.65);
-    rim.position.set(-2.5, 2.8, -1.2);
-    scene.add(rim);
-
-    const clock = new THREE.Clock();
-
-    const resize = () => {
-      const width = Math.max(1, mount.clientWidth || 360);
-      const height = Math.max(1, mount.clientHeight || 440);
-      renderer.setSize(width, height, false);
-      camera.aspect = width / height;
-      camera.updateProjectionMatrix();
-    };
-    resize();
-    if (typeof ResizeObserver !== "undefined") {
-      resizeObserver = new ResizeObserver(() => resize());
-      resizeObserver.observe(mount);
-    } else if (typeof window !== "undefined") {
-      window.addEventListener("resize", resize);
-    }
-
-    const loadVrm = async (): Promise<VRM> => {
-      const candidate = String(config.vrmUrl || "").trim();
-      if (!candidate) throw new Error("Missing phase2_vrm_url.");
-
-      const loader = new GLTFLoader();
-      loader.register((parser) => new VRMLoaderPlugin(parser));
-      try {
-        const gltf = await new Promise<any>((resolve, reject) => loader.load(candidate, resolve, undefined, reject));
-        const vrm: VRM = gltf.userData.vrm;
-        VRMUtils.removeUnnecessaryVertices(gltf.scene);
-        VRMUtils.combineSkeletons(gltf.scene);
-        try { VRMUtils.combineMorphs(vrm); } catch (e) {}
-        vrm.scene.traverse((obj: any) => {
-          obj.frustumCulled = false;
-        });
-        vrm.scene.scale.setScalar(config.scale || 1);
-        return vrm;
-      } catch (e) {
-        throw new Error(`Unable to load VRM asset at ${candidate}. ${e}`);
-      }
-    };
-
-    const loadVrmaClip = async (url: string, vrm: VRM): Promise<THREE.AnimationClip | null> => {
-      if (!url) return null;
-      try {
-        const loader = new GLTFLoader();
-        loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
-        const gltf = await new Promise<any>((resolve, reject) => loader.load(url, resolve, undefined, reject));
-        const vrmAnimations: VRMAnimation[] = gltf.userData.vrmAnimations || [];
-        if (!vrmAnimations.length) return null;
-        return createVRMAnimationClip(vrmAnimations[0], vrm);
-      } catch (e) {
-        console.warn("Phase II animation load skipped", url, e);
-        return null;
-      }
-    };
-
-    (async () => {
-      try {
-        const vrm = await loadVrm();
-        if (disposed) return;
-        vrmRef.current = vrm;
-        scene.add(vrm.scene);
-        const mixer = new THREE.AnimationMixer(vrm.scene);
-        mixerRef.current = mixer;
-
-        const idleClip = await loadVrmaClip(config.idleVrmaUrl || "", vrm);
-        if (idleClip) {
-          const action = mixer.clipAction(idleClip);
-          action.setLoop(THREE.LoopRepeat, Infinity);
-          action.play();
-          idleActionRef.current = action;
-        }
-
-        const talkClip = await loadVrmaClip(config.talkVrmaUrl || "", vrm);
-        if (talkClip) {
-          const action = mixer.clipAction(talkClip);
-          action.setLoop(THREE.LoopRepeat, Infinity);
-          action.enabled = true;
-          action.setEffectiveWeight(0);
-          action.play();
-          talkActionRef.current = action;
-        }
-
-        const entries = Object.entries(config.gestureVrmaUrls || {});
-        for (const [name, url] of entries) {
-          const clip = await loadVrmaClip(url, vrm);
-          if (!clip) continue;
-          const action = mixer.clipAction(clip);
-          action.setLoop(THREE.LoopOnce, 1);
-          action.clampWhenFinished = true;
-          action.enabled = true;
-          action.setEffectiveWeight(1);
-          gestureActionsRef.current[name] = action;
-        }
-
-        blinkStateRef.current.nextAt = performance.now() / 1000 + 2.4;
-        onReady?.();
-      } catch (e: any) {
-        const message = e?.message ? String(e.message) : "Phase II 3D avatar failed to load.";
-        onFatalError?.(message);
-        return;
-      }
-
-      const tick = () => {
-        if (disposed) return;
-        rafRef.current = window.requestAnimationFrame(tick);
-        const delta = Math.min(0.05, clock.getDelta());
-        mixerRef.current?.update(delta);
-        vrmRef.current?.update(delta);
-
-        const audio = audioRef.current;
-        const speechPacket = speechRef.current;
-        const talk = talkActionRef.current;
-        if (talk) {
-          const targetWeight = audio && !audio.paused && !audio.ended ? 1 : 0;
-          const nextWeight = THREE.MathUtils.lerp(talk.getEffectiveWeight(), targetWeight, 1 - Math.exp(-8 * delta));
-          talk.setEffectiveWeight(nextWeight);
-        }
-
-        const em = vrmRef.current?.expressionManager;
-        if (em) {
-          const target = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
-          if (audio && speechPacket && !audio.paused && !audio.ended) {
-            const starts = speechPacket.alignment.character_start_times_seconds || [];
-            const idx = Math.max(0, upperBoundNumber(starts, audio.currentTime) - 1);
-            const ch = String(speechPacket.alignment.characters[idx] || "").toLowerCase();
-            if (/[a]/.test(ch)) target.aa = 1;
-            else if (/[e]/.test(ch)) target.ee = 1;
-            else if (/[iy]/.test(ch)) target.ih = 1;
-            else if (/[o]/.test(ch)) target.oh = 1;
-            else if (/[u]/.test(ch)) target.ou = 1;
-          }
-
-          const blend = 1 - Math.exp(-18 * delta);
-          const visemeState = visemeStateRef.current;
-          visemeState.aa = THREE.MathUtils.lerp(visemeState.aa, target.aa, blend);
-          visemeState.ih = THREE.MathUtils.lerp(visemeState.ih, target.ih, blend);
-          visemeState.ou = THREE.MathUtils.lerp(visemeState.ou, target.ou, blend);
-          visemeState.ee = THREE.MathUtils.lerp(visemeState.ee, target.ee, blend);
-          visemeState.oh = THREE.MathUtils.lerp(visemeState.oh, target.oh, blend);
-          em.setValue("aa", visemeState.aa);
-          em.setValue("ih", visemeState.ih);
-          em.setValue("ou", visemeState.ou);
-          em.setValue("ee", visemeState.ee);
-          em.setValue("oh", visemeState.oh);
-
-          const blink = blinkStateRef.current;
-          const now = performance.now() / 1000;
-          if (now >= blink.nextAt && !blink.closing && blink.amount <= 0.001) {
-            blink.closing = true;
-          }
-          if (blink.closing) {
-            blink.amount = Math.min(1, blink.amount + delta * 9);
-            if (blink.amount >= 1) blink.closing = false;
-          } else if (blink.amount > 0) {
-            blink.amount = Math.max(0, blink.amount - delta * 11);
-            if (blink.amount <= 0.001) {
-              blink.amount = 0;
-              blink.nextAt = now + 2.2 + Math.random() * 2.6;
-            }
-          }
-          em.setValue("blink", blink.amount);
-        }
-
-        if (audio && speechPacket && !audio.paused && !audio.ended) {
-          speechPacket.gestures.forEach((cue, index) => {
-            if (triggeredGestureIndexesRef.current.has(index)) return;
-            if (audio.currentTime < cue.atSeconds) return;
-            const candidates = Object.keys(gestureActionsRef.current);
-            const key = candidates.find((name) => name.toLowerCase() === cue.type.toLowerCase())
-              || candidates.find((name) => name.toLowerCase().includes(cue.type.toLowerCase()))
-              || cue.type;
-            const action = gestureActionsRef.current[key];
-            if (action) {
-              triggeredGestureIndexesRef.current.add(index);
-              action.reset();
-              action.fadeIn(0.08);
-              action.play();
-              window.setTimeout(() => {
-                try { action.fadeOut(0.2); } catch (e) {}
-              }, 600);
-            }
-          });
-        }
-
-        renderer.render(scene, camera);
-      };
-      tick();
-    })();
-
-    return () => {
-      disposed = true;
-      if (rafRef.current) window.cancelAnimationFrame(rafRef.current);
-      resizeObserver?.disconnect();
-      if (typeof window !== "undefined") window.removeEventListener("resize", resize);
-      try {
-        audioRef.current?.pause();
-      } catch (e) {}
-      audioRef.current = null;
-      currentSpeechIdRef.current = "";
-      triggeredGestureIndexesRef.current = new Set();
-      try { mixerRef.current?.stopAllAction(); } catch (e) {}
-      mixerRef.current = null;
-      idleActionRef.current = null;
-      talkActionRef.current = null;
-      gestureActionsRef.current = {};
-      if (vrmRef.current) {
-        try {
-          scene.remove(vrmRef.current.scene);
-          vrmRef.current.scene.traverse((obj: any) => {
-            if (obj.geometry) obj.geometry.dispose?.();
-            if (Array.isArray(obj.material)) obj.material.forEach((m: any) => m?.dispose?.());
-            else obj.material?.dispose?.();
-          });
-        } catch (e) {}
-      }
-      vrmRef.current = null;
-      if (rendererRef.current) {
-        try { rendererRef.current.dispose(); } catch (e) {}
-      }
-      rendererRef.current = null;
-      if (mount.contains(renderer.domElement)) {
-        try { mount.removeChild(renderer.domElement); } catch (e) {}
-      }
-    };
-  }, [active, config.key, config.vrmUrl, config.idleVrmaUrl, config.talkVrmaUrl, JSON.stringify(config.gestureVrmaUrls), config.cameraFov, JSON.stringify(config.cameraPosition), JSON.stringify(config.lookAtTarget), config.scale, config.backgroundColor, onReady, onFatalError]);
-
-  useEffect(() => {
-    if (!active || !speech || !speech.id) return;
-    if (currentSpeechIdRef.current === speech.id) return;
-    currentSpeechIdRef.current = speech.id;
-    triggeredGestureIndexesRef.current = new Set();
-
-    try {
-      audioRef.current?.pause();
-    } catch (e) {}
-    const audio = new Audio(speech.audioUrl);
-    audio.preload = "auto";
-    audio.muted = false;
-    audio.volume = 1;
-    audioRef.current = audio;
-    const finish = () => {
-      const talk = talkActionRef.current;
-      if (talk) talk.setEffectiveWeight(0);
-    };
-    audio.onended = finish;
-    audio.onerror = finish;
-    audio.play().catch((err) => {
-      finish();
-      onFatalError?.(err?.message ? String(err.message) : "3D avatar audio playback failed.");
-    });
-    return () => {
-      audio.onended = null;
-      audio.onerror = null;
-      try { audio.pause(); } catch (e) {}
-    };
-  }, [active, speech?.id, speech?.audioUrl, onFatalError]);
-
-  return (
-    <div
-      ref={mountRef}
-      style={{
-        position: "absolute",
-        inset: 0,
-        background: config.backgroundColor || "#000",
-      }}
-    />
-  );
-}
-
 type Role = "user" | "assistant";
 // `meta` is used for UI-only bookkeeping (e.g., in-stream live chat sender ids).
 // It is never serialized to the backend /chat API.
@@ -862,7 +155,7 @@ type UploadedAttachment = {
 
 type Mode = "friend" | "romantic" | "intimate";
 
-type LiveProvider = "" | "d-id" | "stream";
+type LiveProvider = "d-id" | "stream";
 
 type SessionKind = "stream" | "private" | "conference" | "";
 
@@ -884,45 +177,10 @@ type CompanionMappingRow = {
   didAgentId?: string;
   elevenVoiceId?: string;
 
-  avatar_engine?: string | null;
-  avatarEngine?: string | null;
-  phase2_enabled?: boolean | string | number | null;
-  phase2Enabled?: boolean | string | number | null;
-  phase1_fallback_enabled?: boolean | string | number | null;
-  phase1FallbackEnabled?: boolean | string | number | null;
-  public_image_root?: string | null;
-  publicImageRoot?: string | null;
-  public_image_url?: string | null;
-  publicImageUrl?: string | null;
-  phase2_ready?: boolean | string | number | null;
-  phase2Ready?: boolean | string | number | null;
-  phase2_missing_fields?: string[] | string | null;
-  phase2MissingFields?: string[] | string | null;
-  phase2_vrm_url?: string | null;
-  phase2VrmUrl?: string | null;
-  phase2_idle_vrma_url?: string | null;
-  phase2IdleVrmaUrl?: string | null;
-  phase2_talk_vrma_url?: string | null;
-  phase2TalkVrmaUrl?: string | null;
-  phase2_gesture_urls?: string | Record<string, string> | null;
-  phase2GestureUrls?: string | Record<string, string> | null;
-  phase2_camera_fov?: string | number | null;
-  phase2CameraFov?: string | number | null;
-  phase2_camera_position?: string | number[] | null;
-  phase2CameraPosition?: string | number[] | null;
-  phase2_look_at?: string | number[] | null;
-  phase2LookAt?: string | number[] | null;
-  phase2_scale?: string | number | null;
-  phase2Scale?: string | number | null;
-  phase2_background?: string | null;
-  phase2Background?: string | null;
-
+  // Optional DB column used for UI labeling.
+  // Expected values: "Human" | "AI" (case-insensitive), but treated as a free-form string.
   companion_type?: string | null;
-  companionType?: string | null;
-  companion_id?: string | null;
-  companionId?: string | null;
-  mapping_id?: string | null;
-  mappingId?: string | null;
+  companionType?: string | null; // optional API alias
 };
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
@@ -1660,25 +918,6 @@ function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1Avat
   return key ? PHASE1_AVATAR_MEDIA[key] : null;
 }
 
-function resolvePhase1AvatarMediaFromMapping(
-  mapping: CompanionMappingRow | null,
-  avatarName: string | null | undefined
-): Phase1AvatarMedia | null {
-  const didAgentId = String((mapping as any)?.didAgentId || "").trim();
-  const didClientKey = String((mapping as any)?.didClientKey || "").trim();
-  const elevenVoiceId = String((mapping as any)?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(avatarName || "");
-  if (didAgentId && didClientKey) {
-    return { didAgentId, didClientKey, elevenVoiceId };
-  }
-  const legacy = getPhase1AvatarMedia(avatarName);
-  if (!legacy) return null;
-  return {
-    didAgentId: legacy.didAgentId,
-    didClientKey: legacy.didClientKey,
-    elevenVoiceId: String((mapping as any)?.elevenVoiceId || "").trim() || legacy.elevenVoiceId,
-  };
-}
-
 function isDidSessionError(err: any): boolean {
   const kind = typeof err?.kind === "string" ? err.kind : "";
   const description = typeof err?.description === "string" ? err.description : "";
@@ -1905,56 +1144,6 @@ function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: stri
     for (const ext of exts) candidates.push(`${base}.${ext}`);
   }
 
-  candidates.push(DEFAULT_AVATAR);
-  return candidates;
-}
-
-function buildAvatarCandidatesFromSource(opts: {
-  companionKeyOrName: string;
-  explicitUrl?: string | null;
-  explicitRoot?: string | null;
-  rebrandingSlug?: string;
-}) {
-  const explicitUrl = resolvePublicAssetUrl(String(opts.explicitUrl || "").trim());
-  if (explicitUrl) return uniqueStrings([explicitUrl, DEFAULT_AVATAR]);
-
-  const rootRaw = String(opts.explicitRoot || "").trim();
-  if (!rootRaw) return buildAvatarCandidates(opts.companionKeyOrName, opts.rebrandingSlug);
-
-  const root = trimTrailingSlash(resolvePublicAssetUrl(rootRaw));
-  if (!root) return buildAvatarCandidates(opts.companionKeyOrName, opts.rebrandingSlug);
-
-  const raw = stripExt(String(opts.companionKeyOrName || "").trim());
-  if (!raw) return [DEFAULT_AVATAR];
-
-  const baseInputs = Array.from(
-    new Set([raw, stripTrailingUuid(raw)].map((v) => String(v || "").trim()).filter(Boolean))
-  );
-
-  const encVariants: string[] = [];
-  const seenEnc = new Set<string>();
-  for (const baseInput of baseInputs) {
-    const normalized = normalizeKeyForFile(baseInput);
-    const lower = normalized.toLowerCase();
-    const title = toTitleCaseHyphenated(lower);
-    for (const v of [normalized, title, lower]) {
-      const trimmed = String(v || "").trim();
-      if (!trimmed) continue;
-      const enc = encodeURIComponent(trimmed);
-      if (!seenEnc.has(enc)) {
-        seenEnc.add(enc);
-        encVariants.push(enc);
-      }
-    }
-  }
-
-  const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
-  const candidates: string[] = [];
-  for (const enc of encVariants) {
-    const base = `${root}/${enc}`;
-    candidates.push(base);
-    for (const ext of exts) candidates.push(`${base}.${ext}`);
-  }
   candidates.push(DEFAULT_AVATAR);
   return candidates;
 }
@@ -3486,87 +2675,6 @@ useEffect(() => {
     };
   }, [API_BASE, companyName, companionName]);
 
-useEffect(() => {
-    if (!companionMapping) return;
-
-    const explicitUrl = String((companionMapping as any)?.public_image_url ?? (companionMapping as any)?.publicImageUrl ?? "").trim();
-    const explicitRoot = String((companionMapping as any)?.public_image_root ?? (companionMapping as any)?.publicImageRoot ?? "").trim();
-    if (!explicitUrl && !explicitRoot) return;
-
-    const rawKey = String(companionKeyRaw || "").trim();
-    const { baseKey } = splitCompanionKey(rawKey);
-    const sourceKey = baseKey || String(companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
-    const candidates = buildAvatarCandidatesFromSource({
-      companionKeyOrName: sourceKey,
-      explicitUrl,
-      explicitRoot,
-      rebrandingSlug: normalizeRebrandingSlug(companyName) || undefined,
-    });
-
-    let cancelled = false;
-    pickFirstLoadableImage(candidates).then((picked) => {
-      if (!cancelled) setAvatarSrc(picked);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [companionMapping, companionKeyRaw, companionName, companyName]);
-
-  useEffect(() => {
-    const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
-    const resolved = String(avatarSrc || "").trim();
-    const currentStored = resolvePublicAssetUrl(
-      String((companionMapping as any)?.public_image_url ?? (companionMapping as any)?.publicImageUrl ?? "").trim()
-    );
-    const companionTypeRaw = String((companionMapping as any)?.companion_type ?? (companionMapping as any)?.companionType ?? "")
-      .trim()
-      .toLowerCase();
-
-    // Human companions stay on the legacy 8.17 path in this release.
-    if (companionTypeRaw !== "ai") return;
-    if (!API_BASE || !brand || !avatar) return;
-    if (!isCompanionHeadshotUrl(resolved)) return;
-    if (currentStored && currentStored === resolved) return;
-
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch(`${API_BASE}/mappings/companion/public-image-url`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            brand,
-            avatar,
-            public_image_url: resolved,
-          }),
-        });
-        const json: any = await res.json().catch(() => ({}));
-        if (cancelled || !res.ok) return;
-
-        const updatedUrl = String(json?.public_image_url || resolved).trim();
-        const updatedRoot = String(json?.public_image_root || "").trim();
-
-        setCompanionMapping((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            publicImageUrl: updatedUrl,
-            public_image_url: updatedUrl,
-            publicImageRoot: updatedRoot || (prev as any)?.publicImageRoot || (prev as any)?.public_image_root || "",
-            public_image_root: updatedRoot || (prev as any)?.public_image_root || (prev as any)?.publicImageRoot || "",
-          } as CompanionMappingRow;
-        });
-      } catch (e) {
-        // best-effort only
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [API_BASE, companionMapping, companyName, companionName, avatarSrc]);
-
   // Auto-join active LiveKit stream as a viewer (subscribe-only)
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
@@ -4171,28 +3279,10 @@ const askHostInsights = useCallback(async () => {
   // Notice for Live Sharing (websocket chat)
   const [liveSharingNotice, setLiveSharingNotice] = useState<string | null>(null);
 
-const [phase2SessionActive, setPhase2SessionActive] = useState<boolean>(false);
-const [phase2SpeechPacket, setPhase2SpeechPacket] = useState<Phase2SpeechPacket | null>(null);
-const [phase2RuntimeError, setPhase2RuntimeError] = useState<string>("");
-const [phase2FallbackVersion, setPhase2FallbackVersion] = useState<number>(0);
-const phase2FailedCompanionsRef = useRef<Record<string, string>>({});
-
-const phase1AvatarMedia = useMemo(
-  () => resolvePhase1AvatarMediaFromMapping(companionMapping, companionName),
-  [companionMapping, companionName]
-);
-
-const companionTypeLc = useMemo(
-  () => String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").trim().toLowerCase(),
-  [companionMapping]
-);
-
-const explicitAvatarEngine = useMemo<AvatarEngine>(
-  () => normalizeAvatarEngine((companionMapping as any)?.avatar_engine ?? (companionMapping as any)?.avatarEngine),
-  [companionMapping]
-);
+const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
+  // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
   const capRaw = String((companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? "")
     .trim()
     .toLowerCase();
@@ -4202,79 +3292,31 @@ const channelCap: ChannelCap = useMemo(() => {
   return "";
 }, [companionMapping]);
 
-const phase1FallbackEnabled = useMemo(
-  () => parseBoolish((companionMapping as any)?.phase1_fallback_enabled ?? (companionMapping as any)?.phase1FallbackEnabled) === true,
-  [companionMapping]
-);
-
 const liveProvider: LiveProvider = useMemo(() => {
-  if (explicitAvatarEngine === "stream") return "stream";
-  if (explicitAvatarEngine === "phase1-did") return "d-id";
-
+  // Strict mapping: DB values are Stream, D-ID, or NULL.
+  // NOTE: "did" (no hyphen) is NOT accepted.
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
+
   if (liveRaw === "stream") return "stream";
   if (liveRaw === "d-id") return "d-id";
-  return "";
-}, [companionMapping, explicitAvatarEngine]);
 
-const phase2FailureKey = useMemo(
-  () => `${String(companyName || "Elaralo").trim().toLowerCase()}::${String(companionName || "").trim().toLowerCase()}`,
-  [companyName, companionName]
-);
+  // If channel_cap=Video but live is empty/invalid, treat as misconfigured.
+  // We default to "d-id" as a safe runtime fallback, but we also surface an error via companionMappingError.
+  return "d-id";
+}, [companionMapping]);
 
-const resolvedPhase2PublicImageUrl = useMemo(
-  () => resolvePhase2SourcePublicImageUrl(companionMapping, avatarSrc),
-  [companionMapping, avatarSrc]
-);
 
-const phase2ConfigIssues = useMemo(
-  () => collectPhase2ConfigIssues(companionMapping, companionName, resolvedPhase2PublicImageUrl),
-  [companionMapping, companionName, resolvedPhase2PublicImageUrl]
-);
-
-const phase2Config = useMemo(
-  () => resolvePhase2AvatarConfig(companionMapping, companionName, resolvedPhase2PublicImageUrl),
-  [companionMapping, companionName, resolvedPhase2PublicImageUrl]
-);
-
-const phase2Preferred = useMemo(() => {
-  if (companionTypeLc && companionTypeLc !== "ai") return false;
-  if (explicitAvatarEngine === "phase1-did") return false;
-  if (explicitAvatarEngine === "phase2-vrm") return true;
-  return false;
-}, [companionTypeLc, explicitAvatarEngine]);
-
-const avatarEngine = useMemo<"stream" | "phase2-vrm" | "phase1-did">(() => {
-  // Human companions remain on the original 8.17 Stream path in this release.
-  if (companionTypeLc === "human") return "stream";
-  if (explicitAvatarEngine === "stream") return "stream";
-  if (explicitAvatarEngine === "phase1-did") return "phase1-did";
-  if (explicitAvatarEngine === "phase2-vrm") {
-    const failed = Boolean(phase2FailedCompanionsRef.current[phase2FailureKey]);
-    if (failed && phase1FallbackEnabled && phase1AvatarMedia?.didAgentId && phase1AvatarMedia?.didClientKey) {
-      return "phase1-did";
-    }
-    return "phase2-vrm";
-  }
-  return liveProvider === "stream" ? "stream" : "phase1-did";
-}, [companionTypeLc, explicitAvatarEngine, liveProvider, phase2FailureKey, phase2FallbackVersion, phase1FallbackEnabled, phase1AvatarMedia]);
-
+// Strict validation: Video companions must have a Live provider (Stream or D-ID).
 useEffect(() => {
-  if (!companionMapping) return;
-  if (companionTypeLc === "human") {
-    if (channelCap !== "video") {
-      setCompanionMappingError((prev) => prev || `Invalid companion mapping: Human companions require channel_cap=Video for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
-      return;
-    }
-    if (liveProvider !== "stream") {
-      setCompanionMappingError((prev) => prev || `Invalid companion mapping: Human companions require live=Stream for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
-      return;
+  if (channelCap === "video") {
+    const liveRaw = String(companionMapping?.live || "").trim();
+    if (!liveRaw) {
+      setCompanionMappingError(
+        `Invalid companion mapping: channel_cap=Video but live is NULL/empty for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`
+      );
     }
   }
-  if (companionTypeLc === "ai" && explicitAvatarEngine === "phase2-vrm" && channelCap !== "video") {
-    setCompanionMappingError((prev) => prev || `Invalid companion mapping: AI Phase II companions require channel_cap=Video for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
-  }
-}, [companionMapping, companionTypeLc, explicitAvatarEngine, channelCap, liveProvider, companyName, companionName]);
+}, [channelCap, companionMapping, companyName, companionName]);
 const streamUrl = useMemo(() => {
   const raw = String(companionKeyRaw || "").trim();
   const { flags } = splitCompanionKey(raw);
@@ -4282,15 +3324,13 @@ const streamUrl = useMemo(() => {
 }, [companionKeyRaw]);
 
 const liveEnabled = useMemo(() => {
-  // Restore the Human Companion gate exactly to the 8.17 contract:
-  // channel_cap=Video AND live=Stream.
-  if (companionTypeLc === "human") {
-    return channelCap === "video" && liveProvider === "stream";
-  }
-  if (channelCap !== "video") return false;
-  if (companionTypeLc === "ai") return explicitAvatarEngine === "phase2-vrm" || explicitAvatarEngine === "phase1-did";
-  return false;
-}, [channelCap, companionTypeLc, liveProvider, explicitAvatarEngine]);
+  // Product requirement (Video Icon next to the microphone):
+  // - Show when channel_cap === "Video" AND live is "Stream" or "D-ID"
+  // - Hide otherwise
+  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
+  const liveOk = liveRaw === "stream" || liveRaw === "d-id";
+  return channelCap === "video" && liveOk;
+}, [channelCap, companionMapping]);
 
 
   // Wix templates (and some site themes) may apply a gray page background.
@@ -4329,15 +3369,7 @@ const livekitUiActive =
 
 const showAvatarFrame =
   (liveProvider === "stream" && livekitUiActive) ||
-  (liveProvider !== "stream" && avatarStatus !== "idle" && (avatarEngine === "phase2-vrm" || Boolean(phase1AvatarMedia)));
-
-useEffect(() => {
-  return () => {
-    try {
-      if (phase2SpeechPacket?.audioUrl) URL.revokeObjectURL(phase2SpeechPacket.audioUrl);
-    } catch (e) {}
-  };
-}, [phase2SpeechPacket?.id]);
+  (Boolean(phase1AvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
 
   // Viewer-only: treat any active LegacyStream embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
@@ -4496,30 +3528,6 @@ const stopLiveAvatar = useCallback(async () => {
   try {
     // Always tear down local media + UI state so the user can recover from a stuck session.
     cleanupIphoneLiveAvatarAudio();
-    setPhase2SessionActive(false);
-    setPhase2SpeechPacket(null);
-    setPhase2RuntimeError("");
-    try {
-      await didAgentMgrRef.current?.disconnect?.();
-    } catch (e) {}
-    didAgentMgrRef.current = null;
-    try {
-      const existingStream = didSrcObjectRef.current;
-      if (existingStream && typeof existingStream.getTracks === "function") {
-        existingStream.getTracks().forEach((t: any) => t?.stop?.());
-      }
-    } catch (e) {}
-    didSrcObjectRef.current = null;
-    if (avatarVideoRef.current) {
-      try {
-        const vid = avatarVideoRef.current;
-        vid.srcObject = null;
-        vid.pause();
-        vid.removeAttribute("src");
-        (vid as any).src = "";
-        vid.load?.();
-      } catch (e) {}
-    }
 
     setLivekitToken("");
     setLivekitRoomName("");
@@ -4744,36 +3752,6 @@ const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
   }
 }
 
-if (avatarEngine === "phase2-vrm") {
-  if (
-    avatarStatus === "connecting" ||
-    avatarStatus === "connected" ||
-    avatarStatus === "reconnecting"
-  ) {
-    return;
-  }
-
-  if (!phase2Config) {
-    const missing = phase2ConfigIssues.length
-      ? phase2ConfigIssues.join(", ")
-      : "phase2_vrm_url (or resolved public_image_url), phase2_idle_vrma_url, phase2_talk_vrma_url";
-    setPhase2SessionActive(false);
-    setPhase2SpeechPacket(null);
-    setAvatarStatus("error");
-    setAvatarError(`Phase II 3D configuration is incomplete for ${String(companionName || "this companion")}. Missing: ${missing}.`);
-    return;
-  }
-
-  setPhase2RuntimeError("");
-  setPhase2SpeechPacket(null);
-  setPhase2SessionActive(true);
-  setAvatarStatus("connecting");
-  return;
-}
-
-setPhase2SessionActive(false);
-setPhase2SpeechPacket(null);
-
 if (!phase1AvatarMedia) {
   setAvatarStatus("error");
   setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
@@ -4928,40 +3906,7 @@ if (!phase1AvatarMedia) {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [avatarEngine, phase2Config, phase2ConfigIssues, phase2FailureKey, phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost, requestLivekitAvPermissions]);
-
-const handlePhase2Ready = useCallback(() => {
-  setAvatarError(null);
-  setAvatarStatus("connected");
-}, []);
-
-const handlePhase2FatalError = useCallback((message: string) => {
-  const detail = String(message || "Phase II 3D avatar failed.").trim() || "Phase II 3D avatar failed.";
-  phase2FailedCompanionsRef.current[phase2FailureKey] = detail;
-  setPhase2FallbackVersion((v) => v + 1);
-  setPhase2SessionActive(false);
-  setPhase2SpeechPacket(null);
-  setPhase2RuntimeError(detail);
-  setAvatarStatus("idle");
-}, [phase2FailureKey]);
-
-useEffect(() => {
-  if (!phase2RuntimeError) return;
-  if (liveProvider === "stream") return;
-
-  const baseMessage = `Phase II 3D avatar failed for ${String(companionName || "this companion")}. ${phase2RuntimeError}`;
-
-  if (phase1FallbackEnabled && phase1AvatarMedia?.didAgentId && phase1AvatarMedia?.didClientKey) {
-    setAvatarError(`${baseMessage} Falling back to Phase I.`);
-    setPhase2RuntimeError("");
-    if (avatarStatus === "idle") {
-      void startLiveAvatar();
-    }
-    return;
-  }
-
-  setAvatarError(`${baseMessage} No Phase I fallback is configured for this companion.`);
-}, [phase2RuntimeError, liveProvider, companionName, phase1FallbackEnabled, phase1AvatarMedia, avatarStatus, startLiveAvatar]);
+}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost, requestLivekitAvPermissions]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -4995,60 +3940,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
     console.warn("TTS/audio-url error:", e);
     return null;
   }
-}, [API_BASE, companyName, companionName]);
-
-
-const getTtsWithTimestamps = useCallback(
-  async (text: string, voiceId: string, signal?: AbortSignal): Promise<Phase2SpeechPacket | null> => {
-    try {
-      const res = await fetch(`${API_BASE}/tts/with-timestamps`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          session_id: sessionIdRef.current || "anon",
-          voice_id: voiceId,
-          brand: companyName,
-          avatar: companionName,
-          text,
-        }),
-      });
-
-      if (!res.ok) {
-        const msg = await res.text().catch(() => "");
-        console.warn("TTS/with-timestamps failed:", res.status, msg);
-        return null;
-      }
-
-      const data = (await res.json()) as {
-        audio_base64?: string;
-        mime_type?: string;
-        alignment?: Phase2Alignment;
-        normalized_alignment?: Phase2Alignment;
-        text?: string;
-      };
-      if (!data?.audio_base64) return null;
-
-      const alignment = data.normalized_alignment || data.alignment;
-      if (!alignment?.characters?.length) return null;
-
-      const mimeType = String(data.mime_type || "audio/mpeg").trim() || "audio/mpeg";
-      const audioUrl = base64ToObjectUrl(data.audio_base64, mimeType);
-      return {
-        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        text,
-        audioUrl,
-        mimeType,
-        alignment,
-        gestures: buildRuleBasedGesturePlan(text, alignment, phase2Config?.gestureVrmaUrls || {}),
-      };
-    } catch (e) {
-      console.warn("TTS/with-timestamps error:", e);
-      return null;
-    }
-  },
-  [API_BASE, companyName, companionName, phase2Config]
-);
+}, []);
 
   type SpeakAssistantHooks = {
     // Called right before we ask D-ID to speak.
@@ -5493,6 +4385,8 @@ const playLocalTtsUrl = useCallback(
 const speakAssistantReply = useCallback(
     async (replyText: string, hooks?: SpeakAssistantHooks) => {
     // NOTE: We intentionally keep STT paused while the avatar is speaking.
+    // The D-ID SDK's speak() promise can resolve before audio playback finishes,
+    // so we add a best-effort duration wait to prevent STT feedback (avatar "talking to itself").
     const clean = (replyText || "").trim();
 
     const callDidNotSpeak = () => {
@@ -5514,7 +4408,11 @@ const speakAssistantReply = useCallback(
       }
     };
 
-    if (!clean || clean.startsWith("Error:")) {
+    if (!clean) {
+      callDidNotSpeak();
+      return;
+    }
+    if (clean.startsWith("Error:")) {
       callDidNotSpeak();
       return;
     }
@@ -5523,48 +4421,6 @@ const speakAssistantReply = useCallback(
       callDidNotSpeak();
       return;
     }
-
-    const estimateSpeechMs = (text: string) => {
-      const words = text.trim().split(/\s+/).filter(Boolean).length;
-      const wpm = 160;
-      const baseMs = (words / wpm) * 60_000;
-      const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
-      return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
-    };
-    const fallbackMs = estimateSpeechMs(clean);
-
-    if (avatarEngine === "phase2-vrm") {
-      if (!phase2SessionActive) {
-        callDidNotSpeak();
-        return;
-      }
-
-      const voiceId = phase1AvatarMedia?.elevenVoiceId || getElevenVoiceIdForAvatar(companionName);
-      if (!voiceId) {
-        callDidNotSpeak();
-        return;
-      }
-
-      const packet = await getTtsWithTimestamps(clean, voiceId);
-      if (!packet) {
-        callDidNotSpeak();
-        return;
-      }
-
-      callWillSpeakOnce();
-      setPhase2SpeechPacket((prev) => {
-        try {
-          if (prev?.audioUrl) URL.revokeObjectURL(prev.audioUrl);
-        } catch (e) {}
-        return packet;
-      });
-
-      const ends = packet.alignment.character_end_times_seconds || [];
-      const durationMs = ends.length ? Math.max(fallbackMs, Math.round((ends[ends.length - 1] || 0) * 1000)) : fallbackMs;
-      await new Promise((r) => window.setTimeout(r, Math.min(90_000, durationMs + 900)));
-      return;
-    }
-
     if (!phase1AvatarMedia) {
       callDidNotSpeak();
       return;
@@ -5576,11 +4432,29 @@ const speakAssistantReply = useCallback(
       return;
     }
 
+    // Estimate duration (fallback) based on text length.
+    const estimateSpeechMs = (text: string) => {
+      const words = text.trim().split(/\s+/).filter(Boolean).length;
+      // Typical conversational pace ~160-175 WPM. Use a slightly slower rate to be safe.
+      const wpm = 160;
+      const baseMs = (words / wpm) * 60_000;
+      const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
+      return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
+    };
+
+    const fallbackMs = estimateSpeechMs(clean);
+
+    // Best-effort: read actual audio duration from the blob URL (if metadata is accessible).
     const probeAudioDurationMs = (url: string, fallback: number) =>
       new Promise<number>((resolve) => {
         if (typeof Audio === "undefined") return resolve(fallback);
         const a = new Audio();
         a.preload = "metadata";
+        // Some CDNs require this for cross-origin metadata access (best-effort).
+        try {
+        } catch (e) {
+          // ignore
+        }
 
         let doneCalled = false;
         const done = (ms: number) => {
@@ -5592,6 +4466,7 @@ const speakAssistantReply = useCallback(
           } catch (e) {
             // ignore
           }
+          // release resource
           try {
             a.src = "";
           } catch (e) {
@@ -5656,11 +4531,12 @@ const speakAssistantReply = useCallback(
       return;
     }
 
+    // Wait for audio playback to finish (plus buffer) before allowing STT to resume.
     const durationMs = await durationMsPromise;
     const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
     await new Promise((r) => window.setTimeout(r, waitMs));
   },
-  [avatarStatus, avatarEngine, phase2SessionActive, phase1AvatarMedia, companionName, getTtsAudioUrl, getTtsWithTimestamps, reconnectLiveAvatar]
+  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
 );
 
   useEffect(() => {
@@ -9705,8 +8581,7 @@ if (streamSessionActive) {
       const voiceId = ((companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey));
 
       const canLiveAvatarSpeak =
-        avatarStatus === "connected" &&
-        ((avatarEngine === "phase2-vrm" && phase2SessionActive) || (avatarEngine === "phase1-did" && !!phase1AvatarMedia && !!didAgentMgrRef.current));
+        avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
 
       // Audio-only TTS is only played in hands-free STT mode (mic button enabled),
       // when Live Avatar is NOT speaking.
@@ -9988,7 +8863,7 @@ useEffect(() => {
   // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
   // ------------------------------------------------------------
   const liveAvatarActive =
-    liveProvider !== "stream" &&
+    liveProvider === "d-id" &&
     (avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting");
 
   const speechRecognitionSupported = useMemo(() => {
@@ -12542,43 +11417,7 @@ const modePillControls = (
                         : "Host is offline."}
                     </div>
                   ) : null
-                ) : avatarEngine === "phase2-vrm" && phase2Config ? (
-                  <>
-                    <Phase2AvatarViewport
-                      config={phase2Config}
-                      active={phase2SessionActive || avatarStatus !== "idle"}
-                      speech={phase2SpeechPacket}
-                      onReady={handlePhase2Ready}
-                      onFatalError={handlePhase2FatalError}
-                    />
-                    <div
-                      style={{
-                        position: "absolute",
-                        left: 12,
-                        right: 12,
-                        bottom: 12,
-                        padding: "8px 10px",
-                        borderRadius: 10,
-                        background: "rgba(0,0,0,0.38)",
-                        color: "#fff",
-                        fontSize: 12,
-                        lineHeight: 1.35,
-                        pointerEvents: "none",
-                        border: "1px solid rgba(255,255,255,0.12)",
-                      }}
-                    >
-                      Phase II 3D runtime{phase2FailedCompanionsRef.current[phase2FailureKey] ? " (Phase I fallback armed)" : ""}
-                    </div>
-                  </>
-                ) : (
-                  <video
-                    ref={avatarVideoRef}
-                    style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
-                    playsInline
-                    autoPlay
-                    muted={false}
-                  />
-                )}
+                ) : null}
 
 				{showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
                   <div
