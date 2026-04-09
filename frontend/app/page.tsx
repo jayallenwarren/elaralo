@@ -3519,7 +3519,12 @@ useEffect(() => {
     const currentStored = resolvePublicAssetUrl(
       String((companionMapping as any)?.public_image_url ?? (companionMapping as any)?.publicImageUrl ?? "").trim()
     );
+    const companionTypeRaw = String((companionMapping as any)?.companion_type ?? (companionMapping as any)?.companionType ?? "")
+      .trim()
+      .toLowerCase();
 
+    // Human companions stay on the legacy 8.17 path in this release.
+    if (companionTypeRaw !== "ai") return;
     if (!API_BASE || !brand || !avatar) return;
     if (!isCompanionHeadshotUrl(resolved)) return;
     if (currentStored && currentStored === resolved) return;
@@ -4240,6 +4245,8 @@ const phase2Preferred = useMemo(() => {
 }, [companionTypeLc, explicitAvatarEngine]);
 
 const avatarEngine = useMemo<"stream" | "phase2-vrm" | "phase1-did">(() => {
+  // Human companions remain on the original 8.17 Stream path in this release.
+  if (companionTypeLc === "human") return "stream";
   if (explicitAvatarEngine === "stream") return "stream";
   if (explicitAvatarEngine === "phase1-did") return "phase1-did";
   if (explicitAvatarEngine === "phase2-vrm") {
@@ -4250,18 +4257,24 @@ const avatarEngine = useMemo<"stream" | "phase2-vrm" | "phase1-did">(() => {
     return "phase2-vrm";
   }
   return liveProvider === "stream" ? "stream" : "phase1-did";
-}, [explicitAvatarEngine, liveProvider, phase2FailureKey, phase2FallbackVersion, phase1FallbackEnabled, phase1AvatarMedia]);
+}, [companionTypeLc, explicitAvatarEngine, liveProvider, phase2FailureKey, phase2FallbackVersion, phase1FallbackEnabled, phase1AvatarMedia]);
 
 useEffect(() => {
   if (!companionMapping) return;
-  if (companionTypeLc === "human" && explicitAvatarEngine !== "stream") {
-    setCompanionMappingError((prev) => prev || `Invalid companion mapping: Human companions require avatar_engine=stream for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
-    return;
+  if (companionTypeLc === "human") {
+    if (channelCap !== "video") {
+      setCompanionMappingError((prev) => prev || `Invalid companion mapping: Human companions require channel_cap=Video for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
+      return;
+    }
+    if (liveProvider !== "stream") {
+      setCompanionMappingError((prev) => prev || `Invalid companion mapping: Human companions require live=Stream for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
+      return;
+    }
   }
   if (companionTypeLc === "ai" && explicitAvatarEngine === "phase2-vrm" && channelCap !== "video") {
     setCompanionMappingError((prev) => prev || `Invalid companion mapping: AI Phase II companions require channel_cap=Video for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
   }
-}, [companionMapping, companionTypeLc, explicitAvatarEngine, channelCap, companyName, companionName]);
+}, [companionMapping, companionTypeLc, explicitAvatarEngine, channelCap, liveProvider, companyName, companionName]);
 const streamUrl = useMemo(() => {
   const raw = String(companionKeyRaw || "").trim();
   const { flags } = splitCompanionKey(raw);
@@ -4269,11 +4282,15 @@ const streamUrl = useMemo(() => {
 }, [companionKeyRaw]);
 
 const liveEnabled = useMemo(() => {
+  // Restore the Human Companion gate exactly to the 8.17 contract:
+  // channel_cap=Video AND live=Stream.
+  if (companionTypeLc === "human") {
+    return channelCap === "video" && liveProvider === "stream";
+  }
   if (channelCap !== "video") return false;
-  if (companionTypeLc === "human") return explicitAvatarEngine === "stream";
   if (companionTypeLc === "ai") return explicitAvatarEngine === "phase2-vrm" || explicitAvatarEngine === "phase1-did";
   return false;
-}, [channelCap, companionTypeLc, explicitAvatarEngine]);
+}, [channelCap, companionTypeLc, liveProvider, explicitAvatarEngine]);
 
 
   // Wix templates (and some site themes) may apply a gray page background.
