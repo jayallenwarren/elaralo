@@ -14,6 +14,7 @@ import asyncio
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Set
+from urllib.parse import urlsplit, urlunsplit, quote, unquote
 
 # Pydantic (v1/v2 compatibility)
 try:
@@ -1031,6 +1032,55 @@ def _ensure_writable_db_copy(src_db_path: str) -> str:
         return src_db_path
 
 
+
+_PHASE2_COMPANION_MAPPING_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("avatar_engine", "TEXT"),
+    ("phase2_enabled", "INTEGER"),
+    ("phase1_fallback_enabled", "INTEGER"),
+    ("public_image_root", "TEXT"),
+    ("public_image_url", "TEXT"),
+    ("phase2_vrm_url", "TEXT"),
+    ("phase2_idle_vrma_url", "TEXT"),
+    ("phase2_talk_vrma_url", "TEXT"),
+    ("phase2_gesture_urls", "TEXT"),
+    ("phase2_camera_fov", "REAL"),
+    ("phase2_camera_position", "TEXT"),
+    ("phase2_look_at", "TEXT"),
+    ("phase2_scale", "REAL"),
+    ("phase2_background", "TEXT"),
+)
+
+
+def _quote_ident_sqlite(name: str) -> str:
+    return '"' + str(name or "").replace('"', '""') + '"'
+
+
+def _ensure_companion_mapping_phase2_columns_best_effort(db_path: str, table: str) -> None:
+    if not db_path or not table:
+        return
+
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        quoted_table = _quote_ident_sqlite(table)
+        cur.execute(f"PRAGMA table_info({quoted_table})")
+        existing = {str(r[1]).lower() for r in cur.fetchall()}
+        to_add = [(col, decl) for (col, decl) in _PHASE2_COMPANION_MAPPING_COLUMNS if col.lower() not in existing]
+        for col, decl in to_add:
+            cur.execute(f"ALTER TABLE {quoted_table} ADD COLUMN {_quote_ident_sqlite(col)} {decl}")
+        if to_add:
+            conn.commit()
+    except Exception as e:
+        print(f"[mappings] WARNING: failed ensuring Phase II columns on {db_path} table={table}: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _load_companion_mappings_sync() -> None:
     global _COMPANION_MAPPINGS, _COMPANION_MAPPINGS_LOADED_AT, _COMPANION_MAPPINGS_SOURCE, _COMPANION_MAPPINGS_TABLE
 
@@ -1085,6 +1135,8 @@ def _load_companion_mappings_sync() -> None:
             _COMPANION_MAPPINGS_SOURCE = db_path
             _COMPANION_MAPPINGS_TABLE = ""
             return
+
+        _ensure_companion_mapping_phase2_columns_best_effort(db_path, table)
 
         # Quote the table name to safely handle names with special characters.
         cur.execute(f'SELECT * FROM "{table}"')
@@ -1146,7 +1198,6 @@ def _load_companion_mappings_sync() -> None:
             "brand": brand,
             "avatar": avatar,
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
-            # UI uses channel_cap to decide whether to show the video/play controls.
             "channel_cap": str(get_col("channel_cap", "channelCap", "chanel_cap", "channel_capability", default="") or "").strip(),
             "eleven_voice_id": str(get_col("eleven_voice_id", "Eleven_Voice_ID", default="") or ""),
             "live": str(get_col("live", "Live", default="") or "").strip(),
@@ -1158,11 +1209,11 @@ def _load_companion_mappings_sync() -> None:
             "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
             "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
             "did_client_key": str(get_col("did_client_key", "DID_CLIENT_KEY", default="") or ""),
-            # Phase II / custom-avatar runtime fields (optional; safe to omit from DB).
             "avatar_engine": str(get_col("avatar_engine", "Avatar_Engine", "avatarEngine", default="") or "").strip(),
             "phase2_enabled": get_col("phase2_enabled", "Phase2_Enabled", "phase2Enabled", default=""),
-            "phase2_asset_root": str(get_col("phase2_asset_root", "Phase2_Asset_Root", "phase2AssetRoot", default="") or "").strip(),
-            "phase2_common_root": str(get_col("phase2_common_root", "Phase2_Common_Root", "phase2CommonRoot", default="") or "").strip(),
+            "phase1_fallback_enabled": get_col("phase1_fallback_enabled", "Phase1_Fallback_Enabled", "phase1FallbackEnabled", default=""),
+            "public_image_root": str(get_col("public_image_root", "Public_Image_Root", "publicImageRoot", default="") or "").strip(),
+            "public_image_url": str(get_col("public_image_url", "Public_Image_URL", "publicImageUrl", default="") or "").strip(),
             "phase2_vrm_url": str(get_col("phase2_vrm_url", "Phase2_VRM_URL", "phase2VrmUrl", default="") or "").strip(),
             "phase2_idle_vrma_url": str(get_col("phase2_idle_vrma_url", "Phase2_IDLE_VRMA_URL", "phase2IdleVrmaUrl", default="") or "").strip(),
             "phase2_talk_vrma_url": str(get_col("phase2_talk_vrma_url", "Phase2_TALK_VRMA_URL", "phase2TalkVrmaUrl", default="") or "").strip(),
@@ -1172,8 +1223,8 @@ def _load_companion_mappings_sync() -> None:
             "phase2_look_at": get_col("phase2_look_at", "Phase2_Look_At", "phase2LookAt", default=""),
             "phase2_scale": get_col("phase2_scale", "Phase2_Scale", "phase2Scale", default=""),
             "phase2_background": str(get_col("phase2_background", "Phase2_Background", "phase2Background", default="") or "").strip(),
-            # Preserve common extra fields when present (helps debugging / future UIs).
-            "companion_id": str(get_col("companion_id", "Companion_ID", "CompanionId", default="") or ""),
+            "companion_id": str(get_col("companion_id", "Companion_ID", "CompanionId", "id", "ID", default="") or ""),
+            "mapping_id": str(get_col("id", "ID", "mapping_id", "Mapping_ID", default="") or ""),
         }
 
     _COMPANION_MAPPINGS = d
@@ -1220,6 +1271,93 @@ def _jsonish(value: Any) -> Any:
         return json.loads(str(value))
     except Exception:
         return str(value)
+
+
+def _normalize_avatar_engine(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw in {"stream", "livekit", "beestreamed"}:
+        return "stream"
+    if raw in {"phase1-did", "phase1", "did", "d-id"}:
+        return "phase1-did"
+    if raw in {"phase2-vrm", "phase2", "vrm", "3d", "custom"}:
+        return "phase2-vrm"
+    return ""
+
+
+def _normalize_live_provider(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw == "stream":
+        return "stream"
+    if raw in {"d-id", "did"}:
+        return "d-id"
+    return ""
+
+
+def _derive_phase2_vrm_url_from_public_image(public_image_url: Any) -> str:
+    raw = str(public_image_url or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("data:") or raw.startswith("blob:"):
+        return ""
+
+    split = urlsplit(raw)
+    path = str(split.path or "")
+    if not path:
+        return ""
+
+    slash = path.rfind("/")
+    directory = path[: slash + 1] if slash >= 0 else ""
+    filename = path[slash + 1 :] if slash >= 0 else path
+    if not filename:
+        return ""
+
+    decoded = unquote(filename)
+    if not re.search(r"\.(png|jpg|jpeg|webp)$", decoded, flags=re.I):
+        return ""
+
+    stem = re.sub(r"\.(png|jpg|jpeg|webp)$", "", decoded, flags=re.I).strip()
+    if not stem:
+        return ""
+
+    new_path = f"{directory}{quote(stem)}.vrm"
+    return urlunsplit((split.scheme, split.netloc, new_path, split.query, split.fragment))
+
+
+def _derive_public_image_root(public_image_url: Any) -> str:
+    raw = str(public_image_url or "").strip()
+    if not raw:
+        return ""
+
+    split = urlsplit(raw)
+    path = str(split.path or "")
+    if not path:
+        return ""
+
+    slash = path.rfind("/")
+    if slash < 0:
+        return ""
+
+    dir_path = path[:slash]
+    return urlunsplit((split.scheme, split.netloc, dir_path, "", "")) if split.scheme or split.netloc else dir_path
+
+
+def _resolved_phase2_vrm_url(mapping: Dict[str, Any]) -> str:
+    explicit = str(mapping.get("phase2_vrm_url") or "").strip()
+    if explicit:
+        return explicit
+    return _derive_phase2_vrm_url_from_public_image(mapping.get("public_image_url"))
+
+
+def _phase2_missing_fields(mapping: Dict[str, Any]) -> List[str]:
+    missing: List[str] = []
+    if not _resolved_phase2_vrm_url(mapping):
+        missing.append("phase2_vrm_url_or_public_image_url")
+    for key in ("phase2_idle_vrma_url", "phase2_talk_vrma_url"):
+        if not str(mapping.get(key) or "").strip():
+            missing.append(key)
+    return missing
 
 
 @app.on_event("startup")
@@ -1289,20 +1427,13 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
     cap_raw = str(m.get("channel_cap") or "").strip()
     live_raw = str(m.get("live") or "").strip()
     ctype_raw = str(m.get("companion_type") or "").strip()
+    avatar_engine_raw = str(m.get("avatar_engine") or "").strip()
 
-    # Strict validation (config contract)
     cap_lc = cap_raw.lower()
     if cap_lc not in ("video", "audio"):
         raise HTTPException(
             status_code=500,
             detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
-        )
-
-    live_lc = live_raw.lower()
-    if live_lc not in ("stream", "d-id"):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
         )
 
     ctype_lc = ctype_raw.lower()
@@ -1312,26 +1443,77 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
             detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
         )
 
-    # Business rule: AI companions must use D-ID. Human companions must use Stream.
-    if ctype_lc == "human" and live_lc != "stream":
+    avatar_engine_norm = _normalize_avatar_engine(avatar_engine_raw)
+    if not avatar_engine_norm:
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            detail=(
+                f"Invalid avatar_engine in DB for brand='{b}' avatar='{a}': {avatar_engine_raw!r} "
+                "(expected 'stream', 'phase2-vrm', or 'phase1-did')"
+            ),
         )
-    if ctype_lc == "ai" and live_lc != "d-id":
+
+    live_norm = _normalize_live_provider(live_raw)
+    if live_raw and not live_norm:
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream', 'D-ID', or empty for AI Phase II rows)",
         )
+
+    if ctype_lc == "human":
+        if cap_lc != "video":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: companion_type=Human requires channel_cap=Video for brand='{b}' avatar='{a}' (got {cap_raw!r})",
+            )
+        if avatar_engine_norm != "stream":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: companion_type=Human requires avatar_engine=stream for brand='{b}' avatar='{a}' (got {avatar_engine_raw!r})",
+            )
+        if live_norm != "stream":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            )
+    else:
+        if cap_lc != "video":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: companion_type=AI requires channel_cap=Video for brand='{b}' avatar='{a}' (got {cap_raw!r})",
+            )
+        if avatar_engine_norm not in ("phase2-vrm", "phase1-did"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: companion_type=AI requires avatar_engine=phase2-vrm or phase1-did for brand='{b}' avatar='{a}' (got {avatar_engine_raw!r})",
+            )
+        if live_norm and live_norm != "d-id":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: companion_type=AI only supports live=D-ID when live is set for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            )
+        if avatar_engine_norm == "phase1-did" and live_norm != "d-id":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid mapping: avatar_engine=phase1-did requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            )
+
+    phase2_enabled_out = bool(_coerce_boolish(m.get("phase2_enabled"), default=(avatar_engine_norm == "phase2-vrm")))
+    phase1_fallback_enabled_out = bool(_coerce_boolish(m.get("phase1_fallback_enabled"), default=False))
+    if phase1_fallback_enabled_out and not (str(m.get("did_agent_id") or "").strip() and str(m.get("did_client_key") or "").strip()):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid mapping: phase1_fallback_enabled=1 requires did_agent_id and did_client_key for brand='{b}' avatar='{a}'",
+        )
+
+    resolved_phase2_vrm_url = _resolved_phase2_vrm_url(m)
+    phase2_vrm_url_source = "explicit" if str(m.get("phase2_vrm_url") or "").strip() else ("public_image_url" if resolved_phase2_vrm_url else "")
+    phase2_missing = _phase2_missing_fields(m) if avatar_engine_norm == "phase2-vrm" and phase2_enabled_out else []
+    phase2_ready_out = bool(avatar_engine_norm == "phase2-vrm" and phase2_enabled_out and not phase2_missing)
 
     cap_out = "Video" if cap_lc == "video" else "Audio"
-    live_out = "Stream" if live_lc == "stream" else "D-ID"
+    live_out = "Stream" if live_norm == "stream" else ("D-ID" if live_norm == "d-id" else "")
     ctype_out = "Human" if ctype_lc == "human" else "AI"
-
-    avatar_engine_raw = str(m.get("avatar_engine") or "").strip()
-    if not avatar_engine_raw:
-        avatar_engine_raw = "phase2-vrm" if ctype_lc == "ai" else ("stream" if live_lc == "stream" else "phase1-did")
-    phase2_enabled_out = _coerce_boolish(m.get("phase2_enabled"), default=(ctype_lc == "ai"))
 
     return {
         "found": True,
@@ -1350,16 +1532,24 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "didClientKey": str(m.get("did_client_key") or ""),
         "didAgentLink": str(m.get("did_agent_link") or ""),
         "didEmbedCode": str(m.get("did_embed_code") or ""),
-        "avatarEngine": avatar_engine_raw,
-        "avatar_engine": avatar_engine_raw,
+        "avatarEngine": avatar_engine_norm,
+        "avatar_engine": avatar_engine_norm,
         "phase2Enabled": phase2_enabled_out,
         "phase2_enabled": phase2_enabled_out,
-        "phase2AssetRoot": str(m.get("phase2_asset_root") or ""),
-        "phase2_asset_root": str(m.get("phase2_asset_root") or ""),
-        "phase2CommonRoot": str(m.get("phase2_common_root") or ""),
-        "phase2_common_root": str(m.get("phase2_common_root") or ""),
-        "phase2VrmUrl": str(m.get("phase2_vrm_url") or ""),
-        "phase2_vrm_url": str(m.get("phase2_vrm_url") or ""),
+        "phase1FallbackEnabled": phase1_fallback_enabled_out,
+        "phase1_fallback_enabled": phase1_fallback_enabled_out,
+        "publicImageRoot": str(m.get("public_image_root") or ""),
+        "public_image_root": str(m.get("public_image_root") or ""),
+        "publicImageUrl": str(m.get("public_image_url") or ""),
+        "public_image_url": str(m.get("public_image_url") or ""),
+        "phase2Ready": phase2_ready_out,
+        "phase2_ready": phase2_ready_out,
+        "phase2MissingFields": phase2_missing,
+        "phase2_missing_fields": phase2_missing,
+        "phase2VrmUrl": resolved_phase2_vrm_url,
+        "phase2_vrm_url": resolved_phase2_vrm_url,
+        "phase2VrmUrlSource": phase2_vrm_url_source,
+        "phase2_vrm_url_source": phase2_vrm_url_source,
         "phase2IdleVrmaUrl": str(m.get("phase2_idle_vrma_url") or ""),
         "phase2_idle_vrma_url": str(m.get("phase2_idle_vrma_url") or ""),
         "phase2TalkVrmaUrl": str(m.get("phase2_talk_vrma_url") or ""),
@@ -1376,10 +1566,45 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "phase2_scale": m.get("phase2_scale") if m.get("phase2_scale") not in (None, "") else "",
         "phase2Background": str(m.get("phase2_background") or ""),
         "phase2_background": str(m.get("phase2_background") or ""),
+        "companionId": str(m.get("companion_id") or m.get("mapping_id") or ""),
+        "companion_id": str(m.get("companion_id") or m.get("mapping_id") or ""),
+        "mappingId": str(m.get("mapping_id") or m.get("companion_id") or ""),
+        "mapping_id": str(m.get("mapping_id") or m.get("companion_id") or ""),
         "phonetic": str(m.get("phonetic") or ""),
         "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
         "source": _COMPANION_MAPPINGS_SOURCE,
         "table": _COMPANION_MAPPINGS_TABLE,
+    }
+
+
+@app.post("/mappings/companion/public-image-url")
+async def set_companion_public_image_url(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    brand = str((payload or {}).get("brand") or "").strip() or "Elaralo"
+    avatar = str((payload or {}).get("avatar") or "").strip()
+    public_image_url = str((payload or {}).get("public_image_url") or "").strip()
+
+    if not avatar:
+        raise HTTPException(status_code=400, detail="avatar is required")
+    if not public_image_url:
+        raise HTTPException(status_code=400, detail="public_image_url is required")
+    if "/companion/headshot/" not in public_image_url.lower():
+        raise HTTPException(status_code=400, detail="public_image_url must point to a companion headshot asset")
+
+    ok = await run_in_threadpool(_persist_public_image_url_best_effort, brand, avatar, public_image_url)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to persist public_image_url to companion mapping")
+
+    mapping = _lookup_companion_mapping(brand, avatar) or {}
+    return {
+        "ok": True,
+        "brand": brand,
+        "avatar": avatar,
+        "public_image_url": str(mapping.get("public_image_url") or public_image_url),
+        "publicImageUrl": str(mapping.get("public_image_url") or public_image_url),
+        "public_image_root": str(mapping.get("public_image_root") or _derive_public_image_root(public_image_url)),
+        "publicImageRoot": str(mapping.get("public_image_root") or _derive_public_image_root(public_image_url)),
+        "phase2_vrm_url": _resolved_phase2_vrm_url(mapping) or _derive_phase2_vrm_url_from_public_image(public_image_url),
+        "phase2VrmUrl": _resolved_phase2_vrm_url(mapping) or _derive_phase2_vrm_url_from_public_image(public_image_url),
     }
 
 
@@ -2404,6 +2629,65 @@ def _get_companion_mappings_db_path(for_write: bool = False) -> str:
         return writable or db_path
     except Exception:
         return db_path
+
+
+
+def _persist_public_image_url_best_effort(brand: str, avatar: str, public_image_url: str) -> bool:
+    b = (brand or "").strip() or "Elaralo"
+    a = (avatar or "").strip()
+    u = (public_image_url or "").strip()
+    if not a or not u:
+        return False
+
+    root = _derive_public_image_root(u)
+
+    try:
+        key = (b.lower(), a.lower())
+        if key in _COMPANION_MAPPINGS:
+            _COMPANION_MAPPINGS[key]["public_image_url"] = u
+            if root:
+                _COMPANION_MAPPINGS[key]["public_image_root"] = root
+    except Exception:
+        pass
+
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    if not db_path or not os.path.exists(db_path):
+        return False
+
+    table_name = (_COMPANION_MAPPINGS_TABLE or "companion_mappings").strip() or "companion_mappings"
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name):
+        table_name = "companion_mappings"
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table_name})")
+        cols = [str(r[1] or "").strip().lower() for r in cur.fetchall()]
+        if "public_image_url" not in cols:
+            cur.execute(f'ALTER TABLE {table_name} ADD COLUMN "public_image_url" TEXT')
+            cols.append("public_image_url")
+        if "public_image_root" not in cols:
+            cur.execute(f'ALTER TABLE {table_name} ADD COLUMN "public_image_root" TEXT')
+            cols.append("public_image_root")
+
+        cur.execute(
+            f"UPDATE {table_name} "
+            f"SET public_image_url = ?, "
+            f"    public_image_root = CASE WHEN public_image_root IS NULL OR trim(public_image_root) = '' THEN ? ELSE public_image_root END "
+            f"WHERE lower(brand) = lower(?) AND lower(avatar) = lower(?)",
+            (u, root, b, a),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 
 def _is_session_active(brand: str, avatar: str) -> bool:

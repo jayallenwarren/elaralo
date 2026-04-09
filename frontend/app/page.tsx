@@ -165,12 +165,14 @@ type Phase2SpeechPacket = {
   gestures: Phase2GestureCue[];
 };
 
+type AvatarEngine = "" | "stream" | "phase2-vrm" | "phase1-did";
+
 type Phase2AvatarConfig = {
   key: string;
   label: string;
   vrmUrl: string;
-  idleVrmaUrl?: string;
-  talkVrmaUrl?: string;
+  idleVrmaUrl: string;
+  talkVrmaUrl: string;
   gestureVrmaUrls: Record<string, string>;
   cameraFov?: number;
   cameraPosition?: [number, number, number];
@@ -206,6 +208,92 @@ function normalizeCompanionSlug(value: string | null | undefined): string {
     .replace(/^-+|-+$/g, "") || "avatar";
 }
 
+function resolvePublicAssetUrl(path: string | null | undefined): string {
+  const raw = String(path || "").trim();
+  if (!raw) return "";
+  if (/^(?:https?:)?\/\//i.test(raw)) return raw;
+  if (raw.startsWith("data:") || raw.startsWith("blob:")) return raw;
+  const base = String(APP_BASE_PATH || "").trim();
+  if (base && (raw === base || raw.startsWith(`${base}/`))) return raw;
+  const normalized = raw.startsWith("/") ? raw : `/${raw}`;
+  return joinUrlPrefix(APP_BASE_PATH, normalized);
+}
+
+function isCompanionHeadshotUrl(value: string | null | undefined): boolean {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  return /\/companion\/headshot\//i.test(raw);
+}
+
+function deriveSiblingAssetUrlFromPublicImage(publicImageUrl: string | null | undefined, nextExt: string): string {
+  const raw = String(publicImageUrl || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("data:") || raw.startsWith("blob:")) return "";
+
+  const match = raw.match(/^([^?#]*)(.*)$/);
+  const pathOnly = match ? String(match[1] || "") : raw;
+  const suffix = match ? String(match[2] || "") : "";
+
+  const slash = pathOnly.lastIndexOf("/");
+  const dir = slash >= 0 ? pathOnly.slice(0, slash) : "";
+  const file = slash >= 0 ? pathOnly.slice(slash + 1) : pathOnly;
+  const decodedFile = (() => {
+    try {
+      return decodeURIComponent(file);
+    } catch (e) {
+      return file;
+    }
+  })();
+  if (!/\.(png|jpg|jpeg|webp)$/i.test(decodedFile)) return "";
+  const stem = stripExt(decodedFile);
+  const ext = String(nextExt || "").replace(/^\./, "").trim();
+  if (!stem || !ext) return "";
+  return `${dir ? `${dir}/` : ""}${encodeURIComponent(stem)}.${ext}${suffix}`;
+}
+
+function resolvePhase2SourcePublicImageUrl(
+  mapping: CompanionMappingRow | null,
+  resolvedAvatarSrc?: string | null,
+): string {
+  const explicit = resolvePublicAssetUrl(
+    String((mapping as any)?.public_image_url ?? (mapping as any)?.publicImageUrl ?? "").trim()
+  );
+  if (isCompanionHeadshotUrl(explicit)) return explicit;
+
+  const liveResolved = String(resolvedAvatarSrc || "").trim();
+  if (isCompanionHeadshotUrl(liveResolved)) return liveResolved;
+
+  return "";
+}
+
+function trimTrailingSlash(value: string | null | undefined): string {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+function normalizeAvatarEngine(value: any): AvatarEngine {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  if (["stream", "livekit", "beestreamed"].includes(raw)) return "stream";
+  if (["phase1-did", "phase1", "did", "d-id"].includes(raw)) return "phase1-did";
+  if (["phase2-vrm", "phase2", "vrm", "3d", "custom"].includes(raw)) return "phase2-vrm";
+  return "";
+}
+
+function coerceStringArray(value: any): string[] {
+  if (value === undefined || value === null || value === "") return [];
+  if (Array.isArray(value)) return uniqueStrings(value.map((v) => String(v || "").trim()));
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return uniqueStrings(parsed.map((v) => String(v || "").trim()));
+    } catch (e) {}
+    return [trimmed];
+  }
+  return [];
+}
+
 function safeJsonParse<T = any>(value: any, fallback: T): T {
   if (value === undefined || value === null || value === "") return fallback;
   if (typeof value === "object") return value as T;
@@ -228,6 +316,52 @@ function coerceTuple3(value: any, fallback: [number, number, number]): [number, 
     if (nums.length >= 3) return [nums[0], nums[1], nums[2]];
   }
   return fallback;
+}
+
+function collectPhase2ConfigIssues(
+  mapping: CompanionMappingRow | null,
+  avatarName?: string | null,
+  resolvedPublicImageUrl?: string | null,
+): string[] {
+  const avatar = String(avatarName || mapping?.avatar || "").trim();
+  if (!avatar) return ["avatar"];
+
+  const companionType = String(mapping?.companion_type ?? mapping?.companionType ?? "").trim().toLowerCase();
+  if (companionType && companionType !== "ai") return [];
+
+  const avatarEngine = normalizeAvatarEngine((mapping as any)?.avatar_engine ?? (mapping as any)?.avatarEngine);
+  if (avatarEngine && avatarEngine !== "phase2-vrm") return [];
+
+  const explicitEnabled = parseBoolish((mapping as any)?.phase2_enabled ?? (mapping as any)?.phase2Enabled);
+  if (explicitEnabled === false) return [];
+
+  const explicitVrmUrl = String((mapping as any)?.phase2_vrm_url ?? (mapping as any)?.phase2VrmUrl ?? "").trim();
+  const publicImageUrl = resolvePhase2SourcePublicImageUrl(mapping, resolvedPublicImageUrl);
+  const derivedVrmUrl = !explicitVrmUrl ? deriveSiblingAssetUrlFromPublicImage(publicImageUrl, "vrm") : "";
+
+  const backendIssues = uniqueStrings(
+    coerceStringArray((mapping as any)?.phase2_missing_fields ?? (mapping as any)?.phase2MissingFields)
+  ).filter((issue) => {
+    const norm = String(issue || "").trim().toLowerCase();
+    if (!norm) return false;
+    if ((norm === "phase2_vrm_url" || norm === "phase2_vrm_url_or_public_image_url") && (explicitVrmUrl || derivedVrmUrl)) {
+      return false;
+    }
+    return true;
+  });
+
+  const localIssues: string[] = [];
+  if (!explicitVrmUrl && !derivedVrmUrl) {
+    localIssues.push("phase2_vrm_url or public_image_url (resolved companion headshot)");
+  }
+  if (!String((mapping as any)?.phase2_idle_vrma_url ?? (mapping as any)?.phase2IdleVrmaUrl ?? "").trim()) {
+    localIssues.push("phase2_idle_vrma_url");
+  }
+  if (!String((mapping as any)?.phase2_talk_vrma_url ?? (mapping as any)?.phase2TalkVrmaUrl ?? "").trim()) {
+    localIssues.push("phase2_talk_vrma_url");
+  }
+
+  return uniqueStrings([...backendIssues, ...localIssues]);
 }
 
 function buildWordTimings(alignment: Phase2Alignment): WordTiming[] {
@@ -316,35 +450,44 @@ function buildRuleBasedGesturePlan(text: string, alignment: Phase2Alignment, ava
   return deduped.slice(0, 6);
 }
 
-function resolvePhase2AvatarConfig(mapping: CompanionMappingRow | null, avatarName: string | null | undefined): Phase2AvatarConfig | null {
+function resolvePhase2AvatarConfig(
+  mapping: CompanionMappingRow | null,
+  avatarName: string | null | undefined,
+  resolvedPublicImageUrl?: string | null,
+): Phase2AvatarConfig | null {
   const avatar = String(avatarName || mapping?.avatar || "").trim();
   if (!avatar) return null;
 
   const companionType = String(mapping?.companion_type ?? mapping?.companionType ?? "").trim().toLowerCase();
   if (companionType && companionType !== "ai") return null;
 
+  const avatarEngine = normalizeAvatarEngine((mapping as any)?.avatar_engine ?? (mapping as any)?.avatarEngine);
+  if (avatarEngine && avatarEngine !== "phase2-vrm") return null;
+
   const explicitEnabled = parseBoolish((mapping as any)?.phase2_enabled ?? (mapping as any)?.phase2Enabled);
   if (explicitEnabled === false) return null;
 
-  const slug = normalizeCompanionSlug(avatar);
-  const phase2Root = String((mapping as any)?.phase2_asset_root ?? (mapping as any)?.phase2AssetRoot ?? `/avatars/phase2/${slug}`).trim() || `/avatars/phase2/${slug}`;
-  const commonRoot = String((mapping as any)?.phase2_common_root ?? (mapping as any)?.phase2CommonRoot ?? "/avatars/phase2/common").trim() || "/avatars/phase2/common";
+  const issues = collectPhase2ConfigIssues(mapping, avatar, resolvedPublicImageUrl);
+  if (issues.length) return null;
+
+  const sourcePublicImageUrl = resolvePhase2SourcePublicImageUrl(mapping, resolvedPublicImageUrl);
+  const explicitVrmUrl = resolvePublicAssetUrl(String((mapping as any)?.phase2_vrm_url ?? (mapping as any)?.phase2VrmUrl ?? "").trim());
+  const derivedVrmUrl = !explicitVrmUrl ? deriveSiblingAssetUrlFromPublicImage(sourcePublicImageUrl, "vrm") : "";
+
   const gestures = safeJsonParse<Record<string, string>>((mapping as any)?.phase2_gesture_urls ?? (mapping as any)?.phase2GestureUrls, {} as Record<string, string>);
-  const defaultGestures: Record<string, string> = {
-    nod: `${commonRoot}/nod.vrma`,
-    shrug: `${commonRoot}/shrug.vrma`,
-    open_palm_emphasis: `${commonRoot}/open-palm-emphasis.vrma`,
-    point: `${commonRoot}/point.vrma`,
-    wave: `${commonRoot}/wave.vrma`,
-  };
+  const gestureVrmaUrls: Record<string, string> = {};
+  Object.entries(gestures || {}).forEach(([key, value]) => {
+    const resolved = resolvePublicAssetUrl(String(value || "").trim());
+    if (resolved) gestureVrmaUrls[key] = resolved;
+  });
 
   return {
-    key: slug,
+    key: normalizeCompanionSlug(avatar),
     label: avatar,
-    vrmUrl: String((mapping as any)?.phase2_vrm_url ?? (mapping as any)?.phase2VrmUrl ?? `${phase2Root}/${slug}.vrm`).trim(),
-    idleVrmaUrl: String((mapping as any)?.phase2_idle_vrma_url ?? (mapping as any)?.phase2IdleVrmaUrl ?? `${commonRoot}/idle.vrma`).trim(),
-    talkVrmaUrl: String((mapping as any)?.phase2_talk_vrma_url ?? (mapping as any)?.phase2TalkVrmaUrl ?? `${commonRoot}/talk.vrma`).trim(),
-    gestureVrmaUrls: { ...defaultGestures, ...gestures },
+    vrmUrl: explicitVrmUrl || derivedVrmUrl,
+    idleVrmaUrl: resolvePublicAssetUrl(String((mapping as any)?.phase2_idle_vrma_url ?? (mapping as any)?.phase2IdleVrmaUrl ?? "").trim()),
+    talkVrmaUrl: resolvePublicAssetUrl(String((mapping as any)?.phase2_talk_vrma_url ?? (mapping as any)?.phase2TalkVrmaUrl ?? "").trim()),
+    gestureVrmaUrls,
     cameraFov: Number((mapping as any)?.phase2_camera_fov ?? (mapping as any)?.phase2CameraFov ?? 35) || 35,
     cameraPosition: coerceTuple3((mapping as any)?.phase2_camera_position ?? (mapping as any)?.phase2CameraPosition, [0, 1.42, 2.15]),
     lookAtTarget: coerceTuple3((mapping as any)?.phase2_look_at ?? (mapping as any)?.phase2LookAt, [0, 1.35, 0]),
@@ -453,18 +596,25 @@ function Phase2AvatarViewport({
     }
 
     const loadVrm = async (): Promise<VRM> => {
+      const candidate = String(config.vrmUrl || "").trim();
+      if (!candidate) throw new Error("Missing phase2_vrm_url.");
+
       const loader = new GLTFLoader();
       loader.register((parser) => new VRMLoaderPlugin(parser));
-      const gltf = await new Promise<any>((resolve, reject) => loader.load(config.vrmUrl, resolve, undefined, reject));
-      const vrm: VRM = gltf.userData.vrm;
-      VRMUtils.removeUnnecessaryVertices(gltf.scene);
-      VRMUtils.combineSkeletons(gltf.scene);
-      try { VRMUtils.combineMorphs(vrm); } catch (e) {}
-      vrm.scene.traverse((obj: any) => {
-        obj.frustumCulled = false;
-      });
-      vrm.scene.scale.setScalar(config.scale || 1);
-      return vrm;
+      try {
+        const gltf = await new Promise<any>((resolve, reject) => loader.load(candidate, resolve, undefined, reject));
+        const vrm: VRM = gltf.userData.vrm;
+        VRMUtils.removeUnnecessaryVertices(gltf.scene);
+        VRMUtils.combineSkeletons(gltf.scene);
+        try { VRMUtils.combineMorphs(vrm); } catch (e) {}
+        vrm.scene.traverse((obj: any) => {
+          obj.frustumCulled = false;
+        });
+        vrm.scene.scale.setScalar(config.scale || 1);
+        return vrm;
+      } catch (e) {
+        throw new Error(`Unable to load VRM asset at ${candidate}. ${e}`);
+      }
     };
 
     const loadVrmaClip = async (url: string, vrm: VRM): Promise<THREE.AnimationClip | null> => {
@@ -712,7 +862,7 @@ type UploadedAttachment = {
 
 type Mode = "friend" | "romantic" | "intimate";
 
-type LiveProvider = "d-id" | "stream";
+type LiveProvider = "" | "d-id" | "stream";
 
 type SessionKind = "stream" | "private" | "conference" | "";
 
@@ -734,15 +884,20 @@ type CompanionMappingRow = {
   didAgentId?: string;
   elevenVoiceId?: string;
 
-  // Phase II runtime overrides (optional; backend may omit them and we derive defaults).
   avatar_engine?: string | null;
   avatarEngine?: string | null;
   phase2_enabled?: boolean | string | number | null;
   phase2Enabled?: boolean | string | number | null;
-  phase2_asset_root?: string | null;
-  phase2AssetRoot?: string | null;
-  phase2_common_root?: string | null;
-  phase2CommonRoot?: string | null;
+  phase1_fallback_enabled?: boolean | string | number | null;
+  phase1FallbackEnabled?: boolean | string | number | null;
+  public_image_root?: string | null;
+  publicImageRoot?: string | null;
+  public_image_url?: string | null;
+  publicImageUrl?: string | null;
+  phase2_ready?: boolean | string | number | null;
+  phase2Ready?: boolean | string | number | null;
+  phase2_missing_fields?: string[] | string | null;
+  phase2MissingFields?: string[] | string | null;
   phase2_vrm_url?: string | null;
   phase2VrmUrl?: string | null;
   phase2_idle_vrma_url?: string | null;
@@ -762,10 +917,12 @@ type CompanionMappingRow = {
   phase2_background?: string | null;
   phase2Background?: string | null;
 
-  // Optional DB column used for UI labeling.
-  // Expected values: "Human" | "AI" (case-insensitive), but treated as a free-form string.
   companion_type?: string | null;
-  companionType?: string | null; // optional API alias
+  companionType?: string | null;
+  companion_id?: string | null;
+  companionId?: string | null;
+  mapping_id?: string | null;
+  mappingId?: string | null;
 };
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
@@ -1748,6 +1905,56 @@ function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: stri
     for (const ext of exts) candidates.push(`${base}.${ext}`);
   }
 
+  candidates.push(DEFAULT_AVATAR);
+  return candidates;
+}
+
+function buildAvatarCandidatesFromSource(opts: {
+  companionKeyOrName: string;
+  explicitUrl?: string | null;
+  explicitRoot?: string | null;
+  rebrandingSlug?: string;
+}) {
+  const explicitUrl = resolvePublicAssetUrl(String(opts.explicitUrl || "").trim());
+  if (explicitUrl) return uniqueStrings([explicitUrl, DEFAULT_AVATAR]);
+
+  const rootRaw = String(opts.explicitRoot || "").trim();
+  if (!rootRaw) return buildAvatarCandidates(opts.companionKeyOrName, opts.rebrandingSlug);
+
+  const root = trimTrailingSlash(resolvePublicAssetUrl(rootRaw));
+  if (!root) return buildAvatarCandidates(opts.companionKeyOrName, opts.rebrandingSlug);
+
+  const raw = stripExt(String(opts.companionKeyOrName || "").trim());
+  if (!raw) return [DEFAULT_AVATAR];
+
+  const baseInputs = Array.from(
+    new Set([raw, stripTrailingUuid(raw)].map((v) => String(v || "").trim()).filter(Boolean))
+  );
+
+  const encVariants: string[] = [];
+  const seenEnc = new Set<string>();
+  for (const baseInput of baseInputs) {
+    const normalized = normalizeKeyForFile(baseInput);
+    const lower = normalized.toLowerCase();
+    const title = toTitleCaseHyphenated(lower);
+    for (const v of [normalized, title, lower]) {
+      const trimmed = String(v || "").trim();
+      if (!trimmed) continue;
+      const enc = encodeURIComponent(trimmed);
+      if (!seenEnc.has(enc)) {
+        seenEnc.add(enc);
+        encVariants.push(enc);
+      }
+    }
+  }
+
+  const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
+  const candidates: string[] = [];
+  for (const enc of encVariants) {
+    const base = `${root}/${enc}`;
+    candidates.push(base);
+    for (const ext of exts) candidates.push(`${base}.${ext}`);
+  }
   candidates.push(DEFAULT_AVATAR);
   return candidates;
 }
@@ -3279,6 +3486,82 @@ useEffect(() => {
     };
   }, [API_BASE, companyName, companionName]);
 
+useEffect(() => {
+    if (!companionMapping) return;
+
+    const explicitUrl = String((companionMapping as any)?.public_image_url ?? (companionMapping as any)?.publicImageUrl ?? "").trim();
+    const explicitRoot = String((companionMapping as any)?.public_image_root ?? (companionMapping as any)?.publicImageRoot ?? "").trim();
+    if (!explicitUrl && !explicitRoot) return;
+
+    const rawKey = String(companionKeyRaw || "").trim();
+    const { baseKey } = splitCompanionKey(rawKey);
+    const sourceKey = baseKey || String(companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+    const candidates = buildAvatarCandidatesFromSource({
+      companionKeyOrName: sourceKey,
+      explicitUrl,
+      explicitRoot,
+      rebrandingSlug: normalizeRebrandingSlug(companyName) || undefined,
+    });
+
+    let cancelled = false;
+    pickFirstLoadableImage(candidates).then((picked) => {
+      if (!cancelled) setAvatarSrc(picked);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [companionMapping, companionKeyRaw, companionName, companyName]);
+
+  useEffect(() => {
+    const brand = String(companyName || "").trim();
+    const avatar = String(companionName || "").trim();
+    const resolved = String(avatarSrc || "").trim();
+    const currentStored = resolvePublicAssetUrl(
+      String((companionMapping as any)?.public_image_url ?? (companionMapping as any)?.publicImageUrl ?? "").trim()
+    );
+
+    if (!API_BASE || !brand || !avatar) return;
+    if (!isCompanionHeadshotUrl(resolved)) return;
+    if (currentStored && currentStored === resolved) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/mappings/companion/public-image-url`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            brand,
+            avatar,
+            public_image_url: resolved,
+          }),
+        });
+        const json: any = await res.json().catch(() => ({}));
+        if (cancelled || !res.ok) return;
+
+        const updatedUrl = String(json?.public_image_url || resolved).trim();
+        const updatedRoot = String(json?.public_image_root || "").trim();
+
+        setCompanionMapping((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            publicImageUrl: updatedUrl,
+            public_image_url: updatedUrl,
+            publicImageRoot: updatedRoot || (prev as any)?.publicImageRoot || (prev as any)?.public_image_root || "",
+            public_image_root: updatedRoot || (prev as any)?.public_image_root || (prev as any)?.publicImageRoot || "",
+          } as CompanionMappingRow;
+        });
+      } catch (e) {
+        // best-effort only
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [API_BASE, companionMapping, companyName, companionName, avatarSrc]);
+
   // Auto-join active LiveKit stream as a viewer (subscribe-only)
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
@@ -3899,8 +4182,12 @@ const companionTypeLc = useMemo(
   [companionMapping]
 );
 
+const explicitAvatarEngine = useMemo<AvatarEngine>(
+  () => normalizeAvatarEngine((companionMapping as any)?.avatar_engine ?? (companionMapping as any)?.avatarEngine),
+  [companionMapping]
+);
+
 const channelCap: ChannelCap = useMemo(() => {
-  // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
   const capRaw = String((companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? "")
     .trim()
     .toLowerCase();
@@ -3910,59 +4197,71 @@ const channelCap: ChannelCap = useMemo(() => {
   return "";
 }, [companionMapping]);
 
-const liveProvider: LiveProvider = useMemo(() => {
-  // Strict mapping: DB values are Stream, D-ID, or NULL.
-  // NOTE: "did" (no hyphen) is NOT accepted.
-  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
+const phase1FallbackEnabled = useMemo(
+  () => parseBoolish((companionMapping as any)?.phase1_fallback_enabled ?? (companionMapping as any)?.phase1FallbackEnabled) === true,
+  [companionMapping]
+);
 
+const liveProvider: LiveProvider = useMemo(() => {
+  if (explicitAvatarEngine === "stream") return "stream";
+  if (explicitAvatarEngine === "phase1-did") return "d-id";
+
+  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
   if (liveRaw === "stream") return "stream";
   if (liveRaw === "d-id") return "d-id";
-
-  // If channel_cap=Video but live is empty/invalid, treat as misconfigured.
-  // We default to "d-id" as a safe runtime fallback, but we also surface an error via companionMappingError.
-  return "d-id";
-}, [companionMapping]);
+  return "";
+}, [companionMapping, explicitAvatarEngine]);
 
 const phase2FailureKey = useMemo(
   () => `${String(companyName || "Elaralo").trim().toLowerCase()}::${String(companionName || "").trim().toLowerCase()}`,
   [companyName, companionName]
 );
 
+const resolvedPhase2PublicImageUrl = useMemo(
+  () => resolvePhase2SourcePublicImageUrl(companionMapping, avatarSrc),
+  [companionMapping, avatarSrc]
+);
+
+const phase2ConfigIssues = useMemo(
+  () => collectPhase2ConfigIssues(companionMapping, companionName, resolvedPhase2PublicImageUrl),
+  [companionMapping, companionName, resolvedPhase2PublicImageUrl]
+);
+
 const phase2Config = useMemo(
-  () => resolvePhase2AvatarConfig(companionMapping, companionName),
-  [companionMapping, companionName]
+  () => resolvePhase2AvatarConfig(companionMapping, companionName, resolvedPhase2PublicImageUrl),
+  [companionMapping, companionName, resolvedPhase2PublicImageUrl]
 );
 
 const phase2Preferred = useMemo(() => {
   if (companionTypeLc && companionTypeLc !== "ai") return false;
-  const explicit = parseBoolish((companionMapping as any)?.phase2_enabled ?? (companionMapping as any)?.phase2Enabled);
-  if (explicit === false) return false;
-  const engineRaw = String((companionMapping as any)?.avatar_engine ?? (companionMapping as any)?.avatarEngine ?? "").trim().toLowerCase();
-  if (engineRaw) {
-    if (engineRaw.includes("phase1") || engineRaw === "d-id" || engineRaw === "did") return false;
-    if (engineRaw.includes("phase2") || engineRaw.includes("3d") || engineRaw.includes("vrm") || engineRaw.includes("custom")) return true;
-  }
-  return channelCap === "video" && liveProvider === "d-id";
-}, [companionTypeLc, companionMapping, channelCap, liveProvider]);
+  if (explicitAvatarEngine === "phase1-did") return false;
+  if (explicitAvatarEngine === "phase2-vrm") return true;
+  return false;
+}, [companionTypeLc, explicitAvatarEngine]);
 
 const avatarEngine = useMemo<"stream" | "phase2-vrm" | "phase1-did">(() => {
-  if (liveProvider === "stream") return "stream";
-  const failed = Boolean(phase2FailedCompanionsRef.current[phase2FailureKey]);
-  if (phase2Preferred && phase2Config && !failed) return "phase2-vrm";
-  return "phase1-did";
-}, [liveProvider, phase2Preferred, phase2Config, phase2FailureKey, phase2FallbackVersion]);
-
-// Strict validation: Video companions must have a Live provider (Stream or D-ID).
-useEffect(() => {
-  if (channelCap === "video") {
-    const liveRaw = String(companionMapping?.live || "").trim();
-    if (!liveRaw) {
-      setCompanionMappingError(
-        `Invalid companion mapping: channel_cap=Video but live is NULL/empty for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`
-      );
+  if (explicitAvatarEngine === "stream") return "stream";
+  if (explicitAvatarEngine === "phase1-did") return "phase1-did";
+  if (explicitAvatarEngine === "phase2-vrm") {
+    const failed = Boolean(phase2FailedCompanionsRef.current[phase2FailureKey]);
+    if (failed && phase1FallbackEnabled && phase1AvatarMedia?.didAgentId && phase1AvatarMedia?.didClientKey) {
+      return "phase1-did";
     }
+    return "phase2-vrm";
   }
-}, [channelCap, companionMapping, companyName, companionName]);
+  return liveProvider === "stream" ? "stream" : "phase1-did";
+}, [explicitAvatarEngine, liveProvider, phase2FailureKey, phase2FallbackVersion, phase1FallbackEnabled, phase1AvatarMedia]);
+
+useEffect(() => {
+  if (!companionMapping) return;
+  if (companionTypeLc === "human" && explicitAvatarEngine !== "stream") {
+    setCompanionMappingError((prev) => prev || `Invalid companion mapping: Human companions require avatar_engine=stream for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
+    return;
+  }
+  if (companionTypeLc === "ai" && explicitAvatarEngine === "phase2-vrm" && channelCap !== "video") {
+    setCompanionMappingError((prev) => prev || `Invalid companion mapping: AI Phase II companions require channel_cap=Video for brand='${String(companyName || "").trim()}' avatar='${String(companionName || "").trim()}'.`);
+  }
+}, [companionMapping, companionTypeLc, explicitAvatarEngine, channelCap, companyName, companionName]);
 const streamUrl = useMemo(() => {
   const raw = String(companionKeyRaw || "").trim();
   const { flags } = splitCompanionKey(raw);
@@ -3970,13 +4269,11 @@ const streamUrl = useMemo(() => {
 }, [companionKeyRaw]);
 
 const liveEnabled = useMemo(() => {
-  // Product requirement (Video Icon next to the microphone):
-  // - Show when channel_cap === "Video" AND live is "Stream" or "D-ID"
-  // - Hide otherwise
-  const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
-  const liveOk = liveRaw === "stream" || liveRaw === "d-id";
-  return channelCap === "video" && liveOk;
-}, [channelCap, companionMapping]);
+  if (channelCap !== "video") return false;
+  if (companionTypeLc === "human") return explicitAvatarEngine === "stream";
+  if (companionTypeLc === "ai") return explicitAvatarEngine === "phase2-vrm" || explicitAvatarEngine === "phase1-did";
+  return false;
+}, [channelCap, companionTypeLc, explicitAvatarEngine]);
 
 
   // Wix templates (and some site themes) may apply a gray page background.
@@ -4440,15 +4737,21 @@ if (avatarEngine === "phase2-vrm") {
   }
 
   if (!phase2Config) {
-    phase2FailedCompanionsRef.current[phase2FailureKey] = "Phase II 3D configuration is missing.";
-    setPhase2FallbackVersion((v) => v + 1);
-  } else {
-    setPhase2RuntimeError("");
+    const missing = phase2ConfigIssues.length
+      ? phase2ConfigIssues.join(", ")
+      : "phase2_vrm_url (or resolved public_image_url), phase2_idle_vrma_url, phase2_talk_vrma_url";
+    setPhase2SessionActive(false);
     setPhase2SpeechPacket(null);
-    setPhase2SessionActive(true);
-    setAvatarStatus("connecting");
+    setAvatarStatus("error");
+    setAvatarError(`Phase II 3D configuration is incomplete for ${String(companionName || "this companion")}. Missing: ${missing}.`);
     return;
   }
+
+  setPhase2RuntimeError("");
+  setPhase2SpeechPacket(null);
+  setPhase2SessionActive(true);
+  setAvatarStatus("connecting");
+  return;
 }
 
 setPhase2SessionActive(false);
@@ -4608,7 +4911,7 @@ if (!phase1AvatarMedia) {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [avatarEngine, phase2Config, phase2FailureKey, phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost, requestLivekitAvPermissions]);
+}, [avatarEngine, phase2Config, phase2ConfigIssues, phase2FailureKey, phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost, requestLivekitAvPermissions]);
 
 const handlePhase2Ready = useCallback(() => {
   setAvatarError(null);
@@ -4629,10 +4932,10 @@ useEffect(() => {
   if (!phase2RuntimeError) return;
   if (liveProvider === "stream") return;
 
-  const fallbackMessage = `Phase II 3D avatar failed for ${String(companionName || "this companion")}. Falling back to Phase I. ${phase2RuntimeError}`;
+  const baseMessage = `Phase II 3D avatar failed for ${String(companionName || "this companion")}. ${phase2RuntimeError}`;
 
-  if (phase1AvatarMedia?.didAgentId && phase1AvatarMedia?.didClientKey) {
-    setAvatarError(fallbackMessage);
+  if (phase1FallbackEnabled && phase1AvatarMedia?.didAgentId && phase1AvatarMedia?.didClientKey) {
+    setAvatarError(`${baseMessage} Falling back to Phase I.`);
     setPhase2RuntimeError("");
     if (avatarStatus === "idle") {
       void startLiveAvatar();
@@ -4640,8 +4943,8 @@ useEffect(() => {
     return;
   }
 
-  setAvatarError(fallbackMessage);
-}, [phase2RuntimeError, liveProvider, companionName, phase1AvatarMedia, avatarStatus, startLiveAvatar]);
+  setAvatarError(`${baseMessage} No Phase I fallback is configured for this companion.`);
+}, [phase2RuntimeError, liveProvider, companionName, phase1FallbackEnabled, phase1AvatarMedia, avatarStatus, startLiveAvatar]);
 
 useEffect(() => {
   // Stop when switching companions
