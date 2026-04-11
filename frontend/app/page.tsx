@@ -807,6 +807,27 @@ function buildContentAssistantMsg(rawContent: any): Msg | null {
   };
 }
 
+function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): { role: Role; content: string } {
+  const role = m.role;
+  const meta: any = m.meta || {};
+  const isPlatformContent = Boolean(meta?.contentDelivery);
+  let content = String(m.content || "");
+
+  if (isPlatformContent) {
+    // Scheduled content is chosen by the backend from real files. Do not feed filenames or
+    // /content URLs back into model context, otherwise the model starts inventing fake deliveries.
+    content = content.trim() || "Scheduled content was delivered by the platform.";
+    return { role, content };
+  }
+
+  const att = meta?.attachment;
+  if (att?.url) {
+    const name = att.name || "attachment";
+    content = `${content}${content ? "\n\n" : ""}Attachment: ${name}\n${att.url}`;
+  }
+  return { role, content };
+}
+
 function toWsBaseUrl(httpBase: string): string {
   const raw = String(httpBase || '').trim();
   if (!raw) return '';
@@ -7966,15 +7987,7 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
         session_id,
         wants_explicit,
         session_state: stateForBackend,
-        messages: trimmedForChat.map((m) => {
-          let content = m.content || "";
-          const att = m.meta?.attachment;
-          if (att?.url) {
-            const name = att.name || "attachment";
-            content = `${content}${content ? "\n\n" : ""}Attachment: ${name}\n${att.url}`;
-          }
-          return { role: m.role, content };
-        }),
+        messages: trimmedForChat.map((m) => serializeMessageForBackend(m)),
       }),
     });
 
@@ -8041,15 +8054,7 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
         session_id,
         reason: (reason || "manual_save").trim(),
         session_state: stateToSendWithCompanion,
-        messages: nextMessages.map((m) => {
-          let content = m.content || "";
-          const att = m.meta?.attachment;
-          if (att?.url) {
-            const name = att.name || "attachment";
-            content = `${content}${content ? "\n\n" : ""}Attachment: ${name}\n${att.url}`;
-          }
-          return { role: m.role, content };
-        }),
+        messages: nextMessages.map((m) => serializeMessageForBackend(m, { forSummary: true })),
       }),
     });
 

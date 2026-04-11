@@ -14,7 +14,6 @@ import asyncio
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Set
-from urllib.parse import quote, unquote
 
 # Pydantic (v1/v2 compatibility)
 try:
@@ -251,47 +250,48 @@ def health():
 
 
 @app.get("/content/{brand}/{mode}/{filename}", name="content_file")
-async def content_file(brand: str, mode: str, filename: str):
+async def content_file(request: Request, brand: str, mode: str, filename: str):
     """Serve scheduled media assets from the brand content library.
 
-    Path: /home/site/brand/{brand}/content/mode/{mode}/{filename}
+    Canonical URL shape:
+      /content/{brand}/{mode}/{filename}
 
-    Notes:
-      - Basic path traversal protection is enforced.
-      - Content is served inline so image/video links can preview in-browser instead of downloading.
-      - Starlette/FileResponse supports Range requests which helps iOS video playback.
+    Legacy/bad URL shape tolerated for backwards compatibility:
+      /content/mode/{mode}/{filename}
+      /content/brand/{mode}/{filename}
     """
 
     brand_slug = _safe_slug(brand)
     folder = _safe_slug(mode)
+    raw_filename = unquote(str(filename or "").strip())
     if folder not in ("friend", "romantic", "intimate"):
         raise HTTPException(status_code=404, detail="invalid content mode")
-
-    raw_filename = str(filename or "").strip()
-    decoded_filename = unquote(raw_filename)
-    if not decoded_filename or any(x in decoded_filename for x in ("..", "/", "\\")):
+    if not raw_filename or any(x in raw_filename for x in ("..", "/", "\\")):
         raise HTTPException(status_code=400, detail="invalid filename")
 
-    base = _content_resolve_mode_dir(brand_slug, folder)
-    if not base:
+    base = ""
+    resolved_name = ""
+    if not _content_is_legacy_brand_placeholder(brand_slug):
+        base = _content_resolve_mode_dir(brand_slug, folder)
+        if base:
+            resolved_name = _content_resolve_existing_filename(base, raw_filename)
+
+    if not base or not resolved_name:
+        base, resolved_name = _content_resolve_unique_file_across_brands(folder, raw_filename)
+
+    if not base or not resolved_name:
         raise HTTPException(status_code=404, detail="content not found")
 
-    resolved_name = (
-        _content_resolve_existing_filename(base, decoded_filename)
-        or _content_resolve_existing_filename(base, raw_filename)
-        or decoded_filename
-    )
     path = os.path.join(base, resolved_name)
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="content not found")
 
     media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
-    return FileResponse(
-        path,
-        media_type=media_type,
-        filename=resolved_name,
-        content_disposition_type="inline",
-    )
+    headers = {
+        "Content-Disposition": f'inline; filename="{resolved_name}"',
+        "Cache-Control": "private, max-age=3600",
+    }
+    return FileResponse(path, media_type=media_type, headers=headers)
 
 import json
 import logging
@@ -704,7 +704,7 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
 import sqlite3
 import shutil
 import tempfile
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +1201,11 @@ async def _startup_load_companion_mappings() -> None:
         await run_in_threadpool(_load_companion_mappings_sync)
     except Exception as e:
         print(f"[mappings] ERROR loading companion mappings: {e!r}")
+
+    try:
+        await run_in_threadpool(_content_repair_persisted_urls_sync)
+    except Exception as e:
+        print(f"[content] ERROR repairing persisted content URLs: {e!r}")
 
 
 @app.get("/mappings/companion")
@@ -4371,6 +4376,78 @@ def _sanitize_summary_for_safe_mode(text: str) -> str:
     return t
 
 
+_PLATFORM_CONTENT_URL_RE = re.compile(r'https?://[^\s"\'<>]+?/content/[^\s"\'<>]+', re.IGNORECASE)
+_PLATFORM_ATTACHMENT_BLOCK_RE = re.compile(
+    r'(?:^|\n)\s*Attachment:\s*[^\n]*\n\s*(?:https?://[^\s"\'<>]+?/content/[^\s"\'<>]+|/content/[^\s"\'<>]+)',
+    re.IGNORECASE,
+)
+_PLATFORM_DELIVERY_LINE_RE = re.compile(
+    r'(?im)^\s*Delivering\s+(?:Photo|Video|content|scheduled\s+content)[^\n]*$'
+)
+
+
+def _sanitize_platform_content_text(text: str) -> Tuple[str, bool]:
+    """Remove platform-scheduled attachment details from LLM-visible text."""
+    raw = str(text or "")
+    if not raw:
+        return "", False
+
+    t = raw.replace("\r\n", "\n").replace("\r", "\n")
+    original = t
+
+    t = _PLATFORM_ATTACHMENT_BLOCK_RE.sub("\n", t)
+    t = _PLATFORM_CONTENT_URL_RE.sub("[platform content link removed]", t)
+    t = re.sub(r'(?im)^\s*Attachment:\s*[^\n]*$', '', t)
+    t = _PLATFORM_DELIVERY_LINE_RE.sub('', t)
+    t = re.sub(r'(?im)^\s*\[platform content link removed\]\s*$', '', t)
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+
+    return t, (t != original.strip())
+
+
+def _sanitize_message_content_for_llm(role: str, content: str) -> str:
+    cleaned, removed = _sanitize_platform_content_text(content)
+    if removed and str(role or "").strip().lower() == "assistant":
+        lowered = str(content or "").lower()
+        if (
+            "attachment:" in lowered
+            or "/content/" in lowered
+            or "delivering photo" in lowered
+            or "delivering video" in lowered
+            or "delivering scheduled content" in lowered
+        ) and not cleaned:
+            return "Scheduled content was delivered by the platform."
+    return cleaned or str(content or "").strip()
+
+
+def _sanitize_history_for_platform_content(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for m in messages or []:
+        role = str(m.get("role") or "").strip()
+        if role not in ("user", "assistant"):
+            continue
+        content = _sanitize_message_content_for_llm(role, str(m.get("content") or ""))
+        if not content and role == "assistant":
+            continue
+        out.append({"role": role, "content": content})
+    return out
+
+
+def _sanitize_summary_for_platform_content(text: str) -> str:
+    cleaned, _removed = _sanitize_platform_content_text(text)
+    return cleaned
+
+
+def _sanitize_assistant_reply_for_platform_content(text: str) -> str:
+    cleaned, removed = _sanitize_platform_content_text(text)
+    if not removed:
+        return str(text or "").strip()
+    cleaned = cleaned.strip()
+    if not cleaned or len(cleaned) < 24 or cleaned.endswith(":"):
+        return "I can only share photos or videos when the platform delivers scheduled content that actually exists in the active library."
+    return cleaned
+
+
 def _filter_history_for_safe_mode(messages: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], Optional[str]]:
     """Filter out intimate/explicit messages before sending to a safe-mode model (OpenAI).
 
@@ -6330,14 +6407,21 @@ async def chat(request: Request):
     if llm_provider == "openai":
         history_for_llm, handoff_note = _filter_history_for_safe_mode(messages)
 
+    history_for_llm = _sanitize_history_for_platform_content(history_for_llm)
+
     # Summaries:
     # - saved_summary is server-side cross-session memory (if user authorized)
     # - in_session_summaries are optional summaries collected during the current chat flow
     safe_saved_summary = saved_summary
     if llm_provider == "openai" and safe_saved_summary:
         safe_saved_summary = _sanitize_summary_for_safe_mode(safe_saved_summary)
+    if safe_saved_summary:
+        safe_saved_summary = _sanitize_summary_for_platform_content(safe_saved_summary)
 
-    in_session_summaries = _extract_in_session_summaries(session_state)
+    in_session_summaries = [
+        s for s in (_sanitize_summary_for_platform_content(x) for x in _extract_in_session_summaries(session_state))
+        if str(s or "").strip()
+    ]
 
     # ----------------------------
     # Host override (human companion takeover)
@@ -6494,6 +6578,14 @@ async def chat(request: Request):
         llm_messages.insert(insert_at, {"role": "system", "content": memory_policy})
         insert_at += 1
 
+        content_delivery_policy = (
+            "Content delivery rule: Never invent, promise, or format media attachments, filenames, file numbers, or /content/ links. "
+            "Only the platform may deliver scheduled photos or videos, and only when a real file exists in the active content library. "
+            "If the user asks for media, respond conversationally without URLs, without attachment blocks, and without claiming that content has been sent unless the platform actually attaches it."
+        )
+        llm_messages.insert(insert_at, {"role": "system", "content": content_delivery_policy})
+        insert_at += 1
+
         if provider_switched:
             llm_messages.insert(
                 insert_at,
@@ -6546,6 +6638,7 @@ async def chat(request: Request):
             assistant_reply = _call_xai_chat(llm_messages)
         else:
             assistant_reply = _call_gpt4o(llm_messages)
+        assistant_reply = _sanitize_assistant_reply_for_platform_content(assistant_reply)
     except Exception as e:
         _dbg(debug, "LLM call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
@@ -8063,10 +8156,11 @@ async def save_chat_summary(request: Request):
     for m in messages:
         role = m.get("role")
         if role in ("user", "assistant"):
-            content = str(m.get("content") or "")
+            content = _sanitize_message_content_for_llm(str(role or ""), str(m.get("content") or ""))
             if per_msg_chars > 0 and len(content) > per_msg_chars:
                 content = content[:per_msg_chars] + " …"
-            convo_items.append({"role": role, "content": content})
+            if content:
+                convo_items.append({"role": role, "content": content})
 
     if max_msgs > 0 and len(convo_items) > max_msgs:
         convo_items = convo_items[-max_msgs:]
@@ -12073,7 +12167,17 @@ def _content_history_insert(
         "content_name": str(content_name or "").strip(),
         "content_type": str(content_type or "").strip(),
         "content_stage": str(content_stage or "").strip(),
-        "content_url": str(content_url or "").strip(),
+        "content_url": _content_normalize_url(
+            _content_normalize_url(
+                str(content_url or "").strip(),
+                brand_slug=_content_infer_brand_slug_from_member_key(member_id),
+                folder=str(content_folder or "").strip(),
+                file_name=str(content_name or "").strip(),
+            ),
+            brand_slug=_content_infer_brand_slug_from_member_key(member_id),
+            folder=str(content_folder or "").strip(),
+            file_name=str(content_name or "").strip(),
+        ),
         "delivered_via": str(delivered_via or "").strip(),
         "create_datetime": now_utc,
     }
@@ -12328,8 +12432,16 @@ def _content_claim_get_or_backfill(
             cycle_id,
             int(trigger_minute or 0),
             hist.get("content_sequence"),
-            str(hist.get("content_name") or "").strip(),
+            hist_name,
         )
+
+    hist_name = str(hist.get("content_name") or "").strip()
+    hist_url = _content_normalize_url(
+        str(hist.get("content_url") or "").strip(),
+        brand_slug=_content_infer_brand_slug_from_member_key(member_id),
+        folder=str(content_folder or "").strip(),
+        file_name=hist_name,
+    )
 
     now_epoch = time.time()
     conn.execute(
@@ -12348,7 +12460,7 @@ def _content_claim_get_or_backfill(
             str(hist.get("content_name") or "").strip(),
             str(hist.get("content_type") or "").strip(),
             str(hist.get("content_stage") or "").strip(),
-            str(hist.get("content_url") or "").strip(),
+            hist_url,
             claim_state,
             delivered_via or "history_backfill",
             "",
@@ -12367,10 +12479,10 @@ def _content_claim_get_or_backfill(
         "cycle_id": cycle_id,
         "trigger_minute": int(trigger_minute or 0),
         "content_sequence": str(hist.get("content_sequence") or "").strip(),
-        "content_name": str(hist.get("content_name") or "").strip(),
+        "content_name": hist_name,
         "content_kind": str(hist.get("content_type") or "").strip(),
         "content_stage": str(hist.get("content_stage") or "").strip(),
-        "content_url": str(hist.get("content_url") or "").strip(),
+        "content_url": hist_url,
         "claim_state": claim_state,
         "claimed_via": delivered_via or "history_backfill",
         "session_id": "",
@@ -12466,8 +12578,7 @@ def _content_prepare_delivery_payload(
         elif content_kind == "image":
             content_type_label = "Photo"
 
-    quoted_file_name = quote(str(file_name or ""), safe="")
-    content_url = f"{str(base_url or '').rstrip('/')}/content/{brand_slug}/{folder}/{quoted_file_name}"
+    content_url = _content_build_url(brand_slug=brand_slug, folder=folder, file_name=file_name, base_url=str(base_url or ""))
     content: Dict[str, Any] = {
         "sequence": sequence,
         "filename": file_name,
@@ -12604,8 +12715,11 @@ def _content_root_candidates() -> List[str]:
     ]
     defaults = [
         "/home/site/brand",
+        "/home/site",
         "/home/site/wwwroot/brand",
+        "/home/site/wwwroot",
         "/home/brand",
+        "/home",
     ]
     for raw in env_roots + defaults:
         path = str(raw or "").strip()
@@ -12629,7 +12743,11 @@ def _content_slug_equivalent(actual_name: str, requested_slug: str) -> bool:
         return True
     actual_compact = re.sub(r"[^a-z0-9]+", "", _safe_slug(actual))
     requested_compact = re.sub(r"[^a-z0-9]+", "", requested.lower())
-    return bool(actual_compact and requested_compact and actual_compact == requested_compact)
+    if actual_compact and requested_compact and actual_compact == requested_compact:
+        return True
+    if actual_compact == f"brand{requested_compact}":
+        return True
+    return False
 
 
 def _content_brand_dir_candidates(brand_slug: str) -> List[str]:
@@ -12706,6 +12824,193 @@ def _content_resolve_existing_filename(base_dir: str, filename: str) -> str:
         if str(entry or "").lower() == want and os.path.isfile(os.path.join(base_dir, entry)):
             return entry
     return ""
+
+
+def _content_is_legacy_brand_placeholder(brand_slug: str) -> bool:
+    slug = _safe_slug(brand_slug)
+    return slug in {"", "brand", "mode", "content"}
+
+
+def _content_infer_brand_slug_from_member_key(member_id: str) -> str:
+    raw = str(member_id or "").strip()
+    if not raw:
+        return ""
+    if "::" in raw:
+        prefix = str(raw.split("::", 1)[0] or "").strip()
+        slug = _safe_slug(prefix)
+        if slug and not _content_is_legacy_brand_placeholder(slug):
+            return slug
+    return ""
+
+
+def _normalize_public_base_url(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if "://" not in s:
+        s = "https://" + s.lstrip("/")
+    try:
+        u = urlparse(s)
+    except Exception:
+        return ""
+    scheme = (u.scheme or "https").strip().lower() or "https"
+    netloc = str(u.netloc or "").strip()
+    if not netloc:
+        return ""
+    if netloc.endswith('.scm.azurewebsites.net'):
+        netloc = netloc[:-len('.scm.azurewebsites.net')] + '.azurewebsites.net'
+    netloc = netloc.replace('.scm.', '.')
+    return f"{scheme}://{netloc}".rstrip('/')
+
+
+def _content_public_base_url(request: Optional[Request] = None, fallback_base: str = "") -> str:
+    env_candidates = [
+        os.getenv("CONTENT_PUBLIC_BASE_URL", ""),
+        os.getenv("PUBLIC_API_BASE_URL", ""),
+        os.getenv("API_PUBLIC_BASE_URL", ""),
+        os.getenv("APP_BASE_URL", ""),
+        os.getenv("PUBLIC_BASE_URL", ""),
+        os.getenv("API_BASE_URL", ""),
+    ]
+    for cand in env_candidates:
+        norm = _normalize_public_base_url(cand)
+        if norm:
+            return norm
+    if request is not None:
+        try:
+            hdr = request.headers
+            host = str(hdr.get("x-forwarded-host") or hdr.get("x-original-host") or hdr.get("host") or "").split(",", 1)[0].strip()
+            scheme = str(hdr.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+            if not scheme:
+                scheme = "https" if hdr.get("x-arr-ssl") else str(urlparse(str(request.base_url or "")).scheme or "https")
+            if host:
+                norm = _normalize_public_base_url(f"{scheme}://{host}")
+                if norm:
+                    return norm
+        except Exception:
+            pass
+    norm = _normalize_public_base_url(fallback_base)
+    if norm:
+        return norm
+    website_host = _normalize_public_base_url(os.getenv("WEBSITE_HOSTNAME", ""))
+    if website_host:
+        return website_host
+    return ""
+
+
+def _content_build_url(brand_slug: str, folder: str, file_name: str, base_url: str = "", request: Optional[Request] = None) -> str:
+    slug = _safe_slug(brand_slug) or "elaralo"
+    folder_slug = _safe_slug(folder)
+    encoded_name = quote(str(file_name or "").strip(), safe="")
+    path = f"/content/{slug}/{folder_slug}/{encoded_name}"
+    public_base = _content_public_base_url(request=request, fallback_base=base_url)
+    return f"{public_base}{path}" if public_base else path
+
+
+def _content_normalize_url(url: str, *, brand_slug: str, folder: str, file_name: str, base_url: str = "") -> str:
+    canonical = _content_build_url(brand_slug=brand_slug, folder=folder, file_name=file_name, base_url=base_url)
+    raw = str(url or "").strip()
+    if not raw:
+        return canonical
+    try:
+        parsed = urlparse(raw)
+        path = str(parsed.path or "")
+        parts = [p for p in path.split('/') if p]
+        needs_rebuild = False
+        if '.scm.' in str(parsed.netloc or '').lower():
+            needs_rebuild = True
+        if len(parts) < 4 or parts[0].lower() != 'content':
+            needs_rebuild = True
+        else:
+            url_brand = _safe_slug(parts[1])
+            url_mode = _safe_slug(parts[2])
+            url_file = unquote(parts[3])
+            if _content_is_legacy_brand_placeholder(url_brand):
+                needs_rebuild = True
+            if url_mode != _safe_slug(folder):
+                needs_rebuild = True
+            if url_file != str(file_name or '').strip():
+                needs_rebuild = True
+        return canonical if needs_rebuild else raw
+    except Exception:
+        return canonical
+
+
+def _content_resolve_unique_file_across_brands(folder: str, filename: str) -> Tuple[str, str]:
+    folder_slug = _safe_slug(folder)
+    requested = str(filename or '').strip()
+    if not folder_slug or not requested:
+        return "", ""
+    matches: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+    for root in _content_root_candidates():
+        if not os.path.isdir(root):
+            continue
+        try:
+            entries = os.listdir(root)
+        except Exception:
+            entries = []
+        for entry in entries:
+            full = os.path.join(root, entry)
+            if not os.path.isdir(full):
+                continue
+            for cand in _content_mode_dir_candidates(full, folder_slug):
+                if not os.path.isdir(cand):
+                    continue
+                resolved = _content_resolve_existing_filename(cand, requested)
+                if not resolved:
+                    continue
+                real = os.path.realpath(os.path.join(cand, resolved))
+                if real in seen:
+                    continue
+                seen.add(real)
+                matches.append((cand, resolved))
+    if len(matches) == 1:
+        return matches[0]
+    return "", ""
+
+
+def _content_repair_persisted_urls_sync() -> None:
+    """Best-effort repair of persisted scheduled-content URLs."""
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = _content_db_connect()
+        _content_db_ensure_schema(conn)
+        for table in ("user_content_history", "user_content_claims"):
+            if not _content_table_exists(conn, table):
+                continue
+            cols = set(_content_table_columns(conn, table))
+            if not {"member_id", "content_folder", "content_name", "content_url"}.issubset(cols):
+                continue
+            rows = conn.execute(f'SELECT rowid, member_id, content_folder, content_name, content_url FROM {table}').fetchall()
+            for row in rows:
+                rowid = int(row[0])
+                member_id = str(row[1] or "").strip()
+                content_folder = str(row[2] or "").strip()
+                content_name = str(row[3] or "").strip()
+                content_url = str(row[4] or "").strip()
+                fixed = _content_normalize_url(
+                    content_url,
+                    brand_slug=_content_infer_brand_slug_from_member_key(member_id),
+                    folder=content_folder,
+                    file_name=content_name,
+                )
+                if fixed and fixed != content_url:
+                    conn.execute(f'UPDATE {table} SET content_url=? WHERE rowid=?', (fixed, rowid))
+        conn.commit()
+    except Exception as e:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        print(f"[content] WARNING: failed repairing persisted content URLs: {e!r}")
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
 
 
 def _content_list_files(brand_slug: str, folder: str) -> List[str]:
@@ -13453,6 +13758,12 @@ def _content_mark_host_received(payload: Dict[str, Any]) -> None:
     stage = str(payload.get("content_stage") or "").strip()
     kind = str(payload.get("content_kind") or "").strip()
     url = str(content_obj.get("url") or "").strip()
+    url = _content_normalize_url(
+        url,
+        brand_slug=brand_slug or _content_infer_brand_slug_from_member_key(member_key),
+        folder=folder,
+        file_name=file_name,
+    )
     cycle_id = _content_cycle_scope(payload.get("cycle_id"), payload.get("window_start_epoch"))
     if not cycle_id:
         cycle_id = _content_cycle_scope(None, None)
