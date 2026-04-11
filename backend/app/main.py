@@ -14,6 +14,7 @@ import asyncio
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Set
+from urllib.parse import quote, unquote
 
 # Pydantic (v1/v2 compatibility)
 try:
@@ -257,6 +258,7 @@ async def content_file(brand: str, mode: str, filename: str):
 
     Notes:
       - Basic path traversal protection is enforced.
+      - Content is served inline so image/video links can preview in-browser instead of downloading.
       - Starlette/FileResponse supports Range requests which helps iOS video playback.
     """
 
@@ -264,20 +266,32 @@ async def content_file(brand: str, mode: str, filename: str):
     folder = _safe_slug(mode)
     if folder not in ("friend", "romantic", "intimate"):
         raise HTTPException(status_code=404, detail="invalid content mode")
-    if not filename or any(x in filename for x in ("..", "/", "\\")):
+
+    raw_filename = str(filename or "").strip()
+    decoded_filename = unquote(raw_filename)
+    if not decoded_filename or any(x in decoded_filename for x in ("..", "/", "\\")):
         raise HTTPException(status_code=400, detail="invalid filename")
 
     base = _content_resolve_mode_dir(brand_slug, folder)
     if not base:
         raise HTTPException(status_code=404, detail="content not found")
 
-    resolved_name = _content_resolve_existing_filename(base, filename) or filename
+    resolved_name = (
+        _content_resolve_existing_filename(base, decoded_filename)
+        or _content_resolve_existing_filename(base, raw_filename)
+        or decoded_filename
+    )
     path = os.path.join(base, resolved_name)
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="content not found")
 
     media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type, filename=filename)
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=resolved_name,
+        content_disposition_type="inline",
+    )
 
 import json
 import logging
@@ -12452,7 +12466,8 @@ def _content_prepare_delivery_payload(
         elif content_kind == "image":
             content_type_label = "Photo"
 
-    content_url = f"{str(base_url or '').rstrip('/')}/content/{brand_slug}/{folder}/{file_name}"
+    quoted_file_name = quote(str(file_name or ""), safe="")
+    content_url = f"{str(base_url or '').rstrip('/')}/content/{brand_slug}/{folder}/{quoted_file_name}"
     content: Dict[str, Any] = {
         "sequence": sequence,
         "filename": file_name,
