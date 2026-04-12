@@ -8804,7 +8804,7 @@ const flushQueuedStreamMessages = useCallback(async () => {
       // Advance the backend history used for subsequent queued messages
       history = [...callMsgs];
       if (replyMsg) history.push(replyMsg);
-      if (contentMsg) history.push(contentMsg);
+      if (contentMsgs.length) history.push(...contentMsgs);
 
       // Remove the item only after successful processing
       streamDeferredQueueRef.current.shift();
