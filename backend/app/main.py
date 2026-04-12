@@ -11212,23 +11212,24 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
 
         if delivered_content:
             try:
-                _ai_override_append_event(
-                    sid,
-                    role="assistant",
-                    content="",
-                    sender="system",
-                    audience="all",
-                    kind="user_content",
-                    payload={
-                        "token": str(delivered_content.get("token") or ""),
-                        "content": delivered_content,
-                        "trigger_minute": int(
-                            delivered_content.get("triggerMinute")
-                            or delivered_content.get("trigger_minute")
-                            or 0
-                        ),
-                    },
-                )
+                for item in _content_delivery_items(delivered_content):
+                    _ai_override_append_event(
+                        sid,
+                        role="assistant",
+                        content="",
+                        sender="system",
+                        audience="all",
+                        kind="user_content",
+                        payload={
+                            "token": str(item.get("token") or ""),
+                            "content": item,
+                            "trigger_minute": int(
+                                item.get("triggerMinute")
+                                or item.get("trigger_minute")
+                                or 0
+                            ),
+                        },
+                    )
             except Exception:
                 pass
 
@@ -12422,6 +12423,7 @@ def _content_claim_get_or_backfill(
     if not hist:
         return {}
 
+    hist_name = str(hist.get("content_name") or "").strip()
     delivered_via = str(hist.get("delivered_via") or "").strip().lower()
     claim_state = "delivered_host" if delivered_via == "host_pending" else "delivered_user"
     token = str(hist.get("token") or "").strip()
@@ -12435,7 +12437,6 @@ def _content_claim_get_or_backfill(
             hist_name,
         )
 
-    hist_name = str(hist.get("content_name") or "").strip()
     hist_url = _content_normalize_url(
         str(hist.get("content_url") or "").strip(),
         brand_slug=_content_infer_brand_slug_from_member_key(member_id),
@@ -12457,7 +12458,7 @@ def _content_claim_get_or_backfill(
             str(cycle_id or "").strip(),
             int(trigger_minute or 0),
             str(hist.get("content_sequence") or "").strip(),
-            str(hist.get("content_name") or "").strip(),
+            hist_name,
             str(hist.get("content_type") or "").strip(),
             str(hist.get("content_stage") or "").strip(),
             hist_url,
@@ -12491,6 +12492,110 @@ def _content_claim_get_or_backfill(
         "delivered_epoch": now_epoch,
     }
 
+
+def _content_trigger_delivery_status(
+    conn: sqlite3.Connection,
+    *,
+    member_id: str,
+    content_folder: str,
+    cycle_id: str,
+    trigger_minute: int,
+    window_start_epoch: float,
+) -> Dict[str, Any]:
+    claim = _content_claim_get_or_backfill(
+        conn,
+        member_id=member_id,
+        content_folder=content_folder,
+        cycle_id=cycle_id,
+        trigger_minute=int(trigger_minute or 0),
+        window_start_epoch=window_start_epoch,
+    )
+    history = _content_history_row_for_trigger(
+        conn,
+        member_id=member_id,
+        content_folder=content_folder,
+        scheduled_minute=int(trigger_minute or 0),
+        window_start_epoch=window_start_epoch,
+        tol=1,
+    )
+    claim_state = str((claim or {}).get("claim_state") or "").strip().lower()
+    file_name = str((claim or {}).get("content_name") or "").strip()
+
+    if history:
+        status = "delivered"
+    elif claim_state == "pending_host" and file_name:
+        status = "pending_host"
+    elif claim and claim_state in {"delivered_user", "delivered_host", "delivered_history"}:
+        status = "claim_only_delivered"
+    else:
+        status = "undelivered"
+
+    return {
+        "trigger_minute": int(trigger_minute or 0),
+        "claim": claim,
+        "history": history,
+        "status": status,
+    }
+
+
+def _content_collect_due_backlog(
+    conn: sqlite3.Connection,
+    *,
+    member_id: str,
+    content_folder: str,
+    cycle_id: str,
+    window_start_epoch: float,
+    used_seconds: float,
+    include_host_early: bool,
+) -> List[Dict[str, Any]]:
+    due_scheduled_minutes = _content_due_scheduled_minutes(
+        used_seconds=float(used_seconds or 0.0),
+        include_host_early=bool(include_host_early),
+    )
+    if not due_scheduled_minutes:
+        return []
+
+    backlog: List[Dict[str, Any]] = []
+    for sm in due_scheduled_minutes:
+        trigger_minute = int(sm)
+        release_gate_minute = max(0, trigger_minute - 1) if include_host_early else trigger_minute
+        if float(used_seconds or 0.0) < release_gate_minute * 60:
+            continue
+        status = _content_trigger_delivery_status(
+            conn,
+            member_id=member_id,
+            content_folder=content_folder,
+            cycle_id=cycle_id,
+            trigger_minute=trigger_minute,
+            window_start_epoch=window_start_epoch,
+        )
+        if str(status.get("status") or "") == "delivered":
+            continue
+        status["release_gate_minute"] = release_gate_minute
+        backlog.append(status)
+    return backlog
+
+
+def _content_delivery_items(payload: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    for key in ("content_batch", "contentBatch", "items"):
+        raw = payload.get(key)
+        if isinstance(raw, list):
+            return [dict(item) for item in raw if isinstance(item, dict)]
+    return [payload]
+
+
+def _content_compose_delivery_result(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not items:
+        return None
+    primary = dict(items[0])
+    if len(items) > 1:
+        primary["content_batch"] = list(items)
+        primary["contentBatch"] = list(items)
+        primary["items"] = list(items)
+        primary["contentCount"] = len(items)
+    return primary
 
 def _content_claim_upsert(
     conn: sqlite3.Connection,
@@ -13186,6 +13291,32 @@ def _ai_override_has_token_event(session_id: str, token: str, kind: str) -> bool
         return False
 
 
+def _content_queue_pending_for_host_from_base_url(
+    *,
+    session_id: str,
+    member_id: str,
+    brand_slug: str,
+    folder: str,
+    cycle_id: str,
+    cycle_used_seconds: float,
+    now_epoch: float,
+    base_url: str,
+) -> Optional[Dict[str, Any]]:
+    class _ContentRequestShim:
+        def __init__(self, base_url: str) -> None:
+            self.base_url = str(base_url or "")
+    return _content_queue_pending_for_host(
+        request=_ContentRequestShim(base_url),
+        session_id=session_id,
+        member_id=member_id,
+        brand_slug=brand_slug,
+        folder=folder,
+        cycle_id=cycle_id,
+        cycle_used_seconds=cycle_used_seconds,
+        now_epoch=now_epoch,
+    )
+
+
 def _content_queue_pending_for_host(
     *,
     request: Request,
@@ -13197,14 +13328,10 @@ def _content_queue_pending_for_host(
     cycle_used_seconds: float,
     now_epoch: float,
 ) -> Optional[Dict[str, Any]]:
-    """If a content milestone is due for a session in host-override mode, queue it for the host.
+    """Queue all due content milestones for the host when override is active.
 
-    Durable source of truth:
-      - user_content_claims : one row per member/folder/cycle/trigger minute
-      - user_content_history: delivered audit trail
-      - user_content_state  : convenience cache / pending UI state only
-
-    This avoids worker-local races when multiple app workers handle the same session.
+    If earlier milestones were missed, the next scheduler pass queues the full backlog in
+    trigger-minute order so the host can push them sequentially.
     """
 
     conn = _content_db_connect()
@@ -13269,139 +13396,122 @@ def _content_queue_pending_for_host(
             return None
 
         used_in_window = _content_window_used_seconds(state, cycle_used_seconds)
-        due_scheduled_minutes = _content_due_scheduled_minutes(
+        backlog = _content_collect_due_backlog(
+            conn,
+            member_id=member_key,
+            content_folder=folder,
+            cycle_id=cycle_scope,
+            window_start_epoch=window_start_epoch,
             used_seconds=used_in_window,
             include_host_early=True,
         )
-        if not due_scheduled_minutes:
+        if not backlog:
             conn.commit()
             return None
 
-        scheduled_trigger_minute: Optional[int] = None
-        claim: Dict[str, Any] = {}
-        for sm in due_scheduled_minutes:
-            claim = _content_claim_get_or_backfill(
-                conn,
-                member_id=member_key,
-                content_folder=folder,
-                cycle_id=cycle_scope,
-                trigger_minute=int(sm),
-                window_start_epoch=window_start_epoch,
-            )
-            if _content_claim_is_delivered(claim):
-                continue
-            scheduled_trigger_minute = int(sm)
-            break
+        last_seq_cursor = _content_history_max_sequence(conn, member_key, folder, window_start_epoch)
+        batch_payloads: List[Dict[str, Any]] = []
+        latest_state_update: Dict[str, Any] = {}
 
-        if scheduled_trigger_minute is None:
-            conn.commit()
-            return None
+        for entry in backlog:
+            trigger_minute = int(entry.get("trigger_minute") or 0)
+            claim = entry.get("claim") if isinstance(entry.get("claim"), dict) else {}
+            claim_state = str((claim or {}).get("claim_state") or "").strip().lower()
+            existing_file_name = str((claim or {}).get("content_name") or "").strip()
+            token = str((claim or {}).get("token") or "").strip()
 
-        early_minute = max(0, int(scheduled_trigger_minute) - 1)
-        if used_in_window < early_minute * 60:
-            conn.commit()
-            return None
-
-        existing_state = str((claim or {}).get("claim_state") or "").strip().lower()
-        if existing_state == "pending_host":
-            file_name = str(claim.get("content_name") or "").strip()
-            token = str(claim.get("token") or "").strip()
-            if not file_name:
-                claim = {}
-                existing_state = ""
-        if existing_state != "pending_host":
-            last_seq = _content_history_max_sequence(conn, member_key, folder, window_start_epoch)
-            file_name = _content_pick_next_file(brand_slug, folder, last_seq)
-            if not file_name:
-                _content_state_upsert(
-                    conn,
-                    member_key,
-                    folder,
-                    {
-                        "window_complete": 0,
-                        **_content_clear_pending_fields(now),
-                    },
+            if claim_state == "pending_host" and existing_file_name:
+                file_name = existing_file_name
+                prepared = _content_prepare_delivery_payload(
+                    brand_slug=brand_slug,
+                    folder=folder,
+                    file_name=file_name,
+                    base_url=str(request.base_url),
+                    trigger_minute=trigger_minute,
                 )
-                conn.commit()
-                return None
+                existing_seq = str((claim or {}).get("content_sequence") or prepared.get("sequence") or "").strip()
+                if existing_seq:
+                    last_seq_cursor = existing_seq
+            else:
+                file_name = _content_pick_next_file(brand_slug, folder, last_seq_cursor)
+                if not file_name:
+                    break
+                prepared = _content_prepare_delivery_payload(
+                    brand_slug=brand_slug,
+                    folder=folder,
+                    file_name=file_name,
+                    base_url=str(request.base_url),
+                    trigger_minute=trigger_minute,
+                )
+                if not token:
+                    token = _content_delivery_token(
+                        member_key,
+                        folder,
+                        cycle_scope,
+                        trigger_minute,
+                        prepared["sequence"],
+                        file_name,
+                    )
+                claim = _content_claim_upsert(
+                    conn,
+                    token=token,
+                    member_id=member_key,
+                    content_folder=folder,
+                    cycle_id=cycle_scope,
+                    trigger_minute=trigger_minute,
+                    content_sequence=prepared["sequence"],
+                    content_name=file_name,
+                    content_kind=prepared["content_kind"],
+                    content_stage=prepared["content_stage"],
+                    content_url=prepared["content_url"],
+                    claim_state="pending_host",
+                    claimed_via="host_pending",
+                    session_id=session_id,
+                    now_epoch=now,
+                    delivered_epoch=None,
+                )
+                last_seq_cursor = str(prepared["sequence"])
 
-            prepared = _content_prepare_delivery_payload(
-                brand_slug=brand_slug,
-                folder=folder,
-                file_name=file_name,
-                base_url=str(request.base_url),
-                trigger_minute=int(scheduled_trigger_minute),
-            )
-            token = _content_delivery_token(
-                member_key,
-                folder,
-                cycle_scope,
-                int(scheduled_trigger_minute),
-                prepared["sequence"],
-                file_name,
-            )
-            claim = _content_claim_upsert(
-                conn,
-                token=token,
-                member_id=member_key,
-                content_folder=folder,
-                cycle_id=cycle_scope,
-                trigger_minute=int(scheduled_trigger_minute),
-                content_sequence=prepared["sequence"],
-                content_name=file_name,
-                content_kind=prepared["content_kind"],
-                content_stage=prepared["content_stage"],
-                content_url=prepared["content_url"],
-                claim_state="pending_host",
-                claimed_via="host_pending",
-                session_id=session_id,
-                now_epoch=now,
-                delivered_epoch=None,
-            )
-        else:
-            prepared = _content_prepare_delivery_payload(
-                brand_slug=brand_slug,
-                folder=folder,
-                file_name=file_name,
-                base_url=str(request.base_url),
-                trigger_minute=int(scheduled_trigger_minute),
-            )
-
-        _content_state_upsert(
-            conn,
-            member_key,
-            folder,
-            {
+            latest_state_update = {
                 "pending_token": token,
-                "pending_trigger_minute": int(scheduled_trigger_minute),
+                "pending_trigger_minute": trigger_minute,
                 "pending_file_name": file_name,
                 "pending_sequence": str(prepared["sequence"]),
                 "pending_stage": str(prepared["content_stage"] or ""),
                 "pending_kind": str(prepared["content_kind"] or "image"),
                 "pending_created_epoch": now,
                 "updated_epoch": now,
-            },
-        )
+            }
+
+            content = prepared["content"]
+            payload = {
+                "token": token,
+                "content": content,
+                "trigger_minute": trigger_minute,
+                "member_id": member_id,
+                "content_folder": folder,
+                "brand_slug": brand_slug,
+                "content_sequence": str(prepared["sequence"]),
+                "content_stage": str(prepared["content_stage"] or ""),
+                "content_kind": str(prepared["content_kind"] or "image"),
+                "content_name": file_name,
+                "cycle_id": cycle_scope,
+                "window_start_epoch": window_start_epoch,
+            }
+            batch_payloads.append(payload)
+
+        if not batch_payloads:
+            conn.commit()
+            return None
+
+        if latest_state_update:
+            _content_state_upsert(conn, member_key, folder, latest_state_update)
         conn.commit()
 
-        content = prepared["content"]
-        payload = {
-            "token": token,
-            "content": content,
-            "trigger_minute": int(scheduled_trigger_minute),
-            "member_id": member_id,
-            "content_folder": folder,
-            "brand_slug": brand_slug,
-            "content_sequence": str(prepared["sequence"]),
-            "content_stage": str(prepared["content_stage"] or ""),
-            "content_kind": str(prepared["content_kind"] or "image"),
-            "content_name": file_name,
-            "cycle_id": cycle_scope,
-            "window_start_epoch": window_start_epoch,
-        }
-
-        # Queue to host (audience=host). Avoid duplicating the same token event within this worker.
-        if not _ai_override_has_token_event(session_id, token, "content_pending"):
+        for payload in batch_payloads:
+            token = str(payload.get("token") or "").strip()
+            if token and _ai_override_has_token_event(session_id, token, "content_pending"):
+                continue
             try:
                 _ai_override_append_event(
                     session_id,
@@ -13415,7 +13525,7 @@ def _content_queue_pending_for_host(
             except Exception:
                 pass
 
-        return payload
+        return batch_payloads[0]
     except Exception:
         try:
             conn.rollback()
@@ -13428,8 +13538,6 @@ def _content_queue_pending_for_host(
         except Exception:
             pass
 
-
-
 def _content_deliver_to_user_if_due(
     session_id: str,
     brand_slug: str,
@@ -13441,12 +13549,12 @@ def _content_deliver_to_user_if_due(
     now_epoch: Optional[float] = None,
     force_user_delivery: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Deliver scheduled content when due.
+    """Deliver all due scheduled content when due.
 
-    Stronger long-term behavior:
-      - SQLite is the source of truth for due/delivered state.
-      - Deterministic claim tokens make delivery idempotent across workers.
-      - Paywall suppression depends on durable DB state, not process-local pending events.
+    Restored self-healing rule:
+      - if earlier milestones were missed, the next eligible delivery pass flushes the full backlog
+        in trigger-minute order instead of delivering only one item.
+      - claims that say delivered but have no matching history row are treated as not yet fulfilled.
     """
 
     conn: Optional[sqlite3.Connection] = None
@@ -13519,203 +13627,145 @@ def _content_deliver_to_user_if_due(
                 deliver_to_host_first = False
 
         used_in_window = _content_window_used_seconds(state, float(cycle_used_seconds or 0.0))
-        due_scheduled_minutes = _content_due_scheduled_minutes(
+        backlog = _content_collect_due_backlog(
+            conn,
+            member_id=member_key,
+            content_folder=folder,
+            cycle_id=cycle_scope,
+            window_start_epoch=window_start_epoch,
             used_seconds=used_in_window,
             include_host_early=bool(force_user_delivery or deliver_to_host_first),
         )
-        if not due_scheduled_minutes:
+        if not backlog:
             conn.commit()
             return None
 
-        scheduled_trigger_minute: Optional[int] = None
-        claim: Dict[str, Any] = {}
-        for sm in due_scheduled_minutes:
-            claim = _content_claim_get_or_backfill(
-                conn,
-                member_id=member_key,
-                content_folder=folder,
-                cycle_id=cycle_scope,
-                trigger_minute=int(sm),
-                window_start_epoch=window_start_epoch,
-            )
-            if _content_claim_is_delivered(claim):
-                continue
-            scheduled_trigger_minute = int(sm)
-            break
-
-        if scheduled_trigger_minute is None:
-            conn.commit()
-            return None
-
-        release_gate_minute = max(0, int(scheduled_trigger_minute) - 1) if (force_user_delivery or deliver_to_host_first) else int(scheduled_trigger_minute)
-        if used_in_window < release_gate_minute * 60:
-            conn.commit()
-            return None
-
-        claim_state = str((claim or {}).get("claim_state") or "").strip().lower()
-        existing_file_name = str((claim or {}).get("content_name") or "").strip()
-        if claim_state == "pending_host" and existing_file_name:
-            file_name = existing_file_name
-        else:
-            last_seq = _content_history_max_sequence(conn, member_key, folder, window_start_epoch)
-            file_name = _content_pick_next_file(brand_slug, folder, last_seq)
-
-        if not file_name:
-            _content_state_upsert(
-                conn,
-                member_key,
-                folder,
-                {
-                    "window_complete": 0,
-                    **_content_clear_pending_fields(now),
-                },
-            )
-            conn.commit()
-            return None
-
-        prepared = _content_prepare_delivery_payload(
-            brand_slug=brand_slug,
-            folder=folder,
-            file_name=file_name,
-            base_url=str(base_url or ""),
-            trigger_minute=int(scheduled_trigger_minute),
-        )
-
-        token = str((claim or {}).get("token") or "").strip()
-        if not token:
-            token = _content_delivery_token(
-                member_key,
-                folder,
-                cycle_scope,
-                int(scheduled_trigger_minute),
-                prepared["sequence"],
-                file_name,
-            )
-
+        # When host override is active, queue the entire backlog for the host 1 minute early.
         if deliver_to_host_first and not force_user_delivery:
+            conn.commit()
+            member_id_for_host = str(member_key or "")
+            brand_prefix = f"{brand_slug}::" if brand_slug else ""
+            if brand_prefix and member_id_for_host.startswith(brand_prefix):
+                member_id_for_host = member_id_for_host[len(brand_prefix):]
+            return _content_queue_pending_for_host_from_base_url(
+                session_id=session_id,
+                member_id=member_id_for_host,
+                brand_slug=brand_slug,
+                folder=folder,
+                cycle_id=cycle_id,
+                cycle_used_seconds=float(cycle_used_seconds or 0.0),
+                now_epoch=now,
+                base_url=str(base_url or ""),
+            )
+
+        last_seq_cursor = _content_history_max_sequence(conn, member_key, folder, window_start_epoch)
+        delivered_items: List[Dict[str, Any]] = []
+
+        for entry in backlog:
+            trigger_minute = int(entry.get("trigger_minute") or 0)
+            claim = entry.get("claim") if isinstance(entry.get("claim"), dict) else {}
+            claim_state = str((claim or {}).get("claim_state") or "").strip().lower()
+            existing_file_name = str((claim or {}).get("content_name") or "").strip()
+            token = str((claim or {}).get("token") or "").strip()
+
+            if claim_state == "pending_host" and existing_file_name:
+                file_name = existing_file_name
+                prepared = _content_prepare_delivery_payload(
+                    brand_slug=brand_slug,
+                    folder=folder,
+                    file_name=file_name,
+                    base_url=str(base_url or ""),
+                    trigger_minute=trigger_minute,
+                )
+                existing_seq = str((claim or {}).get("content_sequence") or prepared.get("sequence") or "").strip()
+                if existing_seq:
+                    last_seq_cursor = existing_seq
+            else:
+                file_name = _content_pick_next_file(brand_slug, folder, last_seq_cursor)
+                if not file_name:
+                    break
+                prepared = _content_prepare_delivery_payload(
+                    brand_slug=brand_slug,
+                    folder=folder,
+                    file_name=file_name,
+                    base_url=str(base_url or ""),
+                    trigger_minute=trigger_minute,
+                )
+                last_seq_cursor = str(prepared["sequence"])
+
+            if not token:
+                token = _content_delivery_token(
+                    member_key,
+                    folder,
+                    cycle_scope,
+                    trigger_minute,
+                    prepared["sequence"],
+                    file_name,
+                )
+
             _content_claim_upsert(
                 conn,
                 token=token,
                 member_id=member_key,
                 content_folder=folder,
                 cycle_id=cycle_scope,
-                trigger_minute=int(scheduled_trigger_minute),
+                trigger_minute=trigger_minute,
                 content_sequence=prepared["sequence"],
                 content_name=file_name,
                 content_kind=prepared["content_kind"],
                 content_stage=prepared["content_stage"],
                 content_url=prepared["content_url"],
-                claim_state="pending_host",
-                claimed_via="host_pending",
+                claim_state="delivered_user",
+                claimed_via="auto",
                 session_id=session_id,
                 now_epoch=now,
-                delivered_epoch=None,
+                delivered_epoch=now,
             )
-            _content_state_upsert(
+
+            _content_history_insert(
                 conn,
+                token,
                 member_key,
                 folder,
-                {
-                    "pending_token": token,
-                    "pending_trigger_minute": int(scheduled_trigger_minute),
-                    "pending_file_name": file_name,
-                    "pending_sequence": str(prepared["sequence"]),
-                    "pending_stage": str(prepared["content_stage"] or ""),
-                    "pending_kind": str(prepared["content_kind"] or "image"),
-                    "pending_created_epoch": now,
-                    "updated_epoch": now,
-                },
+                trigger_minute,
+                prepared["sequence"],
+                file_name,
+                prepared["content_kind"] or "image",
+                prepared["content_stage"],
+                prepared["content_url"],
+                "auto",
             )
+
+            delivered_items.append({
+                "token": token,
+                "triggerMinute": trigger_minute,
+                "trigger_minute": trigger_minute,
+                "folder": folder,
+                **prepared["content"],
+            })
+
+        if not delivered_items:
             conn.commit()
-
-            member_id_for_payload = str(member_key or "")
-            brand_prefix = f"{brand_slug}::" if brand_slug else ""
-            if brand_prefix and member_id_for_payload.startswith(brand_prefix):
-                member_id_for_payload = member_id_for_payload[len(brand_prefix):]
-
-            try:
-                if not _ai_override_has_token_event(session_id, token, "content_pending"):
-                    _ai_override_append_event(
-                        session_id,
-                        role="assistant",
-                        content="",
-                        sender="system",
-                        audience="host",
-                        kind="content_pending",
-                        payload={
-                            "token": token,
-                            "member_id": member_id_for_payload,
-                            "brand_slug": brand_slug,
-                            "content_folder": folder,
-                            "trigger_minute": int(scheduled_trigger_minute),
-                            "content_sequence": str(prepared["sequence"]),
-                            "content_name": file_name,
-                            "content_stage": str(prepared["content_stage"] or ""),
-                            "content_kind": str(prepared["content_kind"] or "image"),
-                            "content": prepared["content"],
-                            "cycle_id": cycle_scope,
-                            "window_start_epoch": window_start_epoch,
-                        },
-                    )
-            except Exception:
-                pass
-
             return None
 
-        _content_claim_upsert(
-            conn,
-            token=token,
-            member_id=member_key,
-            content_folder=folder,
-            cycle_id=cycle_scope,
-            trigger_minute=int(scheduled_trigger_minute),
-            content_sequence=prepared["sequence"],
-            content_name=file_name,
-            content_kind=prepared["content_kind"],
-            content_stage=prepared["content_stage"],
-            content_url=prepared["content_url"],
-            claim_state="delivered_user",
-            claimed_via="auto",
-            session_id=session_id,
-            now_epoch=now,
-            delivered_epoch=now,
-        )
-
-        _content_history_insert(
-            conn,
-            token,
-            member_key,
-            folder,
-            int(scheduled_trigger_minute),
-            prepared["sequence"],
-            file_name,
-            prepared["content_kind"] or "image",
-            prepared["content_stage"],
-            prepared["content_url"],
-            "auto",
-        )
-
+        last_item = delivered_items[-1]
+        last_stage = str(last_item.get("stage") or "")
         _content_state_upsert(
             conn,
             member_key,
             folder,
             {
-                "last_sequence": str(prepared["sequence"]),
-                "last_stage": str(prepared["content_stage"] or ""),
-                "last_trigger_minute": int(scheduled_trigger_minute),
-                "window_sent_count": int(state.get("window_sent_count") or 0) + 1,
-                "window_complete": 1 if folder == "friend" or (str(prepared["content_stage"] or "").strip().lower() == "end") else 0,
+                "last_sequence": str(last_item.get("sequence") or ""),
+                "last_stage": last_stage,
+                "last_trigger_minute": int(last_item.get("triggerMinute") or last_item.get("trigger_minute") or 0),
+                "window_sent_count": int(state.get("window_sent_count") or 0) + len(delivered_items),
+                "window_complete": 1 if folder == "friend" or last_stage.strip().lower() == "end" else 0,
                 **_content_clear_pending_fields(now),
             },
         )
         conn.commit()
 
-        return {
-            "token": token,
-            "trigger_minute": int(scheduled_trigger_minute),
-            "folder": folder,
-            **prepared["content"],
-        }
+        return _content_compose_delivery_result(delivered_items)
 
     except Exception:
         if conn is not None:
@@ -13730,8 +13780,6 @@ def _content_deliver_to_user_if_due(
                 conn.close()
             except Exception:
                 pass
-
-
 
 def _content_mark_host_received(payload: Dict[str, Any]) -> None:
     """Mark a host-pending content item as delivered (business rule: delivered once host receives)."""

@@ -224,6 +224,8 @@ type ChatApiResponse = {
   session_state?: Partial<SessionState>;
   audio_url?: string;
   content?: ContentDelivery;
+  content_batch?: ContentDelivery[];
+  contentBatch?: ContentDelivery[];
   // tolerate future additions from the backend without breaking builds
   [k: string]: any;
 };
@@ -826,6 +828,35 @@ function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): { 
     content = `${content}${content ? "\n\n" : ""}Attachment: ${name}\n${att.url}`;
   }
   return { role, content };
+}
+
+
+function buildContentAssistantMsgs(rawPayload: any): Msg[] {
+  const visit = (node: any): any[] => {
+    if (!node || typeof node !== "object") return [];
+
+    const directBatch = (node as any).content_batch ?? (node as any).contentBatch ?? (node as any).items;
+    if (Array.isArray(directBatch)) {
+      return directBatch.filter((item) => item && typeof item === "object");
+    }
+
+    const directSingle = buildContentAssistantMsg(node);
+    if (directSingle) return [node];
+
+    if ((node as any).content && typeof (node as any).content === "object") {
+      return visit((node as any).content);
+    }
+
+    return [];
+  };
+
+  const raws = visit(rawPayload);
+  const out: Msg[] = [];
+  for (const raw of raws) {
+    const msg = buildContentAssistantMsg(raw);
+    if (msg) out.push(msg);
+  }
+  return out;
 }
 
 function toWsBaseUrl(httpBase: string): string {
@@ -4688,10 +4719,10 @@ useEffect(() => {
             const role = String((ev as any).role || "");
             const payload = (ev as any).payload;
 
-            // Host-pushed scheduled content (AI companion attachment)
+            // Host/system-pushed scheduled content attachment(s)
             if (kind === "user_content" && payload) {
-              const msg = buildContentAssistantMsg(payload as any);
-              if (msg) out.push(msg as any);
+              const msgs = buildContentAssistantMsgs(payload as any);
+              if (msgs.length) out.push(...(msgs as any));
               continue;
             }
 
@@ -8527,7 +8558,7 @@ if (streamSessionActive) {
       // When Live Avatar is active, we delay the assistant's text from appearing until
       // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");
-      const contentMsg = buildContentAssistantMsg((data as any).content);
+      const contentMsgs = buildContentAssistantMsgs((data as any).content);
       let assistantCommitted = false;
       const commitAssistantMessage = () => {
         if (assistantCommitted) return;
@@ -8537,8 +8568,8 @@ if (streamSessionActive) {
         if (replyText.trim()) {
           toAdd.push({ role: "assistant", content: replyText, meta: { sender: "ai" } });
         }
-        if (contentMsg) {
-          toAdd.push(contentMsg);
+        if (contentMsgs.length) {
+          toAdd.push(...contentMsgs);
         }
         if (!toAdd.length) return;
 
@@ -8737,7 +8768,7 @@ const flushQueuedStreamMessages = useCallback(async () => {
       }
 
       const replyText = String((data as any).reply || "");
-      const contentMsg = buildContentAssistantMsg((data as any).content);
+      const contentMsgs = buildContentAssistantMsgs((data as any).content);
       const replyMsg: Msg | null = replyText.trim()
         ? { role: "assistant", content: replyText, meta: { sender: "ai" } }
         : null;
@@ -8751,21 +8782,21 @@ const flushQueuedStreamMessages = useCallback(async () => {
         const next = prev.slice();
 
         let replyToAppend: Msg | null = replyMsg;
-        let contentToAppend: Msg | null = contentMsg;
+        let contentToAppend: Msg[] = contentMsgs.slice();
 
         if (noticeIndex >= 0 && noticeIndex < next.length) {
           if (replyMsg) {
             next[noticeIndex] = replyMsg;
             replyToAppend = null;
-          } else if (contentMsg) {
-            next[noticeIndex] = contentMsg;
-            contentToAppend = null;
+          } else if (contentMsgs.length) {
+            next[noticeIndex] = contentMsgs[0];
+            contentToAppend = contentMsgs.slice(1);
           }
         }
 
         const append: Msg[] = [];
         if (replyToAppend) append.push(replyToAppend);
-        if (contentToAppend) append.push(contentToAppend);
+        if (contentToAppend.length) append.push(...contentToAppend);
 
         return append.length ? [...next, ...append] : next;
       });
