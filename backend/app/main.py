@@ -4384,6 +4384,25 @@ _PLATFORM_ATTACHMENT_BLOCK_RE = re.compile(
 _PLATFORM_DELIVERY_LINE_RE = re.compile(
     r'(?im)^\s*Delivering\s+(?:Photo|Video|content|scheduled\s+content)[^\n]*$'
 )
+_PLATFORM_FILENAME_IN_TEXT_RE = re.compile(
+    r'(?im)(?:^|\n)\s*(?:Attachment|File(?:\s+name)?)\s*:\s*([^\n]+)$'
+)
+
+
+def _platform_content_placeholder(file_name: str = "") -> str:
+    name = str(file_name or "").strip()
+    return f"Scheduled content was delivered by the platform: {name}." if name else "Scheduled content was delivered by the platform."
+
+
+def _platform_content_filename_from_text(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    for match in _PLATFORM_FILENAME_IN_TEXT_RE.finditer(raw):
+        candidate = str(match.group(1) or "").strip()
+        if candidate:
+            return candidate
+    return ""
 
 
 def _sanitize_platform_content_text(text: str) -> Tuple[str, bool]:
@@ -4416,7 +4435,7 @@ def _sanitize_message_content_for_llm(role: str, content: str) -> str:
             or "delivering video" in lowered
             or "delivering scheduled content" in lowered
         ) and not cleaned:
-            return "Scheduled content was delivered by the platform."
+            return _platform_content_placeholder(_platform_content_filename_from_text(content))
     return cleaned or str(content or "").strip()
 
 
@@ -6166,8 +6185,24 @@ async def chat(request: Request):
                 if brand_slug_for_content and member_id_for_content
                 else member_id_for_content
             )
-            if folder_for_content and brand_slug_for_content and member_key_for_content:
-                delivered_content = _content_deliver_to_user_if_due(
+            friend_first_turn_content: Optional[Dict[str, Any]] = None
+            mode_specific_content: Optional[Dict[str, Any]] = None
+            if brand_slug_for_content and member_key_for_content:
+                friend_first_turn_content = _content_deliver_friend_first_turn_once_per_24h(
+                    session_id=session_id,
+                    brand_slug=brand_slug_for_content,
+                    member_key=member_key_for_content,
+                    base_url=str(request.base_url),
+                    now_epoch=time.time(),
+                )
+            if (
+                folder_for_content
+                and folder_for_content != "friend"
+                and brand_slug_for_content
+                and member_key_for_content
+                and _content_folder_allowed_for_member(member_key_for_content, folder_for_content, False)
+            ):
+                mode_specific_content = _content_deliver_to_user_if_due(
                     session_id=session_id,
                     brand_slug=brand_slug_for_content,
                     member_key=member_key_for_content,
@@ -6178,6 +6213,7 @@ async def chat(request: Request):
                     now_epoch=time.time(),
                     force_user_delivery=True,
                 )
+            delivered_content = _content_merge_delivery_payloads(friend_first_turn_content, mode_specific_content)
         except Exception:
             delivered_content = None
 
@@ -6306,6 +6342,8 @@ async def chat(request: Request):
 
     # authoritative consent flag should live in session_state (works across gunicorn workers)
     intimate_allowed = bool(session_state.get("explicit_consented") is True)
+    if is_anon:
+        intimate_allowed = False
 
     # if user is requesting intimate OR the UI is in intimate mode, treat as intimate request
     user_requesting_intimate = wants_explicit or requested_intimate or _looks_intimate(user_text)
@@ -6322,6 +6360,18 @@ async def chat(request: Request):
 
     pending = (session_state.get("pending_consent") or "")
     pending = pending.strip().lower() if isinstance(pending, str) else ""
+
+    if is_anon and (requested_intimate or pending == "intimate" or user_requesting_intimate or bool(session_state.get("explicit_consented") is True)):
+        session_state_out = dict(session_state)
+        session_state_out["adult_verified"] = False
+        session_state_out["explicit_consented"] = False
+        session_state_out["pending_consent"] = None
+        session_state_out["mode"] = _safe_non_intimate_mode(session_state_out.get("mode") or "romantic")
+        return await _respond(
+            "Intimate (18+) mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Romantic mode.",
+            STATUS_SAFE,
+            session_state_out,
+        )
 
     def _grant_intimate(state_in: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(state_in)
@@ -6470,12 +6520,30 @@ async def chat(request: Request):
             or session_state_out.get("companionName")
             or session_state_out.get("companion_name")
         )
-        # Scheduled content: when host overrides AI chat, deliver to host (1 min early).
+        # Universal first-turn friend photo is auto-delivered once per 24h.
+        friend_first_turn_content: Optional[Dict[str, Any]] = None
+        try:
+            member_id_norm = str((usage_info or {}).get("member_id") or _normalize_usage_member_id(identity_key or ""))
+            brand_slug = _content_brand_slug(session_state_out)
+            member_key_for_content = f"{brand_slug}::{member_id_norm}" if brand_slug and member_id_norm else member_id_norm
+            if brand_slug and member_key_for_content:
+                friend_first_turn_content = _content_deliver_friend_first_turn_once_per_24h(
+                    session_id=session_id,
+                    brand_slug=brand_slug,
+                    member_key=member_key_for_content,
+                    base_url=str(request.base_url),
+                    now_epoch=time.time(),
+                )
+        except Exception:
+            friend_first_turn_content = None
+
+        # Scheduled content: when host overrides AI chat, non-friend folders still queue to host (1 min early).
         try:
             member_id_norm = str((usage_info or {}).get("member_id") or _normalize_usage_member_id(identity_key or ""))
             brand_slug = _content_brand_slug(session_state_out)
             folder = _content_folder_for_mode(effective_mode)
-            if folder != "intimate" or intimate_allowed:
+            member_key_for_content = f"{brand_slug}::{member_id_norm}" if brand_slug and member_id_norm else member_id_norm
+            if folder != "friend" and _content_folder_allowed_for_member(member_key_for_content, folder, intimate_allowed):
                 _content_queue_pending_for_host(
                     request=request,
                     session_id=session_id,
@@ -6493,6 +6561,7 @@ async def chat(request: Request):
             "",
             STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
             session_state_out,
+            friend_first_turn_content,
         )
 
     if llm_provider == "openai" and in_session_summaries:
@@ -6684,9 +6753,18 @@ async def chat(request: Request):
         brand_slug = _content_brand_slug(session_state_out)
         folder = _content_folder_for_mode(effective_mode)
         member_key_for_content = f"{brand_slug}::{member_id_norm}" if brand_slug and member_id_norm else member_id_norm
-        # Never deliver intimate assets unless intimate is allowed.
-        if member_key_for_content and (folder != "intimate" or intimate_allowed):
-            delivered_content = _content_deliver_to_user_if_due(
+        friend_first_turn_content: Optional[Dict[str, Any]] = None
+        mode_specific_content: Optional[Dict[str, Any]] = None
+        if brand_slug and member_key_for_content:
+            friend_first_turn_content = _content_deliver_friend_first_turn_once_per_24h(
+                session_id=session_id,
+                brand_slug=brand_slug,
+                member_key=member_key_for_content,
+                base_url=str(request.base_url),
+                now_epoch=time.time(),
+            )
+        if member_key_for_content and folder != "friend" and _content_folder_allowed_for_member(member_key_for_content, folder, intimate_allowed):
+            mode_specific_content = _content_deliver_to_user_if_due(
                 session_id=session_id,
                 brand_slug=brand_slug,
                 member_key=member_key_for_content,
@@ -6696,6 +6774,7 @@ async def chat(request: Request):
                 base_url=str(request.base_url),
                 now_epoch=time.time(),
             )
+        delivered_content = _content_merge_delivery_payloads(friend_first_turn_content, mode_specific_content)
     except Exception:
         delivered_content = None
     return await _respond(
@@ -6752,9 +6831,12 @@ async def llm_warm(raw: Dict[str, Any] = Body(...)):
             return {"ok": True, "skipped": True, "provider": provider, "mode": mode}
         _LLM_WARM_LAST[warm_key] = now
 
+    member_id = _extract_member_id(session_state)
     intimate_allowed = bool(session_state.get("explicit_consented") or session_state.get("romance_consented"))
-    if mode != "intimate":
+    if mode != "intimate" or _is_anon_member_id(member_id):
         intimate_allowed = False
+        if mode == "intimate" and _is_anon_member_id(member_id):
+            mode = "romantic"
 
     # Build the same system prompt blocks (persona + onboarding + site context).
     system_prompt = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
@@ -8035,6 +8117,20 @@ def _extract_member_id(session_state: Dict[str, Any]) -> str:
         or ""
     )
     return str(member_id).strip() if member_id is not None else ""
+
+
+def _is_anon_member_id(member_id: Any) -> bool:
+    raw = str(member_id or "").strip().lower()
+    if not raw:
+        return False
+    return raw.startswith("anon:") or "::anon:" in raw
+
+
+def _safe_non_intimate_mode(raw_mode: Any) -> str:
+    m = str(raw_mode or "").strip().lower()
+    if m.startswith("friend"):
+        return "friend"
+    return "romantic"
 
 
 def _extract_companion_raw(session_state: Dict[str, Any]) -> str:
@@ -11195,8 +11291,18 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
                 if brand_slug and member_id_norm
                 else member_id_norm
             )
-            if folder and brand_slug and member_key_for_content:
-                delivered_content = _content_deliver_to_user_if_due(
+            friend_first_turn_content: Optional[Dict[str, Any]] = None
+            mode_specific_content: Optional[Dict[str, Any]] = None
+            if brand_slug and member_key_for_content:
+                friend_first_turn_content = _content_deliver_friend_first_turn_once_per_24h(
+                    session_id=sid,
+                    brand_slug=brand_slug,
+                    member_key=member_key_for_content,
+                    base_url="",
+                    now_epoch=time.time(),
+                )
+            if folder and folder != "friend" and brand_slug and member_key_for_content:
+                mode_specific_content = _content_deliver_to_user_if_due(
                     session_id=sid,
                     brand_slug=brand_slug,
                     member_key=member_key_for_content,
@@ -11207,6 +11313,7 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
                     now_epoch=time.time(),
                     force_user_delivery=True,
                 )
+            delivered_content = _content_merge_delivery_payloads(friend_first_turn_content, mode_specific_content)
         except Exception:
             delivered_content = None
 
@@ -11871,9 +11978,13 @@ def _normalize_usage_member_id(identity_key: str) -> str:
 # ---------------- Scheduled content delivery (media milestones) ----------------
 
 _CONTENT_DB_LOCK = threading.Lock()
+_CONTENT_DB_READY = False
 _CONTENT_WINDOW_SECONDS = 24 * 60 * 60
 _CONTENT_TRIGGER_START_MINUTE = 9
 _CONTENT_TRIGGER_STEP_MINUTES = 10
+_CONTENT_FRIEND_FIRST_TURN_TRIGGER_MINUTE = 1
+_CONTENT_FRIEND_FIRST_TURN_COOLDOWN_SECONDS = 24 * 60 * 60
+_CONTENT_FRIEND_FIRST_TURN_DELIVERED_VIA = "friend_first_turn_daily"
 
 
 def _safe_slug(s: str) -> str:
@@ -12031,33 +12142,35 @@ def _content_ensure_history_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS user_content_history (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          token TEXT,
+          user_content_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+          user_type VARCHAR(25),
           member_id TEXT NOT NULL,
           content_folder TEXT NOT NULL,
-          trigger_minute INTEGER,
-          content_sequence TEXT,
           content_name TEXT,
+          content_sequence TEXT,
+          token TEXT,
+          trigger_minute INTEGER,
           content_type TEXT,
           content_stage TEXT,
           content_url TEXT,
-          delivered_via TEXT,
-          create_datetime datetime DEFAULT CURRENT_TIMESTAMP
+          delivered_via TEXT
         );
         """
     )
     for name, coldef in [
-        ("token", "token TEXT"),
+        ("create_datetime", "create_datetime TEXT"),
+        ("user_type", "user_type VARCHAR(25)"),
         ("member_id", "member_id TEXT"),
         ("content_folder", "content_folder TEXT"),
-        ("trigger_minute", "trigger_minute INTEGER"),
-        ("content_sequence", "content_sequence TEXT"),
         ("content_name", "content_name TEXT"),
+        ("content_sequence", "content_sequence TEXT"),
+        ("token", "token TEXT"),
+        ("trigger_minute", "trigger_minute INTEGER"),
         ("content_type", "content_type TEXT"),
         ("content_stage", "content_stage TEXT"),
         ("content_url", "content_url TEXT"),
         ("delivered_via", "delivered_via TEXT"),
-        ("create_datetime", "create_datetime TEXT"),
     ]:
         _content_ensure_column(conn, "user_content_history", name, coldef)
 
@@ -12065,13 +12178,19 @@ def _content_ensure_history_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_user_content_history_token
         ON user_content_history(token)
-        WHERE token IS NOT NULL;
+        WHERE token IS NOT NULL AND TRIM(token) <> '';
         """
     )
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_user_content_history_member
         ON user_content_history(member_id, content_folder, create_datetime);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_content_history_member_sequence
+        ON user_content_history(member_id, content_folder, content_sequence);
         """
     )
 
@@ -12133,15 +12252,53 @@ def _content_ensure_claims_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _content_db_ensure_schema(conn: sqlite3.Connection) -> None:
-    with _CONTENT_DB_LOCK:
-        _content_ensure_state_schema(conn)
-        _content_ensure_history_schema(conn)
-        _content_ensure_claims_schema(conn)
-        conn.commit()
+def _content_folder_allowed_for_member(member_key: str, folder: str, intimate_allowed: bool = False) -> bool:
+    folder_slug = _safe_slug(folder)
+    if folder_slug != "intimate":
+        return True
+    if _is_anon_member_id(member_key):
+        return False
+    return bool(intimate_allowed)
 
 
-def _content_history_insert(
+def _content_history_needs_rebuild(conn: sqlite3.Connection) -> bool:
+    if not _content_table_exists(conn, "user_content_history"):
+        return False
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='user_content_history' LIMIT 1"
+        ).fetchone()
+        table_sql = str((row[0] if row else "") or "").lower()
+    except Exception:
+        table_sql = ""
+
+    if table_sql and re.search(r"\bmember_id\b[^,)]*\bunique\b", table_sql):
+        return True
+
+    try:
+        index_rows = conn.execute("PRAGMA index_list(user_content_history)").fetchall()
+    except Exception:
+        index_rows = []
+
+    for index_row in index_rows:
+        try:
+            is_unique = int(index_row[2] or 0) == 1
+            idx_name = str(index_row[1] or "").strip()
+        except Exception:
+            is_unique = False
+            idx_name = ""
+        if not is_unique or not idx_name:
+            continue
+        try:
+            cols = [str(c[2] or "").strip().lower() for c in conn.execute(f"PRAGMA index_info({idx_name})").fetchall()]
+        except Exception:
+            cols = []
+        if cols == ["member_id"]:
+            return True
+    return False
+
+
+def _content_history_insert_with_create_datetime(
     conn: sqlite3.Connection,
     token: str,
     member_id: str,
@@ -12153,17 +12310,23 @@ def _content_history_insert(
     content_stage: str,
     content_url: str,
     delivered_via: str,
+    create_datetime: Optional[str] = None,
+    user_type: Optional[str] = None,
 ) -> None:
     cols = _content_table_columns(conn, "user_content_history")
     if not cols:
         return
 
-    now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        trigger_minute_i = int(trigger_minute or 0)
+    except Exception:
+        trigger_minute_i = 0
+
     values: Dict[str, Any] = {
         "token": str(token or "").strip(),
         "member_id": str(member_id or "").strip(),
         "content_folder": str(content_folder or "").strip(),
-        "trigger_minute": int(trigger_minute or 0),
+        "trigger_minute": trigger_minute_i,
         "content_sequence": str(content_sequence or "").strip(),
         "content_name": str(content_name or "").strip(),
         "content_type": str(content_type or "").strip(),
@@ -12180,7 +12343,8 @@ def _content_history_insert(
             file_name=str(content_name or "").strip(),
         ),
         "delivered_via": str(delivered_via or "").strip(),
-        "create_datetime": now_utc,
+        "create_datetime": str(create_datetime or "").strip() or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "user_type": str(user_type or "").strip() or None,
     }
     ordered = [name for name in [
         "token",
@@ -12194,12 +12358,206 @@ def _content_history_insert(
         "content_url",
         "delivered_via",
         "create_datetime",
+        "user_type",
     ] if name in cols]
     if not ordered:
         return
     placeholders = ", ".join(["?"] * len(ordered))
     sql = f"INSERT OR IGNORE INTO user_content_history ({', '.join(ordered)}) VALUES ({placeholders})"
     conn.execute(sql, tuple(values[name] for name in ordered))
+
+
+def _content_history_has_token(conn: sqlite3.Connection, token: str) -> bool:
+    tok = str(token or "").strip()
+    cols = _content_table_columns(conn, "user_content_history")
+    if not tok or "token" not in cols:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM user_content_history WHERE token=? LIMIT 1",
+        (tok,),
+    ).fetchone()
+    return row is not None
+
+
+def _content_epoch_to_datetime(epoch_value: Any) -> str:
+    try:
+        epoch_f = float(epoch_value or 0.0)
+    except Exception:
+        epoch_f = 0.0
+    if epoch_f <= 0:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.utcfromtimestamp(epoch_f).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _content_history_backfill_from_claim(conn: sqlite3.Connection, claim: Dict[str, Any]) -> bool:
+    if not claim or not _content_claim_is_delivered(claim):
+        return False
+
+    member_id = str(claim.get("member_id") or "").strip()
+    content_folder = str(claim.get("content_folder") or "").strip()
+    if _safe_slug(content_folder) == "intimate" and _is_anon_member_id(member_id):
+        return False
+
+    token = str(claim.get("token") or "").strip()
+    if token and _content_history_has_token(conn, token):
+        return False
+
+    claim_state = str(claim.get("claim_state") or "").strip().lower()
+    claimed_via = str(claim.get("claimed_via") or "").strip()
+    delivered_via = claimed_via
+    if not delivered_via:
+        if claim_state == "delivered_host":
+            delivered_via = "host_pending"
+        elif claim_state == "delivered_history":
+            delivered_via = "history_backfill"
+        else:
+            delivered_via = "auto"
+
+    _content_history_insert_with_create_datetime(
+        conn,
+        token=token,
+        member_id=member_id,
+        content_folder=content_folder,
+        trigger_minute=int(claim.get("trigger_minute") or 0),
+        content_sequence=claim.get("content_sequence"),
+        content_name=str(claim.get("content_name") or "").strip(),
+        content_type=str(claim.get("content_kind") or "").strip(),
+        content_stage=str(claim.get("content_stage") or "").strip(),
+        content_url=str(claim.get("content_url") or "").strip(),
+        delivered_via=delivered_via,
+        create_datetime=_content_epoch_to_datetime(
+            claim.get("delivered_epoch") or claim.get("updated_epoch") or claim.get("created_epoch")
+        ),
+        user_type="member",
+    )
+    return bool(token and _content_history_has_token(conn, token))
+
+
+def _content_backfill_history_from_claims(
+    conn: sqlite3.Connection,
+    member_id: str = "",
+    content_folder: str = "",
+) -> int:
+    if not _content_table_exists(conn, "user_content_claims"):
+        return 0
+
+    where = ["LOWER(COALESCE(claim_state, '')) IN ('delivered_user', 'delivered_host', 'delivered_history')"]
+    params: List[Any] = []
+    if str(member_id or "").strip():
+        where.append("member_id = ?")
+        params.append(str(member_id or "").strip())
+    if str(content_folder or "").strip():
+        where.append("content_folder = ?")
+        params.append(str(content_folder or "").strip())
+
+    sql = f"""
+        SELECT *
+        FROM user_content_claims
+        WHERE {' AND '.join(where)}
+        ORDER BY COALESCE(delivered_epoch, updated_epoch, created_epoch), trigger_minute, token
+    """
+    inserted = 0
+    for row in conn.execute(sql, tuple(params)).fetchall():
+        claim = dict(row)
+        token = str(claim.get("token") or "").strip()
+        if token and _content_history_has_token(conn, token):
+            continue
+        if _content_history_backfill_from_claim(conn, claim):
+            inserted += 1
+    return inserted
+
+
+def _content_rebuild_history_schema(conn: sqlite3.Connection) -> bool:
+    if not _content_table_exists(conn, "user_content_history"):
+        _content_ensure_history_schema(conn)
+        return False
+
+    old_rows = conn.execute(
+        "SELECT * FROM user_content_history ORDER BY COALESCE(create_datetime, ''), rowid"
+    ).fetchall()
+
+    conn.execute("DROP TABLE user_content_history")
+    _content_ensure_history_schema(conn)
+
+    for row in old_rows:
+        payload = dict(row)
+        _content_history_insert_with_create_datetime(
+            conn,
+            token=str(payload.get("token") or "").strip(),
+            member_id=str(payload.get("member_id") or "").strip(),
+            content_folder=str(payload.get("content_folder") or "").strip(),
+            trigger_minute=int(payload.get("trigger_minute") or 0),
+            content_sequence=payload.get("content_sequence"),
+            content_name=str(payload.get("content_name") or "").strip(),
+            content_type=str(payload.get("content_type") or "").strip(),
+            content_stage=str(payload.get("content_stage") or "").strip(),
+            content_url=str(payload.get("content_url") or "").strip(),
+            delivered_via=str(payload.get("delivered_via") or "").strip(),
+            create_datetime=str(payload.get("create_datetime") or "").strip(),
+            user_type=str(payload.get("user_type") or "").strip() or None,
+        )
+    return True
+
+
+def _content_purge_anon_intimate_rows(conn: sqlite3.Connection) -> None:
+    for table in ("user_content_history", "user_content_claims", "user_content_state"):
+        cols = _content_table_columns(conn, table)
+        if not {"member_id", "content_folder"}.issubset(cols):
+            continue
+        conn.execute(
+            f"DELETE FROM {table} WHERE lower(content_folder)=? AND instr(lower(member_id), 'anon:') > 0",
+            ("intimate",),
+        )
+
+
+def _content_repair_history_schema_and_backfill(conn: sqlite3.Connection) -> None:
+    if _content_history_needs_rebuild(conn):
+        _content_rebuild_history_schema(conn)
+    _content_purge_anon_intimate_rows(conn)
+    _content_backfill_history_from_claims(conn)
+
+
+def _content_db_ensure_schema(conn: sqlite3.Connection) -> None:
+    global _CONTENT_DB_READY
+    if _CONTENT_DB_READY:
+        return
+    with _CONTENT_DB_LOCK:
+        if _CONTENT_DB_READY:
+            return
+        _content_ensure_state_schema(conn)
+        _content_ensure_history_schema(conn)
+        _content_ensure_claims_schema(conn)
+        _content_repair_history_schema_and_backfill(conn)
+        conn.commit()
+        _CONTENT_DB_READY = True
+
+
+def _content_history_insert(
+    conn: sqlite3.Connection,
+    token: str,
+    member_id: str,
+    content_folder: str,
+    trigger_minute: int,
+    content_sequence: Any,
+    content_name: str,
+    content_type: str,
+    content_stage: str,
+    content_url: str,
+    delivered_via: str,
+) -> None:
+    _content_history_insert_with_create_datetime(
+        conn,
+        token=token,
+        member_id=member_id,
+        content_folder=content_folder,
+        trigger_minute=trigger_minute,
+        content_sequence=content_sequence,
+        content_name=content_name,
+        content_type=content_type,
+        content_stage=content_stage,
+        content_url=content_url,
+        delivered_via=delivered_via,
+    )
 
 
 def _content_parse_filename(name: str) -> Dict[str, str]:
@@ -12281,6 +12639,173 @@ def _content_due_scheduled_minutes(*, used_seconds: float, include_host_early: b
             return []
         due_count = 1 + (used_minutes - 9) // _CONTENT_TRIGGER_STEP_MINUTES
     return [_CONTENT_TRIGGER_START_MINUTE + (_CONTENT_TRIGGER_STEP_MINUTES * i) for i in range(max(0, due_count))]
+
+
+def _content_pick_first_file(brand_slug: str, folder: str, prefer_kind: str = "") -> Optional[str]:
+    files = _content_list_files(brand_slug, folder)
+    if not files:
+        return None
+
+    desired_kind = str(prefer_kind or "").strip().lower()
+    if desired_kind:
+        for fn in files:
+            info = _content_parse_filename(fn)
+            kind = str((info or {}).get("kind") or "").strip().lower()
+            if kind == desired_kind:
+                return fn
+
+    return files[0]
+
+
+def _content_history_has_recent_delivery(
+    conn: sqlite3.Connection,
+    *,
+    member_id: str,
+    content_folder: str,
+    delivered_via: str,
+    since_epoch: float,
+) -> bool:
+    cols = _content_table_columns(conn, "user_content_history")
+    if not cols or "member_id" not in cols or "content_folder" not in cols:
+        return False
+
+    where = ["member_id = ?", "content_folder = ?"]
+    params: List[Any] = [
+        str(member_id or "").strip(),
+        str(content_folder or "").strip(),
+    ]
+
+    if "delivered_via" in cols and str(delivered_via or "").strip():
+        where.append("delivered_via = ?")
+        params.append(str(delivered_via or "").strip())
+
+    if float(since_epoch or 0.0) > 0 and "create_datetime" in cols:
+        where.append("create_datetime >= datetime(?, 'unixepoch')")
+        params.append(float(since_epoch or 0.0))
+
+    row = conn.execute(
+        f"SELECT 1 FROM user_content_history WHERE {' AND '.join(where)} LIMIT 1",
+        tuple(params),
+    ).fetchone()
+    return row is not None
+
+
+def _content_deliver_friend_first_turn_once_per_24h(
+    *,
+    session_id: str,
+    brand_slug: str,
+    member_key: str,
+    base_url: str,
+    now_epoch: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    brand = str(brand_slug or "").strip()
+    member = str(member_key or "").strip()
+    if not brand or not member:
+        return None
+
+    now = float(now_epoch or time.time())
+    since_epoch = max(0.0, now - _CONTENT_FRIEND_FIRST_TURN_COOLDOWN_SECONDS)
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = _content_db_connect()
+        _content_db_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+
+        if _content_history_has_recent_delivery(
+            conn,
+            member_id=member,
+            content_folder="friend",
+            delivered_via="",
+            since_epoch=since_epoch,
+        ):
+            conn.commit()
+            return None
+
+        file_name = _content_pick_first_file(brand, "friend", prefer_kind="image")
+        if not file_name:
+            conn.commit()
+            return None
+
+        prepared = _content_prepare_delivery_payload(
+            brand_slug=brand,
+            folder="friend",
+            file_name=file_name,
+            base_url=str(base_url or ""),
+            trigger_minute=_CONTENT_FRIEND_FIRST_TURN_TRIGGER_MINUTE,
+        )
+
+        cycle_id = f"friend_first_turn_daily:{int(now)}"
+        token = _content_delivery_token(
+            member,
+            "friend",
+            cycle_id,
+            _CONTENT_FRIEND_FIRST_TURN_TRIGGER_MINUTE,
+            prepared["sequence"],
+            file_name,
+        )
+
+        _content_claim_upsert(
+            conn,
+            token=token,
+            member_id=member,
+            content_folder="friend",
+            cycle_id=cycle_id,
+            trigger_minute=_CONTENT_FRIEND_FIRST_TURN_TRIGGER_MINUTE,
+            content_sequence=prepared["sequence"],
+            content_name=file_name,
+            content_kind=prepared["content_kind"],
+            content_stage=prepared["content_stage"],
+            content_url=prepared["content_url"],
+            claim_state="delivered_user",
+            claimed_via=_CONTENT_FRIEND_FIRST_TURN_DELIVERED_VIA,
+            session_id=session_id,
+            now_epoch=now,
+            delivered_epoch=now,
+        )
+
+        _content_history_insert(
+            conn,
+            token,
+            member,
+            "friend",
+            _CONTENT_FRIEND_FIRST_TURN_TRIGGER_MINUTE,
+            prepared["sequence"],
+            file_name,
+            prepared["content_kind"] or "image",
+            prepared["content_stage"],
+            prepared["content_url"],
+            _CONTENT_FRIEND_FIRST_TURN_DELIVERED_VIA,
+        )
+
+        _content_state_upsert(
+            conn,
+            member,
+            "friend",
+            {"updated_epoch": now},
+        )
+        conn.commit()
+
+        return {
+            "token": token,
+            "triggerMinute": _CONTENT_FRIEND_FIRST_TURN_TRIGGER_MINUTE,
+            "trigger_minute": _CONTENT_FRIEND_FIRST_TURN_TRIGGER_MINUTE,
+            "folder": "friend",
+            **prepared["content"],
+        }
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _content_delivery_token(
@@ -12521,6 +13046,17 @@ def _content_trigger_delivery_status(
     claim_state = str((claim or {}).get("claim_state") or "").strip().lower()
     file_name = str((claim or {}).get("content_name") or "").strip()
 
+    if (not history) and claim and claim_state in {"delivered_user", "delivered_host", "delivered_history"}:
+        _content_history_backfill_from_claim(conn, claim)
+        history = _content_history_row_for_trigger(
+            conn,
+            member_id=member_id,
+            content_folder=content_folder,
+            scheduled_minute=int(trigger_minute or 0),
+            window_start_epoch=window_start_epoch,
+            tol=1,
+        )
+
     if history:
         status = "delivered"
     elif claim_state == "pending_host" and file_name:
@@ -12596,6 +13132,27 @@ def _content_compose_delivery_result(items: List[Dict[str, Any]]) -> Optional[Di
         primary["items"] = list(items)
         primary["contentCount"] = len(items)
     return primary
+
+
+def _content_merge_delivery_payloads(*payloads: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for payload in payloads:
+        for item in _content_delivery_items(payload):
+            item_dict = dict(item)
+            token = str(item_dict.get("token") or "").strip()
+            key = token or "|".join(
+                [
+                    str(item_dict.get("folder") or item_dict.get("content_folder") or "").strip(),
+                    str(item_dict.get("fileName") or item_dict.get("filename") or "").strip(),
+                    str(item_dict.get("triggerMinute") or item_dict.get("trigger_minute") or "").strip(),
+                ]
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item_dict)
+    return _content_compose_delivery_result(merged)
 
 def _content_claim_upsert(
     conn: sqlite3.Connection,
@@ -12697,8 +13254,12 @@ def _content_prepare_delivery_payload(
     }
 
     try:
-        if content_description:
+        if content_description and file_name:
+            content["message"] = f"Delivering {content_type_label or 'content'}: {content_description}. File: {file_name}"
+        elif content_description:
             content["message"] = f"Delivering {content_type_label or 'content'}: {content_description}."
+        elif file_name:
+            content["message"] = f"Delivering {content_type_label or 'content'}. File: {file_name}"
         else:
             content["message"] = f"Delivering {content_type_label or 'content'}."
         mime, _enc = mimetypes.guess_type(file_name)
@@ -13336,6 +13897,11 @@ def _content_queue_pending_for_host(
 
     conn = _content_db_connect()
     member_key = f"{brand_slug}::{member_id}" if brand_slug else member_id
+    folder_slug = _safe_slug(folder)
+    if folder_slug == "friend":
+        return None
+    if folder_slug == "intimate" and _is_anon_member_id(member_key):
+        return None
     now = float(now_epoch or time.time())
     try:
         _content_db_ensure_schema(conn)
@@ -13558,6 +14124,11 @@ def _content_deliver_to_user_if_due(
     """
 
     conn: Optional[sqlite3.Connection] = None
+    folder_slug = _safe_slug(folder)
+    if folder_slug == "friend":
+        return None
+    if folder_slug == "intimate" and _is_anon_member_id(member_key):
+        return None
     now = float(now_epoch or time.time())
     try:
         conn = _content_db_connect()

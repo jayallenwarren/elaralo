@@ -800,6 +800,7 @@ function buildContentAssistantMsg(rawContent: any): Msg | null {
     folder: String((rawContent as any).folder || ""),
     sequence: String((rawContent as any).sequence || ""),
     stage: String((rawContent as any).stage || ""),
+    fileName: String((rawContent as any).fileName || (rawContent as any).filename || att?.name || ""),
   };
 
   return {
@@ -809,6 +810,15 @@ function buildContentAssistantMsg(rawContent: any): Msg | null {
   };
 }
 
+function platformContentPlaceholder(contentText: string, meta: any): string {
+  const fromMeta = String(meta?.attachment?.name || meta?.contentDelivery?.fileName || "").trim();
+  if (fromMeta) return `Scheduled content was delivered by the platform: ${fromMeta}.`;
+
+  const match = String(contentText || "").match(/(?:^|\n)\s*(?:Attachment|File(?: name)?)\s*:\s*([^\n]+)/i);
+  const fromText = match ? String(match[1] || "").trim() : "";
+  return fromText ? `Scheduled content was delivered by the platform: ${fromText}.` : "Scheduled content was delivered by the platform.";
+}
+
 function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): { role: Role; content: string } {
   const role = m.role;
   const meta: any = m.meta || {};
@@ -816,9 +826,8 @@ function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): { 
   let content = String(m.content || "");
 
   if (isPlatformContent) {
-    // Scheduled content is chosen by the backend from real files. Do not feed filenames or
-    // /content URLs back into model context, otherwise the model starts inventing fake deliveries.
-    content = content.trim() || "Scheduled content was delivered by the platform.";
+    // Preserve the actual delivered file name while still avoiding raw /content URLs in model context.
+    content = content.trim() || platformContentPlaceholder(content, meta);
     return { role, content };
   }
 
@@ -1053,6 +1062,16 @@ function allowedModesFromElaraloPlanMap(rawPlanMap: unknown, fallbackPlan: PlanN
   if (topMode === "romantic") return ["friend", "romantic"];
   if (topMode === "friend") return ["friend"];
   return allowedModesForPlan(fallbackPlan);
+}
+
+function clampAllowedModesForIdentity(memberId: string, modes: Mode[]): Mode[] {
+  const mid = String(memberId || "").trim();
+  if (!mid || isAnonMemberId(mid)) return ["friend", "romantic"];
+  return modes;
+}
+
+function fallbackModeForAllowedModes(modes: Mode[]): Mode {
+  return modes.includes("romantic") ? "romantic" : "friend";
 }
 
 function stripExt(s: string) {
@@ -7629,8 +7648,12 @@ useEffect(() => {
 
   function showUpgradeMessage(requestedMode: Mode) {
     const modeLabel = MODE_LABELS[requestedMode];
+    const midNow = String(memberIdRef.current || memberId || "").trim();
+    const isVisitorNow = !midNow || isAnonMemberId(midNow);
     const msg = requestedMode === "intimate"
-      ? `Intimate (18+) isn't available on your current plan. Please upgrade or purchase Pay as You Go here: ${upgradeUrl} (or click the Upgrade button in the top-right).`
+      ? isVisitorNow
+        ? "Intimate (18+) mode is available only to signed-in members. Visitors can use Friend and Romantic modes."
+        : `Intimate (18+) isn't available on your current plan. Please upgrade or purchase Pay as You Go here: ${upgradeUrl} (or click the Upgrade button in the top-right).`
       : `The requested mode (${modeLabel}) isn't available on your current plan. Please upgrade here: ${upgradeUrl} (or click the Upgrade button in the top-right).`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
@@ -7816,7 +7839,7 @@ useEffect(() => {
               ? String((data as any).modepill)
               : "";
 
-      const desiredStartMode: Mode =
+      const desiredStartModeRaw: Mode =
         modeFromModePill(incomingModePillRaw) ||
         modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) ||
         (hasEntitledPlan ? "intimate" : "romantic");
@@ -7824,7 +7847,12 @@ useEffect(() => {
       // Requirement: the *Elaralo* entitlement plan determines how many mode pills exist.
       // The Wix `modePill` selects the initially-active mode (if allowed), but does NOT change how many pills are shown.
 
-      const nextAllowed = allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan);
+      const nextAllowed = clampAllowedModesForIdentity(
+        incomingMemberId,
+        allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan)
+      );
+      const desiredStartMode: Mode =
+        nextAllowed.includes(desiredStartModeRaw) ? desiredStartModeRaw : fallbackModeForAllowedModes(nextAllowed);
 
       setAllowedModes(nextAllowed);
 
@@ -7864,12 +7892,12 @@ useEffect(() => {
           if (nextAllowed.includes(desiredStartMode) && (!nextAllowed.includes(nextMode) || nextMode === "friend")) {
             nextMode = desiredStartMode;
           } else if (!nextAllowed.includes(nextMode)) {
-            nextMode = "friend";
+            nextMode = fallbackModeForAllowedModes(nextAllowed);
           }
         }
 
-        if (nextMode === prev.mode) return prev;
-        return { ...prev, mode: nextMode, pending_consent: null };
+        if (nextMode === prev.mode && prev.pending_consent !== "intimate") return prev;
+        return { ...prev, mode: nextMode, pending_consent: nextMode === "intimate" ? prev.pending_consent : null };
       });
 
       // Mark handoff ready so the first audio-only TTS can deterministically use the selected companion voice.
@@ -13167,7 +13195,7 @@ const modePillControls = (
                   // Ensure backend receives pending_consent + intimate mode
                   if (!allowedModes.includes("intimate")) {
                     showUpgradeMessage("intimate");
-                    setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: false, mode: prev.mode === "intimate" ? "friend" : prev.mode }));
+                    setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: false, mode: prev.mode === "intimate" ? fallbackModeForAllowedModes(allowedModes) : prev.mode }));
                     setChatStatus("safe");
                     return;
                   }
@@ -13189,7 +13217,7 @@ const modePillControls = (
                 onClick={() => {
                   if (!allowedModes.includes("intimate")) {
                     showUpgradeMessage("intimate");
-                    setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: false, mode: prev.mode === "intimate" ? "friend" : prev.mode }));
+                    setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: false, mode: prev.mode === "intimate" ? fallbackModeForAllowedModes(allowedModes) : prev.mode }));
                     setChatStatus("safe");
                     return;
                   }
@@ -13209,7 +13237,7 @@ const modePillControls = (
               <button
                 onClick={() => {
                   setChatStatus("safe");
-                  setSessionState((prev) => ({ ...prev, pending_consent: null, mode: "friend" }));
+                  setSessionState((prev) => ({ ...prev, pending_consent: null, mode: fallbackModeForAllowedModes(allowedModes) }));
                 }}
                 style={{
                   marginLeft: "auto",
