@@ -4028,14 +4028,23 @@ def _to_openai_messages(
     mode: str,
     intimate_allowed: bool,
     debug: bool
-):
+) -> List[Dict[str, Any]]:
     sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
     _dbg(debug, "SYSTEM PROMPT:", sys)
 
-    out = [{"role": "system", "content": sys}]
+    out: List[Dict[str, Any]] = [{"role": "system", "content": sys}]
     for m in messages:
-        if m.get("role") in ("user", "assistant"):
-            out.append({"role": m["role"], "content": m.get("content", "")})
+        role = str(m.get("role") or "").strip()
+        if role not in ("user", "assistant"):
+            continue
+
+        content_raw: Any = m.get("content", "")
+        if role == "user" and isinstance(content_raw, str):
+            content_out = _user_message_content_for_llm(content_raw)
+        else:
+            content_out = content_raw if content_raw is not None else ""
+
+        out.append({"role": role, "content": content_out})
     return out
 
 
@@ -4182,7 +4191,7 @@ def _chat_completion_text(
     client: Any,
     *,
     model: str,
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     temperature: float,
     max_tokens: Optional[int] = None,
     stream: bool = False,
@@ -4218,7 +4227,7 @@ def _chat_completion_text(
         return _extract_text_from_chat_completion(resp)
 
 
-def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
+def _call_gpt4o(messages: List[Dict[str, Any]]) -> str:
     client = _get_openai_client()
     return _chat_completion_text(
         client,
@@ -4230,7 +4239,7 @@ def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
 
 
 def _call_gpt4o_with_options(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
@@ -4278,7 +4287,7 @@ def _xai_base_url() -> str:
     return url
 
 
-def _call_xai_chat(messages: List[Dict[str, str]]) -> str:
+def _call_xai_chat(messages: List[Dict[str, Any]]) -> str:
     """Call xAI (OpenAI-compatible) chat completions endpoint."""
     client = _get_xai_client()
 
@@ -4416,12 +4425,107 @@ def _sanitize_platform_content_text(text: str) -> Tuple[str, bool]:
 
     t = _PLATFORM_ATTACHMENT_BLOCK_RE.sub("\n", t)
     t = _PLATFORM_CONTENT_URL_RE.sub("[platform content link removed]", t)
-    t = re.sub(r'(?im)^\s*Attachment:\s*[^\n]*$', '', t)
     t = _PLATFORM_DELIVERY_LINE_RE.sub('', t)
     t = re.sub(r'(?im)^\s*\[platform content link removed\]\s*$', '', t)
     t = re.sub(r'\n{3,}', '\n\n', t).strip()
 
     return t, (t != original.strip())
+
+
+_USER_ATTACHMENT_BLOCK_RE = re.compile(
+    r'(?is)(?:^|\n)\s*Attachment:\s*([^\n]*)\n\s*(https?://[^\s"\'<>]+)'
+)
+_IMAGE_ATTACHMENT_EXTS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff', '.avif', '.heic', '.heif'
+}
+
+
+def _attachment_file_ext(value: str) -> str:
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+    try:
+        parsed = urlparse(raw)
+        path = parsed.path or raw
+    except Exception:
+        path = raw.split('?', 1)[0].split('#', 1)[0]
+    base = str(path or '').rsplit('/', 1)[-1]
+    if '.' not in base:
+        return ''
+    return '.' + base.rsplit('.', 1)[-1].lower()
+
+
+def _attachment_looks_like_image(name: str, url: str) -> bool:
+    for candidate in (name, url):
+        ext = _attachment_file_ext(candidate)
+        if ext and ext in _IMAGE_ATTACHMENT_EXTS:
+            return True
+    return False
+
+
+def _extract_user_attachments_from_text(content: str) -> Tuple[str, List[Dict[str, str]]]:
+    raw = str(content or '')
+    if not raw:
+        return '', []
+
+    attachments: List[Dict[str, str]] = []
+
+    def _repl(match) -> str:
+        name = str(match.group(1) or '').strip()
+        url = str(match.group(2) or '').strip()
+        if url:
+            attachments.append({'name': name, 'url': url})
+        return '\n'
+
+    cleaned = _USER_ATTACHMENT_BLOCK_RE.sub(_repl, raw.replace('\r\n', '\n').replace('\r', '\n'))
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+    return cleaned, attachments
+
+
+def _user_message_content_for_llm(content: str) -> Any:
+    """Convert serialized user attachment text into multimodal message parts when possible.
+
+    Frontend messages are serialized like:
+      Sent an attachment.
+
+      Attachment: photo.jpg
+      https://.../photo.jpg?...
+
+    For image attachments, we transform that into Chat Completions content parts so the
+    model can actually inspect the image instead of only seeing a URL as plain text.
+    """
+    original = str(content or '').strip()
+    cleaned_text, attachments = _extract_user_attachments_from_text(original)
+    if not attachments:
+        return original
+
+    image_parts: List[Dict[str, Any]] = []
+    non_image_notes: List[str] = []
+
+    for att in attachments:
+        name = str(att.get('name') or '').strip()
+        url = str(att.get('url') or '').strip()
+        if not url:
+            continue
+        if _attachment_looks_like_image(name, url):
+            image_parts.append({'type': 'image_url', 'image_url': {'url': url}})
+        else:
+            label = name or (urlparse(url).path.rsplit('/', 1)[-1] if url else '') or 'attachment'
+            non_image_notes.append(f'Attachment provided: {label}.')
+
+    if not image_parts:
+        return original
+
+    text_chunks: List[str] = []
+    if cleaned_text:
+        text_chunks.append(cleaned_text)
+    if non_image_notes:
+        text_chunks.append('\n'.join(non_image_notes))
+
+    merged_text = '\n\n'.join([chunk for chunk in text_chunks if chunk]).strip() or 'Please analyze the attached image.'
+    parts: List[Dict[str, Any]] = [{'type': 'text', 'text': merged_text}]
+    parts.extend(image_parts)
+    return parts
 
 
 def _sanitize_message_content_for_llm(role: str, content: str) -> str:
@@ -4510,7 +4614,7 @@ def _clamp_text(text: str, max_chars: int) -> str:
     return t[: max_chars - 1] + "…"
 
 
-def _compact_llm_messages(messages: List[Dict[str, str]], *, provider_switched: bool) -> List[Dict[str, str]]:
+def _compact_llm_messages(messages: List[Dict[str, Any]], *, provider_switched: bool) -> List[Dict[str, Any]]:
     """Server-side guardrail to keep prompts bounded.
 
     Frontend already trims history, but this prevents occasional oversized requests
@@ -4519,7 +4623,7 @@ def _compact_llm_messages(messages: List[Dict[str, str]], *, provider_switched: 
     Rules:
       - Keep the leading contiguous system block prefix intact.
       - Keep only the last N non-system messages (N smaller on provider switch).
-      - Clamp individual message content length.
+      - Clamp individual text content length while preserving image parts.
     """
     if not messages:
         return messages
@@ -4539,11 +4643,27 @@ def _compact_llm_messages(messages: List[Dict[str, str]], *, provider_switched: 
     sys_prefix = messages[:i]
     body = messages[i:]
 
+    def _clamp_content(content: Any) -> Any:
+        if isinstance(content, str):
+            return _clamp_text(content, max_chars)
+        if isinstance(content, list):
+            out_parts: List[Any] = []
+            for part in content:
+                if isinstance(part, dict):
+                    p = dict(part)
+                    p_type = str(p.get("type") or "").strip().lower()
+                    if p_type in ("text", "input_text") and isinstance(p.get("text"), str):
+                        p["text"] = _clamp_text(str(p.get("text") or ""), max_chars)
+                    out_parts.append(p)
+                else:
+                    out_parts.append(part)
+            return out_parts
+        return content
+
     # Clamp content.
-    def clamp_msg(m: Dict[str, str]) -> Dict[str, str]:
+    def clamp_msg(m: Dict[str, Any]) -> Dict[str, Any]:
         role = str(m.get("role") or "")
-        content = _clamp_text(m.get("content") or "", max_chars)
-        return {"role": role, "content": content}
+        return {"role": role, "content": _clamp_content(m.get("content"))}
 
     sys_prefix = [clamp_msg(m) for m in sys_prefix]
     body = [clamp_msg(m) for m in body]
@@ -6645,6 +6765,14 @@ async def chat(request: Request):
             "Do not say you lack text-to-speech; instead explain that you generate text and the platform voices it."
         )
         llm_messages.insert(insert_at, {"role": "system", "content": memory_policy})
+        insert_at += 1
+
+        vision_policy = (
+            "Vision rule: User image attachments may be supplied to you as direct image input. "
+            "When image input is present, inspect it and answer based on what you see. "
+            "Do not say that you cannot view attachments or images when the platform has provided image input."
+        )
+        llm_messages.insert(insert_at, {"role": "system", "content": vision_policy})
         insert_at += 1
 
         content_delivery_policy = (
@@ -10101,6 +10229,73 @@ def _wix_decode_webhook_jwt(token: str) -> Dict[str, Any]:
     return decoded
 
 
+def _wix_json_maybe_load(value: Any) -> Any:
+    """Best-effort JSON decode for nested Wix webhook payload fragments."""
+    if isinstance(value, str):
+        s = value.strip()
+        if s and ((s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]"))):
+            try:
+                return json.loads(s)
+            except Exception:
+                return value
+    return value
+
+
+def _wix_unwrap_paymentlink_webhook(decoded: Dict[str, Any]) -> Tuple[str, str, Any, Dict[str, Any]]:
+    """Peel nested Wix payment-links webhook payloads down to the payment entity payload.
+
+    Wix wraps payment-links webhooks inside one or more JSON-string ``data`` layers, e.g.:
+      decoded = {
+        "data": "{\"data\": \"{...payment payload...}\", \"instanceId\": ..., \"eventType\": ...}",
+        "iat": ...,
+        "exp": ...,
+      }
+
+    We preserve the envelope metadata (eventType / instanceId / identity) while descending until
+    we reach the dict that contains entityId / createdEvent / updatedEvent / entityFqdn.
+    """
+    event_type = ""
+    instance_id = ""
+    identity_raw: Any = None
+    data_obj: Dict[str, Any] = {}
+
+    cur: Any = decoded if isinstance(decoded, dict) else {}
+    for _depth in range(8):
+        cur = _wix_json_maybe_load(cur)
+        if not isinstance(cur, dict):
+            break
+
+        evt = str(cur.get("eventType") or "").strip()
+        iid = str(cur.get("instanceId") or "").strip()
+        if evt:
+            event_type = evt
+        if iid:
+            instance_id = iid
+        if cur.get("identity") is not None:
+            identity_raw = cur.get("identity")
+
+        looks_like_payment_payload = any(k in cur for k in ("entityId", "createdEvent", "updatedEvent", "entityFqdn"))
+        if looks_like_payment_payload:
+            data_obj = cur
+            nested = _wix_json_maybe_load(cur.get("data")) if "data" in cur else None
+            if isinstance(nested, dict) and any(k in nested for k in ("entityId", "createdEvent", "updatedEvent", "entityFqdn")):
+                cur = nested
+                data_obj = nested
+                continue
+            break
+
+        nxt = cur.get("data")
+        if nxt is None:
+            break
+        cur = nxt
+
+    cur = _wix_json_maybe_load(cur)
+    if not data_obj and isinstance(cur, dict):
+        data_obj = cur
+
+    return event_type, instance_id, identity_raw, (data_obj if isinstance(data_obj, dict) else {})
+
+
 def _wix_oauth_access_token(instance_id: str) -> Optional[str]:
     """
     Create an access token with Wix app identity, using OAuth client_credentials + instance_id.
@@ -10567,43 +10762,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any], *, request_id
             pass
 
     try:
-        envelope_obj: Dict[str, Any] = decoded if isinstance(decoded, dict) else {}
-
-        d0 = envelope_obj.get("data")
-        if isinstance(d0, dict) and ("data" in d0) and ("eventType" in d0 or "instanceId" in d0 or "identity" in d0 or "webhookId" in d0):
-            envelope_obj = d0
-
-        identity_raw: Any = None
-
-        cur: Any = envelope_obj
-        for _depth in range(4):
-            if isinstance(cur, dict) and ("data" in cur) and ("eventType" in cur or "instanceId" in cur or "identity" in cur or "webhookId" in cur):
-                if cur.get("eventType"):
-                    event_type = str(cur.get("eventType") or "").strip() or event_type
-                if cur.get("instanceId"):
-                    instance_id = str(cur.get("instanceId") or "").strip() or instance_id
-                if cur.get("identity") is not None:
-                    identity_raw = cur.get("identity")
-                inner = cur.get("data")
-            else:
-                inner = cur
-
-            if isinstance(inner, str):
-                try:
-                    inner_parsed: Any = json.loads(inner)
-                except Exception:
-                    inner_parsed = {}
-            else:
-                inner_parsed = inner
-
-            if isinstance(inner_parsed, dict) and ("data" in inner_parsed) and (
-                "eventType" in inner_parsed or "instanceId" in inner_parsed or "identity" in inner_parsed or "webhookId" in inner_parsed
-            ):
-                cur = inner_parsed
-                continue
-
-            data_obj = inner_parsed if isinstance(inner_parsed, dict) else {}
-            break
+        event_type, instance_id, identity_raw, data_obj = _wix_unwrap_paymentlink_webhook(decoded)
 
         _audit("ENVELOPE_PARSED")
 
@@ -10768,9 +10927,13 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any], *, request_id
             expected_price = pending.get("priceNum")
             if expected_price is not None and amount is not None:
                 try:
-                    if abs(float(expected_price) - float(amount)) > 0.05:
+                    expected_price_f = float(expected_price)
+                    amount_f = float(amount)
+                    # Accept exact payments and tipped / overpaid checkouts.
+                    # Only fail when the paid amount is materially below the expected PayGo price.
+                    if amount_f + 0.05 < expected_price_f:
                         _ledger_mark_failed(payment_id, "AMOUNT_MISMATCH")
-                        _audit("FAILED", "AMOUNT_MISMATCH", f"Expected {expected_price} but saw {amount}")
+                        _audit("FAILED", "AMOUNT_MISMATCH", f"Expected at least {expected_price_f:.2f} but saw {amount_f:.2f}")
                         return
                 except Exception:
                     pass
