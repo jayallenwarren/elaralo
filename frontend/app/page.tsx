@@ -788,6 +788,34 @@ function normalizeUploadedAttachment(raw: any): UploadedAttachment | null {
   return { url, name, size, contentType, container, blobName };
 }
 
+function extractPlatformContentFileName(contentText: string, meta: any): string {
+  const fromMeta = String(meta?.attachment?.name || meta?.contentDelivery?.fileName || "").trim();
+  if (fromMeta) return fromMeta;
+
+  const text = String(contentText || "");
+  const blockMatch = text.match(/(?:^|\n)\s*(?:Attachment|File(?: name)?)\s*:\s*([^\n]+)/i);
+  if (blockMatch) return String(blockMatch[1] || "").trim().replace(/[.,;:!?]+$/, "");
+
+  const inlineMatch = text.match(/\bFile(?: name)?\s*:\s*([^\n]+)/i);
+  if (inlineMatch) return String(inlineMatch[1] || "").trim().replace(/[.,;:!?]+$/, "");
+
+  return "";
+}
+
+function platformContentPlaceholder(contentText: string, meta: any): string {
+  const fileName = extractPlatformContentFileName(contentText, meta);
+  return fileName ? `Scheduled content was delivered by the platform: ${fileName}.` : "Scheduled content was delivered by the platform.";
+}
+
+function normalizePlatformContentMessage(contentText: string, meta: any): string {
+  const text = String(contentText || "").trim();
+  if (!text) return platformContentPlaceholder(text, meta);
+  if (/^Scheduled content was delivered by the platform\.?$/i.test(text)) {
+    return platformContentPlaceholder(text, meta);
+  }
+  return text;
+}
+
 function buildContentAssistantMsg(rawContent: any): Msg | null {
   if (!rawContent || typeof rawContent !== "object") return null;
   const att = normalizeUploadedAttachment((rawContent as any).attachment);
@@ -805,18 +833,9 @@ function buildContentAssistantMsg(rawContent: any): Msg | null {
 
   return {
     role: "assistant",
-    content: message || "",
+    content: normalizePlatformContentMessage(message, meta),
     meta,
   };
-}
-
-function platformContentPlaceholder(contentText: string, meta: any): string {
-  const fromMeta = String(meta?.attachment?.name || meta?.contentDelivery?.fileName || "").trim();
-  if (fromMeta) return `Scheduled content was delivered by the platform: ${fromMeta}.`;
-
-  const match = String(contentText || "").match(/(?:^|\n)\s*(?:Attachment|File(?: name)?)\s*:\s*([^\n]+)/i);
-  const fromText = match ? String(match[1] || "").trim() : "";
-  return fromText ? `Scheduled content was delivered by the platform: ${fromText}.` : "Scheduled content was delivered by the platform.";
 }
 
 function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): { role: Role; content: string } {
@@ -826,8 +845,9 @@ function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): { 
   let content = String(m.content || "");
 
   if (isPlatformContent) {
-    // Preserve the actual delivered file name while still avoiding raw /content URLs in model context.
-    content = content.trim() || platformContentPlaceholder(content, meta);
+    // Always send the stable placeholder with filename so the backend can preserve the delivered file name
+    // without exposing raw /content URLs or re-feeding the descriptive delivery line into model context.
+    content = platformContentPlaceholder(content, meta);
     return { role, content };
   }
 
@@ -2250,22 +2270,33 @@ useEffect(() => {
 
     const textNode = renderTextWithLinks(m.content || "", m.role === "assistant");
 
+    const textHasAttachmentName = Boolean(attName && String(m.content || "").toLowerCase().includes(String(attName).toLowerCase()));
+
     const attachmentNode = attUrl ? (
       <div style={{ marginTop: 6 }}>
         {isImage ? (
-          <a href={attUrl} target="_blank" rel="noopener noreferrer">
-            <img
-              src={attUrl}
-              alt={attName}
-              style={{
-                maxWidth: 320,
-                maxHeight: 320,
-                borderRadius: 12,
-                border: "1px solid #e5e5e5",
-                display: "block",
-              }}
-            />
-          </a>
+          <>
+            <a href={attUrl} target="_blank" rel="noopener noreferrer">
+              <img
+                src={attUrl}
+                alt={attName}
+                style={{
+                  maxWidth: 320,
+                  maxHeight: 320,
+                  borderRadius: 12,
+                  border: "1px solid #e5e5e5",
+                  display: "block",
+                }}
+              />
+            </a>
+            {!textHasAttachmentName ? (
+              <div style={{ marginTop: 4 }}>
+                <a href={attUrl} target="_blank" rel="noopener noreferrer" style={{ textDecoration: "underline" }}>
+                  {attName || "Open image"}
+                </a>
+              </div>
+            ) : null}
+          </>
         ) : isVideo ? (
           <>
             <video

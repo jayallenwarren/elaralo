@@ -4396,6 +4396,15 @@ _PLATFORM_DELIVERY_LINE_RE = re.compile(
 _PLATFORM_FILENAME_IN_TEXT_RE = re.compile(
     r'(?im)(?:^|\n)\s*(?:Attachment|File(?:\s+name)?)\s*:\s*([^\n]+)$'
 )
+_PLATFORM_INLINE_FILENAME_RE = re.compile(
+    r'(?i)\bFile(?:\s+name)?\s*:\s*([^\n]+)'
+)
+_PLATFORM_GENERIC_PLACEHOLDER_RE = re.compile(
+    r'(?i)^\s*Scheduled content was delivered by the platform\.?\s*$'
+)
+_PLATFORM_PLACEHOLDER_WITH_FILENAME_RE = re.compile(
+    r'(?i)^\s*Scheduled content was delivered by the platform\s*:\s*([^\n]+?)\s*\.?\s*$'
+)
 
 
 def _platform_content_placeholder(file_name: str = "") -> str:
@@ -4403,14 +4412,37 @@ def _platform_content_placeholder(file_name: str = "") -> str:
     return f"Scheduled content was delivered by the platform: {name}." if name else "Scheduled content was delivered by the platform."
 
 
+def _normalize_platform_filename_candidate(value: str) -> str:
+    candidate = str(value or "").strip().strip("\"'")
+    if not candidate:
+        return ""
+    candidate = re.split(r'\s+https?://', candidate, maxsplit=1)[0].strip()
+    candidate = candidate.rstrip(".,;:!?").strip()
+    return candidate
+
+
 def _platform_content_filename_from_text(text: str) -> str:
     raw = str(text or "")
     if not raw:
         return ""
-    for match in _PLATFORM_FILENAME_IN_TEXT_RE.finditer(raw):
-        candidate = str(match.group(1) or "").strip()
+
+    placeholder_match = _PLATFORM_PLACEHOLDER_WITH_FILENAME_RE.match(raw.strip())
+    if placeholder_match:
+        candidate = _normalize_platform_filename_candidate(placeholder_match.group(1) or "")
         if candidate:
             return candidate
+
+    for match in _PLATFORM_FILENAME_IN_TEXT_RE.finditer(raw):
+        candidate = _normalize_platform_filename_candidate(match.group(1) or "")
+        if candidate:
+            return candidate
+
+    inline_match = _PLATFORM_INLINE_FILENAME_RE.search(raw)
+    if inline_match:
+        candidate = _normalize_platform_filename_candidate(inline_match.group(1) or "")
+        if candidate:
+            return candidate
+
     return ""
 
 
@@ -4425,11 +4457,48 @@ def _sanitize_platform_content_text(text: str) -> Tuple[str, bool]:
 
     t = _PLATFORM_ATTACHMENT_BLOCK_RE.sub("\n", t)
     t = _PLATFORM_CONTENT_URL_RE.sub("[platform content link removed]", t)
-    t = _PLATFORM_DELIVERY_LINE_RE.sub('', t)
-    t = re.sub(r'(?im)^\s*\[platform content link removed\]\s*$', '', t)
-    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+    t = _PLATFORM_DELIVERY_LINE_RE.sub("", t)
+    t = re.sub(r'(?im)^\s*\[platform content link removed\]\s*$', "", t)
+    t = re.sub(r'\n{3,}', "\n\n", t).strip()
 
     return t, (t != original.strip())
+
+
+def _platform_content_message_is_generic(text: str) -> bool:
+    return bool(_PLATFORM_GENERIC_PLACEHOLDER_RE.match(str(text or "").strip()))
+
+
+def _extract_platform_content_filenames(messages: List[Dict[str, str]]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in messages or []:
+        if str(item.get("role") or "").strip().lower() != "assistant":
+            continue
+        name = _platform_content_filename_from_text(str(item.get("content") or ""))
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def _repair_generated_summary_for_platform_content(summary: str, platform_filenames: List[str]) -> str:
+    text = str(summary or "").strip()
+    if not text:
+        return text
+    if not _platform_content_message_is_generic(text):
+        return text
+    if not platform_filenames:
+        return text
+    unique_files = [str(x or "").strip() for x in platform_filenames if str(x or "").strip()]
+    if not unique_files:
+        return text
+    if len(unique_files) == 1:
+        return _platform_content_placeholder(unique_files[0])
+    return "Scheduled content was delivered by the platform: " + ", ".join(unique_files) + "."
 
 
 _USER_ATTACHMENT_BLOCK_RE = re.compile(
@@ -4529,8 +4598,18 @@ def _user_message_content_for_llm(content: str) -> Any:
 
 
 def _sanitize_message_content_for_llm(role: str, content: str) -> str:
+    role_norm = str(role or "").strip().lower()
+    raw = str(content or "").strip()
+
+    if role_norm == "assistant":
+        if _platform_content_message_is_generic(raw):
+            return ""
+        placeholder_name = _platform_content_filename_from_text(raw)
+        if placeholder_name and _PLATFORM_PLACEHOLDER_WITH_FILENAME_RE.match(raw):
+            return _platform_content_placeholder(placeholder_name)
+
     cleaned, removed = _sanitize_platform_content_text(content)
-    if removed and str(role or "").strip().lower() == "assistant":
+    if removed and role_norm == "assistant":
         lowered = str(content or "").lower()
         if (
             "attachment:" in lowered
@@ -4539,8 +4618,9 @@ def _sanitize_message_content_for_llm(role: str, content: str) -> str:
             or "delivering video" in lowered
             or "delivering scheduled content" in lowered
         ) and not cleaned:
-            return _platform_content_placeholder(_platform_content_filename_from_text(content))
-    return cleaned or str(content or "").strip()
+            file_name = _platform_content_filename_from_text(content)
+            return _platform_content_placeholder(file_name) if file_name else ""
+    return cleaned or raw
 
 
 def _sanitize_history_for_platform_content(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -4557,8 +4637,18 @@ def _sanitize_history_for_platform_content(messages: List[Dict[str, str]]) -> Li
 
 
 def _sanitize_summary_for_platform_content(text: str) -> str:
-    cleaned, _removed = _sanitize_platform_content_text(text)
-    return cleaned
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if _platform_content_message_is_generic(raw):
+        return ""
+    file_name = _platform_content_filename_from_text(raw)
+    if file_name and _PLATFORM_PLACEHOLDER_WITH_FILENAME_RE.match(raw):
+        return _platform_content_placeholder(file_name)
+    cleaned, removed = _sanitize_platform_content_text(raw)
+    if removed and not cleaned:
+        return _platform_content_placeholder(file_name) if file_name else ""
+    return cleaned or raw
 
 
 def _sanitize_assistant_reply_for_platform_content(text: str) -> str:
@@ -5265,18 +5355,9 @@ _CHAT_SUMMARY_HISTORY_READY = False
 
 def _summary_history_db_connect() -> sqlite3.Connection:
     db_path = _ensure_econnect_db_seeded()
-    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA busy_timeout=5000;")
-    except Exception:
-        pass
     return conn
-
-
-_CHAT_SUMMARY_HISTORY_CLEANUP_INTERVAL_S = max(0, _env_int("CHAT_SUMMARY_HISTORY_CLEANUP_INTERVAL_S", 86400))
-_CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS = 0.0
-_CHAT_SUMMARY_HISTORY_CLEANUP_LOCK = threading.RLock()
 
 
 def _summary_history_ensure_schema(conn: Optional[sqlite3.Connection] = None) -> None:
@@ -5305,24 +5386,15 @@ def _summary_history_ensure_schema(conn: Optional[sqlite3.Connection] = None) ->
                   user_name TEXT,
                   session_id TEXT,
                   reason TEXT,
-                  conversation_hash TEXT,
                   summary TEXT NOT NULL
                 );
                 """
             )
-            if not _column_exists(conn, "chat_summary_history", "conversation_hash"):
-                conn.execute("ALTER TABLE chat_summary_history ADD COLUMN conversation_hash TEXT;")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_brand_avatar_dt ON chat_summary_history(brand, avatar, create_datetime);"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_member_dt ON chat_summary_history(member_id, create_datetime);"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_session_lookup ON chat_summary_history(session_id, brand, avatar, member_id, create_datetime);"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_conversation_hash ON chat_summary_history(conversation_hash);"
             )
             conn.commit()
             _CHAT_SUMMARY_HISTORY_READY = True
@@ -5334,272 +5406,6 @@ def _summary_history_ensure_schema(conn: Optional[sqlite3.Connection] = None) ->
                     pass
 
 
-def _summary_history_norm_scalar(value: Any) -> str:
-    return str(value or "").strip()
-
-
-
-def _summary_history_norm_summary(value: Any) -> str:
-    s = str(value or "")
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    return s.strip()
-
-
-def _summary_history_norm_hash(value: Any) -> str:
-    return str(value or "").strip().lower()
-
-
-
-def _summary_history_compute_conversation_hash(messages: List[Dict[str, str]]) -> str:
-    normalized: List[Dict[str, str]] = []
-    for m in messages or []:
-        if not isinstance(m, dict):
-            continue
-        role = str(m.get("role") or "").strip().lower()
-        if role not in ("user", "assistant"):
-            continue
-        content = _summary_history_norm_summary(m.get("content") or "")
-        normalized.append({"role": role, "content": content})
-
-    if not normalized:
-        return ""
-
-    try:
-        payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    except Exception:
-        return ""
-
-
-
-def _summary_history_dedupe_expr(alias: str = "") -> str:
-    prefix = (str(alias or "").strip() + ".") if str(alias or "").strip() else ""
-    return (
-        f"CASE WHEN COALESCE({prefix}conversation_hash, '') <> '' "
-        f"THEN 'hash:' || COALESCE({prefix}session_id, '') || char(31) || {prefix}conversation_hash "
-        f"ELSE 'legacy:' || COALESCE({prefix}session_id, '') || char(31) || {prefix}summary END"
-    )
-
-
-
-def _summary_history_cleanup_due(now_ts: Optional[float] = None) -> bool:
-    global _CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS
-
-    if _CHAT_SUMMARY_HISTORY_CLEANUP_INTERVAL_S <= 0:
-        return False
-
-    now_val = float(now_ts or time.time())
-    with _CHAT_SUMMARY_HISTORY_CLEANUP_LOCK:
-        last = float(_CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS or 0.0)
-        if last > 0.0 and (now_val - last) < float(_CHAT_SUMMARY_HISTORY_CLEANUP_INTERVAL_S):
-            return False
-        _CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS = now_val
-        return True
-
-
-
-def _summary_history_cleanup_reset() -> None:
-    global _CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS
-    with _CHAT_SUMMARY_HISTORY_CLEANUP_LOCK:
-        _CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS = 0.0
-
-
-
-def _summary_history_delete_exact_duplicates(conn: sqlite3.Connection) -> int:
-    deleted = 0
-
-    conn.execute(
-        """
-        DELETE FROM chat_summary_history
-        WHERE id IN (
-          SELECT h.id
-          FROM chat_summary_history h
-          JOIN (
-            SELECT
-              brand,
-              avatar,
-              member_id,
-              COALESCE(session_id, '') AS session_id_norm,
-              conversation_hash,
-              MAX(id) AS keep_id
-            FROM chat_summary_history
-            WHERE COALESCE(conversation_hash, '') <> ''
-            GROUP BY brand, avatar, member_id, COALESCE(session_id, ''), conversation_hash
-            HAVING COUNT(*) > 1
-          ) d
-            ON h.brand = d.brand
-           AND h.avatar = d.avatar
-           AND h.member_id = d.member_id
-           AND COALESCE(h.session_id, '') = d.session_id_norm
-           AND COALESCE(h.conversation_hash, '') = d.conversation_hash
-           AND h.id <> d.keep_id
-        );
-        """
-    )
-    try:
-        deleted += int(conn.execute("SELECT changes()").fetchone()[0] or 0)
-    except Exception:
-        pass
-
-    conn.execute(
-        """
-        DELETE FROM chat_summary_history
-        WHERE id IN (
-          SELECT h.id
-          FROM chat_summary_history h
-          JOIN (
-            SELECT
-              brand,
-              avatar,
-              member_id,
-              COALESCE(session_id, '') AS session_id_norm,
-              summary,
-              MAX(id) AS keep_id
-            FROM chat_summary_history
-            WHERE COALESCE(conversation_hash, '') = ''
-            GROUP BY brand, avatar, member_id, COALESCE(session_id, ''), summary
-            HAVING COUNT(*) > 1
-          ) d
-            ON h.brand = d.brand
-           AND h.avatar = d.avatar
-           AND h.member_id = d.member_id
-           AND COALESCE(h.session_id, '') = d.session_id_norm
-           AND h.summary = d.summary
-           AND COALESCE(h.conversation_hash, '') = ''
-           AND h.id <> d.keep_id
-        );
-        """
-    )
-    try:
-        deleted += int(conn.execute("SELECT changes()").fetchone()[0] or 0)
-    except Exception:
-        pass
-
-    return deleted
-
-
-
-def _summary_history_cleanup_if_due(force: bool = False) -> int:
-    should_run = bool(force)
-    if not should_run:
-        should_run = _summary_history_cleanup_due()
-    if not should_run:
-        return 0
-
-    try:
-        conn = _summary_history_db_connect()
-        try:
-            _summary_history_ensure_schema(conn)
-            conn.execute("BEGIN IMMEDIATE")
-            deleted = _summary_history_delete_exact_duplicates(conn)
-            conn.commit()
-            return deleted
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    except Exception:
-        if not force:
-            _summary_history_cleanup_reset()
-            return 0
-        raise
-
-
-
-def _summary_history_has_existing_snapshot(
-    conn: sqlite3.Connection,
-    *,
-    brand: str,
-    avatar: str,
-    member_id: str,
-    session_id: str,
-    reason: str,
-    summary: str,
-    conversation_hash: str = "",
-) -> bool:
-    brand_s = _summary_history_norm_scalar(brand)
-    avatar_s = _summary_history_norm_scalar(avatar)
-    member_id_s = _summary_history_norm_scalar(member_id)
-    session_id_s = _summary_history_norm_scalar(session_id)
-    reason_s = _summary_history_norm_scalar(reason)
-    summary_s = _summary_history_norm_summary(summary)
-    conversation_hash_s = _summary_history_norm_hash(conversation_hash)
-    if not summary_s:
-        return False
-
-    if conversation_hash_s:
-        if session_id_s:
-            row = conn.execute(
-                """
-                SELECT 1
-                FROM chat_summary_history
-                WHERE brand = ?
-                  AND avatar = ?
-                  AND member_id = ?
-                  AND session_id = ?
-                  AND conversation_hash = ?
-                LIMIT 1;
-                """,
-                (brand_s, avatar_s, member_id_s, session_id_s, conversation_hash_s),
-            ).fetchone()
-            return row is not None
-
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM chat_summary_history
-            WHERE brand = ?
-              AND avatar = ?
-              AND member_id = ?
-              AND COALESCE(session_id, '') = ''
-              AND conversation_hash = ?
-            LIMIT 1;
-            """,
-            (brand_s, avatar_s, member_id_s, conversation_hash_s),
-        ).fetchone()
-        return row is not None
-
-    if session_id_s:
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM chat_summary_history
-            WHERE brand = ?
-              AND avatar = ?
-              AND member_id = ?
-              AND session_id = ?
-              AND summary = ?
-            LIMIT 1;
-            """,
-            (brand_s, avatar_s, member_id_s, session_id_s, summary_s),
-        ).fetchone()
-        return row is not None
-
-    row = conn.execute(
-        """
-        SELECT 1
-        FROM chat_summary_history
-        WHERE brand = ?
-          AND avatar = ?
-          AND member_id = ?
-          AND COALESCE(session_id, '') = ''
-          AND reason = ?
-          AND summary = ?
-        LIMIT 1;
-        """,
-        (brand_s, avatar_s, member_id_s, reason_s, summary_s),
-    ).fetchone()
-    return row is not None
-
-
-
 def _summary_history_insert(
     *,
     brand: str,
@@ -5609,71 +5415,28 @@ def _summary_history_insert(
     session_id: str,
     reason: str,
     summary: str,
-    conversation_hash: str = "",
 ) -> None:
-    brand_s = _summary_history_norm_scalar(brand)
-    avatar_s = _summary_history_norm_scalar(avatar)
-    member_id_s = _summary_history_norm_scalar(member_id)
-    user_name_s = _summary_history_norm_scalar(user_name)
-    session_id_s = _summary_history_norm_scalar(session_id)
-    reason_s = _summary_history_norm_scalar(reason)
-    summary_s = _summary_history_norm_summary(summary)
-    conversation_hash_s = _summary_history_norm_hash(conversation_hash)
-    if not summary_s:
-        return
-
-    try:
-        _summary_history_cleanup_if_due()
-    except Exception:
-        pass
-
     try:
         conn = _summary_history_db_connect()
         try:
             _summary_history_ensure_schema(conn)
-            conn.execute("BEGIN IMMEDIATE")
-
-            # Duplicate suppression:
-            # save-summary can be triggered by multiple frontend events for the same
-            # conversation snapshot. If we already stored this same session +
-            # conversation fingerprint (or legacy session + summary), skip insert.
-            if _summary_history_has_existing_snapshot(
-                conn,
-                brand=brand_s,
-                avatar=avatar_s,
-                member_id=member_id_s,
-                session_id=session_id_s,
-                reason=reason_s,
-                summary=summary_s,
-                conversation_hash=conversation_hash_s,
-            ):
-                conn.commit()
-                return
-
             conn.execute(
                 """
                 INSERT INTO chat_summary_history (
-                  brand, avatar, member_id, user_name, session_id, reason, conversation_hash, summary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                  brand, avatar, member_id, user_name, session_id, reason, summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
-                    brand_s,
-                    avatar_s,
-                    member_id_s,
-                    user_name_s,
-                    session_id_s,
-                    reason_s,
-                    (conversation_hash_s or None),
-                    summary_s,
+                    (brand or ""),
+                    (avatar or ""),
+                    (member_id or ""),
+                    (user_name or ""),
+                    (session_id or ""),
+                    (reason or ""),
+                    (summary or ""),
                 ),
             )
             conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
         finally:
             try:
                 conn.close()
@@ -8732,7 +8495,6 @@ async def save_chat_summary(request: Request):
         capped.append({"role": m["role"], "content": c})
         total += len(c)
     convo_items = list(reversed(capped))
-    conversation_hash = _summary_history_compute_conversation_hash(convo_items)
 
     sys = (
         "You are a concise assistant that creates a server-side chat summary for future context. "
@@ -8752,6 +8514,9 @@ async def save_chat_summary(request: Request):
     except Exception as e:
         _dbg(debug, "Summary generation failed:", repr(e))
         return {"ok": False, "error_code": "summary_failed", "error": f"{type(e).__name__}: {e}"}
+
+    platform_filenames = _extract_platform_content_filenames(convo_items)
+    summary = _repair_generated_summary_for_platform_content(summary, platform_filenames)
 
     # Refresh from disk before write to avoid clobbering another worker's recent update.
     _refresh_summary_store_if_needed()
@@ -8778,7 +8543,6 @@ async def save_chat_summary(request: Request):
             session_id=session_id,
             reason=reason,
             summary=summary,
-            conversation_hash=conversation_hash,
         )
     except Exception:
         pass
@@ -12074,22 +11838,16 @@ def _host_insights_list_users_sync(brand: str, avatar: str, limit: int = 100) ->
     a = (avatar or "").strip()
     lim = max(1, min(int(limit or 100), 500))
 
-    try:
-        _summary_history_cleanup_if_due()
-    except Exception:
-        pass
-
-    dedupe_expr = _summary_history_dedupe_expr("h")
     summary_conn = _summary_history_db_connect()
     try:
         _summary_history_ensure_schema(summary_conn)
         cur = summary_conn.cursor()
         cur.execute(
-            f"""
+            """
             SELECT
               member_id,
               MAX(create_datetime) AS summary_last_seen,
-              COUNT(DISTINCT {dedupe_expr}) AS summary_count,
+              COUNT(*) AS summary_count,
               (
                 SELECT user_name
                 FROM chat_summary_history h2
@@ -12197,44 +11955,28 @@ def _host_insights_list_summaries_sync(
     tm = (target_member_id or "").strip()
     lim = max(1, min(int(limit or 50), 500))
 
-    try:
-        _summary_history_cleanup_if_due()
-    except Exception:
-        pass
-
-    dedupe_expr = _summary_history_dedupe_expr()
     conn = _summary_history_db_connect()
     try:
         _summary_history_ensure_schema(conn)
         cur = conn.cursor()
         if tm:
             cur.execute(
-                f"""
-                SELECT h.create_datetime, h.session_id, h.reason, h.summary, h.user_name
-                FROM chat_summary_history h
-                JOIN (
-                  SELECT MAX(id) AS keep_id
-                  FROM chat_summary_history
-                  WHERE brand = ? AND avatar = ? AND member_id = ?
-                  GROUP BY {dedupe_expr}
-                ) keep ON keep.keep_id = h.id
-                ORDER BY h.create_datetime DESC, h.id DESC
+                """
+                SELECT create_datetime, session_id, reason, summary, user_name
+                FROM chat_summary_history
+                WHERE brand = ? AND avatar = ? AND member_id = ?
+                ORDER BY create_datetime DESC, id DESC
                 LIMIT ?;
                 """,
                 (b, a, tm, lim),
             )
         else:
             cur.execute(
-                f"""
-                SELECT h.create_datetime, h.session_id, h.reason, h.summary, h.user_name
-                FROM chat_summary_history h
-                JOIN (
-                  SELECT MAX(id) AS keep_id
-                  FROM chat_summary_history
-                  WHERE brand = ? AND avatar = ?
-                  GROUP BY member_id, {dedupe_expr}
-                ) keep ON keep.keep_id = h.id
-                ORDER BY h.create_datetime DESC, h.id DESC
+                """
+                SELECT create_datetime, session_id, reason, summary, user_name
+                FROM chat_summary_history
+                WHERE brand = ? AND avatar = ?
+                ORDER BY create_datetime DESC, id DESC
                 LIMIT ?;
                 """,
                 (b, a, lim),
