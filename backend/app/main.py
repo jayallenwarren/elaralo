@@ -380,6 +380,11 @@ async def usage_status(request: Request):
     if not isinstance(session_state, dict):
         session_state = {}
 
+    try:
+        _member_rebranding_upsert_from_session_state(session_state)
+    except Exception:
+        pass
+
     member_id = _extract_member_id(session_state)
     plan_name_raw = _extract_plan_name(session_state)
     rebranding_key_raw = _extract_rebranding_key(session_state)
@@ -518,7 +523,7 @@ USAGE_MAX_BILLABLE_SECONDS_PER_REQUEST = _env_int("USAGE_MAX_BILLABLE_SECONDS_PE
 # Pay links (shown to the user when minutes are exhausted)
 UPGRADE_URL = (os.getenv("UPGRADE_URL", "") or "").strip()
 PAYG_PAY_URL = (os.getenv("PAYG_PAY_URL", "") or "").strip()
-PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 60)
+PAYG_INCREMENT_MINUTES = _env_int("PAYG_INCREMENT_MINUTES", 30)
 
 # Base Pay-As-You-Go price (e.g., "$4.99"). If PAYG_PRICE_TEXT is not set, we derive it as:
 #   "<PAYG_PRICE> per <PAYG_INCREMENT_MINUTES> minutes"
@@ -526,6 +531,57 @@ PAYG_PRICE = (os.getenv("PAYG_PRICE", "") or "").strip()
 PAYG_PRICE_TEXT = (os.getenv("PAYG_PRICE_TEXT", "") or "").strip()
 if not PAYG_PRICE_TEXT and PAYG_PRICE and PAYG_INCREMENT_MINUTES:
     PAYG_PRICE_TEXT = f"{PAYG_PRICE} per {int(PAYG_INCREMENT_MINUTES)} minutes"
+
+# Member payment-link webhooks do not carry session_state, so keep the fallback grant
+# independent from PAYG_INCREMENT_MINUTES to prevent legacy env/default drift from
+# over-crediting current PayGo purchases.
+PAYG_WEBHOOK_FALLBACK_MINUTES = _env_int("PAYG_WEBHOOK_FALLBACK_MINUTES", 30)
+
+# Optional explicit per-paylink minute mapping for member webhook credits.
+# Supported formats:
+#   - JSON object: {"<paylink_id>": 30, "<paylink_id2>": 45}
+#   - comma/newline separated pairs: "<paylink_id>:30,<paylink_id2>=45"
+def _parse_payg_paylink_minutes_map(raw: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    txt = (raw or "").strip()
+    if not txt:
+        return out
+    try:
+        parsed = json.loads(txt)
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                key = str(k or "").strip()
+                try:
+                    iv = int(v)
+                except Exception:
+                    continue
+                if key and iv > 0:
+                    out[key] = iv
+            if out:
+                return out
+    except Exception:
+        pass
+    for part in re.split(r"[,\n]+", txt):
+        chunk = str(part or "").strip()
+        if not chunk:
+            continue
+        if ":" in chunk:
+            key, val = chunk.split(":", 1)
+        elif "=" in chunk:
+            key, val = chunk.split("=", 1)
+        else:
+            continue
+        key = str(key or "").strip()
+        try:
+            iv = int(str(val or "").strip())
+        except Exception:
+            continue
+        if key and iv > 0:
+            out[key] = iv
+    return out
+
+_PAYG_PAYLINK_MINUTES_MAP_RAW = (os.getenv("PAYG_PAYLINK_MINUTES_MAP", "") or "").strip()
+_PAYG_PAYLINK_MINUTES_MAP = _parse_payg_paylink_minutes_map(_PAYG_PAYLINK_MINUTES_MAP_RAW)
 
 
 # Admin token for server-side minute credits (payment webhook can call this)
@@ -608,6 +664,241 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
         "free_minutes": str(free_minutes or "").strip(),
         "cycle_days": str(cycle_days or "").strip(),
     }
+
+
+_MEMBER_REBRANDING_LOCK = threading.RLock()
+
+
+def _member_rebranding_int_or_none(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    try:
+        s = str(val).strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        pass
+    m = re.search(r"-?\d+", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except Exception:
+        return None
+
+
+def _member_rebranding_ensure_schema(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS member_rebranding (
+          member_id TEXT PRIMARY KEY,
+          rebranding_key TEXT,
+          pay_go_minutes INTEGER,
+          free_minutes INTEGER,
+          cycle_days INTEGER,
+          plan TEXT,
+          plan_map TEXT,
+          updated_at INTEGER
+        );
+        """
+    )
+    existing_cols: Set[str] = set()
+    try:
+        rows = conn.execute("PRAGMA table_info(member_rebranding)").fetchall()
+    except Exception:
+        rows = []
+    for row in rows:
+        name = ""
+        try:
+            name = str(row["name"]).strip() if isinstance(row, sqlite3.Row) else str(row[1]).strip()
+        except Exception:
+            name = ""
+        if name:
+            existing_cols.add(name)
+    for col_name, col_sql in [
+        ("rebranding_key", "rebranding_key TEXT"),
+        ("pay_go_minutes", "pay_go_minutes INTEGER"),
+        ("free_minutes", "free_minutes INTEGER"),
+        ("cycle_days", "cycle_days INTEGER"),
+        ("plan", "plan TEXT"),
+        ("plan_map", "plan_map TEXT"),
+        ("updated_at", "updated_at INTEGER"),
+    ]:
+        if col_name in existing_cols:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE member_rebranding ADD COLUMN {col_sql}")
+        except Exception:
+            pass
+
+
+def _member_rebranding_upsert_from_session_state(session_state: Optional[Dict[str, Any]]) -> None:
+    ss = session_state if isinstance(session_state, dict) else {}
+    member_id = str(ss.get("memberId") or ss.get("member_id") or ss.get("member") or "").strip()
+    if not member_id:
+        return
+    if member_id.lower().startswith("anon:"):
+        return
+
+    def _getstr(*keys: str) -> str:
+        for key in keys:
+            try:
+                val = ss.get(key)
+            except Exception:
+                val = None
+            if val is None:
+                continue
+            txt = str(val).strip()
+            if txt:
+                return txt
+        return ""
+
+    rebranding_key_raw = _getstr("rebrandingKey", "rebranding_key", "RebrandingKey") or _getstr("rebranding")
+    rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+
+    pay_go_minutes_raw = _getstr("pay_go_minutes", "payGoMinutes") or str(rebranding_parsed.get("pay_go_minutes") or "").strip()
+    free_minutes_raw = _getstr("free_minutes", "freeMinutes") or str(rebranding_parsed.get("free_minutes") or "").strip()
+    cycle_days_raw = _getstr("cycle_days", "cycleDays") or str(rebranding_parsed.get("cycle_days") or "").strip()
+    plan_external = (
+        _getstr("rebranding_plan", "rebrandingPlan", "planExternal", "plan_external")
+        or str(rebranding_parsed.get("plan") or "").strip()
+    )
+    plan_map = _getstr("elaralo_plan_map", "elaraloPlanMap") or str(rebranding_parsed.get("elaralo_plan_map") or "").strip()
+
+    if not any([rebranding_key_raw, pay_go_minutes_raw, free_minutes_raw, cycle_days_raw, plan_external, plan_map]):
+        return
+
+    pay_go_minutes = _member_rebranding_int_or_none(pay_go_minutes_raw)
+    free_minutes = _member_rebranding_int_or_none(free_minutes_raw)
+    cycle_days = _member_rebranding_int_or_none(cycle_days_raw)
+    now_ts = int(time.time())
+
+    with _MEMBER_REBRANDING_LOCK:
+        conn = _econnect_conn()
+        try:
+            _member_rebranding_ensure_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO member_rebranding (
+                  member_id, rebranding_key, pay_go_minutes, free_minutes, cycle_days, plan, plan_map, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(member_id) DO UPDATE SET
+                  rebranding_key = excluded.rebranding_key,
+                  pay_go_minutes = excluded.pay_go_minutes,
+                  free_minutes = excluded.free_minutes,
+                  cycle_days = excluded.cycle_days,
+                  plan = excluded.plan,
+                  plan_map = excluded.plan_map,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    member_id,
+                    rebranding_key_raw,
+                    pay_go_minutes,
+                    free_minutes,
+                    cycle_days,
+                    plan_external,
+                    plan_map,
+                    now_ts,
+                ),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _member_rebranding_get_paygo_config(member_id: str) -> Dict[str, Any]:
+    mid = str(member_id or "").strip()
+    out: Dict[str, Any] = {"minutes": None, "price_num": None, "rebranding_key": ""}
+    if not mid or mid.lower().startswith("anon:"):
+        return out
+
+    with _MEMBER_REBRANDING_LOCK:
+        conn = _econnect_conn()
+        try:
+            _member_rebranding_ensure_schema(conn)
+            row = conn.execute(
+                "SELECT rebranding_key, pay_go_minutes, free_minutes, cycle_days, plan, plan_map, updated_at FROM member_rebranding WHERE member_id = ? LIMIT 1",
+                (mid,),
+            ).fetchone()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if not row:
+        return out
+
+    try:
+        rk = str(row["rebranding_key"] or "").strip()
+    except Exception:
+        try:
+            rk = str(row[0] or "").strip()
+        except Exception:
+            rk = ""
+    out["rebranding_key"] = rk
+
+    mins = None
+    try:
+        mins = _member_rebranding_int_or_none(row["pay_go_minutes"])
+    except Exception:
+        try:
+            mins = _member_rebranding_int_or_none(row[1])
+        except Exception:
+            mins = None
+
+    rebranding_parsed = _parse_rebranding_key(rk) if rk else {}
+    if mins is None:
+        mins = _member_rebranding_int_or_none(rebranding_parsed.get("pay_go_minutes"))
+    out["minutes"] = mins
+
+    try:
+        out["price_num"] = _parse_price_to_float(str(rebranding_parsed.get("pay_go_price") or ""))
+    except Exception:
+        out["price_num"] = None
+
+    return out
+
+
+def _payg_paylink_minutes_lookup(paylink_id: str) -> Optional[int]:
+    pid = str(paylink_id or "").strip()
+    if not pid:
+        return None
+    try:
+        minutes = int(_PAYG_PAYLINK_MINUTES_MAP.get(pid) or 0)
+    except Exception:
+        minutes = 0
+    return minutes if minutes > 0 else None
+
+
+def _resolve_paygo_credit_minutes_for_member(member_id: str, paylink_id: str) -> Tuple[int, str, Optional[float]]:
+    mapped = _payg_paylink_minutes_lookup(paylink_id)
+    if mapped is not None and mapped > 0:
+        return mapped, "paylink_minutes_map", _parse_price_to_float(PAYG_PRICE)
+
+    cfg = _member_rebranding_get_paygo_config(member_id)
+    cfg_minutes = _member_rebranding_int_or_none(cfg.get("minutes"))
+    cfg_price = cfg.get("price_num")
+    if cfg_minutes is not None and cfg_minutes > 0:
+        return cfg_minutes, "member_rebranding", cfg_price if cfg_price is not None else _parse_price_to_float(PAYG_PRICE)
+
+    fallback = int(PAYG_WEBHOOK_FALLBACK_MINUTES or 0)
+    if fallback > 0:
+        return fallback, "payg_webhook_fallback", _parse_price_to_float(PAYG_PRICE)
+
+    legacy = int(PAYG_INCREMENT_MINUTES or 0)
+    if legacy > 0:
+        return legacy, "payg_increment_minutes", _parse_price_to_float(PAYG_PRICE)
+
+    return 0, "unresolved", _parse_price_to_float(PAYG_PRICE)
 
 
 # ---------------------------------------------------------------------------
@@ -6202,6 +6493,11 @@ async def chat(request: Request):
     
     voice_id = _extract_voice_id(raw)
 
+    try:
+        _member_rebranding_upsert_from_session_state(session_state)
+    except Exception:
+        pass
+
     # ----------------------------
     # Usage / minutes enforcement
     # ----------------------------
@@ -10821,6 +11117,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any], *, request_id
     identity_source = ""
     credited_identity_key = ""
     identity_type = ""
+    minutes_source = ""
     amount: Optional[float] = None
     minutes_to_credit: Optional[int] = None
     data_obj: Dict[str, Any] = {}
@@ -10999,11 +11296,23 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any], *, request_id
         except Exception:
             pass
 
-        minutes_to_credit = int(PAYG_INCREMENT_MINUTES or 0)
+        minutes_to_credit = 0
 
         if member_id:
             credited_identity_key = f"member::{member_id}"
-            minutes_to_credit = int(PAYG_INCREMENT_MINUTES or 0)
+            minutes_to_credit, minutes_source, expected_price = _resolve_paygo_credit_minutes_for_member(member_id, paylink_id)
+            if expected_price is not None and amount is not None:
+                try:
+                    expected_price_f = float(expected_price)
+                    amount_f = float(amount)
+                    # Accept exact payments and tipped / overpaid checkouts.
+                    # Only fail when the paid amount is materially below the expected PayGo price.
+                    if amount_f + 0.05 < expected_price_f:
+                        _ledger_mark_failed(payment_id, "AMOUNT_MISMATCH")
+                        _audit("FAILED", "AMOUNT_MISMATCH", f"Expected at least {expected_price_f:.2f} but saw {amount_f:.2f}")
+                        return
+                except Exception:
+                    pass
         else:
             if not email_norm:
                 _ledger_mark_failed(payment_id, "NO_EMAIL_AND_NO_MEMBERID")
@@ -11017,6 +11326,7 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any], *, request_id
                 return
 
             identity_source = "pendingEmail"
+            minutes_source = "pending_email"
             expected_price = pending.get("priceNum")
             if expected_price is not None and amount is not None:
                 try:
@@ -11061,11 +11371,12 @@ def _wix_process_paymentlink_webhook_sync(decoded: Dict[str, Any], *, request_id
         _audit("CREDITED", note="Minutes credited successfully")
 
         logger.warning(
-            "PayGo credit diag: payment_id=%s paylink_id=%s order_number=%s minutes=%s identity_source=%s identity_type=%s member_tail=%s contact_tail=%s credited_tail=%s",
+            "PayGo credit diag: payment_id=%s paylink_id=%s order_number=%s minutes=%s minutes_source=%s identity_source=%s identity_type=%s member_tail=%s contact_tail=%s credited_tail=%s",
             payment_id,
             paylink_id,
             order_number,
             minutes_to_credit,
+            (minutes_source or ""),
             (identity_source or ""),
             identity_type,
             (member_id or "")[-8:],
