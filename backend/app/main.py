@@ -7636,18 +7636,22 @@ def _ai_override_db_append_event(
             "SELECT seq FROM ai_override_sessions WHERE session_id=? LIMIT 1",
             (sid,),
         ).fetchone()
+        max_row = cur.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM ai_override_events WHERE session_id=?",
+            (sid,),
+        ).fetchone()
+        session_seq = int(row["seq"] or 0) if row is not None else 0
+        durable_event_seq = int(max_row["max_seq"] or 0) if max_row is not None else 0
+        current_seq = max(session_seq, durable_event_seq)
         if row is None:
             cur.execute(
                 """
                 INSERT INTO ai_override_sessions
                 (session_id, seq, override_active, host_ack_seq, last_seen, updated_epoch)
-                VALUES (?, 0, 0, 0, ?, ?)
+                VALUES (?, ?, 0, 0, ?, ?)
                 """,
-                (sid, now, now),
+                (sid, current_seq, now, now),
             )
-            current_seq = 0
-        else:
-            current_seq = int(row["seq"] or 0)
 
         next_seq = current_seq + 1
         cur.execute(
@@ -7694,7 +7698,6 @@ def _ai_override_db_append_event(
             conn.close()
         except Exception:
             pass
-
 
 def _ai_override_db_list_events(
     session_id: str,
@@ -7878,7 +7881,10 @@ def _ai_override_db_upsert_session(rec: Dict[str, Any]) -> None:
             (session_id, seq, brand, avatar, member_id, identity_key, companion_key, mode, override_active, override_started_at, override_host_member_id, last_seen, host_ack_seq, user_name, user_name_updated_at, usage_ctx_json, summary_key, in_session_summaries_json, updated_epoch)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
-              seq=excluded.seq,
+              seq=CASE
+                    WHEN ai_override_sessions.seq IS NULL OR ai_override_sessions.seq < excluded.seq THEN excluded.seq
+                    ELSE ai_override_sessions.seq
+                  END,
               brand=excluded.brand,
               avatar=excluded.avatar,
               member_id=excluded.member_id,
@@ -7888,14 +7894,23 @@ def _ai_override_db_upsert_session(rec: Dict[str, Any]) -> None:
               override_active=excluded.override_active,
               override_started_at=excluded.override_started_at,
               override_host_member_id=excluded.override_host_member_id,
-              last_seen=excluded.last_seen,
-              host_ack_seq=excluded.host_ack_seq,
+              last_seen=CASE
+                          WHEN ai_override_sessions.last_seen IS NULL OR ai_override_sessions.last_seen < excluded.last_seen THEN excluded.last_seen
+                          ELSE ai_override_sessions.last_seen
+                        END,
+              host_ack_seq=CASE
+                             WHEN ai_override_sessions.host_ack_seq IS NULL OR ai_override_sessions.host_ack_seq < excluded.host_ack_seq THEN excluded.host_ack_seq
+                             ELSE ai_override_sessions.host_ack_seq
+                           END,
               user_name=excluded.user_name,
               user_name_updated_at=excluded.user_name_updated_at,
               usage_ctx_json=excluded.usage_ctx_json,
               summary_key=excluded.summary_key,
               in_session_summaries_json=excluded.in_session_summaries_json,
-              updated_epoch=excluded.updated_epoch
+              updated_epoch=CASE
+                              WHEN ai_override_sessions.updated_epoch IS NULL OR ai_override_sessions.updated_epoch < excluded.updated_epoch THEN excluded.updated_epoch
+                              ELSE ai_override_sessions.updated_epoch
+                            END
             """,
             (
                 sid,
@@ -8025,6 +8040,7 @@ def _ai_override_merge_records(mem: Optional[Dict[str, Any]], db: Optional[Dict[
         merged[k] = v
     if "events" in mem:
         merged["events"] = mem.get("events") or []
+    merged["seq"] = max(int(mem.get("seq") or 0), int(db.get("seq") or 0))
     merged["host_ack_seq"] = max(int(mem.get("host_ack_seq") or 0), int(db.get("host_ack_seq") or 0))
     return merged
 
@@ -8430,17 +8446,16 @@ def _ai_override_poll(
     max_seq = max([since_i] + [int(ev.get("seq") or 0) for ev in wanted])
 
     if mark_host_read and audience == "host":
+        mark_now = time.time()
         with _AI_OVERRIDE_LOCK:
             rec2 = _AI_OVERRIDE_SESSIONS.get(sid)
             if isinstance(rec2, dict):
+                rec2["seq"] = max(int(rec2.get("seq") or 0), int(max_seq or 0))
                 rec2["host_ack_seq"] = max(int(rec2.get("host_ack_seq") or 0), int(max_seq or 0))
-                rec2["updated_epoch"] = time.time()
+                rec2["last_seen"] = max(float(rec2.get("last_seen") or 0.0), float(mark_now))
+                rec2["updated_epoch"] = float(mark_now)
                 _AI_OVERRIDE_SESSIONS[sid] = rec2
                 _ai_override_persist()
-                try:
-                    _ai_override_db_upsert_session(rec2)
-                except Exception:
-                    pass
         try:
             _ai_override_db_set_host_ack(sid, int(max_seq or 0))
         except Exception:
