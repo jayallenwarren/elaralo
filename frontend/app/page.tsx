@@ -3011,6 +3011,18 @@ const [hostInsightsQuestion, setHostInsightsQuestion] = useState<string>("");
 const [hostInsightsAnswer, setHostInsightsAnswer] = useState<string>("");
 const [hostInsightsLoading, setHostInsightsLoading] = useState<boolean>(false);
 const [hostInsightsError, setHostInsightsError] = useState<string>("");
+const hostInsightsUsersScrollRef = useRef<HTMLDivElement | null>(null);
+const hostInsightsAnswerScrollRef = useRef<HTMLDivElement | null>(null);
+
+useEffect(() => {
+  const el = hostInsightsAnswerScrollRef.current;
+  if (el) el.scrollTop = 0;
+}, [hostInsightsAnswer]);
+
+useEffect(() => {
+  const el = hostInsightsUsersScrollRef.current;
+  if (el && hostInsightsOpen) el.scrollTop = 0;
+}, [hostInsightsOpen]);
 
 
 const loadHostGuidelines = useCallback(async () => {
@@ -12449,6 +12461,7 @@ const modePillControls = (
                   flexDirection: "column",
                   gap: 8,
                   minHeight: 0,
+                  overflow: "hidden",
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -12475,12 +12488,18 @@ const modePillControls = (
                 </div>
 
                 <div
+                  ref={hostInsightsUsersScrollRef}
                   style={{
                     overflowY: "auto",
+                    overflowX: "hidden",
                     minHeight: 0,
-                    flex: "1 1 auto",
+                    height: 0,
+                    maxHeight: "100%",
+                    flex: "1 1 0",
+                    paddingRight: 2,
                     WebkitOverflowScrolling: "touch",
                     overscrollBehavior: "contain",
+                    touchAction: "pan-y",
                   }}
                 >
                   {hostInsightsUsers.length === 0 ? (
@@ -12549,6 +12568,7 @@ const modePillControls = (
                   flexDirection: "column",
                   gap: 10,
                   minHeight: 0,
+                  overflow: "hidden",
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
@@ -12583,6 +12603,7 @@ const modePillControls = (
                     borderRadius: 12,
                     padding: 10,
                     overflowY: "auto",
+                    overflowX: "hidden",
                     minHeight: 120,
                     maxHeight: 220,
                     flex: "0 1 220px",
@@ -12591,6 +12612,7 @@ const modePillControls = (
                     whiteSpace: "pre-wrap",
                     WebkitOverflowScrolling: "touch",
                     overscrollBehavior: "contain",
+                    touchAction: "pan-y",
                   }}
                 >
                   {hostInsightsSummaries.length === 0 ? (
@@ -12740,22 +12762,37 @@ const modePillControls = (
                 {hostInsightsAnswer ? (
                   <div
                     style={{
-                      border: "1px solid rgba(0,0,0,0.10)",
-                      background: "rgba(0,0,0,0.02)",
-                      borderRadius: 12,
-                      padding: 10,
-                      fontSize: 13,
-                      color: "#111",
-                      whiteSpace: "pre-wrap",
-                      overflowY: "auto",
-                      minHeight: 140,
-                      maxHeight: 260,
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 6,
                       flex: "1 1 180px",
-                      WebkitOverflowScrolling: "touch",
-                      overscrollBehavior: "contain",
+                      minHeight: 0,
                     }}
                   >
-                    {hostInsightsAnswer}
+                    <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.82 }}>Response</div>
+                    <div
+                      ref={hostInsightsAnswerScrollRef}
+                      style={{
+                        border: "1px solid rgba(0,0,0,0.10)",
+                        background: "rgba(0,0,0,0.02)",
+                        borderRadius: 12,
+                        padding: 10,
+                        fontSize: 13,
+                        color: "#111",
+                        whiteSpace: "pre-wrap",
+                        overflowY: "auto",
+                        overflowX: "hidden",
+                        minHeight: 140,
+                        height: 0,
+                        maxHeight: 260,
+                        flex: "1 1 0",
+                        WebkitOverflowScrolling: "touch",
+                        overscrollBehavior: "contain",
+                        touchAction: "pan-y",
+                      }}
+                    >
+                      {hostInsightsAnswer}
+                    </div>
                   </div>
                 ) : null}
               </div>
