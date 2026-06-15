@@ -4971,6 +4971,28 @@ const speakAssistantReply = useCallback(
 
   const [messages, setMessages] = useState<Msg[]>([]);
 
+  // Translation/language state must be declared before any hooks that list these
+  // values in dependency arrays. Keeping them here avoids block-scoped TDZ
+  // build failures during Next.js type checking.
+  const initialLanguagePreferenceRef = useRef<DetectedLanguagePreference>(detectInitialLanguagePreference());
+  const [userLanguageCode, setUserLanguageCode] = useState<string>(() => normalizeLanguageTag(initialLanguagePreferenceRef.current.code) || "en");
+  const [userLanguagePreferenceKnown, setUserLanguagePreferenceKnown] = useState<boolean>(() => Boolean(initialLanguagePreferenceRef.current.known));
+  const userLanguageName = useMemo(() => languageNameFromCode(userLanguageCode), [userLanguageCode]);
+  const translatorEnabled = useMemo(
+    () => Boolean(userLanguagePreferenceKnown) && !isEnglishLanguage(userLanguageCode),
+    [userLanguagePreferenceKnown, userLanguageCode]
+  );
+  const sttLanguageHintCode = useMemo(
+    () => normalizeLanguageTag(userLanguagePreferenceKnown ? userLanguageCode : initialLanguagePreferenceRef.current.code) || "en",
+    [userLanguagePreferenceKnown, userLanguageCode]
+  );
+  const assistantConversationLanguageCode = translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en";
+  const assistantConversationLanguageName = translatorEnabled
+    ? (userLanguageName || languageNameFromCode(userLanguageCode || ""))
+    : "English";
+  const assistantSpeechLanguageCode = "en";
+  const assistantSpeechLanguageName = "English";
+
   const applyUserTurnTranslationByClientId = useCallback((clientTurnId: string, rawTranslation: any, fallbackDisplayText: string = "") => {
     const id = String(clientTurnId || "").trim();
     if (!id) return;
@@ -5946,24 +5968,6 @@ useEffect(() => {
     pending_consent: null,
   });
 
-  const initialLanguagePreferenceRef = useRef<DetectedLanguagePreference>(detectInitialLanguagePreference());
-  const [userLanguageCode, setUserLanguageCode] = useState<string>(() => normalizeLanguageTag(initialLanguagePreferenceRef.current.code) || "en");
-  const [userLanguagePreferenceKnown, setUserLanguagePreferenceKnown] = useState<boolean>(() => Boolean(initialLanguagePreferenceRef.current.known));
-  const userLanguageName = useMemo(() => languageNameFromCode(userLanguageCode), [userLanguageCode]);
-  const translatorEnabled = useMemo(
-    () => Boolean(userLanguagePreferenceKnown) && !isEnglishLanguage(userLanguageCode),
-    [userLanguagePreferenceKnown, userLanguageCode]
-  );
-  const sttLanguageHintCode = useMemo(
-    () => normalizeLanguageTag(userLanguagePreferenceKnown ? userLanguageCode : initialLanguagePreferenceRef.current.code) || "en",
-    [userLanguagePreferenceKnown, userLanguageCode]
-  );
-  const assistantConversationLanguageCode = translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en";
-  const assistantConversationLanguageName = translatorEnabled
-    ? (userLanguageName || languageNameFromCode(userLanguageCode || ""))
-    : "English";
-  const assistantSpeechLanguageCode = "en";
-  const assistantSpeechLanguageName = "English";
 
   const syncLanguagePreferenceFromBackend = useCallback((rawState: any) => {
     const state = rawState && typeof rawState === "object" ? rawState : {};
