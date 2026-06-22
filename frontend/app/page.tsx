@@ -343,10 +343,10 @@ function dedupeHostInsightsSummaries(items: HostInsightsSummaryItem[]): HostInsi
       .map((m) => `${Number((m as any)?.seq || 0)}|${String((m as any)?.sender || "").trim()}|${String((m as any)?.content || "").trim()}`)
       .join("\n");
     const key = [
-      String(item.createDatetime || "").trim(),
       String(item.sessionId || "").trim(),
       String(item.reason || "").trim(),
       String(item.summary || "").trim(),
+      String(item.userName || "").trim(),
       transcriptSig,
     ].join("||");
     if (seen.has(key)) continue;
@@ -354,6 +354,50 @@ function dedupeHostInsightsSummaries(items: HostInsightsSummaryItem[]): HostInsi
     out.push({ ...item, messages: transcript });
   }
   return out;
+}
+
+function hostActiveChatDisplayDedupKey(chat: HostActiveChat): string {
+  const brand = String(chat?.brand || "").trim().toLowerCase();
+  const avatar = String(chat?.avatar || "").trim().toLowerCase();
+  const memberId = String(chat?.member_id || "").trim().toLowerCase();
+  const userName = String(chat?.user_name || "").trim().toLowerCase();
+  const summary = String(chat?.summary || "").trim().replace(/\s+/g, " ").toLowerCase().slice(0, 240);
+  if (memberId) return `member:${brand}:${avatar}:${memberId}:${summary || "-"}`;
+  if (userName) return `user:${brand}:${avatar}:${userName}:${summary || "-"}`;
+  return `session:${String(chat?.session_id || "").trim()}`;
+}
+
+function dedupeHostActiveChats(chats: HostActiveChat[]): HostActiveChat[] {
+  const byKey = new Map<string, HostActiveChat>();
+  const ordered = [...(chats || [])].sort(
+    (a, b) => Number((b as any)?.last_seen || 0) - Number((a as any)?.last_seen || 0)
+  );
+  for (const chat of ordered) {
+    if (!chat || typeof chat !== "object") continue;
+    const key = hostActiveChatDisplayDedupKey(chat);
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, chat);
+      continue;
+    }
+    const keepCurrent =
+      Number((chat as any)?.last_seen || 0) > Number((prev as any)?.last_seen || 0) ||
+      (Number((chat as any)?.last_seen || 0) === Number((prev as any)?.last_seen || 0) &&
+        Number((chat as any)?.unread || 0) > Number((prev as any)?.unread || 0));
+    const primary = keepCurrent ? chat : prev;
+    const secondary = keepCurrent ? prev : chat;
+    byKey.set(key, {
+      ...secondary,
+      ...primary,
+      unread: Math.max(Number((prev as any)?.unread || 0), Number((chat as any)?.unread || 0)),
+      summary: String((primary as any)?.summary || "").trim() || String((secondary as any)?.summary || "").trim(),
+      summary_source: String((primary as any)?.summary_source || "").trim() || String((secondary as any)?.summary_source || "").trim(),
+      override_active: Boolean((prev as any)?.override_active || (chat as any)?.override_active),
+    });
+  }
+  return Array.from(byKey.values()).sort(
+    (a, b) => Number((b as any)?.last_seen || 0) - Number((a as any)?.last_seen || 0)
+  );
 }
 
 type PlanName =
@@ -5481,7 +5525,7 @@ useEffect(() => {
       if (cancelled) return;
 
       const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-      setHostActiveChats(sessions);
+      setHostActiveChats(dedupeHostActiveChats(sessions));
       setHostActiveLoading(false);
     } catch (e: any) {
       if (cancelled) return;
@@ -5503,6 +5547,39 @@ useEffect(() => {
     if (timer) clearTimeout(timer);
   };
 }, [API_BASE, hostConsoleOpen, isHost, companyName, companionName, hostActiveChats.length]);
+
+useEffect(() => {
+  if (!hostConsoleOpen) return;
+
+  if (hostActiveChats.length === 0) {
+    if (hostSelectedSessionId) {
+      setHostSelectedSessionId("");
+      setHostSelectedEvents([]);
+      setHostPendingContent([]);
+      setHostPendingModalOpen(false);
+      setHostPendingActionErr(null);
+      setHostPollSinceSeq(0);
+      setHostSendText("");
+      setHostNotice("");
+    }
+    return;
+  }
+
+  const currentExists = hostActiveChats.some((c) => String(c?.session_id || "").trim() === String(hostSelectedSessionId || "").trim());
+  if (currentExists) return;
+
+  const nextSid = String(hostActiveChats[0]?.session_id || "").trim();
+  if (!nextSid) return;
+
+  setHostSelectedSessionId(nextSid);
+  setHostSelectedEvents([]);
+  setHostPendingContent([]);
+  setHostPendingModalOpen(false);
+  setHostPendingActionErr(null);
+  setHostPollSinceSeq(0);
+  setHostSendText("");
+  setHostNotice("");
+}, [hostConsoleOpen, hostActiveChats, hostSelectedSessionId]);
 
 useEffect(() => {
   if (!hostConsoleOpen) return;

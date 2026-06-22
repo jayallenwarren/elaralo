@@ -6760,8 +6760,12 @@ def _get_hco_system_blocks_cached_sync(avatar: str) -> List[str]:
 # retrieval, but we also persist every saved summary snapshot into SQLite so the
 # Host Console can query historical sessions across all visitors/members.
 
+
 _CHAT_SUMMARY_HISTORY_LOCK = threading.RLock()
 _CHAT_SUMMARY_HISTORY_READY = False
+_CHAT_SUMMARY_HISTORY_CLEANUP_LOCK = threading.RLock()
+_CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS = 0.0
+_CHAT_SUMMARY_HISTORY_CLEANUP_INTERVAL_S = float(os.getenv("CHAT_SUMMARY_HISTORY_CLEANUP_INTERVAL_S", "86400") or "86400")
 
 
 def _summary_history_db_connect() -> sqlite3.Connection:
@@ -6797,15 +6801,24 @@ def _summary_history_ensure_schema(conn: Optional[sqlite3.Connection] = None) ->
                   user_name TEXT,
                   session_id TEXT,
                   reason TEXT,
+                  conversation_hash TEXT,
                   summary TEXT NOT NULL
                 );
                 """
             )
+            if not _column_exists(conn, "chat_summary_history", "conversation_hash"):
+                conn.execute("ALTER TABLE chat_summary_history ADD COLUMN conversation_hash TEXT;")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_brand_avatar_dt ON chat_summary_history(brand, avatar, create_datetime);"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_member_dt ON chat_summary_history(member_id, create_datetime);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_session_lookup ON chat_summary_history(session_id, brand, avatar, member_id, create_datetime);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_summary_history_conversation_hash ON chat_summary_history(conversation_hash);"
             )
             conn.commit()
             _CHAT_SUMMARY_HISTORY_READY = True
@@ -6817,6 +6830,298 @@ def _summary_history_ensure_schema(conn: Optional[sqlite3.Connection] = None) ->
                     pass
 
 
+def _summary_history_norm_scalar(value: Any) -> str:
+    return str(value or "").strip()
+
+
+
+def _summary_history_norm_summary(value: Any) -> str:
+    s = str(value or "")
+    s = s.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+    return s.strip()
+
+
+def _summary_history_norm_hash(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _summary_history_compute_conversation_hash(messages: List[Dict[str, str]]) -> str:
+    normalized: List[Dict[str, str]] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip().lower()
+        if role not in ("user", "assistant"):
+            continue
+        content = _summary_history_norm_summary(m.get("content") or "")
+        normalized.append({"role": role, "content": content})
+
+    if not normalized:
+        return ""
+
+    try:
+        payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def _summary_history_dedupe_expr(alias: str = "") -> str:
+    prefix = (str(alias or "").strip() + ".") if str(alias or "").strip() else ""
+    return (
+        f"CASE "
+        f"WHEN COALESCE({prefix}session_id, '') <> '' THEN 'session:' || COALESCE({prefix}session_id, '') "
+        f"WHEN COALESCE({prefix}conversation_hash, '') <> '' THEN 'hash:' || COALESCE({prefix}conversation_hash, '') "
+        f"ELSE 'legacy:' || COALESCE({prefix}summary, '') END"
+    )
+
+
+def _summary_history_cleanup_due(now_ts: Optional[float] = None) -> bool:
+    global _CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS
+
+    if _CHAT_SUMMARY_HISTORY_CLEANUP_INTERVAL_S <= 0:
+        return False
+
+    now_val = float(now_ts or time.time())
+    with _CHAT_SUMMARY_HISTORY_CLEANUP_LOCK:
+        last = float(_CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS or 0.0)
+        if last > 0.0 and (now_val - last) < float(_CHAT_SUMMARY_HISTORY_CLEANUP_INTERVAL_S):
+            return False
+        _CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS = now_val
+        return True
+
+
+def _summary_history_cleanup_reset() -> None:
+    global _CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS
+    with _CHAT_SUMMARY_HISTORY_CLEANUP_LOCK:
+        _CHAT_SUMMARY_HISTORY_LAST_CLEANUP_TS = 0.0
+
+
+def _summary_history_delete_exact_duplicates(conn: sqlite3.Connection) -> int:
+    deleted = 0
+
+    conn.execute(
+        """
+        DELETE FROM chat_summary_history
+        WHERE id IN (
+          SELECT h.id
+          FROM chat_summary_history h
+          JOIN (
+            SELECT
+              brand,
+              avatar,
+              member_id,
+              session_id,
+              MAX(id) AS keep_id
+            FROM chat_summary_history
+            WHERE COALESCE(session_id, '') <> ''
+            GROUP BY brand, avatar, member_id, session_id
+            HAVING COUNT(*) > 1
+          ) d
+            ON h.brand = d.brand
+           AND h.avatar = d.avatar
+           AND h.member_id = d.member_id
+           AND h.session_id = d.session_id
+           AND h.id <> d.keep_id
+        );
+        """
+    )
+    try:
+        deleted += int(conn.execute("SELECT changes()").fetchone()[0] or 0)
+    except Exception:
+        pass
+
+    conn.execute(
+        """
+        DELETE FROM chat_summary_history
+        WHERE id IN (
+          SELECT h.id
+          FROM chat_summary_history h
+          JOIN (
+            SELECT
+              brand,
+              avatar,
+              member_id,
+              COALESCE(session_id, '') AS session_id_norm,
+              conversation_hash,
+              MAX(id) AS keep_id
+            FROM chat_summary_history
+            WHERE COALESCE(session_id, '') = ''
+              AND COALESCE(conversation_hash, '') <> ''
+            GROUP BY brand, avatar, member_id, COALESCE(session_id, ''), conversation_hash
+            HAVING COUNT(*) > 1
+          ) d
+            ON h.brand = d.brand
+           AND h.avatar = d.avatar
+           AND h.member_id = d.member_id
+           AND COALESCE(h.session_id, '') = d.session_id_norm
+           AND COALESCE(h.conversation_hash, '') = d.conversation_hash
+           AND h.id <> d.keep_id
+        );
+        """
+    )
+    try:
+        deleted += int(conn.execute("SELECT changes()").fetchone()[0] or 0)
+    except Exception:
+        pass
+
+    conn.execute(
+        """
+        DELETE FROM chat_summary_history
+        WHERE id IN (
+          SELECT h.id
+          FROM chat_summary_history h
+          JOIN (
+            SELECT
+              brand,
+              avatar,
+              member_id,
+              COALESCE(session_id, '') AS session_id_norm,
+              summary,
+              MAX(id) AS keep_id
+            FROM chat_summary_history
+            WHERE COALESCE(session_id, '') = ''
+              AND COALESCE(conversation_hash, '') = ''
+            GROUP BY brand, avatar, member_id, COALESCE(session_id, ''), summary
+            HAVING COUNT(*) > 1
+          ) d
+            ON h.brand = d.brand
+           AND h.avatar = d.avatar
+           AND h.member_id = d.member_id
+           AND COALESCE(h.session_id, '') = d.session_id_norm
+           AND h.summary = d.summary
+           AND COALESCE(h.conversation_hash, '') = ''
+           AND h.id <> d.keep_id
+        );
+        """
+    )
+    try:
+        deleted += int(conn.execute("SELECT changes()").fetchone()[0] or 0)
+    except Exception:
+        pass
+
+    return deleted
+
+
+def _summary_history_cleanup_if_due(force: bool = False) -> int:
+    should_run = bool(force)
+    if not should_run:
+        should_run = _summary_history_cleanup_due()
+    if not should_run:
+        return 0
+
+    try:
+        conn = _summary_history_db_connect()
+        try:
+            _summary_history_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            deleted = _summary_history_delete_exact_duplicates(conn)
+            conn.commit()
+            return deleted
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        if not force:
+            _summary_history_cleanup_reset()
+            return 0
+        raise
+
+
+def _summary_history_has_existing_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    brand: str,
+    avatar: str,
+    member_id: str,
+    session_id: str,
+    reason: str,
+    summary: str,
+    conversation_hash: str = "",
+) -> bool:
+    brand_s = _summary_history_norm_scalar(brand)
+    avatar_s = _summary_history_norm_scalar(avatar)
+    member_id_s = _summary_history_norm_scalar(member_id)
+    session_id_s = _summary_history_norm_scalar(session_id)
+    reason_s = _summary_history_norm_scalar(reason)
+    summary_s = _summary_history_norm_summary(summary)
+    conversation_hash_s = _summary_history_norm_hash(conversation_hash)
+    if not summary_s:
+        return False
+
+    if conversation_hash_s:
+        if session_id_s:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM chat_summary_history
+                WHERE brand = ?
+                  AND avatar = ?
+                  AND member_id = ?
+                  AND session_id = ?
+                  AND conversation_hash = ?
+                LIMIT 1;
+                """,
+                (brand_s, avatar_s, member_id_s, session_id_s, conversation_hash_s),
+            ).fetchone()
+            return row is not None
+
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM chat_summary_history
+            WHERE brand = ?
+              AND avatar = ?
+              AND member_id = ?
+              AND COALESCE(session_id, '') = ''
+              AND conversation_hash = ?
+            LIMIT 1;
+            """,
+            (brand_s, avatar_s, member_id_s, conversation_hash_s),
+        ).fetchone()
+        return row is not None
+
+    if session_id_s:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM chat_summary_history
+            WHERE brand = ?
+              AND avatar = ?
+              AND member_id = ?
+              AND session_id = ?
+              AND summary = ?
+            LIMIT 1;
+            """,
+            (brand_s, avatar_s, member_id_s, session_id_s, summary_s),
+        ).fetchone()
+        return row is not None
+
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM chat_summary_history
+        WHERE brand = ?
+          AND avatar = ?
+          AND member_id = ?
+          AND COALESCE(session_id, '') = ''
+          AND reason = ?
+          AND summary = ?
+        LIMIT 1;
+        """,
+        (brand_s, avatar_s, member_id_s, reason_s, summary_s),
+    ).fetchone()
+    return row is not None
+
+
 def _summary_history_insert(
     *,
     brand: str,
@@ -6826,40 +7131,120 @@ def _summary_history_insert(
     session_id: str,
     reason: str,
     summary: str,
+    conversation_hash: str = "",
 ) -> None:
+    brand_s = _summary_history_norm_scalar(brand)
+    avatar_s = _summary_history_norm_scalar(avatar)
+    member_id_s = _summary_history_norm_scalar(member_id)
+    user_name_s = _summary_history_norm_scalar(user_name)
+    session_id_s = _summary_history_norm_scalar(session_id)
+    reason_s = _summary_history_norm_scalar(reason)
+    summary_s = _summary_history_norm_summary(summary)
+    conversation_hash_s = _summary_history_norm_hash(conversation_hash)
+    if not summary_s:
+        return
+
+    try:
+        _summary_history_cleanup_if_due()
+    except Exception:
+        pass
+
     try:
         conn = _summary_history_db_connect()
         try:
             _summary_history_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+
+            if session_id_s:
+                row = conn.execute(
+                    """
+                    SELECT id
+                    FROM chat_summary_history
+                    WHERE brand = ?
+                      AND avatar = ?
+                      AND member_id = ?
+                      AND session_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1;
+                    """,
+                    (brand_s, avatar_s, member_id_s, session_id_s),
+                ).fetchone()
+                if row is not None:
+                    keep_id = int(row[0] or 0)
+                    conn.execute(
+                        """
+                        UPDATE chat_summary_history
+                        SET create_datetime = datetime('now'),
+                            user_name = ?,
+                            reason = ?,
+                            conversation_hash = ?,
+                            summary = ?
+                        WHERE id = ?;
+                        """,
+                        (user_name_s, reason_s, (conversation_hash_s or None), summary_s, keep_id),
+                    )
+                    conn.execute(
+                        """
+                        DELETE FROM chat_summary_history
+                        WHERE brand = ?
+                          AND avatar = ?
+                          AND member_id = ?
+                          AND session_id = ?
+                          AND id <> ?;
+                        """,
+                        (brand_s, avatar_s, member_id_s, session_id_s, keep_id),
+                    )
+                    conn.commit()
+                    return
+
+            if _summary_history_has_existing_snapshot(
+                conn,
+                brand=brand_s,
+                avatar=avatar_s,
+                member_id=member_id_s,
+                session_id=session_id_s,
+                reason=reason_s,
+                summary=summary_s,
+                conversation_hash=conversation_hash_s,
+            ):
+                conn.commit()
+                return
+
             conn.execute(
                 """
                 INSERT INTO chat_summary_history (
-                  brand, avatar, member_id, user_name, session_id, reason, summary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                  brand, avatar, member_id, user_name, session_id, reason, conversation_hash, summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
-                    (brand or ""),
-                    (avatar or ""),
-                    (member_id or ""),
-                    (user_name or ""),
-                    (session_id or ""),
-                    (reason or ""),
-                    (summary or ""),
+                    brand_s,
+                    avatar_s,
+                    member_id_s,
+                    user_name_s,
+                    session_id_s,
+                    reason_s,
+                    (conversation_hash_s or None),
+                    summary_s,
                 ),
             )
             conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
     except Exception:
-        # Never fail a chat request if analytics/history persistence fails.
         pass
 
 
-
 def _normalize_payload(raw: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]], Dict[str, Any], bool]:
+
     sid = raw.get("session_id") or raw.get("sid")
     msgs = raw.get("messages") or []
     state = raw.get("session_state") or {}
@@ -10161,6 +10546,8 @@ async def save_chat_summary(request: Request):
         total += len(c)
     convo_items = list(reversed(capped))
 
+    conversation_hash = _summary_history_compute_conversation_hash(convo_items)
+
     sys = (
         "You are a concise assistant that creates a server-side chat summary for future context. "
         "Write a compact summary in English that captures: relationship tone, key facts, user preferences/boundaries, "
@@ -10211,6 +10598,7 @@ async def save_chat_summary(request: Request):
             session_id=session_id,
             reason=reason,
             summary=summary,
+            conversation_hash=conversation_hash,
         )
     except Exception:
         pass
@@ -13097,6 +13485,51 @@ async def host_companion_guidelines_set(req: HostCompanionGuidelinesSetRequest):
 
 
 
+
+
+def _host_active_session_group_key(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    brand = str(item.get("brand") or "").strip().lower()
+    avatar = str(item.get("avatar") or "").strip().lower()
+    member_id = str(item.get("member_id") or "").strip().lower()
+    user_name = str(item.get("user_name") or "").strip().lower()
+    summary = re.sub(r"\s+", " ", str(item.get("summary") or "").strip().lower())[:240]
+    if member_id:
+        return f"member:{brand}:{avatar}:{member_id}:{summary or '-'}"
+    if user_name:
+        return f"user:{brand}:{avatar}:{user_name}:{summary or '-'}"
+    return f"session:{str(item.get('session_id') or '').strip()}"
+
+
+def _dedupe_host_active_session_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out_by_key: Dict[str, Dict[str, Any]] = {}
+    ordered: List[Dict[str, Any]] = sorted(
+        [dict(r) for r in (rows or []) if isinstance(r, dict)],
+        key=lambda r: float(r.get("last_seen") or 0.0),
+        reverse=True,
+    )
+    for row in ordered:
+        key = _host_active_session_group_key(row) or f"session:{str(row.get('session_id') or '').strip()}"
+        prev = out_by_key.get(key)
+        if prev is None:
+            out_by_key[key] = row
+            continue
+        keep = prev
+        keep["unread"] = max(int(keep.get("unread") or 0), int(row.get("unread") or 0))
+        if not str(keep.get("summary") or "").strip() and str(row.get("summary") or "").strip():
+            keep["summary"] = row.get("summary")
+            keep["summary_source"] = row.get("summary_source")
+        if not str(keep.get("user_name") or "").strip() and str(row.get("user_name") or "").strip():
+            keep["user_name"] = row.get("user_name")
+        if not str(keep.get("member_id") or "").strip() and str(row.get("member_id") or "").strip():
+            keep["member_id"] = row.get("member_id")
+        keep["override_active"] = bool(keep.get("override_active") is True or row.get("override_active") is True)
+    out = list(out_by_key.values())
+    out.sort(key=lambda r: float(r.get("last_seen") or 0.0), reverse=True)
+    return out
+
+
 @app.post("/host/ai-chats/active")
 async def host_ai_chats_active(req: HostAiChatsActiveRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
@@ -13167,6 +13600,7 @@ async def host_ai_chats_active(req: HostAiChatsActiveRequest):
             }
         )
 
+    sessions_out = _dedupe_host_active_session_rows(sessions_out)
     return {"ok": True, "hostMemberId": host_id, "sessions": sessions_out, "now": _now_ts()}
 
 
@@ -13545,21 +13979,28 @@ def _format_host_insights_last_seen(epoch: Any, fallback_text: str = "") -> str:
     return str(fallback_text or "").strip()
 
 
+
 def _host_insights_list_users_sync(brand: str, avatar: str, limit: int = 100) -> List[Dict[str, Any]]:
     b = (brand or "").strip()
     a = (avatar or "").strip()
     lim = max(1, min(int(limit or 100), 500))
 
+    try:
+        _summary_history_cleanup_if_due()
+    except Exception:
+        pass
+
+    dedupe_expr = _summary_history_dedupe_expr("h")
     summary_conn = _summary_history_db_connect()
     try:
         _summary_history_ensure_schema(summary_conn)
         cur = summary_conn.cursor()
         cur.execute(
-            """
+            f"""
             SELECT
               member_id,
               MAX(create_datetime) AS summary_last_seen,
-              COUNT(*) AS summary_count,
+              COUNT(DISTINCT {dedupe_expr}) AS summary_count,
               (
                 SELECT user_name
                 FROM chat_summary_history h2
@@ -13667,28 +14108,44 @@ def _host_insights_list_summaries_sync(
     tm = (target_member_id or "").strip()
     lim = max(1, min(int(limit or 50), 500))
 
+    try:
+        _summary_history_cleanup_if_due()
+    except Exception:
+        pass
+
+    dedupe_expr = _summary_history_dedupe_expr()
     conn = _summary_history_db_connect()
     try:
         _summary_history_ensure_schema(conn)
         cur = conn.cursor()
         if tm:
             cur.execute(
-                """
-                SELECT create_datetime, session_id, reason, summary, user_name
-                FROM chat_summary_history
-                WHERE brand = ? AND avatar = ? AND member_id = ?
-                ORDER BY create_datetime DESC, id DESC
+                f"""
+                SELECT h.create_datetime, h.session_id, h.reason, h.summary, h.user_name
+                FROM chat_summary_history h
+                JOIN (
+                  SELECT MAX(id) AS keep_id
+                  FROM chat_summary_history
+                  WHERE brand = ? AND avatar = ? AND member_id = ?
+                  GROUP BY {dedupe_expr}
+                ) keep ON keep.keep_id = h.id
+                ORDER BY h.create_datetime DESC, h.id DESC
                 LIMIT ?;
                 """,
                 (b, a, tm, lim),
             )
         else:
             cur.execute(
-                """
-                SELECT create_datetime, session_id, reason, summary, user_name
-                FROM chat_summary_history
-                WHERE brand = ? AND avatar = ?
-                ORDER BY create_datetime DESC, id DESC
+                f"""
+                SELECT h.create_datetime, h.session_id, h.reason, h.summary, h.user_name
+                FROM chat_summary_history h
+                JOIN (
+                  SELECT MAX(id) AS keep_id
+                  FROM chat_summary_history
+                  WHERE brand = ? AND avatar = ?
+                  GROUP BY member_id, {dedupe_expr}
+                ) keep ON keep.keep_id = h.id
+                ORDER BY h.create_datetime DESC, h.id DESC
                 LIMIT ?;
                 """,
                 (b, a, lim),
