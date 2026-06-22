@@ -597,22 +597,52 @@ def _extract_plan_name(session_state: Dict[str, Any]) -> str:
     return str(plan).strip() if plan is not None else ""
 
 
+def _normalize_rebranding_key_value(raw: Any) -> str:
+    try:
+        s = str(raw if raw is not None else "").strip()
+    except Exception:
+        return ""
+    if not s:
+        return ""
+
+    folded = (
+        s.replace("“", '"')
+        .replace("”", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+        .strip()
+    )
+    lower = folded.lower()
+    if lower in ("null", "undefined"):
+        return ""
+    if folded in ('""', "''"):
+        return ""
+    if len(folded) >= 2 and folded[0] == folded[-1] and folded[0] in ('"', "'"):
+        inner = folded[1:-1].strip()
+        inner_lower = inner.lower()
+        if not inner or inner in ('""', "''") or inner_lower in ("null", "undefined"):
+            return ""
+    return folded
+
+
 def _extract_rebranding_key(session_state: Dict[str, Any]) -> str:
     """Extract the Wix-provided RebrandingKey (preferred) or legacy rebranding string."""
-    rk = (
-        session_state.get("rebrandingKey")
-        or session_state.get("rebranding_key")
-        or session_state.get("RebrandingKey")
-        or session_state.get("rebranding")  # legacy: brand name only
-        or ""
-    )
-    return str(rk).strip() if rk is not None else ""
+    ss = session_state if isinstance(session_state, dict) else {}
+    explicit_key_fields = ("rebrandingKey", "rebranding_key", "RebrandingKey")
+    if any(key in ss for key in explicit_key_fields):
+        for key in explicit_key_fields:
+            if key in ss:
+                return _normalize_rebranding_key_value(ss.get(key))
+        return ""
+    return _normalize_rebranding_key_value(ss.get("rebranding"))
 
 def _strip_rebranding_key_label(part: str) -> str:
     """Accept either raw values or labeled values like 'PayGoMinutes: 60'."""
-    s = (part or "").strip()
+    s = _normalize_rebranding_key_value(part)
+    if not s:
+        return ""
     m = re.match(r"^[A-Za-z0-9_ ()+-]+\s*[:=]\s*(.+)$", s)
-    return m.group(1).strip() if m else s
+    return _normalize_rebranding_key_value(m.group(1).strip() if m else s)
 
 def _parse_rebranding_key(raw: str) -> Dict[str, str]:
     """Parse a '|' separated RebrandingKey.
@@ -620,14 +650,17 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
     Expected order:
       Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays
     """
-    v = (raw or "").strip()
+    v = _normalize_rebranding_key_value(raw)
     if not v:
         return {}
 
     # Legacy support: no delimiter -> only brand name
     if "|" not in v:
+        brand = _normalize_rebranding_key_value(_strip_rebranding_key_label(v))
+        if not brand:
+            return {}
         return {
-            "rebranding": _strip_rebranding_key_label(v),
+            "rebranding": brand,
             "upgrade_link": "",
             "pay_go_link": "",
             "pay_go_price": "",
@@ -638,7 +671,7 @@ def _parse_rebranding_key(raw: str) -> Dict[str, str]:
             "cycle_days": "",
         }
 
-    parts = [_strip_rebranding_key_label(p) for p in v.split("|")]
+    parts = [_normalize_rebranding_key_value(_strip_rebranding_key_label(p)) for p in v.split("|")]
     parts += [""] * (9 - len(parts))
 
     (
@@ -757,7 +790,7 @@ def _member_rebranding_upsert_from_session_state(session_state: Optional[Dict[st
                 return txt
         return ""
 
-    rebranding_key_raw = _getstr("rebrandingKey", "rebranding_key", "RebrandingKey") or _getstr("rebranding")
+    rebranding_key_raw = _extract_rebranding_key(ss)
     rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
 
     pay_go_minutes_raw = _getstr("pay_go_minutes", "payGoMinutes") or str(rebranding_parsed.get("pay_go_minutes") or "").strip()
@@ -838,7 +871,7 @@ def _member_rebranding_get_paygo_config(member_id: str) -> Dict[str, Any]:
         return out
 
     try:
-        rk = str(row["rebranding_key"] or "").strip()
+        rk = _normalize_rebranding_key_value(row["rebranding_key"])
     except Exception:
         try:
             rk = str(row[0] or "").strip()
@@ -5886,22 +5919,32 @@ def _avatar_from_session_state(session_state: Dict[str, Any]) -> str:
 
 def _brand_from_session_state(session_state: Dict[str, Any]) -> str:
     """Extract brand/rebranding name from session_state."""
-    raw = (
-        _session_get_str(session_state, "brand", "brandName", "companyName", "company_name", "company")
-        or _session_get_str(session_state, "rebranding", "rebrand", "rebrandingName")
-        or ""
-    )
-    if not raw:
-        rk = _extract_rebranding_key(session_state)
+    ss = session_state if isinstance(session_state, dict) else {}
+    has_explicit_key = any(k in ss for k in ("rebrandingKey", "rebranding_key", "RebrandingKey"))
+    rk = _extract_rebranding_key(ss)
+    if rk:
         parsed = _parse_rebranding_key(rk) if rk else {}
-        raw = str(parsed.get("rebranding") or "").strip()
-    return str(raw or "").strip()
+        raw_from_key = _normalize_rebranding_key_value(parsed.get("rebranding"))
+        if raw_from_key:
+            return raw_from_key
+
+    if has_explicit_key:
+        return ""
+
+    raw = _normalize_rebranding_key_value(
+        _session_get_str(ss, "brand", "brandName", "companyName", "company_name", "company")
+    )
+    if raw:
+        return raw
+
+    raw = _normalize_rebranding_key_value(_session_get_str(ss, "rebranding", "rebrand", "rebrandingName"))
+    return raw
 
 
 def _resolved_tts_brand_avatar(session_state: Dict[str, Any]) -> Tuple[str, str]:
     """Resolve brand/avatar robustly for TTS pronunciation lookups."""
     s = session_state if isinstance(session_state, dict) else {}
-    brand = _brand_from_session_state(s) or str(s.get("brand") or s.get("companyName") or "").strip()
+    brand = _brand_from_session_state(s)
     avatar = str(s.get("avatar") or "").strip()
     if not avatar:
         avatar = _avatar_from_session_state(s)
@@ -13940,15 +13983,17 @@ def _content_brand_slug(session_state: Dict[str, Any]) -> str:
                 return slug
 
     # Next, parse rebrandingKey (frontend format: BrandName|...)
-    rk = session_state.get("rebrandingKey") or session_state.get("rebranding_key")
+    rk = _extract_rebranding_key(session_state)
     if rk:
-        first = str(rk).split("|", 1)[0].strip()
+        first = _normalize_rebranding_key_value(str(rk).split("|", 1)[0])
         slug = _safe_slug(first)
         if slug:
             return slug
 
-    # Fallback to brand/company name.
-    return _safe_slug(session_state.get("brand") or session_state.get("company") or "") or "brand"
+    # Fallback to normalized brand identity. When an explicit empty RebrandingKey is present,
+    # _brand_from_session_state returns "", which keeps us on the core/placeholder path instead
+    # of resurrecting a stale legacy brand field.
+    return _safe_slug(_brand_from_session_state(session_state) or "") or "brand"
 
 
 def _content_folder_for_mode(mode: str) -> str:

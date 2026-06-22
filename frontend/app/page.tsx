@@ -715,8 +715,9 @@ function normalizePlanName(raw: any): PlanName {
 }
 
 function stripTrialControlsFromRebrandingKey(key: string): string {
-  const p = parseRebrandingKey(key);
-  if (!p) return key;
+  const normalizedKey = normalizeRebrandingKeyValue(key);
+  const p = parseRebrandingKey(normalizedKey);
+  if (!p) return normalizedKey;
 
   // IMPORTANT:
   // Historically some backend paths read the *plan* segment (6th field) from the rebrandingKey to decide
@@ -739,8 +740,9 @@ function stripTrialControlsFromRebrandingKey(key: string): string {
   ].join("|");
 }
 
-function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverride?: string): string {
-  const hasMemberId = Boolean((memberId || "").trim());
+function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverride?: string, loggedIn: boolean = true): string {
+  const mid = String(memberId || "").trim();
+  const hasMemberId = Boolean(mid) && !isAnonMemberId(mid) && Boolean(loggedIn);
 
   // Requirement: If we do not have a memberId, the visitor is on Trial, shown as "Free Trial".
   if (!hasMemberId) return "Free Trial";
@@ -921,13 +923,42 @@ function stripRebrandingKeyLabel(part: string): string {
   return m ? String(m[1] || "").trim() : s;
 }
 
+function normalizeRebrandingKeyValue(raw: any): string {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+
+  const folded = s
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .trim();
+
+  const lower = folded.toLowerCase();
+  if (lower === "null" || lower === "undefined") return "";
+  if (folded === '""' || folded === "''") return "";
+
+  if (folded.length >= 2) {
+    const first = folded[0];
+    const last = folded[folded.length - 1];
+    if ((first === '"' || first === "'") && first === last) {
+      const inner = folded.slice(1, -1).trim();
+      const innerLower = inner.toLowerCase();
+      if (!inner || inner === '""' || inner === "''" || innerLower === "null" || innerLower === "undefined") {
+        return "";
+      }
+    }
+  }
+
+  return folded;
+}
+
 function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
-  const v = String(raw || "").trim();
+  const v = normalizeRebrandingKeyValue(raw);
   if (!v) return null;
 
   // Legacy support: if there is no "|" delimiter, treat this as just the brand name.
   if (!v.includes("|")) {
-    const brand = stripRebrandingKeyLabel(v);
+    const brand = normalizeRebrandingKeyValue(stripRebrandingKeyLabel(v));
+    if (!brand) return null;
     return {
       rebranding: brand,
       upgradeLink: "",
@@ -941,7 +972,7 @@ function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
     };
   }
 
-  const parts = v.split("|").map((p) => stripRebrandingKeyLabel(p));
+  const parts = v.split("|").map((p) => normalizeRebrandingKeyValue(stripRebrandingKeyLabel(p)));
 
   const [
     rebranding = "",
@@ -966,6 +997,91 @@ function parseRebrandingKey(raw: string): RebrandingKeyParts | null {
     freeMinutes: String(freeMinutes || "").trim(),
     cycleDays: String(cycleDays || "").trim(),
   };
+}
+
+
+type MemberPlanCacheEnvelope = {
+  v?: number;
+  cachedAt?: number;
+  payload?: any;
+};
+
+function buildVisitorSafeMemberPlanCachePayload(raw: any): Record<string, any> | null {
+  const candidate =
+    raw && typeof raw === "object" && !Array.isArray(raw) && typeof (raw as any).payload === "object"
+      ? (raw as any).payload
+      : raw;
+  const data = candidate && typeof candidate === "object" ? (candidate as any) : null;
+  if (!data || String(data.type || "").trim() !== "MEMBER_PLAN") return null;
+
+  const explicitRebrandingKey = normalizeRebrandingKeyValue(
+    data.rebrandingKey ?? data.rebranding_key ?? data.RebrandingKey ?? data.rebrandingkey ?? ""
+  );
+  const parsedKey = parseRebrandingKey(explicitRebrandingKey);
+  const brand = normalizeRebrandingKeyValue(
+    parsedKey?.rebranding ||
+      data.brand ||
+      data.companyName ||
+      data.company_name ||
+      data.company ||
+      data.rebranding ||
+      ""
+  );
+  const avatar = String(
+    data.avatar || data.avatarName || data.avatar_name || data.companion || data.companionName || data.companion_name || ""
+  ).trim();
+  if (!brand || !avatar) return null;
+
+  const modePill =
+    typeof data.modePill === "string"
+      ? String(data.modePill).trim()
+      : typeof data.mode_pill === "string"
+        ? String(data.mode_pill).trim()
+        : typeof data.modepill === "string"
+          ? String(data.modepill).trim()
+          : "";
+
+  const out: Record<string, any> = {
+    type: "MEMBER_PLAN",
+    loggedIn: false,
+    planName: "Trial",
+    plan_name: "Trial",
+    memberId: "",
+    member_id: "",
+    brand,
+    companyName: brand,
+    company_name: brand,
+    company: brand,
+    rebranding: brand,
+    rebrandingKey: brand,
+    rebranding_key: brand,
+    RebrandingKey: brand,
+    avatar,
+    companion: avatar,
+    companionName: avatar,
+    companion_name: avatar,
+  };
+  if (modePill) {
+    out.modePill = modePill;
+    out.mode_pill = modePill;
+  }
+  return out;
+}
+
+function encodeMemberPlanCachePayload(raw: any): string {
+  const payload = buildVisitorSafeMemberPlanCachePayload(raw);
+  if (!payload) return "";
+  const envelope: MemberPlanCacheEnvelope = {
+    v: 2,
+    cachedAt: Date.now(),
+    payload,
+  };
+  return JSON.stringify(envelope);
+}
+
+function decodeMemberPlanCachePayload(rawText: string): Record<string, any> | null {
+  const parsed = JSON.parse(String(rawText || ""));
+  return buildVisitorSafeMemberPlanCachePayload(parsed);
 }
 
 function normalizeRebrandingSlug(rawBrand: string): string {
@@ -3156,10 +3272,15 @@ useEffect(() => {
   useEffect(() => {
     try {
       const u = new URL(window.location.href);
-      const qKey = u.searchParams.get(REBRANDING_KEY_QUERY_PARAM);
-      const qLegacy = u.searchParams.get(LEGACY_REBRANDING_QUERY_PARAM);
-      const q = String(qKey || "").trim() || String(qLegacy || "").trim();
-      if (q) setRebrandingKey(q);
+      const hasQKey = u.searchParams.has(REBRANDING_KEY_QUERY_PARAM);
+      const qKey = hasQKey ? normalizeRebrandingKeyValue(u.searchParams.get(REBRANDING_KEY_QUERY_PARAM)) : "";
+      const qLegacy = normalizeRebrandingKeyValue(u.searchParams.get(LEGACY_REBRANDING_QUERY_PARAM));
+      const q = hasQKey ? qKey : qLegacy;
+      if (hasQKey) {
+        setRebrandingKey(q);
+      } else if (q) {
+        setRebrandingKey(q);
+      }
     } catch (e) {
       // ignore
     }
@@ -6161,7 +6282,7 @@ useEffect(() => {
     const mid = String(memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
     const companionForBackend =
       String(companionKey || "").trim() || String(companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
-    const rebrandingKeyForBackend = String(rebrandingKey || "").trim();
+    const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
     const planNameForBackend = planName;
 
     return {
@@ -6493,9 +6614,9 @@ useEffect(() => {
         planLabelOverride: String(planLabelOverride || "").trim(),
         plan_label_override: String(planLabelOverride || "").trim(),
 
-        rebrandingKey: String(rebrandingKey || "").trim(),
-        rebranding_key: String(rebrandingKey || "").trim(),
-        RebrandingKey: String(rebrandingKey || "").trim(),
+        rebrandingKey: normalizeRebrandingKeyValue(rebrandingKey),
+        rebranding_key: normalizeRebrandingKeyValue(rebrandingKey),
+        RebrandingKey: normalizeRebrandingKeyValue(rebrandingKey),
         rebranding: String(rebranding || "").trim(),
       };
 
@@ -6626,9 +6747,9 @@ useEffect(() => {
     persistTopupEmail(email);
 
     const session_state: any = {
-      rebrandingKey: (rebrandingKey || "").trim(),
-      rebranding_key: (rebrandingKey || "").trim(),
-      RebrandingKey: (rebrandingKey || "").trim(),
+      rebrandingKey: normalizeRebrandingKeyValue(rebrandingKey),
+      rebranding_key: normalizeRebrandingKeyValue(rebrandingKey),
+      RebrandingKey: normalizeRebrandingKeyValue(rebrandingKey),
       rebranding: (rebranding || "").trim(),
       // Provide PayGo overrides when present
       payGoLink: payUrl,
@@ -6815,9 +6936,9 @@ useEffect(() => {
           planLabelOverride: String(planLabelOverride || "").trim(),
           plan_label_override: String(planLabelOverride || "").trim(),
 
-          rebrandingKey: String(rebrandingKey || "").trim(),
-          rebranding_key: String(rebrandingKey || "").trim(),
-          RebrandingKey: String(rebrandingKey || "").trim(),
+          rebrandingKey: normalizeRebrandingKeyValue(rebrandingKey),
+          rebranding_key: normalizeRebrandingKeyValue(rebrandingKey),
+          RebrandingKey: normalizeRebrandingKeyValue(rebrandingKey),
           rebranding: String(rebranding || "").trim(),
         };
 
@@ -8364,9 +8485,14 @@ useEffect(() => {
       try {
         const cacheKey = getMemberPlanCacheKey();
         if (cacheKey) {
-          const payloadText = JSON.stringify(data);
-          try { window.sessionStorage.setItem(cacheKey, payloadText); } catch (e) {}
-          try { window.localStorage.setItem(cacheKey, payloadText); } catch (e) {}
+          const payloadText = encodeMemberPlanCachePayload(data);
+          if (payloadText) {
+            try { window.sessionStorage.setItem(cacheKey, payloadText); } catch (e) {}
+            try { window.localStorage.setItem(cacheKey, payloadText); } catch (e) {}
+          } else {
+            try { window.sessionStorage.removeItem(cacheKey); } catch (e) {}
+            try { window.localStorage.removeItem(cacheKey); } catch (e) {}
+          }
         }
       } catch (e) {
         // ignore cache write failures
@@ -8386,18 +8512,22 @@ useEffect(() => {
             : "";
       const incomingPlan = normalizePlanName(incomingPlanRaw);
 
+      const hasExplicitRebrandingKeyField =
+        "rebrandingKey" in (data as any) ||
+        "rebranding_key" in (data as any) ||
+        "RebrandingKey" in (data as any) ||
+        "rebrandingkey" in (data as any);
+
       const incomingBrandName =
         typeof (data as any).brand === "string"
-          ? String((data as any).brand).trim()
+          ? normalizeRebrandingKeyValue((data as any).brand)
           : typeof (data as any).companyName === "string"
-            ? String((data as any).companyName).trim()
+            ? normalizeRebrandingKeyValue((data as any).companyName)
             : typeof (data as any).company_name === "string"
-              ? String((data as any).company_name).trim()
+              ? normalizeRebrandingKeyValue((data as any).company_name)
               : typeof (data as any).company === "string"
-                ? String((data as any).company).trim()
-                : typeof (data as any).rebranding === "string"
-                  ? String((data as any).rebranding).trim()
-                  : "";
+                ? normalizeRebrandingKeyValue((data as any).company)
+                : "";
 
       // Optional white-label brand handoff from Wix.
       // - Elaralo site should send: { rebrandingKey: "" }
@@ -8406,12 +8536,7 @@ useEffect(() => {
       // IMPORTANT: This must never alter STT/TTS start/stop code paths.
       let rawRebrandingKey = "";
 
-      if (
-        "rebrandingKey" in (data as any) ||
-        "rebranding_key" in (data as any) ||
-        "RebrandingKey" in (data as any) ||
-        "rebrandingkey" in (data as any)
-      ) {
+      if (hasExplicitRebrandingKeyField) {
         rawRebrandingKey =
           typeof (data as any).rebrandingKey === "string"
             ? String((data as any).rebrandingKey)
@@ -8422,13 +8547,13 @@ useEffect(() => {
                 : typeof (data as any).RebrandingKey === "string"
                   ? String((data as any).RebrandingKey)
                   : "";
-        rawRebrandingKey = rawRebrandingKey.trim();
+        rawRebrandingKey = normalizeRebrandingKeyValue(rawRebrandingKey);
 
         // Allow empty string to explicitly clear any previous rebranding state.
         setRebrandingKey(rawRebrandingKey);
       } else if ("rebranding" in (data as any)) {
         // Legacy support: some older Wix pages may still send { rebranding: "BrandName" }.
-        rawRebrandingKey = typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
+        rawRebrandingKey = typeof (data as any).rebranding === "string" ? normalizeRebrandingKeyValue((data as any).rebranding) : "";
         if (rawRebrandingKey) setRebrandingKey(rawRebrandingKey);
       }
 
@@ -8443,7 +8568,7 @@ useEffect(() => {
         "companyName" in (data as any) ||
         "company_name" in (data as any) ||
         "company" in (data as any);
-      const effectiveIncomingBrandName = String(rkParts?.rebranding || incomingBrandName || "").trim();
+      const effectiveIncomingBrandName = String(rkParts?.rebranding || (!hasExplicitRebrandingKeyField ? incomingBrandName : "") || "").trim();
       const rebrandSlugFromMessage = normalizeRebrandingSlug(effectiveIncomingBrandName);
       if (effectiveIncomingBrandName) {
         setPayloadBrandName(effectiveIncomingBrandName);
@@ -8458,12 +8583,15 @@ useEffect(() => {
           : typeof (data as any).member_id === "string"
             ? String((data as any).member_id).trim()
             : "";
+      const normalizedIncomingMemberId = incomingLoggedIn === false ? "" : incomingMemberId;
       if (hasMemberIdField) {
-        setMemberId(incomingMemberId);
+        setMemberId(normalizedIncomingMemberId);
       }
-      const effectiveMemberId = hasMemberIdField
-        ? incomingMemberId
-        : String(memberIdRef.current || "").trim();
+      const effectiveMemberId = incomingLoggedIn === false
+        ? ""
+        : hasMemberIdField
+          ? normalizedIncomingMemberId
+          : String(memberIdRef.current || "").trim();
 
       const hasDisplayNameField =
         "displayName" in (data as any) ||
@@ -8484,7 +8612,7 @@ useEffect(() => {
                   ? String((data as any).username).trim()
                   : "";
       if (hasDisplayNameField) {
-        setPayloadUserDisplayName(incomingDisplayName);
+        setPayloadUserDisplayName(incomingLoggedIn === false ? "" : incomingDisplayName);
       }
 
       const incomingLanguageRaw =
@@ -8518,16 +8646,19 @@ useEffect(() => {
       const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
       const hasEntitledPlan = Boolean(String(mappedPlanFromKey || incomingPlan || "").trim());
       const payloadHasPlanContext = Boolean(rawRebrandingKey) || Boolean(mappedPlanFromKey) || Boolean(incomingPlanRaw) || incomingLoggedIn === false;
-      const effectivePlan: PlanName = hasEntitledPlan
-        ? (mappedPlanFromKey || incomingPlan)
-        : (payloadHasPlanContext ? "Trial" : (latestPlanNameRef.current || "Trial"));
+      const treatAsVisitorForEntitlements = incomingLoggedIn === false || !effectiveMemberId || isAnonMemberId(effectiveMemberId);
+      const effectivePlan: PlanName = treatAsVisitorForEntitlements
+        ? "Trial"
+        : hasEntitledPlan
+          ? (mappedPlanFromKey || incomingPlan)
+          : (payloadHasPlanContext ? "Trial" : (latestPlanNameRef.current || "Trial"));
       setPlanName(effectivePlan);
 
       // Display the rebranding site's plan label when provided (e.g., "Supreme"),
       // but only for logged-in members (Free Trial ignores plan labels by design).
-      const planLabel = effectiveMemberId ? String(rkParts?.plan || "").trim() : "";
+      const planLabel = !treatAsVisitorForEntitlements ? String(rkParts?.plan || "").trim() : "";
       setPlanLabelOverride((prev) => {
-        if (incomingLoggedIn === false || !effectiveMemberId) return "";
+        if (treatAsVisitorForEntitlements) return "";
         return planLabel || prev;
       });
 
@@ -8610,7 +8741,7 @@ useEffect(() => {
       //   - this is the first MEMBER_PLAN we processed, OR
       //   - the plan context changed (new member/plan/rebrandingKey), OR
       //   - Wix actually changed the modePill value.
-      const fp = `${incomingMemberId || ""}|${String(effectivePlan || "").trim()}|${String(rawRebrandingKey || "").trim()}`;
+      const fp = `${incomingMemberId || ""}|${String(effectivePlan || "").trim()}|${normalizeRebrandingKeyValue(rawRebrandingKey)}`;
       const isPlanRefresh = fp !== wixLastFingerprintRef.current;
       wixLastFingerprintRef.current = fp;
 
@@ -8665,8 +8796,12 @@ useEffect(() => {
       const cacheKey = getMemberPlanCacheKey();
       const cachedRaw = String(window.sessionStorage.getItem(cacheKey) || window.localStorage.getItem(cacheKey) || "").trim();
       if (!cachedRaw) return;
-      const cachedPayload = JSON.parse(cachedRaw);
-      if (!cachedPayload || typeof cachedPayload !== "object" || (cachedPayload as any).type !== "MEMBER_PLAN") return;
+      const cachedPayload = decodeMemberPlanCachePayload(cachedRaw);
+      if (!cachedPayload || typeof cachedPayload !== "object" || (cachedPayload as any).type !== "MEMBER_PLAN") {
+        try { window.sessionStorage.removeItem(cacheKey); } catch (e) {}
+        try { window.localStorage.removeItem(cacheKey); } catch (e) {}
+        return;
+      }
       window.postMessage(cachedPayload, window.location.origin);
     } catch (e) {
       // ignore cache hydrate failures
@@ -8752,7 +8887,9 @@ useEffect(() => {
             loggedIn,
             planName: String(planName || "").trim(),
             memberId: String(memberIdRef.current || "").trim(),
-            rebrandingKey: String(data.rebrandingKey || data.brand || "").trim(),
+            rebrandingKey: ("rebrandingKey" in (data || {}) || "rebranding_key" in (data || {}) || "RebrandingKey" in (data || {}))
+              ? normalizeRebrandingKeyValue((data as any).rebrandingKey ?? (data as any).rebranding_key ?? (data as any).RebrandingKey)
+              : normalizeRebrandingKeyValue((data as any).brand),
             rebranding: String(data.brand || "").trim(),
             brand: String(data.brand || "").trim(),
             avatar: String(data.avatar || "").trim(),
@@ -8812,7 +8949,7 @@ const userDisplayNameForBackend = buildHostReadableViewerName(memberIdForBackend
 
 // `loggedIn` is only available when the Wix parent posts it.
 // For white-label, keep the full rebrandingKey intact so backend can apply minutes/mode/links overrides.
-const rebrandingKeyForBackend = (rebrandingKey || "");
+const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
 
     const stateToSendWithCompanion: SessionState = {
   ...stateToSend,
@@ -8975,7 +9112,7 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
     // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
     const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
 
-    const rebrandingKeyForBackend = (rebrandingKey || "");
+    const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
 
     const userDisplayNameForBackend = buildHostReadableViewerName(memberIdForBackend);
 
@@ -11939,7 +12076,7 @@ const modePillControls = (
           <h1 style={{ margin: 0, fontSize: ui.title }}>{companyName}</h1>
           <div style={{ fontSize: ui.meta, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-            <b>{displayPlanLabel(planName, memberId, planLabelOverride)}</b>
+            <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
           </div>
           <div style={{ fontSize: ui.meta, color: "#666" }}>
             Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
