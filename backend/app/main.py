@@ -5070,518 +5070,6 @@ def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
 
 
 # ---------------------------------------------------------------------
-# Translation helpers (member-native display, English model/TTS/summaries)
-# ---------------------------------------------------------------------
-_TRANSLATION_CACHE_LOCK = threading.RLock()
-_TRANSLATION_CACHE: Dict[str, str] = {}
-_TRANSLATION_CACHE_MAX_ITEMS = max(200, int(os.getenv("TRANSLATION_CACHE_MAX_ITEMS", "4000") or "4000"))
-
-_LANGUAGE_NAME_OVERRIDES: Dict[str, str] = {
-    "en": "English",
-    "es": "Spanish",
-    "fr": "French",
-    "de": "German",
-    "it": "Italian",
-    "pt": "Portuguese",
-    "pt-br": "Portuguese (Brazil)",
-    "pt-pt": "Portuguese (Portugal)",
-    "nl": "Dutch",
-    "ru": "Russian",
-    "uk": "Ukrainian",
-    "pl": "Polish",
-    "tr": "Turkish",
-    "ar": "Arabic",
-    "he": "Hebrew",
-    "fa": "Persian",
-    "hi": "Hindi",
-    "bn": "Bengali",
-    "ur": "Urdu",
-    "ta": "Tamil",
-    "te": "Telugu",
-    "ml": "Malayalam",
-    "kn": "Kannada",
-    "mr": "Marathi",
-    "gu": "Gujarati",
-    "pa": "Punjabi",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "zh": "Chinese",
-    "zh-cn": "Chinese (Simplified)",
-    "zh-tw": "Chinese (Traditional)",
-    "yue": "Cantonese",
-    "vi": "Vietnamese",
-    "th": "Thai",
-    "id": "Indonesian",
-    "ms": "Malay",
-    "tl": "Tagalog",
-    "fil": "Filipino",
-    "ro": "Romanian",
-    "el": "Greek",
-    "sv": "Swedish",
-    "no": "Norwegian",
-    "da": "Danish",
-    "fi": "Finnish",
-    "cs": "Czech",
-    "sk": "Slovak",
-    "hu": "Hungarian",
-    "hr": "Croatian",
-    "sr": "Serbian",
-    "bg": "Bulgarian",
-}
-
-
-def _normalize_language_code(raw: Any) -> str:
-    s = str(raw or "").strip().replace("_", "-")
-    if not s:
-        return ""
-    parts = [p for p in s.split("-") if p]
-    if not parts:
-        return ""
-    base = re.sub(r"[^A-Za-z]", "", parts[0]).lower()
-    if not base:
-        return ""
-    out = [base]
-    for part in parts[1:]:
-        cleaned = re.sub(r"[^A-Za-z0-9]", "", part)
-        if not cleaned:
-            continue
-        if len(cleaned) in (2, 3):
-            out.append(cleaned.upper())
-        else:
-            out.append(cleaned.title())
-    return "-".join(out)
-
-
-def _language_name_from_code(code: Any) -> str:
-    norm = _normalize_language_code(code)
-    if not norm:
-        return "English"
-    key = norm.lower()
-    if key in _LANGUAGE_NAME_OVERRIDES:
-        return _LANGUAGE_NAME_OVERRIDES[key]
-    base = norm.split("-", 1)[0].lower()
-    return _LANGUAGE_NAME_OVERRIDES.get(base, norm)
-
-
-def _is_english_language(code: Any) -> bool:
-    norm = _normalize_language_code(code)
-    if not norm:
-        return True
-    return norm.split("-", 1)[0].lower() == "en"
-
-
-def _coerce_boollike(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return None
-    txt = str(value).strip().lower()
-    if txt in {"1", "true", "yes", "on"}:
-        return True
-    if txt in {"0", "false", "no", "off"}:
-        return False
-    return None
-
-
-def _is_spanish_language(code: Any) -> bool:
-    norm = _normalize_language_code(code)
-    if not norm:
-        return False
-    return norm.split("-", 1)[0].lower() == "es"
-
-
-def _session_translation_context(session_state: Dict[str, Any]) -> Dict[str, Any]:
-    s = session_state if isinstance(session_state, dict) else {}
-
-    flag_value: Optional[bool] = None
-    for key in ("translator_enabled", "translation_enabled", "translationEnabled"):
-        if key not in s:
-            continue
-        parsed = _coerce_boollike(s.get(key))
-        if parsed is not None:
-            flag_value = parsed
-            break
-
-    preference_known: Optional[bool] = None
-    for key in (
-        "user_language_preference_known",
-        "userLanguagePreferenceKnown",
-        "language_preference_known",
-        "languagePreferenceKnown",
-    ):
-        if key not in s:
-            continue
-        parsed = _coerce_boollike(s.get(key))
-        if parsed is not None:
-            preference_known = parsed
-            break
-
-    code = ""
-    for key in (
-        "user_language_code",
-        "userLanguageCode",
-        "display_language_code",
-        "displayLanguageCode",
-        "language_code",
-        "languageCode",
-        "locale",
-        "lang",
-        "language",
-    ):
-        value = _normalize_language_code(s.get(key))
-        if value:
-            code = value
-            break
-
-    name = ""
-    for key in ("user_language_name", "userLanguageName", "language_name", "languageName"):
-        value = str(s.get(key) or "").strip()
-        if value:
-            name = value
-            break
-    if not name:
-        name = _language_name_from_code(code)
-
-    if preference_known is None:
-        if flag_value is True:
-            preference_known = True
-        elif code and not _is_english_language(code):
-            preference_known = True
-        elif code and _is_english_language(code) and flag_value is False:
-            preference_known = True
-        else:
-            preference_known = False
-
-    enabled = flag_value if flag_value is not None else bool(preference_known and code and not _is_english_language(code))
-    if not code:
-        code = "en"
-    if not enabled:
-        code = "en"
-        name = "English"
-
-    display_code = _normalize_language_code(
-        s.get("display_language_code")
-        or s.get("displayLanguageCode")
-        or code
-    ) or code
-    if not enabled:
-        display_code = "en"
-
-    return {
-        "enabled": bool(enabled),
-        "preference_known": bool(preference_known),
-        "user_language_code": code,
-        "user_language_name": name or _language_name_from_code(code),
-        "display_language_code": display_code,
-        "assistant_language_code": "en",
-        "assistant_language_name": "English",
-    }
-
-
-def _translation_notice_already_sent(session_state: Dict[str, Any]) -> bool:
-    s = session_state if isinstance(session_state, dict) else {}
-    for key in ("translation_notice_sent", "translationNoticeSent"):
-        parsed = _coerce_boollike(s.get(key))
-        if parsed is not None:
-            return bool(parsed)
-    return False
-
-
-def _translation_notice_needed(session_state: Dict[str, Any], translation_ctx: Dict[str, Any]) -> bool:
-    ctx = translation_ctx if isinstance(translation_ctx, dict) else {}
-    if not bool(ctx.get("enabled")):
-        return False
-    code = str(ctx.get("user_language_code") or "").strip()
-    if not code or _is_english_language(code) or _is_spanish_language(code):
-        return False
-    if _translation_notice_already_sent(session_state):
-        return False
-    return True
-
-
-def _translation_notice_prefix(translation_ctx: Dict[str, Any]) -> str:
-    return "Quick note: I'm using a translator so we can chat more easily."
-
-
-def _translation_header_for_summary(session_state: Dict[str, Any]) -> str:
-    ctx = _session_translation_context(session_state)
-    if not bool(ctx.get("enabled")):
-        return ""
-    code = str(ctx.get("user_language_code") or "").strip()
-    name = str(ctx.get("user_language_name") or _language_name_from_code(code)).strip()
-    if not code or _is_english_language(code):
-        return ""
-    return f"Language spoken: {name} ({code}). Summary stored in English."
-
-
-def _translation_payload(
-    *,
-    english_text: str,
-    display_text: str,
-    user_language_code: str,
-    user_language_name: str,
-) -> Optional[Dict[str, Any]]:
-    english = str(english_text or "").strip()
-    display = str(display_text or "").strip()
-    code = _normalize_language_code(user_language_code)
-    name = str(user_language_name or _language_name_from_code(code)).strip()
-    if not english and not display:
-        return None
-    if not code or _is_english_language(code):
-        return None
-    return {
-        "english_text": english or display,
-        "native_text": display or english,
-        "display_text": display or english,
-        "user_language_code": code,
-        "user_language_name": name or _language_name_from_code(code),
-        "assistant_language_code": "en",
-        "assistant_language_name": "English",
-        "translated": bool(display and english and display.strip() != english.strip()),
-    }
-
-
-def _translation_payload_display_text(payload: Any) -> str:
-    if not isinstance(payload, dict):
-        return ""
-    return str(payload.get("display_text") or payload.get("native_text") or payload.get("english_text") or "").strip()
-
-
-def _message_translation_fields(message: Dict[str, Any]) -> Dict[str, str]:
-    msg = message if isinstance(message, dict) else {}
-    payload = msg.get("translation") if isinstance(msg.get("translation"), dict) else {}
-    content = str(msg.get("content") or "")
-    display = str(
-        msg.get("display_content")
-        or msg.get("displayContent")
-        or msg.get("original_content")
-        or msg.get("originalContent")
-        or msg.get("native_content")
-        or msg.get("nativeContent")
-        or payload.get("display_text")
-        or payload.get("native_text")
-        or content
-    )
-    english = str(
-        msg.get("english_content")
-        or msg.get("englishContent")
-        or msg.get("translated_content")
-        or msg.get("translatedContent")
-        or payload.get("english_text")
-        or ""
-    )
-    source_code = _normalize_language_code(
-        msg.get("source_language_code")
-        or msg.get("sourceLanguageCode")
-        or payload.get("user_language_code")
-        or msg.get("language_code")
-        or msg.get("languageCode")
-    )
-    return {
-        "content": content,
-        "display": display,
-        "english": english,
-        "source_code": source_code,
-    }
-
-
-def _translation_cache_get(key: str) -> Optional[str]:
-    if not key:
-        return None
-    with _TRANSLATION_CACHE_LOCK:
-        return _TRANSLATION_CACHE.get(key)
-
-
-def _translation_cache_put(key: str, value: str) -> None:
-    if not key:
-        return
-    with _TRANSLATION_CACHE_LOCK:
-        if len(_TRANSLATION_CACHE) >= _TRANSLATION_CACHE_MAX_ITEMS:
-            try:
-                oldest_key = next(iter(_TRANSLATION_CACHE.keys()))
-                _TRANSLATION_CACHE.pop(oldest_key, None)
-            except Exception:
-                _TRANSLATION_CACHE.clear()
-        _TRANSLATION_CACHE[key] = value
-
-
-def _translate_text_sync(text: str, *, source_language_code: str, target_language_code: str) -> str:
-    raw = str(text or "").strip()
-    src = _normalize_language_code(source_language_code) or "auto"
-    tgt = _normalize_language_code(target_language_code)
-    if not raw or not tgt or src.lower() == tgt.lower():
-        return raw
-    if _PLATFORM_PLACEHOLDER_WITH_FILENAME_RE.match(raw) or _platform_content_message_is_generic(raw):
-        return raw
-
-    cache_key = hashlib.sha256((src + "|" + tgt + "|" + raw).encode("utf-8")).hexdigest()
-    cached = _translation_cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    src_name = "auto-detected language" if src == "auto" else _language_name_from_code(src)
-    tgt_name = _language_name_from_code(tgt)
-    prompt = (
-        "You are a precise translator for chat conversations. "
-        f"Translate the user's message from {src_name} to {tgt_name}. "
-        "Preserve meaning, tone, names, filenames, branded names, URLs, markdown-style links, and line breaks. "
-        "Do not add explanations. Return only the translated text."
-    )
-    translated = _call_gpt4o_with_options(
-        [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": raw},
-        ],
-        temperature=0.0,
-        max_tokens=max(80, min(1600, int(len(raw) * 1.8) + 120)),
-    )
-    out = str(translated or "").strip() or raw
-    _translation_cache_put(cache_key, out)
-    return out
-
-
-def _display_text_and_translation_payload(text: str, translation_ctx: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
-    raw = str(text or "").strip()
-    if not raw:
-        return "", None
-    if not bool((translation_ctx or {}).get("enabled")):
-        return raw, None
-    user_code = str((translation_ctx or {}).get("user_language_code") or "").strip()
-    if not user_code or _is_english_language(user_code):
-        return raw, None
-    try:
-        display = _translate_text_sync(raw, source_language_code="en", target_language_code=user_code)
-    except Exception:
-        display = raw
-    payload = _translation_payload(
-        english_text=raw,
-        display_text=display,
-        user_language_code=user_code,
-        user_language_name=str((translation_ctx or {}).get("user_language_name") or _language_name_from_code(user_code)),
-    )
-    return display or raw, payload
-
-
-def _assistant_display_text(reply: str, translation_ctx: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
-    return _display_text_and_translation_payload(reply, translation_ctx)
-
-
-@app.post("/translation/text")
-async def translation_text(raw: Dict[str, Any] = Body(...)):
-    text_in = str(raw.get("text") or raw.get("content") or "").strip()
-    source_language_code = _normalize_language_code(
-        raw.get("source_language_code")
-        or raw.get("sourceLanguageCode")
-        or raw.get("from_language_code")
-        or raw.get("fromLanguageCode")
-        or "auto"
-    ) or "auto"
-    target_language_code = _normalize_language_code(
-        raw.get("target_language_code")
-        or raw.get("targetLanguageCode")
-        or raw.get("language_code")
-        or raw.get("languageCode")
-        or raw.get("to_language_code")
-        or raw.get("toLanguageCode")
-        or ""
-    )
-
-    if not text_in:
-        return {
-            "ok": True,
-            "text": "",
-            "source_language_code": source_language_code,
-            "target_language_code": target_language_code or source_language_code or "en",
-        }
-
-    if not target_language_code or source_language_code.lower() == target_language_code.lower():
-        return {
-            "ok": True,
-            "text": text_in,
-            "source_language_code": source_language_code,
-            "target_language_code": target_language_code or source_language_code or "en",
-        }
-
-    translated = await run_in_threadpool(
-        _translate_text_sync,
-        text_in,
-        source_language_code=source_language_code,
-        target_language_code=target_language_code,
-    )
-    return {
-        "ok": True,
-        "text": str(translated or text_in),
-        "source_language_code": source_language_code,
-        "target_language_code": target_language_code,
-    }
-
-
-def _prepare_messages_for_english_context(
-    messages: List[Dict[str, Any]],
-    *,
-    translation_ctx: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    prepared: List[Dict[str, Any]] = []
-    last_user_turn: Optional[Dict[str, Any]] = None
-    translate_user = bool((translation_ctx or {}).get("enabled")) and not _is_english_language((translation_ctx or {}).get("user_language_code"))
-    user_code = str((translation_ctx or {}).get("user_language_code") or "").strip() or "en"
-    user_name = str((translation_ctx or {}).get("user_language_name") or _language_name_from_code(user_code)).strip()
-
-    for item in messages or []:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        if role not in ("user", "assistant"):
-            continue
-
-        fields = _message_translation_fields(item)
-        display_text = fields["display"].strip()
-        english_text = fields["english"].strip()
-        content_text = fields["content"].strip()
-        model_text = english_text or content_text
-
-        source_code = str(fields.get("source_code") or user_code or "auto").strip() or "auto"
-
-        if translate_user and role == "user":
-            source_text = display_text or content_text
-            if source_text and not english_text:
-                try:
-                    model_text = _translate_text_sync(source_text, source_language_code=source_code, target_language_code="en")
-                except Exception:
-                    model_text = source_text
-            else:
-                model_text = english_text or source_text
-        elif translate_user and role == "assistant" and not english_text and (display_text or content_text):
-            # Backward compatibility for older native-language turns already on screen.
-            source_text = display_text or content_text
-            try:
-                model_text = _translate_text_sync(source_text, source_language_code=source_code, target_language_code="en")
-            except Exception:
-                model_text = source_text
-        else:
-            model_text = english_text or content_text or display_text
-
-        new_item = dict(item)
-        new_item["content"] = model_text or content_text or display_text
-        if display_text:
-            new_item["display_content"] = display_text
-            new_item["original_content"] = display_text
-        if model_text:
-            new_item["english_content"] = model_text
-        prepared.append(new_item)
-
-        if role == "user":
-            last_user_turn = {
-                "display_text": display_text or content_text,
-                "english_text": model_text or content_text or display_text,
-                "user_language_code": user_code,
-                "user_language_name": user_name,
-            }
-
-    return prepared, last_user_turn
-
-
-# ---------------------------------------------------------------------
 # Human Companion onboarding + public website context (AI Representative)
 # ---------------------------------------------------------------------
 #
@@ -7335,20 +6823,6 @@ async def chat(request: Request):
     except Exception:
         pass
 
-    translation_ctx = _session_translation_context(session_state)
-    messages, last_user_turn_translation = _prepare_messages_for_english_context(
-        messages,
-        translation_ctx=translation_ctx,
-    )
-    last_user_display_text = str((last_user_turn_translation or {}).get("display_text") or "").strip()
-    last_user_english_text = str((last_user_turn_translation or {}).get("english_text") or "").strip()
-    last_user_payload = _translation_payload(
-        english_text=last_user_english_text,
-        display_text=last_user_display_text,
-        user_language_code=str((translation_ctx or {}).get("user_language_code") or "en"),
-        user_language_name=str((translation_ctx or {}).get("user_language_name") or "English"),
-    )
-
     # ----------------------------
     # Usage / minutes enforcement
     # ----------------------------
@@ -7434,7 +6908,8 @@ async def chat(request: Request):
 
     # Special-case: allow "minutes remaining" questions to return a status message
     # even when minutes are exhausted (no OpenAI call).
-    probe_text = str(last_user_english_text or "").strip()
+    probe_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    probe_text = ((probe_last_user.get("content") if probe_last_user else "") or "").strip()
     probe_mode_switch = _detect_mode_switch_from_text(probe_text)
     is_minutes_balance_query = _is_minutes_balance_question(probe_text) and not bool(probe_mode_switch)
 
@@ -7480,15 +6955,14 @@ async def chat(request: Request):
                 payg_minutes=pay_go_minutes,
                 payg_price_text=payg_price_text_override,
             )
-            if last_user_display_text or last_user_english_text:
+            if probe_text:
                 _ai_override_append_event(
                     session_id,
                     role="user",
-                    content=(last_user_display_text or last_user_english_text),
+                    content=probe_text,
                     sender="user",
                     audience="all",
                     kind="message",
-                    payload=last_user_payload,
                 )
 
             if _ai_override_is_active(session_id):
@@ -7575,26 +7049,10 @@ async def chat(request: Request):
             delivered_content = None
 
         reply = "" if delivered_content else paywall_reply
-        display_reply, reply_translation = await run_in_threadpool(_assistant_display_text, reply, translation_ctx)
-        session_state_out["translator_enabled"] = bool(translation_ctx.get("enabled"))
-        session_state_out["translation_enabled"] = bool(translation_ctx.get("enabled"))
-        session_state_out["translationEnabled"] = bool(translation_ctx.get("enabled"))
-        session_state_out["user_language_code"] = str(translation_ctx.get("user_language_code") or "en")
-        session_state_out["userLanguageCode"] = str(translation_ctx.get("user_language_code") or "en")
-        session_state_out["user_language_name"] = str(translation_ctx.get("user_language_name") or "English")
-        session_state_out["userLanguageName"] = str(translation_ctx.get("user_language_name") or "English")
-        session_state_out["display_language_code"] = str(translation_ctx.get("display_language_code") or translation_ctx.get("user_language_code") or "en")
-        session_state_out["displayLanguageCode"] = str(translation_ctx.get("display_language_code") or translation_ctx.get("user_language_code") or "en")
         return {
             "session_id": session_id,
             "mode": STATUS_SAFE,
             "reply": reply,
-            "display_reply": display_reply,
-            "reply_translation": reply_translation,
-            "turn_translation": {
-                "user": dict(last_user_turn_translation or {}),
-                "reply": reply_translation,
-            },
             "session_state": session_state_out,
             "audio_url": None,
             "content": delivered_content,
@@ -7636,48 +7094,20 @@ async def chat(request: Request):
             state_out = dict(state_out)
             state_out["host_override_active"] = bool(_ai_override_is_active(session_id))
         except Exception:
-            state_out = dict(state_out)
-
-        translation_state = _session_translation_context(state_out)
-        state_out["translator_enabled"] = bool(translation_state.get("enabled"))
-        state_out["translation_enabled"] = bool(translation_state.get("enabled"))
-        state_out["translationEnabled"] = bool(translation_state.get("enabled"))
-        state_out["user_language_code"] = str(translation_state.get("user_language_code") or "en")
-        state_out["userLanguageCode"] = str(translation_state.get("user_language_code") or "en")
-        state_out["user_language_name"] = str(translation_state.get("user_language_name") or "English")
-        state_out["userLanguageName"] = str(translation_state.get("user_language_name") or "English")
-        state_out["display_language_code"] = str(translation_state.get("display_language_code") or translation_state.get("user_language_code") or "en")
-        state_out["displayLanguageCode"] = str(translation_state.get("display_language_code") or translation_state.get("user_language_code") or "en")
-        state_out["user_language_preference_known"] = bool(translation_state.get("preference_known"))
-        state_out["userLanguagePreferenceKnown"] = bool(translation_state.get("preference_known"))
-        state_out["language_preference_known"] = bool(translation_state.get("preference_known"))
-        state_out["languagePreferenceKnown"] = bool(translation_state.get("preference_known"))
-        state_out["assistant_language_code"] = "en"
-        state_out["assistantLanguageCode"] = "en"
-
-        notice_sent = _translation_notice_already_sent(state_out)
-        reply_text = str(reply or "")
-        if reply_text.strip() and status_mode in (STATUS_SAFE, STATUS_ALLOWED) and _translation_notice_needed(state_out, translation_state):
-            notice_prefix = _translation_notice_prefix(translation_state).strip()
-            reply_text = f"{notice_prefix}\n\n{reply_text.strip()}"
-            notice_sent = True
-        state_out["translation_notice_sent"] = bool(notice_sent)
-        state_out["translationNoticeSent"] = bool(notice_sent)
-
-        display_reply, reply_translation = await run_in_threadpool(_assistant_display_text, reply_text, translation_state)
+            pass
 
         audio_url: Optional[str] = None
-        if voice_id and reply_text.strip():
+        if voice_id and (reply or "").strip():
             try:
                 if _TTS_CHAT_CACHE_FIRST and _TTS_CACHE_ENABLED:
-                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, reply_text)
+                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, reply)
                 if audio_url is None:
                     tts_brand, tts_avatar = _resolved_tts_brand_avatar(state_out)
                     if not tts_brand or not tts_avatar:
                         fallback_brand, fallback_avatar = _resolved_tts_brand_avatar(session_state)
                         tts_brand = tts_brand or fallback_brand
                         tts_avatar = tts_avatar or fallback_avatar
-                    audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply_text, tts_brand, tts_avatar)
+                    audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply, tts_brand, tts_avatar)
             except Exception as e:
                 # Fail-open: never break chat because TTS failed
                 _dbg(debug, "TTS generation failed:", repr(e))
@@ -7687,16 +7117,10 @@ async def chat(request: Request):
         return {
             "session_id": session_id,
             "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
-            "reply": reply_text,
-            "display_reply": display_reply,
-            "reply_translation": reply_translation,
-            "turn_translation": {
-                "user": dict(last_user_turn_translation or {}),
-                "reply": reply_translation,
-            },
+            "reply": reply,
             "session_state": state_out,
             "audio_url": audio_url,       # NEW (optional)
-            "content": content,           # NEW (optional scheduled media)
+            "content": content,         # NEW (optional scheduled media)
         }
 
     # If the user is asking about their remaining minutes, answer deterministically
@@ -7740,8 +7164,8 @@ async def chat(request: Request):
         return await _respond(reply, STATUS_SAFE, session_state_out)
 
     # last user message
-    user_text = str(last_user_english_text or "").strip()
-    user_display_text = str(last_user_display_text or user_text).strip()
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    user_text = ((last_user.get("content") if last_user else "") or "").strip()
     normalized_text = user_text.lower().strip()
 
     # allow text-based mode switching
@@ -7906,15 +7330,14 @@ async def chat(request: Request):
         )
 
         # Append the newest user message for the host transcript.
-        if last_user_display_text or last_user_english_text:
+        if user_text:
             _ai_override_append_event(
                 session_id,
                 role="user",
-                content=(last_user_display_text or last_user_english_text),
+                content=user_text,
                 sender="user",
                 audience="all",
                 kind="message",
-                payload=last_user_payload,
             )
     except Exception:
         pass
@@ -8096,14 +7519,6 @@ async def chat(request: Request):
         llm_messages.insert(insert_at, {"role": "system", "content": memory_policy})
         insert_at += 1
 
-        language_capability_policy = (
-            "Language capability rule: This app can translate between the user's preferred language and English. "
-            "Do not claim that translation is unavailable, and do not say that you can speak only English. "
-            "English remains the assistant's source speech language unless the host configured otherwise, while the platform may localize displayed text for the user."
-        )
-        llm_messages.insert(insert_at, {"role": "system", "content": language_capability_policy})
-        insert_at += 1
-
         vision_policy = (
             "Vision rule: User image attachments may be supplied to you as direct image input. "
             "When image input is present, inspect it and answer based on what you see. "
@@ -8119,18 +7534,6 @@ async def chat(request: Request):
         )
         llm_messages.insert(insert_at, {"role": "system", "content": content_delivery_policy})
         insert_at += 1
-
-        if bool(translation_ctx.get("enabled")) and not _is_english_language(translation_ctx.get("user_language_code")):
-            translation_policy = (
-                f"Translation rule: The user prefers {str(translation_ctx.get('user_language_name') or _language_name_from_code(translation_ctx.get('user_language_code') or '')).strip()} ({str(translation_ctx.get('user_language_code') or '').strip() or 'en'}). "
-                "Write your canonical assistant reply in English only. "
-                "Do not produce bilingual output, and do not self-translate your reply. "
-                "The platform will render the display translation for the user. "
-                "Do not claim that you can speak only English or that translation is unavailable. "
-                "If the user's language is neither English nor Spanish, the platform may add a brief one-time translator notice after the initial greeting."
-            )
-            llm_messages.insert(insert_at, {"role": "system", "content": translation_policy})
-            insert_at += 1
 
         if provider_switched:
             llm_messages.insert(
@@ -8189,6 +7592,20 @@ async def chat(request: Request):
         _dbg(debug, "LLM call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
 
+    
+    # Record the AI reply in the relay so the host can preview ongoing chats.
+    try:
+        if assistant_reply and str(assistant_reply).strip():
+            _ai_override_append_event(
+                session_id,
+                role="assistant",
+                content=str(assistant_reply),
+                sender=("xai" if llm_provider == "xai" else "ai"),
+                audience="all",
+                kind="message",
+            )
+    except Exception:
+        pass
 
 # echo back session_state (ensure correct mode)
     session_state_out = dict(session_state)
@@ -8240,31 +7657,12 @@ async def chat(request: Request):
         delivered_content = _content_merge_delivery_payloads(friend_first_turn_content, mode_specific_content)
     except Exception:
         delivered_content = None
-    response_payload = await _respond(
+    return await _respond(
         assistant_reply,
         STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
         session_state_out,
         delivered_content,
     )
-
-    # Record the AI reply in the relay so the host can preview ongoing chats.
-    try:
-        if assistant_reply and str(assistant_reply).strip():
-            relay_content = str(response_payload.get("display_reply") or assistant_reply).strip()
-            relay_payload = response_payload.get("reply_translation") if isinstance(response_payload.get("reply_translation"), dict) else None
-            _ai_override_append_event(
-                session_id,
-                role="assistant",
-                content=relay_content,
-                sender=("xai" if llm_provider == "xai" else "ai"),
-                audience="all",
-                kind="message",
-                payload=relay_payload,
-            )
-    except Exception:
-        pass
-
-    return response_payload
 
 
 # -----------------------------------------------------------------------------
@@ -8388,33 +7786,6 @@ async def llm_warm(raw: Dict[str, Any] = Body(...)):
         for block in guideline_reference_blocks or []:
             if (block or "").strip():
                 warm_messages.append({"role": "system", "content": block})
-
-    warm_messages.append(
-        {
-            "role": "system",
-            "content": (
-                "Language capability rule: This app can translate between the user's preferred language and English. "
-                "Do not claim that translation is unavailable, and do not say that you can speak only English. "
-                "English remains the assistant's source speech language unless the host configured otherwise, while the platform may localize displayed text for the user."
-            ),
-        }
-    )
-
-    translation_ctx = _session_translation_context(session_state)
-    if bool(translation_ctx.get("enabled")) and not _is_english_language(translation_ctx.get("user_language_code")):
-        warm_messages.append(
-            {
-                "role": "system",
-                "content": (
-                    f"Translation rule: The user prefers {str(translation_ctx.get('user_language_name') or _language_name_from_code(translation_ctx.get('user_language_code') or '')).strip()} ({str(translation_ctx.get('user_language_code') or '').strip() or 'en'}). "
-                    "Write your canonical assistant reply in English only. "
-                    "Do not produce bilingual output, and do not self-translate your reply. "
-                    "The platform will render the display translation for the user. "
-                    "Do not claim that you can speak only English or that translation is unavailable. "
-                    "If the user's language is neither English nor Spanish, the platform may add a brief one-time translator notice after the initial greeting."
-                ),
-            }
-        )
 
     # Tiny user ping; keep max_tokens minimal.
     warm_messages.append({"role": "user", "content": "."})
@@ -9200,7 +8571,6 @@ def _ai_override_touch_from_chat(
         rec["updated_epoch"] = float(now)
 
         # Usage context (needed for host messages to continue charging and for paywall messages)
-        translation_ctx = _session_translation_context(session_state)
         rec["usage_ctx"] = {
             "is_trial": bool(is_trial),
             "plan_name_for_limits": str(plan_name_for_limits or "").strip(),
@@ -9211,10 +8581,6 @@ def _ai_override_touch_from_chat(
             "payg_pay_url": str(payg_pay_url or "").strip(),
             "payg_minutes": payg_minutes,
             "payg_price_text": str(payg_price_text or "").strip(),
-            "translator_enabled": bool(translation_ctx.get("enabled")),
-            "user_language_code": str(translation_ctx.get("user_language_code") or "en"),
-            "user_language_name": str(translation_ctx.get("user_language_name") or "English"),
-            "display_language_code": str(translation_ctx.get("display_language_code") or translation_ctx.get("user_language_code") or "en"),
         }
 
         # Summaries for host preview
@@ -9380,34 +8746,27 @@ def _ai_override_set_active(
     except Exception:
         pass
 
-    translation_ctx = _session_translation_context(rec.get("usage_ctx") if isinstance(rec.get("usage_ctx"), dict) else {})
-
     # Emit a system event so the member UI can show a banner.
     if enabled:
-        msg = "Host override enabled — you are now chatting with a human companion."
-        display_msg, payload = _display_text_and_translation_payload(msg, translation_ctx)
         _ai_override_append_event(
             sid,
             role="system",
-            content=display_msg,
+            content="Host override enabled — you are now chatting with a human companion.",
             sender="system",
             audience="all",
             kind="override_on",
-            payload=payload,
         )
     else:
         msg = "Host override ended — AI companion chat will continue."
         if reason:
             msg = f"Host override ended ({reason})."
-        display_msg, payload = _display_text_and_translation_payload(msg, translation_ctx)
         _ai_override_append_event(
             sid,
             role="system",
-            content=display_msg,
+            content=msg,
             sender="system",
             audience="all",
             kind="override_off",
-            payload=payload,
         )
 
     return _ai_override_get_session(sid) or {}
@@ -9840,34 +9199,15 @@ async def save_chat_summary(request: Request):
     max_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS", "12000") or "12000")
     per_msg_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS_PER_MESSAGE", "2000") or "2000")
 
-    translation_ctx = _session_translation_context(session_state)
-
     convo_items: List[Dict[str, str]] = []
     for m in messages:
-        if not isinstance(m, dict):
-            continue
         role = m.get("role")
-        if role not in ("user", "assistant"):
-            continue
-
-        fields = _message_translation_fields(m)
-        content = str(fields.get("english") or fields.get("content") or "")
-        if role in ("user", "assistant") and translation_ctx.get("enabled") and not _is_english_language(translation_ctx.get("user_language_code")):
-            if not str(fields.get("english") or "").strip() and str(fields.get("display") or fields.get("content") or "").strip():
-                try:
-                    content = _translate_text_sync(
-                        str(fields.get("display") or fields.get("content") or ""),
-                        source_language_code=str(translation_ctx.get("user_language_code") or ""),
-                        target_language_code="en",
-                    )
-                except Exception:
-                    content = str(fields.get("display") or fields.get("content") or "")
-
-        content = _sanitize_message_content_for_llm(str(role or ""), str(content or ""))
-        if per_msg_chars > 0 and len(content) > per_msg_chars:
-            content = content[:per_msg_chars] + " …"
-        if content:
-            convo_items.append({"role": role, "content": content})
+        if role in ("user", "assistant"):
+            content = _sanitize_message_content_for_llm(str(role or ""), str(m.get("content") or ""))
+            if per_msg_chars > 0 and len(content) > per_msg_chars:
+                content = content[:per_msg_chars] + " …"
+            if content:
+                convo_items.append({"role": role, "content": content})
 
     if max_msgs > 0 and len(convo_items) > max_msgs:
         convo_items = convo_items[-max_msgs:]
@@ -9891,7 +9231,7 @@ async def save_chat_summary(request: Request):
 
     sys = (
         "You are a concise assistant that creates a server-side chat summary for future context. "
-        "Write a compact summary in English that captures: relationship tone, key facts, user preferences/boundaries, "
+        "Write a compact summary that captures: relationship tone, key facts, user preferences/boundaries, "
         "names/roles, and any commitments or plans. Avoid quoting long passages. "
         "Output plain text only."
     )
@@ -9910,9 +9250,6 @@ async def save_chat_summary(request: Request):
 
     platform_filenames = _extract_platform_content_filenames(convo_items)
     summary = _repair_generated_summary_for_platform_content(summary, platform_filenames)
-    summary_header = _translation_header_for_summary(session_state)
-    if summary_header:
-        summary = f"{summary_header}\n\n{str(summary or '').strip()}".strip()
 
     # Refresh from disk before write to avoid clobbering another worker's recent update.
     _refresh_summary_store_if_needed()
@@ -10039,7 +9376,7 @@ def _stt_ext_from_content_type(content_type: str) -> str:
     return "bin"
 
 
-def _stt_transcribe_sync(audio_bytes: bytes, content_type: str, language_code: str = "") -> str:
+def _stt_transcribe_sync(audio_bytes: bytes, content_type: str) -> str:
     if not audio_bytes or len(audio_bytes) < 16:
         raise ValueError("No audio received")
 
@@ -10049,14 +9386,10 @@ def _stt_transcribe_sync(audio_bytes: bytes, content_type: str, language_code: s
 
     client = _get_openai_client()
     stt_model = getattr(settings, "STT_MODEL", None) or os.getenv("STT_MODEL", "").strip() or "whisper-1"
-    kwargs: Dict[str, Any] = {
-        "model": stt_model,
-        "file": bio,
-    }
-    normalized_lang = _normalize_language_code(language_code)
-    if normalized_lang and not _is_english_language(normalized_lang):
-        kwargs["language"] = normalized_lang.split("-", 1)[0]
-    resp = client.audio.transcriptions.create(**kwargs)
+    resp = client.audio.transcriptions.create(
+        model=stt_model,
+        file=bio,
+    )
     text = getattr(resp, "text", None)
     if text is None and isinstance(resp, dict):
         text = resp.get("text")
@@ -10067,32 +9400,25 @@ def _stt_transcribe_sync(audio_bytes: bytes, content_type: str, language_code: s
 async def stt_transcribe(request: Request):
     content_type = ""
     audio_bytes = b""
-    language_code = ""
     try:
         if not _resolve_openai_api_key():
             raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
 
         content_type = (request.headers.get("content-type") or "").lower().strip()
-        language_code = _normalize_language_code(
-            request.headers.get("x-stt-language")
-            or request.headers.get("x-user-language")
-            or request.headers.get("x-language-code")
-            or ""
-        )
         audio_bytes = await request.body()
 
         if not audio_bytes or len(audio_bytes) < 16:
             raise HTTPException(status_code=400, detail="No audio received")
 
-        text = await run_in_threadpool(_stt_transcribe_sync, audio_bytes, content_type, language_code)
-        return {"text": text, "language_code": language_code or "en"}
+        text = await run_in_threadpool(_stt_transcribe_sync, audio_bytes, content_type)
+        return {"text": text}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
         try:
-            print(f"[stt] transcription failed content_type={content_type!r} bytes={len(audio_bytes)} lang={language_code!r} err={type(e).__name__}: {e}")
+            print(f"[stt] transcription failed content_type={content_type!r} bytes={len(audio_bytes)} err={type(e).__name__}: {e}")
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"STT transcription failed: {type(e).__name__}: {e}")
@@ -13070,17 +12396,14 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
             payg_price_text=str(ctx.get("payg_price_text") or "").strip(),
         )
 
-        paywall_display, paywall_payload = _display_text_and_translation_payload(paywall, translation_ctx)
-
         # Member sees paywall.
         _ai_override_append_event(
             sid,
             role="assistant",
-            content=paywall_display,
+            content=paywall,
             sender="system",
             audience="user",
             kind="paywall",
-            payload=paywall_payload,
         )
 
         # Host sees termination notice.
@@ -13105,22 +12428,13 @@ async def host_ai_chats_send(req: HostAiChatsSendRequest):
         }
 
     # Normal host message.
-    translation_ctx = {
-        "enabled": bool(ctx.get("translator_enabled")),
-        "user_language_code": str(ctx.get("user_language_code") or "en").strip() or "en",
-        "user_language_name": str(ctx.get("user_language_name") or _language_name_from_code(ctx.get("user_language_code") or "en")).strip() or "English",
-        "display_language_code": str(ctx.get("display_language_code") or ctx.get("user_language_code") or "en").strip() or "en",
-    }
-    display_text, payload = _display_text_and_translation_payload(text, translation_ctx)
-
     appended_event = _ai_override_append_event(
         sid,
         role="assistant",
-        content=display_text,
+        content=text,
         sender="host",
         audience="all",
         kind="message",
-        payload=payload,
     )
 
     try:
