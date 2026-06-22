@@ -220,6 +220,12 @@ type PendingContentItem = {
 
 type ChatApiResponse = {
   reply: string;
+  display_reply?: string;
+  displayReply?: string;
+  reply_translation?: any;
+  replyTranslation?: any;
+  turn_translation?: any;
+  turnTranslation?: any;
   mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
   session_state?: Partial<SessionState>;
   audio_url?: string;
@@ -431,6 +437,252 @@ function isAnonMemberId(memberId: string): boolean {
 }
 
 
+const LANGUAGE_NAME_OVERRIDES: Record<string, string> = {
+  en: "English",
+  es: "Spanish",
+  fr: "French",
+  de: "German",
+  it: "Italian",
+  pt: "Portuguese",
+  "pt-br": "Portuguese (Brazil)",
+  "pt-pt": "Portuguese (Portugal)",
+  nl: "Dutch",
+  ru: "Russian",
+  uk: "Ukrainian",
+  pl: "Polish",
+  tr: "Turkish",
+  ar: "Arabic",
+  he: "Hebrew",
+  fa: "Persian",
+  hi: "Hindi",
+  bn: "Bengali",
+  ur: "Urdu",
+  ta: "Tamil",
+  te: "Telugu",
+  ml: "Malayalam",
+  ja: "Japanese",
+  ko: "Korean",
+  zh: "Chinese",
+  "zh-cn": "Chinese (Simplified)",
+  "zh-tw": "Chinese (Traditional)",
+  vi: "Vietnamese",
+  th: "Thai",
+  id: "Indonesian",
+  ms: "Malay",
+  tl: "Tagalog",
+  fil: "Filipino",
+  ro: "Romanian",
+  el: "Greek",
+  sv: "Swedish",
+  no: "Norwegian",
+  da: "Danish",
+  fi: "Finnish",
+  cs: "Czech",
+  sk: "Slovak",
+  hu: "Hungarian",
+  hr: "Croatian",
+  sr: "Serbian",
+  bg: "Bulgarian",
+};
+
+function normalizeLanguageTag(raw: any): string {
+  const value = String(raw ?? "").trim().replace(/_/g, "-");
+  if (!value) return "";
+  const parts = value.split("-").filter(Boolean);
+  if (!parts.length) return "";
+  const base = parts[0].replace(/[^A-Za-z]/g, "").toLowerCase();
+  if (!base) return "";
+  const out = [base];
+  for (const part of parts.slice(1)) {
+    const cleaned = String(part || "").replace(/[^A-Za-z0-9]/g, "");
+    if (!cleaned) continue;
+    out.push(cleaned.length <= 3 ? cleaned.toUpperCase() : cleaned);
+  }
+  return out.join("-");
+}
+
+function languageBase(code: any): string {
+  return normalizeLanguageTag(code).split("-", 1)[0] || "";
+}
+
+function isEnglishLanguage(code: any): boolean {
+  const base = languageBase(code);
+  return !base || base === "en";
+}
+
+function languageNameFromCode(code: any): string {
+  const norm = normalizeLanguageTag(code).toLowerCase();
+  if (!norm) return "English";
+  if (LANGUAGE_NAME_OVERRIDES[norm]) return LANGUAGE_NAME_OVERRIDES[norm];
+  const base = norm.split("-", 1)[0];
+  if (LANGUAGE_NAME_OVERRIDES[base]) return LANGUAGE_NAME_OVERRIDES[base];
+  return norm;
+}
+
+type DetectedLanguagePreference = {
+  code: string;
+  known: boolean;
+};
+
+function detectInitialLanguagePreference(): DetectedLanguagePreference {
+  if (typeof window !== "undefined") {
+    try {
+      const params = new URLSearchParams(window.location.search || "");
+      const fromQuery =
+        params.get("preferredLanguage") ||
+        params.get("preferred_language") ||
+        params.get("userPreferredLanguage") ||
+        params.get("user_preferred_language") ||
+        params.get("userLanguage") ||
+        params.get("user_language") ||
+        params.get("language") ||
+        params.get("locale") ||
+        params.get("lang") ||
+        "";
+      const normalizedQuery = normalizeLanguageTag(fromQuery);
+      if (normalizedQuery) return { code: normalizedQuery, known: true };
+    } catch (e) {}
+
+    try {
+      const langs = Array.isArray(window.navigator?.languages) ? window.navigator.languages : [];
+      const candidate = normalizeLanguageTag(langs[0] || window.navigator?.language || "");
+      if (candidate) return { code: candidate, known: false };
+    } catch (e) {}
+  }
+  return { code: "en", known: false };
+}
+
+function detectInitialUserLanguageCode(): string {
+  return detectInitialLanguagePreference().code;
+}
+
+function coerceBooleanLike(raw: any): boolean | null {
+  if (typeof raw === "boolean") return raw;
+  if (raw === null || raw === undefined) return null;
+  const txt = String(raw).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(txt)) return true;
+  if (["0", "false", "no", "off"].includes(txt)) return false;
+  return null;
+}
+
+function messageEnglishText(m: Msg): string {
+  const meta: any = (m as any)?.meta || {};
+  const translation: any = meta?.translation || {};
+  return String(
+    translation?.englishText ||
+    meta?.englishText ||
+    meta?.english_text ||
+    (m as any)?.english_content ||
+    m.content ||
+    ""
+  ).trim();
+}
+
+function relayEventPayloadNativeText(ev: RelayEvent | any): string {
+  const payload: any = (ev as any)?.payload || {};
+  return String(payload?.display_text || payload?.native_text || "").trim();
+}
+
+function relayEventPayloadEnglishText(ev: RelayEvent | any): string {
+  const payload: any = (ev as any)?.payload || {};
+  return String(payload?.english_text || "").trim();
+}
+
+function relayEventPayloadLanguageName(ev: RelayEvent | any): string {
+  const payload: any = (ev as any)?.payload || {};
+  return String(payload?.user_language_name || languageNameFromCode(payload?.user_language_code || "")).trim();
+}
+
+function relayEventUserFacingText(ev: RelayEvent | any): string {
+  return relayEventPayloadNativeText(ev) || String((ev as any)?.content || relayEventPayloadEnglishText(ev) || "").trim();
+}
+
+function relayEventHostFacingText(ev: RelayEvent | any): string {
+  const nativeText = relayEventPayloadNativeText(ev);
+  const englishText = relayEventPayloadEnglishText(ev);
+  const langName = relayEventPayloadLanguageName(ev) || "Native";
+  const fallback = String((ev as any)?.content || englishText || nativeText || "").trim();
+  if (!nativeText || !englishText || nativeText === englishText) return fallback;
+  return `English:
+${englishText}
+
+${langName}:
+${nativeText}`;
+}
+
+
+type NormalizedTurnTranslation = {
+  displayText: string;
+  englishText: string;
+  userLanguageCode: string;
+  userLanguageName: string;
+};
+
+function normalizeTurnTranslation(raw: any): NormalizedTurnTranslation | null {
+  const payload: any = raw && typeof raw === "object" ? raw : {};
+  const displayText = String(
+    payload?.display_text ?? payload?.displayText ?? payload?.native_text ?? payload?.nativeText ?? ""
+  ).trim();
+  const englishText = String(payload?.english_text ?? payload?.englishText ?? "").trim();
+  const userLanguageCode = normalizeLanguageTag(payload?.user_language_code ?? payload?.userLanguageCode ?? "");
+  const userLanguageName = String(
+    payload?.user_language_name ?? payload?.userLanguageName ?? languageNameFromCode(userLanguageCode || "")
+  ).trim();
+  if (!displayText && !englishText && !userLanguageCode && !userLanguageName) return null;
+  return {
+    displayText: displayText || englishText,
+    englishText,
+    userLanguageCode,
+    userLanguageName: userLanguageName || languageNameFromCode(userLanguageCode || ""),
+  };
+}
+
+function buildTranslationMeta(raw: any, fallbackDisplayText: string = ""): any | null {
+  const normalized = normalizeTurnTranslation(raw);
+  const fallback = String(fallbackDisplayText || "").trim();
+  if (!normalized && !fallback) return null;
+  const displayText = String(normalized?.displayText || fallback).trim();
+  const englishText = String(normalized?.englishText || "").trim();
+  const userLanguageCode = normalizeLanguageTag(normalized?.userLanguageCode || "");
+  const userLanguageName = String(
+    normalized?.userLanguageName || languageNameFromCode(userLanguageCode || "")
+  ).trim();
+  if (!displayText && !englishText) return null;
+  return {
+    displayText,
+    nativeText: displayText,
+    englishText,
+    userLanguageCode,
+    userLanguageName: userLanguageName || languageNameFromCode(userLanguageCode || ""),
+  };
+}
+
+function applyTranslationMetaToMsg(msg: Msg, raw: any, fallbackDisplayText: string = ""): Msg {
+  const translationMeta = buildTranslationMeta(raw, fallbackDisplayText);
+  if (!translationMeta) return msg;
+  const prevMeta: any = (msg as any)?.meta || {};
+  const nextMeta: any = {
+    ...prevMeta,
+    translation: translationMeta,
+  };
+  if (translationMeta.englishText) {
+    nextMeta.englishText = translationMeta.englishText;
+    nextMeta.english_text = translationMeta.englishText;
+  }
+  return { ...msg, meta: nextMeta };
+}
+
+function buildAssistantTurnMsg(displayText: string, rawTranslation: any, sender: string = "ai"): Msg | null {
+  const content = String(displayText || "").trim();
+  if (!content) return null;
+  return applyTranslationMetaToMsg(
+    { role: "assistant", content, meta: { sender } },
+    rawTranslation,
+    content,
+  );
+}
+
+
 
 // --- Plan and companion helpers (no UI changes beyond required labels) ---
 function normalizePlanName(raw: any): PlanName {
@@ -611,7 +863,7 @@ function buildDigestFromDroppedMessages(dropped: Msg[]): string {
     const m = dropped[i];
     if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
 
-    let c = normalizeDigestLine(String((m as any).content ?? ""));
+    let c = normalizeDigestLine(messageEnglishText(m));
     if (!c) continue;
 
     if (c.length > DIGEST_MAX_CHARS_PER_LINE) c = c.slice(0, DIGEST_MAX_CHARS_PER_LINE) + "…";
@@ -641,6 +893,31 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
 const DEFAULT_COMPANY_NAME = "Elaralo";
+
+function getPostedString(obj: any, ...keys: string[]): string {
+  for (const key of keys) {
+    const v = obj?.[key];
+    if (typeof v === "string") {
+      const s = String(v).trim();
+      if (s) return s;
+    }
+  }
+  return "";
+}
+
+function getPostedStringAllowBlank(obj: any, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const v = obj?.[key];
+    if (typeof v === "string") return String(v).trim();
+  }
+  return null;
+}
+
+function isCoreBrandLabel(raw: string): boolean {
+  const key = safeBrandKey(String(raw || "").trim());
+  return !key || key === "elaralo" || key === "core";
+}
+
 // Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
 const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
 
@@ -838,7 +1115,7 @@ function buildContentAssistantMsg(rawContent: any): Msg | null {
   };
 }
 
-function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): { role: Role; content: string } {
+function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): Record<string, any> {
   const role = m.role;
   const meta: any = m.meta || {};
   const isPlatformContent = Boolean(meta?.contentDelivery);
@@ -851,12 +1128,57 @@ function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): { 
     return { role, content };
   }
 
+  const translationMeta = buildTranslationMeta(
+    meta?.translation || {
+      displayText: meta?.displayText || meta?.display_text || content,
+      nativeText: meta?.nativeText || meta?.native_text || content,
+      englishText: meta?.englishText || meta?.english_text || "",
+      userLanguageCode: meta?.userLanguageCode || meta?.user_language_code || "",
+      userLanguageName: meta?.userLanguageName || meta?.user_language_name || "",
+    },
+    content,
+  );
+
+  let displayContent = String(
+    translationMeta?.displayText || translationMeta?.nativeText || content || ""
+  ).trim();
+  let englishContent = String(
+    translationMeta?.englishText || meta?.englishText || meta?.english_text || ""
+  ).trim();
+
   const att = meta?.attachment;
   if (att?.url) {
     const name = att.name || "attachment";
-    content = `${content}${content ? "\n\n" : ""}Attachment: ${name}\n${att.url}`;
+    const attachmentBlock = `Attachment: ${name}
+${att.url}`;
+    displayContent = `${displayContent}${displayContent ? "\n\n" : ""}${attachmentBlock}`;
+    englishContent = `${englishContent}${englishContent ? "\n\n" : ""}${attachmentBlock}`;
   }
-  return { role, content };
+
+  const out: Record<string, any> = {
+    role,
+    content: englishContent || displayContent || content,
+    display_content: displayContent || content,
+    original_content: displayContent || content,
+  };
+
+  if (englishContent) {
+    out.english_content = englishContent;
+  }
+
+  if (translationMeta) {
+    out.translation = {
+      display_text: String(translationMeta.displayText || displayContent || content || "").trim(),
+      native_text: String(translationMeta.nativeText || translationMeta.displayText || displayContent || content || "").trim(),
+      english_text: String(translationMeta.englishText || englishContent || "").trim(),
+      user_language_code: String(translationMeta.userLanguageCode || "").trim(),
+      user_language_name: String(
+        translationMeta.userLanguageName || languageNameFromCode(translationMeta.userLanguageCode || "")
+      ).trim(),
+    };
+  }
+
+  return out;
 }
 
 
@@ -2388,6 +2710,10 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   const companyName = (rebrandingName || (parseRebrandingKey(rebrandingKey || "")?.rebranding || "") || DEFAULT_COMPANY_NAME);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
+  const rebrandingKeyRef = useRef<string>("");
+  const companionKeyRef = useRef<string>("");
+  const companionKeyRawRef = useRef<string>("");
+  const companionNameRef = useRef<string>(DEFAULT_COMPANION_NAME);
 
   // Viewer-only: display name used in the shared in-stream chat.
   // - Stored locally so we only prompt once per (brand, companion).
@@ -3011,6 +3337,18 @@ const [hostInsightsQuestion, setHostInsightsQuestion] = useState<string>("");
 const [hostInsightsAnswer, setHostInsightsAnswer] = useState<string>("");
 const [hostInsightsLoading, setHostInsightsLoading] = useState<boolean>(false);
 const [hostInsightsError, setHostInsightsError] = useState<string>("");
+const hostInsightsUsersScrollRef = useRef<HTMLDivElement | null>(null);
+const hostInsightsAnswerScrollRef = useRef<HTMLDivElement | null>(null);
+
+useEffect(() => {
+  const el = hostInsightsAnswerScrollRef.current;
+  if (el) el.scrollTop = 0;
+}, [hostInsightsAnswer]);
+
+useEffect(() => {
+  const el = hostInsightsUsersScrollRef.current;
+  if (el && hostInsightsOpen) el.scrollTop = 0;
+}, [hostInsightsOpen]);
 
 
 const loadHostGuidelines = useCallback(async () => {
@@ -4662,6 +5000,56 @@ const speakAssistantReply = useCallback(
 
   const [messages, setMessages] = useState<Msg[]>([]);
 
+  // Translation/language state must be declared before any hooks that list these
+  // values in dependency arrays. Keeping them here avoids block-scoped TDZ
+  // build failures during Next.js type checking.
+  const initialLanguagePreferenceRef = useRef<DetectedLanguagePreference>(detectInitialLanguagePreference());
+  const [userLanguageCode, setUserLanguageCode] = useState<string>(() => normalizeLanguageTag(initialLanguagePreferenceRef.current.code) || "en");
+  const [userLanguagePreferenceKnown, setUserLanguagePreferenceKnown] = useState<boolean>(() => Boolean(initialLanguagePreferenceRef.current.known));
+  const userLanguageName = useMemo(() => languageNameFromCode(userLanguageCode), [userLanguageCode]);
+  const translatorEnabled = useMemo(
+    () => Boolean(userLanguagePreferenceKnown) && !isEnglishLanguage(userLanguageCode),
+    [userLanguagePreferenceKnown, userLanguageCode]
+  );
+  const sttLanguageHintCode = useMemo(
+    () => normalizeLanguageTag(userLanguagePreferenceKnown ? userLanguageCode : initialLanguagePreferenceRef.current.code) || "en",
+    [userLanguagePreferenceKnown, userLanguageCode]
+  );
+  const assistantConversationLanguageCode = translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en";
+  const assistantConversationLanguageName = translatorEnabled
+    ? (userLanguageName || languageNameFromCode(userLanguageCode || ""))
+    : "English";
+  const assistantSpeechLanguageCode = "en";
+  const assistantSpeechLanguageName = "English";
+
+  const applyUserTurnTranslationByClientId = useCallback((clientTurnId: string, rawTranslation: any, fallbackDisplayText: string = "") => {
+    const id = String(clientTurnId || "").trim();
+    if (!id) return;
+    const translationMeta = buildTranslationMeta(rawTranslation, fallbackDisplayText);
+    if (!translationMeta) return;
+
+    setMessages((prev) => {
+      if (!Array.isArray(prev) || !prev.length) return prev as any;
+      const next = prev.slice();
+      for (let i = next.length - 1; i >= 0; i--) {
+        const msg: any = next[i];
+        if (!msg || String(msg.role || "") !== "user") continue;
+        if (String(msg?.meta?.clientTurnId || "") !== id) continue;
+        next[i] = {
+          ...(msg as any),
+          meta: {
+            ...(msg?.meta || {}),
+            translation: translationMeta,
+            englishText: translationMeta.englishText || msg?.meta?.englishText || "",
+            english_text: translationMeta.englishText || msg?.meta?.english_text || "",
+          },
+        };
+        return next;
+      }
+      return prev;
+    });
+  }, []);
+
 // Relay polling for host override (member side)
 const [relaySinceSeq, setRelaySinceSeq] = useState<number>(0);
 const relaySinceSeqRef = useRef<number>(0);
@@ -4720,6 +5108,34 @@ useEffect(() => {
         brand: (companyName || "").trim(),
         avatar: (companionName || "").trim(),
 
+        translator_enabled: translatorEnabled,
+        translation_enabled: translatorEnabled,
+        translationEnabled: translatorEnabled,
+        user_language_code: normalizeLanguageTag(userLanguageCode) || "en",
+        userLanguageCode: normalizeLanguageTag(userLanguageCode) || "en",
+        user_language_name: userLanguageName,
+        userLanguageName: userLanguageName,
+        user_language_preference_known: userLanguagePreferenceKnown,
+        userLanguagePreferenceKnown: userLanguagePreferenceKnown,
+        language_preference_known: userLanguagePreferenceKnown,
+        languagePreferenceKnown: userLanguagePreferenceKnown,
+        user_language_hint_code: normalizeLanguageTag(sttLanguageHintCode) || "en",
+        userLanguageHintCode: normalizeLanguageTag(sttLanguageHintCode) || "en",
+        display_language_code: translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en",
+        displayLanguageCode: translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en",
+        assistant_language_code: assistantConversationLanguageCode,
+        assistantLanguageCode: assistantConversationLanguageCode,
+        assistant_language_name: assistantConversationLanguageName,
+        assistantLanguageName: assistantConversationLanguageName,
+        assistant_speech_language_code: assistantSpeechLanguageCode,
+        assistantSpeechLanguageCode: assistantSpeechLanguageCode,
+        assistant_speech_language_name: assistantSpeechLanguageName,
+        assistantSpeechLanguageName: assistantSpeechLanguageName,
+        assistant_source_language_code: assistantSpeechLanguageCode,
+        assistantSourceLanguageCode: assistantSpeechLanguageCode,
+        assistant_source_language_name: assistantSpeechLanguageName,
+        assistantSourceLanguageName: assistantSpeechLanguageName,
+
         rebrandingKey: stripTrialControlsFromRebrandingKey(rebrandingKey),
         rebranding: rawBrand,
       };
@@ -4776,7 +5192,7 @@ useEffect(() => {
               continue;
             }
 
-            const content = String((ev as any).content || "");
+            const content = relayEventUserFacingText(ev);
             if (!content.trim()) continue;
 
             if (role === "system" || sender === "system" || kind.startsWith("override_")) {
@@ -4789,11 +5205,13 @@ useEffect(() => {
             }
 
             if (sender === "host") {
-              out.push({
-                role: "assistant",
-                content,
-                meta: { sender: "host" },
-              } as any);
+              out.push(
+                buildAssistantTurnMsg(content, payload, "host") || {
+                  role: "assistant",
+                  content,
+                  meta: { sender: "host" },
+                }
+              );
               continue;
             }
 
@@ -4831,6 +5249,13 @@ useEffect(() => {
   companionName,
   companionKey,
   rebrandingKey,
+  translatorEnabled,
+  userLanguageCode,
+  userLanguageName,
+  userLanguagePreferenceKnown,
+  sttLanguageHintCode,
+  assistantConversationLanguageCode,
+  assistantConversationLanguageName,
 ]);
 
   const [loading, setLoading] = useState(false);
@@ -5572,6 +5997,27 @@ useEffect(() => {
     pending_consent: null,
   });
 
+
+  const syncLanguagePreferenceFromBackend = useCallback((rawState: any) => {
+    const state = rawState && typeof rawState === "object" ? rawState : {};
+    const known = coerceBooleanLike(
+      state?.user_language_preference_known ??
+      state?.userLanguagePreferenceKnown ??
+      state?.language_preference_known ??
+      state?.languagePreferenceKnown
+    );
+    const code = normalizeLanguageTag(
+      state?.user_language_code ??
+      state?.userLanguageCode ??
+      state?.display_language_code ??
+      state?.displayLanguageCode ??
+      ""
+    );
+    if (!code || known !== true) return;
+    setUserLanguageCode(code);
+    setUserLanguagePreferenceKnown(true);
+  }, []);
+
   const [planName, setPlanName] = useState<PlanName>(null);
 
   // loggedIn must come from Wix; do NOT infer from memberId.
@@ -5623,10 +6069,22 @@ useEffect(() => {
   const upgradeWatchLastRequestAtRef = useRef<number>(0);
 
 
-  // Sync memberId into a ref so callbacks defined above can always access the latest value.
+  // Sync identity + branding refs so callbacks defined above can always access the latest values.
   useEffect(() => {
     memberIdRef.current = String(memberId || "").trim();
   }, [memberId]);
+  useEffect(() => {
+    rebrandingKeyRef.current = String(rebrandingKey || "").trim();
+  }, [rebrandingKey]);
+  useEffect(() => {
+    companionKeyRef.current = String(companionKey || "").trim();
+  }, [companionKey]);
+  useEffect(() => {
+    companionKeyRawRef.current = String(companionKeyRaw || "").trim();
+  }, [companionKeyRaw]);
+  useEffect(() => {
+    companionNameRef.current = String(companionName || "").trim() || DEFAULT_COMPANION_NAME;
+  }, [companionName]);
 
   // Stable member id used for live chat (Wix memberId when available, otherwise anon:...)
   const brandKeyForAnon = useMemo(() => {
@@ -5653,8 +6111,9 @@ useEffect(() => {
     const rawBrand = String(companyName || rebranding || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME;
     const brandKey = safeBrandKey(rawBrand) || "core";
     const avatarKey = String(companionName || DEFAULT_COMPANION_NAME).trim().toLowerCase();
-    return `${warmProvider}|${sessionState.mode}|${sessionState.explicit_consented ? "1" : "0"}|${brandKey}|${avatarKey}`;
-  }, [warmProvider, sessionState.mode, sessionState.explicit_consented, companyName, rebranding, companionName]);
+    const languageKey = normalizeLanguageTag(userLanguageCode) || "en";
+    return `${warmProvider}|${sessionState.mode}|${sessionState.explicit_consented ? "1" : "0"}|${brandKey}|${avatarKey}|tr:${translatorEnabled ? "1" : "0"}|u:${languageKey}|a:${assistantConversationLanguageCode}`;
+  }, [warmProvider, sessionState.mode, sessionState.explicit_consented, companyName, rebranding, companionName, translatorEnabled, userLanguageCode, assistantConversationLanguageCode]);
 
   const warmLastRef = useRef<{ key: string; at: number }>({ key: "", at: 0 });
 
@@ -5681,8 +6140,35 @@ useEffect(() => {
       rebrandingKey: rebrandingKeyForBackend,
       rebranding_key: rebrandingKeyForBackend,
       rebranding: String(rebranding || "").trim(),
+      translator_enabled: translatorEnabled,
+      translation_enabled: translatorEnabled,
+      translationEnabled: translatorEnabled,
+      user_language_code: normalizeLanguageTag(userLanguageCode) || "en",
+      userLanguageCode: normalizeLanguageTag(userLanguageCode) || "en",
+      user_language_name: userLanguageName,
+      userLanguageName: userLanguageName,
+      user_language_preference_known: userLanguagePreferenceKnown,
+      userLanguagePreferenceKnown: userLanguagePreferenceKnown,
+      language_preference_known: userLanguagePreferenceKnown,
+      languagePreferenceKnown: userLanguagePreferenceKnown,
+      user_language_hint_code: normalizeLanguageTag(sttLanguageHintCode) || "en",
+      userLanguageHintCode: normalizeLanguageTag(sttLanguageHintCode) || "en",
+      display_language_code: translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en",
+      displayLanguageCode: translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en",
+      assistant_language_code: assistantConversationLanguageCode,
+      assistantLanguageCode: assistantConversationLanguageCode,
+      assistant_language_name: assistantConversationLanguageName,
+      assistantLanguageName: assistantConversationLanguageName,
+      assistant_speech_language_code: assistantSpeechLanguageCode,
+      assistantSpeechLanguageCode: assistantSpeechLanguageCode,
+      assistant_speech_language_name: assistantSpeechLanguageName,
+      assistantSpeechLanguageName: assistantSpeechLanguageName,
+      assistant_source_language_code: assistantSpeechLanguageCode,
+      assistantSourceLanguageCode: assistantSpeechLanguageCode,
+      assistant_source_language_name: assistantSpeechLanguageName,
+      assistantSourceLanguageName: assistantSpeechLanguageName,
     };
-  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, rebrandingKey, planName]);
+  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, rebrandingKey, planName, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
 
   useEffect(() => {
     if (!API_BASE) return;
@@ -6820,7 +7306,7 @@ useEffect(() => {
 // LegacyStream "live session" gating (global per companion)
 // - While the host is streaming, we must NOT generate AI responses for anyone.
 // - We queue user messages locally and flush them once the host stops streaming.
-const streamDeferredQueueRef = useRef<Array<{ text: string; state: SessionState; queuedAt: number; noticeIndex: number }>>([]);
+const streamDeferredQueueRef = useRef<Array<{ text: string; state: SessionState; queuedAt: number; noticeIndex: number; clientTurnId?: string }>>([]);
 const streamDeferredFlushInFlightRef = useRef<boolean>(false);
 const streamPreSessionHistoryRef = useRef<Msg[] | null>(null);
 const prevSessionActiveRef = useRef<boolean>(false);
@@ -7628,54 +8114,123 @@ useEffect(() => {
 
   const getEmbedHint = useCallback(() => "", []);
 
+  const greetingTranslationCacheRef = useRef<Record<string, string>>({});
+  const getLocalizedGreeting = useCallback(async (name: string, languageCode: string, preferenceKnown: boolean) => {
+    const englishText = greetingFor(name);
+    const targetLanguageCode = normalizeLanguageTag(languageCode) || "en";
 
-  // Greeting once per browser session per companion
-// Fix: if companionName arrives AFTER the initial greeting timer (e.g., slow Wix postMessage),
-// we may have already inserted the default "Elara" greeting. If the user hasn't typed yet,
-// replace the greeting so it matches the selected companion.
-useEffect(() => {
-  if (typeof window === "undefined") return;
+    if (!preferenceKnown || isEnglishLanguage(targetLanguageCode) || !API_BASE) {
+      return {
+        displayText: englishText,
+        translationMeta: null as any,
+      };
+    }
 
-  const desiredName =
-    (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+    const cacheKey = `${targetLanguageCode}|${englishText}`;
+    let translated = String(greetingTranslationCacheRef.current[cacheKey] || "").trim();
 
-  const keyName = normalizeKeyForFile(desiredName);
-  const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
-
-  const tmr = window.setTimeout(() => {
-    const already = sessionStorage.getItem(greetKey) === "1";
-    const greetingText = greetingFor(desiredName);
-
-    const greetingMsg: Msg = {
-      role: "assistant",
-      content: greetingText,
-    };
-
-    setMessages((prev) => {
-      // If no messages yet, insert greeting only if we elara't greeted this companion in this session.
-      if (prev.length === 0) {
-        return already ? prev : [greetingMsg];
-      }
-
-      // If the only existing message is a greeting for a different companion (and no user messages yet),
-      // replace it so the name matches the current companion.
-      if (prev.length === 1 && prev[0].role === "assistant") {
-        const existing = String((prev[0] as any)?.content ?? "");
-        const m = existing.match(/^Hi,\s*(.+?)\s+here\./i);
-        const existingName = m?.[1]?.trim();
-        if (existingName && existingName.toLowerCase() !== desiredName.toLowerCase()) {
-          return [{ ...prev[0], content: greetingText }];
+    if (!translated) {
+      try {
+        const res = await fetch(`${API_BASE}/translation/text`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: englishText,
+            source_language_code: "en",
+            target_language_code: targetLanguageCode,
+          }),
+        });
+        const data = await res.json().catch(() => null);
+        if (res.ok) {
+          translated = String(data?.text || "").trim();
+          if (translated) greetingTranslationCacheRef.current[cacheKey] = translated;
         }
-      }
+      } catch (e) {}
+    }
 
-      return prev;
-    });
+    const displayText = String(translated || englishText).trim() || englishText;
+    const translationMeta = !isEnglishLanguage(targetLanguageCode) && displayText !== englishText
+      ? {
+          displayText,
+          nativeText: displayText,
+          englishText,
+          userLanguageCode: targetLanguageCode,
+          userLanguageName: languageNameFromCode(targetLanguageCode),
+        }
+      : null;
 
-    if (!already) sessionStorage.setItem(greetKey, "1");
-  }, 150);
+    return { displayText, translationMeta };
+  }, [API_BASE]);
 
-  return () => window.clearTimeout(tmr);
-}, [companionName]);
+
+  // Greeting once per browser session per companion.
+  // Rule:
+  // - If the user's preferred language is unknown, keep the initial greeting in English.
+  // - Once a preferred language is known, refresh the greeting into that language if no user turn exists yet.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    let cancelled = false;
+    const desiredName =
+      (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+
+    const keyName = normalizeKeyForFile(desiredName);
+    const greetingLanguageCode = userLanguagePreferenceKnown
+      ? (normalizeLanguageTag(userLanguageCode) || "en")
+      : "en";
+    const greetKey = `${GREET_ONCE_KEY}:${keyName}:${normalizeKeyForFile(greetingLanguageCode || "en")}`;
+
+    const tmr = window.setTimeout(() => {
+      (async () => {
+        const already = sessionStorage.getItem(greetKey) === "1";
+        const { displayText, translationMeta } = await getLocalizedGreeting(
+          desiredName,
+          greetingLanguageCode,
+          userLanguagePreferenceKnown,
+        );
+        if (cancelled) return;
+
+        let greetingMsg: Msg = {
+          role: "assistant",
+          content: displayText,
+          meta: {
+            greeting: true,
+            greetingLanguageCode,
+            greetingLanguageKnown: userLanguagePreferenceKnown,
+          },
+        };
+        if (translationMeta) {
+          greetingMsg = applyTranslationMetaToMsg(greetingMsg, translationMeta, displayText);
+        }
+
+        setMessages((prev) => {
+          if (prev.length === 0) {
+            return already ? prev : [greetingMsg];
+          }
+
+          if (prev.length === 1 && prev[0].role === "assistant") {
+            const existingMsg: any = prev[0] || {};
+            const existing = String(existingMsg?.content ?? "").trim();
+            const existingMeta = existingMsg?.meta || {};
+            const looksLikeEnglishGreeting = /^Hi,\s*(.+?)\s+here\./i.test(existing);
+            const isGreeting = Boolean(existingMeta?.greeting) || looksLikeEnglishGreeting;
+            if (isGreeting && existing !== String(greetingMsg.content || "").trim()) {
+              return [greetingMsg];
+            }
+          }
+
+          return prev;
+        });
+
+        if (!already) sessionStorage.setItem(greetKey, "1");
+      })().catch(() => {});
+    }, 150);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(tmr);
+    };
+  }, [companionName, userLanguageCode, userLanguagePreferenceKnown, getLocalizedGreeting]);
 
   function showUpgradeMessage(requestedMode: Mode) {
     const modeLabel = MODE_LABELS[requestedMode];
@@ -7697,13 +8252,14 @@ useEffect(() => {
     let trustedParentOrigin: string | null = null;
 
     const looksLikeMemberPlanPayload = (d: any) => {
-      return (
-        !!d &&
-        typeof d === "object" &&
-        (d as any).type === "MEMBER_PLAN" &&
-        typeof (d as any).brand === "string" &&
-        typeof (d as any).avatar === "string"
+      if (!d || typeof d !== "object" || (d as any).type !== "MEMBER_PLAN") return false;
+      const hasBrandLike = Boolean(
+        getPostedStringAllowBlank(d, "brand", "companyName", "company_name", "company", "rebrandingKey", "rebranding_key", "RebrandingKey", "rebranding", "rebrandingName", "rebranding_name") !== null
       );
+      const hasAvatarLike = Boolean(
+        getPostedStringAllowBlank(d, "avatar", "companion", "companionName", "companion_name", "avatarName", "avatar_name") !== null
+      );
+      return hasBrandLike && hasAvatarLike;
     };
 
     const isAllowedPostMessage = (origin: string, data: any) => {
@@ -7752,34 +8308,50 @@ useEffect(() => {
       // Optional white-label brand handoff from Wix.
       // - Elaralo site should send: { rebrandingKey: "" }
       // - Rebranding sites should send the full RebrandingKey (pipe-delimited).
+      // - Some parent payloads only include brand/avatar. Preserve the current branded handoff
+      //   instead of downgrading to core defaults when refresh payloads are incomplete.
       //
       // IMPORTANT: This must never alter STT/TTS start/stop code paths.
-      let rawRebrandingKey = "";
+      const currentRawRebrandingKey = String(rebrandingKeyRef.current || "").trim();
+      const incomingBrandExplicit = getPostedString(
+        data,
+        "brand",
+        "companyName",
+        "company_name",
+        "company",
+        "rebrandingName",
+        "rebranding_name"
+      );
+      const explicitRebrandingValue = getPostedStringAllowBlank(
+        data,
+        "rebrandingKey",
+        "rebranding_key",
+        "RebrandingKey",
+        "rebrandingkey"
+      );
 
-      if (
-        "rebrandingKey" in (data as any) ||
-        "rebranding_key" in (data as any) ||
-        "RebrandingKey" in (data as any) ||
-        "rebrandingkey" in (data as any)
-      ) {
-        rawRebrandingKey =
-          typeof (data as any).rebrandingKey === "string"
-            ? String((data as any).rebrandingKey)
-            : typeof (data as any).rebranding_key === "string"
-              ? String((data as any).rebranding_key)
-              : typeof (data as any).rebrandingkey === "string"
-                ? String((data as any).rebrandingkey)
-                : typeof (data as any).RebrandingKey === "string"
-                  ? String((data as any).RebrandingKey)
-                  : "";
-        rawRebrandingKey = rawRebrandingKey.trim();
+      let rawRebrandingKey = currentRawRebrandingKey;
+      if (explicitRebrandingValue !== null) {
+        if (explicitRebrandingValue) {
+          rawRebrandingKey = explicitRebrandingValue;
+        } else if (incomingBrandExplicit && !isCoreBrandLabel(incomingBrandExplicit)) {
+          rawRebrandingKey = incomingBrandExplicit;
+        } else if (incomingBrandExplicit && isCoreBrandLabel(incomingBrandExplicit)) {
+          rawRebrandingKey = "";
+        } else if (!currentRawRebrandingKey) {
+          rawRebrandingKey = "";
+        }
+      } else {
+        const legacyBrand = getPostedString(data, "rebranding");
+        if (legacyBrand) {
+          rawRebrandingKey = legacyBrand;
+        } else if (incomingBrandExplicit && !isCoreBrandLabel(incomingBrandExplicit)) {
+          rawRebrandingKey = incomingBrandExplicit;
+        }
+      }
 
-        // Allow empty string to explicitly clear any previous rebranding state.
+      if (rawRebrandingKey !== currentRawRebrandingKey) {
         setRebrandingKey(rawRebrandingKey);
-      } else if ("rebranding" in (data as any)) {
-        // Legacy support: some older Wix pages may still send { rebranding: "BrandName" }.
-        rawRebrandingKey = typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
-        if (rawRebrandingKey) setRebrandingKey(rawRebrandingKey);
       }
 
       const rkParts = parseRebrandingKey(rawRebrandingKey);
@@ -7810,6 +8382,32 @@ useEffect(() => {
                   : "";
       setPayloadUserDisplayName(incomingDisplayName);
 
+      const incomingLanguageRaw =
+        typeof (data as any).preferredLanguage === "string"
+          ? String((data as any).preferredLanguage).trim()
+          : typeof (data as any).preferred_language === "string"
+            ? String((data as any).preferred_language).trim()
+            : typeof (data as any).userPreferredLanguage === "string"
+              ? String((data as any).userPreferredLanguage).trim()
+              : typeof (data as any).user_preferred_language === "string"
+                ? String((data as any).user_preferred_language).trim()
+                : typeof (data as any).userLanguage === "string"
+                  ? String((data as any).userLanguage).trim()
+                  : typeof (data as any).user_language === "string"
+                    ? String((data as any).user_language).trim()
+                    : typeof (data as any).language === "string"
+                      ? String((data as any).language).trim()
+                      : typeof (data as any).locale === "string"
+                        ? String((data as any).locale).trim()
+                        : typeof (data as any).lang === "string"
+                          ? String((data as any).lang).trim()
+                          : "";
+      const normalizedIncomingLanguage = normalizeLanguageTag(incomingLanguageRaw);
+      if (normalizedIncomingLanguage) {
+        setUserLanguageCode(normalizedIncomingLanguage);
+        setUserLanguagePreferenceKnown(true);
+      }
+
       // When RebrandingKey is present, use ElaraloPlanMap for capability gating
       // (Wix planName may be the rebrand site's plan names like "Supreme").
       const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
@@ -7822,9 +8420,18 @@ useEffect(() => {
       const planLabel = incomingMemberId ? String(rkParts?.plan || "").trim() : "";
       setPlanLabelOverride(planLabel);
 
-      const incomingCompanion =
-        typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
-      const resolvedCompanionKey = incomingCompanion || "";
+      const incomingCompanion = getPostedString(
+        data,
+        "companion",
+        "avatar",
+        "companionName",
+        "companion_name",
+        "avatarName",
+        "avatar_name"
+      );
+      const currentCompanionRaw =
+        String(companionKeyRawRef.current || companionKeyRef.current || companionNameRef.current || "").trim();
+      const resolvedCompanionKey = incomingCompanion || currentCompanionRaw || "";
       const { baseKey } = splitCompanionKey(resolvedCompanionKey);
 
       if (resolvedCompanionKey) {
@@ -7935,8 +8542,27 @@ useEffect(() => {
       setHandoffReady(true);
     }
 
+    const requestInitialMemberPlan = (reason: string) => {
+      try {
+        if (typeof window === "undefined") return;
+        const msg = {
+          type: "REQUEST_MEMBER_PLAN",
+          reason: String(reason || "").slice(0, 64),
+          ts: Date.now(),
+        };
+        window.parent?.postMessage(JSON.stringify(msg), "*");
+      } catch (e) {
+        // ignore
+      }
+    };
+
     window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
+    requestInitialMemberPlan("initial_load");
+    const initialRetryTimer = window.setTimeout(() => requestInitialMemberPlan("initial_retry"), 900);
+    return () => {
+      try { window.clearTimeout(initialRetryTimer); } catch (e) {}
+      window.removeEventListener("message", onMessage);
+    };
   }, []);
 
   async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
@@ -8010,6 +8636,34 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
   user_name: userDisplayNameForBackend,
   username: userDisplayNameForBackend,
   display_name: userDisplayNameForBackend,
+
+  translator_enabled: translatorEnabled,
+  translation_enabled: translatorEnabled,
+  translationEnabled: translatorEnabled,
+  user_language_code: normalizeLanguageTag(userLanguageCode) || "en",
+  userLanguageCode: normalizeLanguageTag(userLanguageCode) || "en",
+  user_language_name: userLanguageName,
+  userLanguageName: userLanguageName,
+  user_language_preference_known: userLanguagePreferenceKnown,
+  userLanguagePreferenceKnown: userLanguagePreferenceKnown,
+  language_preference_known: userLanguagePreferenceKnown,
+  languagePreferenceKnown: userLanguagePreferenceKnown,
+  user_language_hint_code: normalizeLanguageTag(sttLanguageHintCode) || "en",
+  userLanguageHintCode: normalizeLanguageTag(sttLanguageHintCode) || "en",
+  display_language_code: translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en",
+  displayLanguageCode: translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en",
+  assistant_language_code: assistantConversationLanguageCode,
+  assistantLanguageCode: assistantConversationLanguageCode,
+  assistant_language_name: assistantConversationLanguageName,
+  assistantLanguageName: assistantConversationLanguageName,
+  assistant_speech_language_code: assistantSpeechLanguageCode,
+  assistantSpeechLanguageCode: assistantSpeechLanguageCode,
+  assistant_speech_language_name: assistantSpeechLanguageName,
+  assistantSpeechLanguageName: assistantSpeechLanguageName,
+  assistant_source_language_code: assistantSpeechLanguageCode,
+  assistantSourceLanguageCode: assistantSpeechLanguageCode,
+  assistant_source_language_name: assistantSpeechLanguageName,
+  assistantSourceLanguageName: assistantSpeechLanguageName,
 };
 
     const trimmedForChat = trimMessagesForChat(nextMessages);
@@ -8135,6 +8789,33 @@ const rebrandingKeyForBackend = (rebrandingKey || "");
       user_name: userDisplayNameForBackend,
       username: userDisplayNameForBackend,
       display_name: userDisplayNameForBackend,
+      translator_enabled: translatorEnabled,
+      translation_enabled: translatorEnabled,
+      translationEnabled: translatorEnabled,
+      user_language_code: normalizeLanguageTag(userLanguageCode) || "en",
+      userLanguageCode: normalizeLanguageTag(userLanguageCode) || "en",
+      user_language_name: userLanguageName,
+      userLanguageName: userLanguageName,
+      user_language_preference_known: userLanguagePreferenceKnown,
+      userLanguagePreferenceKnown: userLanguagePreferenceKnown,
+      language_preference_known: userLanguagePreferenceKnown,
+      languagePreferenceKnown: userLanguagePreferenceKnown,
+      user_language_hint_code: normalizeLanguageTag(sttLanguageHintCode) || "en",
+      userLanguageHintCode: normalizeLanguageTag(sttLanguageHintCode) || "en",
+      display_language_code: translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en",
+      displayLanguageCode: translatorEnabled ? (normalizeLanguageTag(userLanguageCode) || "en") : "en",
+      assistant_language_code: assistantConversationLanguageCode,
+      assistantLanguageCode: assistantConversationLanguageCode,
+      assistant_language_name: assistantConversationLanguageName,
+      assistantLanguageName: assistantConversationLanguageName,
+      assistant_speech_language_code: assistantSpeechLanguageCode,
+      assistantSpeechLanguageCode: assistantSpeechLanguageCode,
+      assistant_speech_language_name: assistantSpeechLanguageName,
+      assistantSpeechLanguageName: assistantSpeechLanguageName,
+      assistant_source_language_code: assistantSpeechLanguageCode,
+      assistantSourceLanguageCode: assistantSpeechLanguageCode,
+      assistant_source_language_name: assistantSpeechLanguageName,
+      assistantSourceLanguageName: assistantSpeechLanguageName,
     };
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
@@ -8395,13 +9076,32 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
 const outgoingText = (detectedMode ? cleaned : rawText).trim();
     // If the user sends an attachment without text, still create a stable message for the backend/UI.
     const finalUserContent = outgoingText || (hasAttachment ? "Sent an attachment." : "");
+    const turnClientId =
+      (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
     // Build the user message.
 
     // Build the user message. During LegacyStream live sessions, this may also be
     // broadcast to the shared in-stream chat (without calling /chat).
     
-let userMsg: Msg = { role: "user", content: finalUserContent };
+let userMsg: Msg = {
+      role: "user",
+      content: finalUserContent,
+      meta: { clientTurnId: turnClientId },
+    };
+    if (translatorEnabled && finalUserContent) {
+      userMsg = applyTranslationMetaToMsg(
+        userMsg,
+        {
+          displayText: finalUserContent,
+          nativeText: finalUserContent,
+          englishText: "",
+          userLanguageCode: userLanguageCode,
+          userLanguageName: userLanguageName,
+        },
+        finalUserContent,
+      );
+    }
     if (pendingAttachment) {
       userMsg = {
         ...userMsg,
@@ -8522,6 +9222,7 @@ if (streamSessionActive) {
     state: queuedState,
     queuedAt: Date.now(),
     noticeIndex,
+    clientTurnId: turnClientId,
   });
 
   setMessages([...nextMessages, { role: "assistant", content: notice }]);
@@ -8564,6 +9265,7 @@ if (streamSessionActive) {
 
       // Normalize & apply server session state WITHOUT using data.mode as pill mode
       if (serverSessionState) {
+        syncLanguagePreferenceFromBackend(serverSessionState);
         setSessionState((prev) => {
           const merged: SessionState = { ...(prev as any), ...(serverSessionState as any) };
 
@@ -8617,15 +9319,28 @@ if (streamSessionActive) {
       // When Live Avatar is active, we delay the assistant's text from appearing until
       // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");
+      const displayReplyText = String(
+        (data as any).display_reply ?? (data as any).displayReply ?? replyText ?? ""
+      );
+      const turnTranslation: any = (data as any).turn_translation ?? (data as any).turnTranslation ?? {};
+      const userTurnTranslation: any =
+        (turnTranslation && typeof turnTranslation === "object" ? (turnTranslation as any).user : null) || null;
+      const replyTurnTranslation: any =
+        (turnTranslation && typeof turnTranslation === "object" ? (turnTranslation as any).reply : null) ||
+        (data as any).reply_translation ||
+        (data as any).replyTranslation ||
+        null;
       const contentMsgs = buildContentAssistantMsgs((data as any).content);
+      applyUserTurnTranslationByClientId(turnClientId, userTurnTranslation, finalUserContent);
       let assistantCommitted = false;
       const commitAssistantMessage = () => {
         if (assistantCommitted) return;
         assistantCommitted = true;
 
         const toAdd: Msg[] = [];
-        if (replyText.trim()) {
-          toAdd.push({ role: "assistant", content: replyText, meta: { sender: "ai" } });
+        const assistantReplyMsg = buildAssistantTurnMsg(displayReplyText || replyText, replyTurnTranslation, "ai");
+        if (assistantReplyMsg) {
+          toAdd.push(assistantReplyMsg);
         }
         if (contentMsgs.length) {
           toAdd.push(...contentMsgs);
@@ -8763,7 +9478,24 @@ const flushQueuedStreamMessages = useCallback(async () => {
       if (epochAtStart !== clearEpochRef.current) return;
 
       const item = streamDeferredQueueRef.current[0];
-      const userMsg: Msg = { role: "user", content: String(item?.text || "").trim() };
+      let userMsg: Msg = {
+        role: "user",
+        content: String(item?.text || "").trim(),
+        meta: { clientTurnId: String((item as any)?.clientTurnId || "").trim() },
+      };
+      if (translatorEnabled && userMsg.content) {
+        userMsg = applyTranslationMetaToMsg(
+          userMsg,
+          {
+            displayText: userMsg.content,
+            nativeText: userMsg.content,
+            englishText: "",
+            userLanguageCode: userLanguageCode,
+            userLanguageName: userLanguageName,
+          },
+          userMsg.content,
+        );
+      }
       if (!userMsg.content) {
         streamDeferredQueueRef.current.shift();
         continue;
@@ -8783,6 +9515,7 @@ const flushQueuedStreamMessages = useCallback(async () => {
       const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
 
       if (serverSessionState) {
+        syncLanguagePreferenceFromBackend(serverSessionState);
         const merged: SessionState = { ...(workingState as any), ...(serverSessionState as any) };
 
         // If backend says blocked, keep pill as intimate AND set pending
@@ -8827,10 +9560,29 @@ const flushQueuedStreamMessages = useCallback(async () => {
       }
 
       const replyText = String((data as any).reply || "");
+      const displayReplyText = String(
+        (data as any).display_reply ?? (data as any).displayReply ?? replyText ?? ""
+      );
+      const turnTranslation: any = (data as any).turn_translation ?? (data as any).turnTranslation ?? {};
+      const userTurnTranslation: any =
+        (turnTranslation && typeof turnTranslation === "object" ? (turnTranslation as any).user : null) || null;
+      const replyTurnTranslation: any =
+        (turnTranslation && typeof turnTranslation === "object" ? (turnTranslation as any).reply : null) ||
+        (data as any).reply_translation ||
+        (data as any).replyTranslation ||
+        null;
       const contentMsgs = buildContentAssistantMsgs((data as any).content);
-      const replyMsg: Msg | null = replyText.trim()
-        ? { role: "assistant", content: replyText, meta: { sender: "ai" } }
-        : null;
+      const replyMsg: Msg | null = buildAssistantTurnMsg(displayReplyText || replyText, replyTurnTranslation, "ai");
+      const historyUserMsg = applyTranslationMetaToMsg(
+        userMsg,
+        userTurnTranslation,
+        String((userMsg as any)?.content || "").trim(),
+      );
+      applyUserTurnTranslationByClientId(
+        String((item as any)?.clientTurnId || "").trim(),
+        userTurnTranslation,
+        String((userMsg as any)?.content || "").trim(),
+      );
 
       // If this queued message came from an out-of-session user, we rendered a placeholder
       // notice bubble at noticeIndex. Replace it in-place so chat ordering stays coherent.
@@ -8861,7 +9613,7 @@ const flushQueuedStreamMessages = useCallback(async () => {
       });
 
       // Advance the backend history used for subsequent queued messages
-      history = [...callMsgs];
+      history = [...history, historyUserMsg];
       if (replyMsg) history.push(replyMsg);
       if (contentMsgs.length) history.push(...contentMsgs);
 
@@ -8879,7 +9631,14 @@ const flushQueuedStreamMessages = useCallback(async () => {
     streamDeferredFlushInFlightRef.current = false;
     setLoading(false);
   }
-}, [callChat]);
+}, [
+  applyUserTurnTranslationByClientId,
+  callChat,
+  translatorEnabled,
+  userLanguageCode,
+  userLanguageName,
+  syncLanguagePreferenceFromBackend,
+]);
 
 // Detect LegacyStream session start/stop to capture history + flush queue.
 useEffect(() => {
@@ -9037,7 +9796,12 @@ useEffect(() => {
 
       const resp = await fetch(`${apiBase}/stt/transcribe`, {
         method: "POST",
-        headers: { "Content-Type": contentType, Accept: "application/json" },
+        headers: {
+          "Content-Type": contentType,
+          Accept: "application/json",
+          "X-STT-Language": normalizeLanguageTag(sttLanguageHintCode) || "en",
+          "X-User-Language": normalizeLanguageTag(sttLanguageHintCode) || "en",
+        },
         body: blob,
         signal: controller.signal,
       });
@@ -9053,7 +9817,7 @@ useEffect(() => {
       const data = (await resp.json()) as any;
       return String(data?.text ?? "").trim();
     },
-    [API_BASE, isIOS],
+    [API_BASE, isIOS, userLanguageCode],
   );
 
   const startBackendSttOnce = useCallback(async (): Promise<void> => {
@@ -9416,7 +10180,7 @@ const pauseSpeechToText = useCallback(() => {
     }
 
     try {
-      rec.lang = "en-US";
+      rec.lang = normalizeLanguageTag(userLanguageCode) || "en-US";
     } catch (e) {
       // ignore
     }
@@ -9594,6 +10358,7 @@ const pauseSpeechToText = useCallback(() => {
     getEmbedHint,
     requestMicPermission,
     resetSpeechRecognition,
+    userLanguageCode,
   ]);
 
   const resumeSpeechToText = useCallback(() => {
@@ -12449,6 +13214,7 @@ const modePillControls = (
                   flexDirection: "column",
                   gap: 8,
                   minHeight: 0,
+                  overflow: "hidden",
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -12475,12 +13241,18 @@ const modePillControls = (
                 </div>
 
                 <div
+                  ref={hostInsightsUsersScrollRef}
                   style={{
                     overflowY: "auto",
+                    overflowX: "hidden",
                     minHeight: 0,
-                    flex: "1 1 auto",
+                    height: 0,
+                    maxHeight: "100%",
+                    flex: "1 1 0",
+                    paddingRight: 2,
                     WebkitOverflowScrolling: "touch",
                     overscrollBehavior: "contain",
+                    touchAction: "pan-y",
                   }}
                 >
                   {hostInsightsUsers.length === 0 ? (
@@ -12549,6 +13321,7 @@ const modePillControls = (
                   flexDirection: "column",
                   gap: 10,
                   minHeight: 0,
+                  overflow: "hidden",
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
@@ -12583,6 +13356,7 @@ const modePillControls = (
                     borderRadius: 12,
                     padding: 10,
                     overflowY: "auto",
+                    overflowX: "hidden",
                     minHeight: 120,
                     maxHeight: 220,
                     flex: "0 1 220px",
@@ -12591,6 +13365,7 @@ const modePillControls = (
                     whiteSpace: "pre-wrap",
                     WebkitOverflowScrolling: "touch",
                     overscrollBehavior: "contain",
+                    touchAction: "pan-y",
                   }}
                 >
                   {hostInsightsSummaries.length === 0 ? (
@@ -12740,22 +13515,37 @@ const modePillControls = (
                 {hostInsightsAnswer ? (
                   <div
                     style={{
-                      border: "1px solid rgba(0,0,0,0.10)",
-                      background: "rgba(0,0,0,0.02)",
-                      borderRadius: 12,
-                      padding: 10,
-                      fontSize: 13,
-                      color: "#111",
-                      whiteSpace: "pre-wrap",
-                      overflowY: "auto",
-                      minHeight: 140,
-                      maxHeight: 260,
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 6,
                       flex: "1 1 180px",
-                      WebkitOverflowScrolling: "touch",
-                      overscrollBehavior: "contain",
+                      minHeight: 0,
                     }}
                   >
-                    {hostInsightsAnswer}
+                    <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.82 }}>Response</div>
+                    <div
+                      ref={hostInsightsAnswerScrollRef}
+                      style={{
+                        border: "1px solid rgba(0,0,0,0.10)",
+                        background: "rgba(0,0,0,0.02)",
+                        borderRadius: 12,
+                        padding: 10,
+                        fontSize: 13,
+                        color: "#111",
+                        whiteSpace: "pre-wrap",
+                        overflowY: "auto",
+                        overflowX: "hidden",
+                        minHeight: 140,
+                        height: 0,
+                        maxHeight: 260,
+                        flex: "1 1 0",
+                        WebkitOverflowScrolling: "touch",
+                        overscrollBehavior: "contain",
+                        touchAction: "pan-y",
+                      }}
+                    >
+                      {hostInsightsAnswer}
+                    </div>
                   </div>
                 ) : null}
               </div>
@@ -13089,7 +13879,7 @@ const modePillControls = (
                     {label}
                   </div>
                   <div style={{ whiteSpace: "pre-wrap" }}>
-                    {String((ev as any).content || "")}
+                    {relayEventHostFacingText(ev)}
                   </div>
                 </div>
               );
