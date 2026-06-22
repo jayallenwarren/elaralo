@@ -893,31 +893,6 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
 const DEFAULT_COMPANY_NAME = "Elaralo";
-
-function getPostedString(obj: any, ...keys: string[]): string {
-  for (const key of keys) {
-    const v = obj?.[key];
-    if (typeof v === "string") {
-      const s = String(v).trim();
-      if (s) return s;
-    }
-  }
-  return "";
-}
-
-function getPostedStringAllowBlank(obj: any, ...keys: string[]): string | null {
-  for (const key of keys) {
-    const v = obj?.[key];
-    if (typeof v === "string") return String(v).trim();
-  }
-  return null;
-}
-
-function isCoreBrandLabel(raw: string): boolean {
-  const key = safeBrandKey(String(raw || "").trim());
-  return !key || key === "elaralo" || key === "core";
-}
-
 // Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
 const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
 
@@ -1962,6 +1937,45 @@ export default function Page() {
     }
   }, []);
 
+
+  const getEmbedContext = useCallback(() => {
+    let referrer = "";
+    let ancestorOrigins: string[] = [];
+    try {
+      referrer = typeof document !== "undefined" ? String(document.referrer || "").trim() : "";
+    } catch (e) {
+      referrer = "";
+    }
+    try {
+      const raw = (typeof window !== "undefined" ? (window.location as any)?.ancestorOrigins : null) as
+        | { length: number; [idx: number]: string }
+        | null;
+      if (raw && typeof raw.length === "number") {
+        for (let i = 0; i < raw.length; i++) {
+          const v = String(raw[i] || "").trim();
+          if (v) ancestorOrigins.push(v);
+        }
+      }
+    } catch (e) {
+      ancestorOrigins = [];
+    }
+    const parentOrigin = String(ancestorOrigins[0] || "").trim();
+    return { referrer, parentOrigin, ancestorOrigins };
+  }, []);
+
+  const getMemberPlanCacheKey = useCallback(() => {
+    if (typeof window === "undefined") return "";
+    const embedCtx = getEmbedContext();
+    const basis = String(
+      embedCtx.referrer ||
+      embedCtx.parentOrigin ||
+      (embedCtx.ancestorOrigins[0] || "") ||
+      window.location.pathname ||
+      "core"
+    ).trim();
+    return `ELARALO_MEMBER_PLAN_CACHE::${safeBrandKey(basis)}`;
+  }, [getEmbedContext]);
+
   // -----------------------
   // Responsive layout mode: mobile / tablet / desktop
   // Primary optimization target = mobile.
@@ -2068,6 +2082,9 @@ export default function Page() {
 
   const sessionIdRef = useRef<string | null>(null);
 
+const [startupIdentityResolved, setStartupIdentityResolved] = useState<boolean>(() => !isEmbedded);
+const startupIdentityResolvedRef = useRef<boolean>(!isEmbedded);
+
 // Brief startup overlay (covers the iframe on initial refresh).
 // Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
 // until the companionName has been received from the Wix MEMBER_PLAN payload.
@@ -2121,19 +2138,18 @@ const armStartupOverlay = useCallback(
   [startStartupOverlayCountdown],
 );
 
+
+const markStartupIdentityResolved = useCallback(
+  (name: string = "") => {
+    startupIdentityResolvedRef.current = true;
+    setStartupIdentityResolved(true);
+    const nm = String(name || "").trim();
+    if (nm) armStartupOverlay(nm);
+  },
+  [armStartupOverlay],
+);
+
 useEffect(() => {
-  // Hard cap: if the payload is delayed, start the countdown anyway (without showing an incorrect name).
-  // This prevents the overlay from blocking the UI for 15-20s on slow/late payload delivery.
-  if (startupOverlayHardCapTimerRef.current) {
-    window.clearTimeout(startupOverlayHardCapTimerRef.current);
-    startupOverlayHardCapTimerRef.current = null;
-  }
-
-  startupOverlayHardCapTimerRef.current = window.setTimeout(() => {
-    if (!startupOverlayOpen) return;
-    startStartupOverlayCountdown();
-  }, STARTUP_OVERLAY_MAX_WAIT_MS);
-
   return () => {
     if (startupOverlayTimerRef.current) {
       window.clearTimeout(startupOverlayTimerRef.current);
@@ -2144,7 +2160,32 @@ useEffect(() => {
       startupOverlayHardCapTimerRef.current = null;
     }
   };
-}, [startupOverlayOpen, startStartupOverlayCountdown]);
+}, []);
+
+useEffect(() => {
+  // In embedded contexts, keep the overlay in place until we either process MEMBER_PLAN
+  // or complete the fallback identity bootstrap. This prevents the core Elaralo/Elara shell from flashing.
+  if (startupOverlayHardCapTimerRef.current) {
+    window.clearTimeout(startupOverlayHardCapTimerRef.current);
+    startupOverlayHardCapTimerRef.current = null;
+  }
+
+  if (isEmbedded && !startupIdentityResolved) {
+    return;
+  }
+
+  startupOverlayHardCapTimerRef.current = window.setTimeout(() => {
+    if (!startupOverlayOpen) return;
+    startStartupOverlayCountdown();
+  }, STARTUP_OVERLAY_MAX_WAIT_MS);
+
+  return () => {
+    if (startupOverlayHardCapTimerRef.current) {
+      window.clearTimeout(startupOverlayHardCapTimerRef.current);
+      startupOverlayHardCapTimerRef.current = null;
+    }
+  };
+}, [isEmbedded, startupIdentityResolved, startupOverlayOpen, startStartupOverlayCountdown]);
 
 
   // Keep the latest Wix memberId available for callbacks defined earlier in this file.
@@ -2496,6 +2537,7 @@ useEffect(() => {
   // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
   // IMPORTANT: This must never alter STT/TTS start/stop code paths.
   const [rebrandingKey, setRebrandingKey] = useState<string>("");
+  const [payloadBrandName, setPayloadBrandName] = useState<string>("");
 
   // Derive legacy single-field rebranding string from the pipe-delimited RebrandingKey.
   // Default: "" (treated as core / non-rebranded).
@@ -2707,13 +2749,17 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   }, [upgradeUrl]);
 
   const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
-  const companyName = (rebrandingName || (parseRebrandingKey(rebrandingKey || "")?.rebranding || "") || DEFAULT_COMPANY_NAME);
+  const companyName = useMemo(() => {
+    const derived = String(
+      rebrandingName ||
+      payloadBrandName ||
+      (parseRebrandingKey(rebrandingKey || "")?.rebranding || "") ||
+      DEFAULT_COMPANY_NAME
+    ).trim();
+    return derived || DEFAULT_COMPANY_NAME;
+  }, [rebrandingName, payloadBrandName, rebrandingKey]);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
-  const rebrandingKeyRef = useRef<string>("");
-  const companionKeyRef = useRef<string>("");
-  const companionKeyRawRef = useRef<string>("");
-  const companionNameRef = useRef<string>(DEFAULT_COMPANION_NAME);
 
   // Viewer-only: display name used in the shared in-stream chat.
   // - Stored locally so we only prompt once per (brand, companion).
@@ -6019,6 +6065,10 @@ useEffect(() => {
   }, []);
 
   const [planName, setPlanName] = useState<PlanName>(null);
+  const latestPlanNameRef = useRef<PlanName>(planName);
+  useEffect(() => {
+    latestPlanNameRef.current = planName;
+  }, [planName]);
 
   // loggedIn must come from Wix; do NOT infer from memberId.
   // Used for upgrade polling and entitlement refresh without a full page reload.
@@ -6069,22 +6119,10 @@ useEffect(() => {
   const upgradeWatchLastRequestAtRef = useRef<number>(0);
 
 
-  // Sync identity + branding refs so callbacks defined above can always access the latest values.
+  // Sync memberId into a ref so callbacks defined above can always access the latest value.
   useEffect(() => {
     memberIdRef.current = String(memberId || "").trim();
   }, [memberId]);
-  useEffect(() => {
-    rebrandingKeyRef.current = String(rebrandingKey || "").trim();
-  }, [rebrandingKey]);
-  useEffect(() => {
-    companionKeyRef.current = String(companionKey || "").trim();
-  }, [companionKey]);
-  useEffect(() => {
-    companionKeyRawRef.current = String(companionKeyRaw || "").trim();
-  }, [companionKeyRaw]);
-  useEffect(() => {
-    companionNameRef.current = String(companionName || "").trim() || DEFAULT_COMPANION_NAME;
-  }, [companionName]);
 
   // Stable member id used for live chat (Wix memberId when available, otherwise anon:...)
   const brandKeyForAnon = useMemo(() => {
@@ -6286,23 +6324,50 @@ useEffect(() => {
   // - Iframe requests latest plan from Wix parent by sending { type: "REQUEST_MEMBER_PLAN" }
   // - Companion page responds by re-sending MEMBER_PLAN payload to this iframe (#html1)
   // ---------------------------------------------------------------------
-  const requestLatestMemberPlanFromParent = useCallback((reason: string) => {
+  const requestLatestMemberPlanFromParent = useCallback((reason: string, opts?: { force?: boolean }) => {
     try {
       if (typeof window === "undefined") return;
 
       const now = Date.now();
       // Throttle so we don't spam Velo / backend plan lookup.
-      if (now - (upgradeWatchLastRequestAtRef.current || 0) < 900) return;
+      if (!opts?.force && now - (upgradeWatchLastRequestAtRef.current || 0) < 900) return;
       upgradeWatchLastRequestAtRef.current = now;
 
       const msg = {
         type: "REQUEST_MEMBER_PLAN",
+        source: "elaralo-connect",
         reason: String(reason || "").slice(0, 64),
         ts: now,
+        href: (() => {
+          try {
+            return String(window.location.href || "");
+          } catch (e) {
+            return "";
+          }
+        })(),
+        referrer: (() => {
+          try {
+            return String(document.referrer || "");
+          } catch (e) {
+            return "";
+          }
+        })(),
       };
 
-      // Wix HTML components are tolerant to string payloads; Velo code should parse JSON strings.
-      window.parent?.postMessage(JSON.stringify(msg), "*");
+      const targets: Window[] = [];
+      try {
+        if (window.parent && window.parent !== window) targets.push(window.parent);
+      } catch (e) {}
+      try {
+        if (window.top && window.top !== window && !targets.includes(window.top as Window)) {
+          targets.push(window.top as Window);
+        }
+      } catch (e) {}
+
+      for (const target of targets) {
+        try { target.postMessage(msg, "*"); } catch (e) {}
+        try { target.postMessage(JSON.stringify(msg), "*"); } catch (e) {}
+      }
     } catch (e) {
       // ignore
     }
@@ -8169,6 +8234,7 @@ useEffect(() => {
   // - Once a preferred language is known, refresh the greeting into that language if no user turn exists yet.
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (isEmbedded && !startupIdentityResolved) return;
 
     let cancelled = false;
     const desiredName =
@@ -8230,7 +8296,7 @@ useEffect(() => {
       cancelled = true;
       window.clearTimeout(tmr);
     };
-  }, [companionName, userLanguageCode, userLanguagePreferenceKnown, getLocalizedGreeting]);
+  }, [companionName, getLocalizedGreeting, isEmbedded, startupIdentityResolved, userLanguageCode, userLanguagePreferenceKnown]);
 
   function showUpgradeMessage(requestedMode: Mode) {
     const modeLabel = MODE_LABELS[requestedMode];
@@ -8252,14 +8318,13 @@ useEffect(() => {
     let trustedParentOrigin: string | null = null;
 
     const looksLikeMemberPlanPayload = (d: any) => {
-      if (!d || typeof d !== "object" || (d as any).type !== "MEMBER_PLAN") return false;
-      const hasBrandLike = Boolean(
-        getPostedStringAllowBlank(d, "brand", "companyName", "company_name", "company", "rebrandingKey", "rebranding_key", "RebrandingKey", "rebranding", "rebrandingName", "rebranding_name") !== null
+      return (
+        !!d &&
+        typeof d === "object" &&
+        (d as any).type === "MEMBER_PLAN" &&
+        typeof (d as any).brand === "string" &&
+        typeof (d as any).avatar === "string"
       );
-      const hasAvatarLike = Boolean(
-        getPostedStringAllowBlank(d, "avatar", "companion", "companionName", "companion_name", "avatarName", "avatar_name") !== null
-      );
-      return hasBrandLike && hasAvatarLike;
     };
 
     const isAllowedPostMessage = (origin: string, data: any) => {
@@ -8281,6 +8346,7 @@ useEffect(() => {
     };
 
     function onMessage(event: MessageEvent) {
+      let resolvedStartupName = "";
       // Wix HTML components sometimes deliver the payload as a JSON string.
       // Accept both object and string forms.
       let data: any = (event as any).data;
@@ -8295,79 +8361,116 @@ useEffect(() => {
       if (!isAllowedPostMessage(event.origin, data)) return;
       if (!data || typeof data !== "object" || (data as any).type !== "MEMBER_PLAN") return;
 
-      // loggedIn must come from Wix; do NOT infer from memberId.
-      const incomingLoggedIn = (data as any).loggedIn;
-      if (typeof incomingLoggedIn === "boolean") {
-        setLoggedIn(incomingLoggedIn);
-      } else {
-        setLoggedIn(false);
+      try {
+        const cacheKey = getMemberPlanCacheKey();
+        if (cacheKey) {
+          const payloadText = JSON.stringify(data);
+          try { window.sessionStorage.setItem(cacheKey, payloadText); } catch (e) {}
+          try { window.localStorage.setItem(cacheKey, payloadText); } catch (e) {}
+        }
+      } catch (e) {
+        // ignore cache write failures
       }
 
-      const incomingPlan = normalizePlanName((data as any).planName);
+      // loggedIn must come from Wix; do NOT infer from memberId.
+      const incomingLoggedIn = typeof (data as any).loggedIn === "boolean" ? Boolean((data as any).loggedIn) : null;
+      if (incomingLoggedIn !== null) {
+        setLoggedIn(incomingLoggedIn);
+      }
+
+      const incomingPlanRaw =
+        typeof (data as any).planName === "string"
+          ? String((data as any).planName).trim()
+          : typeof (data as any).plan_name === "string"
+            ? String((data as any).plan_name).trim()
+            : "";
+      const incomingPlan = normalizePlanName(incomingPlanRaw);
+
+      const incomingBrandName =
+        typeof (data as any).brand === "string"
+          ? String((data as any).brand).trim()
+          : typeof (data as any).companyName === "string"
+            ? String((data as any).companyName).trim()
+            : typeof (data as any).company_name === "string"
+              ? String((data as any).company_name).trim()
+              : typeof (data as any).company === "string"
+                ? String((data as any).company).trim()
+                : typeof (data as any).rebranding === "string"
+                  ? String((data as any).rebranding).trim()
+                  : "";
 
       // Optional white-label brand handoff from Wix.
       // - Elaralo site should send: { rebrandingKey: "" }
       // - Rebranding sites should send the full RebrandingKey (pipe-delimited).
-      // - Some parent payloads only include brand/avatar. Preserve the current branded handoff
-      //   instead of downgrading to core defaults when refresh payloads are incomplete.
       //
       // IMPORTANT: This must never alter STT/TTS start/stop code paths.
-      const currentRawRebrandingKey = String(rebrandingKeyRef.current || "").trim();
-      const incomingBrandExplicit = getPostedString(
-        data,
-        "brand",
-        "companyName",
-        "company_name",
-        "company",
-        "rebrandingName",
-        "rebranding_name"
-      );
-      const explicitRebrandingValue = getPostedStringAllowBlank(
-        data,
-        "rebrandingKey",
-        "rebranding_key",
-        "RebrandingKey",
-        "rebrandingkey"
-      );
+      let rawRebrandingKey = "";
 
-      let rawRebrandingKey = currentRawRebrandingKey;
-      if (explicitRebrandingValue !== null) {
-        if (explicitRebrandingValue) {
-          rawRebrandingKey = explicitRebrandingValue;
-        } else if (incomingBrandExplicit && !isCoreBrandLabel(incomingBrandExplicit)) {
-          rawRebrandingKey = incomingBrandExplicit;
-        } else if (incomingBrandExplicit && isCoreBrandLabel(incomingBrandExplicit)) {
-          rawRebrandingKey = "";
-        } else if (!currentRawRebrandingKey) {
-          rawRebrandingKey = "";
-        }
-      } else {
-        const legacyBrand = getPostedString(data, "rebranding");
-        if (legacyBrand) {
-          rawRebrandingKey = legacyBrand;
-        } else if (incomingBrandExplicit && !isCoreBrandLabel(incomingBrandExplicit)) {
-          rawRebrandingKey = incomingBrandExplicit;
-        }
-      }
+      if (
+        "rebrandingKey" in (data as any) ||
+        "rebranding_key" in (data as any) ||
+        "RebrandingKey" in (data as any) ||
+        "rebrandingkey" in (data as any)
+      ) {
+        rawRebrandingKey =
+          typeof (data as any).rebrandingKey === "string"
+            ? String((data as any).rebrandingKey)
+            : typeof (data as any).rebranding_key === "string"
+              ? String((data as any).rebranding_key)
+              : typeof (data as any).rebrandingkey === "string"
+                ? String((data as any).rebrandingkey)
+                : typeof (data as any).RebrandingKey === "string"
+                  ? String((data as any).RebrandingKey)
+                  : "";
+        rawRebrandingKey = rawRebrandingKey.trim();
 
-      if (rawRebrandingKey !== currentRawRebrandingKey) {
+        // Allow empty string to explicitly clear any previous rebranding state.
         setRebrandingKey(rawRebrandingKey);
+      } else if ("rebranding" in (data as any)) {
+        // Legacy support: some older Wix pages may still send { rebranding: "BrandName" }.
+        rawRebrandingKey = typeof (data as any).rebranding === "string" ? String((data as any).rebranding).trim() : "";
+        if (rawRebrandingKey) setRebrandingKey(rawRebrandingKey);
       }
 
       const rkParts = parseRebrandingKey(rawRebrandingKey);
-      const rebrandSlugFromMessage = normalizeRebrandingSlug(rkParts?.rebranding || "");
+      const payloadHasBrandIdentity =
+        "rebrandingKey" in (data as any) ||
+        "rebranding_key" in (data as any) ||
+        "RebrandingKey" in (data as any) ||
+        "rebrandingkey" in (data as any) ||
+        "rebranding" in (data as any) ||
+        "brand" in (data as any) ||
+        "companyName" in (data as any) ||
+        "company_name" in (data as any) ||
+        "company" in (data as any);
+      const effectiveIncomingBrandName = String(rkParts?.rebranding || incomingBrandName || "").trim();
+      const rebrandSlugFromMessage = normalizeRebrandingSlug(effectiveIncomingBrandName);
+      if (effectiveIncomingBrandName) {
+        setPayloadBrandName(effectiveIncomingBrandName);
+      } else if (payloadHasBrandIdentity) {
+        setPayloadBrandName("");
+      }
 
-
-
-
+      const hasMemberIdField = "memberId" in (data as any) || "member_id" in (data as any);
       const incomingMemberId =
         typeof (data as any).memberId === "string"
           ? String((data as any).memberId).trim()
           : typeof (data as any).member_id === "string"
             ? String((data as any).member_id).trim()
             : "";
-      setMemberId(incomingMemberId);
+      if (hasMemberIdField) {
+        setMemberId(incomingMemberId);
+      }
+      const effectiveMemberId = hasMemberIdField
+        ? incomingMemberId
+        : String(memberIdRef.current || "").trim();
 
+      const hasDisplayNameField =
+        "displayName" in (data as any) ||
+        "display_name" in (data as any) ||
+        "userName" in (data as any) ||
+        "user_name" in (data as any) ||
+        "username" in (data as any);
       const incomingDisplayName =
         typeof (data as any).displayName === "string"
           ? String((data as any).displayName).trim()
@@ -8380,7 +8483,9 @@ useEffect(() => {
                 : typeof (data as any).username === "string"
                   ? String((data as any).username).trim()
                   : "";
-      setPayloadUserDisplayName(incomingDisplayName);
+      if (hasDisplayNameField) {
+        setPayloadUserDisplayName(incomingDisplayName);
+      }
 
       const incomingLanguageRaw =
         typeof (data as any).preferredLanguage === "string"
@@ -8412,58 +8517,61 @@ useEffect(() => {
       // (Wix planName may be the rebrand site's plan names like "Supreme").
       const mappedPlanFromKey = normalizePlanName(String(rkParts?.elaraloPlanMap || ""));
       const hasEntitledPlan = Boolean(String(mappedPlanFromKey || incomingPlan || "").trim());
-      const effectivePlan: PlanName = hasEntitledPlan ? (mappedPlanFromKey || incomingPlan) : "Trial";
+      const payloadHasPlanContext = Boolean(rawRebrandingKey) || Boolean(mappedPlanFromKey) || Boolean(incomingPlanRaw) || incomingLoggedIn === false;
+      const effectivePlan: PlanName = hasEntitledPlan
+        ? (mappedPlanFromKey || incomingPlan)
+        : (payloadHasPlanContext ? "Trial" : (latestPlanNameRef.current || "Trial"));
       setPlanName(effectivePlan);
 
       // Display the rebranding site's plan label when provided (e.g., "Supreme"),
       // but only for logged-in members (Free Trial ignores plan labels by design).
-      const planLabel = incomingMemberId ? String(rkParts?.plan || "").trim() : "";
-      setPlanLabelOverride(planLabel);
+      const planLabel = effectiveMemberId ? String(rkParts?.plan || "").trim() : "";
+      setPlanLabelOverride((prev) => {
+        if (incomingLoggedIn === false || !effectiveMemberId) return "";
+        return planLabel || prev;
+      });
 
-      const incomingCompanion = getPostedString(
-        data,
-        "companion",
-        "avatar",
-        "companionName",
-        "companion_name",
-        "avatarName",
-        "avatar_name"
-      );
-      const currentCompanionRaw =
-        String(companionKeyRawRef.current || companionKeyRef.current || companionNameRef.current || "").trim();
-      const resolvedCompanionKey = incomingCompanion || currentCompanionRaw || "";
+      const incomingCompanion =
+        typeof (data as any).companion === "string"
+          ? String((data as any).companion).trim()
+          : typeof (data as any).companionName === "string"
+            ? String((data as any).companionName).trim()
+            : typeof (data as any).companion_name === "string"
+              ? String((data as any).companion_name).trim()
+              : "";
+      const incomingAvatarName =
+        typeof (data as any).avatar === "string"
+          ? String((data as any).avatar).trim()
+          : typeof (data as any).avatarName === "string"
+            ? String((data as any).avatarName).trim()
+            : typeof (data as any).avatar_name === "string"
+              ? String((data as any).avatar_name).trim()
+              : "";
+      const resolvedCompanionKey = incomingCompanion || incomingAvatarName || "";
       const { baseKey } = splitCompanionKey(resolvedCompanionKey);
 
       if (resolvedCompanionKey) {
         setCompanionKeyRaw(resolvedCompanionKey);
         const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
-        setCompanionKey(parsed.key);
-        setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
-        armStartupOverlay(parsed.first || DEFAULT_COMPANION_NAME);
+        const resolvedCompanionName = parsed.first || incomingAvatarName || DEFAULT_COMPANION_NAME;
+        resolvedStartupName = resolvedCompanionName;
+        const resolvedCompanionMetaKey = parsed.key || resolvedCompanionKey;
+        setCompanionKey(resolvedCompanionMetaKey);
+        setCompanionName(resolvedCompanionName);
+        armStartupOverlay(resolvedCompanionName);
 
         // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
         setSessionState((prev) => ({
           ...prev,
-          companion: parsed.key,
-          companionName: parsed.key,
-          companion_name: parsed.key,
+          companion: resolvedCompanionMetaKey,
+          companionName: resolvedCompanionMetaKey,
+          companion_name: resolvedCompanionMetaKey,
+          avatar: resolvedCompanionName,
         }));
-      } else {
-        setCompanionKeyRaw("");
-        setCompanionKey("");
-        setCompanionName(DEFAULT_COMPANION_NAME);
-        armStartupOverlay(DEFAULT_COMPANION_NAME);
 
-        setSessionState((prev) => ({
-          ...prev,
-          companion: DEFAULT_COMPANION_NAME,
-          companionName: DEFAULT_COMPANION_NAME,
-          companion_name: DEFAULT_COMPANION_NAME,
-        }));
+        const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || resolvedCompanionName, rebrandSlugFromMessage);
+        pickFirstLoadableImage(avatarCandidates).then((picked) => setAvatarSrc(picked));
       }
-
-      const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || DEFAULT_COMPANION_NAME, rebrandSlugFromMessage);
-      pickFirstLoadableImage(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       // Brand-default starting mode:
       // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
@@ -8477,16 +8585,17 @@ useEffect(() => {
               ? String((data as any).modepill)
               : "";
 
+      const effectiveHasEntitledPlan = Boolean(String(effectivePlan || "").trim() && effectivePlan !== "Trial");
       const desiredStartModeRaw: Mode =
         modeFromModePill(incomingModePillRaw) ||
         modeFromElaraloPlanMap(rkParts?.elaraloPlanMap) ||
-        (hasEntitledPlan ? "intimate" : "romantic");
+        (effectiveHasEntitledPlan ? "intimate" : "romantic");
 
       // Requirement: the *Elaralo* entitlement plan determines how many mode pills exist.
       // The Wix `modePill` selects the initially-active mode (if allowed), but does NOT change how many pills are shown.
 
       const nextAllowed = clampAllowedModesForIdentity(
-        incomingMemberId,
+        effectiveMemberId,
         allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan)
       );
       const desiredStartMode: Mode =
@@ -8540,30 +8649,132 @@ useEffect(() => {
 
       // Mark handoff ready so the first audio-only TTS can deterministically use the selected companion voice.
       setHandoffReady(true);
+      markStartupIdentityResolved(resolvedStartupName);
     }
 
-    const requestInitialMemberPlan = (reason: string) => {
-      try {
-        if (typeof window === "undefined") return;
-        const msg = {
-          type: "REQUEST_MEMBER_PLAN",
-          reason: String(reason || "").slice(0, 64),
-          ts: Date.now(),
-        };
-        window.parent?.postMessage(JSON.stringify(msg), "*");
-      } catch (e) {
-        // ignore
-      }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [getMemberPlanCacheKey, markStartupIdentityResolved]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!isEmbedded) return;
+    if (startupIdentityResolved) return;
+
+    try {
+      const cacheKey = getMemberPlanCacheKey();
+      const cachedRaw = String(window.sessionStorage.getItem(cacheKey) || window.localStorage.getItem(cacheKey) || "").trim();
+      if (!cachedRaw) return;
+      const cachedPayload = JSON.parse(cachedRaw);
+      if (!cachedPayload || typeof cachedPayload !== "object" || (cachedPayload as any).type !== "MEMBER_PLAN") return;
+      window.postMessage(cachedPayload, window.location.origin);
+    } catch (e) {
+      // ignore cache hydrate failures
+    }
+  }, [getMemberPlanCacheKey, isEmbedded, startupIdentityResolved]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!isEmbedded) return;
+    if (startupIdentityResolved) return;
+
+    let cancelled = false;
+    const startedAt = Date.now();
+
+    const requestNow = (reason: string) => {
+      if (cancelled || startupIdentityResolvedRef.current) return;
+      requestLatestMemberPlanFromParent(reason, { force: true });
     };
 
-    window.addEventListener("message", onMessage);
-    requestInitialMemberPlan("initial_load");
-    const initialRetryTimer = window.setTimeout(() => requestInitialMemberPlan("initial_retry"), 900);
-    return () => {
-      try { window.clearTimeout(initialRetryTimer); } catch (e) {}
-      window.removeEventListener("message", onMessage);
+    requestNow("bootstrap_init");
+    const interval = window.setInterval(() => {
+      if (cancelled || startupIdentityResolvedRef.current) return;
+      if (Date.now() - startedAt > 15000) {
+        try { window.clearInterval(interval); } catch (e) {}
+        return;
+      }
+      requestNow("bootstrap_poll");
+    }, 1000);
+
+    const onFocus = () => requestNow("bootstrap_focus");
+    const onPageShow = () => requestNow("bootstrap_pageshow");
+    const onVisible = () => {
+      try {
+        if (document.visibilityState === "visible") requestNow("bootstrap_visible");
+      } catch (e) {}
     };
-  }, []);
+
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("pageshow", onPageShow);
+    document.addEventListener("visibilitychange", onVisible);
+
+    return () => {
+      cancelled = true;
+      try { window.clearInterval(interval); } catch (e) {}
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("pageshow", onPageShow);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [isEmbedded, requestLatestMemberPlanFromParent, startupIdentityResolved]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!isEmbedded) return;
+    if (startupIdentityResolved) return;
+    if (!API_BASE) return;
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      if (cancelled || startupIdentityResolvedRef.current) return;
+
+      const embedCtx = getEmbedContext();
+      try {
+        const params = new URLSearchParams();
+        if (embedCtx.referrer) params.set("referrer", embedCtx.referrer);
+        if (embedCtx.parentOrigin) params.set("parent_origin", embedCtx.parentOrigin);
+        if (embedCtx.ancestorOrigins.length) params.set("ancestor_origins", JSON.stringify(embedCtx.ancestorOrigins));
+
+        const brandHint = String(payloadBrandName || parseRebrandingKey(rebrandingKey || "")?.rebranding || rebranding || "").trim();
+        if (brandHint && brandHint.toLowerCase() !== DEFAULT_COMPANY_NAME.toLowerCase()) {
+          params.set("brand_hint", brandHint);
+        }
+
+        const res = await fetch(`${API_BASE}/mappings/bootstrap?${params.toString()}`, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        const data = await res.json().catch(() => ({} as any));
+        if (cancelled || startupIdentityResolvedRef.current) return;
+
+        if (res.ok && data && (Boolean(data.ok) || Boolean(data.found)) && data.brand && data.avatar) {
+          window.postMessage({
+            type: "MEMBER_PLAN",
+            loggedIn,
+            planName: String(planName || "").trim(),
+            memberId: String(memberIdRef.current || "").trim(),
+            rebrandingKey: String(data.rebrandingKey || data.brand || "").trim(),
+            rebranding: String(data.brand || "").trim(),
+            brand: String(data.brand || "").trim(),
+            avatar: String(data.avatar || "").trim(),
+            companion: String(data.avatar || "").trim(),
+            companionName: String(data.avatar || "").trim(),
+          }, window.location.origin);
+          return;
+        }
+      } catch (e) {
+        // ignore bootstrap fallback failures
+      }
+
+      startupIdentityResolvedRef.current = true;
+      setStartupIdentityResolved(true);
+      startStartupOverlayCountdown();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      try { window.clearTimeout(timer); } catch (e) {}
+    };
+  }, [API_BASE, getEmbedContext, isEmbedded, loggedIn, payloadBrandName, planName, rebranding, rebrandingKey, startStartupOverlayCountdown, startupIdentityResolved]);
 
   async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
@@ -11325,25 +11536,23 @@ const modePillControls = (
       pointerEvents: "all",
     }}
   >
-    {startupOverlayName ? (
-      <div
-        style={{
-          padding: "12px 16px",
-          borderRadius: 14,
-          background: "#111827",
-          color: "#fff",
-          border: "1px solid rgba(255,255,255,0.18)",
-          boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
-          fontSize: 16,
-          fontWeight: 700,
-          letterSpacing: 0.2,
-          maxWidth: "min(92vw, 520px)",
-          textAlign: "center",
-        }}
-      >
-        ...waiting on {startupOverlayName}
-      </div>
-    ) : null}
+    <div
+      style={{
+        padding: "12px 16px",
+        borderRadius: 14,
+        background: "#111827",
+        color: "#fff",
+        border: "1px solid rgba(255,255,255,0.18)",
+        boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
+        fontSize: 16,
+        fontWeight: 700,
+        letterSpacing: 0.2,
+        maxWidth: "min(92vw, 520px)",
+        textAlign: "center",
+      }}
+    >
+      {startupOverlayName ? `...waiting on ${startupOverlayName}` : "Loading Connect..."}
+    </div>
   </div>
 ) : null}
       {/* Hidden audio element for audio-only TTS (mic mode) */}

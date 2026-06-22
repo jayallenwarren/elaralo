@@ -1485,6 +1485,247 @@ def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any
     return _COMPANION_MAPPINGS.get((b, a))
 
 
+def _compact_brand_key(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+
+
+def _brand_hint_candidates_from_host(referrer_host: str) -> List[str]:
+    host = str(referrer_host or "").strip().lower()
+    if not host:
+        return []
+    host = host.split(":", 1)[0].strip(". ")
+    if host.startswith("www."):
+        host = host[4:]
+
+    out: List[str] = []
+
+    def _add(v: str) -> None:
+        s = str(v or "").strip().lower().strip(". ")
+        if not s:
+            return
+        if s not in out:
+            out.append(s)
+
+    _add(host)
+    parts = [p for p in host.split(".") if p]
+    if len(parts) >= 2:
+        _add(parts[-2])
+        _add(".".join(parts[-2:]))
+    for p in parts:
+        if p in {"www", "com", "net", "org", "io", "co", "app", "site", "online", "ai"}:
+            continue
+        _add(p)
+    return out
+
+
+def _infer_unique_avatar_for_brand(brand: str) -> str:
+    b = _norm_key(brand)
+    if not b:
+        return ""
+    seen: Dict[str, str] = {}
+    for (brand_key, avatar_key), row in (_COMPANION_MAPPINGS or {}).items():
+        if brand_key != b or not avatar_key:
+            continue
+        display = str((row or {}).get("avatar") or avatar_key).strip()
+        if not display:
+            continue
+        sig = display.lower()
+        if sig not in seen:
+            seen[sig] = display
+        if len(seen) > 1:
+            return ""
+    return next(iter(seen.values()), "") if len(seen) == 1 else ""
+
+
+def _bootstrap_brand_avatar_from_referrer(referrer_host: str = "", brand_hint: str = "") -> Dict[str, Any]:
+    candidates = _brand_hint_candidates_from_host(referrer_host)
+    bh = str(brand_hint or "").strip()
+    if bh and bh.lower() not in {c.lower() for c in candidates}:
+        candidates.insert(0, bh)
+
+    matched_brands: Dict[str, Dict[str, Any]] = {}
+    candidate_used = ""
+
+    for cand in candidates:
+        cand_norm = _norm_key(cand)
+        cand_compact = _compact_brand_key(cand)
+        if not cand_norm and not cand_compact:
+            continue
+        local_matches: Dict[str, Dict[str, Any]] = {}
+        for (_brand_key, _avatar_key), row in (_COMPANION_MAPPINGS or {}).items():
+            if not isinstance(row, dict):
+                continue
+            display_brand = str(row.get("brand") or _brand_key or "").strip()
+            if not display_brand:
+                continue
+            brand_norm = _norm_key(display_brand)
+            brand_compact = _compact_brand_key(display_brand)
+            if cand_norm and brand_norm == cand_norm:
+                local_matches[brand_norm] = row
+                continue
+            if cand_compact and brand_compact == cand_compact:
+                local_matches[brand_norm] = row
+                continue
+        if local_matches:
+            matched_brands = local_matches
+            candidate_used = cand
+            break
+
+    if not matched_brands:
+        return {
+            "found": False,
+            "reason": "no_brand_match",
+            "referrer_host": str(referrer_host or "").strip(),
+            "brand_hint": str(brand_hint or "").strip(),
+        }
+
+    if len(matched_brands) != 1:
+        return {
+            "found": False,
+            "reason": "ambiguous_brand_match",
+            "referrer_host": str(referrer_host or "").strip(),
+            "brand_hint": str(brand_hint or "").strip(),
+            "candidate": candidate_used,
+            "brands": [str((row or {}).get("brand") or key or "").strip() for key, row in matched_brands.items()],
+        }
+
+    row = next(iter(matched_brands.values()))
+    brand = str((row or {}).get("brand") or "").strip()
+    if not brand:
+        return {
+            "found": False,
+            "reason": "matched_brand_missing_display_name",
+            "referrer_host": str(referrer_host or "").strip(),
+            "brand_hint": str(brand_hint or "").strip(),
+            "candidate": candidate_used,
+        }
+
+    avatar = _infer_unique_avatar_for_brand(brand)
+    if not avatar:
+        avatar = str((row or {}).get("avatar") or "").strip()
+
+    if not avatar:
+        return {
+            "found": False,
+            "reason": "no_unique_avatar_for_brand",
+            "referrer_host": str(referrer_host or "").strip(),
+            "brand_hint": str(brand_hint or "").strip(),
+            "candidate": candidate_used,
+            "brand": brand,
+        }
+
+    matched = _lookup_companion_mapping(brand, avatar) or row or {}
+    return {
+        "found": True,
+        "ok": True,
+        "referrer_host": str(referrer_host or "").strip(),
+        "brand_hint": str(brand_hint or "").strip(),
+        "candidate": candidate_used,
+        "brand": brand,
+        "avatar": avatar,
+        "companion": avatar,
+        "rebrandingKey": brand,
+        "phonetic": str((matched or {}).get("phonetic") or "").strip(),
+        "channel_cap": str((matched or {}).get("channel_cap") or "").strip(),
+        "live": str((matched or {}).get("live") or "").strip(),
+        "source": "companion_mappings",
+    }
+
+
+def _embed_candidate_hosts(
+    referrer_host: str = "",
+    referrer: str = "",
+    parent_origin: str = "",
+    ancestor_origins: str = "",
+) -> List[str]:
+    out: List[str] = []
+
+    def _add(raw: Any) -> None:
+        txt = str(raw or "").strip()
+        if not txt:
+            return
+        try:
+            parsed = urlparse(txt)
+            if parsed.scheme and parsed.netloc:
+                txt = str(parsed.hostname or "").strip()
+        except Exception:
+            pass
+        txt = txt.split(":", 1)[0].strip().lower().strip(". ")
+        if txt and txt not in out:
+            out.append(txt)
+
+    _add(referrer_host)
+    _add(referrer)
+    _add(parent_origin)
+
+    raw_anc = str(ancestor_origins or "").strip()
+    if raw_anc:
+        items: List[str] = []
+        try:
+            parsed = json.loads(raw_anc)
+            if isinstance(parsed, list):
+                items = [str(x or "").strip() for x in parsed if str(x or "").strip()]
+            elif isinstance(parsed, str):
+                items = [parsed]
+        except Exception:
+            items = [p for p in re.split(r"[\s,]+", raw_anc) if p]
+        for item in items:
+            _add(item)
+
+    return out
+
+
+def _bootstrap_mapping_response(
+    referrer_host: str = "",
+    brand_hint: str = "",
+    referrer: str = "",
+    parent_origin: str = "",
+    ancestor_origins: str = "",
+) -> Dict[str, Any]:
+    hosts = _embed_candidate_hosts(
+        referrer_host=referrer_host,
+        referrer=referrer,
+        parent_origin=parent_origin,
+        ancestor_origins=ancestor_origins,
+    )
+
+    tried: List[str] = []
+    best: Dict[str, Any] = {}
+    for host in hosts or [""]:
+        tried.append(str(host or "").strip())
+        res = _bootstrap_brand_avatar_from_referrer(host, brand_hint)
+        if bool((res or {}).get("found")):
+            out = dict(res or {})
+            out["ok"] = True
+            out["hosts_tried"] = [h for h in tried if h]
+            return out
+        if not best:
+            best = dict(res or {})
+
+    out = dict(best or _bootstrap_brand_avatar_from_referrer("", brand_hint) or {})
+    out["ok"] = bool(out.get("found"))
+    out["hosts_tried"] = [h for h in tried if h]
+    return out
+
+
+@app.get("/mappings/bootstrap")
+@app.get("/embed/resolve")
+async def get_bootstrap_mapping(
+    referrer_host: str = "",
+    brand_hint: str = "",
+    referrer: str = "",
+    parent_origin: str = "",
+    ancestor_origins: str = "",
+) -> Dict[str, Any]:
+    return _bootstrap_mapping_response(
+        referrer_host=referrer_host,
+        brand_hint=brand_hint,
+        referrer=referrer,
+        parent_origin=parent_origin,
+        ancestor_origins=ancestor_origins,
+    )
+
+
 @app.on_event("startup")
 async def _startup_load_companion_mappings() -> None:
     # Load once at startup; do not block on errors.
@@ -4286,12 +4527,8 @@ def _parse_companion_meta(raw: Any) -> Dict[str, str]:
 
 
 def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
-    comp = _parse_companion_meta(
-        session_state.get("companion")
-        or session_state.get("companionName")
-        or session_state.get("companion_name")
-    )
-    name = comp.get("first_name") or "Elara"
+    comp = _parse_companion_meta(_extract_companion_raw(session_state))
+    name = comp.get("first_name") or _avatar_from_session_state(session_state) or "Elara"
 
     lines = [
         f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
@@ -5626,10 +5863,8 @@ _HCO_BLOCKS_CACHE_LOCK = threading.RLock()
 def _avatar_from_session_state(session_state: Dict[str, Any]) -> str:
     """Extract avatar/companion first name from session_state."""
     raw = (
-        session_state.get("avatar")
-        or session_state.get("companionName")
-        or session_state.get("companion")
-        or session_state.get("companion_name")
+        _session_get_str(session_state, "avatar", "avatarName", "avatar_name")
+        or _session_get_str(session_state, "companionName", "companion", "companion_name")
         or ""
     )
     meta = _parse_companion_meta(raw)
@@ -5648,76 +5883,29 @@ def _avatar_from_session_state(session_state: Dict[str, Any]) -> str:
 
 
 
-def _is_core_brand_name(raw: Any) -> bool:
-    txt = str(raw or "").strip().lower()
-    return (not txt) or txt in ("elaralo", "core")
-
-
-
-def _brand_from_rebranding_key(session_state: Dict[str, Any]) -> str:
-    rk = _extract_rebranding_key(session_state if isinstance(session_state, dict) else {})
-    parsed = _parse_rebranding_key(rk) if rk else {}
-    return str(parsed.get("rebranding") or "").strip()
-
-
-
-def _member_rebranding_brand_from_member_id(member_id: str) -> str:
-    mid = str(member_id or "").strip()
-    if not mid or mid.lower().startswith("anon:"):
-        return ""
-    try:
-        cfg = _member_rebranding_get_paygo_config(mid)
-    except Exception:
-        cfg = {}
-    rk = str((cfg or {}).get("rebranding_key") or "").strip()
-    parsed = _parse_rebranding_key(rk) if rk else {}
-    return str(parsed.get("rebranding") or "").strip()
-
-
-
-def _infer_unique_avatar_for_brand(brand: str) -> str:
-    b = _norm_key(brand)
-    if not b:
-        return ""
-    seen: Dict[str, str] = {}
-    for (brand_key, avatar_key), row in (_COMPANION_MAPPINGS or {}).items():
-        if brand_key != b or not avatar_key:
-            continue
-        display = str((row or {}).get("avatar") or avatar_key).strip()
-        if not display:
-            continue
-        sig = display.lower()
-        if sig not in seen:
-            seen[sig] = display
-        if len(seen) > 1:
-            return ""
-    return next(iter(seen.values()), "") if len(seen) == 1 else ""
-
-
 
 def _brand_from_session_state(session_state: Dict[str, Any]) -> str:
     """Extract brand/rebranding name from session_state."""
-    s = session_state if isinstance(session_state, dict) else {}
-    brand = (
-        _session_get_str(s, "brand", "companyName", "company_name", "company")
-        or _session_get_str(s, "rebranding", "rebrand", "rebrandingName")
+    raw = (
+        _session_get_str(session_state, "brand", "brandName", "companyName", "company_name", "company")
+        or _session_get_str(session_state, "rebranding", "rebrand", "rebrandingName")
         or ""
     )
-    brand = str(brand or "").strip()
-    rk_brand = _brand_from_rebranding_key(s)
-    if (_is_core_brand_name(brand) or not brand) and rk_brand and not _is_core_brand_name(rk_brand):
-        brand = rk_brand
-    if (_is_core_brand_name(brand) or not brand):
-        member_brand = _member_rebranding_brand_from_member_id(_extract_member_id(s) or "")
-        if member_brand and not _is_core_brand_name(member_brand):
-            brand = member_brand
-    return str(brand or "").strip()
-
+    if not raw:
+        rk = _extract_rebranding_key(session_state)
+        parsed = _parse_rebranding_key(rk) if rk else {}
+        raw = str(parsed.get("rebranding") or "").strip()
+    return str(raw or "").strip()
 
 
 def _resolved_tts_brand_avatar(session_state: Dict[str, Any]) -> Tuple[str, str]:
     """Resolve brand/avatar robustly for TTS pronunciation lookups."""
-    return _brand_avatar_from_session_state(session_state if isinstance(session_state, dict) else {})
+    s = session_state if isinstance(session_state, dict) else {}
+    brand = _brand_from_session_state(s) or str(s.get("brand") or s.get("companyName") or "").strip()
+    avatar = str(s.get("avatar") or "").strip()
+    if not avatar:
+        avatar = _avatar_from_session_state(s)
+    return brand, avatar
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -7980,11 +8168,7 @@ async def chat(request: Request):
         session_state_out["model_provider"] = "host"
         session_state_out["model"] = "host"
         session_state_out["host_override_active"] = True
-        session_state_out["companion_meta"] = _parse_companion_meta(
-            session_state_out.get("companion")
-            or session_state_out.get("companionName")
-            or session_state_out.get("companion_name")
-        )
+        session_state_out["companion_meta"] = _parse_companion_meta(_extract_companion_raw(session_state_out))
         # Universal first-turn friend photo is auto-delivered once per 24h.
         friend_first_turn_content: Optional[Dict[str, Any]] = None
         try:
@@ -8253,11 +8437,7 @@ async def chat(request: Request):
     else:
         session_state_out["model"] = (os.getenv("OPENAI_MODEL", "") or "gpt-4o").strip()
     session_state_out["pending_consent"] = None if intimate_allowed else session_state_out.get("pending_consent")
-    session_state_out["companion_meta"] = _parse_companion_meta(
-        session_state_out.get("companion")
-        or session_state_out.get("companionName")
-        or session_state_out.get("companion_name")
-    )
+    session_state_out["companion_meta"] = _parse_companion_meta(_extract_companion_raw(session_state_out))
 
 
 
@@ -8352,8 +8532,8 @@ async def llm_warm(raw: Dict[str, Any] = Body(...)):
     if provider not in ("openai", "xai"):
         provider = "xai" if mode == "intimate" else "openai"
 
-    brand_name, avatar_name = _brand_avatar_from_session_state(session_state)
-    brand = str(brand_name or "").strip().lower()
+    avatar_name = _avatar_from_session_state(session_state)
+    brand = str(session_state.get("brand") or "").strip().lower()
 
     warm_ttl_s = float(os.getenv("LLM_WARM_TTL_S", "45") or "45")
     warm_key = f"{provider}|{mode}|{brand}|{(avatar_name or '').strip().lower()}"
@@ -9159,22 +9339,11 @@ def _ai_override_get_host(session_id: str) -> str:
 
 def _brand_avatar_from_session_state(session_state: Dict[str, Any]) -> Tuple[str, str]:
     s = session_state if isinstance(session_state, dict) else {}
-
-    # Prefer explicit brand/avatar fields set by the frontend, but recover from white-label
-    # handoff regressions by consulting RebrandingKey + the stored member snapshot when needed.
     brand = _brand_from_session_state(s)
-    avatar = str(s.get("avatar") or "").strip()
-
+    avatar = str(s.get("avatar") or s.get("avatarName") or s.get("avatar_name") or "").strip()
     if not avatar:
         avatar = _avatar_from_session_state(s)
-
-    inferred_avatar = ""
-    if brand and (not avatar or avatar.strip().lower() == "elara") and not _is_core_brand_name(brand):
-        inferred_avatar = _infer_unique_avatar_for_brand(brand)
-    if inferred_avatar:
-        avatar = inferred_avatar
-
-    return str(brand or "").strip(), str(avatar or "").strip()
+    return brand, avatar
 
 
 def _ai_override_get_session(session_id: str) -> Optional[Dict[str, Any]]:
@@ -9787,6 +9956,9 @@ def _extract_companion_raw(session_state: Dict[str, Any]) -> str:
         session_state.get("companion")
         or session_state.get("companionName")
         or session_state.get("companion_name")
+        or session_state.get("avatar")
+        or session_state.get("avatarName")
+        or session_state.get("avatar_name")
         or ""
     )
     return str(companion).strip() if companion is not None else ""
@@ -9980,7 +10152,7 @@ async def save_chat_summary(request: Request):
         "session_id": session_id,
         "member_id": session_state.get("memberId") or session_state.get("member_id"),
         "user_name": _extract_user_name(session_state),
-        "companion": session_state.get("companion") or session_state.get("companionName") or session_state.get("companion_name"),
+        "companion": _extract_companion_raw(session_state),
         "summary": summary,
     }
     _CHAT_SUMMARY_STORE[key] = record
@@ -9989,8 +10161,8 @@ async def save_chat_summary(request: Request):
     # Persist each saved summary snapshot for Host session insights
     try:
         _summary_history_insert(
-            brand=str(session_state.get("brand") or ""),
-            avatar=str(session_state.get("avatar") or ""),
+            brand=_brand_from_session_state(session_state),
+            avatar=_avatar_from_session_state(session_state),
             member_id=str(session_state.get("memberId") or session_state.get("member_id") or ""),
             user_name=_extract_user_name(session_state),
             session_id=session_id,
