@@ -6361,6 +6361,8 @@ useEffect(() => {
       String(companionKey || "").trim() || String(companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
     const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
     const planNameForBackend = planName;
+    const userDisplayNameForBackend = buildHostReadableViewerName(mid);
+    const hostMemberIdForBackend = String(mappedHostMemberId || "").trim();
 
     return {
       ...sessionState,
@@ -6376,6 +6378,15 @@ useEffect(() => {
       rebrandingKey: rebrandingKeyForBackend,
       rebranding_key: rebrandingKeyForBackend,
       rebranding: String(rebranding || "").trim(),
+      user_name: userDisplayNameForBackend,
+      username: userDisplayNameForBackend,
+      display_name: userDisplayNameForBackend,
+      hostMemberId: hostMemberIdForBackend,
+      host_member_id: hostMemberIdForBackend,
+      isHostUser: isHost,
+      is_host_user: isHost,
+      loggedIn,
+      logged_in: loggedIn,
       translator_enabled: translatorEnabled,
       translation_enabled: translatorEnabled,
       translationEnabled: translatorEnabled,
@@ -6404,7 +6415,7 @@ useEffect(() => {
       assistant_source_language_name: assistantSpeechLanguageName,
       assistantSourceLanguageName: assistantSpeechLanguageName,
     };
-  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, rebrandingKey, planName, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
+  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, rebrandingKey, planName, buildHostReadableViewerName, mappedHostMemberId, isHost, loggedIn, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
 
   useEffect(() => {
     if (!API_BASE) return;
@@ -9017,7 +9028,7 @@ const brandKey = safeBrandKey(rawBrand);
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
 const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
 
-// Viewer/User display name for host readability (used in Host Console + summaries).
+// Viewer/User session username/display name for host readability (used in Host Console + summaries).
 // Do NOT prompt here; this must be safe during normal chat.
 const userDisplayNameForBackend = buildHostReadableViewerName(memberIdForBackend);
 
@@ -9057,10 +9068,16 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
   // Legacy support: backend may still look at "rebranding" if RebrandingKey is absent
   rebranding: (rebranding || "").trim(),
 
-  // User display name (optional). Backend uses this ONLY for Host Console readability.
+  // User session username/display name for chat identity awareness and Host Console readability. This is not necessarily the user's real name, stage name, or preferred persona name, and does not override identity facts in AI Guidelines.
   user_name: userDisplayNameForBackend,
   username: userDisplayNameForBackend,
   display_name: userDisplayNameForBackend,
+  hostMemberId: String(mappedHostMemberId || "").trim(),
+  host_member_id: String(mappedHostMemberId || "").trim(),
+  isHostUser: isHost,
+  is_host_user: isHost,
+  loggedIn,
+  logged_in: loggedIn,
 
   translator_enabled: translatorEnabled,
   translation_enabled: translatorEnabled,
@@ -9214,6 +9231,12 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
       user_name: userDisplayNameForBackend,
       username: userDisplayNameForBackend,
       display_name: userDisplayNameForBackend,
+      hostMemberId: String(mappedHostMemberId || "").trim(),
+      host_member_id: String(mappedHostMemberId || "").trim(),
+      isHostUser: isHost,
+      is_host_user: isHost,
+      loggedIn,
+      logged_in: loggedIn,
       translator_enabled: translatorEnabled,
       translation_enabled: translatorEnabled,
       translationEnabled: translatorEnabled,

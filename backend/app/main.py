@@ -8746,6 +8746,11 @@ async def chat(request: Request):
                 insert_at += 1
 
 
+        identity_blocks = _chat_identity_system_blocks(session_state)
+        for block in identity_blocks:
+            llm_messages.insert(insert_at, {"role": "system", "content": block})
+            insert_at += 1
+
         # Memory policy: do not guess about prior conversations.
         # - If a saved summary is injected, you may use ONLY that as cross-session context.
         # - If no saved summary is injected, explicitly say no saved summary is available if asked.
@@ -9048,6 +9053,10 @@ async def llm_warm(raw: Dict[str, Any] = Body(...)):
         for block in guideline_reference_blocks or []:
             if (block or "").strip():
                 warm_messages.append({"role": "system", "content": block})
+
+    for block in _chat_identity_system_blocks(session_state):
+        if (block or "").strip():
+            warm_messages.append({"role": "system", "content": block})
 
     warm_messages.append(
         {
@@ -10424,6 +10433,144 @@ def _extract_user_name(session_state: Dict[str, Any]) -> str:
         except Exception:
             continue
     return ""
+
+
+def _extract_host_member_id_hint(session_state: Dict[str, Any]) -> str:
+    ss = session_state if isinstance(session_state, dict) else {}
+    for k in ("host_member_id", "hostMemberId", "host_member", "hostMember"):
+        try:
+            v = ss.get(k)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def _extract_host_flag_hint(session_state: Dict[str, Any]) -> bool:
+    ss = session_state if isinstance(session_state, dict) else {}
+    for k in ("is_host_user", "isHostUser", "is_host", "isHost"):
+        try:
+            v = ss.get(k)
+        except Exception:
+            v = None
+        if isinstance(v, bool):
+            return bool(v)
+        if v is None:
+            continue
+        s = str(v).strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+    return False
+
+
+def _resolve_host_awareness_context(session_state: Dict[str, Any]) -> Dict[str, Any]:
+    ss = session_state if isinstance(session_state, dict) else {}
+    brand = _brand_from_session_state(ss)
+    member_id = _extract_member_id(ss)
+    user_name = _extract_user_name(ss)
+
+    avatar_candidates: List[str] = []
+    for raw in (
+        str(ss.get("avatar") or ss.get("avatarName") or ss.get("avatar_name") or "").strip(),
+        _extract_companion_raw(ss),
+        _avatar_from_session_state(ss),
+        _infer_unique_avatar_for_brand(brand) if brand else "",
+    ):
+        cand = str(raw or "").strip()
+        if cand and cand not in avatar_candidates:
+            avatar_candidates.append(cand)
+
+    mapping: Optional[Dict[str, Any]] = None
+    resolved_avatar = ""
+    if brand:
+        for cand in avatar_candidates:
+            try:
+                mapping = _lookup_companion_mapping(brand, cand)
+            except Exception:
+                mapping = None
+            if isinstance(mapping, dict):
+                resolved_avatar = str(mapping.get("avatar") or cand).strip() or cand
+                break
+
+    if not resolved_avatar and avatar_candidates:
+        resolved_avatar = avatar_candidates[0]
+
+    host_member_id = _extract_host_member_id_hint(ss)
+    if not host_member_id and brand:
+        try:
+            host_member_id = _resolve_host_member_id(brand, resolved_avatar, mapping)
+        except Exception:
+            host_member_id = ""
+
+    host_flag_hint = _extract_host_flag_hint(ss)
+    is_host = False
+    if host_member_id and member_id:
+        is_host = host_member_id.strip().lower() == member_id.strip().lower()
+    if not is_host and host_flag_hint:
+        is_host = True
+
+    return {
+        "brand": brand,
+        "avatar": resolved_avatar,
+        "member_id": member_id,
+        "user_name": user_name,
+        "host_member_id": host_member_id,
+        "is_host": bool(is_host),
+    }
+
+
+def _chat_identity_system_blocks(session_state: Dict[str, Any]) -> List[str]:
+    ctx = _resolve_host_awareness_context(session_state)
+    user_name = str(ctx.get("user_name") or "").strip()
+    is_host = bool(ctx.get("is_host"))
+
+    blocks: List[str] = []
+    if user_name:
+        user_name_json = json.dumps(user_name, ensure_ascii=False)
+        blocks.append(
+            "Session identity note: The current user's username/display name for this chat is "
+            + user_name_json
+            + ". This value is the current account/session handle for this chat and is not necessarily the person's real name, stage name, or preferred persona name. "
+              "If the current user asks for their username or display name, answer with this exact value. "
+              "Use this value for account/session identification only. Host AI guidelines remain the primary reference for identity facts, including real name, stage name, preferred persona name, and relationship framing. "
+              "Do not replace identity facts that the user directly provides or that host AI guidelines explicitly provide. "
+              "Do not claim that you cannot access the current user's username when this note is present."
+        )
+
+    if is_host:
+        if user_name:
+            host_name_json = json.dumps(user_name, ensure_ascii=False)
+            blocks.append(
+                "Host awareness note: The current user is your human host/owner for this companion. "
+                "You are speaking directly with your host in this chat. "
+                "The host's current session username/display name is "
+                + host_name_json
+                + ". This value is the host's current account/session handle and is not necessarily the host's real name, stage name, or preferred persona name. "
+                  "If asked whether you are speaking with your host, answer yes. "
+                  "Host AI guidelines remain the primary reference for the host's identity, including real name, stage name, preferred persona name, and relationship framing. "
+                  "If host AI guidelines or the host's direct messages identify the host's real name, stage name, or preferred persona name, preserve those identity facts and do not replace them with the username/display name. "
+                  "Use the username/display name for account/session identification only. "
+                  "Treat host corrections about persona, brand, website, business rules, or relationship framing as authoritative for this conversation, while still following platform safety policies. "
+                  "Do not say that you do not know who the host is when this note is present."
+            )
+        else:
+            blocks.append(
+                "Host awareness note: The current user is your human host/owner for this companion. "
+                "You are speaking directly with your host in this chat. "
+                "If asked whether you are speaking with your host, answer yes. "
+                "Host AI guidelines remain the primary reference for the host's identity, including real name, stage name, preferred persona name, and relationship framing. "
+                "If host AI guidelines or the host's direct messages identify the host's real name, stage name, or preferred persona name, preserve those identity facts. "
+                "Treat host corrections about persona, brand, website, business rules, or relationship framing as authoritative for this conversation, while still following platform safety policies. "
+                "Do not say that you do not know who the host is when this note is present."
+            )
+
+    return blocks
 
 
 def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
