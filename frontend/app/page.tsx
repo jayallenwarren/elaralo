@@ -1219,6 +1219,32 @@ function platformContentPlaceholder(contentText: string, meta: any): string {
   return fileName ? `Scheduled content was delivered by the platform: ${fileName}.` : "Scheduled content was delivered by the platform.";
 }
 
+function extractDeliveredContentFileNamesFromMessages(messages: Msg[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  for (const m of messages || []) {
+    if (!m || typeof m !== "object") continue;
+    if (String((m as any).role || "") !== "assistant") continue;
+
+    const meta: any = (m as any).meta || {};
+    const content = String((m as any).content || "");
+    const isPlatformContent =
+      Boolean(meta?.contentDelivery) || /^Scheduled content was delivered by the platform\b/i.test(content.trim());
+    if (!isPlatformContent) continue;
+
+    const fileName = extractPlatformContentFileName(content, meta);
+    if (!fileName) continue;
+
+    const key = fileName.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(fileName.trim());
+  }
+
+  return out;
+}
+
 function normalizePlatformContentMessage(contentText: string, meta: any): string {
   const text = String(contentText || "").trim();
   if (!text) return platformContentPlaceholder(text, meta);
@@ -9210,6 +9236,8 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
 
     const userDisplayNameForBackend = buildHostReadableViewerName(memberIdForBackend);
 
+    const deliveredContentFilesForSummary = extractDeliveredContentFileNamesFromMessages(nextMessages);
+
     const stateToSendWithCompanion: SessionState = {
       ...stateToSend,
       companion: companionForBackend,
@@ -9264,6 +9292,8 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
       assistantSourceLanguageCode: assistantSpeechLanguageCode,
       assistant_source_language_name: assistantSpeechLanguageName,
       assistantSourceLanguageName: assistantSpeechLanguageName,
+      delivered_content_files: deliveredContentFilesForSummary,
+      deliveredContentFiles: deliveredContentFilesForSummary,
     };
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
@@ -9273,6 +9303,8 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
         session_id,
         reason: (reason || "manual_save").trim(),
         session_state: stateToSendWithCompanion,
+        delivered_content_files: deliveredContentFilesForSummary,
+        deliveredContentFiles: deliveredContentFilesForSummary,
         messages: nextMessages.map((m) => serializeMessageForBackend(m, { forSummary: true })),
       }),
     });

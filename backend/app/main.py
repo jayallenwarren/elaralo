@@ -5062,6 +5062,89 @@ def _repair_generated_summary_for_platform_content(summary: str, platform_filena
     return "Scheduled content was delivered by the platform: " + ", ".join(unique_files) + "."
 
 
+def _coerce_platform_content_filename_list(value: Any) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def _push(item: Any) -> None:
+        candidate = _normalize_platform_filename_candidate(str(item or ""))
+        if not candidate:
+            return
+        key = candidate.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(candidate)
+
+    if value is None:
+        return out
+
+    if isinstance(value, dict):
+        for key in ("files", "file_names", "fileNames", "names", "items"):
+            if key in value:
+                return _coerce_platform_content_filename_list(value.get(key))
+        return out
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _push(item)
+        return out
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return out
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                for item in parsed:
+                    _push(item)
+                return out
+        _push(raw)
+        return out
+
+    _push(value)
+    return out
+
+
+def _merge_platform_content_filename_lists(*values: Any) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        for name in _coerce_platform_content_filename_list(value):
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+    return out
+
+
+def _summary_mentions_platform_content_filename(summary: str, file_name: str) -> bool:
+    body = str(summary or "").lower()
+    target = _normalize_platform_filename_candidate(file_name).lower()
+    return bool(target) and (target in body)
+
+
+def _append_platform_content_note_to_summary(summary: str, platform_filenames: List[str]) -> str:
+    text = str(summary or "").strip()
+    unique_files = _merge_platform_content_filename_lists(platform_filenames)
+    if not unique_files:
+        return text
+
+    missing_files = [name for name in unique_files if not _summary_mentions_platform_content_filename(text, name)]
+    if not missing_files:
+        return text
+
+    note = f"Delivered content this session: {', '.join(missing_files)}."
+    if not text:
+        return note
+    return f"{text}\n\n{note}".strip()
+
+
 _USER_ATTACHMENT_BLOCK_RE = re.compile(
     r'(?is)(?:^|\n)\s*Attachment:\s*([^\n]*)\n\s*(https?://[^\s"\'<>]+)'
 )
@@ -10695,10 +10778,22 @@ async def save_chat_summary(request: Request):
 
     conversation_hash = _summary_history_compute_conversation_hash(convo_items)
 
+    requested_platform_filenames = _merge_platform_content_filename_lists(
+        raw.get("delivered_content_files"),
+        raw.get("deliveredContentFiles"),
+        session_state.get("delivered_content_files") if isinstance(session_state, dict) else None,
+        session_state.get("deliveredContentFiles") if isinstance(session_state, dict) else None,
+    )
+    platform_filenames = _merge_platform_content_filename_lists(
+        requested_platform_filenames,
+        _extract_platform_content_filenames(convo_items),
+    )
+
     sys = (
         "You are a concise assistant that creates a server-side chat summary for future context. "
         "Write a compact summary in English that captures: relationship tone, key facts, user preferences/boundaries, "
         "names/roles, and any commitments or plans. Avoid quoting long passages. "
+        "If scheduled/platform content was delivered during the session, explicitly mention the delivered file name(s). "
         "Output plain text only."
     )
 
@@ -10714,8 +10809,8 @@ async def save_chat_summary(request: Request):
         _dbg(debug, "Summary generation failed:", repr(e))
         return {"ok": False, "error_code": "summary_failed", "error": f"{type(e).__name__}: {e}"}
 
-    platform_filenames = _extract_platform_content_filenames(convo_items)
     summary = _repair_generated_summary_for_platform_content(summary, platform_filenames)
+    summary = _append_platform_content_note_to_summary(summary, platform_filenames)
     summary_header = _translation_header_for_summary(session_state)
     if summary_header:
         summary = f"{summary_header}\n\n{str(summary or '').strip()}".strip()
