@@ -2098,7 +2098,1327 @@ const smallBtn: React.CSSProperties = {
   justifyContent: "center",
   gap: 6,
 };
+
+
+type HOStep = "welcome" | "basics" | "photos" | "processing" | "review" | "completion" | "final_approval";
+
+type HOGenderModel = {
+  mode: "picklist" | "self_describe" | "prefer_not_to_say";
+  picklist_value: string;
+  custom_text: string;
+  display_value?: string;
+};
+
+type HOBasicForm = {
+  legal_name: string;
+  stage_name: string;
+  gender_model: HOGenderModel;
+  birthdate: string;
+  birth_city: string;
+  birth_state_region: string;
+  birth_country_name: string;
+  birth_country_code: string;
+  race_codes: string[];
+  race_self_describe: string;
+  ethnicity_primary_bucket: string;
+  ethnicity_labels: string[];
+  ethnicity_other_text: string;
+};
+
+type HOAssetRow = {
+  asset_id: string;
+  slot_key: string;
+  original_file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+  width?: number | null;
+  height?: number | null;
+  preview_url?: string;
+  validation_status?: string;
+  validation_errors?: string[];
+  validation_warnings?: string[];
+  required_slot?: boolean;
+};
+
+type HOSectionRow = {
+  section_key: string;
+  source_type?: string;
+  review_status?: string;
+  visibility?: string;
+  payload?: any;
+  provenance?: any;
+};
+
+type HOSessionEnvelope = {
+  ok?: boolean;
+  session_id?: string;
+  status?: string;
+  current_step?: string;
+  latest_saved_step?: string;
+  updated_at?: string;
+  created_at?: string;
+  display_name?: string;
+  basics?: any;
+  assets?: HOAssetRow[];
+  sections?: HOSectionRow[];
+  latest_job?: any;
+  required_slots?: Array<{ slot_key: string; label: string; required: boolean }>;
+  optional_slots?: Array<{ slot_key: string; label: string; required: boolean }>;
+  limited_ready?: boolean;
+  full_ready?: boolean;
+  limited_blockers?: string[];
+  full_blockers?: string[];
+  taxonomy?: any;
+  active_version_id?: string | null;
+  input_hash?: string;
+  photo_3d_opt_in?: boolean;
+};
+
+type HOReviewResponse = {
+  ok?: boolean;
+  session_id?: string;
+  status?: string;
+  sections?: HOSectionRow[];
+  nationalities?: { suggested?: string[]; host_confirmed?: string[] };
+  job?: any;
+};
+
+const HO_GENDER_OPTIONS = ["Woman", "Man", "Non-binary", "Another identity", "Prefer not to say"];
+const HO_RACE_OPTIONS = [
+  { code: "black_african_descent", label: "Black / African Descent" },
+  { code: "east_asian", label: "East Asian" },
+  { code: "south_asian", label: "South Asian" },
+  { code: "southeast_asian", label: "Southeast Asian" },
+  { code: "middle_eastern_north_african", label: "Middle Eastern / North African" },
+  { code: "native_indigenous", label: "Native / Indigenous" },
+  { code: "pacific_islander", label: "Pacific Islander" },
+  { code: "white", label: "White" },
+  { code: "another_race", label: "Another race / self-describe" },
+  { code: "prefer_not_to_say", label: "Prefer not to say" },
+];
+const HO_ETHNICITY_BUCKETS = [
+  { code: "african_african_diaspora", label: "African / African diaspora" },
+  { code: "arab_middle_eastern", label: "Arab / Middle Eastern" },
+  { code: "caribbean", label: "Caribbean" },
+  { code: "central_asian", label: "Central Asian" },
+  { code: "east_asian", label: "East Asian" },
+  { code: "european", label: "European" },
+  { code: "hispanic_latino", label: "Hispanic / Latino / Latina / Latine" },
+  { code: "indigenous", label: "Indigenous" },
+  { code: "jewish", label: "Jewish" },
+  { code: "north_african", label: "North African" },
+  { code: "pacific_islander", label: "Pacific Islander" },
+  { code: "south_asian", label: "South Asian" },
+  { code: "southeast_asian", label: "Southeast Asian" },
+  { code: "mixed_multicultural", label: "Mixed / Multicultural" },
+  { code: "other_self_describe", label: "Other / self-describe" },
+  { code: "prefer_not_to_say", label: "Prefer not to say" },
+];
+const HO_ETHNICITY_LABELS = [
+  "African-American / African diaspora", "Afro-Caribbean", "Arab", "Ashkenazi Jewish", "Chinese", "English",
+  "Ethiopian / Eritrean", "Filipino", "French", "German", "Greek", "Haitian", "Indian",
+  "Indigenous American / First Nations", "Indigenous Australian", "Irish", "Italian", "Jamaican", "Japanese",
+  "Korean", "Mexican", "Mixed European", "Mixed European-American", "Nigerian", "Pakistani",
+  "Persian / Iranian", "Polish", "Puerto Rican", "Scottish", "Slavic / Eastern European", "Somali",
+  "Syrian / Lebanese", "Vietnamese", "West African", "Other / self-describe",
+];
+const HO_REQUIRED_SLOTS = [
+  { slot_key: "headshot_front", label: "Headshot front", notes: "Neutral lighting. Unobstructed face. Plain or low-distraction background." },
+  { slot_key: "full_body_front", label: "Full body front", notes: "Entire body visible. Straight posture. Front-facing." },
+  { slot_key: "three_quarter_body", label: "Three-quarter body", notes: "Frame from roughly upper thigh or knees to head." },
+  { slot_key: "angle_left_45", label: "45-degree left", notes: "Natural pose. Do not turn into a full profile." },
+  { slot_key: "angle_right_45", label: "45-degree right", notes: "Natural pose. Do not turn into a full profile." },
+];
+const HO_OPTIONAL_SLOTS = [
+  { slot_key: "left_profile", label: "Left profile" },
+  { slot_key: "right_profile", label: "Right profile" },
+  { slot_key: "smiling_headshot", label: "Smiling headshot" },
+  { slot_key: "neutral_headshot", label: "Neutral-expression headshot" },
+  { slot_key: "extra_angle", label: "Extra angle" },
+];
+const HO_LATER_SECTION_CONFIG: Array<{ key: string; label: string; kind: "text" | "list" | "career" | "education"; example: string }> = [
+  { key: "education", label: "Education", kind: "education", example: "Example: Bachelor of Science in Marketing; University of South Carolina; 2020; consumer behavior, market research." },
+  { key: "career", label: "Career", kind: "career", example: "Example: Vice President of Brand Strategy; responsibilities, achievements, and current role details." },
+  { key: "likes", label: "Likes", kind: "list", example: "Example: International travel; luxury fashion; coastal living; wellness and fitness." },
+  { key: "dislikes", label: "Dislikes", kind: "list", example: "Example: Dishonesty; disorganization; poor communication; broken promises." },
+  { key: "hobbies", label: "Hobbies", kind: "list", example: "Example: Pilates; yoga; sailing; photography; interior design." },
+  { key: "lifestyle", label: "Lifestyle", kind: "text", example: "Example: Describe routine, wellness, schedule, social cadence, and community causes." },
+  { key: "background_story", label: "Background Story", kind: "text", example: "Example: Tell the longer-form story of upbringing, education, career path, and milestones." },
+  { key: "core_values", label: "Core Values", kind: "list", example: "Example: Excellence; integrity; discipline; loyalty; professionalism." },
+  { key: "personal_motto", label: "Personal Motto", kind: "text", example: "Example: Excellence with intention." },
+];
+
+const HO_CARD: React.CSSProperties = {
+  border: "1px solid rgba(0,0,0,0.12)",
+  borderRadius: 18,
+  background: "#fff",
+  boxShadow: "0 8px 24px rgba(0,0,0,0.06)",
+};
+const HO_INPUT: React.CSSProperties = {
+  width: "100%",
+  borderRadius: 12,
+  border: "1px solid rgba(0,0,0,0.16)",
+  padding: "12px 14px",
+  fontSize: 14,
+  outline: "none",
+  background: "#fff",
+};
+const HO_TEXTAREA: React.CSSProperties = {
+  ...HO_INPUT,
+  minHeight: 132,
+  resize: "vertical",
+  fontFamily: "inherit",
+};
+const HO_BTN_PRIMARY: React.CSSProperties = {
+  borderRadius: 12,
+  padding: "12px 18px",
+  fontSize: 14,
+  fontWeight: 700,
+  border: "1px solid #111",
+  background: "#111",
+  color: "#fff",
+  cursor: "pointer",
+};
+const HO_BTN_SECONDARY: React.CSSProperties = {
+  borderRadius: 12,
+  padding: "12px 18px",
+  fontSize: 14,
+  fontWeight: 700,
+  border: "1px solid rgba(0,0,0,0.18)",
+  background: "#fff",
+  color: "#111",
+  cursor: "pointer",
+};
+const HO_BADGE = (bg: string): React.CSSProperties => ({
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  borderRadius: 999,
+  padding: "4px 10px",
+  fontSize: 12,
+  fontWeight: 700,
+  background: bg,
+});
+
+function hoReadQueryIdentity() {
+  if (typeof window === "undefined") {
+    return { memberId: "", brand: "", avatar: "", displayName: "", loggedIn: false };
+  }
+  try {
+    const u = new URL(window.location.href);
+    const memberId = String(u.searchParams.get("memberId") || u.searchParams.get("member_id") || "").trim();
+    const brand = String(u.searchParams.get("brand") || u.searchParams.get("rebranding") || "").trim() || "Elaralo";
+    const avatar = String(u.searchParams.get("avatar") || u.searchParams.get("companion") || "").trim();
+    const displayName = String(u.searchParams.get("displayName") || u.searchParams.get("display_name") || u.searchParams.get("user_name") || "").trim();
+    const loggedInRaw = String(u.searchParams.get("loggedIn") || u.searchParams.get("logged_in") || "").trim().toLowerCase();
+    const loggedIn = loggedInRaw === "1" || loggedInRaw === "true" || Boolean(memberId);
+    return { memberId, brand, avatar, displayName, loggedIn };
+  } catch {
+    return { memberId: "", brand: "", avatar: "", displayName: "", loggedIn: false };
+  }
+}
+
+function hoShouldRenderOnboarding(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const u = new URL(window.location.href);
+    const q = String(u.searchParams.get("app") || u.searchParams.get("surface") || u.searchParams.get("view") || "").trim().toLowerCase();
+    const path = String(u.pathname || "").toLowerCase();
+    return q === "host-onboarding" || q === "host_profile_studio" || path.includes("host-onboarding") || path.includes("host-profile-studio");
+  } catch {
+    return false;
+  }
+}
+
+function hoLooksNonEnglish(value: string): boolean {
+  const txt = String(value || "");
+  if (!txt.trim()) return false;
+  let nonAscii = 0;
+  for (const ch of txt) if (ch.charCodeAt(0) > 127) nonAscii += 1;
+  return nonAscii >= Math.max(2, Math.floor(txt.length * 0.15));
+}
+
+function hoCountryCodeFromName(name: string): string {
+  const s = String(name || "").trim();
+  const m: Record<string, string> = {
+    "United States": "US",
+    "United Kingdom": "GB",
+    "England": "GB",
+    "Scotland": "GB",
+    "Wales": "GB",
+    "Ireland": "IE",
+    "Canada": "CA",
+    "Australia": "AU",
+    "New Zealand": "NZ",
+    "Jamaica": "JM",
+    "Haiti": "HT",
+    "Mexico": "MX",
+    "France": "FR",
+    "Germany": "DE",
+    "Italy": "IT",
+    "Spain": "ES",
+    "India": "IN",
+    "Pakistan": "PK",
+    "Nigeria": "NG",
+    "Japan": "JP",
+    "South Korea": "KR",
+    "China": "CN",
+    "Philippines": "PH",
+    "Vietnam": "VN",
+    "Puerto Rico": "PR",
+  };
+  return m[s] || (s ? s.toUpperCase().slice(0, 2) : "");
+}
+
+function hoStepFromSession(session: HOSessionEnvelope | null): HOStep {
+  const current = String(session?.current_step || session?.latest_saved_step || "welcome").trim().toLowerCase();
+  if (current === "basics") return "basics";
+  if (current === "photos") return "photos";
+  if (current === "processing") return "processing";
+  if (current === "review") return "review";
+  if (current === "completion") return "completion";
+  if (current === "final_approval") return "final_approval";
+  if (String(session?.status || "") === "approved") return "final_approval";
+  return "welcome";
+}
+
+function hoNormalizedPreviewUrl(raw: string, identity: { memberId: string; brand: string; avatar: string }): string {
+  const url = String(raw || "").trim();
+  if (!url) return "";
+  if (!url.startsWith("/host-onboarding/assets/")) return url;
+  try {
+    const u = new URL(url, window.location.origin);
+    if (identity.memberId) u.searchParams.set("member_id", identity.memberId);
+    if (identity.brand) u.searchParams.set("brand", identity.brand);
+    if (identity.avatar) u.searchParams.set("avatar", identity.avatar);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+function HostOnboardingApp() {
+  const identitySeed = useMemo(() => hoReadQueryIdentity(), []);
+  const [identity, setIdentity] = useState(identitySeed);
+  const [handoffReady, setHandoffReady] = useState(Boolean(identitySeed.memberId));
+  const [session, setSession] = useState<HOSessionEnvelope | null>(null);
+  const [step, setStep] = useState<HOStep>("welcome");
+  const [loading, setLoading] = useState<boolean>(false);
+  const [screenError, setScreenError] = useState<string>("");
+  const [saveNotice, setSaveNotice] = useState<string>("");
+  const [basicWarnings, setBasicWarnings] = useState<string[]>([]);
+  const [basicErrors, setBasicErrors] = useState<Record<string, string>>({});
+  const [reviewData, setReviewData] = useState<HOSectionRow[]>([]);
+  const [nationalityDraft, setNationalityDraft] = useState<string[]>([]);
+  const [previewModel, setPreviewModel] = useState<any>(null);
+  const [approvalResult, setApprovalResult] = useState<any>(null);
+  const [uploadingSlot, setUploadingSlot] = useState<string>("");
+  const [deriveRequested, setDeriveRequested] = useState<boolean>(false);
+  const [laterSections, setLaterSections] = useState<Record<string, any>>({});
+  const [completionStatus, setCompletionStatus] = useState<Record<string, string>>({});
+  const [basicForm, setBasicForm] = useState<HOBasicForm>({
+    legal_name: "",
+    stage_name: "",
+    gender_model: { mode: "picklist", picklist_value: "Woman", custom_text: "", display_value: "Woman" },
+    birthdate: "",
+    birth_city: "",
+    birth_state_region: "",
+    birth_country_name: "",
+    birth_country_code: "",
+    race_codes: [],
+    race_self_describe: "",
+    ethnicity_primary_bucket: "",
+    ethnicity_labels: [],
+    ethnicity_other_text: "",
+  });
+
+  const assetsBySlot = useMemo(() => {
+    const out: Record<string, HOAssetRow> = {};
+    for (const a of session?.assets || []) {
+      const slotKey = String(a?.slot_key || "").trim();
+      if (slotKey) out[slotKey] = a;
+    }
+    return out;
+  }, [session?.assets]);
+
+  const sessionId = String(session?.session_id || "").trim();
+  const lastSaved = String(session?.updated_at || "").trim();
+  const photo3dOptIn = Boolean(session?.photo_3d_opt_in === true);
+  const requiredAcceptedCount = useMemo(() => HO_REQUIRED_SLOTS.filter((slot) => String(assetsBySlot[slot.slot_key]?.validation_status || "") === "accepted").length, [assetsBySlot]);
+  const canContinuePhotos = requiredAcceptedCount === HO_REQUIRED_SLOTS.length;
+
+  const postRequestMemberPlan = useCallback((reason: string) => {
+    if (typeof window === "undefined") return;
+    const msgObj = { type: "REQUEST_MEMBER_PLAN", _reason: reason, _sentAt: new Date().toISOString() };
+    const payloads: any[] = [msgObj, JSON.stringify(msgObj)];
+    const targets: Window[] = [];
+    try {
+      if (window.parent && window.parent !== window) targets.push(window.parent);
+    } catch {}
+    try {
+      if (window.top && window.top !== window && !targets.includes(window.top)) targets.push(window.top);
+    } catch {}
+    for (const target of targets) {
+      for (const p of payloads) {
+        try { target.postMessage(p, "*"); } catch {}
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const applyPayload = (incoming: any) => {
+      const data = typeof incoming === "string" ? (() => { try { return JSON.parse(incoming); } catch { return null; } })() : incoming;
+      if (!data || typeof data !== "object") return;
+      const type = String((data as any).type || "").trim();
+      if (type !== "MEMBER_PLAN") return;
+      const memberId = String((data as any).memberId || (data as any).member_id || "").trim();
+      const brand = String((data as any).brand || (data as any).rebranding || "").trim();
+      const avatar = String((data as any).avatar || (data as any).companion || (data as any).companionName || "").trim();
+      const displayName = String((data as any).displayName || (data as any).display_name || (data as any).userName || (data as any).user_name || "").trim();
+      const loggedIn = Boolean((data as any).loggedIn === true || (data as any).logged_in === true || memberId);
+      setIdentity((prev) => ({
+        memberId: memberId || prev.memberId,
+        brand: brand || prev.brand,
+        avatar: avatar || prev.avatar,
+        displayName: displayName || prev.displayName,
+        loggedIn: loggedIn || prev.loggedIn,
+      }));
+      if (memberId) setHandoffReady(true);
+    };
+    const onMessage = (ev: MessageEvent) => applyPayload(ev.data);
+    window.addEventListener("message", onMessage);
+    postRequestMemberPlan("host-onboarding-init");
+    const onFocus = () => postRequestMemberPlan("host-onboarding-focus");
+    const onVisibility = () => { if (document.visibilityState === "visible") postRequestMemberPlan("host-onboarding-visible"); };
+    const onPageShow = () => postRequestMemberPlan("host-onboarding-pageshow");
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", onPageShow);
+    };
+  }, [postRequestMemberPlan]);
+
+  const syncSession = useCallback((payload: HOSessionEnvelope | null | undefined) => {
+    if (!payload || typeof payload !== "object") return;
+    setSession(payload);
+    setStep(hoStepFromSession(payload));
+    const basics = (payload as any).basics || {};
+    setBasicForm((prev) => ({
+      ...prev,
+      legal_name: String(basics.legal_name || prev.legal_name || "").trim(),
+      stage_name: String(basics.stage_name || prev.stage_name || identity.displayName || "").trim(),
+      gender_model: {
+        mode: String((basics.gender_model || prev.gender_model || {}).mode || prev.gender_model.mode || "picklist") as any,
+        picklist_value: String((basics.gender_model || prev.gender_model || {}).picklist_value || prev.gender_model.picklist_value || "Woman"),
+        custom_text: String((basics.gender_model || prev.gender_model || {}).custom_text || prev.gender_model.custom_text || ""),
+        display_value: String((basics.gender_model || prev.gender_model || {}).display_value || prev.gender_model.display_value || "Woman"),
+      },
+      birthdate: String(basics.birthdate || prev.birthdate || ""),
+      birth_city: String(basics.birth_city || prev.birth_city || ""),
+      birth_state_region: String(basics.birth_state_region || prev.birth_state_region || ""),
+      birth_country_name: String(((basics.birth_country || {}).name) || prev.birth_country_name || ""),
+      birth_country_code: String(((basics.birth_country || {}).code) || prev.birth_country_code || ""),
+      race_codes: Array.isArray(basics.race_codes) ? basics.race_codes.map((x: any) => String(x || "").trim()).filter(Boolean) : prev.race_codes,
+      race_self_describe: String(basics.race_self_describe || prev.race_self_describe || ""),
+      ethnicity_primary_bucket: String(basics.ethnicity_primary_bucket || prev.ethnicity_primary_bucket || ""),
+      ethnicity_labels: Array.isArray(basics.ethnicity_labels) ? basics.ethnicity_labels.map((x: any) => String(x || "").trim()).filter(Boolean) : prev.ethnicity_labels,
+      ethnicity_other_text: String(basics.ethnicity_other_text || prev.ethnicity_other_text || ""),
+    }));
+    const sectionMap: Record<string, any> = {};
+    const statusMap: Record<string, string> = {};
+    for (const sec of (payload.sections || [])) {
+      sectionMap[String(sec.section_key || "")] = sec.payload || {};
+      statusMap[String(sec.section_key || "")] = String(sec.review_status || "draft");
+    }
+    setLaterSections((prev) => ({ ...prev, ...sectionMap }));
+    setCompletionStatus((prev) => ({ ...prev, ...statusMap }));
+  }, [identity.displayName]);
+
+  const fetchSession = useCallback(async () => {
+    if (!sessionId || !identity.memberId) return;
+    try {
+      const q = new URLSearchParams({ member_id: identity.memberId, brand: identity.brand || "", avatar: identity.avatar || "" }).toString();
+      const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}?${q}`);
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(String((data && (data.detail || data.message)) || `HTTP ${res.status}`));
+      syncSession(data);
+    } catch (e: any) {
+      setScreenError(String(e?.message || e || "Failed to refresh onboarding session."));
+    }
+  }, [sessionId, identity.memberId, identity.brand, identity.avatar, syncSession]);
+
+  const createOrResumeSession = useCallback(async () => {
+    if (!API_BASE) {
+      setScreenError("NEXT_PUBLIC_API_BASE_URL is not set.");
+      return;
+    }
+    if (!identity.memberId) return;
+    setLoading(true);
+    setScreenError("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          member_id: identity.memberId,
+          brand: identity.brand,
+          avatar: identity.avatar,
+          display_name: identity.displayName,
+          logged_in: identity.loggedIn,
+        }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(String((data && (data.detail || data.message)) || `HTTP ${res.status}`));
+      syncSession(data);
+      setSaveNotice(data?.updated_at ? `Session loaded. Last saved ${data.updated_at}.` : "Onboarding session ready.");
+    } catch (e: any) {
+      setScreenError(String(e?.message || e || "Failed to start host onboarding."));
+    } finally {
+      setLoading(false);
+    }
+  }, [identity, syncSession]);
+
+  useEffect(() => {
+    if (identity.memberId && identity.loggedIn) createOrResumeSession();
+  }, [identity.memberId, identity.loggedIn, identity.brand, identity.avatar, identity.displayName, createOrResumeSession]);
+
+  useEffect(() => {
+    if (step !== "processing" || !sessionId || !identity.memberId) return;
+    if (session?.status === "awaiting_review") return;
+    let cancelled = false;
+    let timer: any = null;
+    const ensureDerive = async () => {
+      if (!deriveRequested) {
+        setDeriveRequested(true);
+        try {
+          const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/derive`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ member_id: identity.memberId, brand: identity.brand, avatar: identity.avatar }),
+          });
+          const data = await res.json().catch(() => ({} as any));
+          if (!res.ok) throw new Error(String((data && (data.detail || data.message)) || `HTTP ${res.status}`));
+        } catch (e: any) {
+          if (!cancelled) setScreenError(String(e?.message || e || "Failed to start derivation."));
+        }
+      }
+      const poll = async () => {
+        if (cancelled) return;
+        await fetchSession();
+        const currentStatus = String(session?.status || "").trim();
+        if (currentStatus === "awaiting_review") {
+          if (!cancelled) setStep("review");
+          return;
+        }
+        timer = setTimeout(poll, 1500);
+      };
+      timer = setTimeout(poll, 400);
+    };
+    ensureDerive();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [step, sessionId, identity.memberId, identity.brand, identity.avatar, deriveRequested, fetchSession, session?.status]);
+
+  useEffect(() => {
+    if (step !== "review" || !sessionId || !identity.memberId) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const q = new URLSearchParams({ member_id: identity.memberId, brand: identity.brand || "", avatar: identity.avatar || "" }).toString();
+        const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/review?${q}`);
+        const data = await res.json().catch(() => ({} as any));
+        if (res.status === 409) {
+          setStep("processing");
+          return;
+        }
+        if (!res.ok) throw new Error(String((data && (data.detail || data.message)) || `HTTP ${res.status}`));
+        if (cancelled) return;
+        const sections = Array.isArray(data?.sections) ? data.sections : [];
+        setReviewData(sections);
+        const nat = data?.nationalities || {};
+        const confirmed = Array.isArray(nat.host_confirmed) ? nat.host_confirmed : [];
+        const suggested = Array.isArray(nat.suggested) ? nat.suggested : [];
+        setNationalityDraft((confirmed.length ? confirmed : suggested).map((x: any) => String(x || "").trim()).filter(Boolean));
+      } catch (e: any) {
+        if (!cancelled) setScreenError(String(e?.message || e || "Failed to load review payload."));
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [step, sessionId, identity.memberId, identity.brand, identity.avatar]);
+
+  const validateBasicsClient = useCallback(() => {
+    const errs: Record<string, string> = {};
+    const warns: string[] = [];
+    const must = (key: keyof HOBasicForm, label: string) => {
+      const value = String((basicForm as any)[key] || "").trim();
+      if (!value) errs[String(key)] = `${label} is required.`;
+      else if (hoLooksNonEnglish(value)) warns.push(`${label} should be entered in English for v1.`);
+    };
+    must("legal_name", "Legal / full name");
+    must("stage_name", "Stage / public name");
+    must("birthdate", "Birthdate");
+    must("birth_city", "Birth city");
+    must("birth_state_region", "Birth state / region");
+    must("birth_country_name", "Birth country");
+    if (!basicForm.race_codes.length) errs["race_codes"] = "At least one race option is required.";
+    if (basicForm.race_codes.filter((x) => x !== "prefer_not_to_say").length > 3) errs["race_codes"] = "Select up to 3 race options.";
+    if (basicForm.race_codes.includes("another_race") && !String(basicForm.race_self_describe || "").trim()) errs["race_self_describe"] = "Please enter a race self-description.";
+    if (!basicForm.ethnicity_primary_bucket) errs["ethnicity_primary_bucket"] = "Please choose an ethnicity bucket.";
+    if (basicForm.ethnicity_primary_bucket !== "prefer_not_to_say" && !basicForm.ethnicity_labels.length) errs["ethnicity_labels"] = "Select at least one heritage label.";
+    if (basicForm.ethnicity_labels.includes("Other / self-describe") && !String(basicForm.ethnicity_other_text || "").trim()) errs["ethnicity_other_text"] = "Please enter an ethnicity self-description.";
+    if (basicForm.gender_model.mode === "picklist" && !basicForm.gender_model.picklist_value) errs["gender_model"] = "Please choose a gender option.";
+    if (basicForm.gender_model.mode === "self_describe" && !String(basicForm.gender_model.custom_text || "").trim()) errs["gender_model.custom_text"] = "Please enter a gender self-description.";
+    return { errs, warns };
+  }, [basicForm]);
+
+  const saveBasics = useCallback(async (nextStep?: HOStep) => {
+    if (!sessionId || !identity.memberId) return false;
+    const { errs, warns } = validateBasicsClient();
+    setBasicErrors(errs);
+    setBasicWarnings(warns);
+    if (Object.keys(errs).length) return false;
+    setLoading(true);
+    setScreenError("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/basics`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          member_id: identity.memberId,
+          brand: identity.brand,
+          avatar: identity.avatar,
+          legal_name: basicForm.legal_name,
+          stage_name: basicForm.stage_name,
+          gender_model: {
+            ...basicForm.gender_model,
+            display_value: basicForm.gender_model.mode === "self_describe" ? basicForm.gender_model.custom_text : basicForm.gender_model.picklist_value,
+          },
+          birthdate: basicForm.birthdate,
+          birth_city: basicForm.birth_city,
+          birth_state_region: basicForm.birth_state_region,
+          birth_country: { code: basicForm.birth_country_code || hoCountryCodeFromName(basicForm.birth_country_name), name: basicForm.birth_country_name },
+          race_codes: basicForm.race_codes,
+          race_self_describe: basicForm.race_self_describe,
+          ethnicity_primary_bucket: basicForm.ethnicity_primary_bucket,
+          ethnicity_labels: basicForm.ethnicity_labels,
+          ethnicity_other_text: basicForm.ethnicity_other_text,
+        }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) {
+        const errsOut: Record<string, string> = {};
+        for (const err of Array.isArray(data?.errors) ? data.errors : []) errsOut[String(err?.field || "form")] = String(err?.message || "Invalid input.");
+        if (Object.keys(errsOut).length) setBasicErrors(errsOut);
+        setBasicWarnings(Array.isArray(data?.warnings) ? data.warnings.map((x: any) => String(x || "")) : warns);
+        throw new Error(String((data && (data.detail || data.message)) || "Please correct the highlighted fields."));
+      }
+      setBasicWarnings(Array.isArray(data?.warnings) ? data.warnings.map((x: any) => String(x || "")) : warns);
+      setBasicErrors({});
+      syncSession(data);
+      setSaveNotice("Basics saved.");
+      if (nextStep) setStep(nextStep);
+      return true;
+    } catch (e: any) {
+      setScreenError(String(e?.message || e || "Failed to save basics."));
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId, identity.memberId, identity.brand, identity.avatar, basicForm, syncSession, validateBasicsClient]);
+
+  const uploadPhotoForSlot = useCallback(async (slotKey: string, file: File) => {
+    if (!sessionId || !identity.memberId) return;
+    setUploadingSlot(slotKey);
+    setScreenError("");
+    try {
+      const presignRes = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/photos/presign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          member_id: identity.memberId,
+          brand: identity.brand,
+          avatar: identity.avatar,
+          slot_key: slotKey,
+          filename: file.name,
+          mime_type: file.type || "application/octet-stream",
+          file_size: file.size,
+        }),
+      });
+      const presignData = await presignRes.json().catch(() => ({} as any));
+      if (!presignRes.ok) throw new Error(String((presignData && (presignData.detail || presignData.message)) || `HTTP ${presignRes.status}`));
+      const uploadRes = await fetch(`${API_BASE}${presignData.upload_url}`, {
+        method: String(presignData.upload_method || "PUT").toUpperCase(),
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+      });
+      const uploadData = await uploadRes.json().catch(() => ({} as any));
+      if (!uploadRes.ok) throw new Error(String((uploadData && (uploadData.detail || uploadData.message)) || `HTTP ${uploadRes.status}`));
+      const commitRes = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/photos/commit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          member_id: identity.memberId,
+          brand: identity.brand,
+          avatar: identity.avatar,
+          asset_id: presignData.asset_id,
+          slot_key: slotKey,
+          photo_3d_opt_in: photo3dOptIn,
+        }),
+      });
+      const commitData = await commitRes.json().catch(() => ({} as any));
+      if (!commitRes.ok) throw new Error(String((commitData && (commitData.detail || commitData.message)) || `HTTP ${commitRes.status}`));
+      syncSession(commitData);
+      setSaveNotice(`${(HO_REQUIRED_SLOTS.find((s) => s.slot_key === slotKey) || HO_OPTIONAL_SLOTS.find((s) => s.slot_key === slotKey) || { label: slotKey }).label} uploaded.`);
+    } catch (e: any) {
+      setScreenError(String(e?.message || e || "Failed to upload photo."));
+    } finally {
+      setUploadingSlot("");
+    }
+  }, [sessionId, identity.memberId, identity.brand, identity.avatar, photo3dOptIn, syncSession]);
+
+  const saveSection = useCallback(async (sectionKey: string, payload: any, saveMode: string, opts?: { refreshReview?: boolean; nextStep?: HOStep }) => {
+    if (!sessionId || !identity.memberId) return false;
+    setLoading(true);
+    setScreenError("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/sections/${encodeURIComponent(sectionKey)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          member_id: identity.memberId,
+          brand: identity.brand,
+          avatar: identity.avatar,
+          section_payload: payload,
+          save_mode: saveMode,
+        }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(String((data && (data.detail || data.message)) || `HTTP ${res.status}`));
+      setLaterSections((prev) => ({ ...prev, [sectionKey]: payload }));
+      setCompletionStatus((prev) => ({ ...prev, [sectionKey]: String(data?.section?.review_status || saveMode) }));
+      setPreviewModel(data);
+      await fetchSession();
+      if (opts?.refreshReview) {
+        const q = new URLSearchParams({ member_id: identity.memberId, brand: identity.brand || "", avatar: identity.avatar || "" }).toString();
+        const reviewRes = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/review?${q}`);
+        const reviewData = await reviewRes.json().catch(() => ({} as any));
+        if (reviewRes.ok && Array.isArray(reviewData?.sections)) setReviewData(reviewData.sections);
+      }
+      if (opts?.nextStep) setStep(opts.nextStep);
+      setSaveNotice(`${sectionKey.replace(/_/g, " ")} saved.`);
+      return true;
+    } catch (e: any) {
+      setScreenError(String(e?.message || e || "Failed to save section."));
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId, identity.memberId, identity.brand, identity.avatar, fetchSession]);
+
+  const approveFoundation = useCallback(async () => {
+    if (!sessionId || !identity.memberId) return;
+    setLoading(true);
+    setScreenError("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/approve-foundation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ member_id: identity.memberId, brand: identity.brand, avatar: identity.avatar }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(Array.isArray(data?.blockers) ? data.blockers.join(" ") : String((data && (data.detail || data.message)) || `HTTP ${res.status}`));
+      syncSession(data);
+      setStep("completion");
+    } catch (e: any) {
+      setScreenError(String(e?.message || e || "Failed to approve the foundation sections."));
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId, identity.memberId, identity.brand, identity.avatar, syncSession]);
+
+  const fetchPreview = useCallback(async (goToFinal = true) => {
+    if (!sessionId || !identity.memberId) return;
+    setLoading(true);
+    setScreenError("");
+    try {
+      const q = new URLSearchParams({ member_id: identity.memberId, brand: identity.brand || "", avatar: identity.avatar || "" }).toString();
+      const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/preview?${q}`);
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(String((data && (data.detail || data.message)) || `HTTP ${res.status}`));
+      setPreviewModel(data);
+      if (goToFinal) setStep("final_approval");
+      await fetchSession();
+    } catch (e: any) {
+      setScreenError(String(e?.message || e || "Failed to compile the preview."));
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId, identity.memberId, identity.brand, identity.avatar, fetchSession]);
+
+  const approveVersion = useCallback(async (scope: "limited" | "full") => {
+    if (!sessionId || !identity.memberId) return;
+    setLoading(true);
+    setScreenError("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/approve-version`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          member_id: identity.memberId,
+          brand: identity.brand,
+          avatar: identity.avatar,
+          publish_scope: scope,
+          approval_note: "Ready for AI grounding and profile use.",
+          expected_latest_input_hash: String(session?.input_hash || ""),
+        }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(Array.isArray(data?.blockers) ? data.blockers.join(" ") : String((data && (data.detail || data.message)) || `HTTP ${res.status}`));
+      setApprovalResult(data);
+      setPreviewModel(data);
+      await fetchSession();
+      setSaveNotice(`Version ${data?.version_number || ""} approved for ${scope} publish.`);
+    } catch (e: any) {
+      setScreenError(String(e?.message || e || "Failed to approve the profile version."));
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId, identity.memberId, identity.brand, identity.avatar, session?.input_hash, fetchSession]);
+
+  const reviewSectionMap = useMemo(() => {
+    const out: Record<string, HOSectionRow> = {};
+    for (const sec of reviewData) out[String(sec.section_key || "")] = sec;
+    return out;
+  }, [reviewData]);
+
+  const renderStepPill = (label: string, value: string, active: boolean) => (
+    <div key={value} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14, color: active ? "#111" : "rgba(0,0,0,0.56)" }}>
+      <div style={{ width: 26, height: 26, borderRadius: 999, border: "1px solid rgba(0,0,0,0.18)", background: active ? "#111" : "#fff", color: active ? "#fff" : "#111", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700 }}>{label[0]}</div>
+      <span>{label}</span>
+    </div>
+  );
+
+  const ProgressNav = () => (
+    <div style={{ ...HO_CARD, padding: 18, minWidth: 220 }}>
+      <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 14 }}>Progress</div>
+      <div style={{ display: "grid", gap: 12 }}>
+        {[
+          { label: "Welcome", value: "welcome" },
+          { label: "Basics", value: "basics" },
+          { label: "Photos", value: "photos" },
+          { label: "Review", value: "review" },
+          { label: "Complete profile", value: "completion" },
+          { label: "Final approval", value: "final_approval" },
+        ].map((item) => renderStepPill(item.label, item.value, step === (item.value as HOStep)))}
+      </div>
+    </div>
+  );
+
+  const WelcomeScreen = () => (
+    <div style={{ ...HO_CARD, padding: 26 }}>
+      <div style={{ fontSize: 30, fontWeight: 900, marginBottom: 10 }}>Complete Your Host Profile</div>
+      <div style={{ fontSize: 15, lineHeight: 1.65, color: "rgba(0,0,0,0.76)", marginBottom: 16 }}>
+        This onboarding is staged. You can save and return later. For this release, all entries must be in English.
+      </div>
+      <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, padding: 18, marginBottom: 18 }}>
+        <div style={{ fontWeight: 800, marginBottom: 8 }}>What happens next</div>
+        <ol style={{ margin: 0, paddingLeft: 18, lineHeight: 1.75 }}>
+          <li>Enter identity basics</li>
+          <li>Upload required photos</li>
+          <li>Review system-derived sections</li>
+          <li>Complete remaining profile sections</li>
+          <li>Approve a version for publishing</li>
+        </ol>
+      </div>
+      <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)", marginBottom: 18 }}>
+        Estimated first-pass completion time: 12–20 minutes. Save/resume is enabled through your host onboarding session.
+      </div>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <button style={HO_BTN_PRIMARY} onClick={() => setStep("basics")} disabled={!sessionId || loading}>Start onboarding</button>
+        <button style={HO_BTN_SECONDARY} onClick={() => setSaveNotice("You can close this page and resume later from your member area.")}>Save and exit</button>
+        <button style={HO_BTN_SECONDARY} onClick={() => setSaveNotice("Need help? Use your internal support workflow or admin/support tools for recovery.")}>Help</button>
+      </div>
+    </div>
+  );
+
+  const BasicsScreen = () => (
+    <div style={{ ...HO_CARD, padding: 26 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginBottom: 16 }}>
+        <div>
+          <div style={{ fontSize: 28, fontWeight: 900 }}>Basic identity intake</div>
+          <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)" }}>Required seed data only: fast completion with inline examples.</div>
+        </div>
+        <div style={HO_BADGE("rgba(0,0,0,0.06)")}>Step 2 of 6</div>
+      </div>
+      <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Legal / full name *</label>
+          <input style={HO_INPUT} value={basicForm.legal_name} placeholder="Example: Alicia Johnson" onChange={(e) => setBasicForm((prev) => ({ ...prev, legal_name: e.target.value }))} />
+          <div style={{ fontSize: 12, color: "rgba(0,0,0,0.56)", marginTop: 6 }}>Private identity field.</div>
+          {basicErrors.legal_name ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors.legal_name}</div> : null}
+        </div>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Birth city *</label>
+          <input style={HO_INPUT} value={basicForm.birth_city} placeholder="Example: London" onChange={(e) => setBasicForm((prev) => ({ ...prev, birth_city: e.target.value }))} />
+          {basicErrors.birth_city ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors.birth_city}</div> : null}
+        </div>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Stage / public name *</label>
+          <input style={HO_INPUT} value={basicForm.stage_name} placeholder="Example: Dulce Moon" onChange={(e) => setBasicForm((prev) => ({ ...prev, stage_name: e.target.value }))} />
+          <div style={{ fontSize: 12, color: "rgba(0,0,0,0.56)", marginTop: 6 }}>Default public identity.</div>
+          {basicErrors.stage_name ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors.stage_name}</div> : null}
+        </div>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Birth state / region *</label>
+          <input style={HO_INPUT} value={basicForm.birth_state_region} placeholder="Example: England" onChange={(e) => setBasicForm((prev) => ({ ...prev, birth_state_region: e.target.value }))} />
+          {basicErrors.birth_state_region ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors.birth_state_region}</div> : null}
+        </div>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Gender *</label>
+          <select style={HO_INPUT} value={basicForm.gender_model.mode === "self_describe" ? "Another identity" : basicForm.gender_model.picklist_value} onChange={(e) => {
+            const v = e.target.value;
+            if (v === "Another identity") setBasicForm((prev) => ({ ...prev, gender_model: { ...prev.gender_model, mode: "self_describe", picklist_value: v, custom_text: prev.gender_model.custom_text } }));
+            else if (v === "Prefer not to say") setBasicForm((prev) => ({ ...prev, gender_model: { ...prev.gender_model, mode: "prefer_not_to_say", picklist_value: v, custom_text: "" } }));
+            else setBasicForm((prev) => ({ ...prev, gender_model: { ...prev.gender_model, mode: "picklist", picklist_value: v, custom_text: "" } }));
+          }}>
+            {HO_GENDER_OPTIONS.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+          </select>
+          <div style={{ fontSize: 12, color: "rgba(0,0,0,0.56)", marginTop: 6 }}>Hybrid model: picklist plus optional self-description.</div>
+          {basicForm.gender_model.mode === "self_describe" ? (
+            <input style={{ ...HO_INPUT, marginTop: 8 }} value={basicForm.gender_model.custom_text} placeholder="Self-describe your gender" onChange={(e) => setBasicForm((prev) => ({ ...prev, gender_model: { ...prev.gender_model, mode: "self_describe", custom_text: e.target.value } }))} />
+          ) : null}
+          {basicErrors["gender_model"] || basicErrors["gender_model.custom_text"] ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors["gender_model"] || basicErrors["gender_model.custom_text"]}</div> : null}
+        </div>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Birth country *</label>
+          <input style={HO_INPUT} value={basicForm.birth_country_name} placeholder="Example: United Kingdom" onChange={(e) => setBasicForm((prev) => ({ ...prev, birth_country_name: e.target.value, birth_country_code: hoCountryCodeFromName(e.target.value) }))} />
+          {basicErrors.birth_country_name ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors.birth_country_name}</div> : null}
+        </div>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Birthdate *</label>
+          <input type="date" style={HO_INPUT} value={basicForm.birthdate} onChange={(e) => setBasicForm((prev) => ({ ...prev, birthdate: e.target.value }))} />
+          {basicErrors.birthdate ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors.birthdate}</div> : null}
+        </div>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Race *</label>
+          <div style={{ ...HO_CARD, padding: 12, boxShadow: "none" }}>
+            <div style={{ display: "grid", gap: 8 }}>
+              {HO_RACE_OPTIONS.map((opt) => {
+                const checked = basicForm.race_codes.includes(opt.code);
+                return (
+                  <label key={opt.code} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14 }}>
+                    <input type="checkbox" checked={checked} onChange={(e) => {
+                      setBasicForm((prev) => {
+                        let next = prev.race_codes.slice();
+                        if (e.target.checked) {
+                          if (!next.includes(opt.code)) next.push(opt.code);
+                        } else {
+                          next = next.filter((x) => x !== opt.code);
+                        }
+                        return { ...prev, race_codes: next };
+                      });
+                    }} />
+                    <span>{opt.label}</span>
+                  </label>
+                );
+              })}
+            </div>
+            <div style={{ fontSize: 12, color: "rgba(0,0,0,0.56)", marginTop: 8 }}>Prescriptive multi-select for consistency. Inline examples are intentionally standardized.</div>
+            {basicForm.race_codes.includes("another_race") ? <input style={{ ...HO_INPUT, marginTop: 10 }} value={basicForm.race_self_describe} placeholder="Self-describe race" onChange={(e) => setBasicForm((prev) => ({ ...prev, race_self_describe: e.target.value }))} /> : null}
+          </div>
+          {basicErrors.race_codes || basicErrors.race_self_describe ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors.race_codes || basicErrors.race_self_describe}</div> : null}
+        </div>
+        <div>
+          <label style={{ fontWeight: 700, fontSize: 13 }}>Ethnicity *</label>
+          <select style={HO_INPUT} value={basicForm.ethnicity_primary_bucket} onChange={(e) => setBasicForm((prev) => ({ ...prev, ethnicity_primary_bucket: e.target.value }))}>
+            <option value="">Choose ethnicity bucket</option>
+            {HO_ETHNICITY_BUCKETS.map((opt) => <option key={opt.code} value={opt.code}>{opt.label}</option>)}
+          </select>
+          <div style={{ ...HO_CARD, padding: 12, boxShadow: "none", marginTop: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>Choose one or more heritage labels (up to 5)</div>
+            <select multiple value={basicForm.ethnicity_labels} onChange={(e) => {
+              const next = Array.from(e.target.selectedOptions).map((opt) => opt.value).slice(0, 5);
+              setBasicForm((prev) => ({ ...prev, ethnicity_labels: next }));
+            }} style={{ ...HO_INPUT, minHeight: 140 }}>
+              {HO_ETHNICITY_LABELS.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+            </select>
+            <div style={{ fontSize: 12, color: "rgba(0,0,0,0.56)", marginTop: 8 }}>Examples: Afro-Caribbean, Mixed European-American, Jamaican, Nigerian, Persian / Iranian.</div>
+            {basicForm.ethnicity_labels.includes("Other / self-describe") ? <input style={{ ...HO_INPUT, marginTop: 10 }} value={basicForm.ethnicity_other_text} placeholder="Self-describe ethnicity / heritage" onChange={(e) => setBasicForm((prev) => ({ ...prev, ethnicity_other_text: e.target.value }))} /> : null}
+          </div>
+          {basicErrors.ethnicity_primary_bucket || basicErrors.ethnicity_labels || basicErrors.ethnicity_other_text ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 6 }}>{basicErrors.ethnicity_primary_bucket || basicErrors.ethnicity_labels || basicErrors.ethnicity_other_text}</div> : null}
+        </div>
+      </div>
+      {basicWarnings.length ? <div style={{ marginTop: 14, color: "#8a5b00", fontSize: 13 }}>Warnings: {basicWarnings.join(" ")}</div> : null}
+      <div style={{ display: "flex", gap: 12, marginTop: 18, flexWrap: "wrap" }}>
+        <button style={HO_BTN_SECONDARY} onClick={() => saveBasics(undefined)} disabled={loading}>Save draft</button>
+        <button style={HO_BTN_PRIMARY} onClick={() => saveBasics("photos")} disabled={loading}>Continue</button>
+      </div>
+    </div>
+  );
+
+  const SlotCard = ({ slot, optional = false }: { slot: { slot_key: string; label: string; notes?: string }; optional?: boolean }) => {
+    const asset = assetsBySlot[slot.slot_key];
+    const preview = hoNormalizedPreviewUrl(String(asset?.preview_url || ""), identity);
+    const status = String(asset?.validation_status || "");
+    const statusStyle = status === "accepted" ? HO_BADGE("rgba(22,163,74,0.12)") : status === "rejected" ? HO_BADGE("rgba(220,38,38,0.12)") : HO_BADGE("rgba(0,0,0,0.06)");
+    return (
+      <div style={{ ...HO_CARD, padding: 16, boxShadow: "none" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <div>
+            <div style={{ fontWeight: 800 }}>{slot.label}{optional ? " (optional)" : " *"}</div>
+            <div style={{ fontSize: 12, color: "rgba(0,0,0,0.56)", marginTop: 4 }}>{slot.notes || "Optional additional reference photo."}</div>
+          </div>
+          <div style={statusStyle}>{status || "pending"}</div>
+        </div>
+        {preview ? <img src={preview} alt={slot.label} style={{ width: "100%", maxHeight: 220, objectFit: "cover", borderRadius: 14, marginTop: 12, border: "1px solid rgba(0,0,0,0.08)" }} /> : null}
+        {asset?.original_file_name ? <div style={{ fontSize: 12, color: "rgba(0,0,0,0.64)", marginTop: 8 }}>{asset.original_file_name}</div> : null}
+        {(asset?.validation_errors || []).length ? <div style={{ color: "#b00020", fontSize: 12, marginTop: 8 }}>{(asset.validation_errors || []).join(" ")}</div> : null}
+        {(asset?.validation_warnings || []).length ? <div style={{ color: "#8a5b00", fontSize: 12, marginTop: 8 }}>{(asset.validation_warnings || []).join(" ")}</div> : null}
+        <div style={{ marginTop: 12 }}>
+          <input type="file" accept="image/jpeg,image/png,image/heic,image/heif" onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) uploadPhotoForSlot(slot.slot_key, file);
+          }} />
+        </div>
+      </div>
+    );
+  };
+
+  const PhotosScreen = () => (
+    <div style={{ ...HO_CARD, padding: 26 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginBottom: 16 }}>
+        <div>
+          <div style={{ fontSize: 28, fontWeight: 900 }}>Photo upload and 3D opt-in</div>
+          <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)" }}>Upload five required photos. Exactly one accepted image is required in each required slot before you continue.</div>
+        </div>
+        <div style={HO_BADGE("rgba(0,0,0,0.06)")}>{requiredAcceptedCount} / {HO_REQUIRED_SLOTS.length} required accepted</div>
+      </div>
+      <div style={{ padding: 14, borderRadius: 14, background: "rgba(0,0,0,0.03)", marginBottom: 18 }}>
+        <label style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+          <input
+            type="checkbox"
+            checked={photo3dOptIn}
+            onChange={async (e) => {
+              if (!sessionId || !identity.memberId) return;
+              const next = Boolean(e.target.checked);
+              try {
+                const res = await fetch(`${API_BASE}/host-onboarding/sessions/${encodeURIComponent(sessionId)}/photo-opt-in`, {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ member_id: identity.memberId, brand: identity.brand, avatar: identity.avatar, photo_3d_opt_in: next }),
+                });
+                const data = await res.json().catch(() => ({} as any));
+                if (res.ok) syncSession(data);
+                else setSession((prev) => prev ? ({ ...prev, photo_3d_opt_in: next }) : prev);
+              } catch {
+                setSession((prev) => prev ? ({ ...prev, photo_3d_opt_in: next }) : prev);
+              }
+            }}
+          />
+          <span style={{ fontSize: 14, lineHeight: 1.55 }}><b>I opt in to future 3D character generation using these uploaded photos.</b><br />Host confirms these photos may be used later for 3D character generation only if host opts in to this service.</span>
+        </label>
+      </div>
+      <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
+        {HO_REQUIRED_SLOTS.map((slot) => <SlotCard key={slot.slot_key} slot={slot} />)}
+      </div>
+      <div style={{ fontSize: 20, fontWeight: 900, marginTop: 22, marginBottom: 12 }}>Optional photos</div>
+      <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
+        {HO_OPTIONAL_SLOTS.map((slot) => <SlotCard key={slot.slot_key} slot={slot} optional />)}
+      </div>
+      {uploadingSlot ? <div style={{ marginTop: 16, fontSize: 13 }}>Uploading {uploadingSlot.replace(/_/g, " ")}…</div> : null}
+      <div style={{ display: "flex", gap: 12, marginTop: 18, flexWrap: "wrap" }}>
+        <button style={HO_BTN_SECONDARY} onClick={() => fetchSession()} disabled={loading}>Refresh photo status</button>
+        <button style={HO_BTN_PRIMARY} onClick={() => setStep("processing")} disabled={loading || !canContinuePhotos}>Continue</button>
+      </div>
+    </div>
+  );
+
+  const ReviewSectionCard = ({ section }: { section: HOSectionRow }) => {
+    const key = String(section.section_key || "");
+    const payload = section.payload || {};
+    const sourceType = String(section.source_type || "");
+    const reviewStatus = String(section.review_status || "pending");
+    const isRequired = ["personal_information", "astrological_profile", "nationalities", "family_heritage", "physical_description", "personality"].includes(key);
+    const badgeColor = sourceType.includes("host") ? "rgba(37,99,235,0.12)" : sourceType.includes("derived") ? "rgba(124,58,237,0.12)" : "rgba(22,163,74,0.12)";
+    return (
+      <div style={{ ...HO_CARD, padding: 18, boxShadow: "none" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10, flexWrap: "wrap" }}>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>{key.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase())}</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={HO_BADGE(badgeColor)}>{sourceType || "source"}</div>
+            <div style={HO_BADGE("rgba(0,0,0,0.06)")}>{reviewStatus || "pending"}</div>
+          </div>
+        </div>
+        {key === "personal_information" ? (
+          <div style={{ fontSize: 14, lineHeight: 1.7 }}>
+            <div><b>Legal / full name:</b> {payload.legal_name || "—"}</div>
+            <div><b>Stage / public name:</b> {payload.stage_name || "—"}</div>
+            <div><b>Birth location:</b> {[payload.birth_city, payload.birth_state_region, payload.birth_country?.name].filter(Boolean).join(", ") || "—"}</div>
+            <div><b>Race:</b> {(payload.race_codes || []).join(", ") || "—"}</div>
+            <div><b>Ethnicity:</b> {(payload.ethnicity_labels || []).join(", ") || "—"}</div>
+          </div>
+        ) : key === "astrological_profile" ? (
+          <div style={{ fontSize: 14, lineHeight: 1.7 }}>
+            <div><b>Age:</b> {payload.age_years ?? "—"}</div>
+            <div><b>Zodiac sign:</b> {payload.zodiac_sign || "—"}</div>
+            <div><b>Birthplace display:</b> {payload.birth_location_display || "—"}</div>
+          </div>
+        ) : key === "nationalities" ? (
+          <div>
+            <div style={{ fontSize: 13, color: "rgba(0,0,0,0.66)", marginBottom: 8 }}>Nationality is reviewable because some hosts may have multiple nationalities.</div>
+            <div style={{ display: "grid", gap: 8 }}>
+              {nationalityDraft.map((n, idx) => (
+                <div key={`${n}-${idx}`} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input style={HO_INPUT} value={n} onChange={(e) => setNationalityDraft((prev) => prev.map((x, i) => i === idx ? e.target.value : x))} />
+                  <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft((prev) => prev.filter((_, i) => i !== idx))}>Remove</button>
+                  <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft((prev) => prev.map((x, i) => i === idx - 1 ? n : i === idx ? prev[idx - 1] : x))} disabled={idx === 0}>↑</button>
+                  <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft((prev) => prev.map((x, i) => i === idx + 1 ? n : i === idx ? prev[idx + 1] : x))} disabled={idx === prev.length - 1}>↓</button>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+              <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft((prev) => [...prev, ""])}>Add another nationality</button>
+              <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft([])}>Prefer not to derive / enter manually later</button>
+            </div>
+          </div>
+        ) : (
+          <textarea style={HO_TEXTAREA} value={String(payload.draft_text || payload.text || "")} onChange={(e) => {
+            const nextText = e.target.value;
+            setReviewData((prev) => prev.map((x) => String(x.section_key || "") === key ? ({ ...x, payload: { ...(x.payload || {}), draft_text: nextText, text: nextText } }) : x));
+          }} />
+        )}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 14 }}>
+          {key === "personal_information" || key === "astrological_profile" ? <button style={HO_BTN_SECONDARY} onClick={() => setStep("basics")}>Edit basics</button> : null}
+          <button style={HO_BTN_PRIMARY} onClick={() => {
+            const nextPayload = key === "nationalities"
+              ? { suggested: payload.suggested || [], host_confirmed: nationalityDraft.filter((x) => String(x || "").trim()) }
+              : (reviewData.find((x) => String(x.section_key || "") === key)?.payload || payload || {});
+            saveSection(key, nextPayload, key === "personal_information" || key === "astrological_profile" ? "accepted" : "edited", { refreshReview: true });
+          }}>Accept / save</button>
+          {!(key === "personal_information" || key === "astrological_profile" || key === "nationalities") ? <button style={HO_BTN_SECONDARY} onClick={() => saveSection(key, reviewData.find((x) => String(x.section_key || "") === key)?.payload || payload || {}, "reject", { refreshReview: true })}>Reject draft</button> : null}
+          {!isRequired ? <button style={HO_BTN_SECONDARY} onClick={() => saveSection(key, payload || {}, "defer", { refreshReview: true })}>Defer</button> : null}
+        </div>
+      </div>
+    );
+  };
+
+  const ReviewScreen = () => {
+    const readyForFoundation = ["personal_information", "astrological_profile", "nationalities", "family_heritage", "physical_description", "personality"].every((key) => {
+      const sec = reviewSectionMap[key] || {};
+      return ["accepted", "edited"].includes(String(sec.review_status || ""));
+    });
+    return (
+      <div style={{ ...HO_CARD, padding: 26 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 28, fontWeight: 900 }}>Derived review and correction</div>
+            <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)" }}>Entered, derived, and AI-draft values are labeled explicitly. Required foundation sections must be accepted or edited before later sections open.</div>
+          </div>
+        </div>
+        <div style={{ display: "grid", gap: 14 }}>
+          {reviewData.map((section) => <ReviewSectionCard key={String(section.section_key || "")} section={section} />)}
+        </div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 18 }}>
+          <button style={HO_BTN_SECONDARY} onClick={() => setStep("processing")}>Back</button>
+          <button style={HO_BTN_PRIMARY} onClick={approveFoundation} disabled={!readyForFoundation || loading}>Open later sections</button>
+        </div>
+      </div>
+    );
+  };
+
+  const renderLaterSectionEditor = (cfg: typeof HO_LATER_SECTION_CONFIG[number]) => {
+    const key = cfg.key;
+    const payload = laterSections[key] || {};
+    const status = completionStatus[key] || "draft";
+    const setPayload = (next: any) => setLaterSections((prev) => ({ ...prev, [key]: next }));
+    return (
+      <div key={key} style={{ ...HO_CARD, padding: 18, boxShadow: "none" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>{cfg.label}</div>
+          <div style={HO_BADGE(status === "accepted" || status === "edited" ? "rgba(22,163,74,0.12)" : status === "deferred" ? "rgba(0,0,0,0.06)" : "rgba(37,99,235,0.12)")}>{status}</div>
+        </div>
+        <div style={{ fontSize: 12, color: "rgba(0,0,0,0.58)", marginBottom: 10 }}>{cfg.example}</div>
+        {cfg.kind === "career" ? (
+          <div style={{ display: "grid", gap: 10 }}>
+            <input style={HO_INPUT} value={String(payload.job_title || "")} placeholder="Current job title / current position" onChange={(e) => setPayload({ ...payload, job_title: e.target.value })} />
+            <input style={HO_INPUT} value={String(payload.employer || "")} placeholder="Employer / company" onChange={(e) => setPayload({ ...payload, employer: e.target.value })} />
+            <textarea style={HO_TEXTAREA} value={String(payload.responsibilities_text || "")} placeholder="Responsibilities and achievements" onChange={(e) => setPayload({ ...payload, responsibilities_text: e.target.value })} />
+            {payload.estimated_income?.value_range ? <div style={{ fontSize: 13, background: "rgba(0,0,0,0.04)", padding: 12, borderRadius: 12 }}><b>Private estimated income suggestion:</b> {String(payload.estimated_income.value_range || "")}</div> : null}
+          </div>
+        ) : cfg.kind === "education" ? (
+          <textarea style={HO_TEXTAREA} value={String(payload.text || "")} placeholder="Degrees, institutions, years, and study focus" onChange={(e) => setPayload({ ...payload, text: e.target.value })} />
+        ) : cfg.kind === "list" ? (
+          <textarea style={HO_TEXTAREA} value={String(payload.text || "")} placeholder="Enter one item per line or comma-separated" onChange={(e) => setPayload({ ...payload, text: e.target.value })} />
+        ) : (
+          <textarea style={HO_TEXTAREA} value={String(payload.text || "")} placeholder={cfg.example} onChange={(e) => setPayload({ ...payload, text: e.target.value })} />
+        )}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+          <button style={HO_BTN_SECONDARY} onClick={() => saveSection(key, payload, "draft")}>Save draft</button>
+          <button style={HO_BTN_PRIMARY} onClick={() => saveSection(key, payload, payload.text || payload.job_title || payload.employer ? "edited" : "accepted")}>Save section</button>
+          <button style={HO_BTN_SECONDARY} onClick={() => saveSection(key, payload, "defer")}>Skip for later</button>
+        </div>
+      </div>
+    );
+  };
+
+  const CompletionScreen = () => (
+    <div style={{ ...HO_CARD, padding: 26 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginBottom: 16, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: 28, fontWeight: 900 }}>Complete remaining profile sections</div>
+          <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)" }}>Save as draft, skip for later, and return later are supported. Limited-publish readiness is shown independently of full completion.</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <div style={HO_BADGE(Boolean(session?.limited_ready) ? "rgba(22,163,74,0.12)" : "rgba(0,0,0,0.06)")}>Limited publish: {session?.limited_ready ? "ready" : "not ready"}</div>
+          <div style={HO_BADGE(Boolean(session?.full_ready) ? "rgba(22,163,74,0.12)" : "rgba(0,0,0,0.06)")}>Full publish: {session?.full_ready ? "ready" : "not ready"}</div>
+        </div>
+      </div>
+      <div style={{ display: "grid", gap: 14 }}>
+        {HO_LATER_SECTION_CONFIG.map(renderLaterSectionEditor)}
+      </div>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 18 }}>
+        <button style={HO_BTN_SECONDARY} onClick={() => setStep("review")}>Back to review</button>
+        <button style={HO_BTN_PRIMARY} onClick={() => fetchPreview(true)}>Go to preview & approval</button>
+      </div>
+    </div>
+  );
+
+  const FinalScreen = () => {
+    const preview = previewModel || {};
+    const readiness = preview.publish_readiness || {};
+    const privatePreview = preview.private_preview || {};
+    const publicPreview = preview.public_preview || {};
+    return (
+      <div style={{ ...HO_CARD, padding: 26 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginBottom: 16, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontSize: 28, fontWeight: 900 }}>Preview and approval</div>
+            <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)" }}>Private/internal data is separated from public/persona profile data. You may jump back to any section before approval.</div>
+          </div>
+          {approvalResult?.version_id ? <div style={HO_BADGE("rgba(22,163,74,0.12)")}>Approved version: {String(approvalResult.version_id || "")}</div> : null}
+        </div>
+        <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
+          <div style={{ ...HO_CARD, padding: 16, boxShadow: "none" }}>
+            <div style={{ fontWeight: 800, marginBottom: 10 }}>Private / internal</div>
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, lineHeight: 1.55 }}>{JSON.stringify(privatePreview, null, 2)}</pre>
+          </div>
+          <div style={{ ...HO_CARD, padding: 16, boxShadow: "none" }}>
+            <div style={{ fontWeight: 800, marginBottom: 10 }}>Public / persona</div>
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, lineHeight: 1.55 }}>{JSON.stringify(publicPreview, null, 2)}</pre>
+          </div>
+        </div>
+        <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
+          <div style={{ ...HO_CARD, padding: 16, boxShadow: "none" }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Limited publish blockers</div>
+            {(readiness.limited_blockers || []).length ? <ul style={{ margin: 0, paddingLeft: 18 }}>{(readiness.limited_blockers || []).map((x: any, i: number) => <li key={i}>{String(x || "")}</li>)}</ul> : <div style={{ color: "rgba(0,0,0,0.66)" }}>No blockers.</div>}
+          </div>
+          <div style={{ ...HO_CARD, padding: 16, boxShadow: "none" }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Full publish blockers</div>
+            {(readiness.full_blockers || []).length ? <ul style={{ margin: 0, paddingLeft: 18 }}>{(readiness.full_blockers || []).map((x: any, i: number) => <li key={i}>{String(x || "")}</li>)}</ul> : <div style={{ color: "rgba(0,0,0,0.66)" }}>No blockers.</div>}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 18 }}>
+          <button style={HO_BTN_SECONDARY} onClick={() => setStep("basics")}>Edit basics</button>
+          <button style={HO_BTN_SECONDARY} onClick={() => setStep("photos")}>Edit photos</button>
+          <button style={HO_BTN_SECONDARY} onClick={() => setStep("review")}>Edit review</button>
+          <button style={HO_BTN_SECONDARY} onClick={() => setStep("completion")}>Edit later sections</button>
+          <button style={HO_BTN_PRIMARY} onClick={() => approveVersion("limited")} disabled={loading || Boolean((readiness.limited_blockers || []).length)}>Approve limited profile</button>
+          <button style={HO_BTN_PRIMARY} onClick={() => approveVersion("full")} disabled={loading || Boolean((readiness.full_blockers || []).length)}>Approve full profile</button>
+        </div>
+      </div>
+    );
+  };
+
+  const notReadyMessage = !identity.memberId
+    ? "Waiting for host member context from Wix or master-site launch. This page expects a logged-in host member handoff."
+    : (!identity.loggedIn ? "Please log in through the Wix member area to use Host Onboarding." : "");
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#f6f7fb", padding: "24px clamp(16px, 4vw, 40px) 40px" }}>
+      <div style={{ maxWidth: 1360, margin: "0 auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginBottom: 20, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontSize: 12, letterSpacing: 1.2, textTransform: "uppercase", color: "rgba(0,0,0,0.45)", fontWeight: 800 }}>Host Onboarding / Host Profile Studio</div>
+            <div style={{ fontSize: 32, fontWeight: 900, color: "#111", marginTop: 4 }}>Build your Host Human Companion Profile</div>
+            <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)", marginTop: 6 }}>
+              Host: {identity.displayName || basicForm.stage_name || identity.memberId || "Unknown"}{identity.brand ? ` · Brand: ${identity.brand}` : ""}{identity.avatar ? ` · Avatar: ${identity.avatar}` : ""}
+            </div>
+          </div>
+          {lastSaved ? <div style={HO_BADGE("rgba(0,0,0,0.06)")}>Last saved: {lastSaved}</div> : null}
+        </div>
+        {screenError ? <div style={{ ...HO_CARD, padding: 14, marginBottom: 16, borderColor: "rgba(176,0,32,0.18)", color: "#b00020" }}>{screenError}</div> : null}
+        {saveNotice ? <div style={{ ...HO_CARD, padding: 14, marginBottom: 16, borderColor: "rgba(22,163,74,0.18)", color: "#166534" }}>{saveNotice}</div> : null}
+        {!handoffReady && !identity.memberId ? <div style={{ ...HO_CARD, padding: 16, marginBottom: 16 }}>{notReadyMessage}</div> : null}
+        {identity.memberId && !identity.loggedIn ? <div style={{ ...HO_CARD, padding: 16, marginBottom: 16 }}>{notReadyMessage}</div> : null}
+        <div style={{ display: "grid", gap: 18, gridTemplateColumns: "minmax(220px, 260px) minmax(0, 1fr)" }}>
+          <ProgressNav />
+          <div>
+            {step === "welcome" ? <WelcomeScreen /> : null}
+            {step === "basics" ? <BasicsScreen /> : null}
+            {step === "photos" ? <PhotosScreen /> : null}
+            {step === "processing" ? (
+              <div style={{ ...HO_CARD, padding: 26 }}>
+                <div style={{ fontSize: 28, fontWeight: 900, marginBottom: 8 }}>Building your first-pass profile draft</div>
+                <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)", marginBottom: 18 }}>This step validates inputs, computes deterministic fields, and prepares review-only text. No raw AI system prompts or internal scoring are shown to the host.</div>
+                <div style={{ display: "grid", gap: 12 }}>
+                  {[
+                    { key: "validate_basics", label: "Validate required basics" },
+                    { key: "validate_photos", label: "Validate required photos" },
+                    { key: "derive_age_and_zodiac", label: "Derive age and zodiac sign" },
+                    { key: "create_nationality_suggestion", label: "Create nationality suggestion" },
+                    { key: "draft_review_sections", label: "Draft review-only narrative sections" },
+                  ].map((item) => {
+                    const status = String(session?.latest_job?.progress?.[item.key]?.status || (item.key === "validate_basics" && session?.basics?.legal_name ? "completed" : "pending"));
+                    const fill = status === "completed" ? "100%" : status === "running" ? "65%" : status === "queued" ? "20%" : "8%";
+                    return (
+                      <div key={item.key}>
+                        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>{item.label}</div>
+                        <div style={{ height: 12, borderRadius: 999, background: "rgba(0,0,0,0.08)", overflow: "hidden" }}>
+                          <div style={{ width: fill, height: "100%", background: "#111", transition: "width 220ms ease" }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{ display: "flex", gap: 12, marginTop: 18, flexWrap: "wrap" }}>
+                  <button style={HO_BTN_SECONDARY} onClick={() => { setDeriveRequested(false); fetchSession(); }} disabled={loading}>Refresh progress</button>
+                  <button style={HO_BTN_PRIMARY} onClick={() => setStep("review")} disabled={String(session?.status || "") !== "awaiting_review"}>Continue to review</button>
+                </div>
+              </div>
+            ) : null}
+            {step === "review" ? <ReviewScreen /> : null}
+            {step === "completion" ? <CompletionScreen /> : null}
+            {step === "final_approval" ? <FinalScreen /> : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HostOnboardingRouteSwitch() {
+  const [mode, setMode] = useState<"connect" | "host-onboarding">(() => (hoShouldRenderOnboarding() ? "host-onboarding" : "connect"));
+  useEffect(() => {
+    setMode(hoShouldRenderOnboarding() ? "host-onboarding" : "connect");
+  }, []);
+  if (mode === "host-onboarding") return <HostOnboardingApp />;
+  return <ConnectPage />;
+}
+
 export default function Page() {
+  return <HostOnboardingRouteSwitch />;
+}
+
+function ConnectPage() {
+
   // iOS detection (includes iPadOS 13+ which reports itself as "Macintosh")
   const isIOS = useMemo(() => {
     if (typeof navigator === "undefined") return false;

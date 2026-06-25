@@ -18037,3 +18037,1408 @@ def _usage_peek_sync(
                 conn.close()
             except Exception:
                 pass
+
+
+# =============================================================================
+# Host Onboarding / Host Profile Studio (MVP)
+# =============================================================================
+
+_HOST_ONBOARDING_SESSIONS_TABLE = "host_onboarding_sessions"
+_HOST_ONBOARDING_ASSETS_TABLE = "host_onboarding_assets"
+_HOST_ONBOARDING_VERSIONS_TABLE = "host_onboarding_versions"
+_HOST_ONBOARDING_AUDIT_TABLE = "host_onboarding_audit_log"
+_HOST_ONBOARDING_MAX_ASSET_BYTES = int(os.getenv("HOST_ONBOARDING_MAX_ASSET_BYTES", str(15 * 1024 * 1024)) or str(15 * 1024 * 1024))
+_HOST_ONBOARDING_ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/heic", "image/heif"}
+_HOST_ONBOARDING_REQUIRED_SLOTS = [
+    "headshot_front",
+    "full_body_front",
+    "three_quarter_body",
+    "angle_left_45",
+    "angle_right_45",
+]
+_HOST_ONBOARDING_OPTIONAL_SLOTS = [
+    "left_profile",
+    "right_profile",
+    "smiling_headshot",
+    "neutral_headshot",
+    "extra_angle",
+]
+_HOST_ONBOARDING_ALLOWED_SLOTS = set(_HOST_ONBOARDING_REQUIRED_SLOTS + _HOST_ONBOARDING_OPTIONAL_SLOTS)
+_HOST_ONBOARDING_GENDER_OPTIONS = [
+    "Female",
+    "Male",
+    "Non-binary",
+    "Transgender woman",
+    "Transgender man",
+    "Prefer to self-describe",
+    "Prefer not to say",
+]
+_HOST_ONBOARDING_RACE_OPTIONS = [
+    "Black or African descent",
+    "White",
+    "Asian",
+    "Middle Eastern or North African",
+    "Native American or Alaska Native",
+    "Native Hawaiian or Other Pacific Islander",
+    "Multiracial",
+    "Other",
+]
+_HOST_ONBOARDING_ETHNICITY_BUCKETS = [
+    "African / Afro-descendant",
+    "Caribbean",
+    "Central Asian",
+    "East Asian",
+    "European",
+    "Latina / Latino / Latin American",
+    "Middle Eastern",
+    "North African",
+    "North American",
+    "Pacific Islander",
+    "South Asian",
+    "Southeast Asian",
+    "Sub-Saharan African",
+    "Other",
+]
+
+
+def _host_onboarding_json_dumps(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return json.dumps({}, ensure_ascii=False)
+
+
+def _host_onboarding_json_loads(raw: Any, default: Any) -> Any:
+    if raw is None:
+        return default
+    if isinstance(raw, (dict, list)):
+        return raw
+    s = str(raw or "").strip()
+    if not s:
+        return default
+    try:
+        return json.loads(s)
+    except Exception:
+        return default
+
+
+def _host_onboarding_safe_str(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _host_onboarding_now() -> float:
+    return float(time.time())
+
+
+def _host_onboarding_normalize_member_id(value: Any) -> str:
+    return _host_onboarding_safe_str(value)
+
+
+def _host_onboarding_safe_slug(value: Any, default: str = "item") -> str:
+    txt = re.sub(r"[^a-z0-9]+", "-", _host_onboarding_safe_str(value).lower()).strip("-")
+    return txt or default
+
+
+def _host_onboarding_parse_birthdate(raw: Any) -> Optional[datetime]:
+    s = _host_onboarding_safe_str(raw)
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _host_onboarding_age_from_birthdate(raw: Any) -> Optional[int]:
+    dt = _host_onboarding_parse_birthdate(raw)
+    if not dt:
+        return None
+    today = datetime.utcnow().date()
+    born = dt.date()
+    years = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    if years < 0:
+        return None
+    return years
+
+
+def _host_onboarding_zodiac_from_birthdate(raw: Any) -> str:
+    dt = _host_onboarding_parse_birthdate(raw)
+    if not dt:
+        return ""
+    m = int(dt.month)
+    d = int(dt.day)
+    z = [
+        ((1, 20), "Capricorn"), ((2, 19), "Aquarius"), ((3, 21), "Pisces"),
+        ((4, 20), "Aries"), ((5, 21), "Taurus"), ((6, 21), "Gemini"),
+        ((7, 23), "Cancer"), ((8, 23), "Leo"), ((9, 23), "Virgo"),
+        ((10, 23), "Libra"), ((11, 22), "Scorpio"), ((12, 22), "Sagittarius"),
+        ((12, 32), "Capricorn"),
+    ]
+    for (month_limit, day_limit), sign in z:
+        if (m, d) < (month_limit, day_limit):
+            return sign
+    return "Capricorn"
+
+
+_HOST_ONBOARDING_NATIONALITY_BY_COUNTRY = {
+    "united states": "American",
+    "united states of america": "American",
+    "canada": "Canadian",
+    "united kingdom": "British",
+    "england": "British",
+    "scotland": "British",
+    "wales": "British",
+    "ireland": "Irish",
+    "australia": "Australian",
+    "new zealand": "New Zealander",
+    "germany": "German",
+    "france": "French",
+    "italy": "Italian",
+    "spain": "Spanish",
+    "portugal": "Portuguese",
+    "mexico": "Mexican",
+    "brazil": "Brazilian",
+    "argentina": "Argentine",
+    "colombia": "Colombian",
+    "india": "Indian",
+    "pakistan": "Pakistani",
+    "bangladesh": "Bangladeshi",
+    "japan": "Japanese",
+    "china": "Chinese",
+    "south korea": "South Korean",
+    "nigeria": "Nigerian",
+    "south africa": "South African",
+    "ghana": "Ghanaian",
+    "jamaica": "Jamaican",
+    "trinidad and tobago": "Trinidadian and Tobagonian",
+    "dominican republic": "Dominican",
+}
+
+
+def _host_onboarding_derive_nationality_list(birth_country: Any, current_values: Optional[List[str]] = None) -> List[str]:
+    explicit = []
+    for item in (current_values or []):
+        t = _host_onboarding_safe_str(item)
+        if t and t not in explicit:
+            explicit.append(t)
+    if explicit:
+        return explicit
+    country = _host_onboarding_safe_str(birth_country).lower()
+    if not country:
+        return []
+    nationality = _HOST_ONBOARDING_NATIONALITY_BY_COUNTRY.get(country)
+    if nationality:
+        return [nationality]
+    pretty = _host_onboarding_safe_str(birth_country)
+    return [pretty] if pretty else []
+
+
+_HOST_ONBOARDING_ZODIAC_NOTES = {
+    "Aries": {
+        "strengths": ["Bold", "Energetic", "Direct", "Competitive", "Action-oriented"],
+        "challenges": ["Impulsive", "Impatient", "Headstrong"],
+        "personality": "Tends to be energetic, direct, and motivated by movement, challenge, and momentum.",
+    },
+    "Taurus": {
+        "strengths": ["Grounded", "Reliable", "Patient", "Steady", "Practical"],
+        "challenges": ["Stubborn", "Slow to change", "Possessive"],
+        "personality": "Often comes across as grounded, dependable, and oriented toward stability and quality.",
+    },
+    "Gemini": {
+        "strengths": ["Curious", "Adaptable", "Expressive", "Quick-thinking"],
+        "challenges": ["Restless", "Scattered", "Inconsistent"],
+        "personality": "Usually presents as curious, verbal, socially agile, and mentally fast-moving.",
+    },
+    "Cancer": {
+        "strengths": ["Protective", "Intuitive", "Loyal", "Empathetic"],
+        "challenges": ["Moody", "Guarded", "Overly sensitive"],
+        "personality": "Frequently reads as intuitive, nurturing, and emotionally perceptive with a strong protective streak.",
+    },
+    "Leo": {
+        "strengths": ["Charismatic", "Warm", "Confident", "Creative"],
+        "challenges": ["Proud", "Dramatic", "Needs validation"],
+        "personality": "Often comes across as charismatic, warm, and comfortable taking up space in visible roles.",
+    },
+    "Virgo": {
+        "strengths": ["Analytical", "Reliable", "Detail-oriented", "Strategic", "Organized"],
+        "challenges": ["Perfectionistic", "Self-critical", "Overthinks decisions"],
+        "personality": "Often appears analytical, disciplined, and highly attentive to details, systems, and execution.",
+    },
+    "Libra": {
+        "strengths": ["Diplomatic", "Balanced", "Social", "Refined"],
+        "challenges": ["Indecisive", "Conflict-avoidant", "People-pleasing"],
+        "personality": "Typically reads as diplomatic, socially aware, and drawn to balance, aesthetics, and connection.",
+    },
+    "Scorpio": {
+        "strengths": ["Intense", "Focused", "Loyal", "Perceptive"],
+        "challenges": ["Private", "Controlling", "Suspicious"],
+        "personality": "Can present as intense, private, perceptive, and highly committed once trust is established.",
+    },
+    "Sagittarius": {
+        "strengths": ["Optimistic", "Independent", "Expansive", "Adventurous"],
+        "challenges": ["Blunt", "Restless", "Overcommits"],
+        "personality": "Usually reads as independent, optimistic, and motivated by growth, discovery, and freedom.",
+    },
+    "Capricorn": {
+        "strengths": ["Disciplined", "Strategic", "Ambitious", "Reliable"],
+        "challenges": ["Reserved", "Rigid", "Work-focused"],
+        "personality": "Often presents as disciplined, strategic, and motivated by long-term achievement and structure.",
+    },
+    "Aquarius": {
+        "strengths": ["Original", "Independent", "Future-focused", "Inventive"],
+        "challenges": ["Detached", "Contrarian", "Unpredictable"],
+        "personality": "Often reads as independent, unconventional, and oriented toward ideas, systems, and future possibilities.",
+    },
+    "Pisces": {
+        "strengths": ["Empathetic", "Creative", "Intuitive", "Imaginative"],
+        "challenges": ["Escapist", "Boundary issues", "Overidealistic"],
+        "personality": "Usually presents as intuitive, imaginative, and emotionally receptive with a strong inner world.",
+    },
+}
+
+
+def _host_onboarding_income_estimate_from_title(title: Any) -> str:
+    t = _host_onboarding_safe_str(title).lower()
+    if not t:
+        return ""
+    rules = [
+        (["chief executive", "ceo", "president", "founder", "co-founder", "owner"], "$180,000-$450,000+"),
+        (["chief", "vp", "vice president", "senior vice president", "svp"], "$140,000-$280,000"),
+        (["director", "head of"], "$100,000-$220,000"),
+        (["manager", "producer", "lead", "supervisor"], "$70,000-$150,000"),
+        (["coordinator", "specialist", "analyst", "consultant"], "$55,000-$120,000"),
+        (["assistant", "associate", "representative"], "$40,000-$85,000"),
+        (["teacher", "nurse", "designer", "creator", "artist"], "$50,000-$130,000"),
+        (["student", "intern"], "$0-$35,000"),
+    ]
+    for needles, band in rules:
+        if any(n in t for n in needles):
+            return band
+    return "$60,000-$140,000"
+
+
+def _host_onboarding_ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_HOST_ONBOARDING_SESSIONS_TABLE} (
+            session_id TEXT PRIMARY KEY,
+            member_id TEXT NOT NULL,
+            brand TEXT,
+            avatar TEXT,
+            host_display_name TEXT,
+            logged_in INTEGER NOT NULL DEFAULT 0,
+            workflow_state TEXT NOT NULL DEFAULT 'not_started',
+            publish_status TEXT NOT NULL DEFAULT 'draft',
+            limited_publish_allowed INTEGER NOT NULL DEFAULT 0,
+            full_publish_ready INTEGER NOT NULL DEFAULT 0,
+            approved_version_id TEXT,
+            basics_json TEXT NOT NULL DEFAULT '{{}}',
+            derived_json TEXT NOT NULL DEFAULT '{{}}',
+            review_json TEXT NOT NULL DEFAULT '{{}}',
+            completion_json TEXT NOT NULL DEFAULT '{{}}',
+            three_d_opt_in INTEGER NOT NULL DEFAULT 0,
+            created_epoch REAL NOT NULL,
+            updated_epoch REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{_HOST_ONBOARDING_SESSIONS_TABLE}_member ON {_HOST_ONBOARDING_SESSIONS_TABLE}(member_id, updated_epoch DESC)"
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_HOST_ONBOARDING_ASSETS_TABLE} (
+            asset_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            slot_key TEXT NOT NULL,
+            required_flag INTEGER NOT NULL DEFAULT 0,
+            url TEXT NOT NULL,
+            file_name TEXT,
+            content_type TEXT,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            width_px INTEGER NOT NULL DEFAULT 0,
+            height_px INTEGER NOT NULL DEFAULT 0,
+            validation_status TEXT NOT NULL DEFAULT 'pending',
+            validation_errors_json TEXT NOT NULL DEFAULT '[]',
+            created_epoch REAL NOT NULL,
+            updated_epoch REAL NOT NULL,
+            UNIQUE(session_id, slot_key)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_HOST_ONBOARDING_VERSIONS_TABLE} (
+            version_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            version_no INTEGER NOT NULL,
+            publish_scope TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            created_epoch REAL NOT NULL,
+            approved_epoch REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{_HOST_ONBOARDING_VERSIONS_TABLE}_session ON {_HOST_ONBOARDING_VERSIONS_TABLE}(session_id, version_no DESC)"
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_HOST_ONBOARDING_AUDIT_TABLE} (
+            audit_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_epoch REAL NOT NULL
+        )
+        """
+    )
+
+
+def _host_onboarding_audit(conn: sqlite3.Connection, session_id: str, member_id: str, event_type: str, payload: Any) -> None:
+    try:
+        conn.execute(
+            f"INSERT INTO {_HOST_ONBOARDING_AUDIT_TABLE} (audit_id, session_id, member_id, event_type, payload_json, created_epoch) VALUES (?, ?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, session_id, member_id, event_type, _host_onboarding_json_dumps(payload), _host_onboarding_now()),
+        )
+    except Exception:
+        pass
+
+
+def _host_onboarding_required_slot(slot_key: str) -> bool:
+    return _host_onboarding_safe_str(slot_key) in set(_HOST_ONBOARDING_REQUIRED_SLOTS)
+
+
+def _host_onboarding_validate_asset(slot_key: str, content_type: str, file_name: str, size_bytes: int, width_px: int = 0, height_px: int = 0) -> Tuple[str, List[str]]:
+    errors: List[str] = []
+    slot = _host_onboarding_safe_str(slot_key)
+    ct = _host_onboarding_safe_str(content_type).lower()
+    fn = _host_onboarding_safe_str(file_name)
+    if slot not in _HOST_ONBOARDING_ALLOWED_SLOTS:
+        errors.append("Unknown photo slot.")
+    if ct not in _HOST_ONBOARDING_ALLOWED_IMAGE_TYPES:
+        errors.append("Only JPG, PNG, WebP, or HEIC images are supported in this onboarding step.")
+    if int(size_bytes or 0) <= 0:
+        errors.append("Uploaded photo is empty.")
+    if int(size_bytes or 0) > int(_HOST_ONBOARDING_MAX_ASSET_BYTES):
+        errors.append("Uploaded photo exceeds the 15 MB limit.")
+    if width_px and height_px:
+        if min(int(width_px), int(height_px)) < 600:
+            errors.append("Photo resolution is too low. Minimum recommended size is 600px on the shortest side.")
+    if fn and len(fn) > 240:
+        errors.append("Original file name is too long.")
+    return ("accepted" if not errors else "needs_review"), errors
+
+
+def _host_onboarding_try_read_image_size(data: bytes) -> Tuple[int, int]:
+    try:
+        from PIL import Image  # type: ignore
+        img = Image.open(io.BytesIO(data))
+        return int(img.size[0] or 0), int(img.size[1] or 0)
+    except Exception:
+        return 0, 0
+
+
+def _host_onboarding_session_row_to_dict(row: sqlite3.Row, assets: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    obj = dict(row) if row is not None else {}
+    basics = _host_onboarding_json_loads(obj.get("basics_json"), {})
+    derived = _host_onboarding_json_loads(obj.get("derived_json"), {})
+    review = _host_onboarding_json_loads(obj.get("review_json"), {})
+    completion = _host_onboarding_json_loads(obj.get("completion_json"), {})
+    compiled_assets = assets if assets is not None else []
+    return {
+        "session_id": _host_onboarding_safe_str(obj.get("session_id")),
+        "member_id": _host_onboarding_safe_str(obj.get("member_id")),
+        "brand": _host_onboarding_safe_str(obj.get("brand")),
+        "avatar": _host_onboarding_safe_str(obj.get("avatar")),
+        "host_display_name": _host_onboarding_safe_str(obj.get("host_display_name")),
+        "logged_in": bool(int(obj.get("logged_in") or 0) == 1),
+        "workflow_state": _host_onboarding_safe_str(obj.get("workflow_state")) or "not_started",
+        "publish_status": _host_onboarding_safe_str(obj.get("publish_status")) or "draft",
+        "limited_publish_allowed": bool(int(obj.get("limited_publish_allowed") or 0) == 1),
+        "full_publish_ready": bool(int(obj.get("full_publish_ready") or 0) == 1),
+        "approved_version_id": _host_onboarding_safe_str(obj.get("approved_version_id")),
+        "three_d_opt_in": bool(int(obj.get("three_d_opt_in") or 0) == 1),
+        "basics": basics if isinstance(basics, dict) else {},
+        "derived": derived if isinstance(derived, dict) else {},
+        "review": review if isinstance(review, dict) else {},
+        "completion": completion if isinstance(completion, dict) else {},
+        "assets": compiled_assets,
+        "created_epoch": float(obj.get("created_epoch") or 0.0),
+        "updated_epoch": float(obj.get("updated_epoch") or 0.0),
+    }
+
+
+def _host_onboarding_asset_rows(conn: sqlite3.Connection, session_id: str) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        f"SELECT * FROM {_HOST_ONBOARDING_ASSETS_TABLE} WHERE session_id = ? ORDER BY created_epoch ASC, slot_key ASC",
+        (session_id,),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        obj = dict(row)
+        out.append(
+            {
+                "asset_id": _host_onboarding_safe_str(obj.get("asset_id")),
+                "session_id": _host_onboarding_safe_str(obj.get("session_id")),
+                "slot_key": _host_onboarding_safe_str(obj.get("slot_key")),
+                "required": bool(int(obj.get("required_flag") or 0) == 1),
+                "url": _host_onboarding_safe_str(obj.get("url")),
+                "file_name": _host_onboarding_safe_str(obj.get("file_name")),
+                "content_type": _host_onboarding_safe_str(obj.get("content_type")),
+                "size_bytes": int(obj.get("size_bytes") or 0),
+                "width_px": int(obj.get("width_px") or 0),
+                "height_px": int(obj.get("height_px") or 0),
+                "validation_status": _host_onboarding_safe_str(obj.get("validation_status")) or "pending",
+                "validation_errors": _host_onboarding_json_loads(obj.get("validation_errors_json"), []),
+            }
+        )
+    return out
+
+
+def _host_onboarding_get_session_by_id(conn: sqlite3.Connection, session_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        f"SELECT * FROM {_HOST_ONBOARDING_SESSIONS_TABLE} WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _host_onboarding_session_row_to_dict(row, _host_onboarding_asset_rows(conn, session_id))
+
+
+def _host_onboarding_find_active_session(conn: sqlite3.Connection, member_id: str, brand: str, avatar: str) -> Optional[Dict[str, Any]]:
+    filters = ["member_id = ?"]
+    params: List[Any] = [member_id]
+    if brand:
+        filters.append("COALESCE(brand, '') = ?")
+        params.append(brand)
+    if avatar:
+        filters.append("COALESCE(avatar, '') = ?")
+        params.append(avatar)
+    row = conn.execute(
+        f"SELECT * FROM {_HOST_ONBOARDING_SESSIONS_TABLE} WHERE {' AND '.join(filters)} ORDER BY updated_epoch DESC LIMIT 1",
+        tuple(params),
+    ).fetchone()
+    if row is None:
+        return None
+    return _host_onboarding_session_row_to_dict(row, _host_onboarding_asset_rows(conn, _host_onboarding_safe_str(row['session_id'])))
+
+
+def _host_onboarding_upsert_session(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    member_id: str,
+    brand: str,
+    avatar: str,
+    host_display_name: str,
+    logged_in: bool,
+    workflow_state: Optional[str] = None,
+    publish_status: Optional[str] = None,
+    basics: Optional[Dict[str, Any]] = None,
+    derived: Optional[Dict[str, Any]] = None,
+    review: Optional[Dict[str, Any]] = None,
+    completion: Optional[Dict[str, Any]] = None,
+    three_d_opt_in: Optional[bool] = None,
+    limited_publish_allowed: Optional[bool] = None,
+    full_publish_ready: Optional[bool] = None,
+    approved_version_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    existing_row = conn.execute(
+        f"SELECT * FROM {_HOST_ONBOARDING_SESSIONS_TABLE} WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    now = _host_onboarding_now()
+    existing = _host_onboarding_session_row_to_dict(existing_row, _host_onboarding_asset_rows(conn, session_id)) if existing_row is not None else None
+    basics_json = basics if basics is not None else (existing or {}).get("basics") or {}
+    derived_json = derived if derived is not None else (existing or {}).get("derived") or {}
+    review_json = review if review is not None else (existing or {}).get("review") or {}
+    completion_json = completion if completion is not None else (existing or {}).get("completion") or {}
+    state_value = _host_onboarding_safe_str(workflow_state) or ((existing or {}).get("workflow_state") or "not_started")
+    publish_value = _host_onboarding_safe_str(publish_status) or ((existing or {}).get("publish_status") or "draft")
+    three_d_value = int(bool(three_d_opt_in if three_d_opt_in is not None else ((existing or {}).get("three_d_opt_in") is True)))
+    limited_value = int(bool(limited_publish_allowed if limited_publish_allowed is not None else ((existing or {}).get("limited_publish_allowed") is True)))
+    full_value = int(bool(full_publish_ready if full_publish_ready is not None else ((existing or {}).get("full_publish_ready") is True)))
+    approved_value = _host_onboarding_safe_str(approved_version_id) or _host_onboarding_safe_str((existing or {}).get("approved_version_id"))
+    created_epoch = float((existing or {}).get("created_epoch") or now)
+    conn.execute(
+        f"""
+        INSERT INTO {_HOST_ONBOARDING_SESSIONS_TABLE}
+        (session_id, member_id, brand, avatar, host_display_name, logged_in, workflow_state, publish_status,
+         limited_publish_allowed, full_publish_ready, approved_version_id, basics_json, derived_json, review_json,
+         completion_json, three_d_opt_in, created_epoch, updated_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            member_id=excluded.member_id,
+            brand=excluded.brand,
+            avatar=excluded.avatar,
+            host_display_name=excluded.host_display_name,
+            logged_in=excluded.logged_in,
+            workflow_state=excluded.workflow_state,
+            publish_status=excluded.publish_status,
+            limited_publish_allowed=excluded.limited_publish_allowed,
+            full_publish_ready=excluded.full_publish_ready,
+            approved_version_id=excluded.approved_version_id,
+            basics_json=excluded.basics_json,
+            derived_json=excluded.derived_json,
+            review_json=excluded.review_json,
+            completion_json=excluded.completion_json,
+            three_d_opt_in=excluded.three_d_opt_in,
+            updated_epoch=excluded.updated_epoch
+        """,
+        (
+            session_id,
+            member_id,
+            brand,
+            avatar,
+            host_display_name,
+            int(bool(logged_in)),
+            state_value,
+            publish_value,
+            limited_value,
+            full_value,
+            approved_value,
+            _host_onboarding_json_dumps(basics_json),
+            _host_onboarding_json_dumps(derived_json),
+            _host_onboarding_json_dumps(review_json),
+            _host_onboarding_json_dumps(completion_json),
+            three_d_value,
+            created_epoch,
+            now,
+        ),
+    )
+    row = conn.execute(
+        f"SELECT * FROM {_HOST_ONBOARDING_SESSIONS_TABLE} WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    return _host_onboarding_session_row_to_dict(row, _host_onboarding_asset_rows(conn, session_id))
+
+
+def _host_onboarding_assert_member_access(session: Dict[str, Any], member_id: str) -> None:
+    owner = _host_onboarding_safe_str((session or {}).get("member_id"))
+    if not owner or owner != _host_onboarding_safe_str(member_id):
+        raise HTTPException(status_code=403, detail="Host onboarding session access denied")
+
+
+def _host_onboarding_required_slots_present(assets: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+    accepted = {str(a.get("slot_key") or "").strip() for a in (assets or []) if str(a.get("validation_status") or "") in ("accepted", "needs_review") and str(a.get("url") or "").strip()}
+    missing = [slot for slot in _HOST_ONBOARDING_REQUIRED_SLOTS if slot not in accepted]
+    return len(missing) == 0, missing
+
+
+def _host_onboarding_build_astro_profile(sign: str) -> Dict[str, Any]:
+    info = _HOST_ONBOARDING_ZODIAC_NOTES.get(_host_onboarding_safe_str(sign), {})
+    strengths = list(info.get("strengths") or [])
+    challenges = list(info.get("challenges") or [])
+    personality = _host_onboarding_safe_str(info.get("personality"))
+    if not sign:
+        return {"sign": "", "strengths": [], "challenges": [], "narrative": ""}
+    narrative = f"{sign} profile draft: {personality}".strip()
+    return {
+        "sign": sign,
+        "strengths": strengths,
+        "challenges": challenges,
+        "narrative": narrative,
+    }
+
+
+def _host_onboarding_build_quick_reference(basics: Dict[str, Any], nationalities: List[str], age_years: Optional[int], zodiac_sign: str) -> Dict[str, Any]:
+    birth_city = _host_onboarding_safe_str(basics.get("birth_city"))
+    birth_state = _host_onboarding_safe_str(basics.get("birth_state_region"))
+    birth_country = _host_onboarding_safe_str(basics.get("birth_country"))
+    birthplace_parts = [x for x in [birth_city, birth_state, birth_country] if x]
+    race_primary = _host_onboarding_safe_str(basics.get("race_primary"))
+    ethnicity_detail = _host_onboarding_safe_str(basics.get("ethnicity_detail"))
+    public_name = _host_onboarding_safe_str(basics.get("stage_name")) or _host_onboarding_safe_str(basics.get("public_display_name"))
+    return {
+        "public_name": public_name,
+        "age": age_years,
+        "zodiac_sign": zodiac_sign,
+        "birth_location": ", ".join(birthplace_parts),
+        "nationalities": nationalities,
+        "race": race_primary,
+        "ethnicity": ethnicity_detail,
+    }
+
+
+def _host_onboarding_build_family_heritage_draft(basics: Dict[str, Any], nationalities: List[str]) -> str:
+    ethnicity_detail = _host_onboarding_safe_str(basics.get("ethnicity_detail"))
+    race_primary = _host_onboarding_safe_str(basics.get("race_primary"))
+    birth_country = _host_onboarding_safe_str(basics.get("birth_country"))
+    parts: List[str] = []
+    if ethnicity_detail:
+        parts.append(f"The host identifies their ethnicity as {ethnicity_detail}.")
+    if race_primary:
+        parts.append(f"The host identifies their race as {race_primary}.")
+    if nationalities:
+        if len(nationalities) == 1:
+            parts.append(f"The current nationality suggestion is {nationalities[0]} and remains host-reviewable.")
+        else:
+            parts.append("The current nationality suggestions are " + ", ".join(nationalities) + ", and remain host-reviewable.")
+    if birth_country:
+        parts.append(f"Birth country is recorded as {birth_country}.")
+    return " ".join(parts).strip()
+
+
+def _host_onboarding_build_personality_draft(zodiac_sign: str) -> str:
+    info = _HOST_ONBOARDING_ZODIAC_NOTES.get(_host_onboarding_safe_str(zodiac_sign), {})
+    personality = _host_onboarding_safe_str(info.get("personality"))
+    if not zodiac_sign:
+        return ""
+    return f"Draft personality framing based on {zodiac_sign}: {personality} This draft is for host review and editing before approval.".strip()
+
+
+def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
+    basics = dict(session.get("basics") or {})
+    derived = dict(session.get("derived") or {})
+    review = dict(session.get("review") or {})
+    completion = dict(session.get("completion") or {})
+    assets = list(session.get("assets") or [])
+    nationalities = []
+    for item in (review.get("nationalities") or derived.get("nationalities") or []):
+        t = _host_onboarding_safe_str(item)
+        if t and t not in nationalities:
+            nationalities.append(t)
+    public_name = _host_onboarding_safe_str(basics.get("stage_name")) or _host_onboarding_safe_str(basics.get("public_display_name"))
+    legal_name = _host_onboarding_safe_str(basics.get("legal_name"))
+    career_title = _host_onboarding_safe_str(completion.get("current_job_title"))
+    income_estimate = _host_onboarding_safe_str(completion.get("estimated_income") or derived.get("estimated_income"))
+    if not income_estimate and career_title:
+        income_estimate = _host_onboarding_income_estimate_from_title(career_title)
+    private_identity = {
+        "legal_name": legal_name,
+        "birthdate": _host_onboarding_safe_str(basics.get("birthdate")),
+        "birth_city": _host_onboarding_safe_str(basics.get("birth_city")),
+        "birth_state_region": _host_onboarding_safe_str(basics.get("birth_state_region")),
+        "birth_country": _host_onboarding_safe_str(basics.get("birth_country")),
+        "nationalities": nationalities,
+        "race_primary": _host_onboarding_safe_str(basics.get("race_primary")),
+        "race_detail": _host_onboarding_safe_str(basics.get("race_detail")),
+        "ethnicity_bucket": _host_onboarding_safe_str(basics.get("ethnicity_bucket")),
+        "ethnicity_detail": _host_onboarding_safe_str(basics.get("ethnicity_detail")),
+        "estimated_income": income_estimate,
+    }
+    public_profile = {
+        "stage_name": public_name,
+        "public_display_name": _host_onboarding_safe_str(basics.get("public_display_name")) or public_name,
+        "gender": _host_onboarding_safe_str(basics.get("gender_display")),
+        "age": review.get("age_years") or derived.get("age_years"),
+        "zodiac_sign": _host_onboarding_safe_str(review.get("zodiac_sign") or derived.get("zodiac_sign")),
+        "quick_reference_summary": review.get("quick_reference") or derived.get("quick_reference") or {},
+        "family_heritage": _host_onboarding_safe_str(review.get("family_heritage_draft") or derived.get("family_heritage_draft")),
+        "astrological_profile": review.get("astrological_profile") or derived.get("astrological_profile") or {},
+        "personality": _host_onboarding_safe_str(review.get("personality_draft") or derived.get("personality_draft")),
+        "physical_description": _host_onboarding_safe_str(review.get("physical_description_draft") or completion.get("physical_description") or ""),
+        "education": _host_onboarding_safe_str(completion.get("education")),
+        "career": {
+            "current_job_title": career_title,
+            "current_company": _host_onboarding_safe_str(completion.get("current_company")),
+            "career_summary": _host_onboarding_safe_str(completion.get("career_summary")),
+        },
+        "likes": _host_onboarding_safe_str(completion.get("likes")),
+        "dislikes": _host_onboarding_safe_str(completion.get("dislikes")),
+        "hobbies": _host_onboarding_safe_str(completion.get("hobbies")),
+        "lifestyle": _host_onboarding_safe_str(completion.get("lifestyle")),
+        "background_story": _host_onboarding_safe_str(completion.get("background_story")),
+        "core_values": _host_onboarding_safe_str(completion.get("core_values")),
+        "personal_motto": _host_onboarding_safe_str(completion.get("personal_motto")),
+        "assets": assets,
+    }
+    ai_profile = {
+        "approved_stage_name": public_profile.get("stage_name"),
+        "host_real_name_private": legal_name,
+        "public_identity": public_profile,
+        "private_identity": private_identity,
+        "three_d_opt_in": bool(session.get("three_d_opt_in") is True),
+    }
+    return {
+        "session": {
+            "session_id": _host_onboarding_safe_str(session.get("session_id")),
+            "member_id": _host_onboarding_safe_str(session.get("member_id")),
+            "brand": _host_onboarding_safe_str(session.get("brand")),
+            "avatar": _host_onboarding_safe_str(session.get("avatar")),
+            "publish_status": _host_onboarding_safe_str(session.get("publish_status")),
+            "workflow_state": _host_onboarding_safe_str(session.get("workflow_state")),
+        },
+        "private_profile": private_identity,
+        "public_profile": public_profile,
+        "ai_profile": ai_profile,
+    }
+
+
+def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any]:
+    basics = dict(session.get("basics") or {})
+    review = dict(session.get("review") or {})
+    completion = dict(session.get("completion") or {})
+    assets = list(session.get("assets") or [])
+    basics_required = [
+        basics.get("legal_name"),
+        basics.get("stage_name"),
+        basics.get("birthdate"),
+        basics.get("birth_city"),
+        basics.get("birth_state_region"),
+        basics.get("birth_country"),
+        basics.get("race_primary"),
+        basics.get("ethnicity_bucket"),
+    ]
+    basics_ok = all(_host_onboarding_safe_str(v) for v in basics_required)
+    photos_ok, missing_slots = _host_onboarding_required_slots_present(assets)
+    review_ok = bool(review) and bool(_host_onboarding_safe_str(review.get("zodiac_sign") or review.get("family_heritage_draft") or review.get("personality_draft")))
+    skipped_sections = completion.get("skipped_sections") or {}
+    if not isinstance(skipped_sections, dict):
+        skipped_sections = {}
+    major_sections = [
+        "education",
+        "career_summary",
+        "likes",
+        "dislikes",
+        "hobbies",
+        "lifestyle",
+        "background_story",
+        "core_values",
+        "personal_motto",
+    ]
+    full_ready = True
+    for key in major_sections:
+        val = _host_onboarding_safe_str(completion.get(key))
+        if val:
+            continue
+        if bool(skipped_sections.get(key) is True):
+            full_ready = False
+            break
+        full_ready = False
+        break
+    limited_allowed = basics_ok and photos_ok and review_ok
+    return {
+        "basics_ok": basics_ok,
+        "photos_ok": photos_ok,
+        "missing_required_slots": missing_slots,
+        "review_ok": review_ok,
+        "limited_publish_allowed": limited_allowed,
+        "full_publish_ready": limited_allowed and full_ready,
+    }
+
+
+class HostOnboardingStartRequest(BaseModel):
+    memberId: Optional[str] = None
+    member_id: Optional[str] = None
+    brand: Optional[str] = None
+    avatar: Optional[str] = None
+    loggedIn: Optional[bool] = None
+    logged_in: Optional[bool] = None
+    hostDisplayName: Optional[str] = None
+    host_display_name: Optional[str] = None
+
+
+class HostOnboardingBasicsRequest(BaseModel):
+    memberId: Optional[str] = None
+    member_id: Optional[str] = None
+    basics: Dict[str, Any] = {}
+
+
+class HostOnboardingPhotosConfigRequest(BaseModel):
+    memberId: Optional[str] = None
+    member_id: Optional[str] = None
+    threeDOptIn: Optional[bool] = None
+    three_d_opt_in: Optional[bool] = None
+
+
+class HostOnboardingReviewRequest(BaseModel):
+    memberId: Optional[str] = None
+    member_id: Optional[str] = None
+    review: Dict[str, Any] = {}
+
+
+class HostOnboardingCompletionRequest(BaseModel):
+    memberId: Optional[str] = None
+    member_id: Optional[str] = None
+    completion: Dict[str, Any] = {}
+
+
+class HostOnboardingApproveRequest(BaseModel):
+    memberId: Optional[str] = None
+    member_id: Optional[str] = None
+    publishScope: Optional[str] = None
+    publish_scope: Optional[str] = None
+
+
+@app.post("/host-onboarding/session/start")
+async def host_onboarding_session_start(req: HostOnboardingStartRequest):
+    member_id = _host_onboarding_normalize_member_id(req.memberId or req.member_id)
+    logged_in = bool(req.loggedIn if req.loggedIn is not None else req.logged_in)
+    brand = _host_onboarding_safe_str(req.brand)
+    avatar = _host_onboarding_safe_str(req.avatar)
+    host_display_name = _host_onboarding_safe_str(req.hostDisplayName or req.host_display_name)
+    if not member_id or not logged_in:
+        raise HTTPException(status_code=403, detail="Host onboarding requires a logged-in host member session")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        existing = _host_onboarding_find_active_session(conn, member_id, brand, avatar)
+        if existing and _host_onboarding_safe_str(existing.get("publish_status")) not in ("approved", "full"):
+            session = _host_onboarding_upsert_session(
+                conn,
+                session_id=_host_onboarding_safe_str(existing.get("session_id")),
+                member_id=member_id,
+                brand=brand or _host_onboarding_safe_str(existing.get("brand")),
+                avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
+                host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
+                logged_in=logged_in,
+            )
+        else:
+            session = _host_onboarding_upsert_session(
+                conn,
+                session_id=uuid.uuid4().hex,
+                member_id=member_id,
+                brand=brand,
+                avatar=avatar,
+                host_display_name=host_display_name,
+                logged_in=logged_in,
+                workflow_state="not_started",
+                publish_status="draft",
+                basics={},
+                derived={},
+                review={},
+                completion={},
+                limited_publish_allowed=False,
+                full_publish_ready=False,
+            )
+            _host_onboarding_audit(conn, session["session_id"], member_id, "session_started", {"brand": brand, "avatar": avatar})
+        conn.commit()
+        return {"ok": True, "session": session, "readiness": _host_onboarding_compute_readiness(session)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/session/{session_id}")
+async def host_onboarding_session_get(session_id: str, request: Request):
+    raw = await request.json()
+    member_id = _host_onboarding_normalize_member_id((raw or {}).get("memberId") or (raw or {}).get("member_id"))
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(session_id))
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        return {"ok": True, "session": session, "readiness": _host_onboarding_compute_readiness(session)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/session/{session_id}/basics")
+async def host_onboarding_save_basics(session_id: str, req: HostOnboardingBasicsRequest):
+    member_id = _host_onboarding_normalize_member_id(req.memberId or req.member_id)
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    basics_in = dict(req.basics or {})
+    legal_name = _host_onboarding_safe_str(basics_in.get("legal_name"))
+    stage_name = _host_onboarding_safe_str(basics_in.get("stage_name"))
+    public_display_name = _host_onboarding_safe_str(basics_in.get("public_display_name")) or stage_name
+    gender_pick = _host_onboarding_safe_str(basics_in.get("gender_pick"))
+    gender_custom = _host_onboarding_safe_str(basics_in.get("gender_custom"))
+    gender_display = gender_custom if gender_pick == "Prefer to self-describe" and gender_custom else gender_pick
+    basics = {
+        "legal_name": legal_name,
+        "stage_name": stage_name,
+        "public_display_name": public_display_name,
+        "gender_pick": gender_pick,
+        "gender_custom": gender_custom,
+        "gender_display": gender_display,
+        "birthdate": _host_onboarding_safe_str(basics_in.get("birthdate")),
+        "birth_city": _host_onboarding_safe_str(basics_in.get("birth_city")),
+        "birth_state_region": _host_onboarding_safe_str(basics_in.get("birth_state_region")),
+        "birth_country": _host_onboarding_safe_str(basics_in.get("birth_country")),
+        "race_primary": _host_onboarding_safe_str(basics_in.get("race_primary")),
+        "race_detail": _host_onboarding_safe_str(basics_in.get("race_detail")),
+        "ethnicity_bucket": _host_onboarding_safe_str(basics_in.get("ethnicity_bucket")),
+        "ethnicity_detail": _host_onboarding_safe_str(basics_in.get("ethnicity_detail")),
+        "source": "entered",
+    }
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(session_id))
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=session["session_id"],
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(session.get("brand")),
+            avatar=_host_onboarding_safe_str(session.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(session.get("host_display_name")),
+            logged_in=bool(session.get("logged_in") is True),
+            workflow_state="in_progress_photos",
+            basics=basics,
+        )
+        _host_onboarding_audit(conn, session["session_id"], member_id, "basics_saved", basics)
+        conn.commit()
+        return {"ok": True, "session": updated, "readiness": _host_onboarding_compute_readiness(updated)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/session/{session_id}/photos-config")
+async def host_onboarding_save_photos_config(session_id: str, req: HostOnboardingPhotosConfigRequest):
+    member_id = _host_onboarding_normalize_member_id(req.memberId or req.member_id)
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    three_d_opt_in = bool(req.threeDOptIn if req.threeDOptIn is not None else req.three_d_opt_in)
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(session_id))
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=session["session_id"],
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(session.get("brand")),
+            avatar=_host_onboarding_safe_str(session.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(session.get("host_display_name")),
+            logged_in=bool(session.get("logged_in") is True),
+            workflow_state="in_progress_photos",
+            three_d_opt_in=three_d_opt_in,
+        )
+        _host_onboarding_audit(conn, session["session_id"], member_id, "photos_config_saved", {"three_d_opt_in": three_d_opt_in})
+        conn.commit()
+        return {"ok": True, "session": updated, "readiness": _host_onboarding_compute_readiness(updated)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/files/upload")
+async def host_onboarding_files_upload(request: Request) -> Dict[str, Any]:
+    session_id = _host_onboarding_safe_str(request.headers.get("x-session-id") or request.headers.get("X-Session-Id"))
+    member_id = _host_onboarding_safe_str(request.headers.get("x-member-id") or request.headers.get("X-Member-Id"))
+    slot_key = _host_onboarding_safe_str(request.headers.get("x-slot-key") or request.headers.get("X-Slot-Key"))
+    filename = _safe_filename(request.headers.get("x-filename") or request.headers.get("X-Filename") or "upload")
+    content_type = _host_onboarding_safe_str(request.headers.get("content-type") or "application/octet-stream")
+    if not session_id or not member_id or not slot_key:
+        raise HTTPException(status_code=400, detail="X-Session-Id, X-Member-Id, and X-Slot-Key headers are required")
+    if slot_key not in _HOST_ONBOARDING_ALLOWED_SLOTS:
+        raise HTTPException(status_code=400, detail="Unknown onboarding photo slot")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload body")
+    if len(data) > _HOST_ONBOARDING_MAX_ASSET_BYTES:
+        raise HTTPException(status_code=413, detail="Photo upload exceeds the 15 MB limit")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        session = _host_onboarding_get_session_by_id(conn, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        ext = _infer_upload_ext(content_type, filename)
+        blob_name = (
+            f"host-onboarding/"
+            f"{_host_onboarding_safe_slug(member_id, default='member')}/"
+            f"{_host_onboarding_safe_slug(session_id, default='session')}/"
+            f"{_host_onboarding_safe_slug(slot_key, default='slot')}/"
+            f"{uuid.uuid4().hex}{ext}"
+        )
+        width_px, height_px = _host_onboarding_try_read_image_size(data)
+        validation_status, validation_errors = _host_onboarding_validate_asset(slot_key, content_type, filename, len(data), width_px, height_px)
+        try:
+            url = await run_in_threadpool(
+                _azure_upload_bytes_and_get_sas_url,
+                container_name=_UPLOADS_CONTAINER,
+                blob_name=blob_name,
+                content_type=content_type,
+                data=data,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Upload failed: {type(e).__name__}: {e}")
+        asset_id = uuid.uuid4().hex
+        conn.execute(
+            f"""
+            INSERT INTO {_HOST_ONBOARDING_ASSETS_TABLE}
+            (asset_id, session_id, slot_key, required_flag, url, file_name, content_type, size_bytes, width_px, height_px,
+             validation_status, validation_errors_json, created_epoch, updated_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, slot_key) DO UPDATE SET
+                asset_id=excluded.asset_id,
+                required_flag=excluded.required_flag,
+                url=excluded.url,
+                file_name=excluded.file_name,
+                content_type=excluded.content_type,
+                size_bytes=excluded.size_bytes,
+                width_px=excluded.width_px,
+                height_px=excluded.height_px,
+                validation_status=excluded.validation_status,
+                validation_errors_json=excluded.validation_errors_json,
+                updated_epoch=excluded.updated_epoch
+            """,
+            (
+                asset_id,
+                session_id,
+                slot_key,
+                int(_host_onboarding_required_slot(slot_key)),
+                url,
+                filename,
+                content_type,
+                len(data),
+                width_px,
+                height_px,
+                validation_status,
+                _host_onboarding_json_dumps(validation_errors),
+                _host_onboarding_now(),
+                _host_onboarding_now(),
+            ),
+        )
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=session_id,
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(session.get("brand")),
+            avatar=_host_onboarding_safe_str(session.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(session.get("host_display_name")),
+            logged_in=bool(session.get("logged_in") is True),
+            workflow_state="in_progress_photos",
+        )
+        _host_onboarding_audit(conn, session_id, member_id, "photo_uploaded", {"slot_key": slot_key, "validation_status": validation_status})
+        conn.commit()
+        return {
+            "ok": True,
+            "asset": next((a for a in (updated.get("assets") or []) if str(a.get("slot_key") or "") == slot_key), None),
+            "session": updated,
+            "readiness": _host_onboarding_compute_readiness(updated),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/session/{session_id}/derive")
+async def host_onboarding_derive(session_id: str, request: Request):
+    raw = await request.json()
+    member_id = _host_onboarding_normalize_member_id((raw or {}).get("memberId") or (raw or {}).get("member_id"))
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(session_id))
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        readiness = _host_onboarding_compute_readiness(session)
+        if not readiness.get("basics_ok"):
+            raise HTTPException(status_code=400, detail="Complete the basics step before derivation")
+        if not readiness.get("photos_ok"):
+            missing = ", ".join(readiness.get("missing_required_slots") or [])
+            raise HTTPException(status_code=400, detail=f"Upload all required photo slots before derivation: {missing}")
+        basics = dict(session.get("basics") or {})
+        age_years = _host_onboarding_age_from_birthdate(basics.get("birthdate"))
+        zodiac_sign = _host_onboarding_zodiac_from_birthdate(basics.get("birthdate"))
+        nationalities = _host_onboarding_derive_nationality_list(basics.get("birth_country"), basics.get("nationalities") or [])
+        quick_reference = _host_onboarding_build_quick_reference(basics, nationalities, age_years, zodiac_sign)
+        astrological_profile = _host_onboarding_build_astro_profile(zodiac_sign)
+        family_heritage_draft = _host_onboarding_build_family_heritage_draft(basics, nationalities)
+        personality_draft = _host_onboarding_build_personality_draft(zodiac_sign)
+        derived = {
+            "age_years": age_years,
+            "zodiac_sign": zodiac_sign,
+            "nationalities": nationalities,
+            "quick_reference": quick_reference,
+            "astrological_profile": astrological_profile,
+            "family_heritage_draft": family_heritage_draft,
+            "personality_draft": personality_draft,
+            "physical_description_draft": "Physical description is intentionally left for host review and completion in this MVP.",
+            "sources": {
+                "age_years": "derived",
+                "zodiac_sign": "derived",
+                "nationalities": "derived_suggestion",
+                "quick_reference": "derived",
+                "astrological_profile": "ai_draft",
+                "family_heritage_draft": "ai_draft",
+                "personality_draft": "ai_draft",
+                "physical_description_draft": "ai_draft",
+            },
+        }
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=session["session_id"],
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(session.get("brand")),
+            avatar=_host_onboarding_safe_str(session.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(session.get("host_display_name")),
+            logged_in=bool(session.get("logged_in") is True),
+            workflow_state="awaiting_review",
+            derived=derived,
+        )
+        _host_onboarding_audit(conn, session["session_id"], member_id, "derivation_completed", {"zodiac_sign": zodiac_sign, "age_years": age_years})
+        conn.commit()
+        return {"ok": True, "session": updated, "derived": derived, "readiness": _host_onboarding_compute_readiness(updated)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/session/{session_id}/review")
+async def host_onboarding_save_review(session_id: str, req: HostOnboardingReviewRequest):
+    member_id = _host_onboarding_normalize_member_id(req.memberId or req.member_id)
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    review_in = dict(req.review or {})
+    nationalities_raw = review_in.get("nationalities") or []
+    if isinstance(nationalities_raw, str):
+        nationalities = [x.strip() for x in nationalities_raw.split(",") if x.strip()]
+    else:
+        nationalities = [x for x in [ _host_onboarding_safe_str(v) for v in list(nationalities_raw or []) ] if x]
+    review = {
+        "age_years": review_in.get("age_years"),
+        "zodiac_sign": _host_onboarding_safe_str(review_in.get("zodiac_sign")),
+        "nationalities": nationalities,
+        "quick_reference": review_in.get("quick_reference") if isinstance(review_in.get("quick_reference"), dict) else {},
+        "astrological_profile": review_in.get("astrological_profile") if isinstance(review_in.get("astrological_profile"), dict) else {},
+        "family_heritage_draft": _host_onboarding_safe_str(review_in.get("family_heritage_draft")),
+        "personality_draft": _host_onboarding_safe_str(review_in.get("personality_draft")),
+        "physical_description_draft": _host_onboarding_safe_str(review_in.get("physical_description_draft")),
+        "reviewed_epoch": _host_onboarding_now(),
+        "sources": {
+            "age_years": "reviewed",
+            "zodiac_sign": "reviewed",
+            "nationalities": "reviewed",
+            "quick_reference": "reviewed",
+            "astrological_profile": "reviewed",
+            "family_heritage_draft": "reviewed",
+            "personality_draft": "reviewed",
+            "physical_description_draft": "reviewed",
+        },
+    }
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(session_id))
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=session["session_id"],
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(session.get("brand")),
+            avatar=_host_onboarding_safe_str(session.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(session.get("host_display_name")),
+            logged_in=bool(session.get("logged_in") is True),
+            workflow_state="in_progress_completion",
+            review=review,
+            limited_publish_allowed=True,
+        )
+        readiness = _host_onboarding_compute_readiness(updated)
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=updated["session_id"],
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(updated.get("brand")),
+            avatar=_host_onboarding_safe_str(updated.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(updated.get("host_display_name")),
+            logged_in=bool(updated.get("logged_in") is True),
+            limited_publish_allowed=bool(readiness.get("limited_publish_allowed") is True),
+            full_publish_ready=bool(readiness.get("full_publish_ready") is True),
+        )
+        _host_onboarding_audit(conn, session["session_id"], member_id, "review_saved", {"nationalities": nationalities})
+        conn.commit()
+        return {"ok": True, "session": updated, "readiness": _host_onboarding_compute_readiness(updated)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/session/{session_id}/completion")
+async def host_onboarding_save_completion(session_id: str, req: HostOnboardingCompletionRequest):
+    member_id = _host_onboarding_normalize_member_id(req.memberId or req.member_id)
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    completion_in = dict(req.completion or {})
+    skipped_sections = completion_in.get("skipped_sections") or {}
+    if not isinstance(skipped_sections, dict):
+        skipped_sections = {}
+    current_job_title = _host_onboarding_safe_str(completion_in.get("current_job_title"))
+    estimated_income = _host_onboarding_safe_str(completion_in.get("estimated_income")) or _host_onboarding_income_estimate_from_title(current_job_title)
+    completion = {
+        "education": _host_onboarding_safe_str(completion_in.get("education")),
+        "current_job_title": current_job_title,
+        "current_company": _host_onboarding_safe_str(completion_in.get("current_company")),
+        "career_summary": _host_onboarding_safe_str(completion_in.get("career_summary")),
+        "estimated_income": estimated_income,
+        "likes": _host_onboarding_safe_str(completion_in.get("likes")),
+        "dislikes": _host_onboarding_safe_str(completion_in.get("dislikes")),
+        "hobbies": _host_onboarding_safe_str(completion_in.get("hobbies")),
+        "lifestyle": _host_onboarding_safe_str(completion_in.get("lifestyle")),
+        "background_story": _host_onboarding_safe_str(completion_in.get("background_story")),
+        "core_values": _host_onboarding_safe_str(completion_in.get("core_values")),
+        "personal_motto": _host_onboarding_safe_str(completion_in.get("personal_motto")),
+        "physical_description": _host_onboarding_safe_str(completion_in.get("physical_description")),
+        "skipped_sections": skipped_sections,
+        "updated_epoch": _host_onboarding_now(),
+    }
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(session_id))
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=session["session_id"],
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(session.get("brand")),
+            avatar=_host_onboarding_safe_str(session.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(session.get("host_display_name")),
+            logged_in=bool(session.get("logged_in") is True),
+            workflow_state="awaiting_final_approval",
+            completion=completion,
+        )
+        readiness = _host_onboarding_compute_readiness(updated)
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=updated["session_id"],
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(updated.get("brand")),
+            avatar=_host_onboarding_safe_str(updated.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(updated.get("host_display_name")),
+            logged_in=bool(updated.get("logged_in") is True),
+            limited_publish_allowed=bool(readiness.get("limited_publish_allowed") is True),
+            full_publish_ready=bool(readiness.get("full_publish_ready") is True),
+        )
+        _host_onboarding_audit(conn, session["session_id"], member_id, "completion_saved", {"estimated_income": estimated_income})
+        conn.commit()
+        return {"ok": True, "session": updated, "readiness": _host_onboarding_compute_readiness(updated)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/session/{session_id}/preview")
+async def host_onboarding_preview(session_id: str, request: Request):
+    raw = await request.json()
+    member_id = _host_onboarding_normalize_member_id((raw or {}).get("memberId") or (raw or {}).get("member_id"))
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(session_id))
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        preview = _host_onboarding_compile_profile(session)
+        return {"ok": True, "session": session, "preview": preview, "readiness": _host_onboarding_compute_readiness(session)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/session/{session_id}/approve")
+async def host_onboarding_approve(session_id: str, req: HostOnboardingApproveRequest):
+    member_id = _host_onboarding_normalize_member_id(req.memberId or req.member_id)
+    publish_scope = _host_onboarding_safe_str(req.publishScope or req.publish_scope).lower() or "limited"
+    if publish_scope not in ("limited", "full"):
+        publish_scope = "limited"
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(session_id))
+        if not session:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(session, member_id)
+        readiness = _host_onboarding_compute_readiness(session)
+        if publish_scope == "limited" and not bool(readiness.get("limited_publish_allowed") is True):
+            raise HTTPException(status_code=400, detail="Limited publish is not available until basics, required photos, and derived review are complete")
+        if publish_scope == "full" and not bool(readiness.get("full_publish_ready") is True):
+            raise HTTPException(status_code=400, detail="Full publish requires completion or explicit handling of all MVP profile sections")
+        version_no_row = conn.execute(
+            f"SELECT COALESCE(MAX(version_no), 0) AS max_version FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        version_no = int(version_no_row["max_version"] if version_no_row is not None else 0) + 1
+        version_id = uuid.uuid4().hex
+        profile = _host_onboarding_compile_profile(session)
+        approved_epoch = _host_onboarding_now()
+        conn.execute(
+            f"INSERT INTO {_HOST_ONBOARDING_VERSIONS_TABLE} (version_id, session_id, member_id, version_no, publish_scope, profile_json, created_epoch, approved_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (version_id, session_id, member_id, version_no, publish_scope, _host_onboarding_json_dumps(profile), approved_epoch, approved_epoch),
+        )
+        workflow_state = "approved" if publish_scope == "full" else "approved_with_later_edits_pending"
+        updated = _host_onboarding_upsert_session(
+            conn,
+            session_id=session["session_id"],
+            member_id=member_id,
+            brand=_host_onboarding_safe_str(session.get("brand")),
+            avatar=_host_onboarding_safe_str(session.get("avatar")),
+            host_display_name=_host_onboarding_safe_str(session.get("host_display_name")),
+            logged_in=bool(session.get("logged_in") is True),
+            workflow_state=workflow_state,
+            publish_status=publish_scope,
+            approved_version_id=version_id,
+            limited_publish_allowed=bool(readiness.get("limited_publish_allowed") is True),
+            full_publish_ready=bool(readiness.get("full_publish_ready") is True),
+        )
+        _host_onboarding_audit(conn, session["session_id"], member_id, "profile_approved", {"version_id": version_id, "publish_scope": publish_scope})
+        conn.commit()
+        return {
+            "ok": True,
+            "session": updated,
+            "version": {
+                "version_id": version_id,
+                "version_no": version_no,
+                "publish_scope": publish_scope,
+                "approved_epoch": approved_epoch,
+            },
+            "preview": profile,
+            "readiness": _host_onboarding_compute_readiness(updated),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
