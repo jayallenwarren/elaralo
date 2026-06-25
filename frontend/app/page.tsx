@@ -3212,8 +3212,8 @@ function HostOnboardingApp() {
 
   const ReviewScreen = () => {
     const readyForFoundation = ["personal_information", "astrological_profile", "nationalities", "family_heritage", "physical_description", "personality"].every((key) => {
-      const sec = reviewSectionMap[key] || {};
-      return ["accepted", "edited"].includes(String(sec.review_status || ""));
+      const sec: HOSectionRow | undefined = reviewSectionMap[key];
+      return ["accepted", "edited"].includes(String(sec?.review_status || ""));
     });
     return (
       <div style={{ ...HO_CARD, padding: 26 }}>
