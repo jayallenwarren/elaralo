@@ -3180,7 +3180,7 @@ function HostOnboardingApp() {
                   <input style={HO_INPUT} value={n} onChange={(e) => setNationalityDraft((prev) => prev.map((x, i) => i === idx ? e.target.value : x))} />
                   <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft((prev) => prev.filter((_, i) => i !== idx))}>Remove</button>
                   <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft((prev) => prev.map((x, i) => i === idx - 1 ? n : i === idx ? prev[idx - 1] : x))} disabled={idx === 0}>↑</button>
-                  <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft((prev) => prev.map((x, i) => i === idx + 1 ? n : i === idx ? prev[idx + 1] : x))} disabled={idx === prev.length - 1}>↓</button>
+                  <button style={HO_BTN_SECONDARY} onClick={() => setNationalityDraft((prev) => prev.map((x, i) => i === idx + 1 ? n : i === idx ? prev[idx + 1] : x))} disabled={idx >= nationalityDraft.length - 1}>↓</button>
                 </div>
               ))}
             </div>
