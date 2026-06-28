@@ -5305,6 +5305,66 @@ def _sanitize_assistant_reply_for_platform_content(text: str) -> str:
     return cleaned
 
 
+def _llm_message_content_has_image_input(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get("type") or "").strip().lower()
+        if part_type != "image_url":
+            continue
+        image_obj = part.get("image_url")
+        if isinstance(image_obj, dict):
+            if str(image_obj.get("url") or "").strip():
+                return True
+        else:
+            return True
+    return False
+
+
+def _llm_messages_have_user_image_input(messages: List[Dict[str, Any]]) -> bool:
+    for m in messages or []:
+        if str(m.get("role") or "").strip().lower() != "user":
+            continue
+        try:
+            if _llm_message_content_has_image_input(m.get("content")):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _sanitize_assistant_reply_for_image_policy(text: str, *, had_image_input: bool) -> str:
+    raw = str(text or "").strip()
+    if not raw or not had_image_input:
+        return raw
+
+    rewrite_patterns = [
+        r"^\s*i(?:\s*am|'m)?\s+(?:not\s+able|unable)\s+to\s+identify\s+or\s+provide\s+information\s+about\s+individuals?\s+in\s+photos?\.\s*",
+        r"^\s*i\s+can(?:not|'t|’t)\s+identify\s+or\s+provide\s+information\s+about\s+individuals?\s+in\s+photos?\.\s*",
+        r"^\s*i(?:\s*am|'m)?\s+(?:not\s+able|unable)\s+to\s+provide\s+information\s+about\s+individuals?\s+in\s+photos?\.\s*",
+        r"^\s*i\s+can(?:not|'t|’t)\s+provide\s+information\s+about\s+individuals?\s+in\s+photos?\.\s*",
+        r"^\s*i(?:\s*am|'m)?\s+(?:not\s+able|unable)\s+to\s+view\s+attachments?\s+directly[,\.]?\s*",
+        r"^\s*i\s+can(?:not|'t|’t)\s+view\s+attachments?\s+directly[,\.]?\s*",
+    ]
+
+    prefix = (
+        "I can't identify a real person in a photo or infer private details about them, "
+        "but I can describe visible, non-identifying details from the image."
+    )
+
+    for pattern in rewrite_patterns:
+        m = re.match(pattern, raw, flags=re.IGNORECASE)
+        if not m:
+            continue
+        tail = raw[m.end():].strip()
+        tail = re.sub(r"^(however|but)\s*,?\s*", "", tail, flags=re.IGNORECASE)
+        return (prefix + (" " + tail if tail else "")).strip()
+
+    return raw
+
+
 def _filter_history_for_safe_mode(messages: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], Optional[str]]:
     """Filter out intimate/explicit messages before sending to a safe-mode model (OpenAI).
 
@@ -8859,6 +8919,10 @@ async def chat(request: Request):
         vision_policy = (
             "Vision rule: User image attachments may be supplied to you as direct image input. "
             "When image input is present, inspect it and answer based on what you see. "
+            "You may describe visible, non-identifying details in a user-supplied photo, including the setting, pose, clothing, objects, and other observable scene details. "
+            "Do not identify a real person in a photo, do not confirm identity, and do not infer sensitive or private attributes from the image. "
+            "Do not use broad refusal wording such as saying you cannot provide information about individuals in photos when you can still describe allowed visible details. "
+            "If the user asks who a real person is, say you cannot identify the real person and then continue with any allowed non-identifying observations. "
             "Do not say that you cannot view attachments or images when the platform has provided image input."
         )
         llm_messages.insert(insert_at, {"role": "system", "content": vision_policy})
@@ -8932,11 +8996,16 @@ async def chat(request: Request):
         # occasional oversized payloads from regressing latency).
         llm_messages = _compact_llm_messages(llm_messages, provider_switched=provider_switched)
 
+        had_user_image_input = _llm_messages_have_user_image_input(llm_messages)
         if llm_provider == "xai":
             assistant_reply = _call_xai_chat(llm_messages)
         else:
             assistant_reply = _call_gpt4o(llm_messages)
         assistant_reply = _sanitize_assistant_reply_for_platform_content(assistant_reply)
+        assistant_reply = _sanitize_assistant_reply_for_image_policy(
+            assistant_reply,
+            had_image_input=had_user_image_input,
+        )
     except Exception as e:
         _dbg(debug, "LLM call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
