@@ -18203,6 +18203,160 @@ def _host_onboarding_normalize_member_id(value: Any) -> str:
     return _host_onboarding_safe_str(value)
 
 
+def _host_onboarding_member_companion_rows(member_id: Any) -> List[Dict[str, Any]]:
+    member_norm = _host_onboarding_normalize_member_id(member_id).lower()
+    if not member_norm:
+        return []
+    rows: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for (_brand_key, _avatar_key), row in (_COMPANION_MAPPINGS or {}).items():
+        if not isinstance(row, dict):
+            continue
+        host_id = str(row.get("host_member_id") or row.get("hostMemberId") or "").strip().lower()
+        if not host_id or host_id != member_norm:
+            continue
+        brand = _host_onboarding_safe_str(row.get("brand") or _brand_key)
+        avatar = _host_onboarding_safe_str(row.get("avatar") or _avatar_key)
+        sig = (brand.lower(), avatar.lower())
+        if sig in seen:
+            continue
+        seen.add(sig)
+        rows.append({
+            "brand": brand,
+            "avatar": avatar,
+            "channel_cap": _host_onboarding_safe_str(row.get("channel_cap")),
+            "live": _host_onboarding_safe_str(row.get("live")),
+            "phonetic": _host_onboarding_safe_str(row.get("phonetic")),
+            "companion_type": _host_onboarding_safe_str(row.get("companion_type")),
+        })
+    rows.sort(key=lambda r: (str(r.get("brand") or "").lower(), str(r.get("avatar") or "").lower()))
+    return rows
+
+
+def _host_onboarding_latest_session_brand_avatar(conn: sqlite3.Connection, member_id: Any) -> Dict[str, str]:
+    mid = _host_onboarding_normalize_member_id(member_id)
+    if not mid:
+        return {}
+    try:
+        row = conn.execute(
+            f"SELECT brand, avatar FROM {_HOST_ONBOARDING_SESSIONS_TABLE} WHERE member_id = ? AND (COALESCE(brand,'') <> '' OR COALESCE(avatar,'') <> '') ORDER BY updated_epoch DESC LIMIT 1",
+            (mid,),
+        ).fetchone()
+        if row is None:
+            return {}
+        return {
+            "brand": _host_onboarding_safe_str(row["brand"]),
+            "avatar": _host_onboarding_safe_str(row["avatar"]),
+        }
+    except Exception:
+        return {}
+
+
+def _host_onboarding_resolve_brand_avatar(member_id: Any, brand_hint: Any = "", avatar_hint: Any = "", conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    member_norm = _host_onboarding_normalize_member_id(member_id)
+    brand_hint_s = _host_onboarding_safe_str(brand_hint)
+    avatar_hint_s = _host_onboarding_safe_str(avatar_hint)
+    out: Dict[str, Any] = {
+        "ok": True,
+        "found": False,
+        "member_id": member_norm,
+        "brand": "",
+        "avatar": "",
+        "available_companions": [],
+        "resolution_source": "",
+        "reason": "",
+    }
+    if not member_norm:
+        out["reason"] = "missing_member_id"
+        return out
+
+    rows = _host_onboarding_member_companion_rows(member_norm)
+    out["available_companions"] = rows
+
+    def _match_brand(val: str, hint: str) -> bool:
+        if not hint:
+            return True
+        return _norm_key(val) == _norm_key(hint) or _compact_brand_key(val) == _compact_brand_key(hint)
+
+    def _match_avatar(val: str, hint: str) -> bool:
+        if not hint:
+            return True
+        return _norm_key(val) == _norm_key(hint)
+
+    def _finalize(row: Dict[str, Any], source: str, reason: str = "") -> Dict[str, Any]:
+        out2 = dict(out)
+        out2.update({
+            "found": bool(_host_onboarding_safe_str((row or {}).get("brand")) or _host_onboarding_safe_str((row or {}).get("avatar"))),
+            "brand": _host_onboarding_safe_str((row or {}).get("brand")),
+            "avatar": _host_onboarding_safe_str((row or {}).get("avatar")),
+            "channel_cap": _host_onboarding_safe_str((row or {}).get("channel_cap")),
+            "live": _host_onboarding_safe_str((row or {}).get("live")),
+            "phonetic": _host_onboarding_safe_str((row or {}).get("phonetic")),
+            "companion_type": _host_onboarding_safe_str((row or {}).get("companion_type")),
+            "resolution_source": _host_onboarding_safe_str(source),
+            "reason": _host_onboarding_safe_str(reason),
+        })
+        return out2
+
+    filtered = [r for r in rows if _match_brand(str(r.get("brand") or ""), brand_hint_s) and _match_avatar(str(r.get("avatar") or ""), avatar_hint_s)]
+    if len(filtered) == 1:
+        return _finalize(filtered[0], "host_member_mapping_exact")
+
+    if brand_hint_s and not avatar_hint_s:
+        brand_rows = [r for r in rows if _match_brand(str(r.get("brand") or ""), brand_hint_s)]
+        if len(brand_rows) == 1:
+            return _finalize(brand_rows[0], "host_member_mapping_brand_hint")
+        unique_avatars = {str(r.get("avatar") or "").strip().lower(): r for r in brand_rows if str(r.get("avatar") or "").strip()}
+        if len(unique_avatars) == 1:
+            return _finalize(next(iter(unique_avatars.values())), "host_member_mapping_brand_hint_unique_avatar")
+
+    if avatar_hint_s and not brand_hint_s:
+        avatar_rows = [r for r in rows if _match_avatar(str(r.get("avatar") or ""), avatar_hint_s)]
+        if len(avatar_rows) == 1:
+            return _finalize(avatar_rows[0], "host_member_mapping_avatar_hint")
+
+    own_conn = False
+    try:
+        db_conn = conn
+        if db_conn is None:
+            db_conn = _econnect_conn()
+            _host_onboarding_ensure_schema(db_conn)
+            own_conn = True
+        last_row = _host_onboarding_latest_session_brand_avatar(db_conn, member_norm)
+    except Exception:
+        last_row = {}
+    finally:
+        if own_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+
+    if last_row:
+        if not brand_hint_s or _match_brand(str(last_row.get("brand") or ""), brand_hint_s):
+            if not avatar_hint_s or _match_avatar(str(last_row.get("avatar") or ""), avatar_hint_s):
+                matched = _lookup_companion_mapping(str(last_row.get("brand") or ""), str(last_row.get("avatar") or "")) or dict(last_row)
+                return _finalize(matched, "previous_onboarding_session")
+
+    if len(rows) == 1:
+        return _finalize(rows[0], "host_member_mapping_unique")
+
+    unique_brands = {str(r.get("brand") or "").strip().lower(): str(r.get("brand") or "").strip() for r in rows if str(r.get("brand") or "").strip()}
+    if len(unique_brands) == 1:
+        brand_val = next(iter(unique_brands.values()), "")
+        inferred_avatar = _infer_unique_avatar_for_brand(brand_val)
+        if inferred_avatar:
+            matched = _lookup_companion_mapping(brand_val, inferred_avatar) or {"brand": brand_val, "avatar": inferred_avatar}
+            return _finalize(matched, "single_brand_unique_avatar")
+
+    if brand_hint_s or avatar_hint_s:
+        out["reason"] = "hint_not_resolved"
+        return out
+
+    out["reason"] = "ambiguous_host_member_mapping" if rows else "no_host_member_mapping"
+    return out
+
+
 def _host_onboarding_safe_slug(value: Any, default: str = "item") -> str:
     txt = re.sub(r"[^a-z0-9]+", "-", _host_onboarding_safe_str(value).lower()).strip("-")
     return txt or default
@@ -18938,6 +19092,35 @@ class HostOnboardingApproveRequest(BaseModel):
     publish_scope: Optional[str] = None
 
 
+class HostOnboardingResolveContextRequest(BaseModel):
+    memberId: Optional[str] = None
+    member_id: Optional[str] = None
+    brand: Optional[str] = None
+    brand_hint: Optional[str] = None
+    avatar: Optional[str] = None
+    avatar_hint: Optional[str] = None
+
+
+@app.post("/host-onboarding/context/resolve")
+async def host_onboarding_context_resolve(req: HostOnboardingResolveContextRequest):
+    member_id = _host_onboarding_normalize_member_id(req.memberId or req.member_id)
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    brand_hint = _host_onboarding_safe_str(req.brand or req.brand_hint)
+    avatar_hint = _host_onboarding_safe_str(req.avatar or req.avatar_hint)
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        resolved = _host_onboarding_resolve_brand_avatar(member_id, brand_hint=brand_hint, avatar_hint=avatar_hint, conn=conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    resolved["ok"] = True
+    return resolved
+
+
 @app.post("/host-onboarding/session/start")
 async def host_onboarding_session_start(req: HostOnboardingStartRequest):
     member_id = _host_onboarding_normalize_member_id(req.memberId or req.member_id)
@@ -18950,6 +19133,9 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
     conn = _econnect_conn()
     try:
         _host_onboarding_ensure_schema(conn)
+        resolved_ctx = _host_onboarding_resolve_brand_avatar(member_id, brand_hint=brand, avatar_hint=avatar, conn=conn)
+        brand = brand or _host_onboarding_safe_str((resolved_ctx or {}).get("brand"))
+        avatar = avatar or _host_onboarding_safe_str((resolved_ctx or {}).get("avatar"))
         conn.execute("BEGIN IMMEDIATE")
         existing = _host_onboarding_find_active_session(conn, member_id, brand, avatar)
         if existing and _host_onboarding_safe_str(existing.get("publish_status")) not in ("approved", "full"):
