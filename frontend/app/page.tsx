@@ -9167,47 +9167,88 @@ useEffect(() => {
 // - when Host override starts
 // - when AI resumes after Host override ends
 // - after 120 seconds of inactivity
+// - at every 10-minute mark within the active conversation/session cycle
+// - at each scheduled content delivery so delivered files are not missed
 // ---------------------------------------------------------------------------
 const autoSaveSummaryInFlightRef = useRef<boolean>(false);
 const autoSaveSummaryLastAtRef = useRef<number>(0);
 const autoSaveSummaryLastUserTurnsRef = useRef<number>(0);
 const autoSaveSummaryIdleTimerRef = useRef<number | null>(null);
 const autoSaveSummaryLastMsgLenRef = useRef<number>(0);
+const autoSaveSummarySessionKeyRef = useRef<string>("");
+const autoSaveSummaryTenMinuteTimerRef = useRef<number | null>(null);
+const autoSaveSummaryTenMinuteLastBucketSavedRef = useRef<number>(0);
+const autoSaveSummaryFirstUserTurnAtRef = useRef<number>(0);
+const autoSaveSummaryTenMinuteCycleKeyRef = useRef<string>("");
+const autoSaveSummaryContentDeliveryTimerRef = useRef<number | null>(null);
+const autoSaveSummaryLastContentDeliveryCountRef = useRef<number>(0);
+
+const resetAutoSaveSummaryCycleState = useCallback(() => {
+  if (autoSaveSummaryTenMinuteTimerRef.current) {
+    window.clearTimeout(autoSaveSummaryTenMinuteTimerRef.current);
+    autoSaveSummaryTenMinuteTimerRef.current = null;
+  }
+  if (autoSaveSummaryContentDeliveryTimerRef.current) {
+    window.clearTimeout(autoSaveSummaryContentDeliveryTimerRef.current);
+    autoSaveSummaryContentDeliveryTimerRef.current = null;
+  }
+  autoSaveSummaryTenMinuteLastBucketSavedRef.current = 0;
+  autoSaveSummaryFirstUserTurnAtRef.current = 0;
+  autoSaveSummaryTenMinuteCycleKeyRef.current = "";
+  autoSaveSummaryLastContentDeliveryCountRef.current = 0;
+}, []);
+
+const getAutoSaveSummaryMessages = useCallback((): Msg[] => {
+  const msgList = messagesRef.current || [];
+  return msgList.filter((m) => {
+    const meta: any = (m as any)?.meta || {};
+    if (meta?.includeInAiContext === false) return false;
+    if (meta?.liveChat) return false;
+    return true;
+  });
+}, []);
+
+const getAutoSaveSummaryUserTurns = useCallback((): number => {
+  return getAutoSaveSummaryMessages().filter((m) => m.role === "user").length;
+}, [getAutoSaveSummaryMessages]);
+
+const getAutoSaveSummaryContentDeliveryCount = useCallback((): number => {
+  return getAutoSaveSummaryMessages().filter((m) => {
+    if ((m as any)?.role !== "assistant") return false;
+    const meta: any = (m as any)?.meta || {};
+    const content = String((m as any)?.content || "");
+    return Boolean(meta?.contentDelivery) || /^Scheduled content was delivered by the platform\b/i.test(content.trim());
+  }).length;
+}, [getAutoSaveSummaryMessages]);
 
 const autoSaveChatSummary = useCallback(
-  async (reason: string) => {
+  async (reason: string, opts?: { force?: boolean }): Promise<boolean> => {
     try {
-      if (!API_BASE) return;
+      if (!API_BASE) return false;
 
       // Throttle: avoid spamming save-summary when multiple triggers fire in quick succession.
       const now = Date.now();
-      if (autoSaveSummaryInFlightRef.current) return;
-      if (now - autoSaveSummaryLastAtRef.current < 3000) return;
+      if (autoSaveSummaryInFlightRef.current) return false;
+      if (!opts?.force && now - autoSaveSummaryLastAtRef.current < 3000) return false;
 
-      const msgList = messagesRef.current || [];
-      if (!msgList.length) return;
-
-      const messagesForSummary = msgList.filter((m) => {
-        const meta: any = (m as any)?.meta || {};
-        if (meta?.includeInAiContext === false) return false;
-        if (meta?.liveChat) return false;
-        return true;
-      });
-
-      if (!messagesForSummary.length) return;
+      const messagesForSummary = getAutoSaveSummaryMessages();
+      if (!messagesForSummary.length) return false;
 
       autoSaveSummaryInFlightRef.current = true;
       const resp = await callSaveChatSummary(messagesForSummary, sessionState, reason || "auto_save");
       if (resp?.ok) {
         autoSaveSummaryLastAtRef.current = now;
+        return true;
       }
+      return false;
     } catch {
       // ignore
+      return false;
     } finally {
       autoSaveSummaryInFlightRef.current = false;
     }
   },
-  [API_BASE, sessionState]
+  [API_BASE, sessionState, getAutoSaveSummaryMessages]
 );
 
 // Every message append: schedule idle timer (120s).
@@ -9245,13 +9286,7 @@ useEffect(() => {
   const last = msgList[msgList.length - 1];
   if (!last || last.role !== "assistant") return;
 
-  const userTurns = msgList.filter((m) => {
-    if (m.role !== "user") return false;
-    const meta: any = (m as any)?.meta || {};
-    if (meta?.includeInAiContext === false) return false;
-    if (meta?.liveChat) return false;
-    return true;
-  }).length;
+  const userTurns = getAutoSaveSummaryUserTurns();
 
   if (!userTurns) return;
   if (userTurns % 6 !== 0) return;
@@ -9259,7 +9294,229 @@ useEffect(() => {
 
   autoSaveSummaryLastUserTurnsRef.current = userTurns;
   void autoSaveChatSummary(`turns_${userTurns}`);
-}, [messages.length, autoSaveChatSummary]);
+}, [messages.length, autoSaveChatSummary, getAutoSaveSummaryUserTurns]);
+
+// Reset autosave markers whenever the underlying session changes.
+// This keeps the recurring 10-minute/content-delivery autosaves session-scoped.
+useEffect(() => {
+  const currentSessionKey =
+    String(sessionIdRef.current || "").trim() ||
+    String((sessionState as any)?.session_id || (sessionState as any)?.sessionId || "").trim() ||
+    "";
+
+  if (!currentSessionKey) return;
+  if (autoSaveSummarySessionKeyRef.current === currentSessionKey) return;
+
+  autoSaveSummarySessionKeyRef.current = currentSessionKey;
+  autoSaveSummaryLastUserTurnsRef.current = 0;
+  autoSaveSummaryLastMsgLenRef.current = 0;
+  autoSaveSummaryLastAtRef.current = 0;
+  resetAutoSaveSummaryCycleState();
+}, [sessionState, resetAutoSaveSummaryCycleState]);
+
+// Reset autosave markers whenever the visible conversation is empty again.
+useEffect(() => {
+  const len = (messagesRef.current || []).length || 0;
+  if (len) return;
+
+  autoSaveSummaryLastUserTurnsRef.current = 0;
+  autoSaveSummaryLastMsgLenRef.current = 0;
+  autoSaveSummaryLastAtRef.current = 0;
+  resetAutoSaveSummaryCycleState();
+}, [messages.length, resetAutoSaveSummaryCycleState]);
+
+// Track the first user turn so we can add autosaves at every 10-minute session mark.
+// This is scoped to the current conversation/session cycle.
+useEffect(() => {
+  const userTurns = getAutoSaveSummaryUserTurns();
+  if (!userTurns) {
+    resetAutoSaveSummaryCycleState();
+    return;
+  }
+
+  if (!autoSaveSummaryFirstUserTurnAtRef.current) {
+    const startedAt = Date.now();
+    const sid = String(sessionIdRef.current || "anon").trim() || "anon";
+    autoSaveSummaryFirstUserTurnAtRef.current = startedAt;
+    autoSaveSummaryTenMinuteLastBucketSavedRef.current = 0;
+    autoSaveSummaryTenMinuteCycleKeyRef.current = `${sid}:${startedAt}`;
+  }
+}, [messages.length, getAutoSaveSummaryUserTurns, resetAutoSaveSummaryCycleState]);
+
+const autoSaveSummaryUsedSeconds = Number((sessionState as any)?.used_seconds ?? (sessionState as any)?.usedSeconds ?? NaN);
+
+// Autosave at every 10-minute mark for the current conversation/session cycle (10m, 20m, 30m, ...).
+useEffect(() => {
+  const userTurns = getAutoSaveSummaryUserTurns();
+  if (!userTurns) return;
+
+  const cycleKey = String(autoSaveSummaryTenMinuteCycleKeyRef.current || "").trim();
+  if (!cycleKey) return;
+
+  let cancelled = false;
+
+  const getDueBucket = (): number => {
+    const startedAt = autoSaveSummaryFirstUserTurnAtRef.current || 0;
+    const wallBucket = startedAt ? Math.floor(Math.max(0, Date.now() - startedAt) / 600000) : 0;
+    const usedBucket = Number.isFinite(autoSaveSummaryUsedSeconds)
+      ? Math.floor(Math.max(0, autoSaveSummaryUsedSeconds) / 600)
+      : 0;
+    return Math.max(wallBucket, usedBucket);
+  };
+
+  const getNextDelayMs = (): number => {
+    const startedAt = autoSaveSummaryFirstUserTurnAtRef.current || 0;
+    if (!startedAt) return 600000;
+    const nextBucket = Math.max(1, autoSaveSummaryTenMinuteLastBucketSavedRef.current + 1);
+    const targetAt = startedAt + nextBucket * 600000;
+    return Math.max(0, targetAt - Date.now());
+  };
+
+  const scheduleAttempt = (delayMs: number) => {
+    if (autoSaveSummaryTenMinuteTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryTenMinuteTimerRef.current);
+      autoSaveSummaryTenMinuteTimerRef.current = null;
+    }
+
+    autoSaveSummaryTenMinuteTimerRef.current = window.setTimeout(() => {
+      if (cancelled) return;
+      if (String(autoSaveSummaryTenMinuteCycleKeyRef.current || "").trim() !== cycleKey) return;
+
+      void (async () => {
+        const dueBucket = getDueBucket();
+        const nextBucket = autoSaveSummaryTenMinuteLastBucketSavedRef.current + 1;
+        if (dueBucket < nextBucket) {
+          scheduleAttempt(getNextDelayMs());
+          return;
+        }
+
+        const msgList = messagesRef.current || [];
+        const last = msgList[msgList.length - 1];
+        const assistantTurnComplete = !loadingRef.current && (!last || last.role === "assistant");
+        if (!assistantTurnComplete) {
+          scheduleAttempt(2000);
+          return;
+        }
+
+        const ok = await autoSaveChatSummary(`session_${nextBucket * 10}m`, { force: true });
+        if (cancelled) return;
+        if (String(autoSaveSummaryTenMinuteCycleKeyRef.current || "").trim() !== cycleKey) return;
+
+        if (ok) {
+          autoSaveSummaryTenMinuteLastBucketSavedRef.current = nextBucket;
+          const remainingDueBucket = getDueBucket();
+          if (remainingDueBucket > autoSaveSummaryTenMinuteLastBucketSavedRef.current) {
+            scheduleAttempt(0);
+          } else {
+            scheduleAttempt(getNextDelayMs());
+          }
+          return;
+        }
+
+        // If another autosave is in flight (or just happened), retry shortly so the
+        // 10-minute snapshot is not lost for this session cycle.
+        scheduleAttempt(4000);
+      })();
+    }, Math.max(0, delayMs));
+  };
+
+  const dueBucket = getDueBucket();
+  const nextBucket = autoSaveSummaryTenMinuteLastBucketSavedRef.current + 1;
+  if (dueBucket >= nextBucket) {
+    scheduleAttempt(0);
+  } else {
+    scheduleAttempt(getNextDelayMs());
+  }
+
+  return () => {
+    cancelled = true;
+    if (autoSaveSummaryTenMinuteTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryTenMinuteTimerRef.current);
+      autoSaveSummaryTenMinuteTimerRef.current = null;
+    }
+  };
+}, [messages.length, autoSaveSummaryUsedSeconds, autoSaveChatSummary, getAutoSaveSummaryUserTurns]);
+
+// Autosave whenever a new scheduled content delivery appears in the session transcript.
+// This runs in addition to the timed/turn/idle autosaves so delivered files are not missed.
+useEffect(() => {
+  const userTurns = getAutoSaveSummaryUserTurns();
+  if (!userTurns) return;
+
+  const currentDeliveryCount = getAutoSaveSummaryContentDeliveryCount();
+  if (!currentDeliveryCount) return;
+  if (currentDeliveryCount <= autoSaveSummaryLastContentDeliveryCountRef.current) return;
+
+  let cancelled = false;
+
+  const scheduleAttempt = (delayMs: number) => {
+    if (autoSaveSummaryContentDeliveryTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryContentDeliveryTimerRef.current);
+      autoSaveSummaryContentDeliveryTimerRef.current = null;
+    }
+
+    autoSaveSummaryContentDeliveryTimerRef.current = window.setTimeout(() => {
+      if (cancelled) return;
+
+      const latestDeliveryCount = getAutoSaveSummaryContentDeliveryCount();
+      const nextDeliveryCount = autoSaveSummaryLastContentDeliveryCountRef.current + 1;
+      if (latestDeliveryCount < nextDeliveryCount) return;
+
+      const msgList = messagesRef.current || [];
+      const last = msgList[msgList.length - 1];
+      const assistantTurnComplete = !loadingRef.current && (!last || last.role === "assistant");
+      if (!assistantTurnComplete) {
+        scheduleAttempt(2000);
+        return;
+      }
+
+      void (async () => {
+        const saveThroughCount = getAutoSaveSummaryContentDeliveryCount();
+        const ok = await autoSaveChatSummary(`content_delivery_${saveThroughCount}`, { force: true });
+        if (cancelled) return;
+
+        if (ok) {
+          autoSaveSummaryLastContentDeliveryCountRef.current = Math.max(
+            autoSaveSummaryLastContentDeliveryCountRef.current,
+            saveThroughCount
+          );
+          const refreshedCount = getAutoSaveSummaryContentDeliveryCount();
+          if (refreshedCount > autoSaveSummaryLastContentDeliveryCountRef.current) {
+            scheduleAttempt(0);
+          }
+          return;
+        }
+
+        // If another autosave is in flight (or just happened), retry shortly so the
+        // content-delivery snapshot is not lost.
+        scheduleAttempt(4000);
+      })();
+    }, Math.max(0, delayMs));
+  };
+
+  scheduleAttempt(0);
+
+  return () => {
+    cancelled = true;
+    if (autoSaveSummaryContentDeliveryTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryContentDeliveryTimerRef.current);
+      autoSaveSummaryContentDeliveryTimerRef.current = null;
+    }
+  };
+}, [messages, autoSaveChatSummary, getAutoSaveSummaryUserTurns, getAutoSaveSummaryContentDeliveryCount]);
+
+useEffect(() => {
+  return () => {
+    if (autoSaveSummaryTenMinuteTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryTenMinuteTimerRef.current);
+      autoSaveSummaryTenMinuteTimerRef.current = null;
+    }
+    if (autoSaveSummaryContentDeliveryTimerRef.current) {
+      window.clearTimeout(autoSaveSummaryContentDeliveryTimerRef.current);
+      autoSaveSummaryContentDeliveryTimerRef.current = null;
+    }
+  };
+}, []);
 
 // Host override transitions: save immediately on start/end.
 const prevHostOverrideRef = useRef<boolean>(false);
@@ -14613,6 +14870,10 @@ const modePillControls = (
                   prevSessionActiveRef.current = false;
 
                   setMessages([]);
+                  autoSaveSummaryLastUserTurnsRef.current = 0;
+                  autoSaveSummaryLastMsgLenRef.current = 0;
+                  autoSaveSummaryLastAtRef.current = 0;
+                  resetAutoSaveSummaryCycleState();
                   // Also reset any in-session summary digests so we don't leak old context into a new conversation.
                   setSessionState((prev) => ({
                     ...(prev as any),
