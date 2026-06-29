@@ -1492,6 +1492,10 @@ def _load_companion_mappings_sync() -> None:
             "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
             "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
             "phonetic": str(get_col("phonetic", "Phonetic", default="") or "").strip(),
+            "headshot_url": str(get_col("headshot_url", "headshotUrl", default="") or "").strip(),
+            "voice_capture_url": str(get_col("voice_capture_url", "voiceCaptureUrl", default="") or "").strip(),
+            "public_gallery_json": str(get_col("public_gallery_json", "publicGalleryJson", default="") or "").strip(),
+            "approved_version_id": str(get_col("approved_version_id", "approvedVersionId", default="") or "").strip(),
             "did_embed_code": str(get_col("did_embed_code", "DID_EMBED_CODE", default="") or ""),
             "did_agent_link": str(get_col("did_agent_link", "DID_AGENT_LINK", default="") or ""),
             "did_agent_id": str(get_col("did_agent_id", "DID_AGENT_ID", default="") or ""),
@@ -18117,7 +18121,24 @@ _HOST_ONBOARDING_ASSETS_TABLE = "host_onboarding_assets"
 _HOST_ONBOARDING_VERSIONS_TABLE = "host_onboarding_versions"
 _HOST_ONBOARDING_AUDIT_TABLE = "host_onboarding_audit_log"
 _HOST_ONBOARDING_MAX_ASSET_BYTES = int(os.getenv("HOST_ONBOARDING_MAX_ASSET_BYTES", str(15 * 1024 * 1024)) or str(15 * 1024 * 1024))
+_HOST_ONBOARDING_MAX_AUDIO_BYTES = int(os.getenv("HOST_ONBOARDING_MAX_AUDIO_BYTES", str(15 * 1024 * 1024)) or str(15 * 1024 * 1024))
 _HOST_ONBOARDING_ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/heic", "image/heif"}
+_HOST_ONBOARDING_ALLOWED_AUDIO_TYPES = {
+    "audio/webm",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/aac",
+    "audio/x-m4a",
+    "audio/mp4a-latm",
+    "audio/ogg",
+    "video/webm",  # MediaRecorder may produce audio-only webm with video/webm content-type in some browsers.
+}
+_HOST_ONBOARDING_VOICE_SLOT = "voice_capture_30s"
+_HOST_ONBOARDING_VOICE_MIN_SECONDS = float(os.getenv("HOST_ONBOARDING_VOICE_MIN_SECONDS", "30") or 30)
+_HOST_ONBOARDING_VOICE_TARGET_SECONDS = float(os.getenv("HOST_ONBOARDING_VOICE_TARGET_SECONDS", "60") or 60)
 _HOST_ONBOARDING_REQUIRED_SLOTS = [
     "headshot_front",
     "full_body_front",
@@ -18132,7 +18153,8 @@ _HOST_ONBOARDING_OPTIONAL_SLOTS = [
     "neutral_headshot",
     "extra_angle",
 ]
-_HOST_ONBOARDING_ALLOWED_SLOTS = set(_HOST_ONBOARDING_REQUIRED_SLOTS + _HOST_ONBOARDING_OPTIONAL_SLOTS)
+_HOST_ONBOARDING_ALLOWED_SLOTS = set(_HOST_ONBOARDING_REQUIRED_SLOTS + _HOST_ONBOARDING_OPTIONAL_SLOTS + [_HOST_ONBOARDING_VOICE_SLOT])
+_HOST_ONBOARDING_CONNECT_EXPORT_PREFIX = (os.getenv("HOST_ONBOARDING_CONNECT_EXPORT_PREFIX", "connect-platform") or "connect-platform").strip().strip("/") or "connect-platform"
 _HOST_ONBOARDING_GENDER_OPTIONS = [
     "Female",
     "Male",
@@ -18586,6 +18608,7 @@ def _host_onboarding_ensure_schema(conn: sqlite3.Connection) -> None:
             size_bytes INTEGER NOT NULL DEFAULT 0,
             width_px INTEGER NOT NULL DEFAULT 0,
             height_px INTEGER NOT NULL DEFAULT 0,
+            duration_seconds REAL NOT NULL DEFAULT 0,
             validation_status TEXT NOT NULL DEFAULT 'pending',
             validation_errors_json TEXT NOT NULL DEFAULT '[]',
             created_epoch REAL NOT NULL,
@@ -18594,6 +18617,12 @@ def _host_onboarding_ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    try:
+        cols = {str(row[1] or "").strip().lower() for row in conn.execute(f"PRAGMA table_info({_HOST_ONBOARDING_ASSETS_TABLE})").fetchall()}
+        if "duration_seconds" not in cols:
+            conn.execute(f"ALTER TABLE {_HOST_ONBOARDING_ASSETS_TABLE} ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 0")
+    except Exception:
+        pass
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {_HOST_ONBOARDING_VERSIONS_TABLE} (
@@ -18639,13 +18668,38 @@ def _host_onboarding_required_slot(slot_key: str) -> bool:
     return _host_onboarding_safe_str(slot_key) in set(_HOST_ONBOARDING_REQUIRED_SLOTS)
 
 
-def _host_onboarding_validate_asset(slot_key: str, content_type: str, file_name: str, size_bytes: int, width_px: int = 0, height_px: int = 0) -> Tuple[str, List[str]]:
+def _host_onboarding_validate_asset(
+    slot_key: str,
+    content_type: str,
+    file_name: str,
+    size_bytes: int,
+    width_px: int = 0,
+    height_px: int = 0,
+    duration_seconds: float = 0.0,
+) -> Tuple[str, List[str]]:
     errors: List[str] = []
     slot = _host_onboarding_safe_str(slot_key)
     ct = _host_onboarding_safe_str(content_type).lower()
     fn = _host_onboarding_safe_str(file_name)
     if slot not in _HOST_ONBOARDING_ALLOWED_SLOTS:
-        errors.append("Unknown photo slot.")
+        errors.append("Unknown onboarding asset slot.")
+        return ("needs_review", errors)
+
+    if slot == _HOST_ONBOARDING_VOICE_SLOT:
+        if ct not in _HOST_ONBOARDING_ALLOWED_AUDIO_TYPES:
+            errors.append("Only audio files supported by the browser recorder/uploader are accepted for the minimum 30-second voice capture.")
+        if int(size_bytes or 0) <= 0:
+            errors.append("Uploaded voice capture is empty.")
+        if int(size_bytes or 0) > int(_HOST_ONBOARDING_MAX_AUDIO_BYTES):
+            errors.append("Uploaded voice capture exceeds the 15 MB limit.")
+        if float(duration_seconds or 0.0) <= 0.0:
+            errors.append("Voice capture duration could not be determined. Please record in the app or upload a standard audio file with readable duration metadata.")
+        elif float(duration_seconds or 0.0) < float(_HOST_ONBOARDING_VOICE_MIN_SECONDS) - 0.5:
+            errors.append(f"Voice capture must be at least {int(_HOST_ONBOARDING_VOICE_MIN_SECONDS)} seconds long.")
+        if fn and len(fn) > 240:
+            errors.append("Original file name is too long.")
+        return ("accepted" if not errors else "needs_review"), errors
+
     if ct not in _HOST_ONBOARDING_ALLOWED_IMAGE_TYPES:
         errors.append("Only JPG, PNG, WebP, or HEIC images are supported in this onboarding step.")
     if int(size_bytes or 0) <= 0:
@@ -18719,6 +18773,7 @@ def _host_onboarding_asset_rows(conn: sqlite3.Connection, session_id: str) -> Li
                 "size_bytes": int(obj.get("size_bytes") or 0),
                 "width_px": int(obj.get("width_px") or 0),
                 "height_px": int(obj.get("height_px") or 0),
+                "duration_seconds": float(obj.get("duration_seconds") or 0.0),
                 "validation_status": _host_onboarding_safe_str(obj.get("validation_status")) or "pending",
                 "validation_errors": _host_onboarding_json_loads(obj.get("validation_errors_json"), []),
             }
@@ -18752,145 +18807,6 @@ def _host_onboarding_find_active_session(conn: sqlite3.Connection, member_id: st
     if row is None:
         return None
     return _host_onboarding_session_row_to_dict(row, _host_onboarding_asset_rows(conn, _host_onboarding_safe_str(row['session_id'])))
-
-
-def _host_onboarding_value_has_meaningful_content(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(_host_onboarding_safe_str(value))
-    if isinstance(value, dict):
-        return any(_host_onboarding_value_has_meaningful_content(v) for v in value.values())
-    if isinstance(value, (list, tuple, set)):
-        return any(_host_onboarding_value_has_meaningful_content(v) for v in value)
-    if isinstance(value, bool):
-        return bool(value)
-    if isinstance(value, (int, float)):
-        return True
-    return bool(value)
-
-
-def _host_onboarding_session_has_meaningful_draft(session: Optional[Dict[str, Any]]) -> bool:
-    if not isinstance(session, dict):
-        return False
-    for key in ("basics", "derived", "review", "completion"):
-        if _host_onboarding_value_has_meaningful_content(session.get(key)):
-            return True
-    for asset in list(session.get("assets") or []):
-        if isinstance(asset, dict) and _host_onboarding_safe_str(asset.get("url")):
-            return True
-    return False
-
-
-def _host_onboarding_get_latest_approved_version_row(
-    conn: sqlite3.Connection,
-    member_id: str,
-    brand: str = "",
-    avatar: str = "",
-) -> Optional[Dict[str, Any]]:
-    filters = ["v.member_id = ?"]
-    params: List[Any] = [member_id]
-    if brand:
-        filters.append("COALESCE(s.brand, '') = ?")
-        params.append(brand)
-    if avatar:
-        filters.append("COALESCE(s.avatar, '') = ?")
-        params.append(avatar)
-    row = conn.execute(
-        f"""
-        SELECT
-            v.*,
-            COALESCE(s.brand, '') AS source_brand,
-            COALESCE(s.avatar, '') AS source_avatar,
-            COALESCE(s.host_display_name, '') AS source_host_display_name
-        FROM {_HOST_ONBOARDING_VERSIONS_TABLE} v
-        LEFT JOIN {_HOST_ONBOARDING_SESSIONS_TABLE} s ON s.session_id = v.session_id
-        WHERE {' AND '.join(filters)}
-        ORDER BY v.approved_epoch DESC, v.created_epoch DESC, v.version_no DESC
-        LIMIT 1
-        """,
-        tuple(params),
-    ).fetchone()
-    return dict(row) if row is not None else None
-
-
-def _host_onboarding_clone_assets_to_session(conn: sqlite3.Connection, source_session_id: str, target_session_id: str) -> None:
-    assets = _host_onboarding_asset_rows(conn, source_session_id)
-    now = _host_onboarding_now()
-    conn.execute(f"DELETE FROM {_HOST_ONBOARDING_ASSETS_TABLE} WHERE session_id = ?", (target_session_id,))
-    for asset in assets:
-        conn.execute(
-            f"""
-            INSERT INTO {_HOST_ONBOARDING_ASSETS_TABLE}
-            (asset_id, session_id, slot_key, required_flag, url, file_name, content_type, size_bytes, width_px, height_px,
-             validation_status, validation_errors_json, created_epoch, updated_epoch)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                uuid.uuid4().hex,
-                target_session_id,
-                _host_onboarding_safe_str(asset.get("slot_key")),
-                1 if bool(asset.get("required") is True) else 0,
-                _host_onboarding_safe_str(asset.get("url")),
-                _host_onboarding_safe_str(asset.get("file_name")),
-                _host_onboarding_safe_str(asset.get("content_type")),
-                int(asset.get("size_bytes") or 0),
-                int(asset.get("width_px") or 0),
-                int(asset.get("height_px") or 0),
-                _host_onboarding_safe_str(asset.get("validation_status")) or "accepted",
-                _host_onboarding_json_dumps(list(asset.get("validation_errors") or [])),
-                now,
-                now,
-            ),
-        )
-
-
-def _host_onboarding_latest_approved_version_meta(version_row: Optional[Dict[str, Any]], mode: str = "") -> Dict[str, Any]:
-    row = dict(version_row or {})
-    return {
-        "mode": _host_onboarding_safe_str(mode),
-        "version_id": _host_onboarding_safe_str(row.get("version_id")),
-        "version_no": int(row.get("version_no") or 0),
-        "publish_scope": _host_onboarding_safe_str(row.get("publish_scope")),
-        "source_session_id": _host_onboarding_safe_str(row.get("session_id")),
-        "brand": _host_onboarding_safe_str(row.get("source_brand") or row.get("brand")),
-        "avatar": _host_onboarding_safe_str(row.get("source_avatar") or row.get("avatar")),
-    }
-
-
-def _host_onboarding_seed_session_from_latest_approved(
-    conn: sqlite3.Connection,
-    *,
-    target_session_id: str,
-    member_id: str,
-    brand: str,
-    avatar: str,
-    host_display_name: str,
-    logged_in: bool,
-    source_session: Dict[str, Any],
-    version_row: Dict[str, Any],
-) -> Dict[str, Any]:
-    seeded = _host_onboarding_upsert_session(
-        conn,
-        session_id=target_session_id,
-        member_id=member_id,
-        brand=brand or _host_onboarding_safe_str(source_session.get("brand")) or _host_onboarding_safe_str(version_row.get("source_brand")),
-        avatar=avatar or _host_onboarding_safe_str(source_session.get("avatar")) or _host_onboarding_safe_str(version_row.get("source_avatar")),
-        host_display_name=host_display_name or _host_onboarding_safe_str(source_session.get("host_display_name")) or _host_onboarding_safe_str(version_row.get("source_host_display_name")),
-        logged_in=logged_in,
-        workflow_state="approved_with_later_edits_pending",
-        publish_status="draft",
-        basics=_host_onboarding_json_loads(_host_onboarding_json_dumps(source_session.get("basics") or {}), {}),
-        derived=_host_onboarding_json_loads(_host_onboarding_json_dumps(source_session.get("derived") or {}), {}),
-        review=_host_onboarding_json_loads(_host_onboarding_json_dumps(source_session.get("review") or {}), {}),
-        completion=_host_onboarding_json_loads(_host_onboarding_json_dumps(source_session.get("completion") or {}), {}),
-        three_d_opt_in=bool(source_session.get("three_d_opt_in") is True),
-        limited_publish_allowed=bool(source_session.get("limited_publish_allowed") is True),
-        full_publish_ready=bool(source_session.get("full_publish_ready") is True),
-        approved_version_id=_host_onboarding_safe_str(version_row.get("version_id")),
-    )
-    _host_onboarding_clone_assets_to_session(conn, _host_onboarding_safe_str(source_session.get("session_id")), target_session_id)
-    return _host_onboarding_get_session_by_id(conn, target_session_id) or seeded
 
 
 def _host_onboarding_upsert_session(
@@ -19071,6 +18987,7 @@ _HOST_ONBOARDING_ASSET_SLOT_LABELS = {
     "smiling_headshot": "Smiling headshot",
     "neutral_headshot": "Neutral-expression headshot",
     "extra_angle": "Extra angle",
+    _HOST_ONBOARDING_VOICE_SLOT: "Voice capture (30 seconds)",
 }
 _HOST_ONBOARDING_ASSET_SLOT_ORDER = {
     slot: idx for idx, slot in enumerate(_HOST_ONBOARDING_ASSET_SLOT_LABELS.keys())
@@ -19181,6 +19098,7 @@ def _host_onboarding_public_asset_payload(asset: Dict[str, Any]) -> Dict[str, An
         "content_type": _host_onboarding_safe_str(a.get("content_type")),
         "width_px": int(a.get("width_px") or 0),
         "height_px": int(a.get("height_px") or 0),
+        "duration_seconds": float(a.get("duration_seconds") or 0.0),
         "validation_status": _host_onboarding_safe_str(a.get("validation_status")),
     }
 
@@ -19191,7 +19109,11 @@ def _host_onboarding_split_public_assets(assets: Any) -> Tuple[Optional[Dict[str
         if not isinstance(asset, dict):
             continue
         url = _host_onboarding_safe_str(asset.get("url"))
-        if not url:
+        slot_key = _host_onboarding_safe_str(asset.get("slot_key"))
+        content_type = _host_onboarding_safe_str(asset.get("content_type")).lower()
+        if not url or slot_key == _HOST_ONBOARDING_VOICE_SLOT:
+            continue
+        if content_type and not content_type.startswith("image/"):
             continue
         normalized_assets.append(_host_onboarding_public_asset_payload(asset))
 
@@ -19225,6 +19147,516 @@ def _host_onboarding_meaningful_physical_description(value: Any) -> str:
     return text
 
 
+def _host_onboarding_generation_label(birthdate: Any) -> str:
+    dt = _host_onboarding_parse_birthdate(birthdate)
+    year = int(dt.year) if dt else 0
+    if year >= 1997:
+        return "Gen-Z"
+    if year >= 1981:
+        return "Millennials"
+    if year >= 1965:
+        return "Generation-X"
+    if year >= 1946:
+        return "Baby-Boomers"
+    return "Classic"
+
+
+def _host_onboarding_gender_label(raw: Any) -> str:
+    s = _host_onboarding_safe_str(raw)
+    lc = s.lower()
+    if "female" in lc or "woman" in lc:
+        return "Female"
+    if "male" in lc or "man" in lc:
+        return "Male"
+    if not s:
+        return "Companion"
+    cleaned = re.sub(r"[^A-Za-z0-9 ]+", " ", s).strip()
+    return cleaned.title() if cleaned else "Companion"
+
+
+def _host_onboarding_race_label(raw: Any) -> str:
+    s = _host_onboarding_safe_str(raw)
+    lc = s.lower()
+    if "black" in lc or "african" in lc:
+        return "Black"
+    if "white" in lc or "caucasian" in lc:
+        return "Caucasian"
+    if "asian" in lc:
+        return "Asian"
+    if "middle eastern" in lc or "north african" in lc:
+        return "Middle Eastern"
+    if "native american" in lc or "alaska" in lc:
+        return "Native American"
+    if "pacific" in lc or "hawaiian" in lc:
+        return "Pacific Islander"
+    if "multiracial" in lc or "mixed" in lc:
+        return "Multiracial"
+    cleaned = re.sub(r"[^A-Za-z0-9 ]+", " ", s).strip()
+    return cleaned.title() if cleaned else "Companion"
+
+
+def _host_onboarding_primary_public_name(basics: Dict[str, Any]) -> str:
+    return _host_onboarding_safe_str(basics.get("stage_name")) or _host_onboarding_safe_str(basics.get("public_display_name")) or "Companion"
+
+
+def _host_onboarding_avatar_key_from_session(session: Dict[str, Any]) -> str:
+    basics = dict(session.get("basics") or {})
+    public_name = _host_onboarding_primary_public_name(basics)
+    first = re.split(r"\s+", public_name.strip())[0] if public_name.strip() else "Companion"
+    first = re.sub(r"[^A-Za-z0-9]+", " ", first).strip().title() or "Companion"
+    gender = _host_onboarding_gender_label(basics.get("gender_display") or basics.get("gender_pick"))
+    race = _host_onboarding_race_label(basics.get("race_primary") or basics.get("race_detail"))
+    generation = _host_onboarding_generation_label(basics.get("birthdate"))
+    parts = [first, gender, race, generation]
+    return "-".join([re.sub(r"\s+", "-", p.strip()) for p in parts if p and p.strip()])
+
+
+def _host_onboarding_gallery_description_for_slot(slot_key: Any) -> str:
+    slot = _host_onboarding_safe_str(slot_key)
+    mapping = {
+        "full_body_front": "Full Body",
+        "three_quarter_body": "Three Quarter",
+        "angle_left_45": "45 Degree Left",
+        "angle_right_45": "45 Degree Right",
+        "left_profile": "Left Profile",
+        "right_profile": "Right Profile",
+        "smiling_headshot": "Smiling Headshot",
+        "neutral_headshot": "Neutral Headshot",
+        "extra_angle": "Extra Angle",
+    }
+    return mapping.get(slot, _host_onboarding_slot_label(slot)).replace("-", " ").strip()
+
+
+def _host_onboarding_safe_filename_component(value: Any) -> str:
+    s = _host_onboarding_safe_str(value)
+    s = re.sub(r"[\/:*?\"<>|]+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or "Asset"
+
+
+def _host_onboarding_connect_public_filename(slot_key: Any, index: int, ext: str) -> str:
+    seq = f"{max(1, int(index)):09d}"
+    desc = _host_onboarding_safe_filename_component(_host_onboarding_gallery_description_for_slot(slot_key))
+    ext_norm = ext if str(ext or "").startswith(".") else f".{str(ext or '').strip()}"
+    ext_norm = ext_norm or ".bin"
+    return f"{seq}-{desc}-Photo-Public{ext_norm}"
+
+
+def _host_onboarding_connect_voice_filename(avatar_key: Any, ext: str) -> str:
+    base = _host_onboarding_safe_filename_component(avatar_key).replace(" ", "-") or "Companion"
+    ext_norm = ext if str(ext or "").startswith(".") else f".{str(ext or '').strip()}"
+    ext_norm = ext_norm or ".bin"
+    return f"{base}-Voice-Capture-Audio{ext_norm}"
+
+
+def _host_onboarding_download_bytes_sync(url: str) -> bytes:
+    target = _host_onboarding_safe_str(url)
+    if not target:
+        return b""
+    import requests  # type: ignore
+    r = requests.get(target, timeout=30)
+    r.raise_for_status()
+    return bytes(r.content or b"")
+
+
+def _host_onboarding_export_blob_name(*parts: str) -> str:
+    cleaned = [str(p or "").strip().strip("/") for p in parts if str(p or "").strip().strip("/")]
+    prefix = _HOST_ONBOARDING_CONNECT_EXPORT_PREFIX.strip().strip("/")
+    if prefix:
+        cleaned.insert(0, prefix)
+    return "/".join(cleaned)
+
+
+def _host_onboarding_export_bytes_sync(blob_name: str, content_type: str, data: bytes) -> str:
+    if not data:
+        raise ValueError("No bytes available for export")
+    return _azure_upload_bytes_and_get_sas_url(
+        container_name=_UPLOADS_CONTAINER,
+        blob_name=blob_name,
+        content_type=content_type or "application/octet-stream",
+        data=data,
+    )
+
+
+def _host_onboarding_export_asset_from_url(asset: Dict[str, Any], blob_name: str) -> Dict[str, Any]:
+    source_url = _host_onboarding_safe_str((asset or {}).get("url"))
+    if not source_url:
+        raise ValueError("Asset URL is missing")
+    content_type = _host_onboarding_safe_str((asset or {}).get("content_type")) or "application/octet-stream"
+    file_name = _host_onboarding_safe_str((asset or {}).get("file_name")) or os.path.basename(blob_name)
+    data = _host_onboarding_download_bytes_sync(source_url)
+    exported_url = _host_onboarding_export_bytes_sync(blob_name, content_type, data)
+    out = dict(asset or {})
+    out["source_url"] = source_url
+    out["url"] = exported_url
+    out["file_name"] = os.path.basename(blob_name)
+    out["original_file_name"] = file_name
+    out["export_blob_name"] = blob_name
+    out["exported_at_epoch"] = _host_onboarding_now()
+    return out
+
+
+def _host_onboarding_ensure_companion_export_columns_best_effort() -> None:
+    try:
+        db_path = _get_companion_mappings_db_path(for_write=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(companion_mappings)")
+            cols = {str(row[1] or "").strip().lower() for row in cur.fetchall()}
+            for col_name, col_type in [
+                ("headshot_url", "TEXT"),
+                ("voice_capture_url", "TEXT"),
+                ("public_gallery_json", "TEXT"),
+                ("approved_version_id", "TEXT"),
+            ]:
+                if col_name not in cols:
+                    try:
+                        cur.execute(f"ALTER TABLE companion_mappings ADD COLUMN {col_name} {col_type}")
+                    except Exception:
+                        pass
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _host_onboarding_upsert_connect_companion_mapping(
+    *,
+    member_id: str,
+    avatar_key: str,
+    headshot_url: str,
+    voice_capture_url: str,
+    public_gallery_assets: List[Dict[str, Any]],
+    approved_version_id: str,
+) -> None:
+    _host_onboarding_ensure_companion_export_columns_best_effort()
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+            ("Elaralo", avatar_key),
+        )
+        cur.execute(
+            """
+            UPDATE companion_mappings
+               SET host_member_id = ?,
+                   channel_cap = COALESCE(NULLIF(channel_cap, ''), 'Video'),
+                   live = COALESCE(NULLIF(live, ''), 'Stream'),
+                   companion_type = COALESCE(NULLIF(companion_type, ''), 'Human'),
+                   phonetic = COALESCE(NULLIF(phonetic, ''), ?),
+                   headshot_url = ?,
+                   voice_capture_url = ?,
+                   public_gallery_json = ?,
+                   approved_version_id = ?
+             WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)
+            """,
+            (
+                member_id,
+                avatar_key.split('-', 1)[0],
+                headshot_url,
+                voice_capture_url,
+                _host_onboarding_json_dumps(public_gallery_assets),
+                approved_version_id,
+                "Elaralo",
+                avatar_key,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        _load_companion_mappings_sync()
+    except Exception:
+        pass
+
+
+def _host_onboarding_upsert_hco_row(
+    *,
+    member_id: str,
+    avatar_key: str,
+    voice_capture_url: str,
+    raw_profile: Dict[str, Any],
+) -> None:
+    db_path = _get_companion_mappings_db_path(for_write=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        companion_row = cur.execute(
+            "SELECT id, phonetic FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
+            ("Elaralo", avatar_key),
+        ).fetchone()
+        companion_id = int(companion_row["id"]) if companion_row and companion_row["id"] is not None else None
+        phonetic = _host_onboarding_safe_str((companion_row or {}).get("phonetic") if isinstance(companion_row, dict) else (companion_row["phonetic"] if companion_row else ""))
+
+        public_profile = dict((raw_profile or {}).get("public_profile") or {})
+        private_profile = dict((raw_profile or {}).get("private_profile") or {})
+        basics = dict((raw_profile or {}).get("session") or {})
+        public_name = _host_onboarding_safe_str(public_profile.get("public_display_name") or public_profile.get("stage_name") or avatar_key)
+        first_name = re.split(r"\s+", public_name, 1)[0].strip() if public_name else avatar_key.split("-", 1)[0]
+        legal_name = _host_onboarding_safe_str(private_profile.get("legal_name"))
+        last_name = ""
+        if legal_name:
+            parts = re.split(r"\s+", legal_name.strip(), maxsplit=1)
+            if len(parts) == 2:
+                last_name = parts[1].strip()
+        birthday = _host_onboarding_safe_str(private_profile.get("birthdate"))
+        gender = _host_onboarding_safe_str(public_profile.get("gender"))
+        ethnicity = _host_onboarding_safe_str(private_profile.get("ethnicity_detail") or private_profile.get("ethnicity_bucket"))
+        wix_id = f"host_onboarding::{_host_onboarding_safe_str(member_id)}::{avatar_key}"
+        source_file = "host_onboarding_approved_version"
+        now_epoch = int(_host_onboarding_now())
+        raw_json = _host_onboarding_json_dumps(raw_profile)
+        if not phonetic:
+            phonetic = first_name
+
+        cur.execute(
+            """
+            INSERT INTO human_companion_onboarding (
+                wix_id, created_date, email, first_name, last_name, status, gender, birthday,
+                phonetic_pronunciation_of_first_name, audio_or_video_file_upload, consent_to_voice_used, ethnicity,
+                raw_json, ingested_at, source_file, companion_id
+            ) VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(wix_id) DO UPDATE SET
+                created_date=excluded.created_date,
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                status=excluded.status,
+                gender=excluded.gender,
+                birthday=excluded.birthday,
+                phonetic_pronunciation_of_first_name=excluded.phonetic_pronunciation_of_first_name,
+                audio_or_video_file_upload=excluded.audio_or_video_file_upload,
+                consent_to_voice_used=excluded.consent_to_voice_used,
+                ethnicity=excluded.ethnicity,
+                raw_json=excluded.raw_json,
+                ingested_at=excluded.ingested_at,
+                source_file=excluded.source_file,
+                companion_id=excluded.companion_id
+            """,
+            (
+                wix_id,
+                datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                first_name,
+                last_name,
+                "approved",
+                gender,
+                birthday,
+                phonetic,
+                _host_onboarding_safe_str(voice_capture_url),
+                "yes" if _host_onboarding_safe_str(voice_capture_url) else "",
+                ethnicity,
+                raw_json,
+                now_epoch,
+                source_file,
+                companion_id,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Dict[str, Any], version_id: str) -> Dict[str, Any]:
+    assets = list(session.get("assets") or [])
+    public_profile = dict(profile.get("public_profile") or {})
+    public_page = dict(profile.get("public_page") or {})
+    ai_profile = dict(profile.get("ai_profile") or {})
+    private_profile = dict(profile.get("private_profile") or {})
+    avatar_key = _host_onboarding_avatar_key_from_session(session)
+    headshot_asset, gallery_assets = _host_onboarding_split_public_assets(assets)
+    voice_asset = next((asset for asset in assets if _host_onboarding_safe_str((asset or {}).get("slot_key")) == _HOST_ONBOARDING_VOICE_SLOT and _host_onboarding_safe_str((asset or {}).get("url"))), None)
+
+    exported_headshot = None
+    if isinstance(headshot_asset, dict) and _host_onboarding_safe_str(headshot_asset.get("url")):
+        ext = _infer_upload_ext(_host_onboarding_safe_str(headshot_asset.get("content_type")), _host_onboarding_safe_str(headshot_asset.get("file_name")))
+        blob_name = _host_onboarding_export_blob_name("companion", "headshot", f"{avatar_key}{ext}")
+        exported_headshot = _host_onboarding_export_asset_from_url(headshot_asset, blob_name)
+
+    exported_gallery: List[Dict[str, Any]] = []
+    for idx, asset in enumerate(gallery_assets, start=1):
+        ext = _infer_upload_ext(_host_onboarding_safe_str(asset.get("content_type")), _host_onboarding_safe_str(asset.get("file_name")))
+        file_name = _host_onboarding_connect_public_filename(asset.get("slot_key"), idx, ext)
+        blob_name = _host_onboarding_export_blob_name("public", "gallery", avatar_key, file_name)
+        exported_gallery.append(_host_onboarding_export_asset_from_url(asset, blob_name))
+
+    exported_voice = None
+    if isinstance(voice_asset, dict) and _host_onboarding_safe_str(voice_asset.get("url")):
+        ext = _infer_upload_ext(_host_onboarding_safe_str(voice_asset.get("content_type")), _host_onboarding_safe_str(voice_asset.get("file_name")))
+        file_name = _host_onboarding_connect_voice_filename(avatar_key, ext)
+        blob_name = _host_onboarding_export_blob_name("companion", "voice", file_name)
+        exported_voice = _host_onboarding_export_asset_from_url(voice_asset, blob_name)
+
+    _host_onboarding_upsert_connect_companion_mapping(
+        member_id=_host_onboarding_safe_str(session.get("member_id")),
+        avatar_key=avatar_key,
+        headshot_url=_host_onboarding_safe_str((exported_headshot or {}).get("url")),
+        voice_capture_url=_host_onboarding_safe_str((exported_voice or {}).get("url")),
+        public_gallery_assets=exported_gallery,
+        approved_version_id=version_id,
+    )
+    _host_onboarding_upsert_hco_row(
+        member_id=_host_onboarding_safe_str(session.get("member_id")),
+        avatar_key=avatar_key,
+        voice_capture_url=_host_onboarding_safe_str((exported_voice or {}).get("url")),
+        raw_profile=profile,
+    )
+
+    public_profile["headshot_asset"] = exported_headshot or public_profile.get("headshot_asset")
+    public_profile["gallery_assets"] = exported_gallery or public_profile.get("gallery_assets") or []
+    public_page["headshot_asset"] = exported_headshot or public_page.get("headshot_asset")
+    public_page["gallery_assets"] = exported_gallery or public_page.get("gallery_assets") or []
+    connect_export = {
+        "brand": "Elaralo",
+        "avatar": avatar_key,
+        "headshot_asset": exported_headshot,
+        "voice_capture_asset": exported_voice,
+        "public_gallery_assets": exported_gallery,
+    }
+    ai_profile["connect_platform"] = connect_export
+    return {
+        **profile,
+        "session": {
+            **dict(profile.get("session") or {}),
+            "brand": "Elaralo",
+            "avatar": avatar_key,
+        },
+        "private_profile": private_profile,
+        "public_profile": public_profile,
+        "public_page": public_page,
+        "ai_profile": ai_profile,
+        "connect_platform": connect_export,
+    }
+
+
+
+
+def _host_onboarding_first_sentence(value: Any, max_words: int = 28) -> str:
+    text = _host_onboarding_safe_str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    first = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+    words = first.split()
+    if len(words) > max_words:
+        first = " ".join(words[:max_words]).rstrip(",;:") + "."
+    if first and not re.search(r"[.!?]$", first):
+        first += "."
+    return first
+
+
+def _host_onboarding_readable_list(items: List[str]) -> str:
+    values = [re.sub(r"\s+", " ", _host_onboarding_safe_str(item)).strip() for item in items if _host_onboarding_safe_str(item)]
+    values = [v for v in values if v]
+    if not values:
+        return ""
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return f"{values[0]} and {values[1]}"
+    return ", ".join(values[:-1]) + f", and {values[-1]}"
+
+
+def _host_onboarding_voice_capture_guidance(public_profile: Dict[str, Any], private_profile: Dict[str, Any]) -> Dict[str, Any]:
+    profile = dict(public_profile or {})
+    private_data = dict(private_profile or {})
+    display_name = _host_onboarding_safe_str(profile.get("public_display_name") or profile.get("stage_name")) or "this host"
+    zodiac = _host_onboarding_safe_str(profile.get("zodiac_sign"))
+    physical = _host_onboarding_first_sentence(profile.get("physical_description"), max_words=24)
+    personality = _host_onboarding_first_sentence(profile.get("personality"), max_words=24)
+    family = _host_onboarding_first_sentence(profile.get("family_heritage"), max_words=24)
+    education_entries = _host_onboarding_normalize_education_entries(profile.get("education_entries") or profile.get("education"))
+    education_text = _host_onboarding_format_education_entries_text(education_entries)
+    education_sentence = _host_onboarding_first_sentence(education_text, max_words=24)
+    career = dict(profile.get("career") or {})
+    current_job_title = _host_onboarding_safe_str(career.get("current_job_title"))
+    current_company = _host_onboarding_safe_str(career.get("current_company"))
+    career_summary = _host_onboarding_first_sentence(career.get("career_summary"), max_words=24)
+    interest_tokens: List[str] = []
+    for raw in (profile.get("likes"), profile.get("hobbies")):
+        text = _host_onboarding_safe_str(raw)
+        if not text:
+            continue
+        # Support both comma-separated and line-separated storage.
+        for part in re.split(r"[\n,•]+", text):
+            cleaned = re.sub(r"\s+", " ", _host_onboarding_safe_str(part)).strip()
+            if cleaned and cleaned.lower() not in {x.lower() for x in interest_tokens}:
+                interest_tokens.append(cleaned)
+        if len(interest_tokens) >= 4:
+            break
+    interests = _host_onboarding_readable_list(interest_tokens[:4])
+    lifestyle = _host_onboarding_first_sentence(profile.get("lifestyle"), max_words=22)
+    background = _host_onboarding_first_sentence(profile.get("background_story"), max_words=22)
+    core_values = _host_onboarding_safe_str(profile.get("core_values"))
+    motto = _host_onboarding_safe_str(profile.get("personal_motto"))
+    birth_country = _host_onboarding_safe_str(private_data.get("birth_country"))
+    nationality_list = private_data.get("nationalities") if isinstance(private_data.get("nationalities"), list) else []
+    nationality = _host_onboarding_readable_list([_host_onboarding_safe_str(x) for x in nationality_list][:2])
+
+    sentences: List[str] = [
+        f"Hello, my name is {display_name}. Thank you for listening to my voice sample for the Connect Platform.",
+    ]
+    if personality:
+        sentences.append(personality)
+    elif zodiac:
+        sentences.append(f"My approved profile reflects the thoughtful and detail-oriented energy often associated with {zodiac}.")
+    if physical:
+        sentences.append(physical)
+    if education_sentence:
+        sentences.append(f"My educational background includes {education_sentence.lstrip()}")
+    if current_job_title and current_company:
+        sentences.append(f"Professionally, I work as {current_job_title} at {current_company}.")
+    elif current_job_title:
+        sentences.append(f"Professionally, I work as {current_job_title}.")
+    elif career_summary:
+        sentences.append(career_summary)
+    if family:
+        sentences.append(family)
+    elif background:
+        sentences.append(background)
+    if nationality and birth_country:
+        sentences.append(f"My background is rooted in {birth_country}, and my approved nationality profile includes {nationality}.")
+    elif interests:
+        sentences.append(f"In my personal time, I enjoy {interests}.")
+    if lifestyle:
+        sentences.append(lifestyle)
+    values_sentence = _host_onboarding_first_sentence(core_values, max_words=18)
+    if values_sentence:
+        sentences.append(f"My values are centered on {values_sentence.lstrip().rstrip('.')}." )
+    if motto:
+        motto_clean = _host_onboarding_safe_str(motto).rstrip(".")
+        sentences.append(f"A phrase that represents me well is: {motto_clean}.")
+    sentences.append("As you listen, you should hear a voice that feels natural, confident, and consistent with the approved profile information that represents me on the platform.")
+    sentences.append("Please read this script at a calm, conversational pace so the final recording captures clear pronunciation, warmth, and personality.")
+
+    script = " ".join([re.sub(r"\s+", " ", s).strip() for s in sentences if _host_onboarding_safe_str(s)]).strip()
+    words = [w for w in re.split(r"\s+", script) if w]
+    if len(words) < 120:
+        script += " I want the recording to sound polished, expressive, and welcoming, while still feeling authentic to the way I would naturally introduce myself, describe my background, and speak to someone for the first time."
+        words = [w for w in re.split(r"\s+", script) if w]
+    if len(words) > 185:
+        script = " ".join(words[:185]).rstrip(",;:") + "."
+        words = [w for w in re.split(r"\s+", script) if w]
+    estimated_seconds = int(round((len(words) / 145.0) * 60.0))
+    if estimated_seconds < int(_HOST_ONBOARDING_VOICE_TARGET_SECONDS):
+        estimated_seconds = int(_HOST_ONBOARDING_VOICE_TARGET_SECONDS)
+    return {
+        "minimum_seconds": int(_HOST_ONBOARDING_VOICE_MIN_SECONDS),
+        "target_seconds": int(_HOST_ONBOARDING_VOICE_TARGET_SECONDS),
+        "estimated_seconds": estimated_seconds,
+        "word_count": len(words),
+        "script": script,
+    }
+
+
 def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
     basics = dict(session.get("basics") or {})
     derived = dict(session.get("derived") or {})
@@ -19245,6 +19677,7 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
     education_entries = _host_onboarding_normalize_education_entries(completion.get("education_entries") or completion.get("education"))
     education_text = _host_onboarding_format_education_entries_text(education_entries) or _host_onboarding_safe_str(completion.get("education"))
     headshot_asset, gallery_assets = _host_onboarding_split_public_assets(assets)
+    voice_capture_asset = next((asset for asset in assets if _host_onboarding_safe_str((asset or {}).get("slot_key")) == _HOST_ONBOARDING_VOICE_SLOT and _host_onboarding_safe_str((asset or {}).get("url"))), None)
     private_identity = {
         "legal_name": legal_name,
         "birthdate": _host_onboarding_safe_str(basics.get("birthdate")),
@@ -19294,12 +19727,14 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         "education_entries": education_entries,
         "education_text": education_text,
     }
+    voice_capture_guidance = _host_onboarding_voice_capture_guidance(public_profile, private_identity)
     ai_profile = {
         "approved_stage_name": public_profile.get("stage_name"),
         "host_real_name_private": legal_name,
         "public_identity": public_profile,
         "private_identity": private_identity,
         "three_d_opt_in": bool(session.get("three_d_opt_in") is True),
+        "voice_capture_asset": voice_capture_asset,
     }
     return {
         "session": {
@@ -19313,6 +19748,7 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         "private_profile": private_identity,
         "public_profile": public_profile,
         "public_page": public_page,
+        "voice_capture_guidance": voice_capture_guidance,
         "ai_profile": ai_profile,
     }
 
@@ -19350,6 +19786,7 @@ def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any
         "core_values": "Core values",
         "personal_motto": "Personal motto",
         "physical_description": "Physical description",
+        "voice_capture": "Voice capture (minimum 30 seconds)",
     }
     section_value_getters = {
         "education": lambda: _host_onboarding_format_education_entries_text(completion.get("education_entries")) or _host_onboarding_safe_str(completion.get("education")),
@@ -19362,6 +19799,7 @@ def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any
         "core_values": lambda: _host_onboarding_safe_str(completion.get("core_values")),
         "personal_motto": lambda: _host_onboarding_safe_str(completion.get("personal_motto")),
         "physical_description": lambda: _host_onboarding_meaningful_physical_description(review.get("physical_description_draft")) or _host_onboarding_meaningful_physical_description(completion.get("physical_description")),
+        "voice_capture": lambda: any(_host_onboarding_safe_str((asset or {}).get("slot_key")) == _HOST_ONBOARDING_VOICE_SLOT and _host_onboarding_safe_str((asset or {}).get("url")) and _host_onboarding_safe_str((asset or {}).get("validation_status")) == "accepted" and float((asset or {}).get("duration_seconds") or 0.0) >= float(_HOST_ONBOARDING_VOICE_MIN_SECONDS) for asset in assets),
     }
     full_publish_missing_sections: List[str] = []
     full_publish_skipped_sections: List[str] = []
@@ -19476,81 +19914,17 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
         brand = brand or _host_onboarding_safe_str((resolved_ctx or {}).get("brand"))
         avatar = avatar or _host_onboarding_safe_str((resolved_ctx or {}).get("avatar"))
         conn.execute("BEGIN IMMEDIATE")
-        latest_version_used: Optional[Dict[str, Any]] = None
-        latest_approved = _host_onboarding_get_latest_approved_version_row(conn, member_id, brand, avatar)
         existing = _host_onboarding_find_active_session(conn, member_id, brand, avatar)
         if existing and _host_onboarding_safe_str(existing.get("publish_status")) not in ("approved", "full"):
-            if (not _host_onboarding_session_has_meaningful_draft(existing)) and latest_approved:
-                source_session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(latest_approved.get("session_id")))
-                if source_session:
-                    session = _host_onboarding_seed_session_from_latest_approved(
-                        conn,
-                        target_session_id=_host_onboarding_safe_str(existing.get("session_id")),
-                        member_id=member_id,
-                        brand=brand,
-                        avatar=avatar,
-                        host_display_name=host_display_name,
-                        logged_in=logged_in,
-                        source_session=source_session,
-                        version_row=latest_approved,
-                    )
-                    latest_version_used = _host_onboarding_latest_approved_version_meta(latest_approved, mode="rehydrated_empty_draft")
-                    _host_onboarding_audit(conn, session["session_id"], member_id, "session_rehydrated_from_latest_approved_version", latest_version_used)
-                else:
-                    session = _host_onboarding_upsert_session(
-                        conn,
-                        session_id=_host_onboarding_safe_str(existing.get("session_id")),
-                        member_id=member_id,
-                        brand=brand or _host_onboarding_safe_str(existing.get("brand")),
-                        avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
-                        host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
-                        logged_in=logged_in,
-                    )
-            else:
-                session = _host_onboarding_upsert_session(
-                    conn,
-                    session_id=_host_onboarding_safe_str(existing.get("session_id")),
-                    member_id=member_id,
-                    brand=brand or _host_onboarding_safe_str(existing.get("brand")),
-                    avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
-                    host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
-                    logged_in=logged_in,
-                )
-        elif latest_approved:
-            source_session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(latest_approved.get("session_id")))
-            if source_session:
-                session = _host_onboarding_seed_session_from_latest_approved(
-                    conn,
-                    target_session_id=uuid.uuid4().hex,
-                    member_id=member_id,
-                    brand=brand,
-                    avatar=avatar,
-                    host_display_name=host_display_name,
-                    logged_in=logged_in,
-                    source_session=source_session,
-                    version_row=latest_approved,
-                )
-                latest_version_used = _host_onboarding_latest_approved_version_meta(latest_approved, mode="new_draft_from_latest_approved")
-                _host_onboarding_audit(conn, session["session_id"], member_id, "session_started_from_latest_approved_version", latest_version_used)
-            else:
-                session = _host_onboarding_upsert_session(
-                    conn,
-                    session_id=uuid.uuid4().hex,
-                    member_id=member_id,
-                    brand=brand,
-                    avatar=avatar,
-                    host_display_name=host_display_name,
-                    logged_in=logged_in,
-                    workflow_state="not_started",
-                    publish_status="draft",
-                    basics={},
-                    derived={},
-                    review={},
-                    completion={},
-                    limited_publish_allowed=False,
-                    full_publish_ready=False,
-                )
-                _host_onboarding_audit(conn, session["session_id"], member_id, "session_started", {"brand": brand, "avatar": avatar})
+            session = _host_onboarding_upsert_session(
+                conn,
+                session_id=_host_onboarding_safe_str(existing.get("session_id")),
+                member_id=member_id,
+                brand=brand or _host_onboarding_safe_str(existing.get("brand")),
+                avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
+                host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
+                logged_in=logged_in,
+            )
         else:
             session = _host_onboarding_upsert_session(
                 conn,
@@ -19571,10 +19945,7 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
             )
             _host_onboarding_audit(conn, session["session_id"], member_id, "session_started", {"brand": brand, "avatar": avatar})
         conn.commit()
-        response = {"ok": True, "session": session, "readiness": _host_onboarding_compute_readiness(session)}
-        if latest_version_used:
-            response["latest_approved_version_used"] = latest_version_used
-        return response
+        return {"ok": True, "session": session, "readiness": _host_onboarding_compute_readiness(session)}
     finally:
         try:
             conn.close()
@@ -19710,8 +20081,14 @@ async def host_onboarding_files_upload(request: Request) -> Dict[str, Any]:
     data = await request.body()
     if not data:
         raise HTTPException(status_code=400, detail="Empty upload body")
-    if len(data) > _HOST_ONBOARDING_MAX_ASSET_BYTES:
-        raise HTTPException(status_code=413, detail="Photo upload exceeds the 15 MB limit")
+    duration_seconds = 0.0
+    try:
+        duration_seconds = float(request.headers.get("x-duration-seconds") or request.headers.get("X-Duration-Seconds") or 0.0)
+    except Exception:
+        duration_seconds = 0.0
+    max_bytes = _HOST_ONBOARDING_MAX_AUDIO_BYTES if slot_key == _HOST_ONBOARDING_VOICE_SLOT else _HOST_ONBOARDING_MAX_ASSET_BYTES
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail=("Voice capture upload exceeds the 15 MB limit" if slot_key == _HOST_ONBOARDING_VOICE_SLOT else "Photo upload exceeds the 15 MB limit"))
     conn = _econnect_conn()
     try:
         _host_onboarding_ensure_schema(conn)
@@ -19728,8 +20105,10 @@ async def host_onboarding_files_upload(request: Request) -> Dict[str, Any]:
             f"{_host_onboarding_safe_slug(slot_key, default='slot')}/"
             f"{uuid.uuid4().hex}{ext}"
         )
-        width_px, height_px = _host_onboarding_try_read_image_size(data)
-        validation_status, validation_errors = _host_onboarding_validate_asset(slot_key, content_type, filename, len(data), width_px, height_px)
+        width_px, height_px = (0, 0)
+        if slot_key != _HOST_ONBOARDING_VOICE_SLOT:
+            width_px, height_px = _host_onboarding_try_read_image_size(data)
+        validation_status, validation_errors = _host_onboarding_validate_asset(slot_key, content_type, filename, len(data), width_px, height_px, duration_seconds)
         try:
             url = await run_in_threadpool(
                 _azure_upload_bytes_and_get_sas_url,
@@ -19744,9 +20123,9 @@ async def host_onboarding_files_upload(request: Request) -> Dict[str, Any]:
         conn.execute(
             f"""
             INSERT INTO {_HOST_ONBOARDING_ASSETS_TABLE}
-            (asset_id, session_id, slot_key, required_flag, url, file_name, content_type, size_bytes, width_px, height_px,
+            (asset_id, session_id, slot_key, required_flag, url, file_name, content_type, size_bytes, width_px, height_px, duration_seconds,
              validation_status, validation_errors_json, created_epoch, updated_epoch)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id, slot_key) DO UPDATE SET
                 asset_id=excluded.asset_id,
                 required_flag=excluded.required_flag,
@@ -19756,6 +20135,7 @@ async def host_onboarding_files_upload(request: Request) -> Dict[str, Any]:
                 size_bytes=excluded.size_bytes,
                 width_px=excluded.width_px,
                 height_px=excluded.height_px,
+                duration_seconds=excluded.duration_seconds,
                 validation_status=excluded.validation_status,
                 validation_errors_json=excluded.validation_errors_json,
                 updated_epoch=excluded.updated_epoch
@@ -19771,6 +20151,7 @@ async def host_onboarding_files_upload(request: Request) -> Dict[str, Any]:
                 len(data),
                 width_px,
                 height_px,
+                duration_seconds,
                 validation_status,
                 _host_onboarding_json_dumps(validation_errors),
                 _host_onboarding_now(),
@@ -19973,6 +20354,7 @@ async def host_onboarding_save_completion(session_id: str, req: HostOnboardingCo
         "core_values": _host_onboarding_safe_str(completion_in.get("core_values")),
         "personal_motto": _host_onboarding_safe_str(completion_in.get("personal_motto")),
         "physical_description": _host_onboarding_safe_str(completion_in.get("physical_description")),
+        "voice_capture_required": True,
         "skipped_sections": skipped_sections,
         "updated_epoch": _host_onboarding_now(),
     }
@@ -20145,18 +20527,20 @@ async def host_onboarding_approve(session_id: str, req: HostOnboardingApproveReq
         version_no = int(version_no_row["max_version"] if version_no_row is not None else 0) + 1
         version_id = uuid.uuid4().hex
         profile = _host_onboarding_compile_profile(session)
+        profile = _host_onboarding_export_connect_profile(session, profile, version_id)
         approved_epoch = _host_onboarding_now()
         conn.execute(
             f"INSERT INTO {_HOST_ONBOARDING_VERSIONS_TABLE} (version_id, session_id, member_id, version_no, publish_scope, profile_json, created_epoch, approved_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (version_id, session_id, member_id, version_no, publish_scope, _host_onboarding_json_dumps(profile), approved_epoch, approved_epoch),
         )
         workflow_state = "approved" if publish_scope == "full" else "approved_with_later_edits_pending"
+        exported_session = dict(profile.get("session") or {})
         updated = _host_onboarding_upsert_session(
             conn,
             session_id=session["session_id"],
             member_id=member_id,
-            brand=_host_onboarding_safe_str(session.get("brand")),
-            avatar=_host_onboarding_safe_str(session.get("avatar")),
+            brand=_host_onboarding_safe_str(exported_session.get("brand") or session.get("brand")),
+            avatar=_host_onboarding_safe_str(exported_session.get("avatar") or session.get("avatar")),
             host_display_name=_host_onboarding_safe_str(session.get("host_display_name")),
             logged_in=bool(session.get("logged_in") is True),
             workflow_state=workflow_state,

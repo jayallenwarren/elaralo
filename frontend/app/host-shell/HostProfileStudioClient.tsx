@@ -15,6 +15,7 @@ type HostOnboardingAsset = {
   size_bytes?: number;
   width_px?: number;
   height_px?: number;
+  duration_seconds?: number;
   validation_status?: string;
   validation_errors?: string[];
 };
@@ -90,6 +91,12 @@ const OPTIONAL_SLOTS = [
   { key: "neutral_headshot", label: "Neutral-expression headshot", required: false },
   { key: "extra_angle", label: "Extra angle", required: false },
 ] as const;
+
+const VOICE_CAPTURE_SLOT = "voice_capture_30s";
+const VOICE_CAPTURE_MIN_SECONDS = 30;
+const VOICE_CAPTURE_TARGET_SECONDS = 60;
+const VOICE_CAPTURE_SAFETY_MAX_SECONDS = 120;
+const VOICE_CAPTURE_ACCEPT = "audio/*,.mp3,.wav,.m4a,.aac,.ogg,.webm";
 
 const RACE_OPTIONS = [
   "Black or African descent",
@@ -288,6 +295,7 @@ function commaList(raw: string): string[] {
 }
 
 function slotLabel(slotKey: string): string {
+  if (slotKey === VOICE_CAPTURE_SLOT) return "Voice capture (minimum 30 seconds)";
   const found = [...REQUIRED_SLOTS, ...OPTIONAL_SLOTS].find((slot) => slot.key === slotKey);
   return found ? found.label : slotKey.replace(/_/g, " ");
 }
@@ -312,6 +320,7 @@ function normalizeAssetLike(raw: any): HostOnboardingAsset | null {
     size_bytes: Number((raw as any).size_bytes || 0),
     width_px: Number((raw as any).width_px || 0),
     height_px: Number((raw as any).height_px || 0),
+    duration_seconds: Number((raw as any).duration_seconds || 0),
     validation_status: String((raw as any).validation_status || "").trim(),
     validation_errors: Array.isArray((raw as any).validation_errors)
       ? (raw as any).validation_errors.map((item: any) => String(item || "").trim()).filter(Boolean)
@@ -338,6 +347,178 @@ function dedupeAssetsBySlot(list: HostOnboardingAsset[]): HostOnboardingAsset[] 
     out.push(asset);
   }
   return out;
+}
+
+function formatDurationSeconds(value: any): string {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n >= 60) {
+    const mins = Math.floor(n / 60);
+    const secs = Math.round(n % 60);
+    return `${mins}:${String(secs).padStart(2, "0")}`;
+  }
+  return `${Math.round(n * 10) / 10}s`;
+}
+
+function guessAudioExtension(mimeType: string): string {
+  const mt = String(mimeType || "").toLowerCase();
+  if (mt.includes("mpeg") || mt.includes("mp3")) return ".mp3";
+  if (mt.includes("wav")) return ".wav";
+  if (mt.includes("aac")) return ".aac";
+  if (mt.includes("ogg")) return ".ogg";
+  if (mt.includes("mp4") || mt.includes("m4a")) return ".m4a";
+  return ".webm";
+}
+
+async function measureAudioDurationSeconds(file: Blob): Promise<number> {
+  if (typeof window === "undefined") return 0;
+  const blobUrl = URL.createObjectURL(file);
+  try {
+    const duration = await new Promise<number>((resolve) => {
+      const audio = document.createElement("audio");
+      const cleanup = () => { try { audio.src = ""; } catch {} };
+      audio.preload = "metadata";
+      audio.onloadedmetadata = () => {
+        const d = Number(audio.duration || 0);
+        cleanup();
+        resolve(Number.isFinite(d) ? d : 0);
+      };
+      audio.onerror = () => {
+        cleanup();
+        resolve(0);
+      };
+      audio.src = blobUrl;
+    });
+    return duration;
+  } finally {
+    try { URL.revokeObjectURL(blobUrl); } catch {}
+  }
+}
+
+
+function countWords(text: string): number {
+  return String(text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+function estimateSpeechSecondsFromText(text: string): number {
+  const wc = countWords(text);
+  if (!wc) return 0;
+  return Math.max(30, Math.round((wc / 145) * 60));
+}
+
+function readableList(items: string[]): string {
+  const vals = items.map((x) => String(x || "").trim()).filter(Boolean);
+  if (!vals.length) return "";
+  if (vals.length === 1) return vals[0];
+  if (vals.length === 2) return `${vals[0]} and ${vals[1]}`;
+  return `${vals.slice(0, -1).join(", ")}, and ${vals[vals.length - 1]}`;
+}
+
+function firstSentence(text: any, maxWords = 24): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const first = normalized.split(/(?<=[.!?])\s+/)[0] || normalized;
+  const words = first.split(/\s+/).filter(Boolean);
+  const trimmed = words.length > maxWords ? `${words.slice(0, maxWords).join(" ").replace(/[,:;]+$/, "")}.` : first;
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function buildVoiceCaptureScriptFromProfile(args: {
+  basics?: Record<string, any>;
+  review?: Record<string, any>;
+  completion?: Record<string, any>;
+  publicProfile?: Record<string, any>;
+  privateProfile?: Record<string, any>;
+}): string {
+  const basics = args.basics || {};
+  const review = args.review || {};
+  const completion = args.completion || {};
+  const publicProfile = args.publicProfile || {};
+  const privateProfile = args.privateProfile || {};
+
+  const stageName = String(publicProfile.public_display_name || publicProfile.stage_name || basics.stage_name || basics.public_display_name || "this host").trim();
+  const zodiac = String(publicProfile.zodiac_sign || review.zodiac_sign || "").trim();
+  const physical = firstSentence(publicProfile.physical_description || review.physical_description_draft || completion.physical_description, 24);
+  const personality = firstSentence(publicProfile.personality || review.personality_draft, 24);
+  const family = firstSentence(publicProfile.family_heritage || review.family_heritage_draft, 24);
+  const educationEntries = Array.isArray(publicProfile.education_entries) && publicProfile.education_entries.length
+    ? publicProfile.education_entries
+    : Array.isArray(completion.education_entries) && completion.education_entries.length
+      ? completion.education_entries
+      : [];
+  const educationLine = readableList(
+    educationEntries
+      .map((entry: any) => {
+        const degree = String(entry?.degree || "").trim();
+        const field = String(entry?.field_of_study || "").trim();
+        const institution = String(entry?.institution || "").trim();
+        return [degree, field, institution].filter(Boolean).join(" in ").replace(" in " + institution, institution ? ` from ${institution}` : "");
+      })
+      .filter(Boolean)
+      .slice(0, 2),
+  );
+  const career = (publicProfile.career && typeof publicProfile.career === "object") ? publicProfile.career : {};
+  const currentJobTitle = String(career.current_job_title || completion.current_job_title || "").trim();
+  const currentCompany = String(career.current_company || completion.current_company || "").trim();
+  const careerSummary = firstSentence(career.career_summary || completion.career_summary, 22);
+  const interests = readableList(
+    [completion.likes, completion.hobbies, publicProfile.likes, publicProfile.hobbies]
+      .flatMap((raw: any) => String(raw || "").split(/[\n,•]+/))
+      .map((part) => String(part || "").trim())
+      .filter(Boolean)
+      .slice(0, 4),
+  );
+  const lifestyle = firstSentence(publicProfile.lifestyle || completion.lifestyle, 20);
+  const background = firstSentence(publicProfile.background_story || completion.background_story, 22);
+  const coreValues = firstSentence(publicProfile.core_values || completion.core_values, 18);
+  const motto = String(publicProfile.personal_motto || completion.personal_motto || "").trim();
+  const birthCountry = String(privateProfile.birth_country || basics.birth_country || "").trim();
+  const nationalities = Array.isArray(privateProfile.nationalities) ? privateProfile.nationalities.map((v: any) => String(v || "").trim()).filter(Boolean).slice(0, 2) : [];
+
+  const sentences: string[] = [
+    `Hello, my name is ${stageName}. Thank you for listening to my voice sample for the Connect Platform.`,
+  ];
+  if (personality) {
+    sentences.push(personality);
+  } else if (zodiac) {
+    sentences.push(`My approved profile reflects the thoughtful and intentional energy often associated with ${zodiac}.`);
+  }
+  if (physical) sentences.push(physical);
+  if (educationLine) sentences.push(`My educational background includes ${educationLine}.`);
+  if (currentJobTitle && currentCompany) {
+    sentences.push(`Professionally, I work as ${currentJobTitle} at ${currentCompany}.`);
+  } else if (currentJobTitle) {
+    sentences.push(`Professionally, I work as ${currentJobTitle}.`);
+  } else if (careerSummary) {
+    sentences.push(careerSummary);
+  }
+  if (family) {
+    sentences.push(family);
+  } else if (background) {
+    sentences.push(background);
+  }
+  if (birthCountry && nationalities.length) {
+    sentences.push(`My background is rooted in ${birthCountry}, and my approved nationality profile includes ${readableList(nationalities)}.`);
+  }
+  if (interests) sentences.push(`In my personal time, I enjoy ${interests}.`);
+  if (lifestyle) sentences.push(lifestyle);
+  if (coreValues) sentences.push(`My values are centered on ${coreValues.replace(/[.!?]+$/, "")}.`);
+  if (motto) sentences.push(`A phrase that represents me well is: ${motto.replace(/[.!?]+$/, "")}.`);
+  sentences.push("As you listen, you should hear a voice that feels natural, confident, and consistent with the approved profile information that represents me on the platform.");
+  sentences.push("Please read this script at a calm, conversational pace so the final recording captures clear pronunciation, warmth, and personality.");
+
+  let script = sentences.map((s) => s.replace(/\s+/g, " ").trim()).filter(Boolean).join(" ");
+  if (countWords(script) < 120) {
+    script += " I want this recording to sound polished, expressive, and welcoming, while still feeling authentic to the way I would naturally introduce myself, describe my background, and speak to someone for the first time.";
+  }
+  let words = script.trim().split(/\s+/).filter(Boolean);
+  if (words.length > 185) {
+    script = `${words.slice(0, 185).join(" ").replace(/[,:;]+$/, "")}.`;
+  }
+  return script;
 }
 
 function isAllowedWixOrigin(origin: string): boolean {
@@ -436,6 +617,15 @@ export default function HostProfileStudioClient() {
   const [previewData, setPreviewData] = useState<any>(null);
   const [uploadingSlot, setUploadingSlot] = useState<string>("");
   const uploadInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const voiceUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const voiceRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceStreamRef = useRef<MediaStream | null>(null);
+  const voiceChunksRef = useRef<BlobPart[]>([]);
+  const voiceStartedAtRef = useRef<number>(0);
+  const voiceTickTimerRef = useRef<number | null>(null);
+  const voiceStopTimerRef = useRef<number | null>(null);
+  const [recordingVoice, setRecordingVoice] = useState<boolean>(false);
+  const [voiceRecordingElapsed, setVoiceRecordingElapsed] = useState<number>(0);
 
   const [basicsForm, setBasicsForm] = useState<Record<string, any>>({
     legal_name: "",
@@ -583,6 +773,23 @@ export default function HostProfileStudioClient() {
     setStep(stepFromSession(payload));
   }, []);
 
+  useEffect(() => {
+    return () => {
+      try { voiceRecorderRef.current?.stop(); } catch {}
+      voiceRecorderRef.current = null;
+      try { voiceStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
+      voiceStreamRef.current = null;
+      if (voiceTickTimerRef.current !== null) {
+        window.clearInterval(voiceTickTimerRef.current);
+        voiceTickTimerRef.current = null;
+      }
+      if (voiceStopTimerRef.current !== null) {
+        window.clearTimeout(voiceStopTimerRef.current);
+        voiceStopTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const startOrResumeSession = useCallback(async () => {
     if (!API_BASE) {
       setError("NEXT_PUBLIC_API_BASE_URL is not configured.");
@@ -720,6 +927,119 @@ export default function HostProfileStudioClient() {
       setUploadingSlot("");
     }
   }, [context.memberId, hydrateFromSession, session?.session_id]);
+
+  const handleUploadVoiceCapture = useCallback(async (fileLike: File | Blob | null, preferredName?: string, preferredDurationSeconds?: number) => {
+    if (!session?.session_id || !fileLike) return;
+    const blob = fileLike;
+    const measuredDuration = Number(preferredDurationSeconds || 0) > 0
+      ? Number(preferredDurationSeconds || 0)
+      : await measureAudioDurationSeconds(blob);
+    const mimeType = String((blob as any)?.type || "audio/webm") || "audio/webm";
+    const fileName = preferredName || `voice-capture${guessAudioExtension(mimeType)}`;
+    const uploadFile = blob instanceof File ? blob : new File([blob], fileName, { type: mimeType });
+    setUploadingSlot(VOICE_CAPTURE_SLOT);
+    setError("");
+    setNotice("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/files/upload`, {
+        method: "POST",
+        headers: {
+          "Content-Type": String(uploadFile.type || mimeType || "application/octet-stream"),
+          "X-Session-Id": session.session_id,
+          "X-Member-Id": context.memberId,
+          "X-Slot-Key": VOICE_CAPTURE_SLOT,
+          "X-Filename": String(uploadFile.name || fileName),
+          "X-Duration-Seconds": String(Number(measuredDuration || 0)),
+        },
+        body: uploadFile,
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || !data?.session) throw new Error(String(data?.detail || `HTTP ${res.status}`));
+      hydrateFromSession(data.session as HostOnboardingSession, (data?.readiness || {}) as HostOnboardingReadiness);
+      setNotice("Voice capture uploaded.");
+    } catch (err: any) {
+      setError(String(err?.message || "Unable to upload the voice capture."));
+    } finally {
+      setUploadingSlot("");
+    }
+  }, [context.memberId, hydrateFromSession, session?.session_id]);
+
+  const stopVoiceCapture = useCallback(() => {
+    try { voiceRecorderRef.current?.stop(); } catch {}
+  }, []);
+
+  const startVoiceCapture = useCallback(async () => {
+    if (recordingVoice) return;
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setError("Voice capture is not supported in this browser. Upload a recorded audio file instead.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeCandidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/mpeg"];
+      const chosenMime = mimeCandidates.find((mime) => {
+        try {
+          return typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mime);
+        } catch {
+          return false;
+        }
+      }) || "audio/webm";
+      const recorder = new MediaRecorder(stream, chosenMime ? { mimeType: chosenMime } as MediaRecorderOptions : undefined);
+      voiceStreamRef.current = stream;
+      voiceRecorderRef.current = recorder;
+      voiceChunksRef.current = [];
+      voiceStartedAtRef.current = Date.now();
+      setVoiceRecordingElapsed(0);
+      setRecordingVoice(true);
+
+      recorder.ondataavailable = (event: BlobEvent) => {
+        if (event.data && event.data.size > 0) voiceChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        setRecordingVoice(false);
+        setError("Voice capture failed. Please try again or upload a file instead.");
+      };
+      recorder.onstop = async () => {
+        const elapsed = (Date.now() - voiceStartedAtRef.current) / 1000;
+        setRecordingVoice(false);
+        setVoiceRecordingElapsed(elapsed);
+        if (voiceTickTimerRef.current !== null) {
+          window.clearInterval(voiceTickTimerRef.current);
+          voiceTickTimerRef.current = null;
+        }
+        if (voiceStopTimerRef.current !== null) {
+          window.clearTimeout(voiceStopTimerRef.current);
+          voiceStopTimerRef.current = null;
+        }
+        try { voiceStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
+        voiceStreamRef.current = null;
+        const mimeType = String(recorder.mimeType || chosenMime || "audio/webm");
+        const blob = new Blob(voiceChunksRef.current, { type: mimeType });
+        voiceChunksRef.current = [];
+        voiceRecorderRef.current = null;
+        if (!blob.size) {
+          setError("Voice capture was empty. Please try again.");
+          return;
+        }
+        await handleUploadVoiceCapture(blob, `voice-capture${guessAudioExtension(mimeType)}`, elapsed);
+      };
+      recorder.start();
+      voiceTickTimerRef.current = window.setInterval(() => {
+        const elapsed = (Date.now() - voiceStartedAtRef.current) / 1000;
+        setVoiceRecordingElapsed(elapsed);
+      }, 250);
+      voiceStopTimerRef.current = window.setTimeout(() => {
+        try { recorder.stop(); } catch {}
+      }, VOICE_CAPTURE_SAFETY_MAX_SECONDS * 1000);
+    } catch (err: any) {
+      setRecordingVoice(false);
+      setError(String(err?.message || "Unable to start voice capture."));
+      try { voiceStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
+      voiceStreamRef.current = null;
+    }
+  }, [handleUploadVoiceCapture, recordingVoice]);
 
   const runDerivation = useCallback(async () => {
     if (!session?.session_id) return;
@@ -1063,6 +1383,29 @@ export default function HostProfileStudioClient() {
     () => PUBLIC_GALLERY_SLOTS.filter((slot) => !sessionAssetMap[slot.key]),
     [sessionAssetMap],
   );
+
+  const voiceCaptureAsset = useMemo(() => sessionAssetMap[VOICE_CAPTURE_SLOT] || null, [sessionAssetMap]);
+  const voiceCaptureGuidance = previewData?.voice_capture_guidance || {};
+  const voiceCaptureScript = useMemo(() => {
+    const guided = String((voiceCaptureGuidance as any)?.script || "").trim();
+    if (guided) return guided;
+    return buildVoiceCaptureScriptFromProfile({
+      basics: basicsForm,
+      review: reviewForm,
+      completion: completionForm,
+      publicProfile,
+      privateProfile,
+    });
+  }, [voiceCaptureGuidance, basicsForm, reviewForm, completionForm, publicProfile, privateProfile]);
+  const voiceCaptureScriptWordCount = useMemo(() => countWords(voiceCaptureScript), [voiceCaptureScript]);
+  const voiceCaptureScriptEstimatedSeconds = useMemo(() => {
+    const hinted = Number((voiceCaptureGuidance as any)?.estimated_seconds || 0);
+    return hinted > 0 ? hinted : estimateSpeechSecondsFromText(voiceCaptureScript);
+  }, [voiceCaptureGuidance, voiceCaptureScript]);
+  const voiceCaptureMinSeconds = Number((voiceCaptureGuidance as any)?.minimum_seconds || VOICE_CAPTURE_MIN_SECONDS) || VOICE_CAPTURE_MIN_SECONDS;
+  const voiceCaptureTargetSeconds = Number((voiceCaptureGuidance as any)?.target_seconds || VOICE_CAPTURE_TARGET_SECONDS) || VOICE_CAPTURE_TARGET_SECONDS;
+  const voiceCaptureMeetsMinimum = Number(voiceCaptureAsset?.duration_seconds || 0) >= voiceCaptureMinSeconds && String(voiceCaptureAsset?.validation_status || "").toLowerCase() === "accepted";
+
 
   const embedded = typeof window !== "undefined" ? (() => {
     try { return window.self !== window.top; } catch { return true; }
@@ -1436,6 +1779,109 @@ export default function HostProfileStudioClient() {
                 </div>
               </div>
             )}
+            <div style={{ ...cardStyle, padding: 16, display: "grid", gap: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 800 }}>Voice capture (minimum 30 seconds)</div>
+                  <div style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
+                    Record or upload a voice sample that is at least {voiceCaptureMinSeconds} seconds long. The guided script below is written to run about {voiceCaptureTargetSeconds} seconds at a natural pace. This clip is required for full publish and is exported with the approved Elaralo companion assets.
+                  </div>
+                </div>
+                <div style={{ fontSize: 13, color: "#6b7280" }}>
+                  {recordingVoice ? `Recording… ${formatDurationSeconds(voiceRecordingElapsed) || "0.0s"}` : voiceCaptureAsset?.duration_seconds ? `Current capture: ${formatDurationSeconds(voiceCaptureAsset.duration_seconds)}` : "No voice capture uploaded yet"}
+                </div>
+              </div>
+              <div style={{ display: "grid", gap: 10, padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ fontWeight: 700 }}>Guided 60-second voice script</div>
+                    <div style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
+                      This script is built from the host information already approved or currently saved in the session.
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 13, color: "#6b7280" }}>
+                    ~{voiceCaptureScriptEstimatedSeconds}s • {voiceCaptureScriptWordCount} words
+                  </div>
+                </div>
+                <textarea
+                  readOnly
+                  value={voiceCaptureScript}
+                  style={{ ...textareaStyle, minHeight: 180, background: "#fff" }}
+                />
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    style={secondaryButtonStyle}
+                    onClick={async () => {
+                      try {
+                        if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+                          await navigator.clipboard.writeText(voiceCaptureScript);
+                          setNotice("Voice script copied.");
+                          setError("");
+                        }
+                      } catch (err: any) {
+                        setError(String(err?.message || "Unable to copy the voice script."));
+                      }
+                    }}
+                  >
+                    Copy script
+                  </button>
+                  <button type="button" style={secondaryButtonStyle} onClick={() => void loadPreview()} disabled={saving}>
+                    {saving ? "Refreshing…" : "Refresh script from approved info"}
+                  </button>
+                </div>
+              </div>
+              {voiceCaptureAsset?.url ? (
+                <div style={{ display: "grid", gap: 10 }}>
+                  <audio controls src={voiceCaptureAsset.url} style={{ width: "100%" }} />
+                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 13, color: "#4b5563" }}>
+                    <span><b>File:</b> {String(voiceCaptureAsset.file_name || "voice-capture")}</span>
+                    {voiceCaptureAsset.duration_seconds ? <span><b>Duration:</b> {formatDurationSeconds(voiceCaptureAsset.duration_seconds)}</span> : null}
+                    {voiceCaptureAsset.validation_status ? <span><b>Status:</b> {voiceCaptureAsset.validation_status}</span> : null}
+                    {voiceCaptureMeetsMinimum ? <span style={{ color: "#065f46", fontWeight: 700 }}>Meets full publish minimum</span> : null}
+                  </div>
+                  {Array.isArray(voiceCaptureAsset.validation_errors) && voiceCaptureAsset.validation_errors.length ? (
+                    <div style={{ color: "#b91c1c", fontSize: 13 }}>
+                      {voiceCaptureAsset.validation_errors.join(" ")}
+                    </div>
+                  ) : null}
+                  {!voiceCaptureMeetsMinimum ? (
+                    <div style={{ color: "#92400e", fontSize: 13, lineHeight: 1.6 }}>
+                      Full publish requires one accepted voice capture that is at least {voiceCaptureMinSeconds} seconds long.
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div style={{ fontSize: 13, color: "#6b7280", lineHeight: 1.6 }}>
+                  Upload or record one accepted voice clip that is at least {voiceCaptureMinSeconds} seconds long to satisfy the full publish requirement.
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button type="button" style={buttonStyle} onClick={() => void startVoiceCapture()} disabled={recordingVoice || uploadingSlot === VOICE_CAPTURE_SLOT}>
+                  {recordingVoice ? "Recording…" : "Start guided recording"}
+                </button>
+                <button type="button" style={secondaryButtonStyle} onClick={() => stopVoiceCapture()} disabled={!recordingVoice}>
+                  Stop recording
+                </button>
+                <button type="button" style={secondaryButtonStyle} onClick={() => { try { voiceUploadInputRef.current?.click(); } catch {} }} disabled={uploadingSlot === VOICE_CAPTURE_SLOT}>
+                  {uploadingSlot === VOICE_CAPTURE_SLOT ? "Uploading…" : "Upload recorded file"}
+                </button>
+                <input
+                  ref={voiceUploadInputRef}
+                  type="file"
+                  accept={VOICE_CAPTURE_ACCEPT}
+                  style={{ display: "none" }}
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0] || null;
+                    if (file) void handleUploadVoiceCapture(file, file.name);
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </div>
+              <div style={{ fontSize: 12, color: "#6b7280", lineHeight: 1.6 }}>
+                Recording continues until you stop it or until the 2-minute safety stop is reached. Aim to read the full script naturally; 30 seconds is the minimum accepted duration.
+              </div>
+            </div>
             <div style={{ display: "flex", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("review")}>Back</button>
               <button type="button" style={buttonStyle} onClick={() => void saveCompletion()} disabled={saving}>{saving ? "Saving…" : "Save completion and continue"}</button>

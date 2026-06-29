@@ -181,6 +181,10 @@ type CompanionMappingRow = {
   // Expected values: "Human" | "AI" (case-insensitive), but treated as a free-form string.
   companion_type?: string | null;
   companionType?: string | null; // optional API alias
+
+  // Exported onboarding assets preferred by Connect when present.
+  headshot_url?: string | null;
+  headshotUrl?: string | null;
 };
 
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
@@ -4655,6 +4659,20 @@ useEffect(() => {
     };
   }, [API_BASE, companyName, companionName]);
 
+  const preferredMappingHeadshot = useMemo(() => {
+    return String((companionMapping as any)?.headshot_url || (companionMapping as any)?.headshotUrl || "").trim();
+  }, [companionMapping]);
+
+  useEffect(() => {
+    const mappedHeadshot = String(preferredMappingHeadshot || "").trim();
+    if (!mappedHeadshot) return;
+    setAvatarSrc((prev) => {
+      const p = String(prev || "").trim();
+      if (p === mappedHeadshot) return prev;
+      return mappedHeadshot;
+    });
+  }, [preferredMappingHeadshot]);
+
   // Auto-join active LiveKit stream as a viewer (subscribe-only)
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
   // Back-compat: also accept `?rebranding=BrandName`.
@@ -4690,7 +4708,9 @@ useEffect(() => {
       // Do NOT override a companion headshot.
       setAvatarSrc((prev) => {
         const p = String(prev || "").trim();
-        if (!p) return DEFAULT_AVATAR;
+        const mappedHeadshot = String(preferredMappingHeadshot || "").trim();
+        if (mappedHeadshot && p === mappedHeadshot) return prev;
+        if (!p) return mappedHeadshot || DEFAULT_AVATAR;
 
         // Covers both:
         // - "/companion/headshot/..."
@@ -4743,7 +4763,9 @@ useEffect(() => {
       // Do NOT override a companion headshot.
       setAvatarSrc((prev) => {
         const p = String(prev || "").trim();
-        if (!p) return picked;
+        const mappedHeadshot = String(preferredMappingHeadshot || "").trim();
+        if (mappedHeadshot && p === mappedHeadshot) return prev;
+        if (!p) return mappedHeadshot || picked;
 
         // Covers both default + rebrand headshots.
         if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
@@ -4760,7 +4782,7 @@ useEffect(() => {
     return () => {
       cancelled = true;
     };
-  }, [rebrandingName, rebrandingSlug]);
+  }, [rebrandingName, rebrandingSlug, preferredMappingHeadshot]);
 
 
 
