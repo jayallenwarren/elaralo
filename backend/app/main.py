@@ -18918,6 +18918,19 @@ def _host_onboarding_build_personality_draft(zodiac_sign: str) -> str:
     return f"Draft personality framing based on {zodiac_sign}: {personality} This draft is for host review and editing before approval.".strip()
 
 
+_HOST_ONBOARDING_PHYSICAL_DESCRIPTION_PLACEHOLDER = "Physical description is intentionally left for host review and completion in this MVP."
+
+
+def _host_onboarding_meaningful_physical_description(value: Any) -> str:
+    text = _host_onboarding_safe_str(value)
+    if not text:
+        return ""
+    lowered = text.strip().lower()
+    if lowered == _HOST_ONBOARDING_PHYSICAL_DESCRIPTION_PLACEHOLDER.strip().lower():
+        return ""
+    return text
+
+
 def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
     basics = dict(session.get("basics") or {})
     derived = dict(session.get("derived") or {})
@@ -18958,7 +18971,7 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         "family_heritage": _host_onboarding_safe_str(review.get("family_heritage_draft") or derived.get("family_heritage_draft")),
         "astrological_profile": review.get("astrological_profile") or derived.get("astrological_profile") or {},
         "personality": _host_onboarding_safe_str(review.get("personality_draft") or derived.get("personality_draft")),
-        "physical_description": _host_onboarding_safe_str(review.get("physical_description_draft") or completion.get("physical_description") or ""),
+        "physical_description": _host_onboarding_meaningful_physical_description(review.get("physical_description_draft")) or _host_onboarding_meaningful_physical_description(completion.get("physical_description")),
         "education": _host_onboarding_safe_str(completion.get("education")),
         "career": {
             "current_job_title": career_title,
@@ -19017,27 +19030,43 @@ def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any
     skipped_sections = completion.get("skipped_sections") or {}
     if not isinstance(skipped_sections, dict):
         skipped_sections = {}
-    major_sections = [
-        "education",
-        "career_summary",
-        "likes",
-        "dislikes",
-        "hobbies",
-        "lifestyle",
-        "background_story",
-        "core_values",
-        "personal_motto",
-    ]
-    full_ready = True
-    for key in major_sections:
-        val = _host_onboarding_safe_str(completion.get(key))
-        if val:
+
+    section_labels = {
+        "education": "Education",
+        "career_summary": "Career summary",
+        "likes": "Likes",
+        "dislikes": "Dislikes",
+        "hobbies": "Hobbies",
+        "lifestyle": "Lifestyle",
+        "background_story": "Background story",
+        "core_values": "Core values",
+        "personal_motto": "Personal motto",
+        "physical_description": "Physical description",
+    }
+    section_value_getters = {
+        "education": lambda: _host_onboarding_safe_str(completion.get("education")),
+        "career_summary": lambda: _host_onboarding_safe_str(completion.get("career_summary")),
+        "likes": lambda: _host_onboarding_safe_str(completion.get("likes")),
+        "dislikes": lambda: _host_onboarding_safe_str(completion.get("dislikes")),
+        "hobbies": lambda: _host_onboarding_safe_str(completion.get("hobbies")),
+        "lifestyle": lambda: _host_onboarding_safe_str(completion.get("lifestyle")),
+        "background_story": lambda: _host_onboarding_safe_str(completion.get("background_story")),
+        "core_values": lambda: _host_onboarding_safe_str(completion.get("core_values")),
+        "personal_motto": lambda: _host_onboarding_safe_str(completion.get("personal_motto")),
+        "physical_description": lambda: _host_onboarding_meaningful_physical_description(review.get("physical_description_draft")) or _host_onboarding_meaningful_physical_description(completion.get("physical_description")),
+    }
+    full_publish_missing_sections: List[str] = []
+    full_publish_skipped_sections: List[str] = []
+    for key, getter in section_value_getters.items():
+        if getter():
             continue
+        label = section_labels.get(key) or key.replace("_", " ").title()
         if bool(skipped_sections.get(key) is True):
-            full_ready = False
-            break
-        full_ready = False
-        break
+            full_publish_skipped_sections.append(label)
+            full_publish_missing_sections.append(label)
+            continue
+        full_publish_missing_sections.append(label)
+
     limited_allowed = basics_ok and photos_ok and review_ok
     return {
         "basics_ok": basics_ok,
@@ -19045,7 +19074,9 @@ def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any
         "missing_required_slots": missing_slots,
         "review_ok": review_ok,
         "limited_publish_allowed": limited_allowed,
-        "full_publish_ready": limited_allowed and full_ready,
+        "full_publish_ready": limited_allowed and not full_publish_missing_sections,
+        "full_publish_missing_sections": full_publish_missing_sections,
+        "full_publish_skipped_sections": full_publish_skipped_sections,
     }
 
 
@@ -19432,7 +19463,7 @@ async def host_onboarding_derive(session_id: str, request: Request):
             "astrological_profile": astrological_profile,
             "family_heritage_draft": family_heritage_draft,
             "personality_draft": personality_draft,
-            "physical_description_draft": "Physical description is intentionally left for host review and completion in this MVP.",
+            "physical_description_draft": "",
             "sources": {
                 "age_years": "derived",
                 "zodiac_sign": "derived",
@@ -19441,7 +19472,7 @@ async def host_onboarding_derive(session_id: str, request: Request):
                 "astrological_profile": "ai_draft",
                 "family_heritage_draft": "ai_draft",
                 "personality_draft": "ai_draft",
-                "physical_description_draft": "ai_draft",
+                "physical_description_draft": "deferred_for_host",
             },
         }
         updated = _host_onboarding_upsert_session(
@@ -19650,7 +19681,14 @@ async def host_onboarding_approve(session_id: str, req: HostOnboardingApproveReq
         if publish_scope == "limited" and not bool(readiness.get("limited_publish_allowed") is True):
             raise HTTPException(status_code=400, detail="Limited publish is not available until basics, required photos, and derived review are complete")
         if publish_scope == "full" and not bool(readiness.get("full_publish_ready") is True):
-            raise HTTPException(status_code=400, detail="Full publish requires completion or explicit handling of all MVP profile sections")
+            missing = [str(x).strip() for x in list(readiness.get("full_publish_missing_sections") or []) if str(x).strip()]
+            skipped = [str(x).strip() for x in list(readiness.get("full_publish_skipped_sections") or []) if str(x).strip()]
+            detail = "Full publish requires completion of all MVP profile sections."
+            if missing:
+                detail += " Missing sections: " + ", ".join(missing) + "."
+            if skipped:
+                detail += " Skipped sections must be completed for full publish: " + ", ".join(skipped) + "."
+            raise HTTPException(status_code=400, detail=detail)
         version_no_row = conn.execute(
             f"SELECT COALESCE(MAX(version_no), 0) AS max_version FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE session_id = ?",
             (session_id,),

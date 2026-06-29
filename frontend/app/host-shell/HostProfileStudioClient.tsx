@@ -45,6 +45,8 @@ type HostOnboardingReadiness = {
   review_ok?: boolean;
   limited_publish_allowed?: boolean;
   full_publish_ready?: boolean;
+  full_publish_missing_sections?: string[];
+  full_publish_skipped_sections?: string[];
 };
 
 type HostOnboardingStep = "welcome" | "basics" | "photos" | "review" | "completion" | "preview";
@@ -116,6 +118,46 @@ const GENDER_OPTIONS = [
   "Prefer to self-describe",
   "Prefer not to say",
 ] as const;
+
+const PHYSICAL_DESCRIPTION_PLACEHOLDER = "Physical description is intentionally left for host review and completion in this MVP.";
+
+function normalizePhysicalDescriptionValue(raw: any): string {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  if (text.toLowerCase() === PHYSICAL_DESCRIPTION_PLACEHOLDER.toLowerCase()) return "";
+  return text;
+}
+
+function prettifySectionLabel(label: string): string {
+  const map: Record<string, string> = {
+    education: "Education",
+    career_summary: "Career summary",
+    likes: "Likes",
+    dislikes: "Dislikes",
+    hobbies: "Hobbies",
+    lifestyle: "Lifestyle",
+    background_story: "Background story",
+    core_values: "Core values",
+    personal_motto: "Personal motto",
+    physical_description: "Physical description",
+  };
+  const key = String(label || "").trim();
+  return map[key] || key.replace(/_/g, " ").split(/\s+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+}
+
+function dedupeLabels(values: any[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values || []) {
+    const label = prettifySectionLabel(String(value || "").trim());
+    if (!label) continue;
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(label);
+  }
+  return out;
+}
 
 function parseJsonMaybe(raw: any): any {
   if (typeof raw !== "string") return raw;
@@ -297,6 +339,7 @@ export default function HostProfileStudioClient() {
     physical_description: "",
     skipped_sections: {},
   });
+  const [showCompletionPhysicalDescriptionEditor, setShowCompletionPhysicalDescriptionEditor] = useState<boolean>(false);
 
   const hydrateFromSession = useCallback((payload: HostOnboardingSession | null, readinessIn?: HostOnboardingReadiness | null) => {
     setSession(payload);
@@ -339,7 +382,7 @@ export default function HostProfileStudioClient() {
           : "",
       family_heritage_draft: String(review.family_heritage_draft || derived.family_heritage_draft || ""),
       personality_draft: String(review.personality_draft || derived.personality_draft || ""),
-      physical_description_draft: String(review.physical_description_draft || derived.physical_description_draft || ""),
+      physical_description_draft: normalizePhysicalDescriptionValue(review.physical_description_draft || derived.physical_description_draft || ""),
       astrological_narrative: String(
         ((review.astrological_profile || {}).narrative) ||
           ((derived.astrological_profile || {}).narrative) ||
@@ -368,6 +411,8 @@ export default function HostProfileStudioClient() {
       quick_reference_race: String(((review.quick_reference || {}).race) || ((derived.quick_reference || {}).race) || basics.race_primary || ""),
       quick_reference_ethnicity: String(((review.quick_reference || {}).ethnicity) || ((derived.quick_reference || {}).ethnicity) || basics.ethnicity_detail || ""),
     }));
+    const hydratedCompletionPhysicalDescription = normalizePhysicalDescriptionValue(completion.physical_description || "");
+    const hydratedReviewPhysicalDescription = normalizePhysicalDescriptionValue(review.physical_description_draft || derived.physical_description_draft || "");
     setCompletionForm((prev) => ({
       ...prev,
       education: String(completion.education || ""),
@@ -382,9 +427,10 @@ export default function HostProfileStudioClient() {
       background_story: String(completion.background_story || ""),
       core_values: String(completion.core_values || ""),
       personal_motto: String(completion.personal_motto || ""),
-      physical_description: String(completion.physical_description || ""),
+      physical_description: hydratedCompletionPhysicalDescription,
       skipped_sections: typeof completion.skipped_sections === "object" && completion.skipped_sections ? completion.skipped_sections : {},
     }));
+    setShowCompletionPhysicalDescriptionEditor(Boolean(hydratedCompletionPhysicalDescription) || !Boolean(hydratedReviewPhysicalDescription));
     setStep(stepFromSession(payload));
   }, []);
 
@@ -756,6 +802,13 @@ export default function HostProfileStudioClient() {
     { key: "preview", label: "Preview" },
   ];
   const currentStepIndex = Math.max(0, stepItems.findIndex((item) => item.key === step));
+  const reviewPhysicalDescriptionAccepted = Boolean(normalizePhysicalDescriptionValue(reviewForm.physical_description_draft));
+  const completionPhysicalDescriptionValue = normalizePhysicalDescriptionValue(completionForm.physical_description);
+  const shouldShowCompletionPhysicalDescription = Boolean(showCompletionPhysicalDescriptionEditor || completionPhysicalDescriptionValue || !reviewPhysicalDescriptionAccepted);
+  const fullPublishMissingSections = useMemo(
+    () => dedupeLabels(Array.isArray(readiness.full_publish_missing_sections) ? readiness.full_publish_missing_sections : []),
+    [readiness.full_publish_missing_sections],
+  );
 
   const privateProfile = previewData?.private_profile || {};
   const publicProfile = previewData?.public_profile || {};
@@ -763,6 +816,22 @@ export default function HostProfileStudioClient() {
   const embedded = typeof window !== "undefined" ? (() => {
     try { return window.self !== window.top; } catch { return true; }
   })() : false;
+
+  const handleApproveFullClick = useCallback(() => {
+    if (saving) return;
+    if (!Boolean(readiness.full_publish_ready)) {
+      const missing = fullPublishMissingSections;
+      setNotice("");
+      setError(
+        missing.length
+          ? `Approve Full Profile requires these sections to be completed and not skipped: ${missing.join(", ")}.`
+          : "Approve Full Profile requires all later profile sections to be completed and not skipped.",
+      );
+      setStep("completion");
+      return;
+    }
+    void approveProfile("full");
+  }, [approveProfile, fullPublishMissingSections, readiness.full_publish_ready, saving]);
 
   if (waitingForContext && embedded && !context.memberId) {
     return (
@@ -1027,7 +1096,18 @@ export default function HostProfileStudioClient() {
             </div>
             {renderTextareaField("Family heritage draft", reviewForm.family_heritage_draft, (v) => setReviewForm((p) => ({ ...p, family_heritage_draft: v })), "Review and edit the family heritage draft")}
             {renderTextareaField("Personality draft", reviewForm.personality_draft, (v) => setReviewForm((p) => ({ ...p, personality_draft: v })), "Review and edit the personality draft")}
-            {renderTextareaField("Physical description draft", reviewForm.physical_description_draft, (v) => setReviewForm((p) => ({ ...p, physical_description_draft: v })), "Optional at this stage; can also be completed later")}
+            {reviewPhysicalDescriptionAccepted ? (
+              renderTextareaField(
+                "Physical description draft",
+                reviewForm.physical_description_draft,
+                (v) => setReviewForm((p) => ({ ...p, physical_description_draft: v })),
+                "Review and edit the physical description draft",
+              )
+            ) : (
+              <div style={{ fontSize: 13, color: "#6b7280", lineHeight: 1.6 }}>
+                Physical description is not being shown at the Review step because there is no meaningful system draft to inspect. You can complete it in the Complete step instead.
+              </div>
+            )}
             <div style={{ display: "flex", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("photos")}>Back</button>
               <button type="button" style={buttonStyle} onClick={() => void saveReview()} disabled={saving}>{saving ? "Saving…" : "Accept derived review and continue"}</button>
@@ -1053,7 +1133,27 @@ export default function HostProfileStudioClient() {
             {renderTextareaField("Background story", completionForm.background_story, (v) => setCompletionForm((p) => ({ ...p, background_story: v })), "Tell the origin story in English", "background_story")}
             {renderTextareaField("Core values", completionForm.core_values, (v) => setCompletionForm((p) => ({ ...p, core_values: v })), "Example: excellence, integrity, discipline", "core_values")}
             {renderTextareaField("Personal motto", completionForm.personal_motto, (v) => setCompletionForm((p) => ({ ...p, personal_motto: v })), "Example: Lead with elegance and intention.", "personal_motto")}
-            {renderTextareaField("Physical description", completionForm.physical_description, (v) => setCompletionForm((p) => ({ ...p, physical_description: v })), "Describe the host's visual presentation in a respectful, factual way", "physical_description")}
+            {shouldShowCompletionPhysicalDescription ? (
+              renderTextareaField(
+                "Physical description",
+                completionForm.physical_description,
+                (v) => setCompletionForm((p) => ({ ...p, physical_description: v })),
+                "Describe the host's visual presentation in a respectful, factual way",
+                "physical_description",
+              )
+            ) : (
+              <div style={{ display: "grid", gap: 8, padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)" }}>
+                <div style={{ fontWeight: 700 }}>Physical description</div>
+                <div style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
+                  Physical description was already reviewed earlier, so it is collapsed here. Expand it only if you want to replace that reviewed text during completion.
+                </div>
+                <div>
+                  <button type="button" style={secondaryButtonStyle} onClick={() => setShowCompletionPhysicalDescriptionEditor(true)}>
+                    Edit physical description here
+                  </button>
+                </div>
+              </div>
+            )}
             <div style={{ display: "flex", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("review")}>Back</button>
               <button type="button" style={buttonStyle} onClick={() => void saveCompletion()} disabled={saving}>{saving ? "Saving…" : "Save completion and continue"}</button>
@@ -1091,8 +1191,13 @@ export default function HostProfileStudioClient() {
                 Limited publish: {Boolean(readiness.limited_publish_allowed) ? "Ready" : "Not ready"}
               </div>
               <div style={{ color: Boolean(readiness.full_publish_ready) ? "#065f46" : "#92400e", fontWeight: 700 }}>
-                Full publish: {Boolean(readiness.full_publish_ready) ? "Ready" : "Complete or explicitly skip all later sections first"}
+                Full publish: {Boolean(readiness.full_publish_ready) ? "Ready" : "Complete all later sections without skipping any of them"}
               </div>
+              {!Boolean(readiness.full_publish_ready) && fullPublishMissingSections.length ? (
+                <div style={{ fontSize: 13, color: "#92400e", lineHeight: 1.6 }}>
+                  Remaining sections for full publish: {fullPublishMissingSections.join(", ")}.
+                </div>
+              ) : null}
             </div>
             {session?.approved_version_id ? (
               <div style={{ color: "#065f46", fontWeight: 700 }}>
@@ -1105,7 +1210,7 @@ export default function HostProfileStudioClient() {
                 <button type="button" style={secondaryButtonStyle} onClick={() => void approveProfile("limited")} disabled={saving || !Boolean(readiness.limited_publish_allowed)}>
                   {saving ? "Saving…" : "Approve limited profile"}
                 </button>
-                <button type="button" style={buttonStyle} onClick={() => void approveProfile("full")} disabled={saving || !Boolean(readiness.full_publish_ready)}>
+                <button type="button" style={buttonStyle} onClick={handleApproveFullClick} disabled={saving}>
                   {saving ? "Saving…" : "Approve full profile"}
                 </button>
               </div>
