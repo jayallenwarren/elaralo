@@ -4562,6 +4562,136 @@ def _parse_companion_meta(raw: Any) -> Dict[str, str]:
     return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
 
 
+def _ai_companion_strip_extensions(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    # Remove any query/hash and keep only the basename.
+    s = s.split("?", 1)[0].split("#", 1)[0]
+    s = os.path.basename(s)
+    # Some filenames arrive with double extensions like .png.jpg
+    while True:
+        nxt = re.sub(r"\.(png|jpg|jpeg|webp)$", "", s, flags=re.I)
+        if nxt == s:
+            break
+        s = nxt
+    return s.strip()
+
+
+def _ai_companion_strip_trailing_uuid(raw: str) -> str:
+    return re.sub(
+        r"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "",
+        str(raw or "").strip(),
+        flags=re.I,
+    )
+
+
+def _ai_companion_title_token(token: str) -> str:
+    lower = str(token or "").strip().lower()
+    if not lower:
+        return ""
+    special = {
+        "genz": "GenZ",
+        "genx": "GenX",
+        "geny": "GenY",
+        "genalpha": "GenAlpha",
+        "usa": "USA",
+        "uk": "UK",
+    }
+    if lower in special:
+        return special[lower]
+    return lower[:1].upper() + lower[1:]
+
+
+def _ai_companion_humanize_token(token: str) -> str:
+    parts = [p for p in str(token or "").replace("_", "-").split("-") if p.strip()]
+    return " ".join(_ai_companion_title_token(p) for p in parts).strip()
+
+
+def _parse_ai_companion_card_meta(raw: Any) -> Dict[str, str]:
+    cleaned = _ai_companion_strip_trailing_uuid(_ai_companion_strip_extensions(str(raw or "")))
+    base_meta = _parse_companion_meta(cleaned)
+    avatar_key = cleaned or _host_onboarding_safe_str(raw)
+    first_name = _ai_companion_humanize_token(base_meta.get("first_name"))
+    gender = _ai_companion_humanize_token(base_meta.get("gender"))
+    ethnicity = _ai_companion_humanize_token(base_meta.get("ethnicity"))
+    generation = _ai_companion_humanize_token(base_meta.get("generation"))
+    out = {
+        "avatar": avatar_key,
+        "first_name": first_name,
+        "gender": gender,
+        "ethnicity": ethnicity,
+        "generation": generation,
+        "source_name": _ai_companion_strip_extensions(str(raw or "")),
+    }
+    return out
+
+
+def _ai_companion_public_payload(brand: str, raw_avatar: str) -> Dict[str, Any]:
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    meta = _parse_ai_companion_card_meta(raw_avatar)
+    avatar_key = _host_onboarding_safe_str(meta.get("avatar"))
+    if not avatar_key:
+        raise HTTPException(status_code=400, detail="avatar or headshot filename is required for an AI companion card")
+
+    mapping = _lookup_companion_mapping(brand_name, avatar_key) or {}
+    display_name = _host_onboarding_safe_str(meta.get("first_name")) or avatar_key
+    gender = _host_onboarding_safe_str(meta.get("gender"))
+    ethnicity = _host_onboarding_safe_str(meta.get("ethnicity"))
+    generation = _host_onboarding_safe_str(meta.get("generation"))
+    headshot_url = _host_onboarding_safe_str((mapping or {}).get("headshot_url"))
+    headshot_asset = {
+        "asset_id": "",
+        "slot_key": "headshot_front",
+        "file_name": _host_onboarding_safe_str(meta.get("source_name") or avatar_key),
+        "url": headshot_url,
+        "content_type": "image/*" if headshot_url else "",
+        "validation_status": "accepted" if headshot_url else "",
+    }
+    quick_reference = {
+        "public_name": display_name,
+        "gender": gender,
+        "ethnicity": ethnicity,
+        "generation": generation,
+    }
+    available_fields = [
+        key for key, value in [
+            ("public_name", display_name),
+            ("gender", gender),
+            ("ethnicity", ethnicity),
+            ("generation", generation),
+        ] if _host_onboarding_safe_str(value)
+    ]
+    public_profile = {
+        "summary_mode": "ai_companion_card",
+        "companion_type": _host_onboarding_safe_str((mapping or {}).get("companion_type")) or "AI",
+        "brand": brand_name,
+        "avatar": avatar_key,
+        "public_display_name": display_name,
+        "stage_name": display_name,
+        "gender": gender,
+        "ethnicity": ethnicity,
+        "generation": generation,
+        "quick_reference_summary": quick_reference,
+        "available_fields": available_fields,
+        "headshot_asset": headshot_asset,
+        "gallery_assets": [],
+    }
+    public_page = {
+        "headline": display_name,
+        "headshot_asset": headshot_asset,
+        "gallery_assets": [],
+        "education_entries": [],
+        "education_text": "",
+        "card_type": "ai_companion",
+    }
+    return {
+        "public_profile": public_profile,
+        "public_page": public_page,
+    }
+
+
 
 def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
     comp = _parse_companion_meta(_extract_companion_raw(session_state))
@@ -20584,11 +20714,34 @@ def _host_onboarding_public_payload_from_profile(profile: Dict[str, Any]) -> Dic
 
 
 @app.get("/host-onboarding/public/summary")
-async def host_onboarding_public_summary(memberId: Optional[str] = None, member_id: Optional[str] = None, versionId: Optional[str] = None, version_id: Optional[str] = None):
+async def host_onboarding_public_summary(
+    memberId: Optional[str] = None,
+    member_id: Optional[str] = None,
+    versionId: Optional[str] = None,
+    version_id: Optional[str] = None,
+    brand: Optional[str] = None,
+    brandId: Optional[str] = None,
+    avatar: Optional[str] = None,
+    companion: Optional[str] = None,
+    companionKey: Optional[str] = None,
+    companion_key: Optional[str] = None,
+    headshot: Optional[str] = None,
+    headshotFile: Optional[str] = None,
+    headshot_file: Optional[str] = None,
+):
     resolved_version_id = _host_onboarding_safe_str(versionId or version_id)
     resolved_member_id = _host_onboarding_normalize_member_id(memberId or member_id)
-    if not resolved_version_id and not resolved_member_id:
-        raise HTTPException(status_code=400, detail="memberId or versionId is required")
+    resolved_brand = _host_onboarding_safe_str(brand or brandId) or "Elaralo"
+    resolved_avatar = _host_onboarding_safe_str(avatar or companion or companionKey or companion_key or headshot or headshotFile or headshot_file)
+    if not resolved_version_id and not resolved_member_id and not resolved_avatar:
+        raise HTTPException(status_code=400, detail="memberId, versionId, avatar, or headshot filename is required")
+    if not resolved_version_id and not resolved_member_id and resolved_avatar:
+        payload = _ai_companion_public_payload(resolved_brand, resolved_avatar)
+        return {
+            "ok": True,
+            "version": None,
+            **payload,
+        }
     conn = _econnect_conn()
     try:
         _host_onboarding_ensure_schema(conn)
