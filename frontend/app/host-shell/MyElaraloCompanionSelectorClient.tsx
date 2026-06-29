@@ -23,7 +23,10 @@ type CompanionCardItem = {
   displayName: string;
   brand: string;
   avatar: string;
+  companionKey: string;
+  mappingAvatar: string;
   headshotUrl: string;
+  headshotFileName: string;
   summaryPublicUrl: string;
   gender: string;
   ethnicity: string;
@@ -42,9 +45,19 @@ type CatalogResponse = {
   message?: string;
 };
 
+type ParsedCompanionMeta = {
+  key: string;
+  first: string;
+  gender: string;
+  ethnicity: string;
+  generation: string;
+};
+
 const API_BASE = String(process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
 const APP_BASE = String(process.env.NEXT_PUBLIC_APP_BASE_URL || "").replace(/\/+$/, "");
 const DEFAULT_HEADSHOT = "/elaralo-logo.png";
+const HEADSHOT_DIR = "/companion/headshot";
+const REBRANDING_PUBLIC_DIR = "/rebranding";
 
 function safeText(value: any): string {
   return String(value ?? "").trim();
@@ -70,14 +83,172 @@ function normalizeCompanionType(value: any): string {
   return toTitle(raw.replace(/[_-]+/g, " "));
 }
 
-function parseList(value: any): string[] {
-  if (Array.isArray(value)) return value.map((x) => safeText(x)).filter(Boolean);
-  const text = safeText(value);
-  if (!text) return [];
-  return text
-    .split(/\n|,|•|\|/)
-    .map((x) => x.trim())
+function normalizeRebrandingSlug(rawBrand: string): string {
+  const raw = safeText(rawBrand);
+  if (!raw) return "";
+  const normalizedBase = raw
+    .replace(/\.(png|jpg|jpeg|webp)$/i, "")
+    .replace(/-logo$/i, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+  return normalizedBase || raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function joinUrlPrefix(prefix: string, path: string): string {
+  const pre = String(prefix || "").trim();
+  const p = String(path || "");
+  if (!pre) return p;
+  if (pre.endsWith("/") && p.startsWith("/")) return pre.slice(0, -1) + p;
+  if (!pre.endsWith("/") && !p.startsWith("/")) return pre + "/" + p;
+  return pre + p;
+}
+
+function stripExt(s: string): string {
+  let out = String(s || "").trim().split("?", 1)[0].split("#", 1)[0];
+  while (true) {
+    const next = out.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
+function stripTrailingUuid(raw: string): string {
+  const s = String(raw || "").trim();
+  return s.replace(/-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, "");
+}
+
+function normalizeKeyForFile(raw: string): string {
+  return String(raw || "").trim().replace(/\s+/g, "-");
+}
+
+function titleCaseToken(token: string): string {
+  const lower = String(token || "").toLowerCase();
+  if (lower === "genz") return "GenZ";
+  if (lower === "genx") return "GenX";
+  if (lower === "geny") return "GenY";
+  if (lower === "genalpha") return "GenAlpha";
+  if (lower === "usa") return "USA";
+  if (lower === "uk") return "UK";
+  if (!lower) return "";
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+function toTitleCaseHyphenated(s: string): string {
+  return String(s || "")
+    .split("-")
+    .map((t) => titleCaseToken(t))
+    .join("-");
+}
+
+function humanizeToken(token: string): string {
+  return String(token || "")
+    .replace(/_/g, "-")
+    .split("-")
+    .map((part) => titleCaseToken(part))
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+}
+
+function parseCompanionKeyMeta(raw: string): ParsedCompanionMeta {
+  const cleaned = normalizeKeyForFile(stripTrailingUuid(stripExt(String(raw || "").split("/").pop() || ""))).replace(/^-+|-+$/g, "");
+  const parts = cleaned
+    .split("-")
+    .map((part) => part.trim())
     .filter(Boolean);
+
+  if (parts.length < 4) {
+    return {
+      key: cleaned,
+      first: humanizeToken(parts[0] || cleaned),
+      gender: "",
+      ethnicity: "",
+      generation: "",
+    };
+  }
+
+  const [first, gender, ethnicity, ...rest] = parts;
+  return {
+    key: cleaned,
+    first: humanizeToken(first),
+    gender: humanizeToken(gender),
+    ethnicity: humanizeToken(ethnicity),
+    generation: humanizeToken(rest.join("-")),
+  };
+}
+
+function isDefaultHeadshot(value: string): boolean {
+  const s = safeText(value);
+  if (!s) return false;
+  return s === DEFAULT_HEADSHOT || /\/elaralo-logo\.(png|jpg|jpeg|webp)$/i.test(s) || /\/elaralo-logo\.png$/i.test(s);
+}
+
+function uniqueStrings(items: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of items) {
+    const s = safeText(value);
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function buildAvatarCandidates(companionKeyOrName: string, brand?: string): string[] {
+  const raw = stripExt(String(companionKeyOrName || "").split("/").pop() || "");
+  if (!raw) return [];
+
+  const baseInputs = Array.from(new Set([raw, stripTrailingUuid(raw)].map((v) => safeText(v)).filter(Boolean)));
+  const encVariants: string[] = [];
+  const seenEnc = new Set<string>();
+
+  for (const baseInput of baseInputs) {
+    const normalized = normalizeKeyForFile(baseInput);
+    const lower = normalized.toLowerCase();
+    const title = toTitleCaseHyphenated(lower);
+    for (const v of [normalized, title, lower]) {
+      const trimmed = safeText(v);
+      if (!trimmed) continue;
+      const enc = encodeURIComponent(trimmed);
+      if (!seenEnc.has(enc)) {
+        seenEnc.add(enc);
+        encVariants.push(enc);
+      }
+    }
+  }
+
+  const slug = normalizeRebrandingSlug(brand || "");
+  const slugEnc = slug ? encodeURIComponent(slug) : "";
+  const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
+  const candidates: string[] = [];
+
+  for (const enc of encVariants) {
+    if (slugEnc && slug !== "elaralo") {
+      const rebrandBase = joinUrlPrefix("", `${REBRANDING_PUBLIC_DIR}/${slugEnc}${HEADSHOT_DIR}/${enc}`);
+      candidates.push(rebrandBase);
+      for (const ext of exts) candidates.push(`${rebrandBase}.${ext}`);
+    }
+
+    const base = joinUrlPrefix("", `${HEADSHOT_DIR}/${enc}`);
+    candidates.push(base);
+    for (const ext of exts) candidates.push(`${base}.${ext}`);
+  }
+
+  return uniqueStrings(candidates);
+}
+
+function resolveSummaryUrl(rawUrl: string, brand: string, companionKey: string): string {
+  const explicit = safeText(rawUrl);
+  if (explicit) {
+    if (/^https?:\/\//i.test(explicit)) return explicit;
+    if (APP_BASE && explicit.startsWith("/")) return `${APP_BASE}${explicit}`;
+    return explicit;
+  }
+  if (!companionKey) return "";
+  const relative = `/summary-public?brand=${encodeURIComponent(brand || "Elaralo")}&avatar=${encodeURIComponent(companionKey)}`;
+  return APP_BASE ? `${APP_BASE}${relative}` : relative;
 }
 
 function readQueryContext(): MemberPlanPayload {
@@ -113,6 +284,19 @@ function mergeMemberPayload(prev: MemberPlanPayload, incoming: MemberPlanPayload
 }
 
 function normalizeCard(item: any, defaultBrand: string): CompanionCardItem {
+  const brand = safeText(item?.brand) || defaultBrand || "Elaralo";
+  const explicitAvatar =
+    safeText(item?.avatar) ||
+    safeText(item?.companion) ||
+    safeText(item?.slug) ||
+    safeText(item?.companion_key) ||
+    safeText(item?.companionKey);
+  const companionKey =
+    safeText(item?.companion_key) ||
+    safeText(item?.companionKey) ||
+    explicitAvatar;
+  const parsed = parseCompanionKeyMeta(companionKey || explicitAvatar);
+  const companionType = normalizeCompanionType(item?.companion_type || item?.companionType) || (parsed.gender || parsed.ethnicity || parsed.generation ? "AI" : "");
   const displayName =
     safeText(item?.display_name) ||
     safeText(item?.displayName) ||
@@ -121,47 +305,48 @@ function normalizeCard(item: any, defaultBrand: string): CompanionCardItem {
     safeText(item?.name) ||
     safeText(item?.first_name) ||
     safeText(item?.firstName) ||
-    safeText(item?.avatar) ||
+    parsed.first ||
+    safeText(companionKey || explicitAvatar) ||
     "Companion";
-  const avatar =
-    safeText(item?.avatar) ||
-    safeText(item?.companion) ||
-    safeText(item?.companion_key) ||
-    safeText(item?.companionKey) ||
-    safeText(item?.slug);
-  const brand = safeText(item?.brand) || defaultBrand || "Elaralo";
   const headshotUrl =
     safeText(item?.headshot_url) ||
     safeText(item?.headshotUrl) ||
     safeText(item?.image_url) ||
     safeText(item?.imageUrl) ||
     safeText(item?.photo_url) ||
-    safeText(item?.photoUrl) ||
-    DEFAULT_HEADSHOT;
-  const summaryPublicUrl =
-    safeText(item?.summary_public_url) ||
-    safeText(item?.summaryPublicUrl) ||
-    (avatar
-      ? `${APP_BASE || ""}/summary-public?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(avatar)}`
-      : "");
+    safeText(item?.photoUrl);
+  const headshotFileName =
+    safeText(item?.headshot_file_name) ||
+    safeText(item?.headshotFileName) ||
+    safeText(item?.headshot_asset?.file_name) ||
+    safeText(item?.public_page?.headshot_asset?.file_name);
+  const summaryPublicUrl = resolveSummaryUrl(
+    safeText(item?.summary_public_url) || safeText(item?.summaryPublicUrl),
+    brand,
+    companionKey || explicitAvatar,
+  );
   const id =
     safeText(item?.id) ||
     safeText(item?.companion_id) ||
     safeText(item?.companionId) ||
-    safeText(item?.member_id) ||
-    safeText(item?.memberId) ||
-    `${brand}:${avatar || displayName}`;
+    safeText(item?.approved_version_id) ||
+    safeText(item?.approvedVersionId) ||
+    `${brand}:${companionType || "Companion"}:${companionKey || explicitAvatar || displayName}`;
+
   return {
     id,
-    companionType: normalizeCompanionType(item?.companion_type || item?.companionType),
+    companionType,
     displayName,
     brand,
-    avatar,
+    avatar: explicitAvatar || companionKey,
+    companionKey: companionKey || explicitAvatar,
+    mappingAvatar: safeText(item?.mapping_avatar || item?.mappingAvatar),
     headshotUrl,
+    headshotFileName,
     summaryPublicUrl,
-    gender: safeText(item?.gender),
-    ethnicity: safeText(item?.ethnicity),
-    generation: safeText(item?.generation),
+    gender: safeText(item?.gender) || parsed.gender,
+    ethnicity: safeText(item?.ethnicity) || parsed.ethnicity,
+    generation: safeText(item?.generation) || parsed.generation,
     shortSummary:
       safeText(item?.summary) || safeText(item?.short_summary) || safeText(item?.shortSummary) || safeText(item?.tagline),
     raw: item,
@@ -173,6 +358,41 @@ function firstLine(text: string): string {
   if (!t) return "";
   const line = t.split(/\n+/)[0]?.trim() || "";
   return line.length > 180 ? `${line.slice(0, 177)}...` : line;
+}
+
+function CompanionHeadshotImage({ card }: { card: CompanionCardItem }) {
+  const candidates = useMemo(() => {
+    const direct = safeText(card.headshotUrl);
+    const fromFile = safeText(card.headshotFileName);
+    const key = safeText(card.companionKey || card.avatar);
+    const raw: string[] = [];
+
+    if (direct && !isDefaultHeadshot(direct)) raw.push(direct);
+    if (fromFile) raw.push(...buildAvatarCandidates(fromFile, card.brand));
+    if (key && safeLower(card.companionType) === "ai") raw.push(...buildAvatarCandidates(key, card.brand));
+    if (direct && isDefaultHeadshot(direct)) raw.push(direct);
+    raw.push(DEFAULT_HEADSHOT);
+    return uniqueStrings(raw);
+  }, [card.avatar, card.brand, card.companionKey, card.companionType, card.headshotFileName, card.headshotUrl]);
+
+  const [idx, setIdx] = useState(0);
+
+  useEffect(() => {
+    setIdx(0);
+  }, [candidates.join("|")]);
+
+  const src = candidates[Math.min(idx, Math.max(candidates.length - 1, 0))] || DEFAULT_HEADSHOT;
+
+  return (
+    <img
+      src={src}
+      alt={card.displayName || "Companion"}
+      style={{ width: "100%", aspectRatio: "1 / 1", objectFit: "cover", display: "block", background: "#e2e8f0" }}
+      onError={() => {
+        setIdx((prev) => (prev + 1 < candidates.length ? prev + 1 : prev));
+      }}
+    />
+  );
 }
 
 export default function MyElaraloCompanionSelectorClient() {
@@ -264,7 +484,7 @@ export default function MyElaraloCompanionSelectorClient() {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, brandName, loggedIn, memberId]);
+  }, [brandName, loggedIn, memberId]);
 
   const companionTypeOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.companionType).filter(Boolean))).sort(), [cards]);
   const generationOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.generation).filter(Boolean))).sort(), [cards]);
@@ -283,7 +503,7 @@ export default function MyElaraloCompanionSelectorClient() {
 
   const openConnect = useCallback(
     (card: CompanionCardItem) => {
-      const avatar = safeText(card.avatar);
+      const avatar = safeText(card.companionKey || card.avatar);
       if (!avatar) return;
       try {
         const url = new URL("/", window.location.origin);
@@ -292,7 +512,9 @@ export default function MyElaraloCompanionSelectorClient() {
         if (displayName) url.searchParams.set("displayName", displayName);
         url.searchParams.set("brand", safeText(card.brand) || brandName || "Elaralo");
         url.searchParams.set("avatar", avatar);
+        url.searchParams.set("companionKey", avatar);
         if (card.companionType) url.searchParams.set("companionType", card.companionType);
+        if (card.mappingAvatar) url.searchParams.set("mappingAvatar", card.mappingAvatar);
         window.location.assign(url.toString());
       } catch {
         // ignore
@@ -301,17 +523,18 @@ export default function MyElaraloCompanionSelectorClient() {
     [brandName, displayName, loggedIn, memberId],
   );
 
-  const openSummaryPublic = useCallback((card: CompanionCardItem) => {
-    const target =
-      safeText(card.summaryPublicUrl) ||
-      `${APP_BASE || ""}/summary-public?brand=${encodeURIComponent(card.brand || brandName || "Elaralo")}&avatar=${encodeURIComponent(card.avatar)}`;
-    if (!target) return;
-    try {
-      window.open(target, "_blank", "noopener,noreferrer");
-    } catch {
-      // ignore
-    }
-  }, [brandName]);
+  const openSummaryPublic = useCallback(
+    (card: CompanionCardItem) => {
+      const target = resolveSummaryUrl(card.summaryPublicUrl, card.brand || brandName || "Elaralo", card.companionKey || card.avatar);
+      if (!target) return;
+      try {
+        window.open(target, "_blank", "noopener,noreferrer");
+      } catch {
+        // ignore
+      }
+    },
+    [brandName],
+  );
 
   const containerStyle: React.CSSProperties = {
     minHeight: "100vh",
@@ -489,18 +712,11 @@ export default function MyElaraloCompanionSelectorClient() {
                 card.generation,
               ].filter(Boolean);
               const summaryLine = firstLine(card.shortSummary);
+              const canOpenConnect = Boolean(safeText(card.companionKey || card.avatar));
               return (
                 <article key={card.id} style={cardStyle}>
                   <button type="button" style={imageButtonStyle} onClick={() => openConnect(card)} title="Open in Connect">
-                    <img
-                      src={card.headshotUrl || DEFAULT_HEADSHOT}
-                      alt={card.displayName || "Companion"}
-                      style={{ width: "100%", aspectRatio: "1 / 1", objectFit: "cover", display: "block", background: "#e2e8f0" }}
-                      onError={(e) => {
-                        const img = e.currentTarget as HTMLImageElement;
-                        if (img.src !== DEFAULT_HEADSHOT) img.src = DEFAULT_HEADSHOT;
-                      }}
-                    />
+                    <CompanionHeadshotImage card={card} />
                   </button>
                   <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 12, flex: 1 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
@@ -519,15 +735,15 @@ export default function MyElaraloCompanionSelectorClient() {
                       <button
                         type="button"
                         onClick={() => openConnect(card)}
-                        disabled={!safeText(card.avatar)}
+                        disabled={!canOpenConnect}
                         style={{
                           borderRadius: 14,
                           border: 0,
-                          background: safeText(card.avatar) ? "#0f172a" : "#94a3b8",
+                          background: canOpenConnect ? "#0f172a" : "#94a3b8",
                           color: "#fff",
                           padding: "12px 16px",
                           fontWeight: 800,
-                          cursor: safeText(card.avatar) ? "pointer" : "not-allowed",
+                          cursor: canOpenConnect ? "pointer" : "not-allowed",
                         }}
                       >
                         Open Connect
@@ -535,7 +751,7 @@ export default function MyElaraloCompanionSelectorClient() {
                       <button
                         type="button"
                         onClick={() => openSummaryPublic(card)}
-                        disabled={!safeText(card.summaryPublicUrl) && !safeText(card.avatar)}
+                        disabled={!safeText(card.summaryPublicUrl) && !safeText(card.companionKey || card.avatar)}
                         style={{
                           borderRadius: 14,
                           border: "1px solid rgba(15,23,42,0.14)",
