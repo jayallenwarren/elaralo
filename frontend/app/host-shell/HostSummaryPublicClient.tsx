@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import elaraLogo from "../public/elaralo-logo.png";
 
 type PublicAsset = {
   asset_id?: string;
@@ -40,7 +39,7 @@ type PublicVersionPayload = {
   message?: string;
 };
 
-const DEFAULT_AVATAR = elaraLogo.src;
+const DEFAULT_AVATAR = "/elaralo-logo.png";
 const HEADSHOT_DIR = "/companion/headshot";
 const REBRANDING_PUBLIC_DIR = "/rebranding";
 const API_BASE = String(process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
