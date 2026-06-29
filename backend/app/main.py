@@ -18754,6 +18754,145 @@ def _host_onboarding_find_active_session(conn: sqlite3.Connection, member_id: st
     return _host_onboarding_session_row_to_dict(row, _host_onboarding_asset_rows(conn, _host_onboarding_safe_str(row['session_id'])))
 
 
+def _host_onboarding_value_has_meaningful_content(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(_host_onboarding_safe_str(value))
+    if isinstance(value, dict):
+        return any(_host_onboarding_value_has_meaningful_content(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_host_onboarding_value_has_meaningful_content(v) for v in value)
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return True
+    return bool(value)
+
+
+def _host_onboarding_session_has_meaningful_draft(session: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(session, dict):
+        return False
+    for key in ("basics", "derived", "review", "completion"):
+        if _host_onboarding_value_has_meaningful_content(session.get(key)):
+            return True
+    for asset in list(session.get("assets") or []):
+        if isinstance(asset, dict) and _host_onboarding_safe_str(asset.get("url")):
+            return True
+    return False
+
+
+def _host_onboarding_get_latest_approved_version_row(
+    conn: sqlite3.Connection,
+    member_id: str,
+    brand: str = "",
+    avatar: str = "",
+) -> Optional[Dict[str, Any]]:
+    filters = ["v.member_id = ?"]
+    params: List[Any] = [member_id]
+    if brand:
+        filters.append("COALESCE(s.brand, '') = ?")
+        params.append(brand)
+    if avatar:
+        filters.append("COALESCE(s.avatar, '') = ?")
+        params.append(avatar)
+    row = conn.execute(
+        f"""
+        SELECT
+            v.*,
+            COALESCE(s.brand, '') AS source_brand,
+            COALESCE(s.avatar, '') AS source_avatar,
+            COALESCE(s.host_display_name, '') AS source_host_display_name
+        FROM {_HOST_ONBOARDING_VERSIONS_TABLE} v
+        LEFT JOIN {_HOST_ONBOARDING_SESSIONS_TABLE} s ON s.session_id = v.session_id
+        WHERE {' AND '.join(filters)}
+        ORDER BY v.approved_epoch DESC, v.created_epoch DESC, v.version_no DESC
+        LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _host_onboarding_clone_assets_to_session(conn: sqlite3.Connection, source_session_id: str, target_session_id: str) -> None:
+    assets = _host_onboarding_asset_rows(conn, source_session_id)
+    now = _host_onboarding_now()
+    conn.execute(f"DELETE FROM {_HOST_ONBOARDING_ASSETS_TABLE} WHERE session_id = ?", (target_session_id,))
+    for asset in assets:
+        conn.execute(
+            f"""
+            INSERT INTO {_HOST_ONBOARDING_ASSETS_TABLE}
+            (asset_id, session_id, slot_key, required_flag, url, file_name, content_type, size_bytes, width_px, height_px,
+             validation_status, validation_errors_json, created_epoch, updated_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                target_session_id,
+                _host_onboarding_safe_str(asset.get("slot_key")),
+                1 if bool(asset.get("required") is True) else 0,
+                _host_onboarding_safe_str(asset.get("url")),
+                _host_onboarding_safe_str(asset.get("file_name")),
+                _host_onboarding_safe_str(asset.get("content_type")),
+                int(asset.get("size_bytes") or 0),
+                int(asset.get("width_px") or 0),
+                int(asset.get("height_px") or 0),
+                _host_onboarding_safe_str(asset.get("validation_status")) or "accepted",
+                _host_onboarding_json_dumps(list(asset.get("validation_errors") or [])),
+                now,
+                now,
+            ),
+        )
+
+
+def _host_onboarding_latest_approved_version_meta(version_row: Optional[Dict[str, Any]], mode: str = "") -> Dict[str, Any]:
+    row = dict(version_row or {})
+    return {
+        "mode": _host_onboarding_safe_str(mode),
+        "version_id": _host_onboarding_safe_str(row.get("version_id")),
+        "version_no": int(row.get("version_no") or 0),
+        "publish_scope": _host_onboarding_safe_str(row.get("publish_scope")),
+        "source_session_id": _host_onboarding_safe_str(row.get("session_id")),
+        "brand": _host_onboarding_safe_str(row.get("source_brand") or row.get("brand")),
+        "avatar": _host_onboarding_safe_str(row.get("source_avatar") or row.get("avatar")),
+    }
+
+
+def _host_onboarding_seed_session_from_latest_approved(
+    conn: sqlite3.Connection,
+    *,
+    target_session_id: str,
+    member_id: str,
+    brand: str,
+    avatar: str,
+    host_display_name: str,
+    logged_in: bool,
+    source_session: Dict[str, Any],
+    version_row: Dict[str, Any],
+) -> Dict[str, Any]:
+    seeded = _host_onboarding_upsert_session(
+        conn,
+        session_id=target_session_id,
+        member_id=member_id,
+        brand=brand or _host_onboarding_safe_str(source_session.get("brand")) or _host_onboarding_safe_str(version_row.get("source_brand")),
+        avatar=avatar or _host_onboarding_safe_str(source_session.get("avatar")) or _host_onboarding_safe_str(version_row.get("source_avatar")),
+        host_display_name=host_display_name or _host_onboarding_safe_str(source_session.get("host_display_name")) or _host_onboarding_safe_str(version_row.get("source_host_display_name")),
+        logged_in=logged_in,
+        workflow_state="approved_with_later_edits_pending",
+        publish_status="draft",
+        basics=_host_onboarding_json_loads(_host_onboarding_json_dumps(source_session.get("basics") or {}), {}),
+        derived=_host_onboarding_json_loads(_host_onboarding_json_dumps(source_session.get("derived") or {}), {}),
+        review=_host_onboarding_json_loads(_host_onboarding_json_dumps(source_session.get("review") or {}), {}),
+        completion=_host_onboarding_json_loads(_host_onboarding_json_dumps(source_session.get("completion") or {}), {}),
+        three_d_opt_in=bool(source_session.get("three_d_opt_in") is True),
+        limited_publish_allowed=bool(source_session.get("limited_publish_allowed") is True),
+        full_publish_ready=bool(source_session.get("full_publish_ready") is True),
+        approved_version_id=_host_onboarding_safe_str(version_row.get("version_id")),
+    )
+    _host_onboarding_clone_assets_to_session(conn, _host_onboarding_safe_str(source_session.get("session_id")), target_session_id)
+    return _host_onboarding_get_session_by_id(conn, target_session_id) or seeded
+
+
 def _host_onboarding_upsert_session(
     conn: sqlite3.Connection,
     *,
@@ -19337,17 +19476,81 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
         brand = brand or _host_onboarding_safe_str((resolved_ctx or {}).get("brand"))
         avatar = avatar or _host_onboarding_safe_str((resolved_ctx or {}).get("avatar"))
         conn.execute("BEGIN IMMEDIATE")
+        latest_version_used: Optional[Dict[str, Any]] = None
+        latest_approved = _host_onboarding_get_latest_approved_version_row(conn, member_id, brand, avatar)
         existing = _host_onboarding_find_active_session(conn, member_id, brand, avatar)
         if existing and _host_onboarding_safe_str(existing.get("publish_status")) not in ("approved", "full"):
-            session = _host_onboarding_upsert_session(
-                conn,
-                session_id=_host_onboarding_safe_str(existing.get("session_id")),
-                member_id=member_id,
-                brand=brand or _host_onboarding_safe_str(existing.get("brand")),
-                avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
-                host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
-                logged_in=logged_in,
-            )
+            if (not _host_onboarding_session_has_meaningful_draft(existing)) and latest_approved:
+                source_session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(latest_approved.get("session_id")))
+                if source_session:
+                    session = _host_onboarding_seed_session_from_latest_approved(
+                        conn,
+                        target_session_id=_host_onboarding_safe_str(existing.get("session_id")),
+                        member_id=member_id,
+                        brand=brand,
+                        avatar=avatar,
+                        host_display_name=host_display_name,
+                        logged_in=logged_in,
+                        source_session=source_session,
+                        version_row=latest_approved,
+                    )
+                    latest_version_used = _host_onboarding_latest_approved_version_meta(latest_approved, mode="rehydrated_empty_draft")
+                    _host_onboarding_audit(conn, session["session_id"], member_id, "session_rehydrated_from_latest_approved_version", latest_version_used)
+                else:
+                    session = _host_onboarding_upsert_session(
+                        conn,
+                        session_id=_host_onboarding_safe_str(existing.get("session_id")),
+                        member_id=member_id,
+                        brand=brand or _host_onboarding_safe_str(existing.get("brand")),
+                        avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
+                        host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
+                        logged_in=logged_in,
+                    )
+            else:
+                session = _host_onboarding_upsert_session(
+                    conn,
+                    session_id=_host_onboarding_safe_str(existing.get("session_id")),
+                    member_id=member_id,
+                    brand=brand or _host_onboarding_safe_str(existing.get("brand")),
+                    avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
+                    host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
+                    logged_in=logged_in,
+                )
+        elif latest_approved:
+            source_session = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(latest_approved.get("session_id")))
+            if source_session:
+                session = _host_onboarding_seed_session_from_latest_approved(
+                    conn,
+                    target_session_id=uuid.uuid4().hex,
+                    member_id=member_id,
+                    brand=brand,
+                    avatar=avatar,
+                    host_display_name=host_display_name,
+                    logged_in=logged_in,
+                    source_session=source_session,
+                    version_row=latest_approved,
+                )
+                latest_version_used = _host_onboarding_latest_approved_version_meta(latest_approved, mode="new_draft_from_latest_approved")
+                _host_onboarding_audit(conn, session["session_id"], member_id, "session_started_from_latest_approved_version", latest_version_used)
+            else:
+                session = _host_onboarding_upsert_session(
+                    conn,
+                    session_id=uuid.uuid4().hex,
+                    member_id=member_id,
+                    brand=brand,
+                    avatar=avatar,
+                    host_display_name=host_display_name,
+                    logged_in=logged_in,
+                    workflow_state="not_started",
+                    publish_status="draft",
+                    basics={},
+                    derived={},
+                    review={},
+                    completion={},
+                    limited_publish_allowed=False,
+                    full_publish_ready=False,
+                )
+                _host_onboarding_audit(conn, session["session_id"], member_id, "session_started", {"brand": brand, "avatar": avatar})
         else:
             session = _host_onboarding_upsert_session(
                 conn,
@@ -19368,7 +19571,10 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
             )
             _host_onboarding_audit(conn, session["session_id"], member_id, "session_started", {"brand": brand, "avatar": avatar})
         conn.commit()
-        return {"ok": True, "session": session, "readiness": _host_onboarding_compute_readiness(session)}
+        response = {"ok": True, "session": session, "readiness": _host_onboarding_compute_readiness(session)}
+        if latest_version_used:
+            response["latest_approved_version_used"] = latest_version_used
+        return response
     finally:
         try:
             conn.close()
