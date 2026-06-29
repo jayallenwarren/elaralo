@@ -19553,6 +19553,101 @@ def _host_onboarding_first_sentence(value: Any, max_words: int = 28) -> str:
     return first
 
 
+def _host_onboarding_ensure_sentence(value: Any) -> str:
+    text = re.sub(r"\s+", " ", _host_onboarding_safe_str(value)).strip()
+    if not text:
+        return ""
+    if not re.search(r"[.!?]$", text):
+        text += "."
+    return text
+
+
+def _host_onboarding_first_clause_without_mid_sentence_cut(value: Any, max_words: int = 28) -> str:
+    text = re.sub(r"\s+", " ", _host_onboarding_safe_str(value)).strip()
+    if not text:
+        return ""
+    first = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+    if len(first.split()) <= max_words:
+        return _host_onboarding_ensure_sentence(first)
+    clauses = [part.strip() for part in re.split(r"\s*(?:;|—|–|,|\bwhile\b|\bbut\b)\s*", first, flags=re.IGNORECASE) if part and part.strip()]
+    chosen = ""
+    for clause in clauses:
+        candidate = f"{chosen}, {clause}" if chosen else clause
+        if len(candidate.split()) <= max_words:
+            chosen = candidate
+            continue
+        break
+    if chosen and len(chosen.split()) >= 6:
+        return _host_onboarding_ensure_sentence(chosen)
+    return _host_onboarding_ensure_sentence(first)
+
+
+def _host_onboarding_voice_to_first_person(value: Any, display_name: str, max_words: int = 28) -> str:
+    text = _host_onboarding_first_clause_without_mid_sentence_cut(value, max_words=max_words)
+    if not text:
+        return ""
+    name = _host_onboarding_safe_str(display_name)
+    if name:
+        text = re.sub(rf"\b{re.escape(name)}'s\b", "my", text, flags=re.IGNORECASE)
+        text = re.sub(rf"\b{re.escape(name)}\b", "I", text, flags=re.IGNORECASE)
+    replacements = [
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}'s\s+father's\s+family\b", "My father's family"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}'s\s+mother's\s+family\b", "My mother's family"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}'s\b", "my"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+is\s+known\s+for\b", "I am known for"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+combines\b", "I combine"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+embodies\b", "I embody"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+maintains\b", "I maintain"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+values\b", "I value"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+carries\b", "I carry"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+approaches\b", "I approach"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+remains\b", "I remain"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+prefers\b", "I prefer"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+enjoys\b", "I enjoy"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+likes\b", "I like"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+works\b", "I work"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+grew\s+up\b", "I grew up"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+was\b", "I was"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+has\b", "I have"),
+        (r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+is\b", "I am"),
+        (r"\b[Ss]he's\b", "I'm"),
+        (r"\b[Hh]e's\b", "I'm"),
+        (r"\b[Tt]hey're\b", "I'm"),
+        (r"\b[Ss]he is\b", "I am"),
+        (r"\b[Hh]e is\b", "I am"),
+        (r"\b[Tt]hey are\b", "I am"),
+        (r"\b[Ss]he was\b", "I was"),
+        (r"\b[Hh]e was\b", "I was"),
+        (r"\b[Tt]hey were\b", "I was"),
+        (r"\b[Ss]he has\b", "I have"),
+        (r"\b[Hh]e has\b", "I have"),
+        (r"\b[Tt]hey have\b", "I have"),
+        (r"\b[Ss]he\b", "I"),
+        (r"\b[Hh]e\b", "I"),
+        (r"\b[Tt]hey\b", "I"),
+        (r"\b[Hh]er\b", "my"),
+        (r"\b[Hh]is\b", "my"),
+        (r"\b[Tt]heir\b", "my"),
+        (r"\b[Hh]ers\b", "mine"),
+        (r"\b[Tt]heirs\b", "mine"),
+        (r"\bI combines\b", "I combine"),
+        (r"\bI embodies\b", "I embody"),
+        (r"\bI maintains\b", "I maintain"),
+        (r"\bI values\b", "I value"),
+        (r"\bI carries\b", "I carry"),
+        (r"\bI approaches\b", "I approach"),
+        (r"\bI remains\b", "I remain"),
+        (r"\bI prefers\b", "I prefer"),
+        (r"\bI enjoys\b", "I enjoy"),
+        (r"\bI likes\b", "I like"),
+        (r"\bI works\b", "I work"),
+        (r"\bI's\b", "my"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    return _host_onboarding_ensure_sentence(text)
+
+
 def _host_onboarding_readable_list(items: List[str]) -> str:
     values = [re.sub(r"\s+", " ", _host_onboarding_safe_str(item)).strip() for item in items if _host_onboarding_safe_str(item)]
     values = [v for v in values if v]
@@ -19565,37 +19660,82 @@ def _host_onboarding_readable_list(items: List[str]) -> str:
     return ", ".join(values[:-1]) + f", and {values[-1]}"
 
 
+def _host_onboarding_voice_list(raw: Any, max_items: int = 6) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    values = raw if isinstance(raw, list) else [raw]
+    for value in values:
+        for part in re.split(r"[\n,;•]+", _host_onboarding_safe_str(value)):
+            cleaned = re.sub(r"\s+", " ", _host_onboarding_safe_str(part)).strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(cleaned)
+            if len(out) >= max_items:
+                return out
+    return out
+
+
+def _host_onboarding_voice_format_education_entry(entry: Dict[str, Any]) -> str:
+    row = dict(entry or {})
+    degree = _host_onboarding_safe_str(row.get("degree") or row.get("credential") or row.get("program_name"))
+    field = _host_onboarding_safe_str(row.get("field_of_study") or row.get("focus") or row.get("academic_focus"))
+    institution = _host_onboarding_safe_str(row.get("institution") or row.get("school"))
+    graduation_year = _host_onboarding_safe_str(row.get("graduation_year") or row.get("year"))
+    if degree and field:
+        phrase = f"{degree} in {field}"
+    else:
+        phrase = degree or field or institution
+    if institution and institution.lower() not in phrase.lower():
+        phrase = f"{phrase} from {institution}" if phrase else institution
+    if graduation_year:
+        phrase = f"{phrase}, class of {graduation_year}" if phrase else f"class of {graduation_year}"
+    return re.sub(r"\s+", " ", phrase).strip()
+
+
+def _host_onboarding_compose_voice_script(sentences: List[str], filler_sentences: List[str], min_words: int = 130, max_words: int = 175) -> Tuple[str, int]:
+    chosen: List[str] = []
+    total = 0
+    normalized_sentences = [_host_onboarding_ensure_sentence(s) for s in sentences if _host_onboarding_safe_str(s)]
+    for idx, sentence in enumerate(normalized_sentences):
+        sentence_words = len([w for w in re.split(r"\s+", sentence) if w])
+        is_essential = idx < 4
+        if is_essential or total + sentence_words <= max_words:
+            chosen.append(sentence)
+            total += sentence_words
+    for filler in [_host_onboarding_ensure_sentence(s) for s in filler_sentences if _host_onboarding_safe_str(s)]:
+        if total >= min_words:
+            break
+        filler_words = len([w for w in re.split(r"\s+", filler) if w])
+        if total + filler_words > max_words:
+            continue
+        chosen.append(filler)
+        total += filler_words
+    script = " ".join(chosen).strip()
+    return script, total
+
+
 def _host_onboarding_voice_capture_guidance(public_profile: Dict[str, Any], private_profile: Dict[str, Any]) -> Dict[str, Any]:
     profile = dict(public_profile or {})
     private_data = dict(private_profile or {})
     display_name = _host_onboarding_safe_str(profile.get("public_display_name") or profile.get("stage_name")) or "this host"
     zodiac = _host_onboarding_safe_str(profile.get("zodiac_sign"))
-    physical = _host_onboarding_first_sentence(profile.get("physical_description"), max_words=24)
-    personality = _host_onboarding_first_sentence(profile.get("personality"), max_words=24)
-    family = _host_onboarding_first_sentence(profile.get("family_heritage"), max_words=24)
+    physical = _host_onboarding_voice_to_first_person(profile.get("physical_description"), display_name, max_words=28)
+    personality = _host_onboarding_voice_to_first_person(profile.get("personality"), display_name, max_words=26)
+    family = _host_onboarding_voice_to_first_person(profile.get("family_heritage"), display_name, max_words=28)
     education_entries = _host_onboarding_normalize_education_entries(profile.get("education_entries") or profile.get("education"))
-    education_text = _host_onboarding_format_education_entries_text(education_entries)
-    education_sentence = _host_onboarding_first_sentence(education_text, max_words=24)
+    education_line = _host_onboarding_readable_list([_host_onboarding_voice_format_education_entry(entry) for entry in education_entries[:2] if _host_onboarding_voice_format_education_entry(entry)])
     career = dict(profile.get("career") or {})
     current_job_title = _host_onboarding_safe_str(career.get("current_job_title"))
     current_company = _host_onboarding_safe_str(career.get("current_company"))
-    career_summary = _host_onboarding_first_sentence(career.get("career_summary"), max_words=24)
-    interest_tokens: List[str] = []
-    for raw in (profile.get("likes"), profile.get("hobbies")):
-        text = _host_onboarding_safe_str(raw)
-        if not text:
-            continue
-        # Support both comma-separated and line-separated storage.
-        for part in re.split(r"[\n,•]+", text):
-            cleaned = re.sub(r"\s+", " ", _host_onboarding_safe_str(part)).strip()
-            if cleaned and cleaned.lower() not in {x.lower() for x in interest_tokens}:
-                interest_tokens.append(cleaned)
-        if len(interest_tokens) >= 4:
-            break
-    interests = _host_onboarding_readable_list(interest_tokens[:4])
-    lifestyle = _host_onboarding_first_sentence(profile.get("lifestyle"), max_words=22)
-    background = _host_onboarding_first_sentence(profile.get("background_story"), max_words=22)
-    core_values = _host_onboarding_safe_str(profile.get("core_values"))
+    career_summary = _host_onboarding_voice_to_first_person(career.get("career_summary"), display_name, max_words=24)
+    interests = _host_onboarding_readable_list(_host_onboarding_voice_list([profile.get("likes"), profile.get("hobbies")], max_items=4))
+    lifestyle = _host_onboarding_voice_to_first_person(profile.get("lifestyle"), display_name, max_words=24)
+    background = _host_onboarding_voice_to_first_person(profile.get("background_story"), display_name, max_words=26)
+    core_values = _host_onboarding_voice_list([profile.get("core_values")], max_items=6)
     motto = _host_onboarding_safe_str(profile.get("personal_motto"))
     birth_country = _host_onboarding_safe_str(private_data.get("birth_country"))
     nationality_list = private_data.get("nationalities") if isinstance(private_data.get("nationalities"), list) else []
@@ -19607,11 +19747,11 @@ def _host_onboarding_voice_capture_guidance(public_profile: Dict[str, Any], priv
     if personality:
         sentences.append(personality)
     elif zodiac:
-        sentences.append(f"My approved profile reflects the thoughtful and detail-oriented energy often associated with {zodiac}.")
+        sentences.append(f"I bring the thoughtful and intentional energy often associated with {zodiac}.")
     if physical:
         sentences.append(physical)
-    if education_sentence:
-        sentences.append(f"My educational background includes {education_sentence.lstrip()}")
+    if education_line:
+        sentences.append(f"My educational background includes {education_line}.")
     if current_job_title and current_company:
         sentences.append(f"Professionally, I work as {current_job_title} at {current_company}.")
     elif current_job_title:
@@ -19624,35 +19764,31 @@ def _host_onboarding_voice_capture_guidance(public_profile: Dict[str, Any], priv
         sentences.append(background)
     if nationality and birth_country:
         sentences.append(f"My background is rooted in {birth_country}, and my approved nationality profile includes {nationality}.")
-    elif interests:
+    if interests:
         sentences.append(f"In my personal time, I enjoy {interests}.")
     if lifestyle:
         sentences.append(lifestyle)
-    values_sentence = _host_onboarding_first_sentence(core_values, max_words=18)
-    if values_sentence:
-        sentences.append(f"My values are centered on {values_sentence.lstrip().rstrip('.')}." )
+    if core_values:
+        sentences.append(f"My values are centered on {_host_onboarding_readable_list(core_values)}.")
     if motto:
-        motto_clean = _host_onboarding_safe_str(motto).rstrip(".")
-        sentences.append(f"A phrase that represents me well is: {motto_clean}.")
-    sentences.append("As you listen, you should hear a voice that feels natural, confident, and consistent with the approved profile information that represents me on the platform.")
-    sentences.append("Please read this script at a calm, conversational pace so the final recording captures clear pronunciation, warmth, and personality.")
+        sentences.append(f"A phrase that represents me well is: {_host_onboarding_safe_str(motto).rstrip('.')}.")
+    sentences.append("I want this sample to sound natural, confident, and consistent with the approved profile information that represents me on the platform.")
+    sentences.append("Thank you for listening, and I hope this gives you a clear sense of my voice, presence, and personality.")
 
-    script = " ".join([re.sub(r"\s+", " ", s).strip() for s in sentences if _host_onboarding_safe_str(s)]).strip()
-    words = [w for w in re.split(r"\s+", script) if w]
-    if len(words) < 120:
-        script += " I want the recording to sound polished, expressive, and welcoming, while still feeling authentic to the way I would naturally introduce myself, describe my background, and speak to someone for the first time."
-        words = [w for w in re.split(r"\s+", script) if w]
-    if len(words) > 185:
-        script = " ".join(words[:185]).rstrip(",;:") + "."
-        words = [w for w in re.split(r"\s+", script) if w]
-    estimated_seconds = int(round((len(words) / 145.0) * 60.0))
+    filler_sentences = [
+        "I am reading this at a calm, conversational pace so you can hear my pronunciation, warmth, and natural rhythm clearly.",
+        "I want this recording to feel polished and expressive while still sounding authentic to the way I would naturally introduce myself and speak in a real conversation.",
+    ]
+
+    script, word_count = _host_onboarding_compose_voice_script(sentences, filler_sentences, min_words=130, max_words=175)
+    estimated_seconds = int(round((word_count / 145.0) * 60.0)) if word_count else 0
     if estimated_seconds < int(_HOST_ONBOARDING_VOICE_TARGET_SECONDS):
         estimated_seconds = int(_HOST_ONBOARDING_VOICE_TARGET_SECONDS)
     return {
         "minimum_seconds": int(_HOST_ONBOARDING_VOICE_MIN_SECONDS),
         "target_seconds": int(_HOST_ONBOARDING_VOICE_TARGET_SECONDS),
         "estimated_seconds": estimated_seconds,
-        "word_count": len(words),
+        "word_count": word_count,
         "script": script,
     }
 

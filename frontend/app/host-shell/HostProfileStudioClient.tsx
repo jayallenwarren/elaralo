@@ -426,6 +426,166 @@ function firstSentence(text: any, maxWords = 24): string {
   return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
+function ensureSentence(text: any): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  return /[.!?]$/.test(normalized) ? normalized : `${normalized}.`;
+}
+
+function splitVoiceList(raw: any, maxItems = 6): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const parts = Array.isArray(raw) ? raw : [raw];
+  parts.forEach((value) => {
+    String(value || "")
+      .split(/[\n,;•]+/)
+      .map((piece) => String(piece || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .forEach((piece) => {
+        const key = piece.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push(piece);
+      });
+  });
+  return out.slice(0, maxItems);
+}
+
+function firstClauseWithoutMidSentenceCut(text: any, maxWords = 28): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const first = normalized.split(/(?<=[.!?])\s+/)[0] || normalized;
+  if (countWords(first) <= maxWords) return ensureSentence(first);
+  const clauses = first
+    .split(/\s*(?:;|—|–|,|\bwhile\b|\bbut\b)\s*/i)
+    .map((part) => String(part || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  let chosen = "";
+  for (const clause of clauses) {
+    const candidate = chosen ? `${chosen}, ${clause}` : clause;
+    if (countWords(candidate) <= maxWords) {
+      chosen = candidate;
+      continue;
+    }
+    break;
+  }
+  if (chosen && countWords(chosen) >= 6) return ensureSentence(chosen);
+  return ensureSentence(first);
+}
+
+function escapeRegexLiteral(value: string): string {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function convertNarrativeToFirstPerson(text: any, displayName: string, maxWords = 28): string {
+  let out = firstClauseWithoutMidSentenceCut(text, maxWords);
+  if (!out) return "";
+  const name = String(displayName || "").trim();
+  if (name) {
+    const escapedName = escapeRegexLiteral(name);
+    out = out.replace(new RegExp(`\b${escapedName}'s\b`, "gi"), "my");
+    out = out.replace(new RegExp(`\b${escapedName}\b`, "gi"), "I");
+  }
+  out = out
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}'s\s+father's\s+family\b/, "My father's family")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}'s\s+mother's\s+family\b/, "My mother's family")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}'s\b/, "my")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+is\s+known\s+for\b/, "I am known for")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+combines\b/, "I combine")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+embodies\b/, "I embody")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+maintains\b/, "I maintain")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+values\b/, "I value")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+carries\b/, "I carry")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+approaches\b/, "I approach")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+remains\b/, "I remain")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+prefers\b/, "I prefer")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+enjoys\b/, "I enjoy")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+likes\b/, "I like")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+works\b/, "I work")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+grew\s+up\b/, "I grew up")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+was\b/, "I was")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+has\b/, "I have")
+    .replace(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\s+is\b/, "I am")
+    .replace(/[Ss]he's/g, "I'm")
+    .replace(/[Hh]e's/g, "I'm")
+    .replace(/[Tt]hey're/g, "I'm")
+    .replace(/[Ss]he is/g, "I am")
+    .replace(/[Hh]e is/g, "I am")
+    .replace(/[Tt]hey are/g, "I am")
+    .replace(/[Ss]he was/g, "I was")
+    .replace(/[Hh]e was/g, "I was")
+    .replace(/[Tt]hey were/g, "I was")
+    .replace(/[Ss]he has/g, "I have")
+    .replace(/[Hh]e has/g, "I have")
+    .replace(/[Tt]hey have/g, "I have")
+    .replace(/[Ss]he/g, "I")
+    .replace(/[Hh]e/g, "I")
+    .replace(/[Tt]hey/g, "I")
+    .replace(/[Hh]er/g, "my")
+    .replace(/[Hh]is/g, "my")
+    .replace(/[Tt]heir/g, "my")
+    .replace(/[Hh]ers/g, "mine")
+    .replace(/[Tt]heirs/g, "mine")
+    .replace(/I combines/g, "I combine")
+    .replace(/I embodies/g, "I embody")
+    .replace(/I maintains/g, "I maintain")
+    .replace(/I values/g, "I value")
+    .replace(/I carries/g, "I carry")
+    .replace(/I approaches/g, "I approach")
+    .replace(/I remains/g, "I remain")
+    .replace(/I prefers/g, "I prefer")
+    .replace(/I enjoys/g, "I enjoy")
+    .replace(/I likes/g, "I like")
+    .replace(/I works/g, "I work")
+    .replace(/I's/g, "my");
+  return ensureSentence(out);
+}
+
+function formatEducationEntryForVoice(entry: any): string {
+  const degree = String(entry?.degree || entry?.credential || entry?.program_name || "").trim();
+  const field = String(entry?.field_of_study || entry?.focus || entry?.academic_focus || "").trim();
+  const institution = String(entry?.institution || entry?.school || "").trim();
+  const graduationYear = String(entry?.graduation_year || entry?.year || "").trim();
+  let phrase = "";
+  if (degree && field) {
+    phrase = `${degree} in ${field}`;
+  } else {
+    phrase = degree || field || institution;
+  }
+  if (institution && !phrase.toLowerCase().includes(institution.toLowerCase())) {
+    phrase += phrase ? ` from ${institution}` : institution;
+  }
+  if (graduationYear) {
+    phrase += `${phrase ? ", " : ""}class of ${graduationYear}`;
+  }
+  return phrase.replace(/\s+/g, " ").trim();
+}
+
+function composeVoiceScript(sentences: string[], fillerSentences: string[], minWords = 130, maxWords = 175): string {
+  const chosen: string[] = [];
+  let total = 0;
+  sentences
+    .map((sentence) => ensureSentence(sentence))
+    .filter(Boolean)
+    .forEach((sentence, idx) => {
+      const sentenceWords = countWords(sentence);
+      const isEssential = idx < 4;
+      if (isEssential || total + sentenceWords <= maxWords) {
+        chosen.push(sentence);
+        total += sentenceWords;
+      }
+    });
+  for (const filler of fillerSentences.map((sentence) => ensureSentence(sentence)).filter(Boolean)) {
+    if (total >= minWords) break;
+    const fillerWords = countWords(filler);
+    if (total + fillerWords > maxWords) continue;
+    chosen.push(filler);
+    total += fillerWords;
+  }
+  if (!chosen.length) return "";
+  return chosen.join(" ").replace(/\s+/g, " ").trim();
+}
+
 function buildVoiceCaptureScriptFromProfile(args: {
   basics?: Record<string, any>;
   review?: Record<string, any>;
@@ -441,84 +601,65 @@ function buildVoiceCaptureScriptFromProfile(args: {
 
   const stageName = String(publicProfile.public_display_name || publicProfile.stage_name || basics.stage_name || basics.public_display_name || "this host").trim();
   const zodiac = String(publicProfile.zodiac_sign || review.zodiac_sign || "").trim();
-  const physical = firstSentence(publicProfile.physical_description || review.physical_description_draft || completion.physical_description, 24);
-  const personality = firstSentence(publicProfile.personality || review.personality_draft, 24);
-  const family = firstSentence(publicProfile.family_heritage || review.family_heritage_draft, 24);
+  const physical = convertNarrativeToFirstPerson(publicProfile.physical_description || review.physical_description_draft || completion.physical_description, stageName, 28);
+  const personality = convertNarrativeToFirstPerson(publicProfile.personality || review.personality_draft, stageName, 26);
+  const family = convertNarrativeToFirstPerson(publicProfile.family_heritage || review.family_heritage_draft, stageName, 28);
   const educationEntries = Array.isArray(publicProfile.education_entries) && publicProfile.education_entries.length
     ? publicProfile.education_entries
     : Array.isArray(completion.education_entries) && completion.education_entries.length
       ? completion.education_entries
       : [];
-  const educationLine = readableList(
-    educationEntries
-      .map((entry: any) => {
-        const degree = String(entry?.degree || "").trim();
-        const field = String(entry?.field_of_study || "").trim();
-        const institution = String(entry?.institution || "").trim();
-        return [degree, field, institution].filter(Boolean).join(" in ").replace(" in " + institution, institution ? ` from ${institution}` : "");
-      })
-      .filter(Boolean)
-      .slice(0, 2),
-  );
+  const educationLine = readableList(educationEntries.map((entry: any) => formatEducationEntryForVoice(entry)).filter(Boolean).slice(0, 2));
   const career = (publicProfile.career && typeof publicProfile.career === "object") ? publicProfile.career : {};
   const currentJobTitle = String(career.current_job_title || completion.current_job_title || "").trim();
   const currentCompany = String(career.current_company || completion.current_company || "").trim();
-  const careerSummary = firstSentence(career.career_summary || completion.career_summary, 22);
-  const interests = readableList(
-    [completion.likes, completion.hobbies, publicProfile.likes, publicProfile.hobbies]
-      .flatMap((raw: any) => String(raw || "").split(/[\n,•]+/))
-      .map((part) => String(part || "").trim())
-      .filter(Boolean)
-      .slice(0, 4),
-  );
-  const lifestyle = firstSentence(publicProfile.lifestyle || completion.lifestyle, 20);
-  const background = firstSentence(publicProfile.background_story || completion.background_story, 22);
-  const coreValues = firstSentence(publicProfile.core_values || completion.core_values, 18);
-  const motto = String(publicProfile.personal_motto || completion.personal_motto || "").trim();
+  const careerSummary = convertNarrativeToFirstPerson(career.career_summary || completion.career_summary, stageName, 24);
+  const interests = readableList(splitVoiceList([completion.likes, completion.hobbies, publicProfile.likes, publicProfile.hobbies], 4));
+  const lifestyle = convertNarrativeToFirstPerson(publicProfile.lifestyle || completion.lifestyle, stageName, 24);
+  const background = convertNarrativeToFirstPerson(publicProfile.background_story || completion.background_story, stageName, 26);
+  const coreValueList = splitVoiceList([publicProfile.core_values, completion.core_values], 6);
+  const motto = String(publicProfile.personal_motto || completion.personal_motto || "").replace(/\s+/g, " ").trim();
   const birthCountry = String(privateProfile.birth_country || basics.birth_country || "").trim();
   const nationalities = Array.isArray(privateProfile.nationalities) ? privateProfile.nationalities.map((v: any) => String(v || "").trim()).filter(Boolean).slice(0, 2) : [];
 
-  const sentences: string[] = [
+  const primarySentences: string[] = [
     `Hello, my name is ${stageName}. Thank you for listening to my voice sample for the Connect Platform.`,
   ];
   if (personality) {
-    sentences.push(personality);
+    primarySentences.push(personality);
   } else if (zodiac) {
-    sentences.push(`My approved profile reflects the thoughtful and intentional energy often associated with ${zodiac}.`);
+    primarySentences.push(`I bring the thoughtful and intentional energy often associated with ${zodiac}.`);
   }
-  if (physical) sentences.push(physical);
-  if (educationLine) sentences.push(`My educational background includes ${educationLine}.`);
+  if (physical) primarySentences.push(physical);
+  if (educationLine) primarySentences.push(`My educational background includes ${educationLine}.`);
   if (currentJobTitle && currentCompany) {
-    sentences.push(`Professionally, I work as ${currentJobTitle} at ${currentCompany}.`);
+    primarySentences.push(`Professionally, I work as ${currentJobTitle} at ${currentCompany}.`);
   } else if (currentJobTitle) {
-    sentences.push(`Professionally, I work as ${currentJobTitle}.`);
+    primarySentences.push(`Professionally, I work as ${currentJobTitle}.`);
   } else if (careerSummary) {
-    sentences.push(careerSummary);
+    primarySentences.push(careerSummary);
   }
   if (family) {
-    sentences.push(family);
+    primarySentences.push(family);
   } else if (background) {
-    sentences.push(background);
+    primarySentences.push(background);
   }
   if (birthCountry && nationalities.length) {
-    sentences.push(`My background is rooted in ${birthCountry}, and my approved nationality profile includes ${readableList(nationalities)}.`);
+    primarySentences.push(`My background is rooted in ${birthCountry}, and my approved nationality profile includes ${readableList(nationalities)}.`);
   }
-  if (interests) sentences.push(`In my personal time, I enjoy ${interests}.`);
-  if (lifestyle) sentences.push(lifestyle);
-  if (coreValues) sentences.push(`My values are centered on ${coreValues.replace(/[.!?]+$/, "")}.`);
-  if (motto) sentences.push(`A phrase that represents me well is: ${motto.replace(/[.!?]+$/, "")}.`);
-  sentences.push("As you listen, you should hear a voice that feels natural, confident, and consistent with the approved profile information that represents me on the platform.");
-  sentences.push("Please read this script at a calm, conversational pace so the final recording captures clear pronunciation, warmth, and personality.");
+  if (interests) primarySentences.push(`In my personal time, I enjoy ${interests}.`);
+  if (lifestyle) primarySentences.push(lifestyle);
+  if (coreValueList.length) primarySentences.push(`My values are centered on ${readableList(coreValueList)}.`);
+  if (motto) primarySentences.push(`A phrase that represents me well is: ${motto.replace(/[.!?]+$/, "")}.`);
+  primarySentences.push("I want this sample to sound natural, confident, and consistent with the approved profile information that represents me on the platform.");
+  primarySentences.push("Thank you for listening, and I hope this gives you a clear sense of my voice, presence, and personality.");
 
-  let script = sentences.map((s) => s.replace(/\s+/g, " ").trim()).filter(Boolean).join(" ");
-  if (countWords(script) < 120) {
-    script += " I want this recording to sound polished, expressive, and welcoming, while still feeling authentic to the way I would naturally introduce myself, describe my background, and speak to someone for the first time.";
-  }
-  let words = script.trim().split(/\s+/).filter(Boolean);
-  if (words.length > 185) {
-    script = `${words.slice(0, 185).join(" ").replace(/[,:;]+$/, "")}.`;
-  }
-  return script;
+  const fillerSentences = [
+    "I am reading this at a calm, conversational pace so you can hear my pronunciation, warmth, and natural rhythm clearly.",
+    "I want this recording to feel polished and expressive while still sounding authentic to the way I would naturally introduce myself and speak in a real conversation.",
+  ];
+
+  return composeVoiceScript(primarySentences, fillerSentences, 130, 175);
 }
 
 function isAllowedWixOrigin(origin: string): boolean {
