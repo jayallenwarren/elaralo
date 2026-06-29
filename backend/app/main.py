@@ -19379,6 +19379,95 @@ def _host_onboarding_connect_voice_filename(avatar_key: Any, ext: str) -> str:
     return f"{base}-Voice-Capture-Audio{ext_norm}"
 
 
+def _elevenlabs_voice_create_endpoint() -> str:
+    return (os.getenv("ELEVENLABS_VOICE_CREATE_URL", "https://api.elevenlabs.io/v1/voices/add") or "https://api.elevenlabs.io/v1/voices/add").strip()
+
+
+def _host_onboarding_should_require_eleven_voice() -> bool:
+    return str(os.getenv("ELEVENLABS_REQUIRE_VOICE_ON_PUBLISH", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _host_onboarding_should_attempt_eleven_voice() -> bool:
+    api_key = (os.getenv("ELEVENLABS_API_KEY", "") or "").strip()
+    enabled = str(os.getenv("ELEVENLABS_AUTO_CREATE_ON_PUBLISH", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+    return bool(api_key) and enabled
+
+
+def _host_onboarding_eleven_voice_display_name(session: Dict[str, Any], profile: Dict[str, Any], avatar_key: str) -> str:
+    public_profile = dict((profile or {}).get("public_profile") or {})
+    basics = dict((session or {}).get("basics") or {})
+    public_name = _host_onboarding_safe_str(public_profile.get("public_display_name") or public_profile.get("stage_name") or basics.get("stage_name") or basics.get("public_display_name"))
+    if public_name:
+        return public_name
+    return _host_onboarding_safe_str(avatar_key).replace("-", " ") or "Elaralo Human Companion"
+
+
+def _host_onboarding_build_eleven_voice_labels(session: Dict[str, Any], profile: Dict[str, Any], avatar_key: str, version_id: str) -> Dict[str, str]:
+    basics = dict((session or {}).get("basics") or {})
+    public_profile = dict((profile or {}).get("public_profile") or {})
+    labels = {
+        "brand": "Elaralo",
+        "avatar": _host_onboarding_safe_str(avatar_key),
+        "member_id": _host_onboarding_safe_str((session or {}).get("member_id")),
+        "approved_version_id": _host_onboarding_safe_str(version_id),
+        "public_display_name": _host_onboarding_safe_str(public_profile.get("public_display_name") or public_profile.get("stage_name")),
+        "gender": _host_onboarding_safe_str(public_profile.get("gender") or basics.get("gender_display")),
+        "ethnicity": _host_onboarding_safe_str(public_profile.get("ethnicity") or basics.get("ethnicity_detail") or basics.get("ethnicity_bucket")),
+        "generation": _host_onboarding_safe_str(public_profile.get("generation") or _host_onboarding_generation_label(basics.get("birthdate"))),
+        "source": "host_onboarding_publish_export",
+    }
+    return {k: v for k, v in labels.items() if _host_onboarding_safe_str(v)}
+
+
+def _host_onboarding_create_eleven_voice_from_asset(asset: Dict[str, Any], voice_name: str, labels: Dict[str, str]) -> Dict[str, Any]:
+    if not _host_onboarding_should_attempt_eleven_voice():
+        return {
+            "status": "skipped",
+            "reason": "ELEVENLABS_API_KEY not configured or voice auto-create disabled",
+            "voice_id": "",
+            "voice_name": _host_onboarding_safe_str(voice_name),
+        }
+
+    source_url = _host_onboarding_safe_str((asset or {}).get("url"))
+    if not source_url:
+        raise ValueError("Voice asset URL is missing")
+
+    file_name = _host_onboarding_safe_str((asset or {}).get("file_name")) or "voice_capture.wav"
+    content_type = _host_onboarding_safe_str((asset or {}).get("content_type")) or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+    data = _host_onboarding_download_bytes_sync(source_url)
+    if not data:
+        raise ValueError("Voice asset bytes could not be downloaded")
+
+    import requests  # type: ignore
+
+    endpoint = _elevenlabs_voice_create_endpoint()
+    headers = {"xi-api-key": (os.getenv("ELEVENLABS_API_KEY", "") or "").strip()}
+    payload = {
+        "name": _host_onboarding_safe_str(voice_name) or "Elaralo Human Companion Voice",
+        "description": f"Host onboarding approved voice for {_host_onboarding_safe_str(voice_name) or 'Elaralo Human Companion'}",
+        "labels": json.dumps(labels or {}, ensure_ascii=False),
+    }
+    files = [("files", (file_name, data, content_type))]
+    response = requests.post(endpoint, headers=headers, data=payload, files=files, timeout=120)
+    if response.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs voice-create error {response.status_code}: {(response.text or '')[:500]}")
+    try:
+        body = response.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    voice_id = _host_onboarding_safe_str(body.get("voice_id") or body.get("voiceId") or ((body.get("voice") or {}).get("voice_id") if isinstance(body.get("voice"), dict) else ""))
+    if not voice_id:
+        raise RuntimeError("ElevenLabs voice-create did not return voice_id")
+    return {
+        "status": "created",
+        "voice_id": voice_id,
+        "voice_name": _host_onboarding_safe_str(payload.get("name")),
+        "response": body,
+    }
+
+
 def _host_onboarding_download_bytes_sync(url: str) -> bytes:
     target = _host_onboarding_safe_str(url)
     if not target:
@@ -19439,6 +19528,10 @@ def _host_onboarding_ensure_companion_export_columns_best_effort() -> None:
                 ("voice_capture_url", "TEXT"),
                 ("public_gallery_json", "TEXT"),
                 ("approved_version_id", "TEXT"),
+                ("eleven_voice_id", "TEXT"),
+                ("eleven_voice_name", "TEXT"),
+                ("voice_clone_status", "TEXT"),
+                ("voice_clone_error", "TEXT"),
             ]:
                 if col_name not in cols:
                     try:
@@ -19460,6 +19553,10 @@ def _host_onboarding_upsert_connect_companion_mapping(
     voice_capture_url: str,
     public_gallery_assets: List[Dict[str, Any]],
     approved_version_id: str,
+    eleven_voice_id: str = "",
+    eleven_voice_name: str = "",
+    voice_clone_status: str = "",
+    voice_clone_error: str = "",
 ) -> None:
     _host_onboarding_ensure_companion_export_columns_best_effort()
     db_path = _get_companion_mappings_db_path(for_write=True)
@@ -19481,7 +19578,11 @@ def _host_onboarding_upsert_connect_companion_mapping(
                    headshot_url = ?,
                    voice_capture_url = ?,
                    public_gallery_json = ?,
-                   approved_version_id = ?
+                   approved_version_id = ?,
+                   eleven_voice_id = COALESCE(NULLIF(?, ''), eleven_voice_id),
+                   eleven_voice_name = COALESCE(NULLIF(?, ''), eleven_voice_name),
+                   voice_clone_status = ?,
+                   voice_clone_error = ?
              WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)
             """,
             (
@@ -19491,6 +19592,10 @@ def _host_onboarding_upsert_connect_companion_mapping(
                 voice_capture_url,
                 _host_onboarding_json_dumps(public_gallery_assets),
                 approved_version_id,
+                eleven_voice_id,
+                eleven_voice_name,
+                _host_onboarding_safe_str(voice_clone_status),
+                _host_onboarding_safe_str(voice_clone_error),
                 "Elaralo",
                 avatar_key,
             ),
@@ -19625,6 +19730,24 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         blob_name = _host_onboarding_export_blob_name("companion", "voice", file_name)
         exported_voice = _host_onboarding_export_asset_from_url(voice_asset, blob_name)
 
+    eleven_voice = {"status": "skipped", "voice_id": "", "voice_name": "", "error": ""}
+    if isinstance(exported_voice, dict) and _host_onboarding_safe_str(exported_voice.get("url")):
+        try:
+            eleven_voice = _host_onboarding_create_eleven_voice_from_asset(
+                exported_voice,
+                _host_onboarding_eleven_voice_display_name(session, profile, avatar_key),
+                _host_onboarding_build_eleven_voice_labels(session, profile, avatar_key, version_id),
+            )
+        except Exception as exc:
+            if _host_onboarding_should_require_eleven_voice():
+                raise
+            eleven_voice = {
+                "status": "error",
+                "voice_id": "",
+                "voice_name": _host_onboarding_eleven_voice_display_name(session, profile, avatar_key),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
     _host_onboarding_upsert_connect_companion_mapping(
         member_id=_host_onboarding_safe_str(session.get("member_id")),
         avatar_key=avatar_key,
@@ -19632,6 +19755,10 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         voice_capture_url=_host_onboarding_safe_str((exported_voice or {}).get("url")),
         public_gallery_assets=exported_gallery,
         approved_version_id=version_id,
+        eleven_voice_id=_host_onboarding_safe_str((eleven_voice or {}).get("voice_id")),
+        eleven_voice_name=_host_onboarding_safe_str((eleven_voice or {}).get("voice_name")),
+        voice_clone_status=_host_onboarding_safe_str((eleven_voice or {}).get("status")),
+        voice_clone_error=_host_onboarding_safe_str((eleven_voice or {}).get("error")),
     )
     _host_onboarding_upsert_hco_row(
         member_id=_host_onboarding_safe_str(session.get("member_id")),
@@ -19650,6 +19777,9 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         "headshot_asset": exported_headshot,
         "voice_capture_asset": exported_voice,
         "public_gallery_assets": exported_gallery,
+        "eleven_voice_id": _host_onboarding_safe_str((eleven_voice or {}).get("voice_id")),
+        "eleven_voice_name": _host_onboarding_safe_str((eleven_voice or {}).get("voice_name")),
+        "voice_clone_status": _host_onboarding_safe_str((eleven_voice or {}).get("status")),
     }
     ai_profile["connect_platform"] = connect_export
     return {
@@ -20711,6 +20841,154 @@ def _host_onboarding_public_payload_from_profile(profile: Dict[str, Any]) -> Dic
     public_profile["headshot_asset"] = headshot_asset
     public_profile["gallery_assets"] = gallery_assets
     return {"public_profile": public_profile, "public_page": public_page_payload}
+
+
+
+def _my_elaralo_catalog_filter_match(value: Any, expected: Any) -> bool:
+    want = _host_onboarding_safe_str(expected).strip().lower()
+    if not want:
+        return True
+    have = _host_onboarding_safe_str(value).strip().lower()
+    return have == want
+
+
+def _my_elaralo_companion_cards_sync(brand: str, companion_type: str = "", generation: str = "", ethnicity: str = "", gender: str = "") -> List[Dict[str, Any]]:
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    rows: List[sqlite3.Row] = []
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        _host_onboarding_ensure_companion_export_columns_best_effort()
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT * FROM companion_mappings
+             WHERE lower(brand)=lower(?)
+             ORDER BY lower(COALESCE(avatar, '')) ASC
+            """,
+            (brand_name,),
+        ).fetchall()
+        version_rows: Dict[str, sqlite3.Row] = {}
+        version_ids = [str(r["approved_version_id"] or "").strip() for r in rows if str(r["approved_version_id"] or "").strip()]
+        if version_ids:
+            placeholders = ",".join(["?"] * len(version_ids))
+            for vr in cur.execute(
+                f"SELECT * FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE version_id IN ({placeholders})",
+                tuple(version_ids),
+            ).fetchall():
+                version_rows[str(vr["version_id"] or "").strip()] = vr
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    out: List[Dict[str, Any]] = []
+    want_type = _host_onboarding_safe_str(companion_type).lower()
+    for row in rows:
+        avatar_key = _host_onboarding_safe_str(row["avatar"])
+        if not avatar_key:
+            continue
+        mapping_type = _host_onboarding_safe_str(row["companion_type"] or ("Human" if _host_onboarding_safe_str(row["approved_version_id"]) else "AI"))
+        normalized_type = mapping_type.lower() if mapping_type else ("human" if _host_onboarding_safe_str(row["approved_version_id"]) else "ai")
+        if want_type and normalized_type != want_type:
+            continue
+
+        if normalized_type == "human" and _host_onboarding_safe_str(row["approved_version_id"]):
+            version_row = version_rows.get(_host_onboarding_safe_str(row["approved_version_id"]))
+            if version_row is None:
+                continue
+            try:
+                profile = _host_onboarding_json_loads(version_row["profile_json"], {})
+            except Exception:
+                profile = {}
+            if not isinstance(profile, dict):
+                profile = {}
+            payload = _host_onboarding_public_payload_from_profile(profile)
+            public_profile = dict(payload.get("public_profile") or {})
+            public_page = dict(payload.get("public_page") or {})
+            quick_ref = dict(public_profile.get("quick_reference_summary") or {})
+            display_name = _host_onboarding_safe_str(public_profile.get("public_display_name") or public_profile.get("stage_name") or quick_ref.get("public_name") or avatar_key)
+            card = {
+                "brand": brand_name,
+                "avatar": avatar_key,
+                "companion_type": "Human",
+                "display_name": display_name,
+                "headline": _host_onboarding_safe_str(public_page.get("headline") or display_name),
+                "gender": _host_onboarding_safe_str(public_profile.get("gender") or quick_ref.get("gender")),
+                "ethnicity": _host_onboarding_safe_str(public_profile.get("ethnicity") or quick_ref.get("ethnicity")),
+                "generation": _host_onboarding_safe_str(public_profile.get("generation") or quick_ref.get("generation")),
+                "headshot_url": _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or row["headshot_url"]),
+                "approved_version_id": _host_onboarding_safe_str(row["approved_version_id"]),
+                "elevenVoiceId": _host_onboarding_safe_str(row["eleven_voice_id"]),
+                "channel_cap": _host_onboarding_safe_str(row["channel_cap"]),
+                "live": _host_onboarding_safe_str(row["live"]),
+                "summary_public_url": f"/summary-public?versionId={_host_onboarding_safe_str(row['approved_version_id'])}",
+            }
+        else:
+            payload = _ai_companion_public_payload(brand_name, avatar_key)
+            public_profile = dict(payload.get("public_profile") or {})
+            public_page = dict(payload.get("public_page") or {})
+            card = {
+                "brand": brand_name,
+                "avatar": avatar_key,
+                "companion_type": _host_onboarding_safe_str(public_profile.get("companion_type") or mapping_type or "AI"),
+                "display_name": _host_onboarding_safe_str(public_profile.get("public_display_name") or avatar_key),
+                "headline": _host_onboarding_safe_str(public_page.get("headline") or public_profile.get("public_display_name") or avatar_key),
+                "gender": _host_onboarding_safe_str(public_profile.get("gender")),
+                "ethnicity": _host_onboarding_safe_str(public_profile.get("ethnicity")),
+                "generation": _host_onboarding_safe_str(public_profile.get("generation")),
+                "headshot_url": _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or row["headshot_url"]),
+                "approved_version_id": "",
+                "elevenVoiceId": _host_onboarding_safe_str(row["eleven_voice_id"]),
+                "channel_cap": _host_onboarding_safe_str(row["channel_cap"]),
+                "live": _host_onboarding_safe_str(row["live"]),
+                "summary_public_url": f"/summary-public?brand={quote(brand_name)}&avatar={quote(avatar_key)}",
+            }
+
+        if not _my_elaralo_catalog_filter_match(card.get("generation"), generation):
+            continue
+        if not _my_elaralo_catalog_filter_match(card.get("ethnicity"), ethnicity):
+            continue
+        if not _my_elaralo_catalog_filter_match(card.get("gender"), gender):
+            continue
+        out.append(card)
+
+    out.sort(key=lambda item: (_host_onboarding_safe_str(item.get("display_name")).lower(), _host_onboarding_safe_str(item.get("avatar")).lower()))
+    return out
+
+
+@app.get("/my-elaralo/companions/catalog")
+@app.get("/catalog/my-elaralo")
+async def my_elaralo_companions_catalog(
+    memberId: Optional[str] = None,
+    member_id: Optional[str] = None,
+    brand: Optional[str] = None,
+    companionType: Optional[str] = None,
+    companion_type: Optional[str] = None,
+    generation: Optional[str] = None,
+    ethnicity: Optional[str] = None,
+    gender: Optional[str] = None,
+):
+    resolved_member_id = _host_onboarding_normalize_member_id(memberId or member_id)
+    if not resolved_member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    items = _my_elaralo_companion_cards_sync(
+        brand=brand_name,
+        companion_type=_host_onboarding_safe_str(companionType or companion_type),
+        generation=_host_onboarding_safe_str(generation),
+        ethnicity=_host_onboarding_safe_str(ethnicity),
+        gender=_host_onboarding_safe_str(gender),
+    )
+    return {
+        "ok": True,
+        "brand": brand_name,
+        "member_id": resolved_member_id,
+        "count": len(items),
+        "items": items,
+    }
 
 
 @app.get("/host-onboarding/public/summary")
