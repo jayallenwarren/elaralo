@@ -7,6 +7,7 @@ type HostOnboardingAsset = {
   asset_id?: string;
   session_id?: string;
   slot_key: string;
+  slot_label?: string;
   required?: boolean;
   url?: string;
   file_name?: string;
@@ -59,6 +60,15 @@ type HostOnboardingContext = {
   hostDisplayName: string;
   email?: string;
   source?: string;
+};
+
+type EducationEntry = {
+  id: string;
+  degree: string;
+  field_of_study: string;
+  institution: string;
+  graduation_year: string;
+  notes: string;
 };
 
 const API_BASE = String(process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
@@ -128,6 +138,99 @@ function normalizePhysicalDescriptionValue(raw: any): string {
   return text;
 }
 
+function createEducationEntry(seed?: Partial<EducationEntry>): EducationEntry {
+  const fallbackId = `edu_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  return {
+    id: String(seed?.id || fallbackId),
+    degree: String(seed?.degree || ""),
+    field_of_study: String(seed?.field_of_study || ""),
+    institution: String(seed?.institution || ""),
+    graduation_year: String(seed?.graduation_year || ""),
+    notes: String(seed?.notes || ""),
+  };
+}
+
+function educationEntryHasMeaningfulValue(entry: Partial<EducationEntry> | null | undefined): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  return [entry.degree, entry.field_of_study, entry.institution, entry.graduation_year, entry.notes].some((value) => String(value || "").trim().length > 0);
+}
+
+function normalizeEducationEntry(raw: any): EducationEntry | null {
+  if (typeof raw === "string") {
+    const text = String(raw || "").trim();
+    if (!text) return null;
+    return createEducationEntry({ notes: text });
+  }
+  if (!raw || typeof raw !== "object") return null;
+  const entry = createEducationEntry({
+    id: String((raw as any).id || ""),
+    degree: String((raw as any).degree || ""),
+    field_of_study: String((raw as any).field_of_study || (raw as any).field || (raw as any).major || ""),
+    institution: String((raw as any).institution || (raw as any).school || (raw as any).university || ""),
+    graduation_year: String((raw as any).graduation_year || (raw as any).year || ""),
+    notes: String((raw as any).notes || (raw as any).summary || (raw as any).education || (raw as any).text || ""),
+  });
+  return educationEntryHasMeaningfulValue(entry) ? entry : null;
+}
+
+function normalizeEducationEntries(raw: any, legacyText?: string): EducationEntry[] {
+  const out: EducationEntry[] = [];
+  const push = (item: any) => {
+    const entry = normalizeEducationEntry(item);
+    if (entry) out.push(entry);
+  };
+  if (Array.isArray(raw)) {
+    raw.forEach(push);
+  } else if (raw && typeof raw === "object") {
+    push(raw);
+  } else if (typeof raw === "string" && raw.trim()) {
+    const parts = raw
+      .split(/
++/)
+      .map((line) => line.replace(/^[-*•]\s*/, "").trim())
+      .filter(Boolean);
+    if (parts.length > 1) {
+      parts.forEach((part) => push(part));
+    } else {
+      push(raw);
+    }
+  } else if (typeof legacyText === "string" && legacyText.trim()) {
+    const parts = legacyText
+      .split(/
++/)
+      .map((line) => line.replace(/^[-*•]\s*/, "").trim())
+      .filter(Boolean);
+    if (parts.length > 1) {
+      parts.forEach((part) => push(part));
+    } else {
+      push(legacyText);
+    }
+  }
+  return out;
+}
+
+function formatEducationEntrySummary(entry: Partial<EducationEntry> | null | undefined): string {
+  if (!entry || typeof entry !== "object") return "";
+  const degree = String(entry.degree || "").trim();
+  const field = String(entry.field_of_study || "").trim();
+  const institution = String(entry.institution || "").trim();
+  const graduationYear = String(entry.graduation_year || "").trim();
+  const notes = String(entry.notes || "").trim();
+  const lead = degree && field ? `${degree} in ${field}` : degree || field;
+  const parts = [lead, institution, graduationYear ? `Class of ${graduationYear}` : ""].filter(Boolean);
+  const base = parts.join(" — ");
+  return notes ? (base ? `${base}. ${notes}` : notes) : base;
+}
+
+function formatEducationEntriesLegacyText(entries: EducationEntry[]): string {
+  return (entries || [])
+    .map((entry) => formatEducationEntrySummary(entry))
+    .filter(Boolean)
+    .join("
+")
+    .trim();
+}
+
 function prettifySectionLabel(label: string): string {
   const map: Record<string, string> = {
     education: "Education",
@@ -190,6 +293,54 @@ function commaList(raw: string): string[] {
 function slotLabel(slotKey: string): string {
   const found = [...REQUIRED_SLOTS, ...OPTIONAL_SLOTS].find((slot) => slot.key === slotKey);
   return found ? found.label : slotKey.replace(/_/g, " ");
+}
+
+const PUBLIC_GALLERY_SLOTS = [...REQUIRED_SLOTS, ...OPTIONAL_SLOTS].filter((slot) => slot.key !== "headshot_front");
+const PUBLIC_GALLERY_SLOT_ORDER = Object.fromEntries(PUBLIC_GALLERY_SLOTS.map((slot, idx) => [slot.key, idx]));
+
+function normalizeAssetLike(raw: any): HostOnboardingAsset | null {
+  if (!raw || typeof raw !== "object") return null;
+  const slotKey = String((raw as any).slot_key || "").trim();
+  const url = String((raw as any).url || "").trim();
+  if (!slotKey || !url) return null;
+  return {
+    asset_id: String((raw as any).asset_id || "").trim(),
+    session_id: String((raw as any).session_id || "").trim(),
+    slot_key: slotKey,
+    slot_label: String((raw as any).slot_label || "").trim(),
+    required: Boolean((raw as any).required),
+    url,
+    file_name: String((raw as any).file_name || "").trim(),
+    content_type: String((raw as any).content_type || "").trim(),
+    size_bytes: Number((raw as any).size_bytes || 0),
+    width_px: Number((raw as any).width_px || 0),
+    height_px: Number((raw as any).height_px || 0),
+    validation_status: String((raw as any).validation_status || "").trim(),
+    validation_errors: Array.isArray((raw as any).validation_errors)
+      ? (raw as any).validation_errors.map((item: any) => String(item || "").trim()).filter(Boolean)
+      : [],
+  };
+}
+
+function orderPublicGalleryAssets(list: HostOnboardingAsset[]): HostOnboardingAsset[] {
+  return [...list].sort((a, b) => {
+    const ao = Number((PUBLIC_GALLERY_SLOT_ORDER as any)[String(a?.slot_key || "")] ?? 999);
+    const bo = Number((PUBLIC_GALLERY_SLOT_ORDER as any)[String(b?.slot_key || "")] ?? 999);
+    if (ao !== bo) return ao - bo;
+    return String(a?.file_name || a?.slot_key || "").localeCompare(String(b?.file_name || b?.slot_key || ""));
+  });
+}
+
+function dedupeAssetsBySlot(list: HostOnboardingAsset[]): HostOnboardingAsset[] {
+  const seen = new Set<string>();
+  const out: HostOnboardingAsset[] = [];
+  for (const asset of list || []) {
+    const slotKey = String(asset?.slot_key || "").trim();
+    if (!slotKey || seen.has(slotKey)) continue;
+    seen.add(slotKey);
+    out.push(asset);
+  }
+  return out;
 }
 
 function isAllowedWixOrigin(origin: string): boolean {
@@ -324,7 +475,7 @@ export default function HostProfileStudioClient() {
     quick_reference_ethnicity: "",
   });
   const [completionForm, setCompletionForm] = useState<Record<string, any>>({
-    education: "",
+    education_entries: [createEducationEntry()],
     current_job_title: "",
     current_company: "",
     career_summary: "",
@@ -413,9 +564,10 @@ export default function HostProfileStudioClient() {
     }));
     const hydratedCompletionPhysicalDescription = normalizePhysicalDescriptionValue(completion.physical_description || "");
     const hydratedReviewPhysicalDescription = normalizePhysicalDescriptionValue(review.physical_description_draft || derived.physical_description_draft || "");
+    const hydratedEducationEntries = normalizeEducationEntries(completion.education_entries, completion.education);
     setCompletionForm((prev) => ({
       ...prev,
-      education: String(completion.education || ""),
+      education_entries: hydratedEducationEntries.length ? hydratedEducationEntries : [createEducationEntry()],
       current_job_title: String(completion.current_job_title || ""),
       current_company: String(completion.current_company || ""),
       career_summary: String(completion.career_summary || ""),
@@ -646,10 +798,18 @@ export default function HostProfileStudioClient() {
     setError("");
     setNotice("");
     try {
+      const educationEntries = (Array.isArray(completionForm.education_entries) ? completionForm.education_entries : [])
+        .map((entry: any) => normalizeEducationEntry(entry))
+        .filter((entry: EducationEntry | null): entry is EducationEntry => Boolean(entry));
+      const completionPayload = {
+        ...completionForm,
+        education_entries: educationEntries.map(({ id, ...rest }) => rest),
+        education: formatEducationEntriesLegacyText(educationEntries),
+      };
       const res = await fetch(`${API_BASE}/host-onboarding/session/${session.session_id}/completion`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ memberId: context.memberId, completion: completionForm }),
+        body: JSON.stringify({ memberId: context.memberId, completion: completionPayload }),
       });
       const data = await res.json().catch(() => ({} as any));
       if (!res.ok || !data?.session) throw new Error(String(data?.detail || `HTTP ${res.status}`));
@@ -686,6 +846,14 @@ export default function HostProfileStudioClient() {
     }
   }, [context.memberId, hydrateFromSession, session?.session_id]);
 
+  const handleReplacePublicGalleryAsset = useCallback(async (slotKey: string, file: File | null) => {
+    if (!file) return;
+    await handleUploadForSlot(slotKey, file);
+    if (session?.session_id) {
+      await loadPreview();
+    }
+  }, [handleUploadForSlot, loadPreview, session?.session_id]);
+
   const approveProfile = useCallback(async (scope: "limited" | "full") => {
     if (!session?.session_id) return;
     setSaving(true);
@@ -715,6 +883,51 @@ export default function HostProfileStudioClient() {
       void loadPreview();
     }
   }, [loadPreview, session?.session_id, step]);
+
+  const updateEducationEntry = useCallback((entryId: string, field: keyof Omit<EducationEntry, "id">, value: string) => {
+    setCompletionForm((prev) => ({
+      ...prev,
+      education_entries: (Array.isArray(prev.education_entries) ? prev.education_entries : [createEducationEntry()]).map((entry: EducationEntry) =>
+        String(entry.id) === String(entryId) ? { ...entry, [field]: value } : entry,
+      ),
+    }));
+  }, []);
+
+  const addEducationEntry = useCallback(() => {
+    setCompletionForm((prev) => ({
+      ...prev,
+      education_entries: [...(Array.isArray(prev.education_entries) ? prev.education_entries : []), createEducationEntry()],
+    }));
+  }, []);
+
+  const removeEducationEntry = useCallback((entryId: string) => {
+    setCompletionForm((prev) => {
+      const current = Array.isArray(prev.education_entries) ? prev.education_entries : [];
+      const filtered = current.filter((entry: EducationEntry) => String(entry.id) !== String(entryId));
+      return {
+        ...prev,
+        education_entries: filtered.length ? filtered : [createEducationEntry()],
+      };
+    });
+  }, []);
+
+  const moveEducationEntry = useCallback((entryId: string, direction: -1 | 1) => {
+    setCompletionForm((prev) => {
+      const current = Array.isArray(prev.education_entries) ? [...prev.education_entries] : [];
+      const index = current.findIndex((entry: EducationEntry) => String(entry.id) === String(entryId));
+      if (index < 0) return prev;
+      const nextIndex = index + direction;
+      if (nextIndex < 0 || nextIndex >= current.length) return prev;
+      const next = [...current];
+      const temp = next[index];
+      next[index] = next[nextIndex];
+      next[nextIndex] = temp;
+      return {
+        ...prev,
+        education_entries: next,
+      };
+    });
+  }, []);
 
   const updateCompletionSkip = useCallback((key: string, checked: boolean) => {
     setCompletionForm((prev) => ({
@@ -812,6 +1025,47 @@ export default function HostProfileStudioClient() {
 
   const privateProfile = previewData?.private_profile || {};
   const publicProfile = previewData?.public_profile || {};
+  const publicPage = previewData?.public_page || {};
+  const completionEducationEntries: EducationEntry[] = Array.isArray(completionForm.education_entries) && completionForm.education_entries.length
+    ? completionForm.education_entries
+    : [createEducationEntry()];
+  const publicSummaryHref = useMemo(() => {
+    const member = String(session?.member_id || context.memberId || "").trim();
+    return member ? `/summary-public?memberId=${encodeURIComponent(member)}` : "";
+  }, [context.memberId, session?.member_id]);
+  const publicGalleryCount = Array.isArray(publicPage?.gallery_assets)
+    ? publicPage.gallery_assets.length
+    : Array.isArray(publicProfile?.gallery_assets)
+      ? publicProfile.gallery_assets.length
+      : 0;
+  const sessionAssetMap = useMemo(() => {
+    const out: Record<string, HostOnboardingAsset> = {};
+    for (const asset of Array.isArray(session?.assets) ? session.assets : []) {
+      const normalized = normalizeAssetLike(asset);
+      if (!normalized) continue;
+      out[String(normalized.slot_key)] = normalized;
+    }
+    return out;
+  }, [session?.assets]);
+  const previewGalleryAssets = useMemo(() => {
+    const raw = Array.isArray(publicPage?.gallery_assets)
+      ? publicPage.gallery_assets
+      : Array.isArray(publicProfile?.gallery_assets)
+        ? publicProfile.gallery_assets
+        : [];
+    return orderPublicGalleryAssets(dedupeAssetsBySlot(raw.map(normalizeAssetLike).filter(Boolean) as HostOnboardingAsset[]));
+  }, [publicPage?.gallery_assets, publicProfile?.gallery_assets]);
+  const publicGalleryAssetsForEditor = useMemo(() => {
+    const fromSession = PUBLIC_GALLERY_SLOTS
+      .map((slot) => sessionAssetMap[slot.key])
+      .filter(Boolean) as HostOnboardingAsset[];
+    const fallback = previewGalleryAssets.filter((asset) => !sessionAssetMap[String(asset.slot_key || "")]);
+    return orderPublicGalleryAssets(dedupeAssetsBySlot([...fromSession, ...fallback]));
+  }, [previewGalleryAssets, sessionAssetMap]);
+  const publicGalleryMissingSlots = useMemo(
+    () => PUBLIC_GALLERY_SLOTS.filter((slot) => !sessionAssetMap[slot.key]),
+    [sessionAssetMap],
+  );
 
   const embedded = typeof window !== "undefined" ? (() => {
     try { return window.self !== window.top; } catch { return true; }
@@ -1120,7 +1374,38 @@ export default function HostProfileStudioClient() {
               Complete the remaining profile sections or intentionally skip them for a limited publish. Estimated income is private and will be derived from the current job title if left blank.
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
-              {renderLabeledInput("Education", completionForm.education, (v) => setCompletionForm((p) => ({ ...p, education: v })), "Example: MBA in Brand Management — Northwestern University")}
+              <div style={{ display: "grid", gap: 12, gridColumn: "1 / -1" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 700 }}>Education</div>
+                  <div style={{ fontSize: 13, color: "#6b7280" }}>
+                    Add one entry per degree, certification, or program. Use multiple entries if applicable.
+                  </div>
+                </div>
+                <button type="button" style={secondaryButtonStyle} onClick={addEducationEntry}>Add education</button>
+              </div>
+              <div style={{ display: "grid", gap: 12 }}>
+                {completionEducationEntries.map((entry, idx) => (
+                  <div key={entry.id || idx} style={{ ...cardStyle, padding: 14, display: "grid", gap: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                      <div style={{ fontWeight: 700 }}>Education {idx + 1}</div>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <button type="button" style={secondaryButtonStyle} onClick={() => moveEducationEntry(String(entry.id), -1)} disabled={idx === 0}>↑</button>
+                        <button type="button" style={secondaryButtonStyle} onClick={() => moveEducationEntry(String(entry.id), 1)} disabled={idx === completionEducationEntries.length - 1}>↓</button>
+                        <button type="button" style={secondaryButtonStyle} onClick={() => removeEducationEntry(String(entry.id))}>Remove</button>
+                      </div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
+                      {renderLabeledInput("Degree", entry.degree, (v) => updateEducationEntry(String(entry.id), "degree", v), "Example: Master of Business Administration")}
+                      {renderLabeledInput("Field of study", entry.field_of_study, (v) => updateEducationEntry(String(entry.id), "field_of_study", v), "Example: Luxury Brand Management")}
+                      {renderLabeledInput("Institution", entry.institution, (v) => updateEducationEntry(String(entry.id), "institution", v), "Example: Northwestern University")}
+                      {renderLabeledInput("Graduation year", entry.graduation_year, (v) => updateEducationEntry(String(entry.id), "graduation_year", v), "Example: 2022")}
+                    </div>
+                    {renderTextareaField("Education notes", entry.notes, (v) => updateEducationEntry(String(entry.id), "notes", v), "Optional notes, honors, academic focus, or supporting detail")}
+                  </div>
+                ))}
+              </div>
+            </div>
               {renderLabeledInput("Current job title", completionForm.current_job_title, (v) => setCompletionForm((p) => ({ ...p, current_job_title: v })), "Example: Vice President of Brand Strategy")}
               {renderLabeledInput("Current company", completionForm.current_company, (v) => setCompletionForm((p) => ({ ...p, current_company: v })), "Example: Aurelia International Luxury Group")}
               {renderLabeledInput("Estimated income (private)", completionForm.estimated_income, (v) => setCompletionForm((p) => ({ ...p, estimated_income: v })), "Auto-derived from job title if left blank")}
@@ -1199,11 +1484,101 @@ export default function HostProfileStudioClient() {
                 </div>
               ) : null}
             </div>
-            {session?.approved_version_id ? (
-              <div style={{ color: "#065f46", fontWeight: 700 }}>
-                Active approved version: {session.approved_version_id}
+            <div style={{ ...cardStyle, padding: 16, display: "grid", gap: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 800 }}>Public Page</div>
+                  <div style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
+                    The public page uses the approved public profile and a gallery made from every uploaded picture except the primary headshot. Replace or update any gallery image here, then approve again to publish the refreshed version.
+                  </div>
+                </div>
+                {publicSummaryHref ? (
+                  <a href={publicSummaryHref} target="_blank" rel="noreferrer" style={{ ...secondaryButtonStyle, textDecoration: "none", display: "inline-flex", alignItems: "center" }}>
+                    Open summary public page
+                  </a>
+                ) : null}
               </div>
-            ) : null}
+              <div style={{ display: "grid", gap: 8 }}>
+                <div style={{ fontSize: 13, color: "#374151", lineHeight: 1.6 }}>
+                  Public gallery images currently selected: {publicGalleryAssetsForEditor.length}. The headshot remains the primary public portrait and is not included in this gallery.
+                </div>
+                <div style={{ fontSize: 13, color: "#6b7280", lineHeight: 1.6 }}>
+                  Uploaded changes are saved to the current onboarding session immediately. Re-approve the profile when you are ready for the Summary Public Page to reflect the latest gallery.
+                </div>
+              </div>
+              {publicGalleryAssetsForEditor.length ? (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14 }}>
+                  {publicGalleryAssetsForEditor.map((asset) => {
+                    const slotKey = String(asset.slot_key || "").trim();
+                    return (
+                      <div key={slotKey || String(asset.asset_id || "")} style={{ display: "grid", gap: 10, padding: 12, border: "1px solid rgba(0,0,0,0.1)", borderRadius: 14, background: "#fff" }}>
+                        {asset.url ? (
+                          <img src={asset.url} alt={String(asset.file_name || slotLabel(slotKey))} style={{ width: "100%", aspectRatio: "4 / 5", objectFit: "cover", borderRadius: 14, border: "1px solid rgba(0,0,0,0.08)" }} />
+                        ) : (
+                          <div style={{ width: "100%", aspectRatio: "4 / 5", borderRadius: 14, border: "1px dashed rgba(0,0,0,0.18)", display: "grid", placeItems: "center", color: "#6b7280", background: "rgba(17,24,39,0.02)" }}>
+                            {slotLabel(slotKey)} pending
+                          </div>
+                        )}
+                        <div style={{ display: "grid", gap: 4 }}>
+                          <div style={{ fontWeight: 700 }}>{String(asset.slot_label || slotLabel(slotKey))}</div>
+                          {asset.file_name ? <div style={{ fontSize: 13, color: "#4b5563" }}>{asset.file_name}</div> : null}
+                        </div>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <button type="button" style={secondaryButtonStyle} onClick={() => openSlotPicker(slotKey)} disabled={uploadingSlot === slotKey || saving}>
+                            {uploadingSlot === slotKey ? "Uploading…" : "Replace / update photo"}
+                          </button>
+                          <input
+                            ref={(node) => { uploadInputRefs.current[slotKey] = node; }}
+                            type="file"
+                            accept="image/*"
+                            style={{ display: "none" }}
+                            onChange={(e) => {
+                              const file = e.currentTarget.files && e.currentTarget.files[0] ? e.currentTarget.files[0] : null;
+                              void handleReplacePublicGalleryAsset(slotKey, file);
+                              e.currentTarget.value = "";
+                            }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ fontSize: 13, color: "#6b7280", lineHeight: 1.6 }}>
+                  No public gallery photos are available yet. Upload non-headshot photo slots to build the public gallery section.
+                </div>
+              )}
+              {publicGalleryMissingSlots.length ? (
+                <div style={{ display: "grid", gap: 10 }}>
+                  <div style={{ fontWeight: 700 }}>Add more gallery photos</div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {publicGalleryMissingSlots.map((slot) => (
+                      <React.Fragment key={slot.key}>
+                        <button type="button" style={secondaryButtonStyle} onClick={() => openSlotPicker(slot.key)} disabled={uploadingSlot === slot.key || saving}>
+                          {uploadingSlot === slot.key ? `Uploading ${slot.label}…` : `Add ${slot.label}`}
+                        </button>
+                        <input
+                          ref={(node) => { uploadInputRefs.current[slot.key] = node; }}
+                          type="file"
+                          accept="image/*"
+                          style={{ display: "none" }}
+                          onChange={(e) => {
+                            const file = e.currentTarget.files && e.currentTarget.files[0] ? e.currentTarget.files[0] : null;
+                            void handleReplacePublicGalleryAsset(slot.key, file);
+                            e.currentTarget.value = "";
+                          }}
+                        />
+                      </React.Fragment>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              {session?.approved_version_id ? (
+                <div style={{ color: "#065f46", fontWeight: 700 }}>
+                  Active approved version: {session.approved_version_id}
+                </div>
+              ) : null}
+            </div>
             <div style={{ display: "flex", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("completion")}>Back</button>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>

@@ -18921,6 +18921,161 @@ def _host_onboarding_build_personality_draft(zodiac_sign: str) -> str:
 _HOST_ONBOARDING_PHYSICAL_DESCRIPTION_PLACEHOLDER = "Physical description is intentionally left for host review and completion in this MVP."
 
 
+_HOST_ONBOARDING_ASSET_SLOT_LABELS = {
+    "headshot_front": "Headshot (front)",
+    "full_body_front": "Full body (front)",
+    "three_quarter_body": "Three-quarter body",
+    "angle_left_45": "45-degree left",
+    "angle_right_45": "45-degree right",
+    "left_profile": "Left profile",
+    "right_profile": "Right profile",
+    "smiling_headshot": "Smiling headshot",
+    "neutral_headshot": "Neutral-expression headshot",
+    "extra_angle": "Extra angle",
+}
+_HOST_ONBOARDING_ASSET_SLOT_ORDER = {
+    slot: idx for idx, slot in enumerate(_HOST_ONBOARDING_ASSET_SLOT_LABELS.keys())
+}
+
+
+def _host_onboarding_slot_label(slot_key: Any) -> str:
+    slot = _host_onboarding_safe_str(slot_key)
+    return _HOST_ONBOARDING_ASSET_SLOT_LABELS.get(slot, slot.replace("_", " ").strip().title())
+
+
+def _host_onboarding_normalize_education_entries(raw: Any) -> List[Dict[str, str]]:
+    items: List[Any]
+    if raw is None:
+        items = []
+    elif isinstance(raw, list):
+        items = list(raw)
+    else:
+        items = [raw]
+
+    out: List[Dict[str, str]] = []
+    for item in items:
+        if item is None:
+            continue
+        entry = {
+            "degree": "",
+            "field_of_study": "",
+            "institution": "",
+            "graduation_year": "",
+            "notes": "",
+        }
+        if isinstance(item, str):
+            text = _host_onboarding_safe_str(item)
+            if not text:
+                continue
+            entry["notes"] = text
+        elif isinstance(item, dict):
+            entry["degree"] = _host_onboarding_safe_str(item.get("degree"))
+            entry["field_of_study"] = _host_onboarding_safe_str(item.get("field_of_study") or item.get("field") or item.get("major"))
+            entry["institution"] = _host_onboarding_safe_str(item.get("institution") or item.get("school") or item.get("university"))
+            entry["graduation_year"] = _host_onboarding_safe_str(item.get("graduation_year") or item.get("year"))
+            entry["notes"] = _host_onboarding_safe_str(
+                item.get("notes")
+                or item.get("focus")
+                or item.get("academic_focus")
+                or item.get("areas_of_focus")
+                or item.get("summary")
+                or item.get("education")
+                or item.get("text")
+            )
+        else:
+            continue
+        if not any(entry.values()):
+            continue
+        out.append(entry)
+    return out
+
+
+def _host_onboarding_format_education_entry(entry: Dict[str, Any]) -> str:
+    degree = _host_onboarding_safe_str((entry or {}).get("degree"))
+    field = _host_onboarding_safe_str((entry or {}).get("field_of_study"))
+    institution = _host_onboarding_safe_str((entry or {}).get("institution"))
+    graduation_year = _host_onboarding_safe_str((entry or {}).get("graduation_year"))
+    notes = _host_onboarding_safe_str((entry or {}).get("notes"))
+
+    lead = degree
+    if degree and field:
+        lead = f"{degree} in {field}"
+    elif field and not degree:
+        lead = field
+
+    parts: List[str] = []
+    if lead:
+        parts.append(lead)
+    if institution:
+        parts.append(institution)
+    if graduation_year:
+        parts.append(f"Class of {graduation_year}")
+    text = " — ".join([p for p in parts if p])
+    if notes:
+        text = f"{text}. {notes}".strip() if text else notes
+    return text.strip()
+
+
+def _host_onboarding_format_education_entries_text(entries: Any) -> str:
+    normalized = _host_onboarding_normalize_education_entries(entries)
+    lines = [line for line in [_host_onboarding_format_education_entry(entry) for entry in normalized] if line]
+    return "\n".join(lines).strip()
+
+
+
+def _host_onboarding_has_meaningful_education(value: Any) -> bool:
+    if _host_onboarding_normalize_education_entries(value):
+        return True
+    return bool(_host_onboarding_safe_str(value))
+
+
+def _host_onboarding_public_asset_payload(asset: Dict[str, Any]) -> Dict[str, Any]:
+    a = dict(asset or {})
+    slot_key = _host_onboarding_safe_str(a.get("slot_key"))
+    return {
+        "asset_id": _host_onboarding_safe_str(a.get("asset_id")),
+        "slot_key": slot_key,
+        "slot_label": _host_onboarding_slot_label(slot_key),
+        "sort_order": int(_HOST_ONBOARDING_ASSET_SLOT_ORDER.get(slot_key, 999)),
+        "url": _host_onboarding_safe_str(a.get("url")),
+        "file_name": _host_onboarding_safe_str(a.get("file_name")),
+        "content_type": _host_onboarding_safe_str(a.get("content_type")),
+        "width_px": int(a.get("width_px") or 0),
+        "height_px": int(a.get("height_px") or 0),
+        "validation_status": _host_onboarding_safe_str(a.get("validation_status")),
+    }
+
+
+def _host_onboarding_split_public_assets(assets: Any) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    normalized_assets: List[Dict[str, Any]] = []
+    for asset in list(assets or []):
+        if not isinstance(asset, dict):
+            continue
+        url = _host_onboarding_safe_str(asset.get("url"))
+        if not url:
+            continue
+        normalized_assets.append(_host_onboarding_public_asset_payload(asset))
+
+    if not normalized_assets:
+        return None, []
+
+    headshot: Optional[Dict[str, Any]] = None
+    for asset in normalized_assets:
+        if _host_onboarding_safe_str(asset.get("slot_key")) == "headshot_front":
+            headshot = asset
+            break
+    if headshot is None:
+        headshot = normalized_assets[0]
+
+    headshot_id = _host_onboarding_safe_str((headshot or {}).get("asset_id"))
+    gallery = [
+        asset for asset in normalized_assets
+        if _host_onboarding_safe_str(asset.get("slot_key")) != "headshot_front" and _host_onboarding_safe_str(asset.get("asset_id")) != headshot_id
+    ]
+    gallery.sort(key=lambda asset: (int(asset.get("sort_order") or 999), _host_onboarding_safe_str(asset.get("file_name")), _host_onboarding_safe_str(asset.get("asset_id"))))
+    return headshot, gallery
+
+
 def _host_onboarding_meaningful_physical_description(value: Any) -> str:
     text = _host_onboarding_safe_str(value)
     if not text:
@@ -18948,6 +19103,9 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
     income_estimate = _host_onboarding_safe_str(completion.get("estimated_income") or derived.get("estimated_income"))
     if not income_estimate and career_title:
         income_estimate = _host_onboarding_income_estimate_from_title(career_title)
+    education_entries = _host_onboarding_normalize_education_entries(completion.get("education_entries") or completion.get("education"))
+    education_text = _host_onboarding_format_education_entries_text(education_entries) or _host_onboarding_safe_str(completion.get("education"))
+    headshot_asset, gallery_assets = _host_onboarding_split_public_assets(assets)
     private_identity = {
         "legal_name": legal_name,
         "birthdate": _host_onboarding_safe_str(basics.get("birthdate")),
@@ -18972,7 +19130,8 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         "astrological_profile": review.get("astrological_profile") or derived.get("astrological_profile") or {},
         "personality": _host_onboarding_safe_str(review.get("personality_draft") or derived.get("personality_draft")),
         "physical_description": _host_onboarding_meaningful_physical_description(review.get("physical_description_draft")) or _host_onboarding_meaningful_physical_description(completion.get("physical_description")),
-        "education": _host_onboarding_safe_str(completion.get("education")),
+        "education": education_text,
+        "education_entries": education_entries,
         "career": {
             "current_job_title": career_title,
             "current_company": _host_onboarding_safe_str(completion.get("current_company")),
@@ -18986,6 +19145,15 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         "core_values": _host_onboarding_safe_str(completion.get("core_values")),
         "personal_motto": _host_onboarding_safe_str(completion.get("personal_motto")),
         "assets": assets,
+        "headshot_asset": headshot_asset,
+        "gallery_assets": gallery_assets,
+    }
+    public_page = {
+        "headline": _host_onboarding_safe_str(public_profile.get("public_display_name")) or public_name,
+        "headshot_asset": headshot_asset,
+        "gallery_assets": gallery_assets,
+        "education_entries": education_entries,
+        "education_text": education_text,
     }
     ai_profile = {
         "approved_stage_name": public_profile.get("stage_name"),
@@ -19005,6 +19173,7 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         },
         "private_profile": private_identity,
         "public_profile": public_profile,
+        "public_page": public_page,
         "ai_profile": ai_profile,
     }
 
@@ -19044,7 +19213,7 @@ def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any
         "physical_description": "Physical description",
     }
     section_value_getters = {
-        "education": lambda: _host_onboarding_safe_str(completion.get("education")),
+        "education": lambda: _host_onboarding_format_education_entries_text(completion.get("education_entries")) or _host_onboarding_safe_str(completion.get("education")),
         "career_summary": lambda: _host_onboarding_safe_str(completion.get("career_summary")),
         "likes": lambda: _host_onboarding_safe_str(completion.get("likes")),
         "dislikes": lambda: _host_onboarding_safe_str(completion.get("dislikes")),
@@ -19581,8 +19750,11 @@ async def host_onboarding_save_completion(session_id: str, req: HostOnboardingCo
         skipped_sections = {}
     current_job_title = _host_onboarding_safe_str(completion_in.get("current_job_title"))
     estimated_income = _host_onboarding_safe_str(completion_in.get("estimated_income")) or _host_onboarding_income_estimate_from_title(current_job_title)
+    education_entries = _host_onboarding_normalize_education_entries(completion_in.get("education_entries") or completion_in.get("education"))
+    education_text = _host_onboarding_format_education_entries_text(education_entries) or _host_onboarding_safe_str(completion_in.get("education"))
     completion = {
-        "education": _host_onboarding_safe_str(completion_in.get("education")),
+        "education": education_text,
+        "education_entries": education_entries,
         "current_job_title": current_job_title,
         "current_company": _host_onboarding_safe_str(completion_in.get("current_company")),
         "career_summary": _host_onboarding_safe_str(completion_in.get("career_summary")),
@@ -19654,6 +19826,77 @@ async def host_onboarding_preview(session_id: str, request: Request):
         _host_onboarding_assert_member_access(session, member_id)
         preview = _host_onboarding_compile_profile(session)
         return {"ok": True, "session": session, "preview": preview, "readiness": _host_onboarding_compute_readiness(session)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+
+
+def _host_onboarding_public_payload_from_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    public_profile = dict(profile.get("public_profile") or {})
+    public_page = dict(profile.get("public_page") or {})
+    education_entries = _host_onboarding_normalize_education_entries(public_profile.get("education_entries") or public_page.get("education_entries") or public_profile.get("education") or public_page.get("education_text"))
+    education_text = _host_onboarding_format_education_entries_text(education_entries) or _host_onboarding_safe_str(public_profile.get("education") or public_page.get("education_text"))
+    headshot_asset, gallery_assets = _host_onboarding_split_public_assets(public_profile.get("assets") or public_page.get("gallery_assets") or [])
+    if public_page.get("headshot_asset") and isinstance(public_page.get("headshot_asset"), dict):
+        headshot_asset = _host_onboarding_public_asset_payload(public_page.get("headshot_asset") or {})
+    if isinstance(public_page.get("gallery_assets"), list) and public_page.get("gallery_assets"):
+        gallery_assets = [_host_onboarding_public_asset_payload(item) for item in list(public_page.get("gallery_assets") or []) if isinstance(item, dict) and _host_onboarding_safe_str(item.get("url"))]
+    public_page_payload = {
+        "headline": _host_onboarding_safe_str(public_page.get("headline") or public_profile.get("public_display_name") or public_profile.get("stage_name")),
+        "headshot_asset": headshot_asset,
+        "gallery_assets": gallery_assets,
+        "education_entries": education_entries,
+        "education_text": education_text,
+    }
+    public_profile["education_entries"] = education_entries
+    public_profile["education"] = education_text
+    public_profile["headshot_asset"] = headshot_asset
+    public_profile["gallery_assets"] = gallery_assets
+    return {"public_profile": public_profile, "public_page": public_page_payload}
+
+
+@app.get("/host-onboarding/public/summary")
+async def host_onboarding_public_summary(memberId: Optional[str] = None, member_id: Optional[str] = None, versionId: Optional[str] = None, version_id: Optional[str] = None):
+    resolved_version_id = _host_onboarding_safe_str(versionId or version_id)
+    resolved_member_id = _host_onboarding_normalize_member_id(memberId or member_id)
+    if not resolved_version_id and not resolved_member_id:
+        raise HTTPException(status_code=400, detail="memberId or versionId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        row = None
+        if resolved_version_id:
+            row = conn.execute(
+                f"SELECT * FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE version_id = ? LIMIT 1",
+                (resolved_version_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                f"SELECT * FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE member_id = ? ORDER BY approved_epoch DESC, created_epoch DESC LIMIT 1",
+                (resolved_member_id,),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="No approved profile version found")
+        profile = _host_onboarding_json_loads(row["profile_json"], {})
+        if not isinstance(profile, dict):
+            profile = {}
+        payload = _host_onboarding_public_payload_from_profile(profile)
+        return {
+            "ok": True,
+            "version": {
+                "version_id": _host_onboarding_safe_str(row["version_id"]),
+                "session_id": _host_onboarding_safe_str(row["session_id"]),
+                "member_id": _host_onboarding_safe_str(row["member_id"]),
+                "version_no": int(row["version_no"] or 0),
+                "publish_scope": _host_onboarding_safe_str(row["publish_scope"]),
+                "approved_epoch": float(row["approved_epoch"] or 0.0),
+            },
+            **payload,
+        }
     finally:
         try:
             conn.close()
