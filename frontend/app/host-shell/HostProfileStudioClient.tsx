@@ -185,8 +185,7 @@ function normalizeEducationEntries(raw: any, legacyText?: string): EducationEntr
     push(raw);
   } else if (typeof raw === "string" && raw.trim()) {
     const parts = raw
-      .split(/
-+/)
+      .split(/\n+/)
       .map((line) => line.replace(/^[-*•]\s*/, "").trim())
       .filter(Boolean);
     if (parts.length > 1) {
@@ -196,8 +195,7 @@ function normalizeEducationEntries(raw: any, legacyText?: string): EducationEntr
     }
   } else if (typeof legacyText === "string" && legacyText.trim()) {
     const parts = legacyText
-      .split(/
-+/)
+      .split(/\n+/)
       .map((line) => line.replace(/^[-*•]\s*/, "").trim())
       .filter(Boolean);
     if (parts.length > 1) {
@@ -226,8 +224,7 @@ function formatEducationEntriesLegacyText(entries: EducationEntry[]): string {
   return (entries || [])
     .map((entry) => formatEducationEntrySummary(entry))
     .filter(Boolean)
-    .join("
-")
+    .join("\n")
     .trim();
 }
 
