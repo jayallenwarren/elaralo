@@ -20622,13 +20622,16 @@ def _host_onboarding_create_companion_mapping_triggers_on_conn(conn: sqlite3.Con
     except Exception:
         pass
     try:
-        # Defense-in-depth for the exact production failure class: no Host
-        # Onboarding/export/repair path may convert an existing AI row into a
-        # Human row or stamp host ownership/version data onto it. This still
-        # permits normal admin maintenance of AI fields such as eleven_voice_id,
-        # channel_cap, live, D-ID fields, etc.
+        # Defense-in-depth for the exact production failure class: Host
+        # Onboarding/export/repair data must never be stamped onto AI rows.
+        # Earlier protection only blocked *changed* host fields, which still
+        # allowed a historically contaminated AI row with an existing
+        # host_member_id to be reused by host-scoped repair code. These triggers
+        # enforce the invariant on the NEW row image: AI rows may not carry
+        # Host Onboarding ownership/version/media-clone fields at all.
         cur = conn.cursor()
         cur.execute("DROP TRIGGER IF EXISTS companion_mappings_prevent_ai_host_overwrite")
+        cur.execute("DROP TRIGGER IF EXISTS companion_mappings_prevent_ai_host_insert")
         cur.execute(
             """
             CREATE TRIGGER companion_mappings_prevent_ai_host_overwrite
@@ -20636,23 +20639,45 @@ def _host_onboarding_create_companion_mapping_triggers_on_conn(conn: sqlite3.Con
             FOR EACH ROW
             WHEN lower(COALESCE(OLD.companion_type, '')) = 'ai'
              AND (
-                    lower(COALESCE(NEW.companion_type, '')) = 'human'
-                 OR (trim(COALESCE(NEW.host_member_id, '')) <> ''
-                     AND COALESCE(NEW.host_member_id, '') <> COALESCE(OLD.host_member_id, ''))
-                 OR (trim(COALESCE(NEW.approved_version_id, '')) <> ''
-                     AND COALESCE(NEW.approved_version_id, '') <> COALESCE(OLD.approved_version_id, ''))
-                 OR (trim(COALESCE(NEW.voice_capture_url, '')) <> ''
-                     AND COALESCE(NEW.voice_capture_url, '') <> COALESCE(OLD.voice_capture_url, ''))
-                 OR (trim(COALESCE(NEW.public_gallery_json, '')) <> ''
-                     AND COALESCE(NEW.public_gallery_json, '') <> COALESCE(OLD.public_gallery_json, ''))
+                    lower(COALESCE(NEW.companion_type, '')) <> 'ai'
+                 OR trim(COALESCE(NEW.host_member_id, '')) <> ''
+                 OR trim(COALESCE(NEW.approved_version_id, '')) <> ''
+                 OR trim(COALESCE(NEW.voice_capture_url, '')) <> ''
+                 OR trim(COALESCE(NEW.public_gallery_json, '')) <> ''
+                 OR trim(COALESCE(NEW.voice_clone_status, '')) <> ''
+                 OR trim(COALESCE(NEW.voice_clone_error, '')) <> ''
                  )
             BEGIN
-                SELECT RAISE(ABORT, 'Refusing to overwrite AI companion_mappings row with Host Onboarding data');
+                SELECT RAISE(ABORT, 'Refusing to store Host Onboarding data on an AI companion_mappings row');
             END;
             """
         )
-    except Exception:
-        pass
+        cur.execute(
+            """
+            CREATE TRIGGER companion_mappings_prevent_ai_host_insert
+            BEFORE INSERT ON companion_mappings
+            FOR EACH ROW
+            WHEN lower(COALESCE(NEW.companion_type, '')) = 'ai'
+             AND (
+                    trim(COALESCE(NEW.host_member_id, '')) <> ''
+                 OR trim(COALESCE(NEW.approved_version_id, '')) <> ''
+                 OR trim(COALESCE(NEW.voice_capture_url, '')) <> ''
+                 OR trim(COALESCE(NEW.public_gallery_json, '')) <> ''
+                 OR trim(COALESCE(NEW.voice_clone_status, '')) <> ''
+                 OR trim(COALESCE(NEW.voice_clone_error, '')) <> ''
+                 )
+            BEGIN
+                SELECT RAISE(ABORT, 'Refusing to insert Host Onboarding data on an AI companion_mappings row');
+            END;
+            """
+        )
+    except Exception as e:
+        # Do not fail platform startup, but make trigger installation failures
+        # visible in App Service logs.
+        try:
+            print(f"[mappings] ERROR creating AI row protection triggers: {e!r}")
+        except Exception:
+            pass
 
 
 def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Connection) -> None:
@@ -20736,53 +20761,65 @@ def _host_onboarding_find_existing_human_mapping_row_on_conn(
     member_id: str,
     approved_version_id: str = "",
     legacy_avatar: str = "",
+    expected_avatar: str = "",
 ) -> Optional[sqlite3.Row]:
-    """Find the existing Human mapping row for a host/version before changing avatar."""
+    """Find the existing Human mapping row for a host/version.
+
+    Safety rule: host_member_id alone is not enough to select a row. Historical
+    contamination put a host_member_id on an AI row, so a candidate must also be
+    explicitly Human and have the same first-name avatar base as the host profile
+    being exported.
+    """
     try:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         member_norm = _host_onboarding_normalize_member_id(member_id)
         version_norm = _host_onboarding_safe_str(approved_version_id)
         legacy_norm = _host_onboarding_safe_str(legacy_avatar)
-        return cur.execute(
+        expected_base = _companion_avatar_first_name(expected_avatar or legacy_avatar)
+        rows = cur.execute(
             """
             SELECT rowid AS _rowid, *
               FROM companion_mappings
              WHERE lower(COALESCE(brand, '')) = lower(?)
+               AND lower(COALESCE(companion_type, '')) = 'human'
                AND (
-                    (? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?))
-                 OR (? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?))
+                    (? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?))
                  OR (? <> '' AND lower(COALESCE(avatar, '')) = lower(?))
-               )
-               AND lower(COALESCE(companion_type, '')) <> 'ai'
-               AND (
-                    lower(COALESCE(companion_type, '')) = 'human'
-                 OR (? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?))
                  OR (? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?))
                )
              ORDER BY
                CASE
                  WHEN ? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?) THEN 0
-                 WHEN ? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?) THEN 1
-                 ELSE 2
+                 WHEN ? <> '' AND lower(COALESCE(avatar, '')) = lower(?) THEN 1
+                 WHEN ? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?) THEN 2
+                 ELSE 3
                END,
                rowid
-             LIMIT 1
+             LIMIT 20
             """,
             (
                 "Elaralo",
+                version_norm, version_norm,
+                legacy_norm, legacy_norm,
                 member_norm, member_norm,
                 version_norm, version_norm,
                 legacy_norm, legacy_norm,
-                version_norm, version_norm,
-                member_norm, member_norm,
-                version_norm, version_norm,
                 member_norm, member_norm,
             ),
-        ).fetchone()
+        ).fetchall()
+        if not rows:
+            return None
+        if not expected_base:
+            return rows[0]
+        expected_lc = expected_base.lower()
+        for row in rows:
+            row_base = _companion_avatar_first_name(row["avatar"] if "avatar" in row.keys() else "")
+            if row_base.lower() == expected_lc:
+                return row
+        return None
     except Exception:
         return None
-
 
 def _host_onboarding_unique_avatar_for_brand_on_conn(
     conn: sqlite3.Connection,
@@ -20890,6 +20927,7 @@ def _host_onboarding_normalize_companion_mapping_avatars_for_brand_on_conn(conn:
 
 
 _STARTUP_MIGRATION_COMPANION_AVATAR_IDENTITY_V9_2_18 = "v9_2_18_companion_avatar_identity_generation_ethnicity"
+_STARTUP_MIGRATION_AI_ROW_OWNERSHIP_HYGIENE_V9_2_22 = "v9_2_22_companion_ai_row_ownership_hygiene"
 
 
 def _startup_migrations_ensure_table_on_conn(conn: sqlite3.Connection) -> None:
@@ -21059,20 +21097,82 @@ def _startup_run_companion_avatar_identity_migration_on_conn(conn: sqlite3.Conne
     }
 
 
-def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
-    """Run deployment-time DB migrations exactly once per DB.
 
-    This is called by the FastAPI startup hook after the companion mapping DB has
-    been discovered and made writable. A small file lock prevents two scaled
-    workers from applying the same migration concurrently. Failures are logged and
-    returned, but are not allowed to crash platform startup.
+def _startup_run_ai_mapping_ownership_hygiene_on_conn(conn: sqlite3.Connection, brand: str = "Elaralo") -> Dict[str, Any]:
+    """Clear stale Host Onboarding ownership fields from AI mapping rows.
+
+    This is a one-time startup hygiene migration for rows that were polluted
+    before the stronger AI-row triggers existed. It does not modify AI voice,
+    channel_cap, live, D-ID, or avatar identity fields.
     """
-    migration_id = _STARTUP_MIGRATION_COMPANION_AVATAR_IDENTITY_V9_2_18
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    _host_onboarding_ensure_companion_export_columns_on_conn(conn)
+    rows = cur.execute(
+        """
+        SELECT rowid AS _rowid, *
+          FROM companion_mappings
+         WHERE lower(COALESCE(brand, '')) = lower(?)
+           AND lower(COALESCE(companion_type, '')) = 'ai'
+           AND (
+                trim(COALESCE(host_member_id, '')) <> ''
+             OR trim(COALESCE(approved_version_id, '')) <> ''
+             OR trim(COALESCE(voice_capture_url, '')) <> ''
+             OR trim(COALESCE(public_gallery_json, '')) <> ''
+             OR trim(COALESCE(voice_clone_status, '')) <> ''
+             OR trim(COALESCE(voice_clone_error, '')) <> ''
+             OR lower(COALESCE(headshot_url, '')) LIKE '%/host-onboarding/%'
+             OR lower(COALESCE(headshot_url, '')) LIKE '%connect-platform/companion/headshot/%'
+           )
+         ORDER BY rowid
+        """,
+        (brand_name,),
+    ).fetchall()
+
+    cleared: List[Dict[str, Any]] = []
+    for row in rows or []:
+        rowid = int(row["_rowid"])
+        old_headshot = _host_onboarding_safe_str(row["headshot_url"] if "headshot_url" in row.keys() else "")
+        clear_headshot = (
+            "/host-onboarding/" in old_headshot.lower()
+            or "connect-platform/companion/headshot/" in old_headshot.lower()
+        )
+        cur.execute(
+            """
+            UPDATE companion_mappings
+               SET host_member_id = NULL,
+                   approved_version_id = NULL,
+                   voice_capture_url = NULL,
+                   public_gallery_json = NULL,
+                   voice_clone_status = NULL,
+                   voice_clone_error = NULL,
+                   headshot_url = CASE WHEN ? THEN NULL ELSE headshot_url END
+             WHERE rowid = ?
+               AND lower(COALESCE(companion_type, '')) = 'ai'
+            """,
+            (1 if clear_headshot else 0, rowid),
+        )
+        cleared.append({
+            "rowid": rowid,
+            "avatar": _host_onboarding_safe_str(row["avatar"] if "avatar" in row.keys() else ""),
+            "cleared_headshot_url": bool(clear_headshot),
+        })
+    return {"brand": brand_name, "ai_rows_scanned": len(rows or []), "ai_rows_cleaned": len(cleared), "cleaned_rows": cleared}
+
+def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
+    """Run deployment-time DB migrations once per DB.
+
+    Runs the existing avatar identity migration and the v9.2.22 AI-row
+    ownership hygiene migration. Each migration has its own ledger marker so a
+    new safety migration can run even when an earlier one was already applied.
+    """
     db_path = ""
+    applied: List[Dict[str, Any]] = []
     try:
         db_path = _get_companion_mappings_db_path(for_write=True) or _ensure_econnect_db_seeded()
         if not db_path:
-            return {"ok": False, "skipped": True, "reason": "no_db_path", "migration_id": migration_id}
+            return {"ok": False, "skipped": True, "reason": "no_db_path"}
 
         lock_path = f"{db_path}.startup-migrations.lock"
         with FileLock(lock_path, timeout=30):
@@ -21084,45 +21184,48 @@ def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
                 except Exception:
                     pass
                 _startup_migrations_ensure_table_on_conn(conn)
-                try:
-                    conn.commit()
-                except Exception:
-                    pass
-
-                conn.execute("BEGIN IMMEDIATE")
-                # Re-check the marker inside the write transaction. The file lock
-                # protects normal App Service multi-worker startup; this DB-level
-                # check keeps the migration safe if the lock cannot coordinate a
-                # future deployment layout.
-                if _startup_migration_is_applied_on_conn(conn, migration_id):
-                    conn.commit()
-                    return {"ok": True, "skipped": True, "reason": "already_applied", "migration_id": migration_id, "db_path": db_path}
-
-                result = _startup_run_companion_avatar_identity_migration_on_conn(conn, "Elaralo")
-                _startup_migration_mark_applied_on_conn(conn, migration_id, result)
+                _host_onboarding_ensure_companion_export_columns_on_conn(conn)
                 conn.commit()
-                print(
-                    "[startup-migration] applied "
-                    f"{migration_id}: rows_scanned={result.get('rows_scanned')} "
-                    f"avatar_updates={result.get('avatar_update_count')} "
-                    f"generation_updates={result.get('generation_update_count')} "
-                    f"ethnicity_updates={result.get('ethnicity_update_count')}"
-                )
-                return {"ok": True, "skipped": False, "migration_id": migration_id, "db_path": db_path, **result}
-            except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                raise
+
+                migration_plan = [
+                    (
+                        _STARTUP_MIGRATION_COMPANION_AVATAR_IDENTITY_V9_2_18,
+                        lambda c: _startup_run_companion_avatar_identity_migration_on_conn(c, "Elaralo"),
+                    ),
+                    (
+                        _STARTUP_MIGRATION_AI_ROW_OWNERSHIP_HYGIENE_V9_2_22,
+                        lambda c: _startup_run_ai_mapping_ownership_hygiene_on_conn(c, "Elaralo"),
+                    ),
+                ]
+
+                for migration_id, runner in migration_plan:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        if _startup_migration_is_applied_on_conn(conn, migration_id):
+                            conn.commit()
+                            applied.append({"migration_id": migration_id, "skipped": True, "reason": "already_applied"})
+                            continue
+                        result = runner(conn) or {}
+                        _startup_migration_mark_applied_on_conn(conn, migration_id, result)
+                        conn.commit()
+                        applied.append({"migration_id": migration_id, "skipped": False, **result})
+                        print(f"[startup-migration] applied {migration_id}: {result}")
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        raise
+
+                return {"ok": True, "db_path": db_path, "migrations": applied}
             finally:
                 try:
                     conn.close()
                 except Exception:
                     pass
     except Exception as e:
-        print(f"[startup-migration] ERROR applying {migration_id} to {db_path or '<unknown>'}: {e!r}")
-        return {"ok": False, "skipped": False, "migration_id": migration_id, "db_path": db_path, "error": repr(e)}
+        print(f"[startup-migration] ERROR applying startup migrations to {db_path or '<unknown>'}: {e!r}")
+        return {"ok": False, "db_path": db_path, "error": repr(e), "migrations": applied}
 
 def _lookup_companion_mapping_by_avatar_base(brand: str, avatar_base: Any) -> Optional[Dict[str, Any]]:
     """Lookup a mapping by first-name base, preferring the bare first-name row."""
@@ -21291,6 +21394,7 @@ def _host_onboarding_upsert_connect_companion_mapping(
             member_id=member_id,
             approved_version_id=approved_version_id_norm,
             legacy_avatar=_host_onboarding_safe_str(avatar_key),
+            expected_avatar=proposed_avatar,
         )
         # Defense in depth: Host Onboarding must never overwrite an AI mapping row.
         # If a historical/corrupt row is marked AI, create a distinct Human row
@@ -21511,6 +21615,7 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
                 member_id=_host_onboarding_safe_str(session.get("member_id")),
                 approved_version_id=version_id,
                 legacy_avatar=avatar_key,
+                expected_avatar=avatar_key,
             )
             existing_rowid = int(existing_mapping["_rowid"]) if existing_mapping is not None else None
             avatar_key = _host_onboarding_unique_avatar_for_brand_on_conn(
@@ -23247,13 +23352,16 @@ def _my_elaralo_member_human_cards_sync(
         member_mapping_rows: List[Dict[str, Any]] = []
         for row in mapping_rows:
             row_obj = _my_elaralo_mapping_row_to_dict(row)
+            ctype = _host_onboarding_safe_str(_my_elaralo_row_value(row_obj, "companion_type", "companionType")).lower()
+            # A stale host_member_id on an AI row must not make that AI row look
+            # like the logged-in host's Human Companion. Human catalog merge only
+            # consumes rows explicitly typed Human.
+            if ctype != "human":
+                continue
             host_member = _host_onboarding_normalize_member_id(_my_elaralo_row_value(row_obj, "host_member_id", "hostMemberId"))
             if host_member.lower() != resolved_member_id.lower():
                 continue
-            ctype = _host_onboarding_safe_str(_my_elaralo_row_value(row_obj, "companion_type", "companionType")).lower()
-            approved_vid = _host_onboarding_safe_str(_my_elaralo_row_value(row_obj, "approved_version_id", "approvedVersionId"))
-            if ctype == "human" or approved_vid:
-                member_mapping_rows.append(row_obj)
+            member_mapping_rows.append(row_obj)
 
         mapping_by_version: Dict[str, Dict[str, Any]] = {}
         mapping_by_avatar: Dict[str, Dict[str, Any]] = {}
