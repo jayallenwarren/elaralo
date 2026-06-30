@@ -5511,11 +5511,26 @@ const streamUrl = useMemo(() => {
   return String(flags["streamurl"] || "").trim() || STREAM_URL;
 }, [companionKeyRaw]);
 
-const liveEnabled = useMemo(() => {
+const providerControlRowEnabled = useMemo(() => {
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
   const liveOk = liveRaw === "stream" || liveRaw === "d-id";
   return channelCap === "video" && liveOk;
 }, [channelCap, companionMapping]);
+
+const showPlayButton = useMemo(() => {
+  // The SQL mapping contract controls Play visibility through channel_cap only.
+  // Provider fields such as live / did are used when Play is clicked, not to decide
+  // whether the Play control is displayed.
+  return channelCap === "video";
+}, [channelCap]);
+
+const showConnectControls = useMemo(() => {
+  // Preserve the existing DulceMoon/Wix control-row behavior, then add the Elaralo
+  // app-sourced handoff case where Audio companions still need the standard Connect
+  // controls but must not show Play.
+  if (providerControlRowEnabled) return true;
+  return isElaraloBrandName(companyName) && companionMappingResolved && Boolean(companionMapping) && !companionMappingError;
+}, [providerControlRowEnabled, companyName, companionMappingResolved, companionMapping, companionMappingError]);
 
 
   // Wix templates (and some site themes) may apply a gray page background.
@@ -14068,7 +14083,7 @@ const modePillControls = (
   </div>
 ) : null}
 
-{liveEnabled ? (
+{showConnectControls ? (
   <section
     style={{
       display: "flex",
@@ -14080,6 +14095,7 @@ const modePillControls = (
     }}
   >
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      {showPlayButton ? (
       <button
         onClick={() => {
           // Stream provider: Play = join/start. It must NOT toggle to Pause.
@@ -14173,6 +14189,7 @@ const modePillControls = (
           <PlayIcon size={ICON_18} />
         )}
       </button>
+      ) : null}
 
       
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
