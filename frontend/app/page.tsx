@@ -3618,6 +3618,26 @@ function ConnectPage() {
     }
   }, []);
 
+  // Elaralo launches Connect from the My Elaralo selector by navigating the same
+  // Wix-hosted iframe and passing a direct query-string payload. DulceMoon's
+  // Connect payload is still supplied by Wix postMessage and must remain on the
+  // existing path. Keep this flag narrow so microphone handling changes only
+  // apply to the Elaralo app-sourced handoff.
+  const directCompanionHandoff = useMemo(() => readDirectCompanionHandoffFromUrl(), []);
+
+  const isDirectElaraloConnectLaunch = useMemo(() => {
+    const handoff = directCompanionHandoff || {};
+    if (!Boolean((handoff as any).directQueryOverride)) return false;
+    if (!isElaraloBrandName((handoff as any).brand || (handoff as any).companyName || (handoff as any).company)) return false;
+
+    const src = String((handoff as any).source || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "");
+
+    return ["myelaralo", "elaraloapp", "elaralocatalog", "elaralo"].includes(src);
+  }, [directCompanionHandoff]);
+
 
   const getEmbedContext = useCallback(() => {
     let referrer = "";
@@ -10198,7 +10218,10 @@ useEffect(() => {
   const backendSttHasSpokenRef = useRef<boolean>(false);
 
 
-  const getEmbedHint = useCallback(() => "", []);
+  const getEmbedHint = useCallback(() => {
+    if (!isEmbedded) return "";
+    return " The Connect iframe must be loaded with Wix iframe permissions for microphone, camera, and autoplay before microphone capture can start.";
+  }, [isEmbedded]);
 
   const greetingTranslationCacheRef = useRef<Record<string, string>>({});
   const getLocalizedGreeting = useCallback(async (name: string, languageCode: string, preferenceKnown: boolean) => {
@@ -10699,7 +10722,7 @@ useEffect(() => {
 
     window.addEventListener("message", onMessage);
 
-    const directHandoff = readDirectCompanionHandoffFromUrl();
+    const directHandoff = directCompanionHandoff;
     if (directHandoff?.avatar) {
       try {
         window.setTimeout(() => window.postMessage(directHandoff, window.location.origin), 0);
@@ -10709,7 +10732,7 @@ useEffect(() => {
     }
 
     return () => window.removeEventListener("message", onMessage);
-  }, [getMemberPlanCacheKey, markStartupIdentityResolved]);
+  }, [directCompanionHandoff, getMemberPlanCacheKey, markStartupIdentityResolved]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -12411,6 +12434,16 @@ const pauseSpeechToText = useCallback(() => {
     // If we're not using backend STT, let SpeechRecognition trigger the permission prompt instead.
     if (isIOS && !useBackendStt) return true;
 
+    // Elaralo-specific iframe handoff fix:
+    // My Elaralo opens Connect by navigating the same Wix iframe that originally
+    // hosted the selector. In that embedded path, Chrome can reject the
+    // getUserMedia preflight even though browser SpeechRecognition can still
+    // trigger the mic prompt from the actual button click. DulceMoon remains on
+    // the Wix postMessage payload path and is not affected by this branch.
+    if (isEmbedded && isDirectElaraloConnectLaunch && speechRecognitionSupported && !useBackendStt) {
+      return true;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach((t) => t.stop());
@@ -12442,7 +12475,7 @@ const pauseSpeechToText = useCallback(() => {
 
       return false;
     }
-  }, [getEmbedHint, isIOS, setBackendSttAvailable, useBackendStt]);
+  }, [getEmbedHint, isDirectElaraloConnectLaunch, isEmbedded, isIOS, setBackendSttAvailable, speechRecognitionSupported, useBackendStt]);
 
   const ensureSpeechRecognition = useCallback((): any | null => {
     if (typeof window === "undefined") return null;
