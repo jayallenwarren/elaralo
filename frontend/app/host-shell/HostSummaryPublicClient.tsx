@@ -406,16 +406,10 @@ export default function HostSummaryPublicClient() {
               </div>
 
               {isAiCompanionCard ? (
-                <div style={{ display: "grid", gap: 10, color: "#374151", lineHeight: 1.6 }}>
-                  <div>
-                    This Companion Card is auto-generated from the hyphen-delimited AI companion headshot filename. Only fields derivable from that filename are shown.
-                  </div>
-                  <div style={{ display: "grid", gap: 6 }}>
-                    {safeText(publicProfile.gender) ? <div><b>Gender:</b> {safeText(publicProfile.gender)}</div> : null}
-                    {safeText(publicProfile.ethnicity) ? <div><b>Ethnicity:</b> {safeText(publicProfile.ethnicity)}</div> : null}
-                    {safeText(publicProfile.generation) ? <div><b>Generation:</b> {safeText(publicProfile.generation)}</div> : null}
-                    {safeText(publicProfile.avatar) ? <div><b>Avatar key:</b> {safeText(publicProfile.avatar)}</div> : null}
-                  </div>
+                <div style={{ display: "grid", gap: 6, color: "#374151", lineHeight: 1.6 }}>
+                  {safeText(publicProfile.gender) ? <div><b>Gender:</b> {safeText(publicProfile.gender)}</div> : null}
+                  {safeText(publicProfile.ethnicity) ? <div><b>Ethnicity:</b> {safeText(publicProfile.ethnicity)}</div> : null}
+                  {safeText(publicProfile.generation) ? <div><b>Generation:</b> {safeText(publicProfile.generation)}</div> : null}
                 </div>
               ) : (
                 <>
