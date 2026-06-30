@@ -1145,6 +1145,18 @@ function buildDigestFromDroppedMessages(dropped: Msg[]): string {
 
 const HEADSHOT_DIR = "/companion/headshot";
 
+function isCompanionImageUrl(raw: any): boolean {
+  const s = String(raw || "").trim().toLowerCase();
+  if (!s) return false;
+  return (
+    s.includes(`${HEADSHOT_DIR}/`) ||
+    s.includes("/brand/elaralo/companion/ai/") ||
+    s.includes("/brand/elaralo/companion/human/") ||
+    s.includes("/host-onboarding/") ||
+    s.includes("/connect-platform/companion/headshot/")
+  );
+}
+
 // Resolve companion key/name for backend requests and TTS voice selection.
 // This must be browser-safe and never rely on DOM parsing.
 function resolveCompanionForBackend(opts: { companionKey?: string; companionName?: string }): string {
@@ -1886,7 +1898,18 @@ function buildAvatarCandidates(companionKeyOrName: string, rebrandingSlug?: stri
   // Some repos store images with uppercase extensions on Windows (e.g. ".JPG"),
   // and the exported static output can be case-sensitive.
   const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
+
+  const isElaraloStaticContext = !slug || normalizeRebrandingSlug(slug) === "elaralo";
+
   for (const enc of encVariants) {
+    // Elaralo AI companion images now live on the API/Linux filesystem.
+    // Try this API-served path before static-app fallbacks so Connect does
+    // not lose the working headshot while probing unavailable frontend paths.
+    if (API_BASE_TRIM && isElaraloStaticContext) {
+      const apiBase = `${API_BASE_TRIM}/brand/elaralo/companion/ai/${enc}`;
+      candidates.push(apiBase);
+      for (const ext of exts) candidates.push(`${apiBase}.${ext}`);
+    }
     // Rebrand-specific headshots (preferred when RebrandingKey is present):
     //   /rebranding/<brand>/companion/headshot/<CompanionName>[.<ext>]
     if (slugEnc) {
@@ -4939,7 +4962,7 @@ useEffect(() => {
         // Covers both:
         // - "/companion/headshot/..."
         // - "/rebranding/<brand>/companion/headshot/..."
-        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
+        if (isCompanionImageUrl(p)) return prev;
 
         if (p === DEFAULT_AVATAR) return DEFAULT_AVATAR;
 
@@ -4992,7 +5015,7 @@ useEffect(() => {
         if (!p) return mappedHeadshot || picked;
 
         // Covers both default + rebrand headshots.
-        if (p.includes(`${HEADSHOT_DIR}/`)) return prev;
+        if (isCompanionImageUrl(p)) return prev;
 
         if (p === DEFAULT_AVATAR) return picked;
 
@@ -10671,6 +10694,20 @@ useEffect(() => {
           : typeof (data as any).mapping_avatar === "string"
             ? String((data as any).mapping_avatar).trim()
             : incomingAvatarName || incomingCompanion || "";
+      const incomingHeadshotUrl =
+        typeof (data as any).headshotUrl === "string"
+          ? String((data as any).headshotUrl).trim()
+          : typeof (data as any).headshot_url === "string"
+            ? String((data as any).headshot_url).trim()
+            : typeof (data as any).imageUrl === "string"
+              ? String((data as any).imageUrl).trim()
+              : typeof (data as any).image_url === "string"
+                ? String((data as any).image_url).trim()
+                : typeof (data as any).photoUrl === "string"
+                  ? String((data as any).photoUrl).trim()
+                  : typeof (data as any).photo_url === "string"
+                    ? String((data as any).photo_url).trim()
+                    : "";
       const resolvedCompanionKey = incomingCompanionKey || incomingCompanion || incomingAvatarName || "";
       const { baseKey } = splitCompanionKey(resolvedCompanionKey);
 
@@ -10701,8 +10738,27 @@ useEffect(() => {
           companion_type: incomingCompanionType,
         }));
 
-        const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || resolvedCompanionName, rebrandSlugFromMessage);
-        pickFirstLoadableImage(avatarCandidates).then((picked) => setAvatarSrc(picked));
+        const avatarCandidates = [
+          incomingHeadshotUrl,
+          ...buildAvatarCandidates(baseKey || resolvedCompanionKey || resolvedCompanionName, rebrandSlugFromMessage),
+        ].filter((url, index, arr) => Boolean(url) && arr.indexOf(url) === index);
+
+        // If a selected companion already arrived with an API-served headshot, show it
+        // immediately and do not let later static-app probe failures replace it with the logo.
+        if (incomingHeadshotUrl) {
+          setAvatarSrc(incomingHeadshotUrl);
+        }
+
+        pickFirstLoadableImage(avatarCandidates).then((picked) => {
+          setAvatarSrc((prev) => {
+            const current = String(prev || "").trim();
+            const next = String(picked || "").trim();
+            if (next && next !== DEFAULT_AVATAR) return next;
+            if (incomingHeadshotUrl) return incomingHeadshotUrl;
+            if (isCompanionImageUrl(current)) return prev;
+            return next || current || DEFAULT_AVATAR;
+          });
+        });
       }
 
       // Brand-default starting mode:
@@ -14112,9 +14168,15 @@ const modePillControls = (
             alt={companyName}
             style={{ width: "100%", height: "100%" }}
             onError={(e) => {
-              // IMPORTANT: Persist the fallback in state to prevent flicker on subsequent renders.
               const fallback = (companyLogoSrc || DEFAULT_AVATAR);
+              const current = String((e.currentTarget as HTMLImageElement).src || avatarSrc || "").trim();
               (e.currentTarget as HTMLImageElement).src = fallback;
+
+              // Do not persist the logo over a selected companion image.  Elaralo AI
+              // headshots are API-served and can be restored by mapping/direct handoff
+              // state; persisting the logo here is what made the image disappear after
+              // a delayed static probe/render cycle.
+              if (isCompanionImageUrl(current)) return;
               setAvatarSrc(fallback);
             }}
           />
