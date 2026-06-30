@@ -436,6 +436,15 @@ async def usage_status(request: Request):
     cycle_days = _safe_int(cycle_days_raw)
 
     is_anon = bool(member_id) and str(member_id).strip().lower().startswith("anon:")
+    persistent_intimate_consent = False
+    if member_id and not is_anon and _session_state_is_context_auto_mode_ai_connect(session_state):
+        persistent_intimate_consent = await run_in_threadpool(_member_has_intimate_consent_sync, member_id)
+        if persistent_intimate_consent:
+            session_state["adult_verified"] = True
+            session_state["explicit_consented"] = True
+            session_state["explicit_consent_persisted"] = True
+            if session_state.get("pending_consent") == "intimate":
+                session_state["pending_consent"] = None
     is_trial = (not bool(member_id)) or is_anon
     identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
 
@@ -4608,6 +4617,309 @@ def _looks_intimate(text: str) -> bool:
             "blowjob", "oral", "anal", "orgasm", "cum",
         ]
     )
+
+
+def _session_state_brand_key_for_mode(session_state: Dict[str, Any]) -> str:
+    """Normalize the Connect brand key used for context-mode automation.
+
+    The feature is active for both the Elaralo core brand and the DulceMoon white-label
+    brand, but remains limited to AI Connect sessions.  It is intentionally not used
+    for Host/Human companion flows.
+    """
+    state = session_state if isinstance(session_state, dict) else {}
+    raw = (
+        state.get("brand")
+        or state.get("companyName")
+        or state.get("company_name")
+        or state.get("rebranding")
+        or state.get("rebrandingKey")
+        or state.get("rebranding_key")
+        or "Elaralo"
+    )
+    try:
+        return _compact_brand_key(_host_onboarding_safe_str(raw) or "Elaralo")
+    except Exception:
+        return str(raw or "").strip().lower().replace(" ", "")
+
+
+def _session_state_is_context_auto_mode_ai_connect(session_state: Dict[str, Any]) -> bool:
+    """Return True when context-based mode switching should be enabled.
+
+    Scope:
+      - Elaralo AI Connect
+      - DulceMoon AI Connect
+
+    Explicitly excluded:
+      - Human companion rows / Host Profile Studio flows
+      - Unknown brands
+    """
+    try:
+        state = session_state if isinstance(session_state, dict) else {}
+        brand_key = _session_state_brand_key_for_mode(state)
+        if brand_key not in {"elaralo", "dulcemoon"}:
+            return False
+
+        companion_type = str(
+            state.get("companion_type")
+            or state.get("companionType")
+            or state.get("type")
+            or ""
+        ).strip().lower()
+        if companion_type and companion_type not in {"ai", "ai_companion"}:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _contextual_mode_from_messages(user_text: str, current_mode: str, messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Deterministic context-mode classifier for AI Connect.
+
+    It deliberately avoids an extra LLM call.  It only changes modes when the latest
+    text and very recent context contain clear signals.  Intimate signals only request
+    Intimate mode; the normal explicit-consent gate still runs before Intimate content
+    can be generated.
+    """
+    latest = str(user_text or "").strip()
+    if not latest:
+        return None
+
+    recent_parts: List[str] = []
+    for item in (messages or [])[-6:]:
+        try:
+            if not item or not isinstance(item, dict):
+                continue
+            recent_parts.append(str(item.get("content") or ""))
+        except Exception:
+            pass
+
+    combined = " ".join(recent_parts + [latest]).lower()
+    compact = re.sub(r"[^a-z0-9+]+", " ", combined)
+    current = _normalize_mode(str(current_mode or "friend"))
+
+    intimate_patterns = [
+        r"\b(explicit|intimate|nsfw|18\+|adult mode)\b",
+        r"\b(sex|sexual|sexy|nude|naked|porn)\b",
+        r"\b(fuck|fucking|cock|dick|penis|pussy|vagina|clit)\b",
+        r"\b(blowjob|oral|anal|orgasm|cum|cumming)\b",
+        r"\b(touch yourself|turn me on|make me hard|make me wet)\b",
+    ]
+    if any(re.search(p, compact) for p in intimate_patterns):
+        return "intimate"
+
+    romantic_patterns = [
+        r"\b(romantic|romance|flirt|flirty|date|dating)\b",
+        r"\b(kiss|kissing|cuddle|cuddling|hold me|hold your hand)\b",
+        r"\b(i love you|love you|falling for you|miss you|my love|sweetheart|darling|babe|baby)\b",
+        r"\b(beautiful|gorgeous|handsome|attracted to you|chemistry between us)\b",
+        r"\b(relationship|boyfriend|girlfriend|partner)\b",
+    ]
+    if current != "intimate" and any(re.search(p, compact) for p in romantic_patterns):
+        return "romantic"
+
+    practical_patterns = [
+        r"\b(help me|can you help|explain|summarize|write|draft|calculate|code|debug|recipe|plan|schedule|weather)\b",
+        r"\b(minutes left|minutes remaining|work|school|homework|email|resume|business|travel|budget|question)\b",
+    ]
+    if current != "friend" and any(re.search(p, compact) for p in practical_patterns):
+        return "friend"
+
+    return None
+
+
+_MODE_ORDER: List[str] = ["friend", "romantic", "intimate"]
+
+
+def _allowed_modes_from_session_state(session_state: Dict[str, Any]) -> Optional[List[str]]:
+    """Read frontend entitlement mode limits from session_state.
+
+    The Connect UI is still the primary entitlement UI, but the backend must also
+    honor the same limits because context-mode switching can be triggered by the
+    conversation rather than a button click.  If no allowed-modes list is present,
+    return None to preserve legacy behavior.
+    """
+    if not isinstance(session_state, dict):
+        return None
+    raw = (
+        session_state.get("allowed_modes")
+        or session_state.get("allowedModes")
+        or session_state.get("available_modes")
+        or session_state.get("availableModes")
+    )
+    values: List[Any]
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        values = re.split(r"[\s,|;]+", raw.strip())
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        return None
+
+    out: List[str] = []
+    for item in values:
+        m = _normalize_mode(str(item or ""))
+        if m in _MODE_ORDER and m not in out:
+            out.append(m)
+    return out or None
+
+
+def _mode_allowed_by_session(mode: str, allowed_modes: Optional[List[str]]) -> bool:
+    m = _normalize_mode(str(mode or "friend"))
+    if not allowed_modes:
+        return True
+    return m in allowed_modes
+
+
+def _fallback_mode_for_allowed_modes(allowed_modes: Optional[List[str]], preferred: str = "romantic") -> str:
+    preferred_norm = _normalize_mode(str(preferred or "romantic"))
+    if allowed_modes and preferred_norm in allowed_modes:
+        return preferred_norm
+    if allowed_modes:
+        for candidate in ("romantic", "friend"):
+            if candidate in allowed_modes:
+                return candidate
+        return allowed_modes[0]
+    if preferred_norm == "intimate":
+        return "romantic"
+    return preferred_norm or "friend"
+
+
+def _intimate_unavailable_response_text(is_anon: bool) -> str:
+    if is_anon:
+        return "Intimate (18+) mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Romantic mode."
+    return "Intimate (18+) mode is not available on your current plan. We’ll keep things in Romantic mode."
+
+
+def _mode_consent_db_path() -> str:
+    try:
+        path = _get_companion_mappings_db_path(for_write=True)
+        if path:
+            return path
+    except Exception:
+        pass
+    try:
+        return _ensure_econnect_db_seeded()
+    except Exception:
+        return ""
+
+
+def _ensure_member_mode_consent_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS member_mode_consents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            brand TEXT,
+            avatar TEXT,
+            confirmed_epoch INTEGER NOT NULL,
+            source TEXT,
+            UNIQUE(member_id, mode)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_member_mode_consents_member_mode ON member_mode_consents(member_id, mode)")
+
+
+def _member_intimate_consent_row_sync(member_id: Any) -> Optional[Dict[str, Any]]:
+    mid = str(member_id or "").strip()
+    if not mid or mid.lower().startswith("anon:"):
+        return None
+    db_path = _mode_consent_db_path()
+    if not db_path:
+        return None
+    try:
+        conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        try:
+            _ensure_member_mode_consent_table(conn)
+            row = conn.execute(
+                """
+                SELECT member_id, mode, brand, avatar, confirmed_epoch, source
+                FROM member_mode_consents
+                WHERE member_id = ? AND mode = 'intimate'
+                LIMIT 1
+                """,
+                (mid,),
+            ).fetchone()
+            if not row or int(row[4] or 0) <= 0:
+                return None
+            return {
+                "member_id": str(row[0] or mid),
+                "mode": str(row[1] or "intimate"),
+                "brand": str(row[2] or ""),
+                "avatar": str(row[3] or ""),
+                "confirmed_epoch": int(row[4] or 0),
+                "source": str(row[5] or ""),
+            }
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _member_has_intimate_consent_sync(member_id: Any) -> bool:
+    return bool(_member_intimate_consent_row_sync(member_id))
+
+
+def _record_member_intimate_consent_sync(member_id: Any, session_state: Dict[str, Any], session_id: str = "") -> bool:
+    mid = str(member_id or "").strip()
+    if not mid or mid.lower().startswith("anon:"):
+        return False
+    db_path = _mode_consent_db_path()
+    if not db_path:
+        return False
+    state = session_state if isinstance(session_state, dict) else {}
+    brand = str(state.get("brand") or state.get("companyName") or state.get("rebranding") or "").strip()
+    avatar = str(state.get("avatar") or state.get("mappingAvatar") or state.get("companionName") or state.get("companion") or "").strip()
+    now = _now_ts()
+    try:
+        conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        try:
+            _ensure_member_mode_consent_table(conn)
+            conn.execute(
+                """
+                INSERT INTO member_mode_consents(member_id, mode, brand, avatar, confirmed_epoch, source)
+                VALUES(?, 'intimate', ?, ?, ?, ?)
+                ON CONFLICT(member_id, mode) DO UPDATE SET
+                    brand=excluded.brand,
+                    avatar=excluded.avatar,
+                    confirmed_epoch=excluded.confirmed_epoch,
+                    source=excluded.source
+                """,
+                (mid, brand, avatar, now, f"chat:{session_id}" if session_id else "chat"),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+@app.get("/mode-consent/intimate/status")
+@app.get("/chat/intimate-consent/status")
+async def mode_consent_intimate_status(memberId: str = "", member_id: str = "", brand: str = ""):
+    """Return whether this member has previously confirmed Intimate (18+) consent.
+
+    Consent is keyed by member_id only, so the same member is not prompted again
+    when switching between Elaralo and DulceMoon AI Connect.  The brand parameter is
+    accepted for compatibility/audit but is not part of the unique key.
+    """
+    mid = str(memberId or member_id or "").strip()
+    if not mid or mid.lower().startswith("anon:"):
+        return {"ok": True, "consented": False, "granted": False, "member_id": mid}
+    row = await run_in_threadpool(_member_intimate_consent_row_sync, mid)
+    granted = bool(row)
+    return {
+        "ok": True,
+        "consented": granted,
+        "granted": granted,
+        "member_id": mid,
+        "brand": str((row or {}).get("brand") or brand or ""),
+        "avatar": str((row or {}).get("avatar") or ""),
+        "granted_epoch": int((row or {}).get("confirmed_epoch") or 0),
+    }
 
 
 def _parse_companion_meta(raw: Any) -> Dict[str, str]:
@@ -9213,21 +9525,62 @@ async def chat(request: Request):
     user_display_text = str(last_user_display_text or user_text).strip()
     normalized_text = user_text.lower().strip()
 
-    # allow text-based mode switching
+    # Allow explicit text-based mode switching. When there is no explicit switch,
+    # infer the mode from recent AI Connect context for both Elaralo and DulceMoon.
+    # Backend also respects the mode entitlements supplied by Connect so automatic
+    # context switching cannot bypass plan gating.
+    allowed_modes_for_session = _allowed_modes_from_session_state(session_state)
+    context_auto_enabled = _session_state_is_context_auto_mode_ai_connect(session_state)
     detected_switch = _detect_mode_switch_from_text(user_text)
+    auto_detected_mode = None
     if detected_switch:
-        session_state["mode"] = detected_switch
+        if _mode_allowed_by_session(detected_switch, allowed_modes_for_session):
+            session_state["mode"] = detected_switch
+            session_state["auto_mode_switch_source"] = "explicit_text"
+        else:
+            session_state["auto_mode_switch_source"] = "blocked_explicit_text"
+            session_state["auto_mode_blocked"] = detected_switch
+    elif context_auto_enabled:
+        auto_detected_mode = _contextual_mode_from_messages(user_text, str(session_state.get("mode") or "friend"), messages)
+        if auto_detected_mode:
+            if _mode_allowed_by_session(auto_detected_mode, allowed_modes_for_session):
+                session_state["mode"] = auto_detected_mode
+                session_state["auto_mode_switch_source"] = "context"
+                session_state["auto_mode_suggested"] = auto_detected_mode
+            else:
+                session_state["auto_mode_switch_source"] = "blocked_context"
+                session_state["auto_mode_blocked"] = auto_detected_mode
 
     requested_mode = _normalize_mode(str(session_state.get("mode") or "friend"))
+    if not _mode_allowed_by_session(requested_mode, allowed_modes_for_session):
+        requested_mode = _fallback_mode_for_allowed_modes(allowed_modes_for_session, "romantic")
+        session_state["mode"] = requested_mode
     requested_intimate = (requested_mode == "intimate")
 
-    # authoritative consent flag should live in session_state (works across gunicorn workers)
-    intimate_allowed = bool(session_state.get("explicit_consented") is True)
+    # Authoritative consent flag lives in session_state and is persisted once per member_id.
+    intimate_allowed = bool(session_state.get("explicit_consented") is True) or bool(persistent_intimate_consent)
+    if persistent_intimate_consent:
+        session_state["adult_verified"] = True
+        session_state["explicit_consented"] = True
+        session_state["explicit_consent_persisted"] = True
     if is_anon:
         intimate_allowed = False
 
-    # if user is requesting intimate OR the UI is in intimate mode, treat as intimate request
-    user_requesting_intimate = wants_explicit or requested_intimate or _looks_intimate(user_text)
+    # if user is requesting intimate OR the UI/backend inferred intimate mode, treat as intimate request.
+    raw_user_requesting_intimate = bool(wants_explicit or requested_intimate or _looks_intimate(user_text))
+    intimate_mode_entitled = _mode_allowed_by_session("intimate", allowed_modes_for_session)
+    if context_auto_enabled and raw_user_requesting_intimate and not intimate_mode_entitled:
+        session_state_out = dict(session_state)
+        session_state_out["adult_verified"] = bool(session_state_out.get("adult_verified") and not is_anon)
+        session_state_out["explicit_consented"] = False
+        session_state_out["pending_consent"] = None
+        session_state_out["mode"] = _fallback_mode_for_allowed_modes(allowed_modes_for_session, "romantic")
+        return await _respond(
+            _intimate_unavailable_response_text(is_anon),
+            STATUS_SAFE,
+            session_state_out,
+        )
+    user_requesting_intimate = raw_user_requesting_intimate and intimate_mode_entitled
 
     # consent keywords
     CONSENT_YES = {
@@ -9267,6 +9620,9 @@ async def chat(request: Request):
     if pending == "intimate" and not intimate_allowed:
         if normalized_text in CONSENT_YES:
             session_state_out = _grant_intimate(session_state)
+            if member_id and not is_anon and _session_state_is_context_auto_mode_ai_connect(session_state_out):
+                saved = await run_in_threadpool(_record_member_intimate_consent_sync, member_id, session_state_out, session_id)
+                session_state_out["explicit_consent_persisted"] = bool(saved)
             return await _respond(
                 "Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
                 STATUS_ALLOWED,

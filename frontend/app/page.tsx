@@ -1782,6 +1782,54 @@ function fallbackModeForAllowedModes(modes: Mode[]): Mode {
   return modes.includes("romantic") ? "romantic" : "friend";
 }
 
+const INTIMATE_CONSENT_STORAGE_PREFIX = "ELARALO_INTIMATE_CONSENT::";
+
+function intimateConsentMemberKey(memberId: string): string {
+  return String(memberId || "").trim().toLowerCase().replace(/\s+/g, "");
+}
+
+function intimateConsentStorageKey(memberId: string): string {
+  const key = intimateConsentMemberKey(memberId);
+  return `${INTIMATE_CONSENT_STORAGE_PREFIX}${key}`;
+}
+
+function readStoredIntimateConsent(memberId: string): boolean {
+  const key = intimateConsentMemberKey(memberId);
+  if (!key || isAnonMemberId(key)) return false;
+  if (typeof window === "undefined") return false;
+  try {
+    const raw = String(window.localStorage.getItem(intimateConsentStorageKey(key)) || "").trim();
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    return Boolean(parsed && parsed.granted === true);
+  } catch {
+    try {
+      return String(window.localStorage.getItem(intimateConsentStorageKey(key)) || "").trim() === "1";
+    } catch {
+      return false;
+    }
+  }
+}
+
+function writeStoredIntimateConsent(memberId: string, payload?: Record<string, any>): void {
+  const key = intimateConsentMemberKey(memberId);
+  if (!key || isAnonMemberId(key)) return;
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      intimateConsentStorageKey(key),
+      JSON.stringify({
+        granted: true,
+        memberId: String(memberId || "").trim(),
+        grantedAt: Date.now(),
+        ...(payload || {}),
+      }),
+    );
+  } catch {
+    // localStorage can be blocked in some iframe contexts. Backend persistence still applies.
+  }
+}
+
 function stripExt(s: string) {
   return (s || "").replace(/\.(png|jpg|jpeg|webp)$/i, "");
 }
@@ -7905,6 +7953,74 @@ useEffect(() => {
   // Used for upgrade polling and entitlement refresh without a full page reload.
   const [loggedIn, setLoggedIn] = useState<boolean>(false);
 
+  const applyIntimateConsentForMember = useCallback(
+    (source: string = "") => {
+      const mid = String(memberIdRef.current || memberId || "").trim();
+      if (!mid || isAnonMemberId(mid)) return false;
+      writeStoredIntimateConsent(mid, {
+        source: source || "connect",
+        brand: String(companyName || "").trim(),
+        avatar: String(companionName || "").trim(),
+      });
+      setSessionState((prev) => ({
+        ...prev,
+        adult_verified: true,
+        explicit_consented: true,
+        pending_consent: null,
+      }));
+      return true;
+    },
+    [memberId, companyName, companionName],
+  );
+
+  useEffect(() => {
+    const mid = String(memberIdRef.current || memberId || "").trim();
+    if (!mid || isAnonMemberId(mid)) return;
+
+    if (readStoredIntimateConsent(mid)) {
+      setSessionState((prev) =>
+        prev.explicit_consented && prev.adult_verified
+          ? prev
+          : { ...prev, adult_verified: true, explicit_consented: true, pending_consent: null },
+      );
+      return;
+    }
+
+    if (!API_BASE) return;
+    let cancelled = false;
+
+    const run = async () => {
+      try {
+        const url = new URL(`${API_BASE}/mode-consent/intimate/status`);
+        url.searchParams.set("memberId", mid);
+        url.searchParams.set("brand", String(companyName || ""));
+        const res = await fetch(url.toString(), { cache: "no-store" });
+        const data: any = await res.json().catch(() => null);
+        const granted = Boolean(data?.granted === true || data?.consented === true);
+        if (cancelled || !res.ok || !granted) return;
+        writeStoredIntimateConsent(mid, {
+          source: "server",
+          brand: String(data?.brand || companyName || "").trim(),
+          avatar: String(data?.avatar || companionName || "").trim(),
+          grantedEpoch: Number(data?.granted_epoch || 0) || undefined,
+        });
+        setSessionState((prev) => ({
+          ...prev,
+          adult_verified: true,
+          explicit_consented: true,
+          pending_consent: null,
+        }));
+      } catch {
+        // Fail closed: if we cannot verify prior consent, the normal consent prompt remains.
+      }
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [API_BASE, memberId, companyName, companionName]);
+
   // ---------------------------------------------------------------------
   // PayGo Top-up (existing Pay Link) - Visitor email capture + pending intent
   //
@@ -11062,6 +11178,12 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
   loggedIn,
   logged_in: loggedIn,
 
+  // Entitlement modes for backend context-mode automation.  The UI remains the
+  // primary plan gate, but the backend needs the same list when it auto-detects
+  // Romantic/Intimate context from conversation text.
+  allowed_modes: allowedModes,
+  allowedModes,
+
   translator_enabled: translatorEnabled,
   translation_enabled: translatorEnabled,
   translationEnabled: translatorEnabled,
@@ -11478,6 +11600,12 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     // If the user message is ONLY a mode switch token, apply locally and don't call backend
     // e.g. "[mode:romantic]" by itself
     if (detectedMode && cleaned.length === 0) {
+      if (detectedMode === "intimate" && !sessionState.explicit_consented) {
+        setChatStatus("explicit_blocked");
+        setSessionState((prev) => ({ ...prev, mode: "intimate", pending_consent: "intimate" }));
+        setInput("");
+        return;
+      }
       setSessionState((prev) => ({ ...prev, mode: detectedMode, pending_consent: null }));
       setMessages((prev) => [
         ...prev,
@@ -11699,6 +11827,9 @@ if (streamSessionActive) {
       // status from backend (safe/explicit_blocked/explicit_allowed)
       if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
         setChatStatus(data.mode);
+        if (data.mode === "explicit_allowed") {
+          applyIntimateConsentForMember("chat_response");
+        }
       }
 
       // Some backends return camelCase "sessionState" instead of snake_case "session_state"
