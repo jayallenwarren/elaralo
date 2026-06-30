@@ -45,7 +45,14 @@ type HostOnboardingReadiness = {
   photos_ok?: boolean;
   missing_required_slots?: string[];
   review_ok?: boolean;
+  voice_capture_ok?: boolean;
+  voice_capture_required?: boolean;
+  voice_capture_min_seconds?: number;
+  voice_capture_asset_id?: string;
+  voice_capture_blockers?: string[];
   limited_publish_allowed?: boolean;
+  limited_publish_missing_sections?: string[];
+  limited_publish_blockers?: string[];
   full_publish_ready?: boolean;
   full_publish_missing_sections?: string[];
   full_publish_skipped_sections?: string[];
@@ -1480,6 +1487,14 @@ export default function HostProfileStudioClient() {
     () => dedupeLabels(Array.isArray(readiness.full_publish_missing_sections) ? readiness.full_publish_missing_sections : []),
     [readiness.full_publish_missing_sections],
   );
+  const limitedPublishMissingSections = useMemo(
+    () => dedupeLabels(Array.isArray(readiness.limited_publish_missing_sections) ? readiness.limited_publish_missing_sections : []),
+    [readiness.limited_publish_missing_sections],
+  );
+  const voiceCaptureBlockers = useMemo(
+    () => dedupeLabels(Array.isArray(readiness.voice_capture_blockers) ? readiness.voice_capture_blockers : []),
+    [readiness.voice_capture_blockers],
+  );
 
   const privateProfile = previewData?.private_profile || {};
   const publicProfile = previewData?.public_profile || {};
@@ -1543,7 +1558,7 @@ export default function HostProfileStudioClient() {
     const hinted = Number((voiceCaptureGuidance as any)?.estimated_seconds || 0);
     return hinted > 0 ? hinted : estimateSpeechSecondsFromText(voiceCaptureScript);
   }, [voiceCaptureGuidance, voiceCaptureScript]);
-  const voiceCaptureMinSeconds = Number((voiceCaptureGuidance as any)?.minimum_seconds || VOICE_CAPTURE_MIN_SECONDS) || VOICE_CAPTURE_MIN_SECONDS;
+  const voiceCaptureMinSeconds = Number((voiceCaptureGuidance as any)?.minimum_seconds || readiness.voice_capture_min_seconds || VOICE_CAPTURE_MIN_SECONDS) || VOICE_CAPTURE_MIN_SECONDS;
   const voiceCaptureTargetSeconds = Number((voiceCaptureGuidance as any)?.target_seconds || VOICE_CAPTURE_TARGET_SECONDS) || VOICE_CAPTURE_TARGET_SECONDS;
   const voiceCaptureMeetsMinimum = Number(voiceCaptureAsset?.duration_seconds || 0) >= voiceCaptureMinSeconds && String(voiceCaptureAsset?.validation_status || "").toLowerCase() === "accepted";
 
@@ -1552,21 +1567,45 @@ export default function HostProfileStudioClient() {
     try { return window.self !== window.top; } catch { return true; }
   })() : false;
 
+  const handleApproveLimitedClick = useCallback(() => {
+    if (saving) return;
+    if (!Boolean(readiness.limited_publish_allowed)) {
+      const missing = limitedPublishMissingSections.length
+        ? limitedPublishMissingSections
+        : ["Basics", "required photos", "derived review", `Voice capture (minimum ${voiceCaptureMinSeconds} seconds)`];
+      const voiceDetails = voiceCaptureBlockers.length ? ` ${voiceCaptureBlockers.join(" ")}` : "";
+      setNotice("");
+      setError(`Approve Limited Profile requires: ${missing.join(", ")}.${voiceDetails}`);
+      if (!voiceCaptureMeetsMinimum || missing.some((item) => String(item || "").toLowerCase().includes("voice"))) {
+        setStep("completion");
+      } else if (missing.some((item) => String(item || "").toLowerCase().includes("photo"))) {
+        setStep("photos");
+      } else if (missing.some((item) => String(item || "").toLowerCase().includes("review"))) {
+        setStep("review");
+      } else {
+        setStep("basics");
+      }
+      return;
+    }
+    void approveProfile("limited");
+  }, [approveProfile, limitedPublishMissingSections, readiness.limited_publish_allowed, saving, voiceCaptureBlockers, voiceCaptureMeetsMinimum, voiceCaptureMinSeconds]);
+
   const handleApproveFullClick = useCallback(() => {
     if (saving) return;
     if (!Boolean(readiness.full_publish_ready)) {
-      const missing = fullPublishMissingSections;
+      const missing = dedupeLabels([...limitedPublishMissingSections, ...fullPublishMissingSections]);
+      const voiceDetails = voiceCaptureBlockers.length ? ` ${voiceCaptureBlockers.join(" ")}` : "";
       setNotice("");
       setError(
         missing.length
-          ? `Approve Full Profile requires these sections to be completed and not skipped: ${missing.join(", ")}.`
-          : "Approve Full Profile requires all later profile sections to be completed and not skipped.",
+          ? `Approve Full Profile requires these requirements to be completed and not skipped: ${missing.join(", ")}.${voiceDetails}`
+          : "Approve Full Profile requires all profile requirements, including a validated voice capture, to be completed and not skipped.",
       );
       setStep("completion");
       return;
     }
     void approveProfile("full");
-  }, [approveProfile, fullPublishMissingSections, readiness.full_publish_ready, saving]);
+  }, [approveProfile, fullPublishMissingSections, limitedPublishMissingSections, readiness.full_publish_ready, saving, voiceCaptureBlockers]);
 
   if (waitingForContext && embedded && !context.memberId) {
     return (
@@ -1979,7 +2018,7 @@ export default function HostProfileStudioClient() {
                     <span><b>File:</b> {String(voiceCaptureAsset.file_name || "voice-capture")}</span>
                     {voiceCaptureAsset.duration_seconds ? <span><b>Duration:</b> {formatDurationSeconds(voiceCaptureAsset.duration_seconds)}</span> : null}
                     {voiceCaptureAsset.validation_status ? <span><b>Status:</b> {voiceCaptureAsset.validation_status}</span> : null}
-                    {voiceCaptureMeetsMinimum ? <span style={{ color: "#065f46", fontWeight: 700 }}>Meets full publish minimum</span> : null}
+                    {voiceCaptureMeetsMinimum ? <span style={{ color: "#065f46", fontWeight: 700 }}>Meets publish minimum</span> : null}
                   </div>
                   {Array.isArray(voiceCaptureAsset.validation_errors) && voiceCaptureAsset.validation_errors.length ? (
                     <div style={{ color: "#b91c1c", fontSize: 13 }}>
@@ -1988,13 +2027,13 @@ export default function HostProfileStudioClient() {
                   ) : null}
                   {!voiceCaptureMeetsMinimum ? (
                     <div style={{ color: "#92400e", fontSize: 13, lineHeight: 1.6 }}>
-                      Full publish requires one accepted voice capture that is at least {voiceCaptureMinSeconds} seconds long.
+                      Limited and full profile approval require one accepted voice capture that is at least {voiceCaptureMinSeconds} seconds long.
                     </div>
                   ) : null}
                 </div>
               ) : (
                 <div style={{ fontSize: 13, color: "#6b7280", lineHeight: 1.6 }}>
-                  Upload or record one accepted voice clip that is at least {voiceCaptureMinSeconds} seconds long to satisfy the full publish requirement.
+                  Upload or record one accepted voice clip that is at least {voiceCaptureMinSeconds} seconds long before approving either a limited or full profile.
                 </div>
               )}
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -2059,6 +2098,12 @@ export default function HostProfileStudioClient() {
               <div style={{ color: Boolean(readiness.limited_publish_allowed) ? "#065f46" : "#92400e", fontWeight: 700 }}>
                 Limited publish: {Boolean(readiness.limited_publish_allowed) ? "Ready" : "Not ready"}
               </div>
+              {!Boolean(readiness.limited_publish_allowed) && limitedPublishMissingSections.length ? (
+                <div style={{ fontSize: 13, color: "#92400e", lineHeight: 1.6 }}>
+                  Remaining requirements for limited publish: {limitedPublishMissingSections.join(", ")}.
+                  {voiceCaptureBlockers.length ? ` ${voiceCaptureBlockers.join(" ")}` : ""}
+                </div>
+              ) : null}
               <div style={{ color: Boolean(readiness.full_publish_ready) ? "#065f46" : "#92400e", fontWeight: 700 }}>
                 Full publish: {Boolean(readiness.full_publish_ready) ? "Ready" : "Complete all later sections without skipping any of them"}
               </div>
@@ -2166,7 +2211,7 @@ export default function HostProfileStudioClient() {
             <div style={{ display: "flex", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("completion")}>Back</button>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button type="button" style={secondaryButtonStyle} onClick={() => void approveProfile("limited")} disabled={saving || !Boolean(readiness.limited_publish_allowed)}>
+                <button type="button" style={secondaryButtonStyle} onClick={handleApproveLimitedClick} disabled={saving}>
                   {saving ? "Saving…" : "Approve limited profile"}
                 </button>
                 <button type="button" style={buttonStyle} onClick={handleApproveFullClick} disabled={saving}>

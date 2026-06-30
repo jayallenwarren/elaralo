@@ -19428,6 +19428,61 @@ def _host_onboarding_required_slots_present(assets: List[Dict[str, Any]]) -> Tup
     return len(missing) == 0, missing
 
 
+def _host_onboarding_voice_capture_asset_ok(assets: List[Dict[str, Any]]) -> Tuple[bool, Optional[Dict[str, Any]], List[str]]:
+    """Return whether the host has a publishable voice sample.
+
+    This is intentionally stricter than the required photo-slot check:
+      - voice_capture_30s must exist
+      - the uploaded asset must have a browser/API-loadable URL
+      - validation_status must be accepted
+      - duration_seconds must be at least HOST_ONBOARDING_VOICE_MIN_SECONDS
+
+    The voice sample is required for BOTH limited and full Human Companion profile
+    approval because it is exported into the Connect companion mapping/profile.
+    """
+    best_asset: Optional[Dict[str, Any]] = None
+    blockers: List[str] = []
+    for raw in list(assets or []):
+        if not isinstance(raw, dict):
+            continue
+        if _host_onboarding_safe_str(raw.get("slot_key")) != _HOST_ONBOARDING_VOICE_SLOT:
+            continue
+        asset = dict(raw)
+        best_asset = asset
+        url = _host_onboarding_safe_str(asset.get("url"))
+        status = _host_onboarding_safe_str(asset.get("validation_status")).lower()
+        try:
+            duration = float(asset.get("duration_seconds") or 0.0)
+        except Exception:
+            duration = 0.0
+        validation_errors = asset.get("validation_errors") or asset.get("validation_errors_json") or []
+        if isinstance(validation_errors, str):
+            parsed_errors = _host_onboarding_json_loads(validation_errors, [])
+            validation_errors = parsed_errors if isinstance(parsed_errors, list) else [validation_errors]
+        if not url:
+            blockers.append("Voice capture file is missing.")
+        if status != "accepted":
+            blockers.append("Voice capture must be accepted by validation.")
+        if duration < float(_HOST_ONBOARDING_VOICE_MIN_SECONDS):
+            blockers.append(f"Voice capture must be at least {int(_HOST_ONBOARDING_VOICE_MIN_SECONDS)} seconds long.")
+        for err in list(validation_errors or []):
+            msg = _host_onboarding_safe_str(err)
+            if msg and msg not in blockers:
+                blockers.append(msg)
+        if url and status == "accepted" and duration >= float(_HOST_ONBOARDING_VOICE_MIN_SECONDS):
+            return True, asset, []
+
+    if best_asset is None:
+        blockers.append(f"Voice capture (minimum {int(_HOST_ONBOARDING_VOICE_MIN_SECONDS)} seconds) is required.")
+    # De-dupe while preserving order.
+    deduped: List[str] = []
+    for msg in blockers:
+        msg_s = _host_onboarding_safe_str(msg)
+        if msg_s and msg_s not in deduped:
+            deduped.append(msg_s)
+    return False, best_asset, deduped
+
+
 def _host_onboarding_build_astro_profile(sign: str) -> Dict[str, Any]:
     info = _HOST_ONBOARDING_ZODIAC_NOTES.get(_host_onboarding_safe_str(sign), {})
     strengths = list(info.get("strengths") or [])
@@ -19902,29 +19957,60 @@ def _host_onboarding_export_asset_from_url(asset: Dict[str, Any], blob_name: str
     return out
 
 
+def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Connection) -> None:
+    """Ensure companion_mappings has the columns required by Host Onboarding exports.
+
+    This is intentionally usable inside the active Host Onboarding approval transaction.
+    The prior best-effort helper opened a second SQLite connection while approval already
+    held a write transaction, which could prevent the Human companion mapping row from
+    being created before the approved profile was committed.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS companion_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                brand TEXT,
+                avatar TEXT
+            )
+            """
+        )
+    except Exception:
+        # If the deployed DB already has the table with a different compatible shape,
+        # continue to the ALTER checks below.
+        pass
+
+    cur.execute("PRAGMA table_info(companion_mappings)")
+    cols = {str(row[1] or "").strip().lower() for row in cur.fetchall()}
+    for col_name, col_type in [
+        ("host_member_id", "TEXT"),
+        ("channel_cap", "TEXT"),
+        ("live", "TEXT"),
+        ("companion_type", "TEXT"),
+        ("phonetic", "TEXT"),
+        ("headshot_url", "TEXT"),
+        ("voice_capture_url", "TEXT"),
+        ("public_gallery_json", "TEXT"),
+        ("approved_version_id", "TEXT"),
+        ("eleven_voice_id", "TEXT"),
+        ("eleven_voice_name", "TEXT"),
+        ("voice_clone_status", "TEXT"),
+        ("voice_clone_error", "TEXT"),
+    ]:
+        if col_name not in cols:
+            try:
+                cur.execute(f"ALTER TABLE companion_mappings ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+
+
 def _host_onboarding_ensure_companion_export_columns_best_effort() -> None:
     try:
         db_path = _get_companion_mappings_db_path(for_write=True)
         conn = sqlite3.connect(db_path)
         try:
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(companion_mappings)")
-            cols = {str(row[1] or "").strip().lower() for row in cur.fetchall()}
-            for col_name, col_type in [
-                ("headshot_url", "TEXT"),
-                ("voice_capture_url", "TEXT"),
-                ("public_gallery_json", "TEXT"),
-                ("approved_version_id", "TEXT"),
-                ("eleven_voice_id", "TEXT"),
-                ("eleven_voice_name", "TEXT"),
-                ("voice_clone_status", "TEXT"),
-                ("voice_clone_error", "TEXT"),
-            ]:
-                if col_name not in cols:
-                    try:
-                        cur.execute(f"ALTER TABLE companion_mappings ADD COLUMN {col_name} {col_type}")
-                    except Exception:
-                        pass
+            _host_onboarding_ensure_companion_export_columns_on_conn(conn)
             conn.commit()
         finally:
             conn.close()
@@ -19944,23 +20030,51 @@ def _host_onboarding_upsert_connect_companion_mapping(
     eleven_voice_name: str = "",
     voice_clone_status: str = "",
     voice_clone_error: str = "",
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
-    _host_onboarding_ensure_companion_export_columns_best_effort()
-    db_path = _get_companion_mappings_db_path(for_write=True)
-    conn = sqlite3.connect(db_path)
+    """Create/update the Elaralo Human companion mapping exported by Host Onboarding.
+
+    Human Companion rows are created by Host Onboarding after a limited/full approval.
+    They are always Human + Stream + Video. AI mapping rows are not modified here.
+    """
+    avatar_key = _host_onboarding_safe_str(avatar_key)
+    member_id = _host_onboarding_normalize_member_id(member_id)
+    if not avatar_key or not member_id:
+        return
+
+    owns_conn = conn is None
+    if owns_conn:
+        _host_onboarding_ensure_companion_export_columns_best_effort()
+        db_path = _get_companion_mappings_db_path(for_write=True)
+        conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            pass
+
     try:
+        assert conn is not None
+        _host_onboarding_ensure_companion_export_columns_on_conn(conn)
         cur = conn.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+
+        existing = cur.execute(
+            "SELECT id FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
             ("Elaralo", avatar_key),
-        )
+        ).fetchone()
+        if existing is None:
+            cur.execute(
+                "INSERT INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+                ("Elaralo", avatar_key),
+            )
+
         cur.execute(
             """
             UPDATE companion_mappings
                SET host_member_id = ?,
-                   channel_cap = COALESCE(NULLIF(channel_cap, ''), 'Video'),
-                   live = COALESCE(NULLIF(live, ''), 'Stream'),
-                   companion_type = COALESCE(NULLIF(companion_type, ''), 'Human'),
+                   channel_cap = 'Video',
+                   live = 'Stream',
+                   companion_type = 'Human',
                    phonetic = COALESCE(NULLIF(phonetic, ''), ?),
                    headshot_url = ?,
                    voice_capture_url = ?,
@@ -19975,25 +20089,28 @@ def _host_onboarding_upsert_connect_companion_mapping(
             (
                 member_id,
                 avatar_key.split('-', 1)[0],
-                headshot_url,
-                voice_capture_url,
-                _host_onboarding_json_dumps(public_gallery_assets),
-                approved_version_id,
-                eleven_voice_id,
-                eleven_voice_name,
+                _host_onboarding_safe_str(headshot_url),
+                _host_onboarding_safe_str(voice_capture_url),
+                _host_onboarding_json_dumps(public_gallery_assets or []),
+                _host_onboarding_safe_str(approved_version_id),
+                _host_onboarding_safe_str(eleven_voice_id),
+                _host_onboarding_safe_str(eleven_voice_name),
                 _host_onboarding_safe_str(voice_clone_status),
                 _host_onboarding_safe_str(voice_clone_error),
                 "Elaralo",
                 avatar_key,
             ),
         )
-        conn.commit()
+        if owns_conn:
+            conn.commit()
     finally:
-        conn.close()
-    try:
-        _load_companion_mappings_sync()
-    except Exception:
-        pass
+        if owns_conn and conn is not None:
+            conn.close()
+    if owns_conn:
+        try:
+            _load_companion_mappings_sync()
+        except Exception:
+            pass
 
 
 def _host_onboarding_upsert_hco_row(
@@ -20002,18 +20119,31 @@ def _host_onboarding_upsert_hco_row(
     avatar_key: str,
     voice_capture_url: str,
     raw_profile: Dict[str, Any],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
-    db_path = _get_companion_mappings_db_path(for_write=True)
-    conn = sqlite3.connect(db_path)
-    try:
+    owns_conn = conn is None
+    if owns_conn:
+        db_path = _get_companion_mappings_db_path(for_write=True)
+        conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            pass
+    try:
+        assert conn is not None
+        conn.row_factory = sqlite3.Row
+        try:
+            _host_onboarding_ensure_schema(conn)
+        except Exception:
+            pass
         cur = conn.cursor()
         companion_row = cur.execute(
             "SELECT id, phonetic FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
             ("Elaralo", avatar_key),
         ).fetchone()
         companion_id = int(companion_row["id"]) if companion_row and companion_row["id"] is not None else None
-        phonetic = _host_onboarding_safe_str((companion_row or {}).get("phonetic") if isinstance(companion_row, dict) else (companion_row["phonetic"] if companion_row else ""))
+        phonetic = _host_onboarding_safe_str(companion_row["phonetic"] if companion_row else "")
 
         public_profile = dict((raw_profile or {}).get("public_profile") or {})
         private_profile = dict((raw_profile or {}).get("private_profile") or {})
@@ -20077,17 +20207,20 @@ def _host_onboarding_upsert_hco_row(
                 companion_id,
             ),
         )
-        conn.commit()
+        if owns_conn:
+            conn.commit()
     except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        if owns_conn and conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
     finally:
-        conn.close()
+        if owns_conn and conn is not None:
+            conn.close()
 
 
-def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Dict[str, Any], version_id: str) -> Dict[str, Any]:
+def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Dict[str, Any], version_id: str, db_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
     assets = list(session.get("assets") or [])
     public_profile = dict(profile.get("public_profile") or {})
     public_page = dict(profile.get("public_page") or {})
@@ -20146,12 +20279,14 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         eleven_voice_name=_host_onboarding_safe_str((eleven_voice or {}).get("voice_name")),
         voice_clone_status=_host_onboarding_safe_str((eleven_voice or {}).get("status")),
         voice_clone_error=_host_onboarding_safe_str((eleven_voice or {}).get("error")),
+        conn=db_conn,
     )
     _host_onboarding_upsert_hco_row(
         member_id=_host_onboarding_safe_str(session.get("member_id")),
         avatar_key=avatar_key,
         voice_capture_url=_host_onboarding_safe_str((exported_voice or {}).get("url")),
         raw_profile=profile,
+        conn=db_conn,
     )
 
     public_profile["headshot_asset"] = exported_headshot or public_profile.get("headshot_asset")
@@ -20184,6 +20319,125 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
     }
 
 
+
+
+
+
+def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
+    *,
+    member_id: str,
+    brand_name: str,
+    version_id: str,
+    profile: Dict[str, Any],
+    session: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Best-effort backfill for older approved Elaralo Human profiles.
+
+    Normal path: approval writes the Human companion row in companion_mappings.
+    This repair path handles profiles approved before that export was reliable, so the
+    current host's Human card can appear and Connect can find the SQL mapping.
+    """
+    if not _is_elaralo_core_brand(brand_name):
+        return {}
+    resolved_member_id = _host_onboarding_normalize_member_id(member_id)
+    approved_version_id = _host_onboarding_safe_str(version_id)
+    if not resolved_member_id or not approved_version_id or not isinstance(profile, dict):
+        return {}
+
+    public_profile = dict(profile.get("public_profile") or {})
+    public_page = dict(profile.get("public_page") or {})
+    profile_session = dict(profile.get("session") or {})
+    connect_platform = dict(profile.get("connect_platform") or {})
+    ai_profile = dict(profile.get("ai_profile") or {})
+    ai_connect = dict(ai_profile.get("connect_platform") or {})
+
+    display_name = _host_onboarding_safe_str(
+        public_profile.get("public_display_name")
+        or public_profile.get("stage_name")
+        or (session or {}).get("host_display_name")
+        or profile_session.get("avatar")
+        or "Human Companion"
+    )
+    avatar_key = _host_onboarding_safe_str(
+        profile_session.get("avatar")
+        or connect_platform.get("avatar")
+        or ai_connect.get("avatar")
+        or ((session or {}).get("avatar") if isinstance(session, dict) else "")
+    )
+    if not avatar_key and session:
+        try:
+            avatar_key = _host_onboarding_avatar_key_from_session(session)
+        except Exception:
+            avatar_key = ""
+    if not avatar_key:
+        first = re.split(r"\s+", display_name.strip(), maxsplit=1)[0] if display_name.strip() else "Human"
+        avatar_key = re.sub(r"[^A-Za-z0-9]+", "-", first).strip("-") or "Human"
+
+    headshot_asset = {}
+    for candidate in [
+        connect_platform.get("headshot_asset"),
+        ai_connect.get("headshot_asset"),
+        public_page.get("headshot_asset"),
+        public_profile.get("headshot_asset"),
+    ]:
+        if isinstance(candidate, dict) and _host_onboarding_safe_str(candidate.get("url")):
+            headshot_asset = dict(candidate)
+            break
+    headshot_url = _host_onboarding_safe_str((headshot_asset or {}).get("url"))
+
+    voice_asset = None
+    for candidate in [
+        connect_platform.get("voice_capture_asset"),
+        ai_connect.get("voice_capture_asset"),
+        ai_profile.get("voice_capture_asset"),
+    ]:
+        if isinstance(candidate, dict) and _host_onboarding_safe_str(candidate.get("url")):
+            voice_asset = dict(candidate)
+            break
+    voice_capture_url = _host_onboarding_safe_str((voice_asset or {}).get("url"))
+
+    gallery_assets = connect_platform.get("public_gallery_assets") or public_page.get("gallery_assets") or public_profile.get("gallery_assets") or []
+    if not isinstance(gallery_assets, list):
+        gallery_assets = []
+
+    eleven_voice_id = _host_onboarding_safe_str(connect_platform.get("eleven_voice_id") or ai_connect.get("eleven_voice_id"))
+    eleven_voice_name = _host_onboarding_safe_str(connect_platform.get("eleven_voice_name") or ai_connect.get("eleven_voice_name"))
+    voice_clone_status = _host_onboarding_safe_str(connect_platform.get("voice_clone_status") or ai_connect.get("voice_clone_status"))
+
+    _host_onboarding_upsert_connect_companion_mapping(
+        member_id=resolved_member_id,
+        avatar_key=avatar_key,
+        headshot_url=headshot_url,
+        voice_capture_url=voice_capture_url,
+        public_gallery_assets=gallery_assets,
+        approved_version_id=approved_version_id,
+        eleven_voice_id=eleven_voice_id,
+        eleven_voice_name=eleven_voice_name,
+        voice_clone_status=voice_clone_status or "repaired_from_approved_profile",
+        voice_clone_error="",
+    )
+    try:
+        _host_onboarding_upsert_hco_row(
+            member_id=resolved_member_id,
+            avatar_key=avatar_key,
+            voice_capture_url=voice_capture_url,
+            raw_profile=profile,
+        )
+    except Exception:
+        pass
+
+    return _lookup_companion_mapping("Elaralo", avatar_key) or {
+        "brand": "Elaralo",
+        "avatar": avatar_key,
+        "host_member_id": resolved_member_id,
+        "companion_type": "Human",
+        "channel_cap": "Video",
+        "live": "Stream",
+        "headshot_url": headshot_url,
+        "approved_version_id": approved_version_id,
+        "eleven_voice_id": eleven_voice_id,
+        "voice_capture_url": voice_capture_url,
+    }
 
 
 def _host_onboarding_first_sentence(value: Any, max_words: int = 28) -> str:
@@ -20553,6 +20807,7 @@ def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any
     ]
     basics_ok = all(_host_onboarding_safe_str(v) for v in basics_required)
     photos_ok, missing_slots = _host_onboarding_required_slots_present(assets)
+    voice_capture_ok, voice_capture_asset, voice_capture_blockers = _host_onboarding_voice_capture_asset_ok(assets)
     review_ok = bool(review) and bool(_host_onboarding_safe_str(review.get("zodiac_sign") or review.get("family_heritage_draft") or review.get("personality_draft")))
     skipped_sections = completion.get("skipped_sections") or {}
     if not isinstance(skipped_sections, dict):
@@ -20582,7 +20837,7 @@ def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any
         "core_values": lambda: _host_onboarding_safe_str(completion.get("core_values")),
         "personal_motto": lambda: _host_onboarding_safe_str(completion.get("personal_motto")),
         "physical_description": lambda: _host_onboarding_meaningful_physical_description(review.get("physical_description_draft")) or _host_onboarding_meaningful_physical_description(completion.get("physical_description")),
-        "voice_capture": lambda: any(_host_onboarding_safe_str((asset or {}).get("slot_key")) == _HOST_ONBOARDING_VOICE_SLOT and _host_onboarding_safe_str((asset or {}).get("url")) and _host_onboarding_safe_str((asset or {}).get("validation_status")) == "accepted" and float((asset or {}).get("duration_seconds") or 0.0) >= float(_HOST_ONBOARDING_VOICE_MIN_SECONDS) for asset in assets),
+        "voice_capture": lambda: voice_capture_ok,
     }
     full_publish_missing_sections: List[str] = []
     full_publish_skipped_sections: List[str] = []
@@ -20596,13 +20851,33 @@ def _host_onboarding_compute_readiness(session: Dict[str, Any]) -> Dict[str, Any
             continue
         full_publish_missing_sections.append(label)
 
-    limited_allowed = basics_ok and photos_ok and review_ok
+    limited_publish_missing_sections: List[str] = []
+    if not basics_ok:
+        limited_publish_missing_sections.append("Basics")
+    if not photos_ok:
+        photo_label = "Required photos"
+        if missing_slots:
+            photo_label += ": " + ", ".join(_host_onboarding_slot_label(slot) for slot in missing_slots)
+        limited_publish_missing_sections.append(photo_label)
+    if not review_ok:
+        limited_publish_missing_sections.append("Derived review")
+    if not voice_capture_ok:
+        limited_publish_missing_sections.append(section_labels["voice_capture"])
+
+    limited_allowed = basics_ok and photos_ok and review_ok and voice_capture_ok
     return {
         "basics_ok": basics_ok,
         "photos_ok": photos_ok,
         "missing_required_slots": missing_slots,
         "review_ok": review_ok,
+        "voice_capture_ok": voice_capture_ok,
+        "voice_capture_required": True,
+        "voice_capture_min_seconds": int(_HOST_ONBOARDING_VOICE_MIN_SECONDS),
+        "voice_capture_asset_id": _host_onboarding_safe_str((voice_capture_asset or {}).get("asset_id")),
+        "voice_capture_blockers": voice_capture_blockers,
         "limited_publish_allowed": limited_allowed,
+        "limited_publish_missing_sections": limited_publish_missing_sections,
+        "limited_publish_blockers": voice_capture_blockers if not voice_capture_ok else [],
         "full_publish_ready": limited_allowed and not full_publish_missing_sections,
         "full_publish_missing_sections": full_publish_missing_sections,
         "full_publish_skipped_sections": full_publish_skipped_sections,
@@ -21397,6 +21672,387 @@ def _my_elaralo_ai_file_cards(brand_name: str, public_base_url: str = "") -> Lis
     return cards
 
 
+def _my_elaralo_mapping_row_to_dict(row: Any) -> Dict[str, Any]:
+    if not row:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
+def _my_elaralo_row_value(row: Any, *keys: str) -> str:
+    obj = _my_elaralo_mapping_row_to_dict(row)
+    if not obj:
+        return ""
+    keys_lc = {str(k).lower(): k for k in obj.keys()}
+    for key in keys:
+        actual = keys_lc.get(str(key or "").lower())
+        if actual is not None:
+            return _host_onboarding_safe_str(obj.get(actual))
+    return ""
+
+
+def _my_elaralo_public_asset_url(asset: Any) -> str:
+    if isinstance(asset, dict):
+        return _host_onboarding_safe_str(asset.get("url"))
+    return ""
+
+
+def _my_elaralo_human_profile_card_from_version(
+    *,
+    brand_name: str,
+    member_id: str,
+    version_row: Any,
+    session: Optional[Dict[str, Any]],
+    mapping: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    version_id = _my_elaralo_row_value(version_row, "version_id", "versionId")
+    if not version_id:
+        return None
+    try:
+        profile = _host_onboarding_json_loads(_my_elaralo_row_value(version_row, "profile_json", "profileJson"), {})
+    except Exception:
+        profile = {}
+    if not isinstance(profile, dict):
+        profile = {}
+
+    payload = _host_onboarding_public_payload_from_profile(profile)
+    public_profile = dict(payload.get("public_profile") or {})
+    public_page = dict(payload.get("public_page") or {})
+    quick_ref = dict(public_profile.get("quick_reference_summary") or {})
+    private_profile = dict(profile.get("private_profile") or {})
+    profile_session = dict(profile.get("session") or {})
+    connect_platform = dict(profile.get("connect_platform") or {})
+    ai_profile = dict(profile.get("ai_profile") or {})
+    ai_connect = dict(ai_profile.get("connect_platform") or {})
+    basics = dict((session or {}).get("basics") or {})
+
+    display_name = _host_onboarding_safe_str(
+        public_profile.get("public_display_name")
+        or public_profile.get("stage_name")
+        or quick_ref.get("public_name")
+        or (session or {}).get("host_display_name")
+        or profile_session.get("avatar")
+        or "Human Companion"
+    )
+
+    avatar_key = _host_onboarding_safe_str(
+        profile_session.get("avatar")
+        or connect_platform.get("avatar")
+        or ai_connect.get("avatar")
+        or _my_elaralo_row_value(mapping, "avatar")
+        or (session or {}).get("avatar")
+    )
+    if not avatar_key and session:
+        try:
+            avatar_key = _host_onboarding_avatar_key_from_session(session)
+        except Exception:
+            avatar_key = ""
+    if not avatar_key:
+        first = re.split(r"\s+", display_name.strip(), maxsplit=1)[0] if display_name.strip() else "Human"
+        avatar_key = re.sub(r"[^A-Za-z0-9]+", "-", first).strip("-") or "Human"
+
+    headshot_asset = dict(public_page.get("headshot_asset") or public_profile.get("headshot_asset") or {})
+    if not _my_elaralo_public_asset_url(headshot_asset) and session:
+        try:
+            session_headshot, _session_gallery = _host_onboarding_split_public_assets((session or {}).get("assets") or [])
+            if session_headshot:
+                headshot_asset = dict(session_headshot)
+        except Exception:
+            pass
+
+    gallery_assets = public_page.get("gallery_assets") or public_profile.get("gallery_assets") or []
+    if not isinstance(gallery_assets, list):
+        gallery_assets = []
+
+    headshot_url = (
+        _my_elaralo_public_asset_url(headshot_asset)
+        or _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "headshot_url", "headshotUrl"))
+    )
+
+    birthdate = (
+        private_profile.get("birthdate")
+        or basics.get("birthdate")
+        or quick_ref.get("birthdate")
+    )
+    generation = _host_onboarding_safe_str(
+        public_profile.get("generation")
+        or quick_ref.get("generation")
+        or _host_onboarding_generation_label(birthdate)
+    )
+    ethnicity = _host_onboarding_safe_str(
+        public_profile.get("ethnicity")
+        or quick_ref.get("ethnicity")
+        or private_profile.get("ethnicity_detail")
+        or private_profile.get("ethnicity_bucket")
+        or basics.get("ethnicity_detail")
+        or basics.get("ethnicity_bucket")
+        or private_profile.get("race_primary")
+        or basics.get("race_primary")
+    )
+    gender = _host_onboarding_safe_str(
+        public_profile.get("gender")
+        or quick_ref.get("gender")
+        or basics.get("gender_display")
+        or basics.get("gender_pick")
+    )
+
+    channel_cap = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "channel_cap", "channelCap")) or "Video"
+    live = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "live")) or "Stream"
+    eleven_voice_id = _host_onboarding_safe_str(
+        _my_elaralo_row_value(mapping, "eleven_voice_id", "elevenVoiceId")
+        or connect_platform.get("eleven_voice_id")
+        or ai_connect.get("eleven_voice_id")
+    )
+    voice_capture_url = _host_onboarding_safe_str(
+        _my_elaralo_row_value(mapping, "voice_capture_url", "voiceCaptureUrl")
+        or ((connect_platform.get("voice_capture_asset") or {}).get("url") if isinstance(connect_platform.get("voice_capture_asset"), dict) else "")
+        or ((ai_profile.get("voice_capture_asset") or {}).get("url") if isinstance(ai_profile.get("voice_capture_asset"), dict) else "")
+    )
+
+    approved_epoch_raw = _my_elaralo_row_value(version_row, "approved_epoch", "approvedEpoch")
+    try:
+        approved_epoch = float(approved_epoch_raw or 0.0)
+    except Exception:
+        approved_epoch = 0.0
+
+    return {
+        "id": f"human:{_host_onboarding_safe_str(member_id)}:{version_id}",
+        "brand": brand_name,
+        "member_id": _host_onboarding_safe_str(member_id),
+        "host_member_id": _host_onboarding_safe_str(member_id),
+        "avatar": avatar_key,
+        "companion_key": avatar_key,
+        "mapping_avatar": _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "avatar")) or avatar_key,
+        "companion_type": "Human",
+        "display_name": display_name,
+        "headline": _host_onboarding_safe_str(public_page.get("headline") or display_name),
+        "gender": gender,
+        "ethnicity": ethnicity,
+        "generation": generation,
+        "headshot_url": headshot_url,
+        "headshot_asset": headshot_asset,
+        "gallery_assets": gallery_assets,
+        "voice_capture_url": voice_capture_url,
+        "approved_version_id": version_id,
+        "approved_epoch": approved_epoch,
+        "elevenVoiceId": eleven_voice_id,
+        "eleven_voice_id": eleven_voice_id,
+        "channel_cap": channel_cap,
+        "channelCap": channel_cap,
+        "live": live,
+        "summary_public_url": f"/summary-public?versionId={quote(version_id)}&brand={quote(brand_name)}",
+        "mapping_found": bool(mapping),
+    }
+
+
+def _my_elaralo_member_human_cards_sync(
+    brand_name: str,
+    member_id: str = "",
+    public_base_url: str = "",
+) -> List[Dict[str, Any]]:
+    _ = public_base_url
+    resolved_member_id = _host_onboarding_normalize_member_id(member_id)
+    if not resolved_member_id:
+        return []
+
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        _host_onboarding_ensure_companion_export_columns_best_effort()
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        mapping_rows: List[sqlite3.Row] = []
+        try:
+            mapping_rows = cur.execute(
+                """
+                SELECT * FROM companion_mappings
+                 WHERE lower(COALESCE(brand, '')) = lower(?)
+                 ORDER BY lower(COALESCE(avatar, '')) ASC
+                """,
+                (brand_name,),
+            ).fetchall()
+        except Exception:
+            mapping_rows = []
+
+        member_mapping_rows: List[Dict[str, Any]] = []
+        for row in mapping_rows:
+            row_obj = _my_elaralo_mapping_row_to_dict(row)
+            host_member = _host_onboarding_normalize_member_id(_my_elaralo_row_value(row_obj, "host_member_id", "hostMemberId"))
+            if host_member.lower() != resolved_member_id.lower():
+                continue
+            ctype = _host_onboarding_safe_str(_my_elaralo_row_value(row_obj, "companion_type", "companionType")).lower()
+            approved_vid = _host_onboarding_safe_str(_my_elaralo_row_value(row_obj, "approved_version_id", "approvedVersionId"))
+            if ctype == "human" or approved_vid:
+                member_mapping_rows.append(row_obj)
+
+        mapping_by_version: Dict[str, Dict[str, Any]] = {}
+        mapping_by_avatar: Dict[str, Dict[str, Any]] = {}
+        for mapping in member_mapping_rows:
+            approved_vid = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "approved_version_id", "approvedVersionId"))
+            avatar_key = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "avatar"))
+            if approved_vid and approved_vid.lower() not in mapping_by_version:
+                mapping_by_version[approved_vid.lower()] = mapping
+            if avatar_key and avatar_key.lower() not in mapping_by_avatar:
+                mapping_by_avatar[avatar_key.lower()] = mapping
+
+        version_rows: List[sqlite3.Row] = []
+        try:
+            version_rows = cur.execute(
+                f"""
+                SELECT * FROM {_HOST_ONBOARDING_VERSIONS_TABLE}
+                 WHERE member_id = ?
+                 ORDER BY approved_epoch DESC, created_epoch DESC
+                 LIMIT 10
+                """,
+                (resolved_member_id,),
+            ).fetchall()
+        except Exception:
+            version_rows = []
+
+        # If the mapping references an approved version that was not returned by the member query
+        # due to historical member-id normalization differences, fetch it explicitly.
+        known_version_ids = {
+            _host_onboarding_safe_str(_my_elaralo_row_value(vr, "version_id", "versionId")).lower()
+            for vr in version_rows
+            if _host_onboarding_safe_str(_my_elaralo_row_value(vr, "version_id", "versionId"))
+        }
+        missing_version_ids = [vid for vid in mapping_by_version.keys() if vid and vid not in known_version_ids]
+        for vid in missing_version_ids[:10]:
+            try:
+                row = cur.execute(
+                    f"SELECT * FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE lower(version_id)=lower(?) LIMIT 1",
+                    (vid,),
+                ).fetchone()
+                if row is not None:
+                    version_rows.append(row)
+            except Exception:
+                pass
+
+        session_cache: Dict[str, Dict[str, Any]] = {}
+
+        def get_session(session_id: str) -> Optional[Dict[str, Any]]:
+            sid = _host_onboarding_safe_str(session_id)
+            if not sid:
+                return None
+            if sid not in session_cache:
+                try:
+                    session_cache[sid] = _host_onboarding_get_session_by_id(conn, sid) or {}
+                except Exception:
+                    session_cache[sid] = {}
+            return session_cache.get(sid) or None
+
+        cards: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for vr in version_rows:
+            version_id = _host_onboarding_safe_str(_my_elaralo_row_value(vr, "version_id", "versionId"))
+            if not version_id or version_id.lower() in seen:
+                continue
+            session = get_session(_my_elaralo_row_value(vr, "session_id", "sessionId"))
+            mapping = mapping_by_version.get(version_id.lower())
+            profile_for_repair: Dict[str, Any] = {}
+            if not mapping:
+                try:
+                    profile_for_repair = _host_onboarding_json_loads(_my_elaralo_row_value(vr, "profile_json", "profileJson"), {})
+                    p_session = dict((profile_for_repair or {}).get("session") or {}) if isinstance(profile_for_repair, dict) else {}
+                    avatar_key = _host_onboarding_safe_str(p_session.get("avatar") or ((session or {}).get("avatar") if session else ""))
+                    if avatar_key:
+                        mapping = mapping_by_avatar.get(avatar_key.lower())
+                except Exception:
+                    profile_for_repair = {}
+                    mapping = None
+            needs_mapping_repair = (
+                not mapping
+                or not _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "approved_version_id", "approvedVersionId"))
+                or not _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "headshot_url", "headshotUrl"))
+                or _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "companion_type", "companionType")).lower() != "human"
+            )
+            if needs_mapping_repair:
+                try:
+                    if not profile_for_repair:
+                        profile_for_repair = _host_onboarding_json_loads(_my_elaralo_row_value(vr, "profile_json", "profileJson"), {})
+                    repaired = _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
+                        member_id=resolved_member_id,
+                        brand_name=brand_name,
+                        version_id=version_id,
+                        profile=profile_for_repair if isinstance(profile_for_repair, dict) else {},
+                        session=session,
+                    )
+                    if repaired:
+                        mapping = repaired
+                        approved_vid = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "approved_version_id", "approvedVersionId"))
+                        avatar_key = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "avatar"))
+                        if approved_vid:
+                            mapping_by_version[approved_vid.lower()] = mapping
+                        if avatar_key:
+                            mapping_by_avatar[avatar_key.lower()] = mapping
+                except Exception:
+                    pass
+            card = _my_elaralo_human_profile_card_from_version(
+                brand_name=brand_name,
+                member_id=resolved_member_id,
+                version_row=vr,
+                session=session,
+                mapping=mapping,
+            )
+            if not card:
+                continue
+            seen.add(version_id.lower())
+            cards.append(card)
+
+        # Last-resort fallback: a Human companion mapping with a headshot but no readable version row.
+        # This keeps the card visible while the Companion Card button still uses memberId and will
+        # gracefully 404 if no approved public profile exists.
+        if not cards:
+            for mapping in member_mapping_rows:
+                avatar_key = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "avatar"))
+                headshot_url = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "headshot_url", "headshotUrl"))
+                display_name = _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "phonetic")) or (avatar_key.split("-", 1)[0] if avatar_key else "Human Companion")
+                if not avatar_key and not headshot_url:
+                    continue
+                cards.append({
+                    "id": f"human:{resolved_member_id}:{avatar_key or display_name}",
+                    "brand": brand_name,
+                    "member_id": resolved_member_id,
+                    "host_member_id": resolved_member_id,
+                    "avatar": avatar_key or display_name,
+                    "companion_key": avatar_key or display_name,
+                    "mapping_avatar": avatar_key or display_name,
+                    "companion_type": "Human",
+                    "display_name": display_name,
+                    "headline": display_name,
+                    "gender": "",
+                    "ethnicity": "",
+                    "generation": "",
+                    "headshot_url": headshot_url,
+                    "approved_version_id": _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "approved_version_id", "approvedVersionId")),
+                    "elevenVoiceId": _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "eleven_voice_id", "elevenVoiceId")),
+                    "eleven_voice_id": _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "eleven_voice_id", "elevenVoiceId")),
+                    "channel_cap": _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "channel_cap", "channelCap")) or "Video",
+                    "channelCap": _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "channel_cap", "channelCap")) or "Video",
+                    "live": _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "live")) or "Stream",
+                    "summary_public_url": f"/summary-public?memberId={quote(resolved_member_id)}&brand={quote(brand_name)}",
+                    "mapping_found": True,
+                })
+                break
+
+        cards.sort(key=lambda item: (
+            -float(item.get("approved_epoch") or 0.0),
+            _host_onboarding_safe_str(item.get("display_name")).lower(),
+            _host_onboarding_safe_str(item.get("avatar")).lower(),
+        ))
+        return cards[:1]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _my_elaralo_companion_cards_sync(
     brand: str,
     member_id: str = "",
@@ -21406,7 +22062,6 @@ def _my_elaralo_companion_cards_sync(
     gender: str = "",
     public_base_url: str = "",
 ) -> List[Dict[str, Any]]:
-    _ = member_id
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
 
     if not _is_elaralo_core_brand(brand_name):
@@ -21440,8 +22095,20 @@ def _my_elaralo_companion_cards_sync(
             add_card(card)
 
     if want_type != "ai":
-        for card in _my_elaralo_companion_cards_db_sync(brand_name, "Human", "", "", ""):
+        human_cards = _my_elaralo_member_human_cards_sync(
+            brand_name,
+            member_id=member_id,
+            public_base_url=public_base_url,
+        )
+        for card in human_cards:
             add_card(card)
+
+        # Historical fallback for non-member-scoped Elaralo rows. In normal My Elaralo use,
+        # member_id is present and the member-scoped Host Onboarding/Profile Studio card above
+        # is the source of truth for the Human Companion.
+        if not human_cards:
+            for card in _my_elaralo_companion_cards_db_sync(brand_name, "Human", "", "", ""):
+                add_card(card)
 
     out.sort(key=lambda item: (_host_onboarding_safe_str(item.get("display_name")).lower(), _host_onboarding_safe_str(item.get("avatar")).lower()))
     return out
@@ -21569,13 +22236,25 @@ async def host_onboarding_approve(session_id: str, req: HostOnboardingApproveReq
         _host_onboarding_assert_member_access(session, member_id)
         readiness = _host_onboarding_compute_readiness(session)
         if publish_scope == "limited" and not bool(readiness.get("limited_publish_allowed") is True):
-            raise HTTPException(status_code=400, detail="Limited publish is not available until basics, required photos, and derived review are complete")
-        if publish_scope == "full" and not bool(readiness.get("full_publish_ready") is True):
-            missing = [str(x).strip() for x in list(readiness.get("full_publish_missing_sections") or []) if str(x).strip()]
-            skipped = [str(x).strip() for x in list(readiness.get("full_publish_skipped_sections") or []) if str(x).strip()]
-            detail = "Full publish requires completion of all MVP profile sections."
+            missing = [str(x).strip() for x in list(readiness.get("limited_publish_missing_sections") or []) if str(x).strip()]
+            blockers = [str(x).strip() for x in list(readiness.get("limited_publish_blockers") or []) if str(x).strip()]
+            detail = "Limited publish requires basics, required photos, derived review, and a validated host voice capture."
             if missing:
-                detail += " Missing sections: " + ", ".join(missing) + "."
+                detail += " Missing requirements: " + ", ".join(missing) + "."
+            if blockers:
+                detail += " Voice capture blockers: " + " ".join(blockers)
+            raise HTTPException(status_code=400, detail=detail)
+        if publish_scope == "full" and not bool(readiness.get("full_publish_ready") is True):
+            limited_missing = [str(x).strip() for x in list(readiness.get("limited_publish_missing_sections") or []) if str(x).strip()]
+            full_missing = [str(x).strip() for x in list(readiness.get("full_publish_missing_sections") or []) if str(x).strip()]
+            skipped = [str(x).strip() for x in list(readiness.get("full_publish_skipped_sections") or []) if str(x).strip()]
+            missing: List[str] = []
+            for item in limited_missing + full_missing:
+                if item and item not in missing:
+                    missing.append(item)
+            detail = "Full publish requires completion of all MVP profile sections plus a validated host voice capture."
+            if missing:
+                detail += " Missing requirements: " + ", ".join(missing) + "."
             if skipped:
                 detail += " Skipped sections must be completed for full publish: " + ", ".join(skipped) + "."
             raise HTTPException(status_code=400, detail=detail)
@@ -21586,7 +22265,7 @@ async def host_onboarding_approve(session_id: str, req: HostOnboardingApproveReq
         version_no = int(version_no_row["max_version"] if version_no_row is not None else 0) + 1
         version_id = uuid.uuid4().hex
         profile = _host_onboarding_compile_profile(session)
-        profile = _host_onboarding_export_connect_profile(session, profile, version_id)
+        profile = _host_onboarding_export_connect_profile(session, profile, version_id, db_conn=conn)
         approved_epoch = _host_onboarding_now()
         conn.execute(
             f"INSERT INTO {_HOST_ONBOARDING_VERSIONS_TABLE} (version_id, session_id, member_id, version_no, publish_scope, profile_json, created_epoch, approved_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -21610,6 +22289,10 @@ async def host_onboarding_approve(session_id: str, req: HostOnboardingApproveReq
         )
         _host_onboarding_audit(conn, session["session_id"], member_id, "profile_approved", {"version_id": version_id, "publish_scope": publish_scope})
         conn.commit()
+        try:
+            _load_companion_mappings_sync()
+        except Exception:
+            pass
         return {
             "ok": True,
             "session": updated,
