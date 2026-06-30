@@ -54,6 +54,10 @@ function safeLower(value: any): string {
   return safeText(value).toLowerCase();
 }
 
+function stripAvatarCollisionSuffix(value: any): string {
+  return safeText(value).replace(/-\d{9}$/, "");
+}
+
 function toTitle(value: string): string {
   return value
     .split(/\s+/)
@@ -113,7 +117,7 @@ function mergeMemberPayload(prev: MemberPlanPayload, incoming: MemberPlanPayload
 }
 
 function normalizeCard(item: any, defaultBrand: string): CompanionCardItem {
-  const displayName =
+  const rawDisplayName =
     safeText(item?.display_name) ||
     safeText(item?.displayName) ||
     safeText(item?.public_name) ||
@@ -123,6 +127,7 @@ function normalizeCard(item: any, defaultBrand: string): CompanionCardItem {
     safeText(item?.firstName) ||
     safeText(item?.avatar) ||
     "Companion";
+  const displayName = stripAvatarCollisionSuffix(rawDisplayName) || "Companion";
   const avatar =
     safeText(item?.avatar) ||
     safeText(item?.companion) ||
@@ -191,7 +196,29 @@ function canonicalCompanionKeyForCard(card: CompanionCardItem | null | undefined
 
 function companionDisplayNameForCard(card: CompanionCardItem | null | undefined): string {
   const key = canonicalCompanionKeyForCard(card);
-  return safeText(card?.displayName) || safeText((card?.raw || {})?.display_name) || safeText((card?.raw || {})?.name) || key.split("-", 1)[0] || "Companion";
+  const raw = (card?.raw && typeof card.raw === "object") ? card.raw : {};
+  return stripAvatarCollisionSuffix(
+    safeText(card?.displayName) ||
+      safeText(raw?.display_name) ||
+      safeText(raw?.displayName) ||
+      safeText(raw?.name) ||
+      key.split("-", 1)[0] ||
+      "Companion",
+  );
+}
+
+function companionMappingAvatarForCard(card: CompanionCardItem | null | undefined): string {
+  const raw = (card?.raw && typeof card.raw === "object") ? card.raw : {};
+  const companionKey = canonicalCompanionKeyForCard(card);
+  const ctype = safeLower(card?.companionType || raw?.companion_type || raw?.companionType);
+  const explicitMappingAvatar =
+    safeText(raw?.mapping_avatar) ||
+    safeText(raw?.mappingAvatar) ||
+    safeText(raw?.sql_avatar) ||
+    safeText(raw?.sqlAvatar);
+  if (explicitMappingAvatar) return explicitMappingAvatar;
+  if (ctype === "ai") return companionDisplayNameForCard(card) || companionKey;
+  return safeText(card?.avatar) || safeText(raw?.avatar) || companionKey;
 }
 
 function resolveButtonUrl(rawTarget: string, fallbackPath: string): URL | null {
@@ -343,9 +370,10 @@ export default function MyElaraloCompanionSelectorClient() {
         url.searchParams.set("rebranding", brand);
 
         // Connect uses avatar/companionName for the companion_mappings SQL lookup.
-        // For Elaralo AI companions, the SQL mapping avatar is the display first name,
-        // while companionKey remains the full hyphenated filename stem used for image/card identity.
-        const mappingAvatar = (safeLower(card.companionType) === "ai" ? companionDisplayName : companionKey) || companionKey;
+        // The API can return mapping_avatar when companion_mappings.avatar has a
+        // collision suffix such as Sera-000000001. Do not strip that value for lookup;
+        // only display labels hide the suffix.
+        const mappingAvatar = companionMappingAvatarForCard(card) || companionKey;
         url.searchParams.set("avatar", mappingAvatar);
         url.searchParams.set("avatarName", mappingAvatar);
         url.searchParams.set("avatar_name", mappingAvatar);

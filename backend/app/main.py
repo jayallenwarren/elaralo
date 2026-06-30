@@ -1810,9 +1810,10 @@ async def _startup_load_companion_mappings() -> None:
 
     try:
         await run_in_threadpool(_host_onboarding_ensure_companion_export_columns_best_effort)
+        await run_in_threadpool(_deployment_run_startup_migrations_sync)
         await run_in_threadpool(_load_companion_mappings_sync)
     except Exception as e:
-        print(f"[mappings] ERROR ensuring companion mapping export schema: {e!r}")
+        print(f"[mappings] ERROR ensuring companion mapping export schema/startup migrations: {e!r}")
 
     try:
         await run_in_threadpool(_content_repair_persisted_urls_sync)
@@ -4641,10 +4642,6 @@ def _ai_companion_title_token(token: str) -> str:
     if not lower:
         return ""
     special = {
-        "genz": "GenZ",
-        "genx": "GenX",
-        "geny": "GenY",
-        "genalpha": "GenAlpha",
         "usa": "USA",
         "uk": "UK",
     }
@@ -4656,6 +4653,98 @@ def _ai_companion_title_token(token: str) -> str:
 def _ai_companion_humanize_token(token: str) -> str:
     parts = [p for p in str(token or "").replace("_", "-").split("-") if p.strip()]
     return " ".join(_ai_companion_title_token(p) for p in parts).strip()
+
+
+def _normalize_companion_generation_label(raw: Any) -> str:
+    """Normalize generation facets while staying faithful to source metadata.
+
+    This intentionally treats textual variants that mean the same generation as one
+    dropdown value (for example Gen-Z, Gen Z, and GenZ -> Generation Z). It does
+    not convert Millennials into Generation Y unless the source metadata literally
+    says Gen-Y/Generation Y.
+    """
+    s = _host_onboarding_safe_str(raw)
+    if not s:
+        return ""
+    cleaned = re.sub(r"[_\-]+", " ", s).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    key = re.sub(r"[^a-z0-9]+", "", cleaned.lower())
+    mapping = {
+        "genz": "Generation Z",
+        "generationz": "Generation Z",
+        "genx": "Generation X",
+        "generationx": "Generation X",
+        "geny": "Generation Y",
+        "generationy": "Generation Y",
+        "genalpha": "Generation Alpha",
+        "generationalpha": "Generation Alpha",
+        "babyboomer": "Baby Boomers",
+        "babyboomers": "Baby Boomers",
+    }
+    if key in mapping:
+        return mapping[key]
+    # Keep source labels such as Millennials and Classic as-is apart from spacing/case.
+    return " ".join(_ai_companion_title_token(part) for part in cleaned.split(" ") if part).strip()
+
+
+def _normalize_companion_ethnicity_label(raw: Any) -> str:
+    """Normalize ethnicity/race facet labels used in My Elaralo dropdowns."""
+    s = _host_onboarding_safe_str(raw)
+    if not s:
+        return ""
+    lc = s.strip().lower()
+    if lc in {"white", "caucasian"}:
+        return "Caucasian"
+    if "black" in lc or "african" in lc:
+        return "Black"
+    if "hispanic" in lc or "latina" in lc or "latino" in lc or "latin" in lc:
+        return "Hispanic"
+    if "asian" in lc and "middle eastern" not in lc and "north african" not in lc:
+        return "Asian"
+    if "middle eastern" in lc or "north african" in lc:
+        return "Middle Eastern"
+    if "native american" in lc or "alaska" in lc:
+        return "Native American"
+    if "pacific" in lc or "hawaiian" in lc:
+        return "Pacific Islander"
+    if "multiracial" in lc or "mixed" in lc:
+        return "Multiracial"
+    cleaned = re.sub(r"[^A-Za-z0-9 ]+", " ", s).strip()
+    return " ".join(_ai_companion_title_token(part) for part in cleaned.split() if part).strip()
+
+
+_COMPANION_AVATAR_COLLISION_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<num>\d{9})$")
+
+
+def _companion_avatar_strip_collision_suffix(raw: Any) -> str:
+    s = _host_onboarding_safe_str(raw)
+    if not s:
+        return ""
+    m = _COMPANION_AVATAR_COLLISION_SUFFIX_RE.match(s)
+    return m.group("base").strip() if m else s
+
+
+def _companion_avatar_first_name(raw: Any) -> str:
+    """Return the canonical first-name avatar base used in companion_mappings.avatar."""
+    s = _companion_avatar_strip_collision_suffix(raw)
+    if not s:
+        return ""
+    # Existing AI/historical values may include metadata after the first hyphen.
+    first = s.split("-", 1)[0].strip()
+    # Full names use the first whitespace-delimited token.
+    first = re.split(r"\s+", first, maxsplit=1)[0].strip() if first else ""
+    first = re.sub(r"[^A-Za-z0-9]+", " ", first).strip()
+    first = re.split(r"\s+", first, maxsplit=1)[0].strip() if first else ""
+    if not first:
+        return "Companion"
+    if first.islower() or first.isupper():
+        return first[:1].upper() + first[1:].lower()
+    return first[:1].upper() + first[1:]
+
+
+def _companion_avatar_display_name(raw: Any) -> str:
+    """Display helper: hide the -######### collision suffix from UI labels."""
+    return _companion_avatar_strip_collision_suffix(raw)
 
 
 def _parse_ai_companion_card_meta(raw: Any) -> Dict[str, str]:
@@ -4672,8 +4761,8 @@ def _parse_ai_companion_card_meta(raw: Any) -> Dict[str, str]:
     avatar_key = cleaned or _host_onboarding_safe_str(raw)
     first_name = _ai_companion_humanize_token(base_meta.get("first_name"))
     gender = _ai_companion_humanize_token(base_meta.get("gender"))
-    ethnicity = _ai_companion_humanize_token(base_meta.get("ethnicity"))
-    generation = _ai_companion_humanize_token(base_meta.get("generation"))
+    ethnicity = _normalize_companion_ethnicity_label(_ai_companion_humanize_token(base_meta.get("ethnicity")))
+    generation = _normalize_companion_generation_label(_ai_companion_humanize_token(base_meta.get("generation")))
     out = {
         "avatar": avatar_key,
         "companion_key": avatar_key,
@@ -4989,7 +5078,7 @@ def _lookup_companion_mapping_for_ai_media(brand: Any, avatar_key: Any) -> Dict[
         resolved = _resolve_elaralo_ai_companion_key(brand_name, avatar_s) or avatar_s
         first = _elaralo_ai_first_token(resolved)
         if first and first.lower() != avatar_s.lower():
-            fallback = _lookup_companion_mapping(brand_name, first)
+            fallback = _lookup_companion_mapping(brand_name, first) or _lookup_companion_mapping_by_avatar_base(brand_name, first)
             if isinstance(fallback, dict):
                 out = dict(fallback)
                 out["avatar"] = resolved
@@ -19734,13 +19823,13 @@ def _host_onboarding_generation_label(birthdate: Any) -> str:
     dt = _host_onboarding_parse_birthdate(birthdate)
     year = int(dt.year) if dt else 0
     if year >= 1997:
-        return "Gen-Z"
+        return "Generation Z"
     if year >= 1981:
         return "Millennials"
     if year >= 1965:
-        return "Generation-X"
+        return "Generation X"
     if year >= 1946:
-        return "Baby-Boomers"
+        return "Baby Boomers"
     return "Classic"
 
 
@@ -19783,15 +19872,15 @@ def _host_onboarding_primary_public_name(basics: Dict[str, Any]) -> str:
 
 
 def _host_onboarding_avatar_key_from_session(session: Dict[str, Any]) -> str:
+    """Return the Human Companion avatar base for companion_mappings.avatar.
+
+    Human avatar values in companion_mappings are first-name based. Duplicate names
+    for the same brand get a database-assigned -######### suffix at export/upsert
+    time, where the DB can see existing rows.
+    """
     basics = dict(session.get("basics") or {})
     public_name = _host_onboarding_primary_public_name(basics)
-    first = re.split(r"\s+", public_name.strip())[0] if public_name.strip() else "Companion"
-    first = re.sub(r"[^A-Za-z0-9]+", " ", first).strip().title() or "Companion"
-    gender = _host_onboarding_gender_label(basics.get("gender_display") or basics.get("gender_pick"))
-    race = _host_onboarding_race_label(basics.get("race_primary") or basics.get("race_detail"))
-    generation = _host_onboarding_generation_label(basics.get("birthdate"))
-    parts = [first, gender, race, generation]
-    return "-".join([re.sub(r"\s+", "-", p.strip()) for p in parts if p and p.strip()])
+    return _companion_avatar_first_name(public_name) or "Companion"
 
 
 def _host_onboarding_gallery_description_for_slot(slot_key: Any) -> str:
@@ -20219,6 +20308,11 @@ def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Conne
     _host_onboarding_create_companion_mapping_triggers_on_conn(conn)
     _host_onboarding_backfill_brand_id_for_brand_on_conn(conn, "Elaralo")
     _host_onboarding_backfill_companion_ids_on_conn(conn)
+    # Avatar identity normalization is intentionally not run from this generic
+    # schema helper. It is applied once at app startup by
+    # _deployment_run_startup_migrations_sync(), then recorded in
+    # app_startup_migrations so ordinary schema checks do not rewrite identity
+    # values on every request.
 
 
 def _host_onboarding_ensure_companion_export_columns_best_effort() -> None:
@@ -20236,6 +20330,426 @@ def _host_onboarding_ensure_companion_export_columns_best_effort() -> None:
         pass
 
 
+def _host_onboarding_find_existing_human_mapping_row_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    member_id: str,
+    approved_version_id: str = "",
+    legacy_avatar: str = "",
+) -> Optional[sqlite3.Row]:
+    """Find the existing Human mapping row for a host/version before changing avatar."""
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        member_norm = _host_onboarding_normalize_member_id(member_id)
+        version_norm = _host_onboarding_safe_str(approved_version_id)
+        legacy_norm = _host_onboarding_safe_str(legacy_avatar)
+        return cur.execute(
+            """
+            SELECT rowid AS _rowid, *
+              FROM companion_mappings
+             WHERE lower(COALESCE(brand, '')) = lower(?)
+               AND (
+                    (? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?))
+                 OR (? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?))
+                 OR (? <> '' AND lower(COALESCE(avatar, '')) = lower(?))
+               )
+               AND (
+                    lower(COALESCE(companion_type, '')) = 'human'
+                 OR COALESCE(approved_version_id, '') <> ''
+                 OR COALESCE(host_member_id, '') <> ''
+               )
+             ORDER BY
+               CASE
+                 WHEN ? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?) THEN 0
+                 WHEN ? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?) THEN 1
+                 ELSE 2
+               END,
+               rowid
+             LIMIT 1
+            """,
+            (
+                "Elaralo",
+                member_norm, member_norm,
+                version_norm, version_norm,
+                legacy_norm, legacy_norm,
+                version_norm, version_norm,
+                member_norm, member_norm,
+            ),
+        ).fetchone()
+    except Exception:
+        return None
+
+
+def _host_onboarding_unique_avatar_for_brand_on_conn(
+    conn: sqlite3.Connection,
+    brand: str,
+    proposed_avatar: Any,
+    *,
+    current_rowid: Optional[int] = None,
+) -> str:
+    """Return first-name avatar or first-name-######### for duplicate names.
+
+    The first row for a name/brand receives the bare first name. Later rows with
+    the same first-name base receive the lowest available nine-digit suffix.
+    """
+    base = _companion_avatar_first_name(proposed_avatar) or "Companion"
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    used_exact = False
+    used_nums: Set[int] = set()
+    try:
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT rowid AS _rowid, avatar
+              FROM companion_mappings
+             WHERE lower(COALESCE(brand, '')) = lower(?)
+               AND (lower(COALESCE(avatar, '')) = lower(?) OR lower(COALESCE(avatar, '')) LIKE lower(?))
+             ORDER BY rowid
+            """,
+            (brand_name, base, f"{base}-%"),
+        ).fetchall()
+        for row in rows or []:
+            try:
+                rowid = int(row["_rowid"] if isinstance(row, sqlite3.Row) else row[0])
+            except Exception:
+                rowid = 0
+            if current_rowid is not None and rowid == int(current_rowid):
+                continue
+            avatar = _host_onboarding_safe_str(row["avatar"] if isinstance(row, sqlite3.Row) else row[1])
+            if avatar.lower() == base.lower():
+                used_exact = True
+                continue
+            m = _COMPANION_AVATAR_COLLISION_SUFFIX_RE.match(avatar)
+            if m and m.group("base").lower() == base.lower():
+                try:
+                    used_nums.add(int(m.group("num")))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if not used_exact:
+        return base
+    n = 1
+    while n in used_nums:
+        n += 1
+    return f"{base}-{n:09d}"
+
+
+def _host_onboarding_normalize_companion_mapping_avatars_for_brand_on_conn(conn: sqlite3.Connection, brand: str = "Elaralo") -> None:
+    """Best-effort one-time normalization for existing Elaralo mapping rows.
+
+    Existing rows are processed in rowid order so the first instance of a name keeps
+    the bare first name and later instances receive -######### suffixes. DulceMoon
+    and other white-label rows are intentionally not touched by the Elaralo startup
+    repair path.
+    """
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT rowid AS _rowid, avatar
+              FROM companion_mappings
+             WHERE lower(COALESCE(brand, '')) = lower(?)
+             ORDER BY rowid
+            """,
+            (brand_name,),
+        ).fetchall()
+        used: Dict[str, Set[int]] = {}
+        has_bare: Set[str] = set()
+        updates: List[Tuple[str, int]] = []
+        for row in rows or []:
+            rowid = int(row["_rowid"])
+            old_avatar = _host_onboarding_safe_str(row["avatar"])
+            base = _companion_avatar_first_name(old_avatar) or "Companion"
+            base_key = base.lower()
+            used.setdefault(base_key, set())
+            if base_key not in has_bare:
+                new_avatar = base
+                has_bare.add(base_key)
+            else:
+                n = 1
+                while n in used[base_key]:
+                    n += 1
+                used[base_key].add(n)
+                new_avatar = f"{base}-{n:09d}"
+            if new_avatar != old_avatar:
+                updates.append((new_avatar, rowid))
+        for new_avatar, rowid in updates:
+            cur.execute("UPDATE companion_mappings SET avatar = ? WHERE rowid = ?", (new_avatar, rowid))
+    except Exception:
+        pass
+
+
+
+
+_STARTUP_MIGRATION_COMPANION_AVATAR_IDENTITY_V9_2_18 = "v9_2_18_companion_avatar_identity_generation_ethnicity"
+
+
+def _startup_migrations_ensure_table_on_conn(conn: sqlite3.Connection) -> None:
+    """Create the one-time startup migration ledger.
+
+    This table lives in the same econnect.sqlite3 DB as companion_mappings, so the
+    deployment migration is recorded with the data it changed. If the packaged DB
+    is replaced by a future deployment that lacks the marker, the migration runs
+    for that new DB exactly once.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_startup_migrations (
+            migration_id TEXT PRIMARY KEY,
+            applied_at_epoch INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            details_json TEXT
+        )
+        """
+    )
+
+
+def _startup_migration_is_applied_on_conn(conn: sqlite3.Connection, migration_id: str) -> bool:
+    try:
+        _startup_migrations_ensure_table_on_conn(conn)
+        row = conn.execute(
+            "SELECT status FROM app_startup_migrations WHERE migration_id = ? LIMIT 1",
+            (_host_onboarding_safe_str(migration_id),),
+        ).fetchone()
+        return bool(row and _host_onboarding_safe_str(row[0]).lower() == "applied")
+    except Exception:
+        return False
+
+
+def _startup_migration_mark_applied_on_conn(conn: sqlite3.Connection, migration_id: str, details: Dict[str, Any]) -> None:
+    _startup_migrations_ensure_table_on_conn(conn)
+    conn.execute(
+        """
+        INSERT INTO app_startup_migrations (migration_id, applied_at_epoch, status, details_json)
+        VALUES (?, ?, 'applied', ?)
+        ON CONFLICT(migration_id) DO UPDATE SET
+            applied_at_epoch = excluded.applied_at_epoch,
+            status = excluded.status,
+            details_json = excluded.details_json
+        """,
+        (
+            _host_onboarding_safe_str(migration_id),
+            int(_host_onboarding_now()),
+            _host_onboarding_json_dumps(details or {}),
+        ),
+    )
+
+
+def _startup_normalize_companion_mapping_metadata_for_brand_on_conn(conn: sqlite3.Connection, brand: str = "Elaralo") -> Dict[str, Any]:
+    """Normalize existing metadata columns when present.
+
+    Current live companion_mappings does not always include generation/ethnicity
+    columns. This function is defensive: if those columns are absent, it records
+    zero updates and exits. If they exist in a future DB, it normalizes values to
+    the same compact dropdown set used by the My Elaralo catalog.
+    """
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    generation_updates = 0
+    ethnicity_updates = 0
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(companion_mappings)")
+        cols = {str(row[1] or "").strip().lower() for row in cur.fetchall()}
+        if "brand" not in cols:
+            return {"generation_updates": 0, "ethnicity_updates": 0}
+
+        rows = cur.execute(
+            """
+            SELECT rowid AS _rowid, *
+              FROM companion_mappings
+             WHERE lower(COALESCE(brand, '')) = lower(?)
+             ORDER BY rowid
+            """,
+            (brand_name,),
+        ).fetchall()
+
+        if "generation" in cols:
+            for row in rows or []:
+                try:
+                    old = _host_onboarding_safe_str(row["generation"])
+                    new_value = _normalize_companion_generation_label(old)
+                    if new_value and new_value != old:
+                        cur.execute("UPDATE companion_mappings SET generation = ? WHERE rowid = ?", (new_value, int(row["_rowid"])))
+                        generation_updates += 1
+                except Exception:
+                    continue
+
+        if "ethnicity" in cols:
+            for row in rows or []:
+                try:
+                    old = _host_onboarding_safe_str(row["ethnicity"])
+                    new_value = _normalize_companion_ethnicity_label(old)
+                    if new_value and new_value != old:
+                        cur.execute("UPDATE companion_mappings SET ethnicity = ? WHERE rowid = ?", (new_value, int(row["_rowid"])))
+                        ethnicity_updates += 1
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return {"generation_updates": generation_updates, "ethnicity_updates": ethnicity_updates}
+
+
+def _startup_run_companion_avatar_identity_migration_on_conn(conn: sqlite3.Connection, brand: str = "Elaralo") -> Dict[str, Any]:
+    """Apply the Elaralo companion identity migration once for the deployment.
+
+    Effects:
+      - Existing Elaralo companion_mappings.avatar values become first-name IDs.
+      - Duplicate first names within the brand receive -######### suffixes.
+      - brand_id / companion_id repair and DB triggers remain in place.
+      - Generation/Ethnicity columns are normalized if present.
+
+    This is idempotent and safe to run inside a deployment startup transaction.
+    The surrounding one-time ledger prevents re-running after success.
+    """
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    _host_onboarding_ensure_companion_export_columns_on_conn(conn)
+
+    before_rows = cur.execute(
+        """
+        SELECT rowid AS _rowid, avatar
+          FROM companion_mappings
+         WHERE lower(COALESCE(brand, '')) = lower(?)
+         ORDER BY rowid
+        """,
+        (brand_name,),
+    ).fetchall()
+    before_by_rowid = {
+        int(row["_rowid"]): _host_onboarding_safe_str(row["avatar"])
+        for row in before_rows or []
+    }
+
+    _host_onboarding_normalize_companion_mapping_avatars_for_brand_on_conn(conn, brand_name)
+    metadata_result = _startup_normalize_companion_mapping_metadata_for_brand_on_conn(conn, brand_name)
+
+    after_rows = cur.execute(
+        """
+        SELECT rowid AS _rowid, avatar
+          FROM companion_mappings
+         WHERE lower(COALESCE(brand, '')) = lower(?)
+         ORDER BY rowid
+        """,
+        (brand_name,),
+    ).fetchall()
+    avatar_updates: List[Dict[str, Any]] = []
+    for row in after_rows or []:
+        rowid = int(row["_rowid"])
+        old_avatar = before_by_rowid.get(rowid, "")
+        new_avatar = _host_onboarding_safe_str(row["avatar"])
+        if old_avatar != new_avatar:
+            avatar_updates.append({"rowid": rowid, "old": old_avatar, "new": new_avatar})
+
+    return {
+        "brand": brand_name,
+        "rows_scanned": len(before_by_rowid),
+        "avatar_updates": avatar_updates,
+        "avatar_update_count": len(avatar_updates),
+        "generation_update_count": int((metadata_result or {}).get("generation_updates") or 0),
+        "ethnicity_update_count": int((metadata_result or {}).get("ethnicity_updates") or 0),
+    }
+
+
+def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
+    """Run deployment-time DB migrations exactly once per DB.
+
+    This is called by the FastAPI startup hook after the companion mapping DB has
+    been discovered and made writable. A small file lock prevents two scaled
+    workers from applying the same migration concurrently. Failures are logged and
+    returned, but are not allowed to crash platform startup.
+    """
+    migration_id = _STARTUP_MIGRATION_COMPANION_AVATAR_IDENTITY_V9_2_18
+    db_path = ""
+    try:
+        db_path = _get_companion_mappings_db_path(for_write=True) or _ensure_econnect_db_seeded()
+        if not db_path:
+            return {"ok": False, "skipped": True, "reason": "no_db_path", "migration_id": migration_id}
+
+        lock_path = f"{db_path}.startup-migrations.lock"
+        with FileLock(lock_path, timeout=30):
+            conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                try:
+                    conn.execute("PRAGMA busy_timeout=5000;")
+                except Exception:
+                    pass
+                _startup_migrations_ensure_table_on_conn(conn)
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
+
+                conn.execute("BEGIN IMMEDIATE")
+                # Re-check the marker inside the write transaction. The file lock
+                # protects normal App Service multi-worker startup; this DB-level
+                # check keeps the migration safe if the lock cannot coordinate a
+                # future deployment layout.
+                if _startup_migration_is_applied_on_conn(conn, migration_id):
+                    conn.commit()
+                    return {"ok": True, "skipped": True, "reason": "already_applied", "migration_id": migration_id, "db_path": db_path}
+
+                result = _startup_run_companion_avatar_identity_migration_on_conn(conn, "Elaralo")
+                _startup_migration_mark_applied_on_conn(conn, migration_id, result)
+                conn.commit()
+                print(
+                    "[startup-migration] applied "
+                    f"{migration_id}: rows_scanned={result.get('rows_scanned')} "
+                    f"avatar_updates={result.get('avatar_update_count')} "
+                    f"generation_updates={result.get('generation_update_count')} "
+                    f"ethnicity_updates={result.get('ethnicity_update_count')}"
+                )
+                return {"ok": True, "skipped": False, "migration_id": migration_id, "db_path": db_path, **result}
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[startup-migration] ERROR applying {migration_id} to {db_path or '<unknown>'}: {e!r}")
+        return {"ok": False, "skipped": False, "migration_id": migration_id, "db_path": db_path, "error": repr(e)}
+
+def _lookup_companion_mapping_by_avatar_base(brand: str, avatar_base: Any) -> Optional[Dict[str, Any]]:
+    """Lookup a mapping by first-name base, preferring the bare first-name row."""
+    b = _norm_key(brand) or "elaralo"
+    base = _companion_avatar_first_name(avatar_base)
+    if not base:
+        return None
+    exact = _lookup_companion_mapping(brand, base)
+    if exact:
+        return exact
+    base_lc = base.lower()
+    candidates: List[Tuple[int, str, Dict[str, Any]]] = []
+    for (row_brand, row_avatar), mapping in list(_COMPANION_MAPPINGS.items()):
+        if row_brand != b:
+            continue
+        avatar = _host_onboarding_safe_str((mapping or {}).get("avatar"))
+        m = _COMPANION_AVATAR_COLLISION_SUFFIX_RE.match(avatar)
+        if not m or m.group("base").lower() != base_lc:
+            continue
+        try:
+            n = int(m.group("num"))
+        except Exception:
+            n = 999999999
+        candidates.append((n, avatar.lower(), mapping))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return dict(candidates[0][2])
+
+
 def _host_onboarding_upsert_connect_companion_mapping(
     *,
     member_id: str,
@@ -20249,16 +20763,20 @@ def _host_onboarding_upsert_connect_companion_mapping(
     voice_clone_status: str = "",
     voice_clone_error: str = "",
     conn: Optional[sqlite3.Connection] = None,
-) -> None:
+) -> str:
     """Create/update the Elaralo Human companion mapping exported by Host Onboarding.
 
     Human Companion rows are created by Host Onboarding after a limited/full approval.
     They are always Human + Stream + Video. AI mapping rows are not modified here.
+
+    The companion_mappings.avatar value is first-name based. The first row for a
+    name/brand uses the bare first name; later rows receive -######### suffixes.
     """
-    avatar_key = _host_onboarding_safe_str(avatar_key)
+    proposed_avatar = _companion_avatar_first_name(avatar_key) or _host_onboarding_safe_str(avatar_key)
     member_id = _host_onboarding_normalize_member_id(member_id)
-    if not avatar_key or not member_id:
-        return
+    approved_version_id_norm = _host_onboarding_safe_str(approved_version_id)
+    if not proposed_avatar or not member_id:
+        return _host_onboarding_safe_str(avatar_key)
 
     owns_conn = conn is None
     if owns_conn:
@@ -20271,32 +20789,52 @@ def _host_onboarding_upsert_connect_companion_mapping(
         except Exception:
             pass
 
+    final_avatar = proposed_avatar
     try:
         assert conn is not None
+        conn.row_factory = sqlite3.Row
         _host_onboarding_ensure_companion_export_columns_on_conn(conn)
         cur = conn.cursor()
 
         brand_id = _host_onboarding_resolve_brand_id_for_brand_on_conn(conn, "Elaralo")
-        existing = cur.execute(
-            "SELECT id, companion_id, brand_id FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
-            ("Elaralo", avatar_key),
-        ).fetchone()
+        existing = _host_onboarding_find_existing_human_mapping_row_on_conn(
+            conn,
+            member_id=member_id,
+            approved_version_id=approved_version_id_norm,
+            legacy_avatar=_host_onboarding_safe_str(avatar_key),
+        )
+        current_rowid: Optional[int] = None
+        if existing is not None:
+            try:
+                current_rowid = int(existing["_rowid"])
+            except Exception:
+                current_rowid = None
+
+        final_avatar = _host_onboarding_unique_avatar_for_brand_on_conn(
+            conn,
+            "Elaralo",
+            proposed_avatar,
+            current_rowid=current_rowid,
+        )
+
         if existing is None:
             if brand_id is not None:
                 cur.execute(
                     "INSERT INTO companion_mappings (brand, avatar, brand_id) VALUES (?, ?, ?)",
-                    ("Elaralo", avatar_key, brand_id),
+                    ("Elaralo", final_avatar, brand_id),
                 )
             else:
                 cur.execute(
                     "INSERT INTO companion_mappings (brand, avatar) VALUES (?, ?)",
-                    ("Elaralo", avatar_key),
+                    ("Elaralo", final_avatar),
                 )
+            current_rowid = int(cur.lastrowid)
 
         cur.execute(
             """
             UPDATE companion_mappings
-               SET brand_id = CASE
+               SET avatar = ?,
+                   brand_id = CASE
                         WHEN ? IS NOT NULL AND (brand_id IS NULL OR trim(CAST(brand_id AS TEXT)) = '') THEN ?
                         ELSE brand_id
                    END,
@@ -20313,23 +20851,23 @@ def _host_onboarding_upsert_connect_companion_mapping(
                    eleven_voice_name = COALESCE(NULLIF(?, ''), eleven_voice_name),
                    voice_clone_status = ?,
                    voice_clone_error = ?
-             WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)
+             WHERE rowid = ?
             """,
             (
+                final_avatar,
                 brand_id,
                 brand_id,
                 member_id,
-                avatar_key.split('-', 1)[0],
+                _companion_avatar_display_name(final_avatar),
                 _host_onboarding_safe_str(headshot_url),
                 _host_onboarding_safe_str(voice_capture_url),
                 _host_onboarding_json_dumps(public_gallery_assets or []),
-                _host_onboarding_safe_str(approved_version_id),
+                approved_version_id_norm,
                 _host_onboarding_safe_str(eleven_voice_id),
                 _host_onboarding_safe_str(eleven_voice_name),
                 _host_onboarding_safe_str(voice_clone_status),
                 _host_onboarding_safe_str(voice_clone_error),
-                "Elaralo",
-                avatar_key,
+                current_rowid,
             ),
         )
         if owns_conn:
@@ -20342,7 +20880,7 @@ def _host_onboarding_upsert_connect_companion_mapping(
             _load_companion_mappings_sync()
         except Exception:
             pass
-
+    return final_avatar
 
 def _host_onboarding_upsert_hco_row(
     *,
@@ -20397,7 +20935,7 @@ def _host_onboarding_upsert_hco_row(
                 last_name = parts[1].strip()
         birthday = _host_onboarding_safe_str(private_profile.get("birthdate"))
         gender = _host_onboarding_safe_str(public_profile.get("gender"))
-        ethnicity = _host_onboarding_safe_str(private_profile.get("ethnicity_detail") or private_profile.get("ethnicity_bucket"))
+        ethnicity = _normalize_companion_ethnicity_label(private_profile.get("race_primary") or basics.get("race_primary") or private_profile.get("ethnicity_detail") or private_profile.get("ethnicity_bucket"))
         wix_id = f"host_onboarding::{_host_onboarding_safe_str(member_id)}::{avatar_key}"
         source_file = "host_onboarding_approved_version"
         now_epoch = int(_host_onboarding_now())
@@ -20466,6 +21004,23 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
     ai_profile = dict(profile.get("ai_profile") or {})
     private_profile = dict(profile.get("private_profile") or {})
     avatar_key = _host_onboarding_avatar_key_from_session(session)
+    try:
+        if db_conn is not None:
+            existing_mapping = _host_onboarding_find_existing_human_mapping_row_on_conn(
+                db_conn,
+                member_id=_host_onboarding_safe_str(session.get("member_id")),
+                approved_version_id=version_id,
+                legacy_avatar=avatar_key,
+            )
+            existing_rowid = int(existing_mapping["_rowid"]) if existing_mapping is not None else None
+            avatar_key = _host_onboarding_unique_avatar_for_brand_on_conn(
+                db_conn,
+                "Elaralo",
+                avatar_key,
+                current_rowid=existing_rowid,
+            )
+    except Exception:
+        avatar_key = _host_onboarding_avatar_key_from_session(session)
     headshot_asset, gallery_assets = _host_onboarding_split_public_assets(assets)
     voice_asset = next((asset for asset in assets if _host_onboarding_safe_str((asset or {}).get("slot_key")) == _HOST_ONBOARDING_VOICE_SLOT and _host_onboarding_safe_str((asset or {}).get("url"))), None)
 
@@ -20507,7 +21062,7 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
-    _host_onboarding_upsert_connect_companion_mapping(
+    saved_avatar_key = _host_onboarding_upsert_connect_companion_mapping(
         member_id=_host_onboarding_safe_str(session.get("member_id")),
         avatar_key=avatar_key,
         headshot_url=_host_onboarding_safe_str((exported_headshot or {}).get("url")),
@@ -20520,6 +21075,8 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         voice_clone_error=_host_onboarding_safe_str((eleven_voice or {}).get("error")),
         conn=db_conn,
     )
+    if saved_avatar_key:
+        avatar_key = saved_avatar_key
     _host_onboarding_upsert_hco_row(
         member_id=_host_onboarding_safe_str(session.get("member_id")),
         avatar_key=avatar_key,
@@ -20643,7 +21200,7 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
     eleven_voice_name = _host_onboarding_safe_str(connect_platform.get("eleven_voice_name") or ai_connect.get("eleven_voice_name"))
     voice_clone_status = _host_onboarding_safe_str(connect_platform.get("voice_clone_status") or ai_connect.get("voice_clone_status"))
 
-    _host_onboarding_upsert_connect_companion_mapping(
+    saved_avatar_key = _host_onboarding_upsert_connect_companion_mapping(
         member_id=resolved_member_id,
         avatar_key=avatar_key,
         headshot_url=headshot_url,
@@ -20655,6 +21212,8 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
         voice_clone_status=voice_clone_status or "repaired_from_approved_profile",
         voice_clone_error="",
     )
+    if saved_avatar_key:
+        avatar_key = saved_avatar_key
     try:
         _host_onboarding_upsert_hco_row(
             member_id=resolved_member_id,
@@ -21818,8 +22377,8 @@ def _my_elaralo_companion_cards_db_sync(brand: str, companion_type: str = "", ge
                 "display_name": display_name,
                 "headline": _host_onboarding_safe_str(public_page.get("headline") or display_name),
                 "gender": _host_onboarding_safe_str(public_profile.get("gender") or quick_ref.get("gender")),
-                "ethnicity": _host_onboarding_safe_str(public_profile.get("ethnicity") or quick_ref.get("ethnicity")),
-                "generation": _host_onboarding_safe_str(public_profile.get("generation") or quick_ref.get("generation")),
+                "ethnicity": _normalize_companion_ethnicity_label(public_profile.get("ethnicity") or quick_ref.get("ethnicity")),
+                "generation": _normalize_companion_generation_label(public_profile.get("generation") or quick_ref.get("generation")),
                 "headshot_url": _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or row["headshot_url"]),
                 "approved_version_id": _host_onboarding_safe_str(row["approved_version_id"]),
                 "elevenVoiceId": _host_onboarding_safe_str(row["eleven_voice_id"]),
@@ -21838,8 +22397,8 @@ def _my_elaralo_companion_cards_db_sync(brand: str, companion_type: str = "", ge
                 "display_name": _host_onboarding_safe_str(public_profile.get("public_display_name") or avatar_key),
                 "headline": _host_onboarding_safe_str(public_page.get("headline") or public_profile.get("public_display_name") or avatar_key),
                 "gender": _host_onboarding_safe_str(public_profile.get("gender")),
-                "ethnicity": _host_onboarding_safe_str(public_profile.get("ethnicity")),
-                "generation": _host_onboarding_safe_str(public_profile.get("generation")),
+                "ethnicity": _normalize_companion_ethnicity_label(public_profile.get("ethnicity")),
+                "generation": _normalize_companion_generation_label(public_profile.get("generation")),
                 "headshot_url": _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or row["headshot_url"]),
                 "approved_version_id": "",
                 "elevenVoiceId": _host_onboarding_safe_str(row["eleven_voice_id"]),
@@ -21979,10 +22538,10 @@ def _my_elaralo_human_profile_card_from_version(
     )
 
     avatar_key = _host_onboarding_safe_str(
-        profile_session.get("avatar")
+        _my_elaralo_row_value(mapping, "avatar")
         or connect_platform.get("avatar")
         or ai_connect.get("avatar")
-        or _my_elaralo_row_value(mapping, "avatar")
+        or profile_session.get("avatar")
         or (session or {}).get("avatar")
     )
     if not avatar_key and session:
@@ -22017,20 +22576,28 @@ def _my_elaralo_human_profile_card_from_version(
         or basics.get("birthdate")
         or quick_ref.get("birthdate")
     )
-    generation = _host_onboarding_safe_str(
+    generation = _normalize_companion_generation_label(
         public_profile.get("generation")
         or quick_ref.get("generation")
         or _host_onboarding_generation_label(birthdate)
     )
-    ethnicity = _host_onboarding_safe_str(
-        public_profile.get("ethnicity")
-        or quick_ref.get("ethnicity")
-        or private_profile.get("ethnicity_detail")
-        or private_profile.get("ethnicity_bucket")
-        or basics.get("ethnicity_detail")
-        or basics.get("ethnicity_bucket")
+    race_source = (
+        public_profile.get("race")
+        or quick_ref.get("race")
         or private_profile.get("race_primary")
         or basics.get("race_primary")
+        or private_profile.get("race_detail")
+        or basics.get("race_detail")
+    )
+    ethnicity = _normalize_companion_ethnicity_label(
+        _host_onboarding_race_label(race_source) if _host_onboarding_safe_str(race_source) else (
+            public_profile.get("ethnicity")
+            or quick_ref.get("ethnicity")
+            or private_profile.get("ethnicity_detail")
+            or private_profile.get("ethnicity_bucket")
+            or basics.get("ethnicity_detail")
+            or basics.get("ethnicity_bucket")
+        )
     )
     gender = _host_onboarding_safe_str(
         public_profile.get("gender")
