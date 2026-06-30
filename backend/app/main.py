@@ -1484,12 +1484,12 @@ def _load_companion_mappings_sync() -> None:
                 "brand",
                 "rebranding",
                 "company",
-                "brand_id",
                 "Brand",
                 default="",
            )
             or ""
        ).strip()
+        brand_id_value = str(get_col("brand_id", "brandId", "Brand_ID", "BrandId", default="") or "").strip()
 
         # Core brand behavior:
         # - Wix sends rebrandingKey="" (or NULL) when there is NO white label.
@@ -1518,6 +1518,7 @@ def _load_companion_mappings_sync() -> None:
         d[key] = {
             "brand": brand,
             "avatar": avatar,
+            "brand_id": brand_id_value,
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
             # UI uses channel_cap to decide whether to show the video/play controls.
             "channel_cap": str(get_col("channel_cap", "channelCap", "chanel_cap", "channel_capability", default="") or "").strip(),
@@ -1800,11 +1801,18 @@ async def get_bootstrap_mapping(
 
 @app.on_event("startup")
 async def _startup_load_companion_mappings() -> None:
-    # Load once at startup; do not block on errors.
+    # Load once first so _COMPANION_MAPPINGS_SOURCE points at the writable econnect DB.
+    # Then run the Host Onboarding identity-column schema repair and reload the cache.
     try:
         await run_in_threadpool(_load_companion_mappings_sync)
     except Exception as e:
         print(f"[mappings] ERROR loading companion mappings: {e!r}")
+
+    try:
+        await run_in_threadpool(_host_onboarding_ensure_companion_export_columns_best_effort)
+        await run_in_threadpool(_load_companion_mappings_sync)
+    except Exception as e:
+        print(f"[mappings] ERROR ensuring companion mapping export schema: {e!r}")
 
     try:
         await run_in_threadpool(_content_repair_persisted_urls_sync)
@@ -6638,7 +6646,8 @@ def _fetch_onboarding_join_for_avatar_sync(avatar: str) -> Optional[Dict[str, An
     """Fetch the latest onboarding row for the given avatar (companionName).
 
     Primary path (preferred):
-        a.companion_id = b.id  AND  lower(b.avatar)=lower(?)
+        a.companion_id = b.companion_id when available, otherwise b.id,
+        AND lower(b.avatar)=lower(?)
 
     Fallback path (if companion_id column is missing on onboarding table):
         lower(a.first_name)=lower(?)  AND  lower(b.avatar)=lower(?)
@@ -6665,7 +6674,9 @@ def _fetch_onboarding_join_for_avatar_sync(avatar: str) -> Optional[Dict[str, An
         if not _table_exists(conn, mapping_table) or not _table_exists(conn, _HCO_TABLE):
             return None
 
-        use_fk = _column_exists(conn, _HCO_TABLE, "companion_id") and _column_exists(conn, mapping_table, "id")
+        has_hco_companion_id = _column_exists(conn, _HCO_TABLE, "companion_id")
+        mapping_join_col = "companion_id" if _column_exists(conn, mapping_table, "companion_id") else ("id" if _column_exists(conn, mapping_table, "id") else "")
+        use_fk = bool(has_hco_companion_id and mapping_join_col)
 
         cur = conn.cursor()
         if use_fk:
@@ -6679,7 +6690,7 @@ def _fetch_onboarding_join_for_avatar_sync(avatar: str) -> Optional[Dict[str, An
                         a.*
                 FROM    {_HCO_TABLE} a,
                         {mapping_table} b
-                WHERE   a.companion_id = b.id
+                WHERE   a.companion_id = b.{mapping_join_col}
                   AND   lower(b.avatar) = lower(?)
                 ORDER BY COALESCE(a.ingested_at, 0) DESC,
                          COALESCE(a.created_date, '') DESC
@@ -19844,6 +19855,46 @@ def _host_onboarding_eleven_voice_display_name(session: Dict[str, Any], profile:
     return _host_onboarding_safe_str(avatar_key).replace("-", " ") or "Elaralo Human Companion"
 
 
+_ELEVENLABS_LABEL_VALUE_MAX_CHARS = 50
+
+
+def _host_onboarding_eleven_label_value(value: Any, max_chars: int = _ELEVENLABS_LABEL_VALUE_MAX_CHARS) -> str:
+    """Return an ElevenLabs-safe label value.
+
+    ElevenLabs rejects voice-create requests when any label value exceeds 50
+    characters. Preserve useful traceability by truncating long values and adding
+    an 8-character digest suffix so IDs/names remain distinguishable.
+    """
+    text = re.sub(r"\s+", " ", _host_onboarding_safe_str(value)).strip()
+    if not text:
+        return ""
+    try:
+        limit = int(max_chars)
+    except Exception:
+        limit = _ELEVENLABS_LABEL_VALUE_MAX_CHARS
+    limit = max(12, min(limit, _ELEVENLABS_LABEL_VALUE_MAX_CHARS))
+    if len(text) <= limit:
+        return text
+    digest = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    keep = max(1, limit - len(digest) - 1)
+    prefix = text[:keep].rstrip(" -_.:/|,")
+    if not prefix:
+        prefix = text[:keep]
+    return f"{prefix}-{digest}"[:limit]
+
+
+def _host_onboarding_sanitize_eleven_voice_labels(labels: Dict[str, Any]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for raw_key, raw_value in (labels or {}).items():
+        key = re.sub(r"[^A-Za-z0-9_-]+", "_", _host_onboarding_safe_str(raw_key)).strip("_")
+        if not key:
+            continue
+        value = _host_onboarding_eleven_label_value(raw_value)
+        if value:
+            out[key] = value
+    return out
+
+
 def _host_onboarding_build_eleven_voice_labels(session: Dict[str, Any], profile: Dict[str, Any], avatar_key: str, version_id: str) -> Dict[str, str]:
     basics = dict((session or {}).get("basics") or {})
     public_profile = dict((profile or {}).get("public_profile") or {})
@@ -19858,7 +19909,7 @@ def _host_onboarding_build_eleven_voice_labels(session: Dict[str, Any], profile:
         "generation": _host_onboarding_safe_str(public_profile.get("generation") or _host_onboarding_generation_label(basics.get("birthdate"))),
         "source": "host_onboarding_publish_export",
     }
-    return {k: v for k, v in labels.items() if _host_onboarding_safe_str(v)}
+    return _host_onboarding_sanitize_eleven_voice_labels(labels)
 
 
 def _host_onboarding_create_eleven_voice_from_asset(asset: Dict[str, Any], voice_name: str, labels: Dict[str, str]) -> Dict[str, Any]:
@@ -19884,10 +19935,11 @@ def _host_onboarding_create_eleven_voice_from_asset(asset: Dict[str, Any], voice
 
     endpoint = _elevenlabs_voice_create_endpoint()
     headers = {"xi-api-key": (os.getenv("ELEVENLABS_API_KEY", "") or "").strip()}
+    safe_labels = _host_onboarding_sanitize_eleven_voice_labels(labels or {})
     payload = {
         "name": _host_onboarding_safe_str(voice_name) or "Elaralo Human Companion Voice",
         "description": f"Host onboarding approved voice for {_host_onboarding_safe_str(voice_name) or 'Elaralo Human Companion'}",
-        "labels": json.dumps(labels or {}, ensure_ascii=False),
+        "labels": json.dumps(safe_labels, ensure_ascii=False),
     }
     files = [("files", (file_name, data, content_type))]
     response = requests.post(endpoint, headers=headers, data=payload, files=files, timeout=120)
@@ -19957,6 +20009,163 @@ def _host_onboarding_export_asset_from_url(asset: Dict[str, Any], blob_name: str
     return out
 
 
+def _host_onboarding_resolve_brand_id_for_brand_on_conn(conn: sqlite3.Connection, brand: str) -> Optional[int]:
+    """Resolve a brand_id by querying existing companion_mappings rows.
+
+    This intentionally does not hard-code Elaralo's numeric brand_id. The live DB
+    already contains branded AI rows, so Host Onboarding inherits the brand_id
+    from those canonical rows.
+    """
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(companion_mappings)")
+        cols = {str(row[1] or "").strip().lower() for row in cur.fetchall()}
+        if "brand_id" not in cols:
+            return None
+        if "brand" in cols:
+            row = cur.execute(
+                """
+                SELECT brand_id
+                  FROM companion_mappings
+                 WHERE lower(brand)=lower(?)
+                   AND brand_id IS NOT NULL
+                   AND trim(CAST(brand_id AS TEXT)) <> ''
+                 ORDER BY rowid
+                 LIMIT 1
+                """,
+                (brand_name,),
+            ).fetchone()
+            if row is not None and row[0] is not None and str(row[0]).strip() != "":
+                try:
+                    return int(row[0])
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return None
+
+
+def _host_onboarding_backfill_brand_id_for_brand_on_conn(conn: sqlite3.Connection, brand: str) -> None:
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    brand_id = _host_onboarding_resolve_brand_id_for_brand_on_conn(conn, brand_name)
+    if brand_id is None:
+        return
+    try:
+        conn.execute(
+            """
+            UPDATE companion_mappings
+               SET brand_id = ?
+             WHERE lower(brand)=lower(?)
+               AND (brand_id IS NULL OR trim(CAST(brand_id AS TEXT)) = '')
+            """,
+            (brand_id, brand_name),
+        )
+    except Exception:
+        pass
+
+
+def _host_onboarding_backfill_companion_ids_on_conn(conn: sqlite3.Connection) -> None:
+    """Backfill missing companion_id values from DB state, not application logic.
+
+    Existing rows created before companion_id existed still need a one-time value.
+    New rows are handled by the SQLite trigger created below.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(companion_mappings)")
+        cols = {str(row[1] or "").strip().lower() for row in cur.fetchall()}
+        if "companion_id" not in cols:
+            return
+        rows = cur.execute(
+            """
+            SELECT rowid
+              FROM companion_mappings
+             WHERE companion_id IS NULL OR trim(CAST(companion_id AS TEXT)) = ''
+             ORDER BY rowid
+            """
+        ).fetchall()
+        for row in rows or []:
+            rowid = row[0]
+            cur.execute(
+                """
+                UPDATE companion_mappings
+                   SET companion_id = (
+                         SELECT COALESCE(MAX(CAST(companion_id AS INTEGER)), 0) + 1
+                           FROM companion_mappings
+                          WHERE rowid <> ?
+                            AND companion_id IS NOT NULL
+                            AND trim(CAST(companion_id AS TEXT)) <> ''
+                            AND CAST(companion_id AS INTEGER) > 0
+                       )
+                 WHERE rowid = ?
+                   AND (companion_id IS NULL OR trim(CAST(companion_id AS TEXT)) = '')
+                """,
+                (rowid, rowid),
+            )
+    except Exception:
+        pass
+
+
+def _host_onboarding_create_companion_mapping_triggers_on_conn(conn: sqlite3.Connection) -> None:
+    """Create SQLite triggers for companion_mappings derived identifiers.
+
+    SQLite only supports AUTOINCREMENT on an INTEGER PRIMARY KEY. The deployed
+    table already uses its own primary key shape, so companion_id is auto-filled
+    at the database layer with an INSERT trigger using max(companion_id)+1.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS companion_mappings_companion_id_autofill
+            AFTER INSERT ON companion_mappings
+            FOR EACH ROW
+            WHEN NEW.companion_id IS NULL OR trim(CAST(NEW.companion_id AS TEXT)) = ''
+            BEGIN
+                UPDATE companion_mappings
+                   SET companion_id = (
+                         SELECT COALESCE(MAX(CAST(companion_id AS INTEGER)), 0) + 1
+                           FROM companion_mappings
+                          WHERE rowid <> NEW.rowid
+                            AND companion_id IS NOT NULL
+                            AND trim(CAST(companion_id AS TEXT)) <> ''
+                            AND CAST(companion_id AS INTEGER) > 0
+                       )
+                 WHERE rowid = NEW.rowid;
+            END;
+            """
+        )
+    except Exception:
+        pass
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS companion_mappings_brand_id_autofill
+            AFTER INSERT ON companion_mappings
+            FOR EACH ROW
+            WHEN NEW.brand_id IS NULL OR trim(CAST(NEW.brand_id AS TEXT)) = ''
+            BEGIN
+                UPDATE companion_mappings
+                   SET brand_id = (
+                         SELECT brand_id
+                           FROM companion_mappings
+                          WHERE rowid <> NEW.rowid
+                            AND lower(brand)=lower(NEW.brand)
+                            AND brand_id IS NOT NULL
+                            AND trim(CAST(brand_id AS TEXT)) <> ''
+                          ORDER BY rowid
+                          LIMIT 1
+                       )
+                 WHERE rowid = NEW.rowid;
+            END;
+            """
+        )
+    except Exception:
+        pass
+
+
 def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Connection) -> None:
     """Ensure companion_mappings has the columns required by Host Onboarding exports.
 
@@ -19984,6 +20193,8 @@ def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Conne
     cur.execute("PRAGMA table_info(companion_mappings)")
     cols = {str(row[1] or "").strip().lower() for row in cur.fetchall()}
     for col_name, col_type in [
+        ("brand_id", "INTEGER"),
+        ("companion_id", "INTEGER"),
         ("host_member_id", "TEXT"),
         ("channel_cap", "TEXT"),
         ("live", "TEXT"),
@@ -20001,13 +20212,20 @@ def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Conne
         if col_name not in cols:
             try:
                 cur.execute(f"ALTER TABLE companion_mappings ADD COLUMN {col_name} {col_type}")
+                cols.add(col_name)
             except Exception:
                 pass
+
+    _host_onboarding_create_companion_mapping_triggers_on_conn(conn)
+    _host_onboarding_backfill_brand_id_for_brand_on_conn(conn, "Elaralo")
+    _host_onboarding_backfill_companion_ids_on_conn(conn)
 
 
 def _host_onboarding_ensure_companion_export_columns_best_effort() -> None:
     try:
-        db_path = _get_companion_mappings_db_path(for_write=True)
+        db_path = _get_companion_mappings_db_path(for_write=True) or _ensure_econnect_db_seeded()
+        if not db_path:
+            return
         conn = sqlite3.connect(db_path)
         try:
             _host_onboarding_ensure_companion_export_columns_on_conn(conn)
@@ -20058,20 +20276,31 @@ def _host_onboarding_upsert_connect_companion_mapping(
         _host_onboarding_ensure_companion_export_columns_on_conn(conn)
         cur = conn.cursor()
 
+        brand_id = _host_onboarding_resolve_brand_id_for_brand_on_conn(conn, "Elaralo")
         existing = cur.execute(
-            "SELECT id FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
+            "SELECT id, companion_id, brand_id FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
             ("Elaralo", avatar_key),
         ).fetchone()
         if existing is None:
-            cur.execute(
-                "INSERT INTO companion_mappings (brand, avatar) VALUES (?, ?)",
-                ("Elaralo", avatar_key),
-            )
+            if brand_id is not None:
+                cur.execute(
+                    "INSERT INTO companion_mappings (brand, avatar, brand_id) VALUES (?, ?, ?)",
+                    ("Elaralo", avatar_key, brand_id),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+                    ("Elaralo", avatar_key),
+                )
 
         cur.execute(
             """
             UPDATE companion_mappings
-               SET host_member_id = ?,
+               SET brand_id = CASE
+                        WHEN ? IS NOT NULL AND (brand_id IS NULL OR trim(CAST(brand_id AS TEXT)) = '') THEN ?
+                        ELSE brand_id
+                   END,
+                   host_member_id = ?,
                    channel_cap = 'Video',
                    live = 'Stream',
                    companion_type = 'Human',
@@ -20087,6 +20316,8 @@ def _host_onboarding_upsert_connect_companion_mapping(
              WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?)
             """,
             (
+                brand_id,
+                brand_id,
                 member_id,
                 avatar_key.split('-', 1)[0],
                 _host_onboarding_safe_str(headshot_url),
@@ -20139,10 +20370,18 @@ def _host_onboarding_upsert_hco_row(
             pass
         cur = conn.cursor()
         companion_row = cur.execute(
-            "SELECT id, phonetic FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
+            "SELECT id, companion_id, phonetic FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
             ("Elaralo", avatar_key),
         ).fetchone()
-        companion_id = int(companion_row["id"]) if companion_row and companion_row["id"] is not None else None
+        companion_id_raw = None
+        if companion_row:
+            try:
+                companion_id_raw = companion_row["companion_id"]
+            except Exception:
+                companion_id_raw = None
+            if companion_id_raw is None or _host_onboarding_safe_str(companion_id_raw) == "":
+                companion_id_raw = companion_row["id"] if companion_row["id"] is not None else None
+        companion_id = int(companion_id_raw) if companion_id_raw is not None and _host_onboarding_safe_str(companion_id_raw) else None
         phonetic = _host_onboarding_safe_str(companion_row["phonetic"] if companion_row else "")
 
         public_profile = dict((raw_profile or {}).get("public_profile") or {})
