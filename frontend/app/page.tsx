@@ -873,6 +873,142 @@ type CompanionMeta = {
 
 const DEFAULT_COMPANION_NAME = "Elara";
 
+function trimQueryValue(raw: any): string {
+  return String(raw ?? "").trim();
+}
+
+function firstQueryValue(params: URLSearchParams, names: string[]): string {
+  for (const name of names) {
+    const value = trimQueryValue(params.get(name));
+    if (value) return value;
+  }
+  return "";
+}
+
+function booleanFromQuery(raw: string): boolean | null {
+  const v = trimQueryValue(raw).toLowerCase();
+  if (!v) return null;
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off"].includes(v)) return false;
+  return null;
+}
+
+function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const params = new URLSearchParams(window.location.search || "");
+    const companionKey = firstQueryValue(params, [
+      "companionKey",
+      "companion_key",
+      "avatar",
+      "avatarName",
+      "avatar_name",
+      "companion",
+      "companionName",
+      "companion_name",
+      "selectedAvatar",
+      "selected_avatar",
+      "selectedCompanion",
+      "selected_companion",
+    ]);
+    if (!companionKey) return null;
+
+    const brand = firstQueryValue(params, ["brand", "rebranding", "companyName", "company_name", "company"]) || DEFAULT_COMPANY_NAME;
+    const rebrandingKey = firstQueryValue(params, ["rebrandingKey", "rebranding_key", "RebrandingKey", "rebrandingkey"]);
+    const memberId = firstQueryValue(params, ["memberId", "member_id"]);
+    const displayName = firstQueryValue(params, ["displayName", "display_name", "userName", "user_name", "username"]);
+    const planName = firstQueryValue(params, ["planName", "plan_name", "plan"]);
+    const modePill = firstQueryValue(params, ["modePill", "mode_pill", "modepill", "mode"]);
+    const preferredLanguage = firstQueryValue(params, ["preferredLanguage", "preferred_language", "userLanguage", "user_language", "language", "locale", "lang"]);
+    const headshotUrl = firstQueryValue(params, ["headshotUrl", "headshot_url", "imageUrl", "image_url", "photoUrl", "photo_url"]);
+    const loggedInValue = booleanFromQuery(firstQueryValue(params, ["loggedIn", "logged_in"]));
+    const loggedIn = loggedInValue !== null ? loggedInValue : Boolean(memberId);
+
+    const payload: Record<string, any> = {
+      type: "MEMBER_PLAN",
+      source: "direct-query",
+      directQueryOverride: true,
+      loggedIn,
+      logged_in: loggedIn,
+      memberId,
+      member_id: memberId,
+      displayName,
+      display_name: displayName,
+      userName: displayName,
+      user_name: displayName,
+      brand,
+      companyName: brand,
+      company_name: brand,
+      company: brand,
+      rebranding: brand,
+      avatar: companionKey,
+      avatarName: companionKey,
+      avatar_name: companionKey,
+      companion: companionKey,
+      companionName: companionKey,
+      companion_name: companionKey,
+      companionKey,
+      companion_key: companionKey,
+    };
+
+    if (rebrandingKey) {
+      payload.rebrandingKey = rebrandingKey;
+      payload.rebranding_key = rebrandingKey;
+      payload.RebrandingKey = rebrandingKey;
+    }
+    if (planName) {
+      payload.planName = planName;
+      payload.plan_name = planName;
+    }
+    if (modePill) {
+      payload.modePill = modePill;
+      payload.mode_pill = modePill;
+    }
+    if (preferredLanguage) {
+      payload.preferredLanguage = preferredLanguage;
+      payload.preferred_language = preferredLanguage;
+      payload.userLanguage = preferredLanguage;
+      payload.user_language = preferredLanguage;
+    }
+    if (headshotUrl) {
+      payload.headshotUrl = headshotUrl;
+      payload.headshot_url = headshotUrl;
+    }
+
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+function mergeDirectCompanionHandoff(data: any, direct: Record<string, any> | null): any {
+  if (!direct || !direct.avatar) return data;
+  const input = data && typeof data === "object" ? data : {};
+  const merged: Record<string, any> = { ...input, ...direct };
+
+  // Preserve authoritative Wix/member context when the parent provides it, while
+  // keeping the directly selected companion key from the My Elaralo button.
+  if ("loggedIn" in input) merged.loggedIn = (input as any).loggedIn;
+  if ("logged_in" in input) merged.logged_in = (input as any).logged_in;
+  if (trimQueryValue((input as any).memberId || (input as any).member_id)) {
+    merged.memberId = trimQueryValue((input as any).memberId || (input as any).member_id);
+    merged.member_id = merged.memberId;
+  }
+  if (trimQueryValue((input as any).planName || (input as any).plan_name)) {
+    merged.planName = trimQueryValue((input as any).planName || (input as any).plan_name);
+    merged.plan_name = merged.planName;
+  }
+  if (trimQueryValue((input as any).displayName || (input as any).display_name || (input as any).userName || (input as any).user_name)) {
+    merged.displayName = trimQueryValue((input as any).displayName || (input as any).display_name || (input as any).userName || (input as any).user_name);
+    merged.display_name = merged.displayName;
+    merged.userName = merged.displayName;
+    merged.user_name = merged.displayName;
+  }
+
+  return merged;
+}
+
+
 // Step C (Latency): limit how much chat history we send to /chat.
 // 20 turns ~= 40 messages (user+assistant). System prompt (if present) is always preserved.
 const MAX_MESSAGES_TO_SEND = 40;
@@ -4595,7 +4731,7 @@ useEffect(() => {
       setCompanionMappingResolved(false);
 
       const brand = String(companyName || "").trim();
-      const avatar = String(companionName || "").trim();
+      const avatar = String(companionKey || companionName || "").trim();
 
       // Strict: brand+avatar must be present (core brand defaults to Elaralo when rebrandingKey is empty).
       if (!brand || !avatar) {
@@ -4657,7 +4793,7 @@ useEffect(() => {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, companyName, companionName]);
+  }, [API_BASE, companyName, companionKey, companionName]);
 
   const preferredMappingHeadshot = useMemo(() => {
     return String((companionMapping as any)?.headshot_url || (companionMapping as any)?.headshotUrl || "").trim();
@@ -10195,6 +10331,8 @@ useEffect(() => {
       if (!isAllowedPostMessage(event.origin, data)) return;
       if (!data || typeof data !== "object" || (data as any).type !== "MEMBER_PLAN") return;
 
+      data = mergeDirectCompanionHandoff(data, readDirectCompanionHandoffFromUrl());
+
       try {
         const cacheKey = getMemberPlanCacheKey();
         if (cacheKey) {
@@ -10497,6 +10635,16 @@ useEffect(() => {
     }
 
     window.addEventListener("message", onMessage);
+
+    const directHandoff = readDirectCompanionHandoffFromUrl();
+    if (directHandoff?.avatar) {
+      try {
+        window.setTimeout(() => window.postMessage(directHandoff, window.location.origin), 0);
+      } catch (e) {
+        // ignore direct handoff failures
+      }
+    }
+
     return () => window.removeEventListener("message", onMessage);
   }, [getMemberPlanCacheKey, markStartupIdentityResolved]);
 
