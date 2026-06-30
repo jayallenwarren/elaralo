@@ -293,6 +293,41 @@ async def content_file(request: Request, brand: str, mode: str, filename: str):
     }
     return FileResponse(path, media_type=media_type, headers=headers)
 
+@app.get("/brand/{brand}/companion/{companion_type}/{filename:path}", name="brand_companion_asset")
+async def brand_companion_asset(request: Request, brand: str, companion_type: str, filename: str):
+    """Serve brand companion images from the App Service Linux filesystem.
+
+    Elaralo AI companion images are sourced from:
+      /home/site/brand/elaralo/companion/ai/
+
+    This route intentionally serves files only; it does not expose directory listings.
+    """
+    _ = request
+    path, resolved_name = _brand_companion_asset_path(brand, companion_type, filename)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="companion asset not found")
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    headers = {
+        "Content-Disposition": f'inline; filename="{resolved_name}"',
+        "Cache-Control": "public, max-age=3600",
+    }
+    return FileResponse(path, media_type=media_type, headers=headers)
+
+
+@app.get("/companion/headshot/{filename:path}", name="elaralo_ai_legacy_headshot_asset")
+async def elaralo_ai_legacy_headshot_asset(request: Request, filename: str):
+    """Compatibility alias for Elaralo AI headshots."""
+    _ = request
+    path, resolved_name = _brand_companion_asset_path("Elaralo", "ai", filename)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="companion headshot not found")
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    headers = {
+        "Content-Disposition": f'inline; filename="{resolved_name}"',
+        "Cache-Control": "public, max-age=3600",
+    }
+    return FileResponse(path, media_type=media_type, headers=headers)
+
 import json
 import logging
 
@@ -1778,7 +1813,7 @@ async def _startup_load_companion_mappings() -> None:
 
 
 @app.get("/mappings/companion")
-async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, Any]:
+async def get_companion_mapping(request: Request, brand: str = "", avatar: str = "") -> Dict[str, Any]:
     """Lookup a companion mapping row by (brand, avatar).
 
     This endpoint is intentionally STRICT:
@@ -1817,14 +1852,7 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
     # Core brand default: empty brand => Elaralo
     b = b_in or "Elaralo"
 
-    m = _lookup_companion_mapping(b, a)
-    fallback_mapping_avatar = ""
-    if not m and _is_elaralo_core_brand(b):
-        resolved_ai_key = _resolve_elaralo_ai_companion_key(b, a)
-        first_token = _elaralo_ai_first_token(resolved_ai_key or a)
-        if first_token and first_token.lower() != a.lower():
-            m = _lookup_companion_mapping(b, first_token)
-            fallback_mapping_avatar = first_token if m else ""
+    m = _lookup_companion_mapping_for_ai_media(b, a) if _is_elaralo_core_brand(b) else (_lookup_companion_mapping(b, a) or {})
     if not m:
         raise HTTPException(
             status_code=404,
@@ -1884,10 +1912,7 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
     return {
         "found": True,
         "brand": str(m.get("brand") or b),
-        "avatar": a if fallback_mapping_avatar else str(m.get("avatar") or a),
-        "companion_key": a,
-        "mappingAvatar": fallback_mapping_avatar or str(m.get("avatar") or a),
-        "mapping_avatar": fallback_mapping_avatar or str(m.get("avatar") or a),
+        "avatar": str(m.get("avatar") or a),
         "hostMemberId": str(m.get("host_member_id") or ""),
         "host_member_id": str(m.get("host_member_id") or ""),
         "companionType": ctype_out,
@@ -1902,6 +1927,11 @@ async def get_companion_mapping(brand: str = "", avatar: str = "") -> Dict[str, 
         "didAgentLink": str(m.get("did_agent_link") or ""),
         "didEmbedCode": str(m.get("did_embed_code") or ""),
         "phonetic": str(m.get("phonetic") or ""),
+        "headshot_url": _ai_headshot_url_from_mapping_or_file(b, a, m, public_base_url=_companion_public_api_base_url(request=request)),
+        "headshotUrl": _ai_headshot_url_from_mapping_or_file(b, a, m, public_base_url=_companion_public_api_base_url(request=request)),
+        "headshot_file_name": _host_onboarding_safe_str((_elaralo_ai_companion_asset_for_key(b, a, public_base_url=_companion_public_api_base_url(request=request)) or {}).get("file_name")),
+        "mappingAvatar": str(m.get("mapping_avatar") or m.get("avatar") or ""),
+        "mapping_avatar": str(m.get("mapping_avatar") or m.get("avatar") or ""),
         "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
         "source": _COMPANION_MAPPINGS_SOURCE,
         "table": _COMPANION_MAPPINGS_TABLE,
@@ -4620,16 +4650,12 @@ def _ai_companion_humanize_token(token: str) -> str:
 
 
 def _parse_ai_companion_card_meta(raw: Any) -> Dict[str, str]:
-    """Parse an AI companion key/filename into Companion Card metadata.
+    """Parse an AI companion filename/key into Companion Card metadata.
 
-    Elaralo AI companion identity is the static headshot filename stem under
-    public/companion/headshot, for example:
-        Adriana-Female-Black-GenX.png -> Adriana-Female-Black-GenX
-
-    Wix is not expected to provide this key. When a first-name-only legacy value
-    is supplied, other Elaralo-specific helpers may resolve it to the unique
-    filename stem from the local/manifest headshot inventory before this parser
-    is called.
+    For the Elaralo brand, the canonical AI companion_key is the exact
+    extensionless filename stem stored in /home/site/brand/elaralo/companion/ai/.
+    Example: Adriana-Female-Hispanic-Millennials.jpeg ->
+    Adriana-Female-Hispanic-Millennials.
     """
     cleaned = _ai_companion_strip_trailing_uuid(_ai_companion_strip_extensions(str(raw or "")))
     cleaned = re.sub(r"\s+", "-", cleaned).strip("- ")
@@ -4652,16 +4678,16 @@ def _parse_ai_companion_card_meta(raw: Any) -> Dict[str, str]:
 
 
 # -----------------------------------------------------------------------------
-# My Elaralo AI Companion catalog helpers
+# Elaralo AI Companion Linux image catalog
 # -----------------------------------------------------------------------------
-# For the core Elaralo brand, AI Companion Cards are keyed by the exact
-# extensionless filename stem in the frontend static public/companion/headshot
-# directory. These helpers deliberately do not alter DulceMoon or other
-# white-label behaviors.
-_ELARALO_AI_HEADSHOT_PUBLIC_DIR = "/companion/headshot"
-_ELARALO_AI_HEADSHOT_EXTENSIONS = (".jpeg", ".JPEG", ".jpg", ".JPG", ".png", ".PNG", ".webp", ".WEBP")
-_ELARALO_AI_HEADSHOT_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "items": []}
-_ELARALO_AI_HEADSHOT_CACHE_TTL = 60.0
+# Source of truth for Elaralo AI companions:
+#   /home/site/brand/elaralo/companion/ai/
+# The filename stem is the companion_key and the metadata source.
+_ELARALO_AI_COMPANION_DIR_DEFAULT = "/home/site/brand/elaralo/companion/ai"
+_ELARALO_HUMAN_COMPANION_DIR_DEFAULT = "/home/site/brand/elaralo/companion/human"
+_ELARALO_COMPANION_IMAGE_EXTENSIONS = (".jpeg", ".jpg", ".png", ".webp")
+_ELARALO_AI_COMPANION_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "items": []}
+_ELARALO_AI_COMPANION_CACHE_TTL_SECONDS = 30.0
 
 
 def _is_elaralo_core_brand(brand: Any) -> bool:
@@ -4670,51 +4696,16 @@ def _is_elaralo_core_brand(brand: Any) -> bool:
 
 def _ai_companion_key_has_metadata(raw: Any) -> bool:
     stem = _ai_companion_strip_trailing_uuid(_ai_companion_strip_extensions(str(raw or "")))
-    parts = [p for p in re.sub(r"\s+", "-", stem).split("-") if p.strip()]
+    stem = re.sub(r"\s+", "-", stem).strip("- ")
+    parts = [p for p in stem.split("-") if p.strip()]
     return len(parts) >= 4
 
 
-def _elaralo_ai_headshot_stem(raw: Any) -> str:
-    stem = _ai_companion_strip_trailing_uuid(_ai_companion_strip_extensions(str(raw or "")))
-    stem = re.sub(r"\s+", "-", stem).strip("- ")
-    if not stem or not _ai_companion_key_has_metadata(stem):
-        return ""
-    return stem
+def _elaralo_companion_dir_candidates(companion_type: Any) -> List[str]:
+    kind = _host_onboarding_safe_str(companion_type).lower()
+    if kind not in ("ai", "human"):
+        kind = "ai"
 
-
-def _elaralo_ai_headshot_manifest_tokens() -> List[str]:
-    """Optional explicit manifest for deployments where backend cannot see Next public files.
-
-    Accepted env vars:
-      - ELARALO_AI_COMPANION_HEADSHOTS
-      - AI_COMPANION_HEADSHOTS
-
-    Values may be JSON arrays or comma/pipe/semicolon/newline separated strings.
-    Entries can be full filenames or extensionless stems.
-    """
-    raw = (os.getenv("ELARALO_AI_COMPANION_HEADSHOTS", "") or os.getenv("AI_COMPANION_HEADSHOTS", "") or "").strip()
-    if not raw:
-        return []
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return [_host_onboarding_safe_str(x) for x in parsed if _host_onboarding_safe_str(x)]
-        if isinstance(parsed, dict):
-            vals: List[str] = []
-            for value in parsed.values():
-                if isinstance(value, list):
-                    vals.extend([_host_onboarding_safe_str(x) for x in value if _host_onboarding_safe_str(x)])
-                else:
-                    s = _host_onboarding_safe_str(value)
-                    if s:
-                        vals.append(s)
-            return vals
-    except Exception:
-        pass
-    return [p.strip() for p in re.split(r"[\n,|;]+", raw) if p.strip()]
-
-
-def _elaralo_ai_headshot_dir_candidates() -> List[str]:
     out: List[str] = []
 
     def add(path: Any) -> None:
@@ -4725,202 +4716,322 @@ def _elaralo_ai_headshot_dir_candidates() -> List[str]:
         if p not in out:
             out.append(p)
 
-    for env_name in ("ELARALO_AI_HEADSHOT_DIR", "AI_COMPANION_HEADSHOT_DIR", "NEXT_PUBLIC_COMPANION_HEADSHOT_DIR"):
+    if kind == "ai":
+        env_names = (
+            "ELARALO_AI_COMPANION_IMAGE_DIR",
+            "ELARALO_AI_COMPANION_DIR",
+            "AI_COMPANION_IMAGE_DIR",
+            "AI_COMPANION_DIR",
+        )
+        default_dir = _ELARALO_AI_COMPANION_DIR_DEFAULT
+    else:
+        env_names = (
+            "ELARALO_HUMAN_COMPANION_IMAGE_DIR",
+            "ELARALO_HUMAN_COMPANION_DIR",
+            "HUMAN_COMPANION_IMAGE_DIR",
+            "HUMAN_COMPANION_DIR",
+        )
+        default_dir = _ELARALO_HUMAN_COMPANION_DIR_DEFAULT
+
+    for env_name in env_names:
         raw = os.getenv(env_name, "") or ""
         for token in re.split(r"[|;]+", raw):
             add(token)
 
-    roots: List[str] = []
-    for raw_root in (
-        os.getcwd(),
-        os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "",
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__" in globals() else "",
-        "/home/site/wwwroot",
-        "/home/site/wwwroot/app",
-        "/home/site/wwwroot/frontend",
-        "/app",
-        "/workspace",
-    ):
-        root = _host_onboarding_safe_str(raw_root)
-        if root and root not in roots:
-            roots.append(root)
+    root = os.getenv("ELARALO_COMPANION_ROOT", "") or os.getenv("BRAND_COMPANION_ROOT", "") or ""
+    if root:
+        add(os.path.join(root, kind))
+        add(os.path.join(root, "elaralo", "companion", kind))
 
-    for root in roots:
-        add(os.path.join(root, "public", "companion", "headshot"))
-        add(os.path.join(root, "companion", "headshot"))
-
+    add(default_dir)
     return out
 
 
-def _elaralo_ai_headshot_public_url(file_name_or_stem: str) -> str:
-    name = os.path.basename(_host_onboarding_safe_str(file_name_or_stem))
-    if not name:
+def _elaralo_ai_companion_stem(raw: Any) -> str:
+    stem = _ai_companion_strip_trailing_uuid(_ai_companion_strip_extensions(str(raw or "")))
+    stem = re.sub(r"\s+", "-", stem).strip("- ")
+    if not stem or not _ai_companion_key_has_metadata(stem):
         return ""
-    return f"{_ELARALO_AI_HEADSHOT_PUBLIC_DIR}/{quote(name)}"
+    return stem
 
 
-def _elaralo_ai_headshot_assets(force_refresh: bool = False) -> List[Dict[str, str]]:
+def _brand_companion_asset_path(brand: Any, companion_type: Any, filename: Any) -> Tuple[str, str]:
+    """Resolve a brand companion image path without allowing traversal."""
+    if not _is_elaralo_core_brand(brand):
+        return "", ""
+    kind = _host_onboarding_safe_str(companion_type).lower()
+    if kind in ("ai_companion", "artificial_intelligence"):
+        kind = "ai"
+    if kind in ("human_companion", "host"):
+        kind = "human"
+    if kind not in ("ai", "human"):
+        return "", ""
+
+    raw_filename = unquote(_host_onboarding_safe_str(filename))
+    if not raw_filename:
+        return "", ""
+    if raw_filename != os.path.basename(raw_filename):
+        return "", ""
+    if any(x in raw_filename for x in ("..", "/", "\\")):
+        return "", ""
+
+    wanted = raw_filename.lower()
+    wanted_stem = _ai_companion_strip_extensions(raw_filename).lower()
+    for folder in _elaralo_companion_dir_candidates(kind):
+        if not os.path.isdir(folder):
+            continue
+        try:
+            entries = os.listdir(folder)
+        except Exception:
+            entries = []
+        for entry in entries:
+            if entry.startswith("."):
+                continue
+            full = os.path.join(folder, entry)
+            if not os.path.isfile(full):
+                continue
+            low = entry.lower()
+            if not low.endswith(_ELARALO_COMPANION_IMAGE_EXTENSIONS):
+                continue
+            if low == wanted or _ai_companion_strip_extensions(entry).lower() == wanted_stem:
+                return full, entry
+    return "", ""
+
+
+def _elaralo_ai_companion_assets(force_refresh: bool = False) -> List[Dict[str, str]]:
     now = time.time()
     if not force_refresh:
-        loaded_at = float(_ELARALO_AI_HEADSHOT_CACHE.get("loaded_at") or 0.0)
-        cached = _ELARALO_AI_HEADSHOT_CACHE.get("items") or []
-        if loaded_at and now - loaded_at < _ELARALO_AI_HEADSHOT_CACHE_TTL:
+        loaded_at = float(_ELARALO_AI_COMPANION_CACHE.get("loaded_at") or 0.0)
+        cached = _ELARALO_AI_COMPANION_CACHE.get("items") or []
+        if loaded_at and now - loaded_at < _ELARALO_AI_COMPANION_CACHE_TTL_SECONDS:
             return [dict(item) for item in cached if isinstance(item, dict)]
 
     items: List[Dict[str, str]] = []
     seen: Set[str] = set()
-
-    def add(raw_name: Any, source: str) -> None:
-        raw_s = _host_onboarding_safe_str(raw_name)
-        if not raw_s:
-            return
-        base = os.path.basename(raw_s.split("?", 1)[0].split("#", 1)[0])
-        stem = _elaralo_ai_headshot_stem(base)
-        if not stem:
-            return
-        key = stem.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        has_ext = bool(re.search(r"\.(png|jpg|jpeg|webp)$", base, flags=re.I))
-        file_name = base if has_ext else stem
-        url = _elaralo_ai_headshot_public_url(file_name) if has_ext else ""
-        items.append({
-            "stem": stem,
-            "companion_key": stem,
-            "file_name": file_name,
-            "url": url,
-            "source": source,
-        })
-
-    for token in _elaralo_ai_headshot_manifest_tokens():
-        add(token, "env_manifest")
-
-    for folder in _elaralo_ai_headshot_dir_candidates():
-        try:
-            if not os.path.isdir(folder):
-                continue
-            for entry in sorted(os.listdir(folder)):
-                if entry.startswith("."):
-                    continue
-                if not entry.lower().endswith(tuple(ext.lower() for ext in _ELARALO_AI_HEADSHOT_EXTENSIONS)):
-                    continue
-                low = entry.lower()
-                if "logo" in low or "placeholder" in low or "default" in low:
-                    continue
-                add(entry, folder)
-        except Exception:
+    for folder in _elaralo_companion_dir_candidates("ai"):
+        if not os.path.isdir(folder):
             continue
+        try:
+            entries = sorted(os.listdir(folder), key=lambda x: x.lower())
+        except Exception:
+            entries = []
+        for entry in entries:
+            if entry.startswith("."):
+                continue
+            low = entry.lower()
+            if not low.endswith(_ELARALO_COMPANION_IMAGE_EXTENSIONS):
+                continue
+            if any(token in low for token in ("logo", "placeholder", "default")):
+                continue
+            full = os.path.join(folder, entry)
+            if not os.path.isfile(full):
+                continue
+            stem = _elaralo_ai_companion_stem(entry)
+            if not stem:
+                continue
+            key = stem.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "stem": stem,
+                "companion_key": stem,
+                "file_name": entry,
+                "path": full,
+                "source_dir": folder,
+            })
 
-    _ELARALO_AI_HEADSHOT_CACHE["loaded_at"] = now
-    _ELARALO_AI_HEADSHOT_CACHE["items"] = [dict(item) for item in items]
+    _ELARALO_AI_COMPANION_CACHE["loaded_at"] = now
+    _ELARALO_AI_COMPANION_CACHE["items"] = [dict(item) for item in items]
     return items
 
 
 def _elaralo_ai_first_token(key: Any) -> str:
     stem = _ai_companion_strip_trailing_uuid(_ai_companion_strip_extensions(str(key or "")))
     stem = re.sub(r"\s+", "-", stem).strip("- ")
-    return stem.split("-", 1)[0].strip()
+    return stem.split("-", 1)[0].strip() if stem else ""
 
 
 def _resolve_elaralo_ai_companion_key(brand: Any, raw_avatar: Any) -> str:
-    """Resolve first-name legacy values to the unique filename stem when possible."""
+    """Resolve exact Elaralo AI companion_key from the Linux image filename catalog."""
     cleaned = _ai_companion_strip_trailing_uuid(_ai_companion_strip_extensions(str(raw_avatar or "")))
     cleaned = re.sub(r"\s+", "-", cleaned).strip("- ")
-    if not cleaned:
-        return ""
-    if not _is_elaralo_core_brand(brand):
-        return cleaned
-    if _ai_companion_key_has_metadata(cleaned):
+    if not cleaned or not _is_elaralo_core_brand(brand):
         return cleaned
 
-    first_lc = cleaned.split("-", 1)[0].strip().lower()
-    if not first_lc:
-        return cleaned
-    matches = [item for item in _elaralo_ai_headshot_assets() if _elaralo_ai_first_token(item.get("stem")).lower() == first_lc]
-    if len(matches) == 1:
-        return _host_onboarding_safe_str(matches[0].get("stem")) or cleaned
+    assets = _elaralo_ai_companion_assets()
+    for item in assets:
+        stem = _host_onboarding_safe_str(item.get("stem"))
+        file_name = _host_onboarding_safe_str(item.get("file_name"))
+        if cleaned.lower() in (stem.lower(), file_name.lower(), _ai_companion_strip_extensions(file_name).lower()):
+            return stem
+
+    if "-" not in cleaned:
+        matches = [item for item in assets if _elaralo_ai_first_token(item.get("stem")).lower() == cleaned.lower()]
+        if len(matches) == 1:
+            return _host_onboarding_safe_str(matches[0].get("stem"))
+
     return cleaned
 
 
-def _elaralo_ai_headshot_asset_for_key(brand: Any, avatar_key: Any) -> Dict[str, str]:
+def _elaralo_ai_companion_asset_for_key(brand: Any, raw_avatar: Any, public_base_url: str = "") -> Dict[str, str]:
     if not _is_elaralo_core_brand(brand):
         return {}
-    target = _resolve_elaralo_ai_companion_key(brand, avatar_key).lower()
-    if not target:
+    resolved_key = _resolve_elaralo_ai_companion_key(brand, raw_avatar)
+    if not resolved_key:
         return {}
-    for item in _elaralo_ai_headshot_assets():
-        if _host_onboarding_safe_str(item.get("stem")).lower() == target:
-            return dict(item)
+    target = resolved_key.lower()
+    target_file = os.path.basename(str(raw_avatar or "")).lower()
+    for item in _elaralo_ai_companion_assets():
+        stem = _host_onboarding_safe_str(item.get("stem"))
+        file_name = _host_onboarding_safe_str(item.get("file_name"))
+        if target in (stem.lower(), _ai_companion_strip_extensions(file_name).lower()) or target_file == file_name.lower():
+            out = dict(item)
+            out["url"] = _elaralo_ai_companion_file_url(file_name, public_base_url=public_base_url)
+            return out
     return {}
 
 
-def _lookup_companion_mapping_for_ai_media(brand: Any, avatar_key: Any) -> Dict[str, Any]:
-    """Get provider metadata for AI without weakening the canonical filename key.
 
-    Exact companion-key rows win. For Elaralo AI, a first-name mapping row is allowed
-    as a provider-media fallback because the static image key is the full filename
-    stem while voice/video rows have historically been keyed by first name.
+def _companion_public_api_base_url(request: Optional[Request] = None, fallback_base: str = "") -> str:
+    """Return the public API origin used to serve Linux companion images.
+
+    Companion image files live on the Linux App Service filesystem, so browser
+    URLs for these images must point at the API host, not the Static Web App
+    host.  Prefer the current request host because the catalog/summary request
+    is already being made to the public API origin.  Use API-oriented env vars as
+    fallbacks; intentionally do not prefer APP_BASE_URL because that is commonly
+    the front-end/static-app origin.
+    """
+    if request is not None:
+        try:
+            hdr = request.headers
+            host = str(hdr.get("x-forwarded-host") or hdr.get("x-original-host") or hdr.get("host") or "").split(",", 1)[0].strip()
+            scheme = str(hdr.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+            if not scheme:
+                scheme = "https" if hdr.get("x-arr-ssl") else str(urlparse(str(request.base_url or "")).scheme or "https")
+            if host:
+                norm = _normalize_public_base_url(f"{scheme}://{host}")
+                if norm:
+                    return norm
+        except Exception:
+            pass
+
+    env_candidates = [
+        os.getenv("ELARALO_PUBLIC_API_BASE_URL", ""),
+        os.getenv("PUBLIC_API_BASE_URL", ""),
+        os.getenv("API_PUBLIC_BASE_URL", ""),
+        os.getenv("NEXT_PUBLIC_API_BASE_URL", ""),
+        os.getenv("API_BASE_URL", ""),
+        os.getenv("CONTENT_PUBLIC_BASE_URL", ""),
+        os.getenv("WEBSITE_HOSTNAME", ""),
+        fallback_base,
+    ]
+    for cand in env_candidates:
+        try:
+            norm = _normalize_public_base_url(cand)
+        except Exception:
+            norm = str(cand or "").strip().rstrip("/")
+        if norm:
+            return norm
+    return ""
+
+
+def _elaralo_ai_companion_file_url(file_name_or_stem: Any, public_base_url: str = "") -> str:
+    name = os.path.basename(_host_onboarding_safe_str(file_name_or_stem))
+    if not name:
+        return ""
+    if not name.lower().endswith(_ELARALO_COMPANION_IMAGE_EXTENSIONS):
+        path, resolved_name = _brand_companion_asset_path("Elaralo", "ai", name)
+        _ = path
+        name = resolved_name or name
+    encoded_name = quote(name, safe="")
+    path = f"/brand/elaralo/companion/ai/{encoded_name}"
+    base = _host_onboarding_safe_str(public_base_url)
+    if not base:
+        try:
+            base = _companion_public_api_base_url(fallback_base=public_base_url)
+        except Exception:
+            base = _host_onboarding_safe_str(public_base_url)
+    if base:
+        try:
+            base = _normalize_public_base_url(base)
+        except Exception:
+            base = str(base or "").strip().rstrip("/")
+    return f"{base}{path}" if base else path
+
+
+def _lookup_companion_mapping_for_ai_media(brand: Any, avatar_key: Any) -> Dict[str, Any]:
+    """Lookup companion media/provider mapping for an AI filename key.
+
+    Elaralo AI image companion_key is the full filename stem. Historical provider
+    rows may be keyed by first name, so Elaralo allows a first-token fallback for
+    provider fields only. The companion_key remains the full filename stem.
     """
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
     avatar_s = _host_onboarding_safe_str(avatar_key)
     direct = _lookup_companion_mapping(brand_name, avatar_s)
     if isinstance(direct, dict):
-        return dict(direct)
+        out = dict(direct)
+        out["companion_key"] = avatar_s
+        out["mapping_avatar"] = _host_onboarding_safe_str(direct.get("avatar"))
+        return out
     if _is_elaralo_core_brand(brand_name):
-        first = _elaralo_ai_first_token(avatar_s)
+        resolved = _resolve_elaralo_ai_companion_key(brand_name, avatar_s) or avatar_s
+        first = _elaralo_ai_first_token(resolved)
         if first and first.lower() != avatar_s.lower():
             fallback = _lookup_companion_mapping(brand_name, first)
             if isinstance(fallback, dict):
                 out = dict(fallback)
+                out["avatar"] = resolved
+                out["companion_key"] = resolved
                 out["mapping_avatar"] = _host_onboarding_safe_str(fallback.get("avatar"))
-                out["avatar"] = avatar_s
-                out["companion_key"] = avatar_s
                 return out
     return {}
 
 
-def _ai_headshot_url_from_mapping_or_static(brand: Any, avatar_key: Any, mapping: Dict[str, Any]) -> str:
-    static_asset = _elaralo_ai_headshot_asset_for_key(brand, avatar_key)
-    static_url = _host_onboarding_safe_str(static_asset.get("url"))
-    if static_url:
-        return static_url
-    mapped = _host_onboarding_safe_str((mapping or {}).get("headshot_url") or (mapping or {}).get("headshotUrl"))
-    if not mapped:
-        return ""
-    # For Elaralo AI, do not return a first-name-only mapped image URL when the
-    # canonical companion key is a hyphenated filename stem. Leaving this empty
-    # lets the Summary/Public and My Elaralo clients probe exact filename candidates.
-    if _is_elaralo_core_brand(brand) and _ai_companion_key_has_metadata(avatar_key):
-        if _host_onboarding_safe_str(avatar_key).lower() not in mapped.lower():
-            return ""
-    return mapped
+def _ai_headshot_url_from_mapping_or_file(brand: Any, avatar_key: Any, mapping: Dict[str, Any], public_base_url: str = "") -> str:
+    if _is_elaralo_core_brand(brand):
+        asset = _elaralo_ai_companion_asset_for_key(brand, avatar_key, public_base_url=public_base_url)
+        static_url = _host_onboarding_safe_str(asset.get("url"))
+        if static_url:
+            return static_url
+    return _host_onboarding_safe_str((mapping or {}).get("headshot_url") or (mapping or {}).get("headshotUrl"))
 
 
-
-
-def _ai_companion_public_payload(brand: str, raw_avatar: str) -> Dict[str, Any]:
+def _ai_companion_public_payload(brand: str, raw_avatar: str, public_base_url: str = "") -> Dict[str, Any]:
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
     resolved_avatar = _resolve_elaralo_ai_companion_key(brand_name, raw_avatar) if _is_elaralo_core_brand(brand_name) else _host_onboarding_safe_str(raw_avatar)
-    meta = _parse_ai_companion_card_meta(resolved_avatar or raw_avatar)
+    meta = _parse_ai_companion_card_meta(resolved_avatar)
     avatar_key = _host_onboarding_safe_str(meta.get("avatar"))
     if not avatar_key:
         raise HTTPException(status_code=400, detail="avatar or headshot filename is required for an AI companion card")
 
-    mapping = _lookup_companion_mapping_for_ai_media(brand_name, avatar_key)
+    mapping = _lookup_companion_mapping_for_ai_media(brand_name, avatar_key) if _is_elaralo_core_brand(brand_name) else (_lookup_companion_mapping(brand_name, avatar_key) or {})
+    static_asset = _elaralo_ai_companion_asset_for_key(brand_name, avatar_key, public_base_url=public_base_url)
+    if _is_elaralo_core_brand(brand_name) and not static_asset and not _ai_companion_key_has_metadata(avatar_key):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "Elaralo AI companion image filename not found",
+                "avatar": raw_avatar,
+                "expected_source_dir": _ELARALO_AI_COMPANION_DIR_DEFAULT,
+                "rule": "AI companion_key must match the extensionless hyphenated image filename stem.",
+            },
+        )
+
     display_name = _host_onboarding_safe_str(meta.get("first_name")) or avatar_key
     gender = _host_onboarding_safe_str(meta.get("gender"))
     ethnicity = _host_onboarding_safe_str(meta.get("ethnicity"))
     generation = _host_onboarding_safe_str(meta.get("generation"))
-    static_asset = _elaralo_ai_headshot_asset_for_key(brand_name, avatar_key)
+    headshot_url = _ai_headshot_url_from_mapping_or_file(brand_name, avatar_key, mapping, public_base_url=public_base_url)
     headshot_file_name = _host_onboarding_safe_str(static_asset.get("file_name") or meta.get("source_name") or avatar_key)
-    headshot_url = _ai_headshot_url_from_mapping_or_static(brand_name, avatar_key, mapping)
     headshot_asset = {
         "asset_id": "",
         "slot_key": "headshot_front",
         "file_name": headshot_file_name,
         "url": headshot_url,
-        "content_type": "image/*" if headshot_url else "",
+        "content_type": mimetypes.guess_type(headshot_file_name)[0] or ("image/*" if headshot_url else ""),
         "validation_status": "accepted" if headshot_url else "",
     }
     quick_reference = {
@@ -4943,7 +5054,7 @@ def _ai_companion_public_payload(brand: str, raw_avatar: str) -> Dict[str, Any]:
         "brand": brand_name,
         "avatar": avatar_key,
         "companion_key": avatar_key,
-        "mapping_avatar": _host_onboarding_safe_str((mapping or {}).get("mapping_avatar") or (mapping or {}).get("avatar")),
+        "mapping_avatar": _host_onboarding_safe_str((mapping or {}).get("mapping_avatar")),
         "public_display_name": display_name,
         "stage_name": display_name,
         "gender": gender,
@@ -4961,13 +5072,11 @@ def _ai_companion_public_payload(brand: str, raw_avatar: str) -> Dict[str, Any]:
         "education_entries": [],
         "education_text": "",
         "card_type": "ai_companion",
-        "companion_key": avatar_key,
     }
     return {
         "public_profile": public_profile,
         "public_page": public_page,
     }
-
 
 
 def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
@@ -21129,148 +21238,7 @@ def _my_elaralo_catalog_filter_match(value: Any, expected: Any) -> bool:
     return have == want
 
 
-def _my_elaralo_card_matches_filters(card: Dict[str, Any], companion_type: str = "", generation: str = "", ethnicity: str = "", gender: str = "") -> bool:
-    want_type = _host_onboarding_safe_str(companion_type).lower()
-    have_type = _host_onboarding_safe_str(card.get("companion_type")).lower()
-    if want_type and have_type != want_type:
-        return False
-    if not _my_elaralo_catalog_filter_match(card.get("generation"), generation):
-        return False
-    if not _my_elaralo_catalog_filter_match(card.get("ethnicity"), ethnicity):
-        return False
-    if not _my_elaralo_catalog_filter_match(card.get("gender"), gender):
-        return False
-    return True
-
-
-def _row_value(row: Any, key: str, default: Any = "") -> Any:
-    try:
-        return row[key]
-    except Exception:
-        try:
-            return row.get(key, default) if isinstance(row, dict) else default
-        except Exception:
-            return default
-
-
-def _my_elaralo_public_version_card_from_row(brand_name: str, mapping_row: Any, version_row: Any) -> Optional[Dict[str, Any]]:
-    if version_row is None:
-        return None
-    try:
-        profile = _host_onboarding_json_loads(version_row["profile_json"], {})
-    except Exception:
-        profile = {}
-    if not isinstance(profile, dict):
-        profile = {}
-    payload = _host_onboarding_public_payload_from_profile(profile)
-    public_profile = dict(payload.get("public_profile") or {})
-    public_page = dict(payload.get("public_page") or {})
-    quick_ref = dict(public_profile.get("quick_reference_summary") or {})
-    avatar_key = _host_onboarding_safe_str(_row_value(mapping_row, "avatar"))
-    if not avatar_key:
-        avatar_key = _host_onboarding_safe_str((profile.get("session") or {}).get("avatar"))
-    if not avatar_key:
-        avatar_key = _host_onboarding_safe_str(public_profile.get("avatar"))
-    if not avatar_key:
-        avatar_key = "Human"
-    display_name = _host_onboarding_safe_str(
-        public_profile.get("public_display_name")
-        or public_profile.get("stage_name")
-        or quick_ref.get("public_name")
-        or avatar_key
-    )
-    approved_version_id = _host_onboarding_safe_str(_row_value(mapping_row, "approved_version_id") or _row_value(version_row, "version_id"))
-    headshot_url = _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or _row_value(mapping_row, "headshot_url"))
-    return {
-        "brand": brand_name,
-        "avatar": avatar_key,
-        "companion_key": avatar_key,
-        "companion_type": "Human",
-        "display_name": display_name,
-        "headline": _host_onboarding_safe_str(public_page.get("headline") or display_name),
-        "gender": _host_onboarding_safe_str(public_profile.get("gender") or quick_ref.get("gender")),
-        "ethnicity": _host_onboarding_safe_str(public_profile.get("ethnicity") or quick_ref.get("ethnicity")),
-        "generation": _host_onboarding_safe_str(public_profile.get("generation") or quick_ref.get("generation")),
-        "headshot_url": headshot_url,
-        "approved_version_id": approved_version_id,
-        "elevenVoiceId": _host_onboarding_safe_str(_row_value(mapping_row, "eleven_voice_id")),
-        "channel_cap": _host_onboarding_safe_str(_row_value(mapping_row, "channel_cap")) or "Video",
-        "live": _host_onboarding_safe_str(_row_value(mapping_row, "live")) or "Stream",
-        "summary_public_url": f"/summary-public?versionId={quote(approved_version_id)}" if approved_version_id else "",
-    }
-
-
-def _my_elaralo_latest_human_version_card(conn: sqlite3.Connection, brand_name: str, member_id: str) -> Optional[Dict[str, Any]]:
-    mid = _host_onboarding_normalize_member_id(member_id)
-    if not mid:
-        return None
-    try:
-        version_row = conn.execute(
-            f"SELECT * FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE member_id = ? ORDER BY approved_epoch DESC, created_epoch DESC LIMIT 1",
-            (mid,),
-        ).fetchone()
-    except Exception:
-        version_row = None
-    if version_row is None:
-        return None
-
-    avatar_key = ""
-    try:
-        profile = _host_onboarding_json_loads(version_row["profile_json"], {})
-        if isinstance(profile, dict):
-            avatar_key = _host_onboarding_safe_str((profile.get("session") or {}).get("avatar"))
-            if not avatar_key:
-                public_profile = dict(profile.get("public_profile") or {})
-                avatar_key = _host_onboarding_safe_str(public_profile.get("avatar"))
-    except Exception:
-        pass
-    if not avatar_key:
-        try:
-            session_id = _host_onboarding_safe_str(version_row["session_id"])
-            session = _host_onboarding_get_session_by_id(conn, session_id)
-            if isinstance(session, dict):
-                avatar_key = _host_onboarding_avatar_key_from_session(session)
-        except Exception:
-            avatar_key = ""
-    if not avatar_key:
-        avatar_key = "Human"
-
-    mapping_row = None
-    try:
-        mapping_row = conn.execute(
-            """
-            SELECT * FROM companion_mappings
-             WHERE lower(brand)=lower(?)
-               AND lower(avatar)=lower(?)
-               AND (host_member_id = ? OR approved_version_id = ?)
-             LIMIT 1
-            """,
-            (brand_name, avatar_key, mid, _host_onboarding_safe_str(version_row["version_id"])),
-        ).fetchone()
-    except Exception:
-        mapping_row = None
-
-    if mapping_row is None:
-        mapping_row = {
-            "avatar": avatar_key,
-            "approved_version_id": _host_onboarding_safe_str(version_row["version_id"]),
-            "headshot_url": "",
-            "eleven_voice_id": "",
-            "channel_cap": "Video",
-            "live": "Stream",
-        }
-    return _my_elaralo_public_version_card_from_row(brand_name, mapping_row, version_row)
-
-
-def _my_elaralo_companion_cards_db_sync(
-    brand: str,
-    member_id: str = "",
-    companion_type: str = "",
-    generation: str = "",
-    ethnicity: str = "",
-    gender: str = "",
-) -> List[Dict[str, Any]]:
-    """Legacy DB-driven catalog path, preserved for DulceMoon/white labels."""
+def _my_elaralo_companion_cards_db_sync(brand: str, companion_type: str = "", generation: str = "", ethnicity: str = "", gender: str = "") -> List[Dict[str, Any]]:
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
     rows: List[sqlite3.Row] = []
     conn = _econnect_conn()
@@ -21303,26 +21271,54 @@ def _my_elaralo_companion_cards_db_sync(
             pass
 
     out: List[Dict[str, Any]] = []
+    want_type = _host_onboarding_safe_str(companion_type).lower()
     for row in rows:
         avatar_key = _host_onboarding_safe_str(row["avatar"])
         if not avatar_key:
             continue
         mapping_type = _host_onboarding_safe_str(row["companion_type"] or ("Human" if _host_onboarding_safe_str(row["approved_version_id"]) else "AI"))
         normalized_type = mapping_type.lower() if mapping_type else ("human" if _host_onboarding_safe_str(row["approved_version_id"]) else "ai")
+        if want_type and normalized_type != want_type:
+            continue
 
         if normalized_type == "human" and _host_onboarding_safe_str(row["approved_version_id"]):
-            card = _my_elaralo_public_version_card_from_row(brand_name, row, version_rows.get(_host_onboarding_safe_str(row["approved_version_id"])))
-            if card is None:
+            version_row = version_rows.get(_host_onboarding_safe_str(row["approved_version_id"]))
+            if version_row is None:
                 continue
+            try:
+                profile = _host_onboarding_json_loads(version_row["profile_json"], {})
+            except Exception:
+                profile = {}
+            if not isinstance(profile, dict):
+                profile = {}
+            payload = _host_onboarding_public_payload_from_profile(profile)
+            public_profile = dict(payload.get("public_profile") or {})
+            public_page = dict(payload.get("public_page") or {})
+            quick_ref = dict(public_profile.get("quick_reference_summary") or {})
+            display_name = _host_onboarding_safe_str(public_profile.get("public_display_name") or public_profile.get("stage_name") or quick_ref.get("public_name") or avatar_key)
+            card = {
+                "brand": brand_name,
+                "avatar": avatar_key,
+                "companion_type": "Human",
+                "display_name": display_name,
+                "headline": _host_onboarding_safe_str(public_page.get("headline") or display_name),
+                "gender": _host_onboarding_safe_str(public_profile.get("gender") or quick_ref.get("gender")),
+                "ethnicity": _host_onboarding_safe_str(public_profile.get("ethnicity") or quick_ref.get("ethnicity")),
+                "generation": _host_onboarding_safe_str(public_profile.get("generation") or quick_ref.get("generation")),
+                "headshot_url": _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or row["headshot_url"]),
+                "approved_version_id": _host_onboarding_safe_str(row["approved_version_id"]),
+                "elevenVoiceId": _host_onboarding_safe_str(row["eleven_voice_id"]),
+                "channel_cap": _host_onboarding_safe_str(row["channel_cap"]),
+                "live": _host_onboarding_safe_str(row["live"]),
+                "summary_public_url": f"/summary-public?versionId={_host_onboarding_safe_str(row['approved_version_id'])}",
+            }
         else:
             payload = _ai_companion_public_payload(brand_name, avatar_key)
             public_profile = dict(payload.get("public_profile") or {})
             public_page = dict(payload.get("public_page") or {})
             card = {
                 "brand": brand_name,
-                "avatar": _host_onboarding_safe_str(public_profile.get("avatar") or avatar_key),
-                "companion_key": _host_onboarding_safe_str(public_profile.get("companion_key") or public_profile.get("avatar") or avatar_key),
-                "mapping_avatar": _host_onboarding_safe_str(public_profile.get("mapping_avatar")),
+                "avatar": avatar_key,
                 "companion_type": _host_onboarding_safe_str(public_profile.get("companion_type") or mapping_type or "AI"),
                 "display_name": _host_onboarding_safe_str(public_profile.get("public_display_name") or avatar_key),
                 "headline": _host_onboarding_safe_str(public_page.get("headline") or public_profile.get("public_display_name") or avatar_key),
@@ -21334,42 +21330,47 @@ def _my_elaralo_companion_cards_db_sync(
                 "elevenVoiceId": _host_onboarding_safe_str(row["eleven_voice_id"]),
                 "channel_cap": _host_onboarding_safe_str(row["channel_cap"]),
                 "live": _host_onboarding_safe_str(row["live"]),
-                "summary_public_url": f"/summary-public?brand={quote(brand_name)}&avatar={quote(_host_onboarding_safe_str(public_profile.get('avatar') or avatar_key))}",
+                "summary_public_url": f"/summary-public?brand={quote(brand_name)}&avatar={quote(avatar_key)}",
             }
 
-        if not _my_elaralo_card_matches_filters(card, companion_type, generation, ethnicity, gender):
+        if not _my_elaralo_catalog_filter_match(card.get("generation"), generation):
+            continue
+        if not _my_elaralo_catalog_filter_match(card.get("ethnicity"), ethnicity):
+            continue
+        if not _my_elaralo_catalog_filter_match(card.get("gender"), gender):
             continue
         out.append(card)
-
-    if _is_elaralo_core_brand(brand_name) and member_id:
-        # Legacy safety net: include the current member's approved Human profile even if
-        # the companion_mappings export row was not created yet.
-        conn2 = _econnect_conn()
-        try:
-            _host_onboarding_ensure_schema(conn2)
-            human_card = _my_elaralo_latest_human_version_card(conn2, brand_name, member_id)
-        finally:
-            try:
-                conn2.close()
-            except Exception:
-                pass
-        if human_card and _my_elaralo_card_matches_filters(human_card, companion_type, generation, ethnicity, gender):
-            sig = (_host_onboarding_safe_str(human_card.get("approved_version_id")).lower(), _host_onboarding_safe_str(human_card.get("avatar")).lower())
-            exists = any((_host_onboarding_safe_str(c.get("approved_version_id")).lower(), _host_onboarding_safe_str(c.get("avatar")).lower()) == sig for c in out)
-            if not exists:
-                out.append(human_card)
 
     out.sort(key=lambda item: (_host_onboarding_safe_str(item.get("display_name")).lower(), _host_onboarding_safe_str(item.get("avatar")).lower()))
     return out
 
 
-def _my_elaralo_ai_file_cards(brand_name: str) -> List[Dict[str, Any]]:
+def _my_elaralo_card_matches_filters(
+    card: Dict[str, Any],
+    companion_type: str = "",
+    generation: str = "",
+    ethnicity: str = "",
+    gender: str = "",
+) -> bool:
+    if not _my_elaralo_catalog_filter_match(card.get("companion_type"), companion_type):
+        return False
+    if not _my_elaralo_catalog_filter_match(card.get("generation"), generation):
+        return False
+    if not _my_elaralo_catalog_filter_match(card.get("ethnicity"), ethnicity):
+        return False
+    if not _my_elaralo_catalog_filter_match(card.get("gender"), gender):
+        return False
+    return True
+
+
+def _my_elaralo_ai_file_cards(brand_name: str, public_base_url: str = "") -> List[Dict[str, Any]]:
     cards: List[Dict[str, Any]] = []
-    for asset in _elaralo_ai_headshot_assets():
+    for asset in _elaralo_ai_companion_assets():
         companion_key = _host_onboarding_safe_str(asset.get("stem"))
-        if not companion_key:
+        file_name = _host_onboarding_safe_str(asset.get("file_name"))
+        if not companion_key or not file_name:
             continue
-        payload = _ai_companion_public_payload(brand_name, companion_key)
+        payload = _ai_companion_public_payload(brand_name, companion_key, public_base_url=public_base_url)
         public_profile = dict(payload.get("public_profile") or {})
         public_page = dict(payload.get("public_page") or {})
         mapping = _lookup_companion_mapping_for_ai_media(brand_name, companion_key)
@@ -21377,15 +21378,15 @@ def _my_elaralo_ai_file_cards(brand_name: str) -> List[Dict[str, Any]]:
             "brand": brand_name,
             "avatar": companion_key,
             "companion_key": companion_key,
-            "mapping_avatar": _host_onboarding_safe_str((mapping or {}).get("mapping_avatar") or (mapping or {}).get("avatar")),
+            "mapping_avatar": _host_onboarding_safe_str((mapping or {}).get("mapping_avatar")),
             "companion_type": "AI",
             "display_name": _host_onboarding_safe_str(public_profile.get("public_display_name") or companion_key.split("-", 1)[0]),
             "headline": _host_onboarding_safe_str(public_page.get("headline") or public_profile.get("public_display_name") or companion_key),
             "gender": _host_onboarding_safe_str(public_profile.get("gender")),
             "ethnicity": _host_onboarding_safe_str(public_profile.get("ethnicity")),
             "generation": _host_onboarding_safe_str(public_profile.get("generation")),
-            "headshot_url": _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or asset.get("url")),
-            "headshot_file_name": _host_onboarding_safe_str(asset.get("file_name") or companion_key),
+            "headshot_url": _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or _elaralo_ai_companion_file_url(file_name, public_base_url=public_base_url)),
+            "headshot_file_name": file_name,
             "approved_version_id": "",
             "elevenVoiceId": _host_onboarding_safe_str((mapping or {}).get("eleven_voice_id")),
             "channel_cap": _host_onboarding_safe_str((mapping or {}).get("channel_cap")) or "Video",
@@ -21402,22 +21403,23 @@ def _my_elaralo_companion_cards_sync(
     generation: str = "",
     ethnicity: str = "",
     gender: str = "",
+    public_base_url: str = "",
 ) -> List[Dict[str, Any]]:
+    _ = member_id
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
 
-    # Preserve existing DB-driven behavior for DulceMoon and all other white-labels.
     if not _is_elaralo_core_brand(brand_name):
-        return _my_elaralo_companion_cards_db_sync(brand_name, member_id, companion_type, generation, ethnicity, gender)
+        return _my_elaralo_companion_cards_db_sync(brand_name, companion_type, generation, ethnicity, gender)
 
     out: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, str]] = set()
 
-    def add_card(card: Optional[Dict[str, Any]]) -> None:
+    def add_card(card: Dict[str, Any]) -> None:
         if not isinstance(card, dict):
             return
         if not _my_elaralo_card_matches_filters(card, companion_type, generation, ethnicity, gender):
             return
-        ctype = _host_onboarding_safe_str(card.get("companion_type") or "AI")
+        ctype = _host_onboarding_safe_str(card.get("companion_type") or card.get("companionType") or "AI")
         avatar_key = _host_onboarding_safe_str(card.get("avatar") or card.get("companion_key") or card.get("display_name"))
         sig = (ctype.lower(), avatar_key.lower())
         if sig in seen:
@@ -21425,68 +21427,29 @@ def _my_elaralo_companion_cards_sync(
         seen.add(sig)
         out.append(card)
 
-    # AI source of truth: static Elaralo headshot filenames.
-    ai_cards = _my_elaralo_ai_file_cards(brand_name)
-    for card in ai_cards:
-        add_card(card)
+    want_type = _host_onboarding_safe_str(companion_type).lower()
 
-    # Fallback: if the backend cannot see the static public directory/manifest,
-    # keep existing AI DB rows available. Hyphenated DB avatars still parse into
-    # complete filter facets; first-name-only DB rows remain legacy-compatible.
-    if not ai_cards:
-        for card in _my_elaralo_companion_cards_db_sync(brand_name, member_id, "AI", "", "", ""):
+    ai_cards = _my_elaralo_ai_file_cards(brand_name, public_base_url=public_base_url)
+    if want_type != "human":
+        for card in ai_cards:
             add_card(card)
 
-    # Human source of truth: the current member's approved Host/Profile Studio version.
-    if member_id:
-        conn = _econnect_conn()
-        try:
-            _host_onboarding_ensure_schema(conn)
-            _host_onboarding_ensure_companion_export_columns_best_effort()
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            human_rows = cur.execute(
-                """
-                SELECT * FROM companion_mappings
-                 WHERE lower(brand)=lower(?)
-                   AND lower(COALESCE(companion_type, '')) = 'human'
-                   AND (host_member_id = ? OR COALESCE(host_member_id, '') = '')
-                   AND COALESCE(approved_version_id, '') <> ''
-                 ORDER BY lower(COALESCE(avatar, '')) ASC
-                """,
-                (brand_name, _host_onboarding_normalize_member_id(member_id)),
-            ).fetchall()
-            version_ids = [_host_onboarding_safe_str(r["approved_version_id"]) for r in human_rows if _host_onboarding_safe_str(r["approved_version_id"])]
-            version_rows: Dict[str, sqlite3.Row] = {}
-            if version_ids:
-                placeholders = ",".join(["?"] * len(version_ids))
-                for vr in cur.execute(
-                    f"SELECT * FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE version_id IN ({placeholders})",
-                    tuple(version_ids),
-                ).fetchall():
-                    # Current member only; avoids leaking other human profiles in the All view.
-                    if _host_onboarding_normalize_member_id(vr["member_id"]).lower() == _host_onboarding_normalize_member_id(member_id).lower():
-                        version_rows[_host_onboarding_safe_str(vr["version_id"])] = vr
-            for row in human_rows:
-                add_card(_my_elaralo_public_version_card_from_row(brand_name, row, version_rows.get(_host_onboarding_safe_str(row["approved_version_id"]))))
+    if not ai_cards and want_type != "human":
+        for card in _my_elaralo_companion_cards_db_sync(brand_name, "AI", "", "", ""):
+            add_card(card)
 
-            latest_card = _my_elaralo_latest_human_version_card(conn, brand_name, member_id)
-            add_card(latest_card)
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    if want_type != "ai":
+        for card in _my_elaralo_companion_cards_db_sync(brand_name, "Human", "", "", ""):
+            add_card(card)
 
     out.sort(key=lambda item: (_host_onboarding_safe_str(item.get("display_name")).lower(), _host_onboarding_safe_str(item.get("avatar")).lower()))
     return out
 
 
 @app.get("/my-elaralo/companions/catalog")
-
-@app.get("/my-elaralo/companions/catalog")
 @app.get("/catalog/my-elaralo")
 async def my_elaralo_companions_catalog(
+    request: Request,
     memberId: Optional[str] = None,
     member_id: Optional[str] = None,
     brand: Optional[str] = None,
@@ -21507,6 +21470,7 @@ async def my_elaralo_companions_catalog(
         generation=_host_onboarding_safe_str(generation),
         ethnicity=_host_onboarding_safe_str(ethnicity),
         gender=_host_onboarding_safe_str(gender),
+        public_base_url=_companion_public_api_base_url(request=request),
     )
     return {
         "ok": True,
@@ -21519,6 +21483,7 @@ async def my_elaralo_companions_catalog(
 
 @app.get("/host-onboarding/public/summary")
 async def host_onboarding_public_summary(
+    request: Request,
     memberId: Optional[str] = None,
     member_id: Optional[str] = None,
     versionId: Optional[str] = None,
@@ -21540,7 +21505,7 @@ async def host_onboarding_public_summary(
     if not resolved_version_id and not resolved_member_id and not resolved_avatar:
         raise HTTPException(status_code=400, detail="memberId, versionId, avatar, or headshot filename is required")
     if not resolved_version_id and not resolved_member_id and resolved_avatar:
-        payload = _ai_companion_public_payload(resolved_brand, resolved_avatar)
+        payload = _ai_companion_public_payload(resolved_brand, resolved_avatar, public_base_url=_companion_public_api_base_url(request=request))
         return {
             "ok": True,
             "version": None,
