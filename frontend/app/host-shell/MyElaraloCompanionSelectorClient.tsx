@@ -377,6 +377,10 @@ export default function MyElaraloCompanionSelectorClient() {
         url.searchParams.set("avatar", mappingAvatar);
         url.searchParams.set("avatarName", mappingAvatar);
         url.searchParams.set("avatar_name", mappingAvatar);
+        url.searchParams.set("mappingAvatar", mappingAvatar);
+        url.searchParams.set("mapping_avatar", mappingAvatar);
+        url.searchParams.set("sqlAvatar", mappingAvatar);
+        url.searchParams.set("sql_avatar", mappingAvatar);
         url.searchParams.set("companion", mappingAvatar);
         url.searchParams.set("companionName", mappingAvatar);
         url.searchParams.set("companion_name", mappingAvatar);

@@ -6,6 +6,9 @@ import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
 import Hls from "hls.js";
 import elaraLogo from "../public/elaralo-logo.png";
+// v9.1.13: preserve selected companion mapping identity separately from the
+// logged-in host/member identity. Direct My Elaralo launches pass companionType
+// so AI selections cannot resolve to the host's Human row.
 const PlayIcon = ({ size = 18 }: { size?: number }) => (
   <svg
     width={size}
@@ -931,6 +934,14 @@ function aiFirstNameFromKey(raw: any): string {
   return cleaned.split("-", 1)[0]?.trim() || "";
 }
 
+function normalizeCompanionTypeHint(raw: any): "AI" | "Human" | "" {
+  const s = String(raw || "").trim().toLowerCase().replace(/[_-]+/g, " ");
+  if (!s) return "";
+  if (s === "ai" || s === "ai companion") return "AI";
+  if (s === "human" || s === "human companion") return "Human";
+  return "";
+}
+
 function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
   if (typeof window === "undefined") return null;
   try {
@@ -969,7 +980,9 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
       rawCompanion ||
       companionKey;
 
-    const mappingAvatar = isAiKey ? companionDisplayName : (rawCompanion || companionDisplayName || companionKey);
+    const explicitMappingAvatar = firstQueryValue(params, ["mappingAvatar", "mapping_avatar", "sqlAvatar", "sql_avatar"]);
+    const mappingAvatar = explicitMappingAvatar || rawCompanion || (isAiKey ? aiFirstNameFromKey(companionKey) : companionDisplayName) || companionKey;
+    const companionTypeHint = normalizeCompanionTypeHint(firstQueryValue(params, ["companionType", "companion_type", "type"]));
     const rebrandingKey = firstQueryValue(params, ["rebrandingKey", "rebranding_key", "RebrandingKey", "rebrandingkey"]);
     const memberId = firstQueryValue(params, ["memberId", "member_id"]);
     const displayName = firstQueryValue(params, ["displayName", "display_name", "userName", "user_name", "username"]);
@@ -1011,6 +1024,11 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
       companionKey: companionKey,
       companion_key: companionKey,
     };
+
+    if (companionTypeHint) {
+      payload.companionType = companionTypeHint;
+      payload.companion_type = companionTypeHint;
+    }
 
     if (rebrandingKey) {
       payload.rebrandingKey = rebrandingKey;
@@ -4461,6 +4479,8 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   }, [rebrandingName, payloadBrandName, rebrandingKey]);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
+  const [selectedMappingAvatar, setSelectedMappingAvatar] = useState<string>("");
+  const [selectedCompanionType, setSelectedCompanionType] = useState<"AI" | "Human" | "">("");
 
   // Viewer-only: display name used in the shared in-stream chat.
   // - Stored locally so we only prompt once per (brand, companion).
@@ -4787,9 +4807,16 @@ useEffect(() => {
 
       const brand = String(companyName || "").trim();
       const displayAvatar = String(companionName || "").trim();
+      const mappingAvatar = String(selectedMappingAvatar || "").trim();
       const fullKey = String(companionKey || "").trim();
-      const isElaraloAiSelection = isElaraloBrandName(brand) && isAiCompanionFilenameKey(fullKey || displayAvatar);
-      const primaryAvatar = displayAvatar || fullKey;
+      const requestedType = normalizeCompanionTypeHint(selectedCompanionType);
+      const explicitAiSelection = requestedType === "AI";
+      const explicitHumanSelection = requestedType === "Human";
+      const isElaraloAiSelection = isElaraloBrandName(brand) && (
+        explicitAiSelection ||
+        (!explicitHumanSelection && isAiCompanionFilenameKey(fullKey || mappingAvatar || displayAvatar))
+      );
+      const primaryAvatar = mappingAvatar || displayAvatar || fullKey;
 
       if (!brand || !primaryAvatar) {
         setCompanionMapping(null);
@@ -4806,14 +4833,18 @@ useEffect(() => {
       }
 
       const candidates = isElaraloAiSelection
-        ? [primaryAvatar, aiFirstNameFromKey(fullKey || primaryAvatar), fullKey]
+        ? [mappingAvatar, fullKey, displayAvatar, aiFirstNameFromKey(fullKey || primaryAvatar)]
         : [primaryAvatar];
       const lookupAvatars = Array.from(new Set(candidates.map((x) => String(x || "").trim()).filter(Boolean)));
       const errors: string[] = [];
 
       for (const lookupAvatar of lookupAvatars) {
         try {
-          const url = `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(lookupAvatar)}`;
+          const params = new URLSearchParams();
+          params.set("brand", brand);
+          params.set("avatar", lookupAvatar);
+          if (requestedType) params.set("companionType", requestedType);
+          const url = `${API_BASE}/mappings/companion?${params.toString()}`;
           const res = await fetch(url, { method: "GET" });
           const json: any = await res.json().catch(() => ({}));
           if (cancelled) return;
@@ -4850,7 +4881,7 @@ useEffect(() => {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, companyName, companionKey, companionName]);
+  }, [API_BASE, companyName, companionKey, companionName, selectedCompanionType, selectedMappingAvatar]);
 
   const preferredMappingHeadshot = useMemo(() => {
     return String((companionMapping as any)?.headshot_url || (companionMapping as any)?.headshotUrl || "").trim();
@@ -6892,7 +6923,11 @@ useEffect(() => {
 
         // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
         brand: (companyName || "").trim(),
-        avatar: (companionName || "").trim(),
+        avatar: (selectedMappingAvatar || companionName || "").trim(),
+        mappingAvatar: (selectedMappingAvatar || companionName || "").trim(),
+        mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
+        companionType: selectedCompanionType,
+        companion_type: selectedCompanionType,
 
         translator_enabled: translatorEnabled,
         translation_enabled: translatorEnabled,
@@ -7944,7 +7979,11 @@ useEffect(() => {
       memberId: mid,
       member_id: mid,
       brand: rawBrand,
-      avatar: String(companionName || companionForBackend).trim(),
+      avatar: String(selectedMappingAvatar || companionName || companionForBackend).trim(),
+      mappingAvatar: String(selectedMappingAvatar || companionName || companionForBackend).trim(),
+      mapping_avatar: String(selectedMappingAvatar || companionName || companionForBackend).trim(),
+      companionType: selectedCompanionType,
+      companion_type: selectedCompanionType,
       companion: companionForBackend,
       companionName: companionForBackend,
       companion_name: companionForBackend,
@@ -7990,7 +8029,7 @@ useEffect(() => {
       assistant_source_language_name: assistantSpeechLanguageName,
       assistantSourceLanguageName: assistantSpeechLanguageName,
     };
-  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, rebrandingKey, planName, buildHostReadableViewerName, mappedHostMemberId, isHost, loggedIn, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
+  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, selectedMappingAvatar, selectedCompanionType, rebrandingKey, planName, buildHostReadableViewerName, mappedHostMemberId, isHost, loggedIn, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
 
   useEffect(() => {
     if (!API_BASE) return;
@@ -8266,7 +8305,11 @@ useEffect(() => {
         companion_name: companionForBackend,
   // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
   brand: (companyName || "").trim(),
-  avatar: (companionName || "").trim(),
+  avatar: (selectedMappingAvatar || companionName || "").trim(),
+        mappingAvatar: (selectedMappingAvatar || companionName || "").trim(),
+        mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
+        companionType: selectedCompanionType,
+        companion_type: selectedCompanionType,
 
         memberId: (memberIdForBackend || "").trim(),
         member_id: (memberIdForBackend || "").trim(),
@@ -10615,6 +10658,19 @@ useEffect(() => {
           : typeof (data as any).companion_display_name === "string"
             ? String((data as any).companion_display_name).trim()
             : "";
+      const incomingCompanionType = normalizeCompanionTypeHint(
+        typeof (data as any).companionType === "string"
+          ? String((data as any).companionType).trim()
+          : typeof (data as any).companion_type === "string"
+            ? String((data as any).companion_type).trim()
+            : ""
+      );
+      const incomingMappingAvatar =
+        typeof (data as any).mappingAvatar === "string"
+          ? String((data as any).mappingAvatar).trim()
+          : typeof (data as any).mapping_avatar === "string"
+            ? String((data as any).mapping_avatar).trim()
+            : incomingAvatarName || incomingCompanion || "";
       const resolvedCompanionKey = incomingCompanionKey || incomingCompanion || incomingAvatarName || "";
       const { baseKey } = splitCompanionKey(resolvedCompanionKey);
 
@@ -10624,17 +10680,25 @@ useEffect(() => {
         const resolvedCompanionName = incomingCompanionDisplayName || parsed.first || incomingAvatarName || incomingCompanion || DEFAULT_COMPANION_NAME;
         resolvedStartupName = resolvedCompanionName;
         const resolvedCompanionMetaKey = parsed.key || resolvedCompanionKey;
+        const resolvedMappingAvatar = incomingMappingAvatar || resolvedCompanionName;
         setCompanionKey(resolvedCompanionMetaKey);
         setCompanionName(resolvedCompanionName);
+        setSelectedMappingAvatar(resolvedMappingAvatar);
+        setSelectedCompanionType(incomingCompanionType);
         armStartupOverlay(resolvedCompanionName);
 
         // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
+        // avatar/mappingAvatar are SQL mapping identities; companionName remains the full companion key for AI filename cards.
         setSessionState((prev) => ({
           ...prev,
           companion: resolvedCompanionMetaKey,
           companionName: resolvedCompanionMetaKey,
           companion_name: resolvedCompanionMetaKey,
-          avatar: resolvedCompanionName,
+          avatar: resolvedMappingAvatar,
+          mappingAvatar: resolvedMappingAvatar,
+          mapping_avatar: resolvedMappingAvatar,
+          companionType: incomingCompanionType,
+          companion_type: incomingCompanionType,
         }));
 
         const avatarCandidates = buildAvatarCandidates(baseKey || resolvedCompanionKey || resolvedCompanionName, rebrandSlugFromMessage);
@@ -10906,7 +10970,11 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
   companion_name: companionForBackend,
   // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
   brand: (companyName || "").trim(),
-  avatar: (companionName || "").trim(),
+  avatar: (selectedMappingAvatar || companionName || "").trim(),
+        mappingAvatar: (selectedMappingAvatar || companionName || "").trim(),
+        mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
+        companionType: selectedCompanionType,
+        companion_type: selectedCompanionType,
 
   // Member identity (from Wix)
   memberId: (memberIdForBackend || "").trim(),
@@ -11077,7 +11145,11 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
       companionName: companionForBackend,
       companion_name: companionForBackend,
       brand: (companyName || "").trim(),
-      avatar: (companionName || "").trim(),
+      avatar: (selectedMappingAvatar || companionName || "").trim(),
+        mappingAvatar: (selectedMappingAvatar || companionName || "").trim(),
+        mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
+        companionType: selectedCompanionType,
+        companion_type: selectedCompanionType,
       planName: effectivePlanForBackend,
       plan_name: effectivePlanForBackend,
       plan: effectivePlanForBackend,

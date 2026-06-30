@@ -59,6 +59,9 @@ STATUS_ALLOWED = "explicit_allowed"
 
 app = FastAPI(title="Elaralo API")
 
+# v9.2.21 remediation: isolate selected companion mappings from Host Onboarding exports.
+# AI rows must never be converted into Human rows when a logged-in host selects another companion.
+
 # ----------------------------
 # WIX FORM
 # ----------------------------
@@ -1822,7 +1825,13 @@ async def _startup_load_companion_mappings() -> None:
 
 
 @app.get("/mappings/companion")
-async def get_companion_mapping(request: Request, brand: str = "", avatar: str = "") -> Dict[str, Any]:
+async def get_companion_mapping(
+    request: Request,
+    brand: str = "",
+    avatar: str = "",
+    companionType: str = "",
+    companion_type: str = "",
+) -> Dict[str, Any]:
     """Lookup a companion mapping row by (brand, avatar).
 
     Contract:
@@ -1843,17 +1852,29 @@ async def get_companion_mapping(request: Request, brand: str = "", avatar: str =
     b = b_in or "Elaralo"
     is_elaralo = _is_elaralo_core_brand(b)
     public_base = _companion_public_api_base_url(request=request)
+    requested_type = _host_onboarding_safe_str(companionType or companion_type).strip().lower()
+    if requested_type in ("human_companion", "human-companion"):
+        requested_type = "human"
+    elif requested_type in ("ai_companion", "ai-companion"):
+        requested_type = "ai"
+    elif requested_type not in ("", "human", "ai"):
+        requested_type = ""
+
     resolved_ai_key = _resolve_elaralo_ai_companion_key(b, a) if is_elaralo else a
     ai_asset = _elaralo_ai_companion_asset_for_key(b, resolved_ai_key or a, public_base_url=public_base) if is_elaralo else {}
-    is_elaralo_ai_media = bool(is_elaralo and (ai_asset or _ai_companion_key_has_metadata(resolved_ai_key or a)))
+    is_elaralo_ai_media = bool(is_elaralo and (requested_type == "ai" or (requested_type != "human" and (ai_asset or _ai_companion_key_has_metadata(resolved_ai_key or a)))))
 
-    m = _lookup_companion_mapping_for_ai_media(b, a) if is_elaralo else (_lookup_companion_mapping(b, a) or {})
+    if is_elaralo_ai_media:
+        m = _lookup_companion_mapping_for_ai_media(b, a)
+    else:
+        m = _lookup_companion_mapping_typed(b, a, requested_type) if requested_type else (_lookup_companion_mapping(b, a) or {})
     if not m:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"Companion mapping not found for brand='{b}' avatar='{a}'. "
-                "Please add this companion to the voice/video mapping database before opening Connect."
+                f"Companion mapping not found for brand='{b}' avatar='{a}'"
+                + (f" companion_type='{requested_type.title()}'" if requested_type else "")
+                + ". Please add this companion to the voice/video mapping database before opening Connect."
             ),
         )
 
@@ -3224,11 +3245,15 @@ def _set_session_kind_room_best_effort(resolved_brand: str, resolved_avatar: str
         cur.execute("ALTER TABLE companion_mappings ADD COLUMN session_room TEXT")
         cols.add("session_room")
 
-      # Ensure row exists (INSERT OR IGNORE)
+      # Do not create mapping rows here. Connect must fail gracefully when a
+      # companion has no explicit SQL mapping; otherwise operational helpers can
+      # accidentally create blank rows that later get mistaken for real mappings.
       cur.execute(
-        "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+        "SELECT rowid FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
         (b, a),
       )
+      if cur.fetchone() is None:
+        return False
 
       # UPDATE only provided fields
       sets = []
@@ -3370,10 +3395,14 @@ def _set_livekit_fields_best_effort(
             cur = conn.cursor()
             _ensure_livekit_columns_best_effort()
 
+            # Do not create mapping rows here. Live/video helpers must operate
+            # only on validated companion_mappings rows.
             cur.execute(
-                "INSERT OR IGNORE INTO companion_mappings (brand, avatar) VALUES (?, ?)",
+                "SELECT rowid FROM companion_mappings WHERE lower(brand)=lower(?) AND lower(avatar)=lower(?) LIMIT 1",
                 (b, a),
             )
+            if cur.fetchone() is None:
+                return False
 
             sets = []
             params = []
@@ -5060,31 +5089,39 @@ def _elaralo_ai_companion_file_url(file_name_or_stem: Any, public_base_url: str 
 
 
 def _lookup_companion_mapping_for_ai_media(brand: Any, avatar_key: Any) -> Dict[str, Any]:
-    """Lookup companion media/provider mapping for an AI filename key.
+    """Lookup provider mapping for an Elaralo AI filename key.
 
-    Elaralo AI image companion_key is the full filename stem. Historical provider
-    rows may be keyed by first name, so Elaralo allows a first-token fallback for
-    provider fields only. The companion_key remains the full filename stem.
+    Elaralo AI image companion_key is the full filename stem. Provider rows in
+    companion_mappings are keyed by the SQL avatar identity, which is normally
+    the first name and may include a -######### collision suffix. This lookup is
+    intentionally type-isolated: an AI filename must never fall back to a Human
+    mapping row simply because the host has the same first name.
     """
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
     avatar_s = _host_onboarding_safe_str(avatar_key)
-    direct = _lookup_companion_mapping(brand_name, avatar_s)
+
+    direct = _lookup_companion_mapping_typed(brand_name, avatar_s, "AI")
     if isinstance(direct, dict):
         out = dict(direct)
         out["companion_key"] = avatar_s
         out["mapping_avatar"] = _host_onboarding_safe_str(direct.get("avatar"))
         return out
+
     if _is_elaralo_core_brand(brand_name):
         resolved = _resolve_elaralo_ai_companion_key(brand_name, avatar_s) or avatar_s
         first = _elaralo_ai_first_token(resolved)
-        if first and first.lower() != avatar_s.lower():
-            fallback = _lookup_companion_mapping(brand_name, first) or _lookup_companion_mapping_by_avatar_base(brand_name, first)
+        if first:
+            fallback = (
+                _lookup_companion_mapping_typed(brand_name, first, "AI")
+                or _lookup_companion_mapping_by_avatar_base_typed(brand_name, first, "AI")
+            )
             if isinstance(fallback, dict):
                 out = dict(fallback)
                 out["avatar"] = resolved
                 out["companion_key"] = resolved
                 out["mapping_avatar"] = _host_onboarding_safe_str(fallback.get("avatar"))
                 return out
+
     return {}
 
 
@@ -20146,6 +20183,74 @@ def _host_onboarding_avatar_key_from_session(session: Dict[str, Any]) -> str:
     return _companion_avatar_first_name(public_name) or "Companion"
 
 
+def _host_onboarding_non_default_first_name(raw: Any) -> str:
+    """Return a first-name avatar candidate, excluding app/default companion names.
+
+    Historical Host Onboarding sessions sometimes stored the currently selected
+    Connect companion (for example Elara) in session.avatar. That value is a
+    selection context, not the host's Human Companion identity, and must never be
+    used to target companion_mappings for a Host export/repair.
+    """
+    first = _companion_avatar_first_name(raw)
+    if not first:
+        return ""
+    if first.strip().lower() in {"elara", "elaralo", "companion", "human"}:
+        return ""
+    return first
+
+
+def _host_onboarding_human_avatar_key_from_profile(profile: Dict[str, Any], session: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve the Human Companion mapping avatar from Host profile data only.
+
+    This deliberately prefers approved Host/Profile Studio naming fields and only
+    uses stored connect_platform avatar values as a last resort. It does not use
+    session.avatar defaults such as Elara, because those can represent the
+    companion the host selected in Connect rather than the host herself.
+    """
+    profile = dict(profile or {})
+    session_obj = dict(session or {}) if isinstance(session, dict) else {}
+    public_profile = dict(profile.get("public_profile") or {})
+    private_profile = dict(profile.get("private_profile") or {})
+    ai_profile = dict(profile.get("ai_profile") or {})
+    profile_session = dict(profile.get("session") or {})
+    basics = dict(session_obj.get("basics") or {})
+    completion = dict(session_obj.get("completion") or {})
+    ai_connect = dict(ai_profile.get("connect_platform") or {})
+    connect_platform = dict(profile.get("connect_platform") or {})
+
+    primary_candidates = [
+        public_profile.get("public_display_name"),
+        public_profile.get("stage_name"),
+        ai_profile.get("approved_stage_name"),
+        basics.get("public_display_name"),
+        basics.get("stage_name"),
+        completion.get("public_display_name"),
+        completion.get("stage_name"),
+        profile_session.get("public_display_name"),
+        profile_session.get("stage_name"),
+        session_obj.get("host_display_name"),
+        private_profile.get("legal_name"),
+    ]
+    for candidate in primary_candidates:
+        first = _host_onboarding_non_default_first_name(candidate)
+        if first:
+            return first
+
+    # Last resort: older approved profiles may have already exported a correct
+    # human connect_platform avatar such as Sera-Female-Caucasian-Gen-Z or Sera.
+    # Reject app-default selections such as Elara.
+    fallback_candidates = [
+        connect_platform.get("avatar"),
+        ai_connect.get("avatar"),
+    ]
+    for candidate in fallback_candidates:
+        first = _host_onboarding_non_default_first_name(candidate)
+        if first:
+            return first
+
+    return ""
+
+
 def _host_onboarding_gallery_description_for_slot(slot_key: Any) -> str:
     slot = _host_onboarding_safe_str(slot_key)
     mapping = {
@@ -20516,6 +20621,38 @@ def _host_onboarding_create_companion_mapping_triggers_on_conn(conn: sqlite3.Con
         )
     except Exception:
         pass
+    try:
+        # Defense-in-depth for the exact production failure class: no Host
+        # Onboarding/export/repair path may convert an existing AI row into a
+        # Human row or stamp host ownership/version data onto it. This still
+        # permits normal admin maintenance of AI fields such as eleven_voice_id,
+        # channel_cap, live, D-ID fields, etc.
+        cur = conn.cursor()
+        cur.execute("DROP TRIGGER IF EXISTS companion_mappings_prevent_ai_host_overwrite")
+        cur.execute(
+            """
+            CREATE TRIGGER companion_mappings_prevent_ai_host_overwrite
+            BEFORE UPDATE ON companion_mappings
+            FOR EACH ROW
+            WHEN lower(COALESCE(OLD.companion_type, '')) = 'ai'
+             AND (
+                    lower(COALESCE(NEW.companion_type, '')) = 'human'
+                 OR (trim(COALESCE(NEW.host_member_id, '')) <> ''
+                     AND COALESCE(NEW.host_member_id, '') <> COALESCE(OLD.host_member_id, ''))
+                 OR (trim(COALESCE(NEW.approved_version_id, '')) <> ''
+                     AND COALESCE(NEW.approved_version_id, '') <> COALESCE(OLD.approved_version_id, ''))
+                 OR (trim(COALESCE(NEW.voice_capture_url, '')) <> ''
+                     AND COALESCE(NEW.voice_capture_url, '') <> COALESCE(OLD.voice_capture_url, ''))
+                 OR (trim(COALESCE(NEW.public_gallery_json, '')) <> ''
+                     AND COALESCE(NEW.public_gallery_json, '') <> COALESCE(OLD.public_gallery_json, ''))
+                 )
+            BEGIN
+                SELECT RAISE(ABORT, 'Refusing to overwrite AI companion_mappings row with Host Onboarding data');
+            END;
+            """
+        )
+    except Exception:
+        pass
 
 
 def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Connection) -> None:
@@ -20617,10 +20754,11 @@ def _host_onboarding_find_existing_human_mapping_row_on_conn(
                  OR (? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?))
                  OR (? <> '' AND lower(COALESCE(avatar, '')) = lower(?))
                )
+               AND lower(COALESCE(companion_type, '')) <> 'ai'
                AND (
                     lower(COALESCE(companion_type, '')) = 'human'
-                 OR COALESCE(approved_version_id, '') <> ''
-                 OR COALESCE(host_member_id, '') <> ''
+                 OR (? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?))
+                 OR (? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?))
                )
              ORDER BY
                CASE
@@ -20636,6 +20774,8 @@ def _host_onboarding_find_existing_human_mapping_row_on_conn(
                 member_norm, member_norm,
                 version_norm, version_norm,
                 legacy_norm, legacy_norm,
+                version_norm, version_norm,
+                member_norm, member_norm,
                 version_norm, version_norm,
                 member_norm, member_norm,
             ),
@@ -21013,6 +21153,91 @@ def _lookup_companion_mapping_by_avatar_base(brand: str, avatar_base: Any) -> Op
     return dict(candidates[0][2])
 
 
+def _companion_mapping_companion_type_lc(mapping: Any) -> str:
+    if not isinstance(mapping, dict):
+        try:
+            mapping = dict(mapping)
+        except Exception:
+            mapping = {}
+    return _host_onboarding_safe_str((mapping or {}).get("companion_type") or (mapping or {}).get("companionType")).lower()
+
+
+def _companion_mapping_matches_requested_type(mapping: Any, requested_type: Any) -> bool:
+    """Return whether a mapping row is safe to use for an explicit companion type.
+
+    The important production invariant is isolation: an AI selection must never
+    reuse a Human mapping row for the same first name, and a Human selection must
+    not consume an AI mapping row. Blank legacy rows are tolerated only when they
+    do not carry Host Onboarding ownership/version markers.
+    """
+    wanted = _host_onboarding_safe_str(requested_type).lower()
+    if wanted in ("human_companion", "human-companion"):
+        wanted = "human"
+    elif wanted in ("ai_companion", "ai-companion"):
+        wanted = "ai"
+    if wanted not in ("human", "ai"):
+        return bool(mapping)
+    if not isinstance(mapping, dict):
+        try:
+            mapping = dict(mapping)
+        except Exception:
+            mapping = {}
+    if not mapping:
+        return False
+    ctype = _companion_mapping_companion_type_lc(mapping)
+    host_member_id = _host_onboarding_safe_str((mapping or {}).get("host_member_id") or (mapping or {}).get("hostMemberId"))
+    approved_version_id = _host_onboarding_safe_str((mapping or {}).get("approved_version_id") or (mapping or {}).get("approvedVersionId"))
+    if wanted == "ai":
+        if ctype == "ai":
+            return True
+        # Historical AI rows may have a blank companion_type, but they should not
+        # be Host Onboarding rows. A row with host_member_id/approved_version_id is Human-owned.
+        return not ctype and not host_member_id and not approved_version_id
+    if wanted == "human":
+        if ctype == "ai":
+            return False
+        return ctype == "human" or bool(host_member_id or approved_version_id)
+    return False
+
+
+def _lookup_companion_mapping_typed(brand: str, avatar: Any, requested_type: Any) -> Optional[Dict[str, Any]]:
+    row = _lookup_companion_mapping(brand, _host_onboarding_safe_str(avatar))
+    if row and _companion_mapping_matches_requested_type(row, requested_type):
+        return dict(row)
+    return None
+
+
+def _lookup_companion_mapping_by_avatar_base_typed(brand: str, avatar_base: Any, requested_type: Any) -> Optional[Dict[str, Any]]:
+    """Lookup by first-name base while preserving AI/Human type isolation."""
+    b = _norm_key(brand) or "elaralo"
+    base = _companion_avatar_first_name(avatar_base)
+    if not base:
+        return None
+    exact = _lookup_companion_mapping_typed(brand, base, requested_type)
+    if exact:
+        return exact
+    base_lc = base.lower()
+    candidates: List[Tuple[int, str, Dict[str, Any]]] = []
+    for (row_brand, _row_avatar), mapping in list(_COMPANION_MAPPINGS.items()):
+        if row_brand != b:
+            continue
+        if not _companion_mapping_matches_requested_type(mapping, requested_type):
+            continue
+        avatar = _host_onboarding_safe_str((mapping or {}).get("avatar"))
+        m = _COMPANION_AVATAR_COLLISION_SUFFIX_RE.match(avatar)
+        if not m or m.group("base").lower() != base_lc:
+            continue
+        try:
+            n = int(m.group("num"))
+        except Exception:
+            n = 999999999
+        candidates.append((n, avatar.lower(), mapping))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return dict(candidates[0][2])
+
+
 def _host_onboarding_upsert_connect_companion_mapping(
     *,
     member_id: str,
@@ -21067,6 +21292,14 @@ def _host_onboarding_upsert_connect_companion_mapping(
             approved_version_id=approved_version_id_norm,
             legacy_avatar=_host_onboarding_safe_str(avatar_key),
         )
+        # Defense in depth: Host Onboarding must never overwrite an AI mapping row.
+        # If a historical/corrupt row is marked AI, create a distinct Human row
+        # instead of converting the selected AI companion into the host.
+        try:
+            if existing is not None and _host_onboarding_safe_str(existing["companion_type"]).lower() == "ai":
+                existing = None
+        except Exception:
+            pass
         current_rowid: Optional[int] = None
         if existing is not None:
             try:
@@ -21425,24 +21658,18 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
     display_name = _host_onboarding_safe_str(
         public_profile.get("public_display_name")
         or public_profile.get("stage_name")
+        or ai_profile.get("approved_stage_name")
+        or (dict((session or {}).get("basics") or {}).get("public_display_name") if isinstance(session, dict) else "")
+        or (dict((session or {}).get("basics") or {}).get("stage_name") if isinstance(session, dict) else "")
         or (session or {}).get("host_display_name")
-        or profile_session.get("avatar")
         or "Human Companion"
     )
-    avatar_key = _host_onboarding_safe_str(
-        profile_session.get("avatar")
-        or connect_platform.get("avatar")
-        or ai_connect.get("avatar")
-        or ((session or {}).get("avatar") if isinstance(session, dict) else "")
-    )
-    if not avatar_key and session:
-        try:
-            avatar_key = _host_onboarding_avatar_key_from_session(session)
-        except Exception:
-            avatar_key = ""
+    avatar_key = _host_onboarding_human_avatar_key_from_profile(profile, session)
     if not avatar_key:
-        first = re.split(r"\s+", display_name.strip(), maxsplit=1)[0] if display_name.strip() else "Human"
-        avatar_key = re.sub(r"[^A-Za-z0-9]+", "-", first).strip("-") or "Human"
+        # If we cannot derive a Host identity from approved profile fields, do not
+        # repair/write companion_mappings. Falling back to profile_session.avatar
+        # or session.avatar can target the currently selected AI companion.
+        return {}
 
     headshot_asset = {}
     for candidate in [
