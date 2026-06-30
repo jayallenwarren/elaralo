@@ -823,6 +823,7 @@ export default function HostProfileStudioClient() {
     core_values: "",
     personal_motto: "",
     physical_description: "",
+    phonetic_pronunciation: "",
     skipped_sections: {},
   });
   const [showCompletionPhysicalDescriptionEditor, setShowCompletionPhysicalDescriptionEditor] = useState<boolean>(false);
@@ -915,6 +916,13 @@ export default function HostProfileStudioClient() {
       core_values: String(completion.core_values || ""),
       personal_motto: String(completion.personal_motto || ""),
       physical_description: hydratedCompletionPhysicalDescription,
+      phonetic_pronunciation: String(
+        completion.phonetic_pronunciation ||
+          completion.phonetic_pronunciation_of_first_name ||
+          completion.phonetic_spelling ||
+          completion.phonetic ||
+          "",
+      ),
       skipped_sections: typeof completion.skipped_sections === "object" && completion.skipped_sections ? completion.skipped_sections : {},
     }));
     setShowCompletionPhysicalDescriptionEditor(Boolean(hydratedCompletionPhysicalDescription) || !Boolean(hydratedReviewPhysicalDescription));
@@ -1266,8 +1274,11 @@ export default function HostProfileStudioClient() {
       const educationEntries = (Array.isArray(completionForm.education_entries) ? completionForm.education_entries : [])
         .map((entry: any) => normalizeEducationEntry(entry))
         .filter((entry: EducationEntry | null): entry is EducationEntry => Boolean(entry));
+      const phoneticPronunciation = String(completionForm.phonetic_pronunciation || "").trim();
       const completionPayload = {
         ...completionForm,
+        phonetic_pronunciation: phoneticPronunciation,
+        phonetic_pronunciation_of_first_name: phoneticPronunciation,
         education_entries: educationEntries.map(({ id, ...rest }) => rest),
         education: formatEducationEntriesLegacyText(educationEntries),
       };
@@ -1959,12 +1970,21 @@ export default function HostProfileStudioClient() {
                 </div>
               </div>
             )}
+            {renderLabeledInput(
+              "Phonetic spelling of first name (optional)",
+              completionForm.phonetic_pronunciation,
+              (v) => setCompletionForm((p) => ({ ...p, phonetic_pronunciation: v })),
+              "Example: ser-ah",
+              <span style={{ fontSize: 12, color: "#6b7280", lineHeight: 1.5 }}>
+                Optional. Use this only when the host's first name should be pronounced differently from its spelling. If left blank, Elaralo will not derive a phonetic value from the first name.
+              </span>,
+            )}
             <div style={{ ...cardStyle, padding: 16, display: "grid", gap: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <div>
                   <div style={{ fontWeight: 800 }}>Voice capture (minimum 30 seconds)</div>
                   <div style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
-                    Record or upload a voice sample that is at least {voiceCaptureMinSeconds} seconds long. The guided script below is written to run about {voiceCaptureTargetSeconds} seconds at a natural pace. This clip is required for full publish and is exported with the approved Elaralo companion assets.
+                    Record or upload a voice sample that is at least {voiceCaptureMinSeconds} seconds long. The guided script below is written to run about {voiceCaptureTargetSeconds} seconds at a natural pace. This clip is required for limited and full profile approval and is exported with the approved Elaralo companion assets.
                   </div>
                 </div>
                 <div style={{ fontSize: 13, color: "#6b7280" }}>

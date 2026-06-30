@@ -18834,6 +18834,52 @@ def _host_onboarding_safe_str(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _host_onboarding_optional_phonetic(value: Any, max_chars: int = 160) -> str:
+    """Return an explicitly entered phonetic pronunciation, never a derived fallback.
+
+    Phonetic values affect TTS name pronunciation. They should be preserved when
+    a human provides them, but the system must not copy the first name into this
+    field because names and pronunciations are often different (for example,
+    Sera => ser-ah).
+    """
+    text = re.sub(r"\s+", " ", _host_onboarding_safe_str(value)).strip()
+    if not text:
+        return ""
+    try:
+        limit = max(20, int(max_chars))
+    except Exception:
+        limit = 160
+    return text[:limit].strip()
+
+
+def _host_onboarding_extract_explicit_phonetic(*sources: Any) -> str:
+    """Find the first explicit phonetic value in session/profile payloads.
+
+    Accepted keys are intentionally narrow so we do not infer phonetics from
+    stage_name, public_display_name, avatar, or first_name.
+    """
+    keys = (
+        "phonetic_pronunciation",
+        "phonetic_pronunciation_of_first_name",
+        "phonetic_spelling",
+        "phonetic",
+    )
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = _host_onboarding_optional_phonetic(source.get(key))
+            if value:
+                return value
+        for nested_key in ("completion", "private_profile", "public_profile", "ai_profile", "session"):
+            nested = source.get(nested_key)
+            if isinstance(nested, dict):
+                nested_value = _host_onboarding_extract_explicit_phonetic(nested)
+                if nested_value:
+                    return nested_value
+    return ""
+
+
 def _host_onboarding_now() -> float:
     return float(time.time())
 
@@ -19424,6 +19470,223 @@ def _host_onboarding_find_active_session(conn: sqlite3.Connection, member_id: st
     if row is None:
         return None
     return _host_onboarding_session_row_to_dict(row, _host_onboarding_asset_rows(conn, _host_onboarding_safe_str(row['session_id'])))
+
+
+def _host_onboarding_find_latest_session_for_member_brand(conn: sqlite3.Connection, member_id: str, brand: str) -> Optional[Dict[str, Any]]:
+    mid = _host_onboarding_normalize_member_id(member_id)
+    if not mid:
+        return None
+    params: List[Any] = [mid]
+    filters = ["member_id = ?"]
+    if _host_onboarding_safe_str(brand):
+        filters.append("COALESCE(brand, '') = ?")
+        params.append(_host_onboarding_safe_str(brand))
+    row = conn.execute(
+        f"SELECT * FROM {_HOST_ONBOARDING_SESSIONS_TABLE} WHERE {' AND '.join(filters)} ORDER BY updated_epoch DESC LIMIT 1",
+        tuple(params),
+    ).fetchone()
+    if row is None:
+        return None
+    return _host_onboarding_session_row_to_dict(row, _host_onboarding_asset_rows(conn, _host_onboarding_safe_str(row['session_id'])))
+
+
+def _host_onboarding_find_latest_approved_session(conn: sqlite3.Connection, member_id: str, brand: str = "", avatar: str = "") -> Optional[Dict[str, Any]]:
+    """Return the latest approved/full Host Profile Studio session for a member.
+
+    This is used when a host reopens Profile Studio after approval. Older code
+    created a blank draft in that case; this helper lets startup seed the editor
+    from the approved profile instead.
+    """
+    mid = _host_onboarding_normalize_member_id(member_id)
+    if not mid:
+        return None
+    base_filters = ["member_id = ?", "lower(COALESCE(publish_status, '')) IN ('approved', 'full', 'limited')"]
+    base_params: List[Any] = [mid]
+    brand_norm = _host_onboarding_safe_str(brand)
+    avatar_norm = _host_onboarding_safe_str(avatar)
+
+    attempts: List[Tuple[List[str], List[Any]]] = []
+    if brand_norm and avatar_norm:
+        attempts.append((base_filters + ["COALESCE(brand, '') = ?", "COALESCE(avatar, '') = ?"], base_params + [brand_norm, avatar_norm]))
+    if brand_norm:
+        attempts.append((base_filters + ["COALESCE(brand, '') = ?"], base_params + [brand_norm]))
+    attempts.append((base_filters, base_params))
+
+    seen_sql: Set[str] = set()
+    for filters, params in attempts:
+        sql_where = " AND ".join(filters)
+        if sql_where in seen_sql:
+            continue
+        seen_sql.add(sql_where)
+        row = conn.execute(
+            f"SELECT * FROM {_HOST_ONBOARDING_SESSIONS_TABLE} WHERE {sql_where} ORDER BY approved_version_id IS NULL ASC, updated_epoch DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        if row is not None:
+            return _host_onboarding_session_row_to_dict(row, _host_onboarding_asset_rows(conn, _host_onboarding_safe_str(row['session_id'])))
+    return None
+
+
+def _host_onboarding_session_has_profile_content(session: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(session, dict):
+        return False
+    for key in ("basics", "derived", "review", "completion"):
+        value = session.get(key)
+        if isinstance(value, dict) and any(_host_onboarding_safe_str(v) or isinstance(v, (dict, list)) and len(v) > 0 for v in value.values()):
+            return True
+    return bool(session.get("assets"))
+
+
+def _host_onboarding_clone_assets_to_session(conn: sqlite3.Connection, source_session_id: str, target_session_id: str) -> None:
+    source = _host_onboarding_safe_str(source_session_id)
+    target = _host_onboarding_safe_str(target_session_id)
+    if not source or not target or source == target:
+        return
+    rows = conn.execute(
+        f"SELECT * FROM {_HOST_ONBOARDING_ASSETS_TABLE} WHERE session_id = ? ORDER BY created_epoch ASC, slot_key ASC",
+        (source,),
+    ).fetchall()
+    now = _host_onboarding_now()
+    for row in rows:
+        obj = dict(row)
+        slot_key = _host_onboarding_safe_str(obj.get("slot_key"))
+        if not slot_key:
+            continue
+        exists = conn.execute(
+            f"SELECT asset_id FROM {_HOST_ONBOARDING_ASSETS_TABLE} WHERE session_id = ? AND slot_key = ? LIMIT 1",
+            (target, slot_key),
+        ).fetchone()
+        if exists is not None:
+            continue
+        conn.execute(
+            f"""
+            INSERT INTO {_HOST_ONBOARDING_ASSETS_TABLE}
+                (asset_id, session_id, slot_key, required_flag, url, file_name, content_type, size_bytes,
+                 width_px, height_px, duration_seconds, validation_status, validation_errors_json, created_epoch, updated_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                target,
+                slot_key,
+                int(obj.get("required_flag") or 0),
+                _host_onboarding_safe_str(obj.get("url")),
+                _host_onboarding_safe_str(obj.get("file_name")),
+                _host_onboarding_safe_str(obj.get("content_type")),
+                int(obj.get("size_bytes") or 0),
+                int(obj.get("width_px") or 0),
+                int(obj.get("height_px") or 0),
+                float(obj.get("duration_seconds") or 0.0),
+                _host_onboarding_safe_str(obj.get("validation_status")) or "pending",
+                _host_onboarding_safe_str(obj.get("validation_errors_json")) or "[]",
+                now,
+                now,
+            ),
+        )
+
+
+def _host_onboarding_seed_draft_from_approved_session(
+    conn: sqlite3.Connection,
+    *,
+    target_session_id: str,
+    member_id: str,
+    brand: str,
+    avatar: str,
+    host_display_name: str,
+    logged_in: bool,
+    approved_session: Dict[str, Any],
+) -> Dict[str, Any]:
+    seeded = _host_onboarding_upsert_session(
+        conn,
+        session_id=target_session_id,
+        member_id=member_id,
+        brand=brand or _host_onboarding_safe_str(approved_session.get("brand")),
+        avatar=avatar or _host_onboarding_safe_str(approved_session.get("avatar")),
+        host_display_name=host_display_name or _host_onboarding_safe_str(approved_session.get("host_display_name")),
+        logged_in=logged_in,
+        workflow_state="awaiting_final_approval",
+        publish_status="draft",
+        basics=dict(approved_session.get("basics") or {}),
+        derived=dict(approved_session.get("derived") or {}),
+        review=dict(approved_session.get("review") or {}),
+        completion=dict(approved_session.get("completion") or {}),
+        three_d_opt_in=bool(approved_session.get("three_d_opt_in") is True),
+        approved_version_id=_host_onboarding_safe_str(approved_session.get("approved_version_id")),
+    )
+    _host_onboarding_clone_assets_to_session(
+        conn,
+        _host_onboarding_safe_str(approved_session.get("session_id")),
+        _host_onboarding_safe_str(seeded.get("session_id")),
+    )
+    seeded = _host_onboarding_get_session_by_id(conn, _host_onboarding_safe_str(seeded.get("session_id"))) or seeded
+    readiness = _host_onboarding_compute_readiness(seeded)
+    seeded = _host_onboarding_upsert_session(
+        conn,
+        session_id=_host_onboarding_safe_str(seeded.get("session_id")),
+        member_id=member_id,
+        brand=_host_onboarding_safe_str(seeded.get("brand")),
+        avatar=_host_onboarding_safe_str(seeded.get("avatar")),
+        host_display_name=_host_onboarding_safe_str(seeded.get("host_display_name")),
+        logged_in=bool(seeded.get("logged_in") is True),
+        limited_publish_allowed=bool(readiness.get("limited_publish_allowed") is True),
+        full_publish_ready=bool(readiness.get("full_publish_ready") is True),
+    )
+    return seeded
+
+
+def _host_onboarding_enrich_session_with_mapping_phonetic_on_conn(conn: sqlite3.Connection, session: Dict[str, Any]) -> Dict[str, Any]:
+    """Surface the manually curated mapping phonetic in Profile Studio.
+
+    This only fills the optional completion field when the session does not
+    already contain an explicit phonetic value. It never derives a value from the
+    first name.
+    """
+    if not isinstance(session, dict):
+        return session
+    completion = dict(session.get("completion") or {})
+    if _host_onboarding_extract_explicit_phonetic(completion):
+        return session
+    member_id = _host_onboarding_normalize_member_id(session.get("member_id"))
+    brand = _host_onboarding_safe_str(session.get("brand")) or "Elaralo"
+    avatar = _host_onboarding_safe_str(session.get("avatar"))
+    if not member_id:
+        return session
+    try:
+        conn.row_factory = sqlite3.Row
+        row = None
+        if avatar:
+            row = conn.execute(
+                """
+                SELECT phonetic
+                  FROM companion_mappings
+                 WHERE lower(COALESCE(brand, '')) = lower(?)
+                   AND lower(COALESCE(avatar, '')) = lower(?)
+                   AND lower(COALESCE(companion_type, '')) = 'human'
+                 LIMIT 1
+                """,
+                (brand, avatar),
+            ).fetchone()
+        if row is None:
+            row = conn.execute(
+                """
+                SELECT phonetic
+                  FROM companion_mappings
+                 WHERE lower(COALESCE(brand, '')) = lower(?)
+                   AND COALESCE(host_member_id, '') = ?
+                   AND lower(COALESCE(companion_type, '')) = 'human'
+                 ORDER BY rowid DESC
+                 LIMIT 1
+                """,
+                (brand, member_id),
+            ).fetchone()
+        phonetic = _host_onboarding_optional_phonetic(row["phonetic"] if row is not None else "")
+        if phonetic:
+            completion["phonetic_pronunciation"] = phonetic
+            completion["phonetic_pronunciation_of_first_name"] = phonetic
+            session = {**session, "completion": completion}
+    except Exception:
+        pass
+    return session
 
 
 def _host_onboarding_upsert_session(
@@ -20762,6 +21025,7 @@ def _host_onboarding_upsert_connect_companion_mapping(
     eleven_voice_name: str = "",
     voice_clone_status: str = "",
     voice_clone_error: str = "",
+    phonetic_pronunciation: str = "",
     conn: Optional[sqlite3.Connection] = None,
 ) -> str:
     """Create/update the Elaralo Human companion mapping exported by Host Onboarding.
@@ -20842,7 +21106,10 @@ def _host_onboarding_upsert_connect_companion_mapping(
                    channel_cap = 'Video',
                    live = 'Stream',
                    companion_type = 'Human',
-                   phonetic = COALESCE(NULLIF(phonetic, ''), ?),
+                   phonetic = CASE
+                        WHEN trim(?) <> '' THEN ?
+                        ELSE phonetic
+                   END,
                    headshot_url = ?,
                    voice_capture_url = ?,
                    public_gallery_json = ?,
@@ -20858,7 +21125,8 @@ def _host_onboarding_upsert_connect_companion_mapping(
                 brand_id,
                 brand_id,
                 member_id,
-                _companion_avatar_display_name(final_avatar),
+                _host_onboarding_optional_phonetic(phonetic_pronunciation),
+                _host_onboarding_optional_phonetic(phonetic_pronunciation),
                 _host_onboarding_safe_str(headshot_url),
                 _host_onboarding_safe_str(voice_capture_url),
                 _host_onboarding_json_dumps(public_gallery_assets or []),
@@ -20920,7 +21188,7 @@ def _host_onboarding_upsert_hco_row(
             if companion_id_raw is None or _host_onboarding_safe_str(companion_id_raw) == "":
                 companion_id_raw = companion_row["id"] if companion_row["id"] is not None else None
         companion_id = int(companion_id_raw) if companion_id_raw is not None and _host_onboarding_safe_str(companion_id_raw) else None
-        phonetic = _host_onboarding_safe_str(companion_row["phonetic"] if companion_row else "")
+        existing_phonetic = _host_onboarding_safe_str(companion_row["phonetic"] if companion_row else "")
 
         public_profile = dict((raw_profile or {}).get("public_profile") or {})
         private_profile = dict((raw_profile or {}).get("private_profile") or {})
@@ -20940,8 +21208,7 @@ def _host_onboarding_upsert_hco_row(
         source_file = "host_onboarding_approved_version"
         now_epoch = int(_host_onboarding_now())
         raw_json = _host_onboarding_json_dumps(raw_profile)
-        if not phonetic:
-            phonetic = first_name
+        phonetic = _host_onboarding_extract_explicit_phonetic(raw_profile) or existing_phonetic
 
         cur.execute(
             """
@@ -21062,6 +21329,13 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
+    explicit_phonetic_pronunciation = _host_onboarding_extract_explicit_phonetic(
+        dict(session or {}).get("completion") if isinstance(session, dict) else {},
+        private_profile,
+        public_profile,
+        ai_profile,
+        profile,
+    )
     saved_avatar_key = _host_onboarding_upsert_connect_companion_mapping(
         member_id=_host_onboarding_safe_str(session.get("member_id")),
         avatar_key=avatar_key,
@@ -21073,6 +21347,7 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         eleven_voice_name=_host_onboarding_safe_str((eleven_voice or {}).get("voice_name")),
         voice_clone_status=_host_onboarding_safe_str((eleven_voice or {}).get("status")),
         voice_clone_error=_host_onboarding_safe_str((eleven_voice or {}).get("error")),
+        phonetic_pronunciation=explicit_phonetic_pronunciation,
         conn=db_conn,
     )
     if saved_avatar_key:
@@ -21200,6 +21475,10 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
     eleven_voice_name = _host_onboarding_safe_str(connect_platform.get("eleven_voice_name") or ai_connect.get("eleven_voice_name"))
     voice_clone_status = _host_onboarding_safe_str(connect_platform.get("voice_clone_status") or ai_connect.get("voice_clone_status"))
 
+    explicit_phonetic_pronunciation = _host_onboarding_extract_explicit_phonetic(
+        profile,
+        dict(session or {}).get("completion") if isinstance(session, dict) else {},
+    )
     saved_avatar_key = _host_onboarding_upsert_connect_companion_mapping(
         member_id=resolved_member_id,
         avatar_key=avatar_key,
@@ -21211,6 +21490,7 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
         eleven_voice_name=eleven_voice_name,
         voice_clone_status=voice_clone_status or "repaired_from_approved_profile",
         voice_clone_error="",
+        phonetic_pronunciation=explicit_phonetic_pronunciation,
     )
     if saved_avatar_key:
         avatar_key = saved_avatar_key
@@ -21511,6 +21791,7 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         income_estimate = _host_onboarding_income_estimate_from_title(career_title)
     education_entries = _host_onboarding_normalize_education_entries(completion.get("education_entries") or completion.get("education"))
     education_text = _host_onboarding_format_education_entries_text(education_entries) or _host_onboarding_safe_str(completion.get("education"))
+    phonetic_pronunciation = _host_onboarding_extract_explicit_phonetic(completion)
     headshot_asset, gallery_assets = _host_onboarding_split_public_assets(assets)
     voice_capture_asset = next((asset for asset in assets if _host_onboarding_safe_str((asset or {}).get("slot_key")) == _HOST_ONBOARDING_VOICE_SLOT and _host_onboarding_safe_str((asset or {}).get("url"))), None)
     private_identity = {
@@ -21525,6 +21806,8 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         "ethnicity_bucket": _host_onboarding_safe_str(basics.get("ethnicity_bucket")),
         "ethnicity_detail": _host_onboarding_safe_str(basics.get("ethnicity_detail")),
         "estimated_income": income_estimate,
+        "phonetic_pronunciation": phonetic_pronunciation,
+        "phonetic_pronunciation_of_first_name": phonetic_pronunciation,
     }
     public_profile = {
         "stage_name": public_name,
@@ -21569,6 +21852,7 @@ def _host_onboarding_compile_profile(session: Dict[str, Any]) -> Dict[str, Any]:
         "public_identity": public_profile,
         "private_identity": private_identity,
         "three_d_opt_in": bool(session.get("three_d_opt_in") is True),
+        "phonetic_pronunciation": phonetic_pronunciation,
         "voice_capture_asset": voice_capture_asset,
     }
     return {
@@ -21771,16 +22055,54 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
         avatar = avatar or _host_onboarding_safe_str((resolved_ctx or {}).get("avatar"))
         conn.execute("BEGIN IMMEDIATE")
         existing = _host_onboarding_find_active_session(conn, member_id, brand, avatar)
-        if existing and _host_onboarding_safe_str(existing.get("publish_status")) not in ("approved", "full"):
-            session = _host_onboarding_upsert_session(
+        if existing is None:
+            # If the exact brand/avatar lookup misses because avatar naming changed,
+            # still prefer the latest member/brand draft before creating anything new.
+            existing = _host_onboarding_find_latest_session_for_member_brand(conn, member_id, brand)
+        approved_seed = _host_onboarding_find_latest_approved_session(conn, member_id, brand, avatar)
+        existing_status = _host_onboarding_safe_str((existing or {}).get("publish_status")).lower()
+
+        if existing and existing_status not in ("approved", "full", "limited"):
+            # Resume a real in-progress draft. If a previous deployment created a
+            # blank draft after approval, hydrate that draft from the approved
+            # profile instead of showing an empty Profile Studio.
+            if approved_seed and not _host_onboarding_session_has_profile_content(existing):
+                session = _host_onboarding_seed_draft_from_approved_session(
+                    conn,
+                    target_session_id=_host_onboarding_safe_str(existing.get("session_id")) or uuid.uuid4().hex,
+                    member_id=member_id,
+                    brand=brand,
+                    avatar=avatar,
+                    host_display_name=host_display_name,
+                    logged_in=logged_in,
+                    approved_session=approved_seed,
+                )
+                _host_onboarding_audit(conn, session["session_id"], member_id, "draft_seeded_from_approved_profile", {"approved_session_id": approved_seed.get("session_id")})
+            else:
+                session = _host_onboarding_upsert_session(
+                    conn,
+                    session_id=_host_onboarding_safe_str(existing.get("session_id")),
+                    member_id=member_id,
+                    brand=brand or _host_onboarding_safe_str(existing.get("brand")),
+                    avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
+                    host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
+                    logged_in=logged_in,
+                )
+        elif approved_seed:
+            # Hosts reopening Profile Studio after approval should see the approved
+            # profile values and assets, not a blank new session. Create one
+            # editable draft seeded from the approved version.
+            session = _host_onboarding_seed_draft_from_approved_session(
                 conn,
-                session_id=_host_onboarding_safe_str(existing.get("session_id")),
+                target_session_id=uuid.uuid4().hex,
                 member_id=member_id,
-                brand=brand or _host_onboarding_safe_str(existing.get("brand")),
-                avatar=avatar or _host_onboarding_safe_str(existing.get("avatar")),
-                host_display_name=host_display_name or _host_onboarding_safe_str(existing.get("host_display_name")),
+                brand=brand,
+                avatar=avatar,
+                host_display_name=host_display_name,
                 logged_in=logged_in,
+                approved_session=approved_seed,
             )
+            _host_onboarding_audit(conn, session["session_id"], member_id, "draft_seeded_from_approved_profile", {"approved_session_id": approved_seed.get("session_id")})
         else:
             session = _host_onboarding_upsert_session(
                 conn,
@@ -21800,6 +22122,7 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
                 full_publish_ready=False,
             )
             _host_onboarding_audit(conn, session["session_id"], member_id, "session_started", {"brand": brand, "avatar": avatar})
+        session = _host_onboarding_enrich_session_with_mapping_phonetic_on_conn(conn, session)
         conn.commit()
         return {"ok": True, "session": session, "readiness": _host_onboarding_compute_readiness(session)}
     finally:
@@ -21822,6 +22145,7 @@ async def host_onboarding_session_get(session_id: str, request: Request):
         if not session:
             raise HTTPException(status_code=404, detail="Host onboarding session not found")
         _host_onboarding_assert_member_access(session, member_id)
+        session = _host_onboarding_enrich_session_with_mapping_phonetic_on_conn(conn, session)
         return {"ok": True, "session": session, "readiness": _host_onboarding_compute_readiness(session)}
     finally:
         try:
@@ -22195,9 +22519,17 @@ async def host_onboarding_save_completion(session_id: str, req: HostOnboardingCo
     estimated_income = _host_onboarding_safe_str(completion_in.get("estimated_income")) or _host_onboarding_income_estimate_from_title(current_job_title)
     education_entries = _host_onboarding_normalize_education_entries(completion_in.get("education_entries") or completion_in.get("education"))
     education_text = _host_onboarding_format_education_entries_text(education_entries) or _host_onboarding_safe_str(completion_in.get("education"))
+    phonetic_pronunciation = _host_onboarding_optional_phonetic(
+        completion_in.get("phonetic_pronunciation")
+        or completion_in.get("phonetic_pronunciation_of_first_name")
+        or completion_in.get("phonetic_spelling")
+        or completion_in.get("phonetic")
+    )
     completion = {
         "education": education_text,
         "education_entries": education_entries,
+        "phonetic_pronunciation": phonetic_pronunciation,
+        "phonetic_pronunciation_of_first_name": phonetic_pronunciation,
         "current_job_title": current_job_title,
         "current_company": _host_onboarding_safe_str(completion_in.get("current_company")),
         "career_summary": _host_onboarding_safe_str(completion_in.get("career_summary")),
