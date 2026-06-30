@@ -5484,16 +5484,22 @@ const channelCap: ChannelCap = useMemo(() => {
 }, [companionMapping]);
 
 const liveProvider: LiveProvider = useMemo(() => {
+  // SQL contract: channel_cap decides whether video/live controls exist.
+  // For Audio companions, ignore stale/non-null live values so the mic remains
+  // a normal audio-only STT control instead of entering Stream/D-ID guard logic.
+  if (channelCap !== "video") return "";
+
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
   if (liveRaw === "stream") return "stream";
   if (liveRaw === "d-id") return "d-id";
   return "";
-}, [companionMapping]);
+}, [channelCap, companionMapping]);
 
-// Video / Play visibility is controlled by the companion_mappings SQL contract:
-// channel_cap=Video plus live=Stream or D-ID. D-ID credentials are used only
-// when starting a D-ID avatar, not to decide whether the Play button exists.
+// SQL contract:
+// - channel_cap=Video controls whether the Play button exists.
+// - live=Stream or D-ID selects the provider only after Play is available/clicked.
+// - D-ID credentials are used only when starting a D-ID avatar.
 useEffect(() => {
   if (channelCap === "video") {
     const liveRaw = String(companionMapping?.live || "").trim();
