@@ -1816,32 +1816,14 @@ async def _startup_load_companion_mappings() -> None:
 async def get_companion_mapping(request: Request, brand: str = "", avatar: str = "") -> Dict[str, Any]:
     """Lookup a companion mapping row by (brand, avatar).
 
-    This endpoint is intentionally STRICT:
-      - exact (brand, avatar) match required (case-insensitive via lower/strip normalization)
-      - errors out when a mapping is missing, so configuration issues are visible during development
-
-    Query params:
-      - brand: Brand name (e.g., "Elaralo", "DulceMoon")
-      - avatar: Avatar first name (e.g., "Jennifer")
-
-    Response (200):
-      {
-        found: true,
-        brand: str,
-        avatar: str,
-        companionType: "Human"|"AI",
-        channel_cap: "Video"|"Audio" ,
-        channelCap: "Video"|"Audio" ,   # alias for convenience
-        live: "D-ID"|"Stream" ,
-        elevenVoiceId: str,
-        elevenVoiceName: str,
-        didAgentId: str,
-        didClientKey: str,
-        didAgentLink: str,
-        didEmbedCode: str,
-        loadedAt: <unix seconds> | null,
-        source: <db path> | ""
-      }
+    Contract:
+      - Connect requires a real companion_mappings / voice-video SQL row.
+      - Elaralo AI image filenames are catalog/card identifiers, not a substitute
+        for the SQL mapping row.
+      - For Elaralo AI filename keys, provider lookup tolerates rows keyed by the
+        display first name, but missing rows still return a clear error.
+      - Play/video visibility is controlled by SQL channel_cap + live.
+      - D-ID fields are used only when a D-ID live avatar actually starts.
     """
     b_in = (brand or "").strip()
     a = (avatar or "").strip()
@@ -1849,29 +1831,31 @@ async def get_companion_mapping(request: Request, brand: str = "", avatar: str =
     if not a:
         raise HTTPException(status_code=400, detail="avatar is required")
 
-    # Core brand default: empty brand => Elaralo
     b = b_in or "Elaralo"
+    is_elaralo = _is_elaralo_core_brand(b)
+    public_base = _companion_public_api_base_url(request=request)
+    resolved_ai_key = _resolve_elaralo_ai_companion_key(b, a) if is_elaralo else a
+    ai_asset = _elaralo_ai_companion_asset_for_key(b, resolved_ai_key or a, public_base_url=public_base) if is_elaralo else {}
+    is_elaralo_ai_media = bool(is_elaralo and (ai_asset or _ai_companion_key_has_metadata(resolved_ai_key or a)))
 
-    m = _lookup_companion_mapping_for_ai_media(b, a) if _is_elaralo_core_brand(b) else (_lookup_companion_mapping(b, a) or {})
+    m = _lookup_companion_mapping_for_ai_media(b, a) if is_elaralo else (_lookup_companion_mapping(b, a) or {})
     if not m:
         raise HTTPException(
             status_code=404,
-            detail={
-                "error": "Companion mapping not found",
-                "brand": b,
-                "avatar": a,
-                "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,
-                "source": _COMPANION_MAPPINGS_SOURCE,
-                "table": _COMPANION_MAPPINGS_TABLE,
-                "count": len(_COMPANION_MAPPINGS),
-            },
+            detail=(
+                f"Companion mapping not found for brand='{b}' avatar='{a}'. "
+                "Please add this companion to the voice/video mapping database before opening Connect."
+            ),
         )
 
     cap_raw = str(m.get("channel_cap") or "").strip()
     live_raw = str(m.get("live") or "").strip()
     ctype_raw = str(m.get("companion_type") or "").strip()
+    did_agent_id = str(m.get("did_agent_id") or "").strip()
+    did_client_key = str(m.get("did_client_key") or "").strip()
+    did_agent_link = str(m.get("did_agent_link") or "").strip()
+    did_embed_code = str(m.get("did_embed_code") or "").strip()
 
-    # Strict validation (config contract)
     cap_lc = cap_raw.lower()
     if cap_lc not in ("video", "audio"):
         raise HTTPException(
@@ -1879,40 +1863,57 @@ async def get_companion_mapping(request: Request, brand: str = "", avatar: str =
             detail=f"Invalid channel_cap in DB for brand='{b}' avatar='{a}': {cap_raw!r} (expected 'Video' or 'Audio')",
         )
 
-    live_lc = live_raw.lower()
-    if live_lc not in ("stream", "d-id"):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID')",
-        )
-
     ctype_lc = ctype_raw.lower()
     if ctype_lc not in ("human", "ai"):
+        if is_elaralo_ai_media:
+            ctype_lc = "ai"
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
+            )
+
+    live_lc = live_raw.lower()
+    if cap_lc == "video" and live_lc not in ("stream", "d-id"):
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid companion_type in DB for brand='{b}' avatar='{a}': {ctype_raw!r} (expected 'Human' or 'AI')",
+            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected 'Stream' or 'D-ID' for Video companions)",
+        )
+    if cap_lc == "audio" and live_lc and live_lc not in ("stream", "d-id"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid live in DB for brand='{b}' avatar='{a}': {live_raw!r} (expected blank, 'Stream', or 'D-ID')",
         )
 
-    # Business rule: AI companions must use D-ID. Human companions must use Stream.
-    if ctype_lc == "human" and live_lc != "stream":
+    if ctype_lc == "human" and cap_lc == "video" and live_lc != "stream":
         raise HTTPException(
             status_code=500,
             detail=f"Invalid mapping: companion_type=Human requires live=Stream for brand='{b}' avatar='{a}' (got {live_raw!r})",
         )
-    if ctype_lc == "ai" and live_lc != "d-id":
+    if ctype_lc == "ai" and cap_lc == "video" and live_lc != "d-id":
         raise HTTPException(
             status_code=500,
-            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for brand='{b}' avatar='{a}' (got {live_raw!r})",
+            detail=f"Invalid mapping: companion_type=AI requires live=D-ID for Video companions brand='{b}' avatar='{a}' (got {live_raw!r})",
+        )
+    if ctype_lc == "ai" and cap_lc == "video" and live_lc == "d-id" and not (did_agent_id and did_client_key):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid D-ID mapping for brand='{b}' avatar='{a}': did_agent_id and did_client_key are required when channel_cap=Video and live=D-ID",
         )
 
     cap_out = "Video" if cap_lc == "video" else "Audio"
-    live_out = "Stream" if live_lc == "stream" else "D-ID"
+    live_out = "Stream" if live_lc == "stream" else ("D-ID" if live_lc == "d-id" else "")
     ctype_out = "Human" if ctype_lc == "human" else "AI"
+    resolved_for_url = (resolved_ai_key if is_elaralo_ai_media else a) or a
+    headshot_url = _ai_headshot_url_from_mapping_or_file(b, resolved_for_url, m, public_base_url=public_base)
+    asset_for_file = _elaralo_ai_companion_asset_for_key(b, resolved_for_url, public_base_url=public_base) if is_elaralo else {}
 
     return {
         "found": True,
         "brand": str(m.get("brand") or b),
         "avatar": str(m.get("avatar") or a),
+        "companionKey": str(m.get("companion_key") or resolved_for_url or a),
+        "companion_key": str(m.get("companion_key") or resolved_for_url or a),
         "hostMemberId": str(m.get("host_member_id") or ""),
         "host_member_id": str(m.get("host_member_id") or ""),
         "companionType": ctype_out,
@@ -1922,14 +1923,14 @@ async def get_companion_mapping(request: Request, brand: str = "", avatar: str =
         "live": live_out,
         "elevenVoiceId": str(m.get("eleven_voice_id") or ""),
         "elevenVoiceName": str(m.get("eleven_voice_name") or ""),
-        "didAgentId": str(m.get("did_agent_id") or ""),
-        "didClientKey": str(m.get("did_client_key") or ""),
-        "didAgentLink": str(m.get("did_agent_link") or ""),
-        "didEmbedCode": str(m.get("did_embed_code") or ""),
+        "didAgentId": did_agent_id,
+        "didClientKey": did_client_key,
+        "didAgentLink": did_agent_link,
+        "didEmbedCode": did_embed_code,
         "phonetic": str(m.get("phonetic") or ""),
-        "headshot_url": _ai_headshot_url_from_mapping_or_file(b, a, m, public_base_url=_companion_public_api_base_url(request=request)),
-        "headshotUrl": _ai_headshot_url_from_mapping_or_file(b, a, m, public_base_url=_companion_public_api_base_url(request=request)),
-        "headshot_file_name": _host_onboarding_safe_str((_elaralo_ai_companion_asset_for_key(b, a, public_base_url=_companion_public_api_base_url(request=request)) or {}).get("file_name")),
+        "headshot_url": headshot_url,
+        "headshotUrl": headshot_url,
+        "headshot_file_name": _host_onboarding_safe_str((asset_for_file or {}).get("file_name")),
         "mappingAvatar": str(m.get("mapping_avatar") or m.get("avatar") or ""),
         "mapping_avatar": str(m.get("mapping_avatar") or m.get("avatar") or ""),
         "loadedAt": _COMPANION_MAPPINGS_LOADED_AT,

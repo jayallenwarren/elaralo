@@ -342,15 +342,16 @@ export default function MyElaraloCompanionSelectorClient() {
         url.searchParams.set("brand", brand);
         url.searchParams.set("rebranding", brand);
 
-        // Connect treats these fields as the canonical companion identity. For
-        // Elaralo AI companions this must be the full hyphenated filename stem,
-        // not just the display first name.
-        url.searchParams.set("avatar", companionKey);
-        url.searchParams.set("avatarName", companionKey);
-        url.searchParams.set("avatar_name", companionKey);
-        url.searchParams.set("companion", companionKey);
-        url.searchParams.set("companionName", companionKey);
-        url.searchParams.set("companion_name", companionKey);
+        // Connect uses avatar/companionName for the companion_mappings SQL lookup.
+        // For Elaralo AI companions, the SQL mapping avatar is the display first name,
+        // while companionKey remains the full hyphenated filename stem used for image/card identity.
+        const mappingAvatar = (safeLower(card.companionType) === "ai" ? companionDisplayName : companionKey) || companionKey;
+        url.searchParams.set("avatar", mappingAvatar);
+        url.searchParams.set("avatarName", mappingAvatar);
+        url.searchParams.set("avatar_name", mappingAvatar);
+        url.searchParams.set("companion", mappingAvatar);
+        url.searchParams.set("companionName", mappingAvatar);
+        url.searchParams.set("companion_name", mappingAvatar);
         url.searchParams.set("companionKey", companionKey);
         url.searchParams.set("companion_key", companionKey);
         url.searchParams.set("companionDisplayName", companionDisplayName);

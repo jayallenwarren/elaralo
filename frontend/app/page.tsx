@@ -155,7 +155,7 @@ type UploadedAttachment = {
 
 type Mode = "friend" | "romantic" | "intimate";
 
-type LiveProvider = "d-id" | "stream";
+type LiveProvider = "d-id" | "stream" | "";
 
 type SessionKind = "stream" | "private" | "conference" | "";
 
@@ -893,13 +893,49 @@ function booleanFromQuery(raw: string): boolean | null {
   return null;
 }
 
+function readableError(value: any): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map((item) => readableError(item)).filter(Boolean).join("; ").trim();
+  if (typeof value === "object") {
+    const preferred =
+      readableError((value as any).message) ||
+      readableError((value as any).error) ||
+      readableError((value as any).detail) ||
+      readableError((value as any).reason);
+    if (preferred) return preferred;
+    try { return JSON.stringify(value); } catch { return "Unexpected API error."; }
+  }
+  return String(value || "").trim();
+}
+
+function compactBrandKey(raw: any): string {
+  return String(raw || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function isElaraloBrandName(raw: any): boolean {
+  return compactBrandKey(raw || DEFAULT_COMPANY_NAME) === "elaralo";
+}
+
+function isAiCompanionFilenameKey(raw: any): boolean {
+  const base = splitCompanionKey(String(raw || "")).baseKey || String(raw || "");
+  const cleaned = stripExt(base).replace(/\s+/g, "-").replace(/^-+|-+$/g, "");
+  const parts = cleaned.split("-").filter(Boolean);
+  return parts.length >= 4;
+}
+
+function aiFirstNameFromKey(raw: any): string {
+  const base = splitCompanionKey(String(raw || "")).baseKey || String(raw || "");
+  const cleaned = stripExt(base).replace(/\s+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned.split("-", 1)[0]?.trim() || "";
+}
+
 function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
   if (typeof window === "undefined") return null;
   try {
     const params = new URLSearchParams(window.location.search || "");
-    const companionKey = firstQueryValue(params, [
-      "companionKey",
-      "companion_key",
+    const rawCompanion = firstQueryValue(params, [
       "avatar",
       "avatarName",
       "avatar_name",
@@ -911,9 +947,29 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
       "selectedCompanion",
       "selected_companion",
     ]);
+    const explicitCompanionKey = firstQueryValue(params, ["companionKey", "companion_key"]);
+    const companionKey = explicitCompanionKey || rawCompanion;
     if (!companionKey) return null;
 
-    const brand = firstQueryValue(params, ["brand", "rebranding", "companyName", "company_name", "company"]) || DEFAULT_COMPANY_NAME;
+    const explicitBrand = firstQueryValue(params, ["brand", "companyName", "company_name", "company", "rebranding"]);
+    const source = firstQueryValue(params, ["source", "handoffSource", "handoff_source", "origin"]);
+    const normalizedSource = source.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const isMyElaraloDirect = ["myelaralo", "elaraloapp", "elaralocatalog", "elaralo"].includes(normalizedSource);
+    const isExplicitElaraloBrand = Boolean(explicitBrand && isElaraloBrandName(explicitBrand));
+
+    // DulceMoon and other white-label Connect payloads are provided by Wix postMessage.
+    // Direct URL handoff is reserved for My Elaralo / Elaralo catalog launches.
+    if (!isMyElaraloDirect && !isExplicitElaraloBrand) return null;
+
+    const brand = explicitBrand || DEFAULT_COMPANY_NAME;
+    const isAiKey = isAiCompanionFilenameKey(companionKey);
+    const companionDisplayName =
+      firstQueryValue(params, ["companionDisplayName", "companion_display_name", "displayCompanionName", "display_companion_name"]) ||
+      (isAiKey ? aiFirstNameFromKey(companionKey) : "") ||
+      rawCompanion ||
+      companionKey;
+
+    const mappingAvatar = isAiKey ? companionDisplayName : (rawCompanion || companionDisplayName || companionKey);
     const rebrandingKey = firstQueryValue(params, ["rebrandingKey", "rebranding_key", "RebrandingKey", "rebrandingkey"]);
     const memberId = firstQueryValue(params, ["memberId", "member_id"]);
     const displayName = firstQueryValue(params, ["displayName", "display_name", "userName", "user_name", "username"]);
@@ -926,7 +982,7 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
 
     const payload: Record<string, any> = {
       type: "MEMBER_PLAN",
-      source: "direct-query",
+      source: source || "my-elaralo",
       directQueryOverride: true,
       loggedIn,
       logged_in: loggedIn,
@@ -941,13 +997,18 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
       company_name: brand,
       company: brand,
       rebranding: brand,
-      avatar: companionKey,
-      avatarName: companionKey,
-      avatar_name: companionKey,
-      companion: companionKey,
-      companionName: companionKey,
-      companion_name: companionKey,
-      companionKey,
+
+      // Mapping/display identifiers.  For Elaralo AI, the mapping avatar is the
+      // display first name, while companionKey remains the full filename stem.
+      avatar: mappingAvatar,
+      avatarName: mappingAvatar,
+      avatar_name: mappingAvatar,
+      companion: mappingAvatar,
+      companionName: mappingAvatar,
+      companion_name: mappingAvatar,
+      companionDisplayName,
+      companion_display_name: companionDisplayName,
+      companionKey: companionKey,
       companion_key: companionKey,
     };
 
@@ -1538,29 +1599,11 @@ function buildWsUrl(httpBase: string, path: string, query: Record<string, string
   return u.toString();
 }
 
-type Phase1AvatarMedia = {
+type DidAvatarMedia = {
   didAgentId: string;
   didClientKey: string;
   elevenVoiceId: string;
 };
-
-const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
-  "Jennifer": {
-    "didAgentId": "v2_agt_n7itFF6f",
-    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    "elevenVoiceId": "19STyYD15bswVz51nqLf"
-  },
-  "Jason": {
-    "didAgentId": "v2_agt_WpC1hOBQ",
-    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    "elevenVoiceId": "j0jBf06B5YHDbCWVmlmr"
-  },
-  "Tonya": {
-    "didAgentId": "v2_agt_2lL6f5YY",
-    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    "elevenVoiceId": "Hybl6rg76ZOcgqZqN5WN"
-  }
-} as any;
 
 const ELEVEN_VOICE_ID_BY_AVATAR: Record<string, string> = {
   "Jennifer": "19STyYD15bswVz51nqLf",
@@ -1594,32 +1637,24 @@ function getElevenVoiceIdForAvatar(avatarName: string | null | undefined): strin
   const raw = (avatarName || "").trim();
   if (raw && ELEVEN_VOICE_ID_BY_AVATAR[raw]) return ELEVEN_VOICE_ID_BY_AVATAR[raw];
 
-  // Many companions arrive from Wix as a descriptive key like:
-  //   "Ashley-Female-Caucasian-Millennials"
-  // while our ElevenLabs map is keyed by the first name ("Ashley").
-  // Normalize to reduce accidental fallback to Elara for the greeting.
   const firstToken = raw.split("-")[0]?.trim() || "";
   if (firstToken && ELEVEN_VOICE_ID_BY_AVATAR[firstToken]) return ELEVEN_VOICE_ID_BY_AVATAR[firstToken];
 
-  // Case-insensitive match as a final attempt.
   const ciKey = Object.keys(ELEVEN_VOICE_ID_BY_AVATAR).find(
     (k) => k.toLowerCase() === raw.toLowerCase() || (firstToken && k.toLowerCase() === firstToken.toLowerCase())
   );
   if (ciKey) return ELEVEN_VOICE_ID_BY_AVATAR[ciKey];
 
-  // Fallback to Elara so audio-only TTS always has a voice.
   return ELEVEN_VOICE_ID_BY_AVATAR["Elara"] || "";
 }
-function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
-  if (!avatarName) return null;
 
-  const direct = PHASE1_AVATAR_MEDIA[avatarName];
-  if (direct) return direct;
-
-  const key = Object.keys(PHASE1_AVATAR_MEDIA).find(
-    (k) => k.toLowerCase() === avatarName.toLowerCase()
-  );
-  return key ? PHASE1_AVATAR_MEDIA[key] : null;
+function getDidAvatarMediaFromMapping(mapping: CompanionMappingRow | null, companionKeyOrName: string | null | undefined): DidAvatarMedia | null {
+  const row: any = mapping || {};
+  const didAgentId = String(row.didAgentId || row.did_agent_id || "").trim();
+  const didClientKey = String(row.didClientKey || row.did_client_key || "").trim();
+  if (!didAgentId || !didClientKey) return null;
+  const elevenVoiceId = String(row.elevenVoiceId || row.eleven_voice_id || "").trim() || getElevenVoiceIdForAvatar(companionKeyOrName);
+  return { didAgentId, didClientKey, elevenVoiceId };
 }
 
 function isDidSessionError(err: any): boolean {
@@ -4177,7 +4212,7 @@ useEffect(() => {
   }, [applyTtsGainRouting]);
 
 
-  // Companion identity (drives persona + Phase 1 live avatar mapping)
+  // Companion identity (drives persona + companion mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
@@ -4731,10 +4766,12 @@ useEffect(() => {
       setCompanionMappingResolved(false);
 
       const brand = String(companyName || "").trim();
-      const avatar = String(companionKey || companionName || "").trim();
+      const displayAvatar = String(companionName || "").trim();
+      const fullKey = String(companionKey || "").trim();
+      const isElaraloAiSelection = isElaraloBrandName(brand) && isAiCompanionFilenameKey(fullKey || displayAvatar);
+      const primaryAvatar = displayAvatar || fullKey;
 
-      // Strict: brand+avatar must be present (core brand defaults to Elaralo when rebrandingKey is empty).
-      if (!brand || !avatar) {
+      if (!brand || !primaryAvatar) {
         setCompanionMapping(null);
         setCompanionMappingError("Missing brand or avatar for companion mapping lookup.");
         setCompanionMappingResolved(true);
@@ -4748,44 +4785,44 @@ useEffect(() => {
         return;
       }
 
-      try {
-        const url = `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(
-          avatar
-        )}`;
-        const res = await fetch(url, { method: "GET" });
+      const candidates = isElaraloAiSelection
+        ? [primaryAvatar, aiFirstNameFromKey(fullKey || primaryAvatar), fullKey]
+        : [primaryAvatar];
+      const lookupAvatars = Array.from(new Set(candidates.map((x) => String(x || "").trim()).filter(Boolean)));
+      const errors: string[] = [];
 
-        // Backend is strict and may return 404; surface its error message.
-        const json: any = await res.json().catch(() => ({}));
-        if (cancelled) return;
+      for (const lookupAvatar of lookupAvatars) {
+        try {
+          const url = `${API_BASE}/mappings/companion?brand=${encodeURIComponent(brand)}&avatar=${encodeURIComponent(lookupAvatar)}`;
+          const res = await fetch(url, { method: "GET" });
+          const json: any = await res.json().catch(() => ({}));
+          if (cancelled) return;
 
-        if (!res.ok) {
-          const detail = String(json?.detail || json?.message || "").trim();
-          setCompanionMapping(null);
-          setCompanionMappingError(
-            detail || `Companion mapping request failed (${res.status} ${res.statusText}).`
-          );
+          if (!res.ok) {
+            const detail = readableError(json?.detail || json?.message || json?.error).trim();
+            errors.push(detail || `Companion mapping request failed (${res.status} ${res.statusText}).`);
+            continue;
+          }
+
+          if (!(json as any)?.found) {
+            errors.push(`Companion mapping not found for brand='${brand}' avatar='${lookupAvatar}'.`);
+            continue;
+          }
+
+          setCompanionMapping(json as CompanionMappingRow);
+          setCompanionMappingError("");
           setCompanionMappingResolved(true);
           return;
-        }
-
-        // Strict: mapping endpoint must return found=true
-        if (!(json as any)?.found) {
-          setCompanionMapping(null);
-          setCompanionMappingError(`Companion mapping not found for brand='${brand}' avatar='${avatar}'.`);
-          setCompanionMappingResolved(true);
-          return;
-        }
-
-        setCompanionMapping(json as CompanionMappingRow);
-        setCompanionMappingError("");
-        setCompanionMappingResolved(true);
-      } catch (e: any) {
-        if (!cancelled) {
-          setCompanionMapping(null);
-          setCompanionMappingError(String(e?.message || e || "Failed to load companion mapping."));
-          setCompanionMappingResolved(true);
+        } catch (e: any) {
+          if (cancelled) return;
+          const msg = readableError(e?.message || e || "Failed to load companion mapping.");
+          errors.push(msg || "Failed to load companion mapping.");
         }
       }
+
+      setCompanionMapping(null);
+      setCompanionMappingError(errors.find(Boolean) || `Companion mapping not found for brand='${brand}' avatar='${primaryAvatar}'.`);
+      setCompanionMappingResolved(true);
     }
 
     void load();
@@ -4923,7 +4960,7 @@ useEffect(() => {
 
 
 // ----------------------------
-// Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
+// Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
 // ----------------------------
 const didSrcObjectRef = useRef<any | null>(null);
 const didAgentMgrRef = useRef<any | null>(null);
@@ -5434,10 +5471,9 @@ const askHostInsights = useCallback(async () => {
   // Notice for Live Sharing (websocket chat)
   const [liveSharingNotice, setLiveSharingNotice] = useState<string | null>(null);
 
-const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
+const didAvatarMedia = useMemo(() => getDidAvatarMediaFromMapping(companionMapping, companionKey || companionName), [companionMapping, companionKey, companionName]);
 
 const channelCap: ChannelCap = useMemo(() => {
-  // IMPORTANT: communication is legacy and will be removed. Use channel_cap only.
   const capRaw = String((companionMapping as any)?.channel_cap ?? (companionMapping as any)?.channelCap ?? "")
     .trim()
     .toLowerCase();
@@ -5448,20 +5484,16 @@ const channelCap: ChannelCap = useMemo(() => {
 }, [companionMapping]);
 
 const liveProvider: LiveProvider = useMemo(() => {
-  // Strict mapping: DB values are Stream, D-ID, or NULL.
-  // NOTE: "did" (no hyphen) is NOT accepted.
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
 
   if (liveRaw === "stream") return "stream";
   if (liveRaw === "d-id") return "d-id";
-
-  // If channel_cap=Video but live is empty/invalid, treat as misconfigured.
-  // We default to "d-id" as a safe runtime fallback, but we also surface an error via companionMappingError.
-  return "d-id";
+  return "";
 }, [companionMapping]);
 
-
-// Strict validation: Video companions must have a Live provider (Stream or D-ID).
+// Video / Play visibility is controlled by the companion_mappings SQL contract:
+// channel_cap=Video plus live=Stream or D-ID. D-ID credentials are used only
+// when starting a D-ID avatar, not to decide whether the Play button exists.
 useEffect(() => {
   if (channelCap === "video") {
     const liveRaw = String(companionMapping?.live || "").trim();
@@ -5472,6 +5504,7 @@ useEffect(() => {
     }
   }
 }, [channelCap, companionMapping, companyName, companionName]);
+
 const streamUrl = useMemo(() => {
   const raw = String(companionKeyRaw || "").trim();
   const { flags } = splitCompanionKey(raw);
@@ -5479,9 +5512,6 @@ const streamUrl = useMemo(() => {
 }, [companionKeyRaw]);
 
 const liveEnabled = useMemo(() => {
-  // Product requirement (Video Icon next to the microphone):
-  // - Show when channel_cap === "Video" AND live is "Stream" or "D-ID"
-  // - Hide otherwise
   const liveRaw = String(companionMapping?.live || "").trim().toLowerCase();
   const liveOk = liveRaw === "stream" || liveRaw === "d-id";
   return channelCap === "video" && liveOk;
@@ -5524,7 +5554,7 @@ const livekitUiActive =
 
 const showAvatarFrame =
   (liveProvider === "stream" && livekitUiActive) ||
-  (Boolean(phase1AvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
+  (Boolean(didAvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
 
   // Viewer-only: treat any active LegacyStream embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
@@ -5907,9 +5937,9 @@ const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
   }
 }
 
-if (!phase1AvatarMedia) {
+if (!didAvatarMedia) {
   setAvatarStatus("error");
-  setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
+  setAvatarError("Live Avatar is not configured for this companion.");
   return;
 }
 
@@ -5957,9 +5987,9 @@ if (!phase1AvatarMedia) {
     // quickstart snippets. We keep runtime behavior aligned with D-ID docs and
     // cast the options object to `any` to avoid CI type-check failures.
     const mgr = await createAgentManager(
-      phase1AvatarMedia.didAgentId,
+      didAvatarMedia.didAgentId,
       {
-      auth: { type: "key", clientKey: phase1AvatarMedia.didClientKey },
+      auth: { type: "key", clientKey: didAvatarMedia.didClientKey },
       callbacks: {
         onConnectionStateChange: (state: any) => {
           if (state === "connected") {
@@ -6061,7 +6091,7 @@ if (!phase1AvatarMedia) {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost, requestLivekitAvPermissions]);
+}, [didAvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost, requestLivekitAvPermissions]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -6576,12 +6606,12 @@ const speakAssistantReply = useCallback(
       callDidNotSpeak();
       return;
     }
-    if (!phase1AvatarMedia) {
+    if (!didAvatarMedia) {
       callDidNotSpeak();
       return;
     }
 
-    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
+    const audioUrl = await getTtsAudioUrl(clean, didAvatarMedia.elevenVoiceId);
     if (!audioUrl) {
       callDidNotSpeak();
       return;
@@ -6691,7 +6721,7 @@ const speakAssistantReply = useCallback(
     const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
     await new Promise((r) => window.setTimeout(r, waitMs));
   },
-  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
+  [avatarStatus, didAvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
 );
 
   useEffect(() => {
@@ -10529,13 +10559,25 @@ useEffect(() => {
             : typeof (data as any).avatar_name === "string"
               ? String((data as any).avatar_name).trim()
               : "";
-      const resolvedCompanionKey = incomingCompanion || incomingAvatarName || "";
+      const incomingCompanionKey =
+        typeof (data as any).companionKey === "string"
+          ? String((data as any).companionKey).trim()
+          : typeof (data as any).companion_key === "string"
+            ? String((data as any).companion_key).trim()
+            : "";
+      const incomingCompanionDisplayName =
+        typeof (data as any).companionDisplayName === "string"
+          ? String((data as any).companionDisplayName).trim()
+          : typeof (data as any).companion_display_name === "string"
+            ? String((data as any).companion_display_name).trim()
+            : "";
+      const resolvedCompanionKey = incomingCompanionKey || incomingCompanion || incomingAvatarName || "";
       const { baseKey } = splitCompanionKey(resolvedCompanionKey);
 
       if (resolvedCompanionKey) {
         setCompanionKeyRaw(resolvedCompanionKey);
         const parsed = parseCompanionMeta(baseKey || resolvedCompanionKey);
-        const resolvedCompanionName = parsed.first || incomingAvatarName || DEFAULT_COMPANION_NAME;
+        const resolvedCompanionName = incomingCompanionDisplayName || parsed.first || incomingAvatarName || incomingCompanion || DEFAULT_COMPANION_NAME;
         resolvedStartupName = resolvedCompanionName;
         const resolvedCompanionMetaKey = parsed.key || resolvedCompanionKey;
         setCompanionKey(resolvedCompanionMetaKey);
@@ -11542,7 +11584,7 @@ if (streamSessionActive) {
         }
       }
 
-      // Phase 1: Speak the assistant reply (if Live Avatar is connected).
+      // Speak the assistant reply (if Live Avatar is connected).
       // When Live Avatar is active, we delay the assistant's text from appearing until
       // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");
@@ -11618,7 +11660,7 @@ if (streamSessionActive) {
       const voiceId = ((companionMapping?.elevenVoiceId || "").trim() || getElevenVoiceIdForAvatar(safeCompanionKey));
 
       const canLiveAvatarSpeak =
-        avatarStatus === "connected" && !!phase1AvatarMedia && !!didAgentMgrRef.current;
+        avatarStatus === "connected" && !!didAvatarMedia && !!didAgentMgrRef.current;
 
       // Audio-only TTS is only played in hands-free STT mode (mic button enabled),
       // when Live Avatar is NOT speaking.
