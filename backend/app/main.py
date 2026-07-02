@@ -58,7 +58,9 @@ STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
 app = FastAPI(title="Elaralo API")
-# v9.2.26: v9.2.25 plus /chat persistent Intimate-consent initialization fix.
+# v9.2.28: Public Connect mode labels are Intro/Mate/Mature; internal routing remains friend/romantic/intimate.
+# v9.2.27: DulceMoon Discover/Explore/Encounter plan support.
+# v9.2.26: v9.2.25 plus /chat persistent Mature-consent initialization fix.
 # Keeps DulceMoon mapping alias behavior and automatic context-mode switching.
 
 # v9.2.21 remediation: isolate selected companion mappings from Host Onboarding exports.
@@ -559,9 +561,15 @@ def _env_int(name: str, default: int) -> int:
 TRIAL_MINUTES = _env_int("TRIAL_MINUTES", 15)
 
 # Included minutes per subscription plan (set these in App Service Configuration)
+# Legacy Elaralo mode-aligned plans are retained for compatibility.
 INCLUDED_MINUTES_FRIEND = _env_int("INCLUDED_MINUTES_FRIEND", 0)
 INCLUDED_MINUTES_ROMANTIC = _env_int("INCLUDED_MINUTES_ROMANTIC", 0)
 INCLUDED_MINUTES_INTIMATE = _env_int("INCLUDED_MINUTES_INTIMATE", 0)
+# DulceMoon current public plans. These intentionally map to Elaralo mode entitlements:
+#   Discover / Explore / Encounter -> Mature entitlement (Intro + Mate + Mature)
+INCLUDED_MINUTES_DISCOVER = _env_int("INCLUDED_MINUTES_DISCOVER", 30)
+INCLUDED_MINUTES_EXPLORE = _env_int("INCLUDED_MINUTES_EXPLORE", 60)
+INCLUDED_MINUTES_ENCOUNTER = _env_int("INCLUDED_MINUTES_ENCOUNTER", 90)
 INCLUDED_MINUTES_PAYG = _env_int("INCLUDED_MINUTES_PAYG", 0)
 
 # Billing/usage tuning (optional)
@@ -4182,14 +4190,38 @@ def _normalize_plan_name_for_limits(plan_name: str) -> str:
     p = (plan_name or "").strip()
     if not p:
         return ""
-    # Normalize "Test - X" plans to X for quota purposes
-    if p.lower().startswith("test - "):
-        p = p[7:].strip()
-    return p
+    p = re.sub(r"\s*\([^)]*\)\s*$", "", p).strip()
+    p = re.sub(r"\s+membership\s*$", "", p, flags=re.I).strip()
+    # Normalize "Test - X" / "Test X" plans to X for quota purposes.
+    p = re.sub(r"^test\s*(?:-\s*)?", "", p, flags=re.I).strip()
+    key = re.sub(r"[\s_\-]+", " ", p.lower()).strip()
+    # Current DulceMoon public plans mapped to Elaralo entitlements.
+    aliases = {
+        "discover": "discover",
+        "explore": "explore",
+        "encounter": "encounter",
+        # Current public mode labels normalized to legacy/internal quota buckets.
+        "intro": "friend",
+        "mate": "romantic",
+        "mature": "intimate (18+)",
+        # Legacy/internal labels.
+        "friend": "friend",
+        "romantic": "romantic",
+        "intimate": "intimate (18+)",
+        "intimate 18+": "intimate (18+)",
+        "pay as you go": "pay as you go",
+    }
+    return aliases.get(key, p)
 
 def _included_minutes_for_plan(plan_name: str) -> int:
     p = _normalize_plan_name_for_limits(plan_name).lower()
 
+    if p == "discover":
+        return INCLUDED_MINUTES_DISCOVER
+    if p == "explore":
+        return INCLUDED_MINUTES_EXPLORE
+    if p == "encounter":
+        return INCLUDED_MINUTES_ENCOUNTER
     if p == "friend":
         return INCLUDED_MINUTES_FRIEND
     if p == "romantic":
@@ -4574,11 +4606,16 @@ def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any
 
 def _normalize_mode(raw: str) -> str:
     t = (raw or "").strip().lower()
-    # allow some synonyms from older frontend builds
-    if t in {"explicit", "intimate", "18+", "adult"}:
+    t = re.sub(r"[\s_\-]+", " ", t).strip()
+    # Public mode labels are Intro/Mate/Mature.
+    # Internal routing remains friend/romantic/intimate to preserve content folders,
+    # model routing, consent gates, and provider behavior.
+    if t in {"mature", "mature 18+", "intimate", "intimate 18+", "explicit", "18+", "adult"}:
         return "intimate"
-    if t in {"romance", "romantic"}:
+    if t in {"mate", "romance", "romantic"}:
         return "romantic"
+    if t in {"intro", "friend", "friendly"}:
+        return "friend"
     return "friend"
 
 
@@ -4586,13 +4623,15 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     t = (text or "").lower().strip()
 
     # explicit hints: allow [mode:romantic] etc
-    if "mode:friend" in t or "[mode:friend]" in t:
+    if "mode:friend" in t or "[mode:friend]" in t or "mode:intro" in t or "[mode:intro]" in t:
         return "friend"
-    if "mode:romantic" in t or "[mode:romantic]" in t:
+    if "mode:romantic" in t or "[mode:romantic]" in t or "mode:mate" in t or "[mode:mate]" in t:
         return "romantic"
     if (
         "mode:intimate" in t
         or "[mode:intimate]" in t
+        or "mode:mature" in t
+        or "[mode:mature]" in t
         or "mode:explicit" in t
         or "[mode:explicit]" in t
     ):
@@ -4601,6 +4640,16 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     # soft detection (more natural language coverage)
     # friend
     if any(p in t for p in [
+        "switch to intro",
+        "change to intro",
+        "move to intro",
+        "make it intro",
+        "go to intro",
+        "back to intro",
+        "intro mode",
+        "set intro",
+        "set mode to intro",
+        "turn on intro",
         "switch to friend",
         "change to friend",
         "move to friend",
@@ -4616,6 +4665,15 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
 
     # romantic
     if any(p in t for p in [
+        "switch to mate",
+        "change to mate",
+        "move to mate",
+        "go to mate",
+        "back to mate",
+        "mate mode",
+        "set mate",
+        "set mode to mate",
+        "turn on mate",
         "switch to romantic",
         "change to romantic",
         "move to romantic",
@@ -4632,6 +4690,15 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
 
     # intimate/explicit
     if any(p in t for p in [
+        "switch to mature",
+        "change to mature",
+        "move to mature",
+        "go to mature",
+        "back to mature",
+        "mature mode",
+        "set mature",
+        "set mode to mature",
+        "turn on mature",
         "switch to intimate",
         "change to intimate",
         "move to intimate",
@@ -4710,7 +4777,7 @@ def _looks_intimate(text: str) -> bool:
         k in t
         for k in [
             # Mode / intent
-            "explicit", "intimate", "nsfw", "adult", "18+",
+            "mature", "explicit", "intimate", "nsfw", "adult", "18+",
             # Common explicit content terms (kept intentionally simple: substring match)
             "sex", "sexy", "nude", "naked", "porn",
             "fuck", "fucking", "cock", "dick", "penis", "pussy", "vagina",
@@ -4776,8 +4843,8 @@ def _contextual_mode_from_messages(user_text: str, current_mode: str, messages: 
     """Deterministic context-mode classifier for AI Connect.
 
     It deliberately avoids an extra LLM call.  It only changes modes when the latest
-    text and very recent context contain clear signals.  Intimate signals only request
-    Intimate mode; the normal explicit-consent gate still runs before Intimate content
+    text and very recent context contain clear signals.  Mature signals only request
+    Mature mode; the normal explicit-consent gate still runs before Mature content
     can be generated.
     """
     latest = str(user_text or "").strip()
@@ -4798,7 +4865,7 @@ def _contextual_mode_from_messages(user_text: str, current_mode: str, messages: 
     current = _normalize_mode(str(current_mode or "friend"))
 
     intimate_patterns = [
-        r"\b(explicit|intimate|nsfw|18\+|adult mode)\b",
+        r"\b(mature|explicit|intimate|nsfw|18\+|adult mode)\b",
         r"\b(sex|sexual|sexy|nude|naked|porn)\b",
         r"\b(fuck|fucking|cock|dick|penis|pussy|vagina|clit)\b",
         r"\b(blowjob|oral|anal|orgasm|cum|cumming)\b",
@@ -4808,7 +4875,7 @@ def _contextual_mode_from_messages(user_text: str, current_mode: str, messages: 
         return "intimate"
 
     romantic_patterns = [
-        r"\b(romantic|romance|flirt|flirty|date|dating)\b",
+        r"\b(mate|romantic|romance|flirt|flirty|date|dating)\b",
         r"\b(kiss|kissing|cuddle|cuddling|hold me|hold your hand)\b",
         r"\b(i love you|love you|falling for you|miss you|my love|sweetheart|darling|babe|baby)\b",
         r"\b(beautiful|gorgeous|handsome|attracted to you|chemistry between us)\b",
@@ -4887,8 +4954,8 @@ def _fallback_mode_for_allowed_modes(allowed_modes: Optional[List[str]], preferr
 
 def _intimate_unavailable_response_text(is_anon: bool) -> str:
     if is_anon:
-        return "Intimate (18+) mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Romantic mode."
-    return "Intimate (18+) mode is not available on your current plan. We’ll keep things in Romantic mode."
+        return "Mature mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Mate mode."
+    return "Mature mode is not available on your current plan. We’ll keep things in Mate mode."
 
 
 def _mode_consent_db_path() -> str:
@@ -5000,7 +5067,7 @@ def _record_member_intimate_consent_sync(member_id: Any, session_state: Dict[str
 @app.get("/mode-consent/intimate/status")
 @app.get("/chat/intimate-consent/status")
 async def mode_consent_intimate_status(memberId: str = "", member_id: str = "", brand: str = ""):
-    """Return whether this member has previously confirmed Intimate (18+) consent.
+    """Return whether this member has previously confirmed Mature consent.
 
     Consent is keyed by member_id only, so the same member is not prompted again
     when switching between Elaralo and DulceMoon AI Connect.  The brand parameter is
@@ -5641,7 +5708,7 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
 
     if mode == "intimate" and intimate_allowed:
         lines.append(
-            "The user has consented to Intimate (18+) conversation. "
+            "The user has consented to Mature conversation. "
             "You may engage in adult, sensual discussion, but avoid graphic or pornographic detail. "
             "Focus on intimacy, emotion, and connection."
         )
@@ -5896,8 +5963,8 @@ def _call_gpt4o_with_options(
 
 # ----------------------------
 # Multi-provider LLM routing
-#   - Friend/Romantic -> OpenAI
-#   - Intimate (18+) -> xAI
+#   - Intro/Mate -> OpenAI
+#   - Mature -> xAI
 # ----------------------------
 
 def _xai_base_url() -> str:
@@ -5994,7 +6061,7 @@ def _extract_in_session_summaries(session_state: Dict[str, Any]) -> List[str]:
 
 
 def _sanitize_summary_for_safe_mode(text: str) -> str:
-    """Sanitize a summary for Friend/Romantic (OpenAI) context.
+    """Sanitize a summary for Intro/Mate (OpenAI) context.
 
     If the summary appears intimate/explicit, replace it with a high-level, non-explicit note.
     """
@@ -6003,8 +6070,8 @@ def _sanitize_summary_for_safe_mode(text: str) -> str:
         return ""
     if _looks_intimate(t):
         return (
-            "Earlier conversation included an Intimate (18+) segment with consent. "
-            "Details are intentionally omitted in Friend/Romantic mode."
+            "Earlier conversation included a Mature segment with consent. "
+            "Details are intentionally omitted in Intro/Mate mode."
         )
 
     max_chars = int(os.getenv("SAFE_MODE_SUMMARY_MAX_CHARS", "2500") or "2500")
@@ -6457,7 +6524,7 @@ def _filter_history_for_safe_mode(messages: List[Dict[str, str]]) -> Tuple[List[
         return messages, None
 
     note = (
-        f"Context note: {omitted} earlier message(s) from an Intimate (18+) segment were omitted because the current mode is Friend/Romantic. "
+        f"Context note: {omitted} earlier message(s) from a Mature segment were omitted because the current mode is Intro/Mate. "
         "Assume consent had been established and an intimate conversation occurred, but do not reference explicit details. "
         "Continue naturally from the remaining chat context and any provided summaries."
     )
@@ -9270,7 +9337,7 @@ async def chat(request: Request):
 
     is_anon = bool(member_id) and str(member_id).strip().lower().startswith("anon:")
 
-    # v9.2.26: Initialize persistent Intimate-consent state inside /chat.
+    # v9.2.26: Initialize persistent Mature-consent state inside /chat.
     # v9.2.24/v9.2.25 initialized this variable in /usage/status, but /chat later
     # referenced it during consent/mode handling. That caused a NameError and the
     # generic {"detail":"Internal Server Error"} response on normal chat turns.
@@ -9720,7 +9787,7 @@ async def chat(request: Request):
         session_state_out["pending_consent"] = None
         session_state_out["mode"] = _safe_non_intimate_mode(session_state_out.get("mode") or "romantic")
         return await _respond(
-            "Intimate (18+) mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Romantic mode.",
+            "Mature mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Mate mode.",
             STATUS_SAFE,
             session_state_out,
         )
@@ -9742,7 +9809,7 @@ async def chat(request: Request):
                 saved = await run_in_threadpool(_record_member_intimate_consent_sync, member_id, session_state_out, session_id)
                 session_state_out["explicit_consent_persisted"] = bool(saved)
             return await _respond(
-                "Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
+                "Thank you — Mature mode is enabled. What would you like to explore together?",
                 STATUS_ALLOWED,
                 session_state_out,
             )
@@ -9753,7 +9820,7 @@ async def chat(request: Request):
             session_state_out["explicit_consented"] = False
             session_state_out["mode"] = "friend"
             return await _respond(
-                "No problem — we’ll keep things in Friend mode.",
+                "No problem — we’ll keep things in Intro mode.",
                 STATUS_SAFE,
                 session_state_out,
             )
@@ -9770,14 +9837,14 @@ async def chat(request: Request):
 
     # Start consent if intimate requested but not allowed
     require_consent = bool(getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True))
-    # Always gate Intimate (18+) behind explicit consent. This avoids silently ignoring
+    # Always gate Mature behind explicit consent. This avoids silently ignoring
     # a user-requested mode switch when consent has not yet been granted.
     if user_requesting_intimate and not intimate_allowed:
         session_state_out = dict(session_state)
         session_state_out["pending_consent"] = "intimate"
         session_state_out["mode"] = "intimate"
         return await _respond(
-            "Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
+            "Before we continue, please confirm you are 18+ and consent to Mature conversation. Reply 'yes' to continue.",
             STATUS_BLOCKED,
             session_state_out,
         )
@@ -9793,7 +9860,7 @@ async def chat(request: Request):
         f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending} voice_id={'yes' if voice_id else 'no'}",
     )
 
-    # call model (provider-routing: Intimate -> xAI, Friend/Romantic -> OpenAI)
+    # call model (provider-routing: Mature -> xAI, Intro/Mate -> OpenAI)
     llm_provider = "xai" if effective_mode == "intimate" else "openai"
 
     # Detect provider switches so we can encourage the model to rely on summaries for continuity.
@@ -9805,8 +9872,8 @@ async def chat(request: Request):
     ).strip().lower()
     provider_switched = bool(prev_provider) and (prev_provider != llm_provider)
 
-    # In Friend/Romantic mode, never send explicit/intimate content to OpenAI.
-    # If the browser is still holding prior Intimate messages, omit them and provide a safe handoff note.
+    # In Intro/Mate mode, never send explicit/intimate content to OpenAI.
+    # If the browser is still holding prior Mature messages, omit them and provide a safe handoff note.
     history_for_llm = messages
     handoff_note: str | None = None
     if llm_provider == "openai":
@@ -11666,8 +11733,8 @@ def _is_anon_member_id(member_id: Any) -> bool:
 
 
 def _safe_non_intimate_mode(raw_mode: Any) -> str:
-    m = str(raw_mode or "").strip().lower()
-    if m.startswith("friend"):
+    m = _normalize_mode(str(raw_mode or ""))
+    if m == "friend":
         return "friend"
     return "romantic"
 

@@ -411,13 +411,19 @@ function dedupeHostActiveChats(chats: HostActiveChat[]): HostActiveChat[] {
 
 type PlanName =
   | "Trial"
+  | "Discover"
+  | "Explore"
+  | "Encounter"
   | "Friend"
   | "Romantic"
-  | "Intimate (18+)"
+  | "Mature"
   | "Pay as You Go"
+  | "Test - Discover"
+  | "Test - Explore"
+  | "Test - Encounter"
   | "Test - Friend"
   | "Test - Romantic"
-  | "Test - Intimate (18+)"
+  | "Test - Mature"
   | "Test - Pay as You Go"
   | null;
 
@@ -741,30 +747,38 @@ function buildAssistantTurnMsg(displayText: string, rawTranslation: any, sender:
 function normalizePlanName(raw: any): PlanName {
   const s = String(raw ?? "").trim();
   if (!s) return null;
-  const key = s.toLowerCase();
+  const normalized = s
+    .replace(/\s*\([^)]*\)\s*$/g, "")
+    .replace(/[-–—]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\s*membership\s*$/i, "")
+    .trim();
+  const isTest = /^test\s+/i.test(normalized);
+  const base = normalized.replace(/^test\s+/i, "").trim();
+  const key = base.toLowerCase();
 
-  switch (key) {
-    case "trial":
-      return "Trial";
-    case "friend":
-      return "Friend";
-    case "romantic":
-      return "Romantic";
-    case "intimate (18+)":
-      return "Intimate (18+)";
-    case "pay as you go":
-      return "Pay as You Go";
-    case "test - friend":
-      return "Test - Friend";
-    case "test - romantic":
-      return "Test - Romantic";
-    case "test - intimate (18+)":
-      return "Test - Intimate (18+)";
-    case "test - pay as you go":
-      return "Test - Pay as You Go";
-    default:
-      return null;
-  }
+  const canonical: Record<string, Exclude<PlanName, null>> = {
+    trial: "Trial",
+    discover: "Discover",
+    explore: "Explore",
+    encounter: "Encounter",
+    friend: "Friend",
+    romantic: "Romantic",
+    intimate: "Mature",
+    "intimate 18+": "Mature",
+    "pay as you go": "Pay as You Go",
+  };
+
+  const mapped = canonical[key];
+  if (!mapped) return null;
+  if (!isTest || mapped === "Trial" || mapped === "Pay as You Go") return mapped;
+  if (mapped === "Discover") return "Test - Discover";
+  if (mapped === "Explore") return "Test - Explore";
+  if (mapped === "Encounter") return "Test - Encounter";
+  if (mapped === "Friend") return "Test - Friend";
+  if (mapped === "Romantic") return "Test - Romantic";
+  if (mapped === "Mature") return "Test - Mature";
+  return mapped;
 }
 
 function stripTrialControlsFromRebrandingKey(key: string): string {
@@ -775,7 +789,7 @@ function stripTrialControlsFromRebrandingKey(key: string): string {
   // IMPORTANT:
   // Historically some backend paths read the *plan* segment (6th field) from the rebrandingKey to decide
   // included minutes. For white-label sites, the 6th field may be the white-label plan label (e.g. "Test - Exclusive")
-  // and the Elaralo entitlement plan is carried in `elaraloPlanMap` (e.g. "Intimate (18+)").
+  // and the Elaralo entitlement plan is carried in `elaraloPlanMap` (e.g. "Mature").
   //
   // Keep format stable (9 segments) but DO NOT blank-out FreeMinutes/CycleDays.
   // For white-label, `FreeMinutes` is treated as the plan's top-up/included minutes value.
@@ -850,9 +864,9 @@ function splitCompanionKey(raw: string): CompanionKeySplit {
 function modeFromElaraloPlanMap(raw: unknown): Mode | null {
   const s = String(raw ?? "").trim().toLowerCase();
   if (!s) return null;
-  if (s.includes("intimate")) return "intimate";
-  if (s.includes("romantic")) return "romantic";
-  if (s.includes("friend")) return "friend";
+  if (s.includes("mature") || s.includes("intimate")) return "intimate";
+  if (s.includes("mate") || s.includes("romantic")) return "romantic";
+  if (s.includes("intro") || s.includes("friend")) return "friend";
   return null;
 }
 
@@ -862,9 +876,9 @@ function modeFromElaraloPlanMap(raw: unknown): Mode | null {
 function modeFromModePill(raw: unknown): Mode | null {
   const s = String(raw ?? "").trim().toLowerCase();
   if (!s) return null;
-  if (s.includes("intimate")) return "intimate";
-  if (s.includes("romantic")) return "romantic";
-  if (s.includes("friend")) return "friend";
+  if (s.includes("mature") || s.includes("intimate")) return "intimate";
+  if (s.includes("mate") || s.includes("romantic")) return "romantic";
+  if (s.includes("intro") || s.includes("friend")) return "friend";
   return null;
 }
 
@@ -1725,23 +1739,33 @@ const UPGRADE_URL = process.env.NEXT_PUBLIC_UPGRADE_URL || "https://www.elaralo.
 const STREAM_URL = process.env.NEXT_PUBLIC_STREAM_URL || "";
 
 const MODE_LABELS: Record<Mode, string> = {
-  friend: "Friend",
-  romantic: "Romantic",
-  intimate: "Intimate (18+)",
+  friend: "Intro",
+  romantic: "Mate",
+  intimate: "Mature",
 };
 
 // Plan → mode availability mapping (UI pills)
-// Requirements:
-// - Friend or Test - Friend Plan: Friend only
-// - Romantic or Test - Romantic Plan: Friend + Romantic
-// - Intimate (18+) or Test - Intimate (18+) Plan: Friend + Romantic + Intimate (18+)
+// Public labels shown in the UI:
+// - Intro  = internal friend
+// - Mate   = internal romantic
+// - Mature = internal intimate
+// DulceMoon current public plans:
+// - Free Trial -> Intro + Mate only; Mature is excluded
+// - Discover / Explore / Encounter -> Intro + Mate + Mature
+// Legacy Intro/Mate/Intimate plan names are retained as hidden/backward-compatible aliases.
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Trial",
+  "Discover",
+  "Explore",
+  "Encounter",
   "Romantic",
-  "Intimate (18+)",
+  "Mature",
   "Pay as You Go",
+  "Test - Discover",
+  "Test - Explore",
+  "Test - Encounter",
   "Test - Romantic",
-  "Test - Intimate (18+)",
+  "Test - Mature",
   "Test - Pay as You Go",
 ];
 
@@ -1750,8 +1774,14 @@ function allowedModesForPlan(planName: PlanName): Mode[] {
   const modes: Mode[] = ["friend"];
   if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
   if (
-    planName === "Intimate (18+)" ||
-    planName === "Test - Intimate (18+)" ||
+    planName === "Discover" ||
+    planName === "Explore" ||
+    planName === "Encounter" ||
+    planName === "Test - Discover" ||
+    planName === "Test - Explore" ||
+    planName === "Test - Encounter" ||
+    planName === "Mature" ||
+    planName === "Test - Mature" ||
     planName === "Pay as You Go" ||
     planName === "Test - Pay as You Go"
   )
@@ -1762,9 +1792,9 @@ function allowedModesForPlan(planName: PlanName): Mode[] {
 // White-label support:
 // The companion page provides an Elaralo entitlement plan name via RebrandingKey.elaraloPlanMap.
 // That plan name determines how many Mode pills are available:
-//   Friend   -> [Friend]
-//   Romantic -> [Friend, Romantic]
-//   Intimate -> [Friend, Romantic, Intimate]
+//   Intro  -> [Intro]
+//   Mate   -> [Intro, Mate]
+//   Mature -> [Intro, Mate, Mature]
 // We keep a fallback to the legacy PlanName mapping when elaraloPlanMap is missing/unknown.
 function allowedModesFromElaraloPlanMap(rawPlanMap: unknown, fallbackPlan: PlanName): Mode[] {
   const topMode = modeFromElaraloPlanMap(rawPlanMap);
@@ -2100,25 +2130,25 @@ function isAllowedOrigin(origin: string) {
  * - mode: desired mode
  * - cleaned: text with explicit [mode:*] removed (so it won't pollute the chat)
  *
- * Supports:
- * - [mode:romantic], mode:romantic
- * - "switch to romantic", "romantic mode", "set mode to romantic", etc.
+ * Supports public labels and legacy labels:
+ * - [mode:mate], mode:mate, [mode:romantic], mode:romantic
+ * - "switch to mate", "mate mode", "set mode to mature", etc.
  */
 function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: string } {
   const raw = text || "";
   const t = raw.toLowerCase();
 
   // explicit tokens
-  // NOTE: allow "romance" token from older builds as a synonym for "romantic"
+  // NOTE: allow legacy tokens from older builds as synonyms for the public labels.
   const tokenRe =
-    /\[mode:(friend|romantic|romance|intimate|explicit)\]|mode:(friend|romantic|romance|intimate|explicit)/gi;
+    /\[mode:(intro|friend|mate|romantic|romance|mature|intimate|explicit)\]|mode:(intro|friend|mate|romantic|romance|mature|intimate|explicit)/gi;
 
   let tokenMode: Mode | null = null;
   let cleaned = raw.replace(tokenRe, (m) => {
     const mm = m.toLowerCase();
-    if (mm.includes("friend")) tokenMode = "friend";
-    else if (mm.includes("romantic") || mm.includes("romance")) tokenMode = "romantic";
-    else if (mm.includes("intimate") || mm.includes("explicit")) tokenMode = "intimate";
+    if (mm.includes("intro") || mm.includes("friend")) tokenMode = "friend";
+    else if (mm.includes("mate") || mm.includes("romantic") || mm.includes("romance")) tokenMode = "romantic";
+    else if (mm.includes("mature") || mm.includes("intimate") || mm.includes("explicit")) tokenMode = "intimate";
     return "";
   });
 
@@ -2126,28 +2156,28 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
 
   if (tokenMode) return { mode: tokenMode, cleaned };
 
-  // soft phrasing (covers friend->romantic and intimate->romantic)
+  // soft phrasing (supports both public labels and legacy labels)
   const soft = t.trim();
 
   const wantsFriend =
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\bfriend\b/.test(soft) ||
-    /\bfriend mode\b/.test(soft);
+    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(intro|friend)\b/.test(soft) ||
+    /\b(intro|friend) mode\b/.test(soft);
 
   const wantsRomantic =
-    // "romantic mode" / "romance mode"
-    /\b(romantic|romance) mode\b/.test(soft) ||
-    // switch/set/back/go/turn ... romantic
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(romantic|romance)\b/.test(soft) ||
+    // "mate mode" / legacy "romantic mode" / "romance mode"
+    /\b(mate|romantic|romance) mode\b/.test(soft) ||
+    // switch/set/back/go/turn ... mate/romantic
+    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(mate|romantic|romance)\b/.test(soft) ||
     // natural phrasing users actually type
-    /\b(let['’]?s|lets)\b.*\b(romantic|romance)\b/.test(soft) ||
-    /\b(be|being|try|trying|have|having)\b.*\b(romantic|romance)\b/.test(soft) ||
-    /\bromantic conversation\b/.test(soft) ||
+    /\b(let['’]?s|lets)\b.*\b(mate|romantic|romance)\b/.test(soft) ||
+    /\b(be|being|try|trying|have|having)\b.*\b(mate|romantic|romance)\b/.test(soft) ||
+    /\b(mate|romantic) conversation\b/.test(soft) ||
     /\bromance again\b/.test(soft) ||
     /\btry romance again\b/.test(soft);
 
   const wantsIntimate =
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
-    /\b(intimate|explicit) mode\b/.test(soft);
+    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(mature|intimate|explicit|adult|18\+)\b/.test(soft) ||
+    /\b(mature|intimate|explicit) mode\b/.test(soft);
 
   if (wantsFriend) return { mode: "friend", cleaned: raw };
   if (wantsRomantic) return { mode: "romantic", cleaned: raw };
@@ -10556,8 +10586,8 @@ useEffect(() => {
     const isVisitorNow = !midNow || isAnonMemberId(midNow);
     const msg = requestedMode === "intimate"
       ? isVisitorNow
-        ? "Intimate (18+) mode is available only to signed-in members. Visitors can use Friend and Romantic modes."
-        : `Intimate (18+) isn't available on your current plan. Please upgrade or purchase Pay as You Go here: ${upgradeUrl} (or click the Upgrade button in the top-right).`
+        ? "Mature mode is available only to signed-in members. Visitors can use Intro and Mate modes."
+        : `Mature isn't available on your current plan. Please upgrade or purchase Pay as You Go here: ${upgradeUrl} (or click the Upgrade button in the top-right).`
       : `The requested mode (${modeLabel}) isn't available on your current plan. Please upgrade here: ${upgradeUrl} (or click the Upgrade button in the top-right).`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
@@ -10911,7 +10941,7 @@ useEffect(() => {
 
       // Brand-default starting mode:
       // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
-      // - Fallback: entitled plans default to Intimate, Trial/visitors default to Romantic.
+      // - Fallback: entitled plans default to Mature internally, Trial/visitors default to Mate internally.
       const incomingModePillRaw =
         typeof (data as any).modePill === "string"
           ? String((data as any).modePill)
@@ -11212,7 +11242,7 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
 
   // Entitlement modes for backend context-mode automation.  The UI remains the
   // primary plan gate, but the backend needs the same list when it auto-detects
-  // Romantic/Intimate context from conversation text.
+  // Mate/Mature context from conversation text.
   allowed_modes: allowedModes,
   allowedModes,
 
@@ -11558,7 +11588,7 @@ const clearPendingAttachment = useCallback(() => {
       return;
     }
 
-    // Selecting Intimate (18+) requires explicit consent; trigger the consent overlay if not already consented.
+    // Selecting Mature requires explicit consent; trigger the consent overlay if not already consented.
     if (m === "intimate" && !sessionState.explicit_consented) {
       setChatStatus("explicit_blocked");
     }
@@ -11884,7 +11914,7 @@ if (streamSessionActive) {
             merged.pending_consent = null;
           }
 
-          // If the backend sent a mode (in session state OR top-level), normalize it so Romantic always highlights
+          // If the backend sent a mode (in session state OR top-level), normalize it so Mate always highlights
           const backendMode = normalizeMode((serverSessionState as any)?.mode ?? (data as any)?.mode);
           if (backendMode && data.mode !== "explicit_blocked") {
             merged.mode = backendMode;
@@ -16630,8 +16660,8 @@ const modePillControls = (
           >
             <h3 style={{ marginTop: 0 }}>Consent Required</h3>
             <p style={{ marginTop: 0 }}>
-              To enable <b>Intimate (18+)</b> mode, please confirm you are 18+ and consent to an
-              Intimate (18+) conversation.
+              To enable <b>Mature</b> mode, please confirm you are 18+ and consent to an
+              Mature conversation.
             </p>
 
             <div style={{ display: "flex", gap: 8 }}>
