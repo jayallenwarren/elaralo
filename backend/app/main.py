@@ -8817,22 +8817,85 @@ def _normalize_tts_text(
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "") -> str:
-    text = (text or "").strip()
 
-    # Pronunciation normalization (runs before caching / audio generation).
-    # - Splits CamelCase brand tokens (e.g., DulceMoon -> Dulce Moon)
-    # - Applies companion phonetic name (DB mapping) at token boundaries
+def _tts_explicit_phonetic_from_payload(value: Any) -> str:
+    """Return an explicitly supplied phonetic pronunciation for TTS.
+
+    This value is only pronunciation guidance; it is never derived from the
+    companion first name and is never used as a display label.
+    """
+    if not isinstance(value, dict):
+        return ""
+    for key in (
+        "mapping_phonetic",
+        "mappingPhonetic",
+        "companion_phonetic",
+        "companionPhonetic",
+        "phonetic_pronunciation",
+        "phoneticPronunciation",
+        "phonetic",
+    ):
+        s = str(value.get(key) or "").strip()
+        if s and s.lower() not in {"null", "undefined"}:
+            return s[:160]
+    return ""
+
+
+def _tts_lookup_phonetic_context(brand: str, avatar: str, explicit_phonetic: str = "") -> Tuple[str, str, str]:
+    """Return (brand, pronunciation_target, phonetic) for TTS name normalization.
+
+    The UI may send the visible companion name ("Dulce"), the SQL mapping avatar
+    (also normally "Dulce"), or a hyphenated companion key
+    ("Dulce-Female-Black-Millennials").  The phonetic column lives on the
+    companion_mappings row, so this helper always resolves through the same
+    alias-aware lookup used by Connect before TTS cache lookup or generation.
+    """
+    b = str(brand or "").strip()
+    a = str(avatar or "").strip()
+    if not b or not a:
+        return b, a, ""
+
+    row: Dict[str, Any] = {}
     try:
-        if brand:
-            phon = ""
-            if avatar:
-                m = _lookup_companion_mapping(brand, avatar) or {}
-                phon = (m.get("phonetic") or "").strip()
-            text = _normalize_tts_text(text, brand=brand, avatar=avatar, mapping_phonetic=phon)
+        row = _lookup_companion_mapping_with_aliases(b, a) or {}
     except Exception:
-        # Never fail TTS due to normalization
+        row = {}
+
+    phonetic = str(explicit_phonetic or (row or {}).get("phonetic") or "").strip()
+    # Use the SQL avatar identity/first name as the replacement target so a
+    # hyphenated companion key still normalizes spoken text containing "Dulce".
+    target = str(
+        (row or {}).get("mapping_avatar")
+        or (row or {}).get("avatar")
+        or _companion_avatar_first_name(a)
+        or a
+    ).strip()
+    return b, target, phonetic
+
+
+def _normalize_tts_generation_text(text: str, *, brand: str, avatar: str, mapping_phonetic: str = "") -> str:
+    """Normalize TTS text before cache lookup and before ElevenLabs generation."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    try:
+        resolved_brand, pronunciation_target, phonetic = _tts_lookup_phonetic_context(brand, avatar, mapping_phonetic)
+        if resolved_brand:
+            return _normalize_tts_text(
+                raw,
+                brand=resolved_brand,
+                avatar=pronunciation_target,
+                mapping_phonetic=phonetic,
+            )
+    except Exception:
         pass
+    return raw
+
+def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "", mapping_phonetic: str = "") -> str:
+    # Pronunciation normalization runs before caching/audio generation.
+    # This is intentionally alias-aware so initial greetings sent from Wix/Connect
+    # use companion_mappings.phonetic from the very first spoken line.
+    text = _normalize_tts_generation_text(text, brand=brand, avatar=avatar, mapping_phonetic=mapping_phonetic)
     if not text:
         raise RuntimeError("TTS text is empty")
 
@@ -9635,15 +9698,34 @@ async def chat(request: Request):
         audio_url: Optional[str] = None
         if voice_id and reply_text.strip():
             try:
+                tts_brand, tts_avatar = _resolved_tts_brand_avatar(state_out)
+                if not tts_brand or not tts_avatar:
+                    fallback_brand, fallback_avatar = _resolved_tts_brand_avatar(session_state)
+                    tts_brand = tts_brand or fallback_brand
+                    tts_avatar = tts_avatar or fallback_avatar
+                tts_mapping_phonetic = (
+                    _tts_explicit_phonetic_from_payload(state_out)
+                    or _tts_explicit_phonetic_from_payload(session_state)
+                )
+                tts_reply_text = _normalize_tts_generation_text(
+                    reply_text,
+                    brand=tts_brand,
+                    avatar=tts_avatar,
+                    mapping_phonetic=tts_mapping_phonetic,
+                )
+
                 if _TTS_CHAT_CACHE_FIRST and _TTS_CACHE_ENABLED:
-                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, reply_text)
+                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, tts_reply_text)
                 if audio_url is None:
-                    tts_brand, tts_avatar = _resolved_tts_brand_avatar(state_out)
-                    if not tts_brand or not tts_avatar:
-                        fallback_brand, fallback_avatar = _resolved_tts_brand_avatar(session_state)
-                        tts_brand = tts_brand or fallback_brand
-                        tts_avatar = tts_avatar or fallback_avatar
-                    audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply_text, tts_brand, tts_avatar)
+                    audio_url = await run_in_threadpool(
+                        _tts_audio_url_sync,
+                        session_id,
+                        voice_id,
+                        tts_reply_text,
+                        tts_brand,
+                        tts_avatar,
+                        tts_mapping_phonetic,
+                    )
             except Exception as e:
                 # Fail-open: never break chat because TTS failed
                 _dbg(debug, "TTS generation failed:", repr(e))
@@ -12150,15 +12232,52 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail="voice_id and text are required")
 
     try:
+        tts_state = body.get("session_state") or body.get("sessionState") or {}
+        if not isinstance(tts_state, dict):
+            tts_state = {}
+
+        brand = str(body.get("brand") or body.get("companyName") or body.get("company_name") or "").strip()
+        avatar = str(
+            body.get("mappingAvatar")
+            or body.get("mapping_avatar")
+            or body.get("avatar")
+            or body.get("companionName")
+            or body.get("companion")
+            or body.get("companionKey")
+            or body.get("companion_key")
+            or ""
+        ).strip()
+        if not brand or not avatar:
+            fallback_brand, fallback_avatar = _resolved_tts_brand_avatar(tts_state)
+            brand = brand or fallback_brand
+            avatar = avatar or fallback_avatar
+
+        # Normalize BEFORE looking in the deterministic cache. Otherwise an old
+        # unnormalized greeting cache blob (e.g. "Hi, I'm Dulce...") can be
+        # returned and spoken as "Dull-seh" even though companion_mappings.phonetic
+        # now says "DOOL-seh".  _tts_audio_url_sync normalizes again safely, but
+        # this pre-normalized value ensures cache lookup and generation use the
+        # same phonetic-safe key.
+        mapping_phonetic = (
+            _tts_explicit_phonetic_from_payload(body)
+            or _tts_explicit_phonetic_from_payload(tts_state)
+        )
+        text_for_tts = _normalize_tts_generation_text(
+            text,
+            brand=brand,
+            avatar=avatar,
+            mapping_phonetic=mapping_phonetic,
+        )
+
         # STEP B: if another worker/request is already generating the same cached blob, wait briefly.
         audio_url: Optional[str] = None
-        if _TTS_CACHE_ENABLED and voice_id and text:
+        if _TTS_CACHE_ENABLED and voice_id and text_for_tts:
             try:
-                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
+                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text_for_tts)
                 if _inflight_marker_is_fresh(cache_blob):
                     waited = 0
                     while waited < _TTS_INFLIGHT_WAIT_MS:
-                        peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text)
+                        peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text_for_tts)
                         if peek:
                             audio_url = peek
                             break
@@ -12167,18 +12286,7 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
             except Exception:
                 pass
         if audio_url is None:
-
-            tts_state = body.get("session_state") or body.get("sessionState") or {}
-            if not isinstance(tts_state, dict):
-                tts_state = {}
-            brand = (body.get("brand") or "").strip()
-            avatar = (body.get("avatar") or "").strip()
-            if not brand or not avatar:
-                fallback_brand, fallback_avatar = _resolved_tts_brand_avatar(tts_state)
-                brand = brand or fallback_brand
-                avatar = avatar or fallback_avatar
-
-            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text, brand, avatar)
+            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text_for_tts, brand, avatar, mapping_phonetic)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
 

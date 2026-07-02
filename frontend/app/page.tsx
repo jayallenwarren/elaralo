@@ -181,6 +181,15 @@ type CompanionMappingRow = {
   didClientKey?: string;
   didAgentId?: string;
   elevenVoiceId?: string;
+  elevenVoiceName?: string;
+
+  // Optional DB column used by backend TTS normalization.
+  // Pronunciation guidance only; never display this value as the companion name.
+  phonetic?: string | null;
+  mapping_phonetic?: string | null;
+  mappingPhonetic?: string | null;
+  companion_phonetic?: string | null;
+  companionPhonetic?: string | null;
 
   // Optional DB column used for UI labeling.
   // Expected values: "Human" | "AI" (case-insensitive), but treated as a free-form string.
@@ -6297,8 +6306,27 @@ useEffect(() => {
   void stopLiveAvatar();
 }, [companionKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
+const companionPhonetic = useMemo(() => {
+  const m: any = companionMapping || {};
+  return String(
+    m.phonetic ??
+    m.mapping_phonetic ??
+    m.mappingPhonetic ??
+    m.companion_phonetic ??
+    m.companionPhonetic ??
+    ""
+  ).trim();
+}, [companionMapping]);
+
 const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?: AbortSignal): Promise<string | null> => {
   try {
+    const currentBrand = String(companyName || "").trim();
+    const currentCompanionName = String(companionName || "").trim();
+    const currentMappingAvatar = String(selectedMappingAvatar || currentCompanionName || "").trim();
+    const currentCompanionKey = String(companionKey || "").trim();
+    const currentCompanionType = String(selectedCompanionType || "").trim();
+    const currentPhonetic = String(companionPhonetic || "").trim();
+
     const res = await fetch(`${API_BASE}/tts/audio-url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -6306,8 +6334,23 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
       body: JSON.stringify({
         session_id: sessionIdRef.current || "anon",
         voice_id: voiceId,
-        brand: companyName,
-        avatar: companionName,
+        brand: currentBrand,
+        // Use the SQL mapping avatar for phonetic lookup. For DulceMoon this is
+        // "Dulce", while companionKey can remain "Dulce-Female-Black-Millennials".
+        avatar: currentMappingAvatar || currentCompanionName,
+        mappingAvatar: currentMappingAvatar,
+        mapping_avatar: currentMappingAvatar,
+        companionName: currentCompanionName,
+        companion_name: currentCompanionName,
+        companionKey: currentCompanionKey,
+        companion_key: currentCompanionKey,
+        companionType: currentCompanionType,
+        companion_type: currentCompanionType,
+        phonetic: currentPhonetic,
+        mapping_phonetic: currentPhonetic,
+        mappingPhonetic: currentPhonetic,
+        companion_phonetic: currentPhonetic,
+        companionPhonetic: currentPhonetic,
         text,
       }),
     });
@@ -6324,7 +6367,15 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
     console.warn("TTS/audio-url error:", e);
     return null;
   }
-}, []);
+}, [
+  API_BASE,
+  companyName,
+  companionName,
+  companionKey,
+  selectedMappingAvatar,
+  selectedCompanionType,
+  companionPhonetic,
+]);
 
   type SpeakAssistantHooks = {
     // Called right before we ask D-ID to speak.
@@ -7055,6 +7106,11 @@ useEffect(() => {
         mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
         companionType: selectedCompanionType,
         companion_type: selectedCompanionType,
+        phonetic: companionPhonetic,
+        mapping_phonetic: companionPhonetic,
+        mappingPhonetic: companionPhonetic,
+        companion_phonetic: companionPhonetic,
+        companionPhonetic: companionPhonetic,
 
         translator_enabled: translatorEnabled,
         translation_enabled: translatorEnabled,
@@ -8224,7 +8280,7 @@ useEffect(() => {
       assistant_source_language_name: assistantSpeechLanguageName,
       assistantSourceLanguageName: assistantSpeechLanguageName,
     };
-  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, selectedMappingAvatar, selectedCompanionType, rebrandingKey, planName, buildHostReadableViewerName, mappedHostMemberId, isHost, loggedIn, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
+  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, selectedMappingAvatar, selectedCompanionType, companionPhonetic, rebrandingKey, planName, buildHostReadableViewerName, mappedHostMemberId, isHost, loggedIn, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
 
   useEffect(() => {
     if (!API_BASE) return;
@@ -8505,6 +8561,11 @@ useEffect(() => {
         mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
         companionType: selectedCompanionType,
         companion_type: selectedCompanionType,
+        phonetic: companionPhonetic,
+        mapping_phonetic: companionPhonetic,
+        mappingPhonetic: companionPhonetic,
+        companion_phonetic: companionPhonetic,
+        companionPhonetic: companionPhonetic,
 
         memberId: (memberIdForBackend || "").trim(),
         member_id: (memberIdForBackend || "").trim(),
@@ -8538,7 +8599,7 @@ useEffect(() => {
     } catch (e) {
       // ignore
     }
-  }, [API_BASE, companionKey, companionName, memberId, planName, planLabelOverride, rebrandingKey, rebranding, applyUsageStatusSnapshot]);
+  }, [API_BASE, companionKey, companionName, selectedMappingAvatar, selectedCompanionType, companionPhonetic, companyName, memberId, planName, planLabelOverride, rebrandingKey, rebranding, applyUsageStatusSnapshot]);
 
   // Keep the on-screen usage meter in sync even when there are no new turns.
   // This endpoint is non-charging (status only), so it is safe to poll.
@@ -11209,6 +11270,11 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
         mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
         companionType: selectedCompanionType,
         companion_type: selectedCompanionType,
+        phonetic: companionPhonetic,
+        mapping_phonetic: companionPhonetic,
+        mappingPhonetic: companionPhonetic,
+        companion_phonetic: companionPhonetic,
+        companionPhonetic: companionPhonetic,
 
   // Member identity (from Wix)
   memberId: (memberIdForBackend || "").trim(),
@@ -11390,6 +11456,11 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
         mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
         companionType: selectedCompanionType,
         companion_type: selectedCompanionType,
+        phonetic: companionPhonetic,
+        mapping_phonetic: companionPhonetic,
+        mappingPhonetic: companionPhonetic,
+        companion_phonetic: companionPhonetic,
+        companionPhonetic: companionPhonetic,
       planName: effectivePlanForBackend,
       plan_name: effectivePlanForBackend,
       plan: effectivePlanForBackend,
