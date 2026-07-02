@@ -21371,6 +21371,10 @@ def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Conne
         ("eleven_voice_name", "TEXT"),
         ("voice_clone_status", "TEXT"),
         ("voice_clone_error", "TEXT"),
+        ("list_in_companion_catalog", "INTEGER"),
+        ("catalog_hidden_reason", "TEXT"),
+        ("catalog_visibility_updated_at", "INTEGER"),
+        ("catalog_visibility_updated_by", "TEXT"),
     ]:
         if col_name not in cols:
             try:
@@ -21382,6 +21386,8 @@ def _host_onboarding_ensure_companion_export_columns_on_conn(conn: sqlite3.Conne
     _host_onboarding_create_companion_mapping_triggers_on_conn(conn)
     _host_onboarding_backfill_brand_id_for_brand_on_conn(conn, "Elaralo")
     _host_onboarding_backfill_companion_ids_on_conn(conn)
+    _brand_feature_flags_ensure_table_on_conn(conn)
+    _companion_catalog_visibility_install_triggers_on_conn(conn)
     # Avatar identity normalization is intentionally not run from this generic
     # schema helper. It is applied once at app startup by
     # _deployment_run_startup_migrations_sync(), then recorded in
@@ -21575,8 +21581,204 @@ def _host_onboarding_normalize_companion_mapping_avatars_for_brand_on_conn(conn:
 
 
 
+def _bool_from_any(value: Any, default: Optional[bool] = None) -> Optional[bool]:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if int(value) == 1:
+            return True
+        if int(value) == 0:
+            return False
+    text = _host_onboarding_safe_str(value).strip().lower()
+    if not text:
+        return default
+    if text in ("1", "true", "yes", "y", "on", "enabled", "enable", "visible", "show", "shown", "public"):
+        return True
+    if text in ("0", "false", "no", "n", "off", "disabled", "disable", "hidden", "hide", "private"):
+        return False
+    return default
+
+
+def _brand_feature_flag_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", _host_onboarding_safe_str(value).strip().lower()).strip("_")
+
+
+def _brand_feature_flags_ensure_table_on_conn(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS brand_feature_flags (
+                brand TEXT NOT NULL,
+                feature_key TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                config_json TEXT,
+                updated_at_epoch INTEGER,
+                updated_by TEXT,
+                PRIMARY KEY (brand, feature_key)
+            )
+            """
+        )
+    except Exception:
+        pass
+
+
+def _brand_feature_flag_db_enabled_on_conn(conn: sqlite3.Connection, brand: str, feature_key: str) -> Optional[bool]:
+    try:
+        _brand_feature_flags_ensure_table_on_conn(conn)
+        row = conn.execute(
+            """
+            SELECT enabled
+              FROM brand_feature_flags
+             WHERE lower(COALESCE(brand, '')) = lower(?)
+               AND lower(COALESCE(feature_key, '')) = lower(?)
+             LIMIT 1
+            """,
+            (_host_onboarding_safe_str(brand), _host_onboarding_safe_str(feature_key)),
+        ).fetchone()
+        if row is None:
+            return None
+        return _bool_from_any(row[0], default=False)
+    except Exception:
+        return None
+
+
+def _env_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
+    if name not in os.environ:
+        return default
+    return _bool_from_any(os.getenv(name), default=default)
+
+
+def _brand_feature_flag_enabled_sync(brand: Any, feature_key: Any, *, default: bool = False) -> bool:
+    """Resolve a brand feature flag with default-off behavior.
+
+    Env vars are the primary switch. A DB row may disable or enable a feature for
+    a brand. If neither env nor DB is present, default is used.
+    """
+    brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    feature = _brand_feature_flag_key(feature_key)
+    brand_env = f"{_brand_feature_flag_key(brand_name).upper()}_{feature.upper()}_ENABLED"
+    global_env = f"{feature.upper()}_ENABLED"
+    env_value = _env_bool(brand_env, default=None)
+    if env_value is None:
+        env_value = _env_bool(global_env, default=None)
+    effective = bool(env_value if env_value is not None else default)
+    try:
+        db_path = _get_companion_mappings_db_path(for_write=False) or _ensure_econnect_db_seeded()
+        if db_path:
+            conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+            try:
+                db_value = _brand_feature_flag_db_enabled_on_conn(conn, brand_name, feature)
+                if db_value is False:
+                    return False
+                if db_value is True:
+                    return True
+            finally:
+                conn.close()
+    except Exception:
+        pass
+    return effective
+
+
+def _host_profile_studio_enabled_for_brand(brand: Any) -> bool:
+    return _brand_feature_flag_enabled_sync(brand or "Elaralo", "host_profile_studio", default=False)
+
+
+def _companion_catalog_visibility_value(value: Any, *, default: Optional[bool] = None) -> Optional[bool]:
+    return _bool_from_any(value, default=default)
+
+
+def _host_onboarding_catalog_visible_from_objs(*objs: Any) -> Optional[bool]:
+    keys = (
+        "list_in_companion_catalog",
+        "listInCompanionCatalog",
+        "catalog_visible",
+        "catalogVisible",
+        "show_in_companion_catalog",
+        "showInCompanionCatalog",
+        "public_catalog_visible",
+        "publicCatalogVisible",
+    )
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for key in keys:
+            if key in obj:
+                parsed = _companion_catalog_visibility_value(obj.get(key), default=None)
+                if parsed is not None:
+                    return parsed
+    return None
+
+
+def _companion_catalog_visibility_install_triggers_on_conn(conn: sqlite3.Connection) -> None:
+    try:
+        cur = conn.cursor()
+        cur.execute("DROP TRIGGER IF EXISTS companion_mappings_default_catalog_visibility_insert")
+        cur.execute(
+            """
+            CREATE TRIGGER companion_mappings_default_catalog_visibility_insert
+            AFTER INSERT ON companion_mappings
+            FOR EACH ROW
+            WHEN NEW.list_in_companion_catalog IS NULL
+            BEGIN
+                UPDATE companion_mappings
+                   SET list_in_companion_catalog = CASE
+                          WHEN lower(COALESCE(NEW.companion_type, '')) = 'human' THEN 0
+                          ELSE 1
+                       END,
+                       catalog_hidden_reason = CASE
+                          WHEN lower(COALESCE(NEW.companion_type, '')) = 'human' THEN COALESCE(NULLIF(catalog_hidden_reason, ''), 'host_hidden_by_default')
+                          ELSE catalog_hidden_reason
+                       END,
+                       catalog_visibility_updated_at = COALESCE(catalog_visibility_updated_at, CAST(strftime('%s','now') AS INTEGER))
+                 WHERE rowid = NEW.rowid;
+            END;
+            """
+        )
+    except Exception:
+        pass
+
+
+def _companion_mapping_catalog_visible(mapping: Any, current_member_id: str = "") -> bool:
+    try:
+        obj = dict(mapping) if not isinstance(mapping, dict) else mapping
+    except Exception:
+        obj = {}
+    ctype = _host_onboarding_safe_str(obj.get("companion_type") or obj.get("companionType")).lower()
+    host_member = _host_onboarding_normalize_member_id(obj.get("host_member_id") or obj.get("hostMemberId"))
+    current = _host_onboarding_normalize_member_id(current_member_id)
+    explicit = _companion_catalog_visibility_value(
+        obj.get("list_in_companion_catalog") if "list_in_companion_catalog" in obj else obj.get("listInCompanionCatalog"),
+        default=None,
+    )
+    if ctype == "human":
+        if current and host_member and current.lower() == host_member.lower():
+            return True
+        return bool(explicit is True)
+    if explicit is False:
+        return False
+    return True
+
+
+def _companion_mapping_is_hidden_for_owner(mapping: Any) -> bool:
+    try:
+        obj = dict(mapping) if not isinstance(mapping, dict) else mapping
+    except Exception:
+        obj = {}
+    ctype = _host_onboarding_safe_str(obj.get("companion_type") or obj.get("companionType")).lower()
+    if ctype != "human":
+        return False
+    explicit = _companion_catalog_visibility_value(
+        obj.get("list_in_companion_catalog") if "list_in_companion_catalog" in obj else obj.get("listInCompanionCatalog"),
+        default=False,
+    )
+    return not bool(explicit)
+
+
 _STARTUP_MIGRATION_COMPANION_AVATAR_IDENTITY_V9_2_18 = "v9_2_18_companion_avatar_identity_generation_ethnicity"
 _STARTUP_MIGRATION_AI_ROW_OWNERSHIP_HYGIENE_V9_2_22 = "v9_2_22_companion_ai_row_ownership_hygiene"
+_STARTUP_MIGRATION_COMPANION_CATALOG_VISIBILITY_V9_2_30 = "v9_2_30_companion_catalog_visibility_defaults"
 
 
 def _startup_migrations_ensure_table_on_conn(conn: sqlite3.Connection) -> None:
@@ -21809,6 +22011,55 @@ def _startup_run_ai_mapping_ownership_hygiene_on_conn(conn: sqlite3.Connection, 
         })
     return {"brand": brand_name, "ai_rows_scanned": len(rows or []), "ai_rows_cleaned": len(cleared), "cleaned_rows": cleared}
 
+
+def _startup_run_companion_catalog_visibility_defaults_on_conn(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Initialize catalog visibility defaults for existing rows.
+
+    Future Human Companion rows default hidden. For existing rows, preserve the
+    working DulceMoon default companion by making Dulce visible if it has no
+    explicit value yet. Elaralo Human Host rows with NULL visibility are hidden.
+    AI rows stay visible unless explicitly hidden.
+    """
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    _host_onboarding_ensure_companion_export_columns_on_conn(conn)
+    rows = cur.execute(
+        """
+        SELECT rowid AS _rowid, brand, avatar, companion_type, list_in_companion_catalog
+          FROM companion_mappings
+         WHERE list_in_companion_catalog IS NULL
+         ORDER BY rowid
+        """
+    ).fetchall()
+    updates: List[Dict[str, Any]] = []
+    now_epoch = int(_host_onboarding_now())
+    for row in rows or []:
+        rowid = int(row["_rowid"])
+        brand = _host_onboarding_safe_str(row["brand"])
+        avatar = _host_onboarding_safe_str(row["avatar"])
+        ctype = _host_onboarding_safe_str(row["companion_type"]).lower()
+        visible = 1
+        reason = None
+        if ctype == "human":
+            if brand.lower() == "dulcemoon" and _companion_avatar_first_name(avatar).lower() == "dulce":
+                visible = 1
+            else:
+                visible = 0
+                reason = "host_hidden_by_default"
+        cur.execute(
+            """
+            UPDATE companion_mappings
+               SET list_in_companion_catalog = ?,
+                   catalog_hidden_reason = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(NULLIF(catalog_hidden_reason, ''), ?) END,
+                   catalog_visibility_updated_at = COALESCE(catalog_visibility_updated_at, ?),
+                   catalog_visibility_updated_by = COALESCE(NULLIF(catalog_visibility_updated_by, ''), 'startup_migration_v9_2_30')
+             WHERE rowid = ?
+            """,
+            (visible, visible, reason or "", now_epoch, rowid),
+        )
+        updates.append({"rowid": rowid, "brand": brand, "avatar": avatar, "companion_type": ctype, "visible": bool(visible)})
+    return {"rows_scanned": len(rows or []), "visibility_updates": len(updates), "updates": updates}
+
 def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
     """Run deployment-time DB migrations once per DB.
 
@@ -21844,6 +22095,10 @@ def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
                     (
                         _STARTUP_MIGRATION_AI_ROW_OWNERSHIP_HYGIENE_V9_2_22,
                         lambda c: _startup_run_ai_mapping_ownership_hygiene_on_conn(c, "Elaralo"),
+                    ),
+                    (
+                        _STARTUP_MIGRATION_COMPANION_CATALOG_VISIBILITY_V9_2_30,
+                        lambda c: _startup_run_companion_catalog_visibility_defaults_on_conn(c),
                     ),
                 ]
 
@@ -22003,6 +22258,7 @@ def _host_onboarding_upsert_connect_companion_mapping(
     voice_clone_status: str = "",
     voice_clone_error: str = "",
     phonetic_pronunciation: str = "",
+    list_in_companion_catalog: Optional[bool] = None,
     conn: Optional[sqlite3.Connection] = None,
 ) -> str:
     """Create/update the Elaralo Human companion mapping exported by Host Onboarding.
@@ -22124,6 +22380,38 @@ def _host_onboarding_upsert_connect_companion_mapping(
                 current_rowid,
             ),
         )
+        # Human Host profiles are private by default. Preserve an existing explicit
+        # listing choice unless Host/Profile Studio supplied a new value.
+        visible_choice = list_in_companion_catalog
+        if visible_choice is None:
+            cur.execute(
+                """
+                UPDATE companion_mappings
+                   SET list_in_companion_catalog = COALESCE(list_in_companion_catalog, 0),
+                       catalog_hidden_reason = CASE
+                            WHEN COALESCE(list_in_companion_catalog, 0) = 1 THEN NULL
+                            ELSE COALESCE(NULLIF(catalog_hidden_reason, ''), 'host_hidden_by_default')
+                       END,
+                       catalog_visibility_updated_at = COALESCE(catalog_visibility_updated_at, ?),
+                       catalog_visibility_updated_by = COALESCE(NULLIF(catalog_visibility_updated_by, ''), ?)
+                 WHERE rowid = ?
+                """,
+                (int(_host_onboarding_now()), member_id, current_rowid),
+            )
+        else:
+            visible_int = 1 if bool(visible_choice) else 0
+            cur.execute(
+                """
+                UPDATE companion_mappings
+                   SET list_in_companion_catalog = ?,
+                       catalog_hidden_reason = CASE WHEN ? = 1 THEN NULL ELSE 'host_hidden_by_default' END,
+                       catalog_visibility_updated_at = ?,
+                       catalog_visibility_updated_by = ?
+                 WHERE rowid = ?
+                """,
+                (visible_int, visible_int, int(_host_onboarding_now()), member_id, current_rowid),
+            )
+
         if owns_conn:
             conn.commit()
     finally:
@@ -22335,6 +22623,7 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         voice_clone_status=_host_onboarding_safe_str((eleven_voice or {}).get("status")),
         voice_clone_error=_host_onboarding_safe_str((eleven_voice or {}).get("error")),
         phonetic_pronunciation=explicit_phonetic_pronunciation,
+        list_in_companion_catalog=_host_onboarding_catalog_visible_from_objs(dict(session or {}).get("completion") if isinstance(session, dict) else {}),
         conn=db_conn,
     )
     if saved_avatar_key:
@@ -22472,6 +22761,7 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
         voice_clone_status=voice_clone_status or "repaired_from_approved_profile",
         voice_clone_error="",
         phonetic_pronunciation=explicit_phonetic_pronunciation,
+        list_in_companion_catalog=_host_onboarding_catalog_visible_from_objs(dict(session or {}).get("completion") if isinstance(session, dict) else {}, profile),
     )
     if saved_avatar_key:
         avatar_key = saved_avatar_key
@@ -23026,6 +23316,8 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
     brand = _host_onboarding_safe_str(req.brand)
     avatar = _host_onboarding_safe_str(req.avatar)
     host_display_name = _host_onboarding_safe_str(req.hostDisplayName or req.host_display_name)
+    if not _host_profile_studio_enabled_for_brand(brand or "Elaralo"):
+        raise HTTPException(status_code=403, detail="Host Profile Studio is disabled for this brand")
     if not member_id or not logged_in:
         raise HTTPException(status_code=403, detail="Host onboarding requires a logged-in host member session")
     conn = _econnect_conn()
@@ -23523,6 +23815,9 @@ async def host_onboarding_save_completion(session_id: str, req: HostOnboardingCo
         "core_values": _host_onboarding_safe_str(completion_in.get("core_values")),
         "personal_motto": _host_onboarding_safe_str(completion_in.get("personal_motto")),
         "physical_description": _host_onboarding_safe_str(completion_in.get("physical_description")),
+        "list_in_companion_catalog": bool(_host_onboarding_catalog_visible_from_objs(completion_in) is True),
+        "catalog_visible": bool(_host_onboarding_catalog_visible_from_objs(completion_in) is True),
+        "show_in_companion_catalog": bool(_host_onboarding_catalog_visible_from_objs(completion_in) is True),
         "voice_capture_required": True,
         "skipped_sections": skipped_sections,
         "updated_epoch": _host_onboarding_now(),
@@ -23625,7 +23920,7 @@ def _my_elaralo_catalog_filter_match(value: Any, expected: Any) -> bool:
     return have == want
 
 
-def _my_elaralo_companion_cards_db_sync(brand: str, companion_type: str = "", generation: str = "", ethnicity: str = "", gender: str = "") -> List[Dict[str, Any]]:
+def _my_elaralo_companion_cards_db_sync(brand: str, companion_type: str = "", generation: str = "", ethnicity: str = "", gender: str = "", member_id: str = "") -> List[Dict[str, Any]]:
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
     rows: List[sqlite3.Row] = []
     conn = _econnect_conn()
@@ -23663,6 +23958,8 @@ def _my_elaralo_companion_cards_db_sync(brand: str, companion_type: str = "", ge
         avatar_key = _host_onboarding_safe_str(row["avatar"])
         if not avatar_key:
             continue
+        if not _companion_mapping_catalog_visible(row, current_member_id=member_id):
+            continue
         mapping_type = _host_onboarding_safe_str(row["companion_type"] or ("Human" if _host_onboarding_safe_str(row["approved_version_id"]) else "AI"))
         normalized_type = mapping_type.lower() if mapping_type else ("human" if _host_onboarding_safe_str(row["approved_version_id"]) else "ai")
         if want_type and normalized_type != want_type:
@@ -23687,6 +23984,9 @@ def _my_elaralo_companion_cards_db_sync(brand: str, companion_type: str = "", ge
                 "brand": brand_name,
                 "avatar": avatar_key,
                 "companion_type": "Human",
+                "list_in_companion_catalog": bool(_companion_catalog_visibility_value(row["list_in_companion_catalog"], default=False)),
+                "catalog_hidden": _companion_mapping_is_hidden_for_owner(row),
+                "hidden": _companion_mapping_is_hidden_for_owner(row),
                 "display_name": display_name,
                 "headline": _host_onboarding_safe_str(public_page.get("headline") or display_name),
                 "gender": _host_onboarding_safe_str(public_profile.get("gender") or quick_ref.get("gender")),
@@ -23947,6 +24247,9 @@ def _my_elaralo_human_profile_card_from_version(
         "companion_key": avatar_key,
         "mapping_avatar": _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "avatar")) or avatar_key,
         "companion_type": "Human",
+        "list_in_companion_catalog": bool(_companion_catalog_visibility_value(_my_elaralo_row_value(mapping, "list_in_companion_catalog", "listInCompanionCatalog"), default=False)),
+        "catalog_hidden": _companion_mapping_is_hidden_for_owner(mapping or {}),
+        "hidden": _companion_mapping_is_hidden_for_owner(mapping or {}),
         "display_name": display_name,
         "headline": _host_onboarding_safe_str(public_page.get("headline") or display_name),
         "gender": gender,
@@ -24187,7 +24490,7 @@ def _my_elaralo_companion_cards_sync(
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
 
     if not _is_elaralo_core_brand(brand_name):
-        return _my_elaralo_companion_cards_db_sync(brand_name, companion_type, generation, ethnicity, gender)
+        return _my_elaralo_companion_cards_db_sync(brand_name, companion_type, generation, ethnicity, gender, member_id=member_id)
 
     out: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, str]] = set()
@@ -24213,7 +24516,7 @@ def _my_elaralo_companion_cards_sync(
             add_card(card)
 
     if not ai_cards and want_type != "human":
-        for card in _my_elaralo_companion_cards_db_sync(brand_name, "AI", "", "", ""):
+        for card in _my_elaralo_companion_cards_db_sync(brand_name, "AI", "", "", "", member_id=member_id):
             add_card(card)
 
     if want_type != "ai":
@@ -24229,7 +24532,7 @@ def _my_elaralo_companion_cards_sync(
         # member_id is present and the member-scoped Host Onboarding/Profile Studio card above
         # is the source of truth for the Human Companion.
         if not human_cards:
-            for card in _my_elaralo_companion_cards_db_sync(brand_name, "Human", "", "", ""):
+            for card in _my_elaralo_companion_cards_db_sync(brand_name, "Human", "", "", "", member_id=member_id):
                 add_card(card)
 
     out.sort(key=lambda item: (_host_onboarding_safe_str(item.get("display_name")).lower(), _host_onboarding_safe_str(item.get("avatar")).lower()))
@@ -24269,6 +24572,60 @@ async def my_elaralo_companions_catalog(
         "count": len(items),
         "items": items,
     }
+
+
+@app.post("/host-onboarding/catalog-visibility")
+async def host_onboarding_catalog_visibility(request: Request):
+    """Update the logged-in Host's Human Companion catalog visibility."""
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    member_id = _host_onboarding_normalize_member_id(raw.get("memberId") or raw.get("member_id"))
+    brand_name = _host_onboarding_safe_str(raw.get("brand") or raw.get("brandId") or raw.get("brand_id") or "Elaralo") or "Elaralo"
+    visible = _host_onboarding_catalog_visible_from_objs(raw)
+    if visible is None:
+        visible = _bool_from_any(raw.get("visible"), default=None)
+    if visible is None:
+        raise HTTPException(status_code=400, detail="visible/list_in_companion_catalog is required")
+    if not member_id:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    db_path = _get_companion_mappings_db_path(for_write=True) or _ensure_econnect_db_seeded()
+    if not db_path:
+        raise HTTPException(status_code=500, detail="companion mappings database is not configured")
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+        _host_onboarding_ensure_companion_export_columns_on_conn(conn)
+        visible_int = 1 if bool(visible) else 0
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE companion_mappings
+               SET list_in_companion_catalog = ?,
+                   catalog_hidden_reason = CASE WHEN ? = 1 THEN NULL ELSE 'host_hidden_by_default' END,
+                   catalog_visibility_updated_at = ?,
+                   catalog_visibility_updated_by = ?
+             WHERE lower(COALESCE(brand, '')) = lower(?)
+               AND lower(COALESCE(companion_type, '')) = 'human'
+               AND lower(COALESCE(host_member_id, '')) = lower(?)
+            """,
+            (visible_int, visible_int, int(_host_onboarding_now()), member_id, brand_name, member_id),
+        )
+        updated = int(cur.rowcount or 0)
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        _load_companion_mappings_sync()
+    except Exception:
+        pass
+    if updated <= 0:
+        raise HTTPException(status_code=404, detail="No Human Companion mapping row found for this host")
+    return {"ok": True, "brand": brand_name, "member_id": member_id, "list_in_companion_catalog": bool(visible_int), "updated": updated}
 
 
 @app.get("/host-onboarding/public/summary")

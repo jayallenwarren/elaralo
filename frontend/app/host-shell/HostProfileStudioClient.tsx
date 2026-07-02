@@ -824,6 +824,7 @@ export default function HostProfileStudioClient() {
     personal_motto: "",
     physical_description: "",
     phonetic_pronunciation: "",
+    list_in_companion_catalog: false,
     skipped_sections: {},
   });
   const [showCompletionPhysicalDescriptionEditor, setShowCompletionPhysicalDescriptionEditor] = useState<boolean>(false);
@@ -922,6 +923,15 @@ export default function HostProfileStudioClient() {
           completion.phonetic_spelling ||
           completion.phonetic ||
           "",
+      ),
+      list_in_companion_catalog: Boolean(
+        completion.list_in_companion_catalog ??
+          completion.listInCompanionCatalog ??
+          completion.catalog_visible ??
+          completion.catalogVisible ??
+          completion.show_in_companion_catalog ??
+          completion.showInCompanionCatalog ??
+          false,
       ),
       skipped_sections: typeof completion.skipped_sections === "object" && completion.skipped_sections ? completion.skipped_sections : {},
     }));
@@ -1279,6 +1289,9 @@ export default function HostProfileStudioClient() {
         ...completionForm,
         phonetic_pronunciation: phoneticPronunciation,
         phonetic_pronunciation_of_first_name: phoneticPronunciation,
+        list_in_companion_catalog: Boolean(completionForm.list_in_companion_catalog),
+        catalog_visible: Boolean(completionForm.list_in_companion_catalog),
+        show_in_companion_catalog: Boolean(completionForm.list_in_companion_catalog),
         education_entries: educationEntries.map(({ id, ...rest }) => rest),
         education: formatEducationEntriesLegacyText(educationEntries),
       };
@@ -1979,6 +1992,20 @@ export default function HostProfileStudioClient() {
                 Optional. Use this only when the host's first name should be pronounced differently from its spelling. If left blank, Elaralo will not derive a phonetic value from the first name.
               </span>,
             )}
+            <label style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={Boolean(completionForm.list_in_companion_catalog)}
+                onChange={(e) => setCompletionForm((p) => ({ ...p, list_in_companion_catalog: e.currentTarget.checked }))}
+                style={{ marginTop: 3 }}
+              />
+              <span style={{ display: "grid", gap: 4 }}>
+                <span style={{ fontWeight: 800 }}>List my Host profile in the Companion catalog</span>
+                <span style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
+                  Optional and off by default. When unchecked, your Human Companion remains available to you for management/testing, but ordinary members and visitors will not see it on the Companion page.
+                </span>
+              </span>
+            </label>
             <div style={{ ...cardStyle, padding: 16, display: "grid", gap: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <div>

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type MemberPlanPayload = {
   loggedIn?: boolean;
@@ -29,6 +29,8 @@ type CompanionCardItem = {
   ethnicity: string;
   generation: string;
   shortSummary: string;
+  catalogHidden: boolean;
+  listInCompanionCatalog: boolean;
   raw: any;
 };
 
@@ -101,6 +103,21 @@ function readQueryContext(): MemberPlanPayload {
   }
 }
 
+function readQueryFlag(...names: string[]): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const qs = new URLSearchParams(window.location.search || "");
+    for (const name of names) {
+      const raw = safeLower(qs.get(name));
+      if (["1", "true", "yes", "y", "on"].includes(raw)) return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+
 function mergeMemberPayload(prev: MemberPlanPayload, incoming: MemberPlanPayload): MemberPlanPayload {
   return {
     ...prev,
@@ -169,6 +186,8 @@ function normalizeCard(item: any, defaultBrand: string): CompanionCardItem {
     generation: safeText(item?.generation),
     shortSummary:
       safeText(item?.summary) || safeText(item?.short_summary) || safeText(item?.shortSummary) || safeText(item?.tagline),
+    catalogHidden: Boolean(item?.catalog_hidden || item?.hidden || item?.is_hidden || item?.isHidden),
+    listInCompanionCatalog: Boolean(item?.list_in_companion_catalog ?? item?.listInCompanionCatalog ?? item?.catalog_visible ?? item?.catalogVisible),
     raw: item,
   };
 }
@@ -247,6 +266,8 @@ export default function MyElaraloCompanionSelectorClient() {
   const [generationFilter, setGenerationFilter] = useState<string>("");
   const [ethnicityFilter, setEthnicityFilter] = useState<string>("");
   const [genderFilter, setGenderFilter] = useState<string>("");
+  const autoOpenedSingleRef = useRef<boolean>(false);
+  const autoOpenSingle = useMemo(() => readQueryFlag("autoOpenSingle", "auto_open_single", "autoOpen", "auto_open"), []);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
@@ -392,12 +413,35 @@ export default function MyElaraloCompanionSelectorClient() {
         const headshotUrl = safeText(card.headshotUrl) || safeText(raw?.headshot_url) || safeText(raw?.headshotUrl);
         if (headshotUrl) url.searchParams.set("headshotUrl", headshotUrl);
 
+        const passthroughParamMap: Array<[string, string[]]> = [
+          ["planName", ["planName", "plan_name", "plan"]],
+          ["plan_name", ["planName", "plan_name", "plan"]],
+          ["rebrandingKey", ["rebrandingKey", "rebranding_key", "RebrandingKey", "rebrandingkey"]],
+          ["rebranding_key", ["rebrandingKey", "rebranding_key", "RebrandingKey", "rebrandingkey"]],
+          ["modePill", ["modePill", "mode_pill", "modepill"]],
+          ["mode_pill", ["modePill", "mode_pill", "modepill"]],
+          ["freeMinutes", ["freeMinutes", "free_minutes", "includedMinutes", "included_minutes"]],
+          ["free_minutes", ["freeMinutes", "free_minutes", "includedMinutes", "included_minutes"]],
+          ["cycleDays", ["cycleDays", "cycle_days"]],
+          ["cycle_days", ["cycleDays", "cycle_days"]],
+          ["upgradeUrl", ["upgradeUrl", "upgrade_url", "upgradeURL", "UPGRADE_URL"]],
+          ["paygUrl", ["paygUrl", "payg_url", "paygURL", "PAYG_PAY_URL"]],
+          ["paygPrice", ["paygPrice", "payg_price", "PAYG_PRICE"]],
+          ["paygMinutes", ["paygMinutes", "payg_minutes", "PAYG_INCREMENT_MINUTES"]],
+          ["brandId", ["brandId", "brand_id"]],
+          ["email", ["email"]],
+        ];
+        for (const [target, sources] of passthroughParamMap) {
+          const value = sources.map((key) => safeText((memberPayload as any)?.[key])).find(Boolean) || "";
+          if (value) url.searchParams.set(target, value);
+        }
+
         window.location.assign(url.toString());
       } catch {
         // ignore
       }
     },
-    [brandName, displayName, loggedIn, memberId],
+    [brandName, displayName, loggedIn, memberId, memberPayload],
   );
 
   const openSummaryPublic = useCallback((card: CompanionCardItem) => {
@@ -422,6 +466,15 @@ export default function MyElaraloCompanionSelectorClient() {
       // ignore
     }
   }, [brandName]);
+
+
+  useEffect(() => {
+    if (!autoOpenSingle || loading || error || autoOpenedSingleRef.current) return;
+    if (cards.length !== 1) return;
+    autoOpenedSingleRef.current = true;
+    const timer = window.setTimeout(() => openConnect(cards[0]), 80);
+    return () => window.clearTimeout(timer);
+  }, [autoOpenSingle, cards, error, loading, openConnect]);
 
   const containerStyle: React.CSSProperties = {
     minHeight: "100vh",
@@ -514,7 +567,7 @@ export default function MyElaraloCompanionSelectorClient() {
           <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
             <div>
               <div style={{ fontSize: 13, fontWeight: 800, letterSpacing: ".08em", color: "#64748b", textTransform: "uppercase", marginBottom: 10 }}>
-                My Elaralo
+                {brandName && safeLower(brandName) !== "elaralo" ? brandName : "My Elaralo"}
               </div>
               <h1 style={{ margin: 0, fontSize: 42, lineHeight: 1.08 }}>Choose your Companion</h1>
               <p style={{ margin: "12px 0 0", fontSize: 16, lineHeight: 1.6, maxWidth: 840, color: "#475569" }}>
@@ -602,6 +655,7 @@ export default function MyElaraloCompanionSelectorClient() {
                 card.generation,
               ].filter(Boolean);
               const summaryLine = firstLine(card.shortSummary);
+              const isHiddenCard = Boolean(card.catalogHidden);
               return (
                 <article key={card.id} style={cardStyle}>
                   <button type="button" style={imageButtonStyle} onClick={() => openConnect(card)} title="Open in Connect">
@@ -622,6 +676,7 @@ export default function MyElaraloCompanionSelectorClient() {
                         {summaryLine ? <div style={{ fontSize: 14, color: "#475569", marginTop: 6 }}>{summaryLine}</div> : null}
                       </div>
                       <span style={pillStyle(card.companionType)}>{card.companionType || ""}</span>
+                      {isHiddenCard ? <span style={{ ...pillStyle("Hidden"), background: "rgba(245,158,11,0.16)", color: "#92400e" }}>Hidden</span> : null}
                     </div>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       {lines.map((line) => (
