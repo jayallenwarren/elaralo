@@ -1,4 +1,6 @@
 "use client";
+// v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
+// hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
@@ -4883,10 +4885,10 @@ useEffect(() => {
       const requestedType = normalizeCompanionTypeHint(selectedCompanionType);
       const explicitAiSelection = requestedType === "AI";
       const explicitHumanSelection = requestedType === "Human";
-      const isElaraloAiSelection = isElaraloBrandName(brand) && (
+      const filenameKeyLooksLikeAi = isAiCompanionFilenameKey(fullKey || mappingAvatar || displayAvatar);
+      const isAiFilenameSelection =
         explicitAiSelection ||
-        (!explicitHumanSelection && isAiCompanionFilenameKey(fullKey || mappingAvatar || displayAvatar))
-      );
+        (!explicitHumanSelection && filenameKeyLooksLikeAi);
       const primaryAvatar = mappingAvatar || displayAvatar || fullKey;
 
       if (!brand || !primaryAvatar) {
@@ -4903,8 +4905,16 @@ useEffect(() => {
         return;
       }
 
-      const candidates = isElaraloAiSelection
-        ? [mappingAvatar, fullKey, displayAvatar, aiFirstNameFromKey(fullKey || primaryAvatar)]
+      const candidates = isAiFilenameSelection
+        ? [
+            mappingAvatar,
+            primaryAvatar,
+            fullKey,
+            displayAvatar,
+            aiFirstNameFromKey(fullKey || primaryAvatar || displayAvatar),
+            aiFirstNameFromKey(mappingAvatar),
+            aiFirstNameFromKey(displayAvatar),
+          ]
         : [primaryAvatar];
       const lookupAvatars = Array.from(new Set(candidates.map((x) => String(x || "").trim()).filter(Boolean)));
       const errors: string[] = [];
@@ -4929,6 +4939,22 @@ useEffect(() => {
           if (!(json as any)?.found) {
             errors.push(`Companion mapping not found for brand='${brand}' avatar='${lookupAvatar}'.`);
             continue;
+          }
+
+          const resolvedSqlAvatar = String(
+            (json as any)?.mappingAvatar ||
+            (json as any)?.mapping_avatar ||
+            (json as any)?.avatar ||
+            ""
+          ).trim();
+          if (resolvedSqlAvatar && resolvedSqlAvatar !== mappingAvatar) {
+            setSelectedMappingAvatar(resolvedSqlAvatar);
+            setSessionState((prev) => ({
+              ...prev,
+              avatar: resolvedSqlAvatar,
+              mappingAvatar: resolvedSqlAvatar,
+              mapping_avatar: resolvedSqlAvatar,
+            }));
           }
 
           setCompanionMapping(json as CompanionMappingRow);
@@ -10804,12 +10830,12 @@ useEffect(() => {
             ? String((data as any).companion_type).trim()
             : ""
       );
-      const incomingMappingAvatar =
+      const explicitIncomingMappingAvatar =
         typeof (data as any).mappingAvatar === "string"
           ? String((data as any).mappingAvatar).trim()
           : typeof (data as any).mapping_avatar === "string"
             ? String((data as any).mapping_avatar).trim()
-            : incomingAvatarName || incomingCompanion || "";
+            : "";
       const incomingHeadshotUrl =
         typeof (data as any).headshotUrl === "string"
           ? String((data as any).headshotUrl).trim()
@@ -10833,7 +10859,13 @@ useEffect(() => {
         const resolvedCompanionName = incomingCompanionDisplayName || parsed.first || incomingAvatarName || incomingCompanion || DEFAULT_COMPANION_NAME;
         resolvedStartupName = resolvedCompanionName;
         const resolvedCompanionMetaKey = parsed.key || resolvedCompanionKey;
-        const resolvedMappingAvatar = incomingMappingAvatar || resolvedCompanionName;
+        const filenameKeyLooksLikeAi = isAiCompanionFilenameKey(resolvedCompanionKey);
+        const resolvedMappingAvatar =
+          explicitIncomingMappingAvatar ||
+          (filenameKeyLooksLikeAi ? (parsed.first || aiFirstNameFromKey(resolvedCompanionKey)) : "") ||
+          incomingAvatarName ||
+          incomingCompanion ||
+          resolvedCompanionName;
         setCompanionKey(resolvedCompanionMetaKey);
         setCompanionName(resolvedCompanionName);
         setSelectedMappingAvatar(resolvedMappingAvatar);

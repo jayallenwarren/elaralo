@@ -58,6 +58,8 @@ STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
 app = FastAPI(title="Elaralo API")
+# v9.2.25: v9.2.24 auto-mode baseline plus DulceMoon/white-label
+# companion mapping alias lookup for hyphenated companion keys.
 
 # v9.2.21 remediation: isolate selected companion mappings from Host Onboarding exports.
 # AI rows must never be converted into Human rows when a logged-in host selects another companion.
@@ -1570,6 +1572,99 @@ def _lookup_companion_mapping(brand: str, avatar: str) -> Optional[Dict[str, Any
     return _COMPANION_MAPPINGS.get((b, a))
 
 
+def _companion_mapping_lookup_avatar_candidates(raw_avatar: Any) -> List[str]:
+    """Return safe lookup candidates for a companion_mappings.avatar request.
+
+    companion_mappings.avatar is now the SQL provider identity, normally a first
+    name such as "Dulce" or "Elara". Wix/white-label payloads may still carry
+    the older hyphenated companion metadata key, for example
+    "Dulce-Female-Black-Millennials". That key is still useful as a
+    companionKey/headshot key, but provider lookup must fall back to the first
+    token when the exact row does not exist.
+
+    Collision suffixes like "Sera-000000001" are intentionally preserved unless
+    the value is clearly a metadata filename key with four or more hyphenated
+    parts.
+    """
+    raw = str(raw_avatar or "").strip()
+    if not raw:
+        return []
+
+    out: List[str] = []
+
+    def add(value: Any) -> None:
+        s = str(value or "").strip()
+        if not s:
+            return
+        if s not in out:
+            out.append(s)
+
+    # Exact request first. This preserves strict behavior for correctly keyed rows.
+    add(raw)
+
+    # Remove URL/query/extension noise if a filename or asset URL was supplied.
+    try:
+        stripped = _ai_companion_strip_extensions(raw.split("|", 1)[0].strip())
+    except Exception:
+        stripped = raw.split("|", 1)[0].strip()
+    add(stripped)
+
+    # Only metadata-style keys fall back to first-name identity. Do not strip
+    # legitimate collision suffixes such as Name-000000001.
+    try:
+        has_metadata = _ai_companion_key_has_metadata(stripped)
+    except Exception:
+        has_metadata = len([p for p in re.split(r"-+", stripped) if p.strip()]) >= 4
+    if has_metadata:
+        add(_companion_avatar_first_name(stripped))
+
+    return out
+
+
+def _lookup_companion_mapping_with_aliases(brand: str, avatar: Any, requested_type: Any = "") -> Optional[Dict[str, Any]]:
+    """Lookup companion_mappings using exact avatar, then metadata-key alias.
+
+    Missing mappings still return None. This only resolves legacy/current payloads
+    that send a full hyphenated companion key while the SQL table stores the
+    provider avatar identity as the first name.
+    """
+    requested = str(requested_type or "").strip().lower()
+    if requested in ("human_companion", "human-companion"):
+        requested = "human"
+    elif requested in ("ai_companion", "ai-companion"):
+        requested = "ai"
+    elif requested not in ("", "human", "ai"):
+        requested = ""
+
+    for candidate in _companion_mapping_lookup_avatar_candidates(avatar):
+        row = (
+            _lookup_companion_mapping_typed(brand, candidate, requested)
+            if requested
+            else _lookup_companion_mapping(brand, candidate)
+        )
+        if isinstance(row, dict) and row:
+            out = dict(row)
+            out.setdefault("companion_key", str(avatar or "").strip())
+            out.setdefault("mapping_avatar", str(row.get("avatar") or candidate or "").strip())
+            return out
+
+    # If exact/first-name lookup missed, try the existing suffix-aware helper.
+    first = _companion_avatar_first_name(avatar)
+    if first:
+        row = (
+            _lookup_companion_mapping_by_avatar_base_typed(brand, first, requested)
+            if requested
+            else _lookup_companion_mapping_by_avatar_base(brand, first)
+        )
+        if isinstance(row, dict) and row:
+            out = dict(row)
+            out.setdefault("companion_key", str(avatar or "").strip())
+            out.setdefault("mapping_avatar", str(row.get("avatar") or first or "").strip())
+            return out
+
+    return None
+
+
 def _compact_brand_key(raw: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
 
@@ -1876,14 +1971,19 @@ async def get_companion_mapping(
     if is_elaralo_ai_media:
         m = _lookup_companion_mapping_for_ai_media(b, a)
     else:
-        m = _lookup_companion_mapping_typed(b, a, requested_type) if requested_type else (_lookup_companion_mapping(b, a) or {})
+        m = _lookup_companion_mapping_with_aliases(b, a, requested_type) or {}
     if not m:
+        alias_candidates = _companion_mapping_lookup_avatar_candidates(a)
+        candidate_note = ""
+        if len(alias_candidates) > 1:
+            candidate_note = f" Tried avatar aliases: {', '.join(alias_candidates)}."
         raise HTTPException(
             status_code=404,
             detail=(
                 f"Companion mapping not found for brand='{b}' avatar='{a}'"
                 + (f" companion_type='{requested_type.title()}'" if requested_type else "")
                 + ". Please add this companion to the voice/video mapping database before opening Connect."
+                + candidate_note
             ),
         )
 
