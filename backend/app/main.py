@@ -58,8 +58,8 @@ STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
 app = FastAPI(title="Elaralo API")
-# v9.2.25: v9.2.24 auto-mode baseline plus DulceMoon/white-label
-# companion mapping alias lookup for hyphenated companion keys.
+# v9.2.26: v9.2.25 plus /chat persistent Intimate-consent initialization fix.
+# Keeps DulceMoon mapping alias behavior and automatic context-mode switching.
 
 # v9.2.21 remediation: isolate selected companion mappings from Host Onboarding exports.
 # AI rows must never be converted into Human rows when a logged-in host selects another companion.
@@ -9269,6 +9269,24 @@ async def chat(request: Request):
     cycle_days = _safe_int(cycle_days_raw)
 
     is_anon = bool(member_id) and str(member_id).strip().lower().startswith("anon:")
+
+    # v9.2.26: Initialize persistent Intimate-consent state inside /chat.
+    # v9.2.24/v9.2.25 initialized this variable in /usage/status, but /chat later
+    # referenced it during consent/mode handling. That caused a NameError and the
+    # generic {"detail":"Internal Server Error"} response on normal chat turns.
+    persistent_intimate_consent = False
+    if member_id and not is_anon and _session_state_is_context_auto_mode_ai_connect(session_state):
+        try:
+            persistent_intimate_consent = await run_in_threadpool(_member_has_intimate_consent_sync, member_id)
+        except Exception:
+            persistent_intimate_consent = False
+        if persistent_intimate_consent:
+            session_state["adult_verified"] = True
+            session_state["explicit_consented"] = True
+            session_state["explicit_consent_persisted"] = True
+            if session_state.get("pending_consent") == "intimate":
+                session_state["pending_consent"] = None
+
     is_trial = (not bool(member_id)) or is_anon
     identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
 
