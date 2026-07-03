@@ -3724,6 +3724,8 @@ function HostOnboardingRouteSwitch() {
 declare global {
   interface Window {
     Stripe?: any;
+    __ELARALO_STRIPE_PUBLISHABLE_KEY__?: string;
+    __STRIPE_PUBLISHABLE_KEY__?: string;
   }
 }
 
@@ -3773,6 +3775,38 @@ function formatCents(amountCents: any, currency: any): string {
     return new Intl.NumberFormat(undefined, { style: "currency", currency: cur }).format(cents / 100);
   } catch {
     return `$${(cents / 100).toFixed(2)}`;
+  }
+}
+
+function readRuntimeStripePublishableKey(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return String(
+      window.__ELARALO_STRIPE_PUBLISHABLE_KEY__ ||
+        window.__STRIPE_PUBLISHABLE_KEY__ ||
+        ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+async function fetchStripePaygoRuntimeConfig(apiBase: string, brand: string): Promise<any> {
+  const base = String(apiBase || "").replace(/\/+$/, "");
+  if (!base) return null;
+  const b = encodeURIComponent(String(brand || "Elaralo").trim() || "Elaralo");
+  try {
+    const res = await fetch(`${base}/stripe/paygo/config?brand=${b}`, {
+      method: "GET",
+      cache: "no-store",
+    });
+    const raw = await res.text().catch(() => "");
+    let json: any = null;
+    try { json = raw ? JSON.parse(raw) : null; } catch { json = null; }
+    if (!res.ok) return null;
+    return json && typeof json === "object" ? json : null;
+  } catch {
+    return null;
   }
 }
 function paygoSafeReturnUrl(brandRaw: any): string {
@@ -8832,6 +8866,11 @@ useEffect(() => {
       const hostedUrl = String(json?.hosted_url || json?.hostedUrl || "").trim();
       const checkoutSessionId = String(json?.checkout_session_id || json?.checkoutSessionId || "").trim();
       const responsePublishableKey = String(json?.publishable_key || json?.publishableKey || json?.stripe_publishable_key || "").trim();
+      let configPublishableKey = "";
+      if (!(readRuntimeStripePublishableKey() || STRIPE_PUBLISHABLE_KEY || responsePublishableKey)) {
+        const cfg = await fetchStripePaygoRuntimeConfig(String(API_BASE || ""), brandNow);
+        configPublishableKey = String(cfg?.publishable_key || cfg?.publishableKey || cfg?.stripe_publishable_key || "").trim();
+      }
       const minutesPerUnit = Number(json?.minutes_per_unit ?? json?.minutesPerUnit ?? 30) || 30;
       const minutesTotal = Number(json?.minutes_total ?? json?.minutesTotal ?? minutesPerUnit * units) || minutesPerUnit * units;
       const unitAmountCents = Number(json?.unit_amount_cents ?? json?.unitAmountCents ?? 0) || 0;
@@ -8846,14 +8885,14 @@ useEffect(() => {
       setTopupCheckoutClientSecret(clientSecret);
       setTopupCheckoutSessionId(checkoutSessionId);
       setTopupHostedUrl(hostedUrl);
-      setTopupPublishableKey(responsePublishableKey);
+      const effectivePublishableKey = readRuntimeStripePublishableKey() || STRIPE_PUBLISHABLE_KEY || responsePublishableKey || configPublishableKey;
+      setTopupPublishableKey(effectivePublishableKey);
       setTopupModalOpen(true);
 
-      const effectivePublishableKey = STRIPE_PUBLISHABLE_KEY || responsePublishableKey;
       if (clientSecret && effectivePublishableKey) {
         setTopupStage("checkout");
       } else if (clientSecret && !effectivePublishableKey) {
-        throw new Error("Stripe publishable key is not configured for embedded Checkout.");
+        throw new Error("Stripe publishable key is not available to Connect. Add STRIPE_PUBLISHABLE_KEY to the API App Service or redeploy the Static Web App with NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY.");
       } else {
         throw new Error("Stripe Embedded Checkout was not created. Payment was not opened so the user stays inside Connect.");
       }
@@ -8891,7 +8930,7 @@ useEffect(() => {
 
     const startEmbedded = async () => {
       try {
-        const effectivePublishableKey = STRIPE_PUBLISHABLE_KEY || topupPublishableKey;
+        const effectivePublishableKey = readRuntimeStripePublishableKey() || STRIPE_PUBLISHABLE_KEY || topupPublishableKey;
         const stripe = await loadStripeJs(effectivePublishableKey);
         if (cancelled) return;
         if (!stripe || typeof stripe.initEmbeddedCheckout !== "function") {

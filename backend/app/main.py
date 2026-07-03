@@ -664,9 +664,15 @@ USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
 #   DulceMoon: 30 minutes/unit @ $6.99
 STRIPE_PAYGO_ENABLED = str(os.getenv("STRIPE_PAYGO_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 STRIPE_SECRET_KEY = (os.getenv("STRIPE_SECRET_KEY", "") or "").strip()
-STRIPE_PUBLISHABLE_KEY = (os.getenv("STRIPE_PUBLISHABLE_KEY", "") or os.getenv("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "") or "").strip()
 STRIPE_WEBHOOK_SECRET = (os.getenv("STRIPE_WEBHOOK_SECRET", "") or "").strip()
-STRIPE_PUBLISHABLE_KEY = (os.getenv("STRIPE_PUBLISHABLE_KEY", "") or os.getenv("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "") or "").strip()
+def _stripe_publishable_key_env() -> Tuple[str, str]:
+    for name in ("STRIPE_PUBLISHABLE_KEY", "NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "PUBLIC_STRIPE_PUBLISHABLE_KEY", "STRIPE_PK"):
+        value = (os.getenv(name, "") or "").strip()
+        if value:
+            return value, name
+    return "", ""
+
+STRIPE_PUBLISHABLE_KEY, STRIPE_PUBLISHABLE_KEY_SOURCE = _stripe_publishable_key_env()
 STRIPE_CURRENCY = (os.getenv("STRIPE_CURRENCY", "usd") or "usd").strip().lower() or "usd"
 STRIPE_PAYGO_MIN_UNITS = _env_int("STRIPE_PAYGO_MIN_UNITS", 1)
 STRIPE_PAYGO_MAX_UNITS = _env_int("STRIPE_PAYGO_MAX_UNITS", 12)
@@ -14079,6 +14085,7 @@ async def stripe_paygo_create_checkout_session(request: Request):
         "checkout_session_id": _stripe_paygo_clean_text(embedded.get("id")),
         "client_secret": _stripe_paygo_clean_text(embedded.get("client_secret")),
         "publishable_key": STRIPE_PUBLISHABLE_KEY,
+        "publishable_key_source": STRIPE_PUBLISHABLE_KEY_SOURCE,
         "hosted_checkout_session_id": _stripe_paygo_clean_text(hosted.get("id")),
         "hosted_url": _stripe_paygo_clean_text(hosted.get("url")),
         "embedded_error": _stripe_paygo_clean_text(created.get("embedded_error")),
@@ -14200,6 +14207,13 @@ async def stripe_paygo_config(brand: str = "Elaralo"):
         "min_units": int(STRIPE_PAYGO_MIN_UNITS or 1),
         "max_units": int(STRIPE_PAYGO_MAX_UNITS or 12),
         "publishable_key_configured": bool(STRIPE_PUBLISHABLE_KEY),
+        # Public by design: Stripe publishable keys are meant for the browser.
+        # Returning it here makes the already-built Static Web App independent
+        # of compile-time NEXT_PUBLIC_* injection and avoids requiring a rebuild
+        # when only the Stripe publishable key changes.
+        "publishable_key": STRIPE_PUBLISHABLE_KEY,
+        "publishableKey": STRIPE_PUBLISHABLE_KEY,
+        "publishable_key_source": STRIPE_PUBLISHABLE_KEY_SOURCE,
     }
 
 # ============================================================
