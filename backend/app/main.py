@@ -382,7 +382,9 @@ async def usage_credit(request: Request):
     if not member_id or minutes_i <= 0:
         raise HTTPException(status_code=400, detail="member_id and minutes (> 0) are required")
 
-    identity_key = f"member::{member_id}"
+    brand = _stripe_paygo_brand(raw.get("brand") or raw.get("brandId") or raw.get("brand_id") or "Elaralo")
+    email = _stripe_paygo_email_norm(raw.get("email") or raw.get("customer_email") or "")
+    identity_key = _usage_identity_key_for_brand(brand=brand, member_id=member_id, email=email, request=request)
     result = await run_in_threadpool(_usage_credit_minutes_sync, identity_key, minutes_i)
     return result
 
@@ -450,7 +452,15 @@ async def usage_status(request: Request):
             if session_state.get("pending_consent") == "intimate":
                 session_state["pending_consent"] = None
     is_trial = (not bool(member_id)) or is_anon
-    identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+    brand_for_usage = _usage_brand_from_session_state(session_state, rebranding_parsed)
+    email_for_usage = _session_get_str(session_state, "email", "customerEmail", "customer_email")
+    identity_key = _usage_identity_key_for_brand(
+        brand=brand_for_usage,
+        member_id=member_id,
+        email=email_for_usage,
+        session_id=session_id,
+        request=request,
+    )
 
     minutes_allowed_override: Optional[int] = free_minutes if free_minutes is not None else None
     cycle_days_override: Optional[int] = cycle_days if cycle_days is not None else None
@@ -643,6 +653,182 @@ _PAYG_PAYLINK_MINUTES_MAP = _parse_payg_paylink_minutes_map(_PAYG_PAYLINK_MINUTE
 
 # Admin token for server-side minute credits (payment webhook can call this)
 USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
+
+
+# ----------------------------
+# Stripe PayGo — embedded checkout first, hosted checkout fallback
+# ----------------------------
+# Dynamic price_data is used instead of Stripe Price IDs.
+# Brand-specific defaults match current product decisions:
+#   Elaralo:   30 minutes/unit @ $6.99
+#   DulceMoon: 30 minutes/unit @ $4.99
+STRIPE_PAYGO_ENABLED = str(os.getenv("STRIPE_PAYGO_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+STRIPE_SECRET_KEY = (os.getenv("STRIPE_SECRET_KEY", "") or "").strip()
+STRIPE_PUBLISHABLE_KEY = (os.getenv("STRIPE_PUBLISHABLE_KEY", "") or os.getenv("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "") or "").strip()
+STRIPE_WEBHOOK_SECRET = (os.getenv("STRIPE_WEBHOOK_SECRET", "") or "").strip()
+STRIPE_PUBLISHABLE_KEY = (os.getenv("STRIPE_PUBLISHABLE_KEY", "") or os.getenv("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "") or "").strip()
+STRIPE_CURRENCY = (os.getenv("STRIPE_CURRENCY", "usd") or "usd").strip().lower() or "usd"
+STRIPE_PAYGO_MIN_UNITS = _env_int("STRIPE_PAYGO_MIN_UNITS", 1)
+STRIPE_PAYGO_MAX_UNITS = _env_int("STRIPE_PAYGO_MAX_UNITS", 12)
+STRIPE_PAYGO_MINUTES_ELARALO = _env_int("STRIPE_PAYGO_MINUTES_ELARALO", _env_int("STRIPE_PAYGO_UNIT_MINUTES_ELARALO", 30))
+STRIPE_PAYGO_MINUTES_DULCEMOON = _env_int("STRIPE_PAYGO_MINUTES_DULCEMOON", _env_int("STRIPE_PAYGO_UNIT_MINUTES_DULCEMOON", 30))
+STRIPE_PAYGO_AMOUNT_CENTS_ELARALO = _env_int("STRIPE_PAYGO_AMOUNT_CENTS_ELARALO", _env_int("STRIPE_PAYGO_UNIT_AMOUNT_CENTS_ELARALO", 699))
+STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON = _env_int("STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON", _env_int("STRIPE_PAYGO_UNIT_AMOUNT_CENTS_DULCEMOON", 499))
+STRIPE_PAYGO_PUBLIC_BASE_URL = (os.getenv("STRIPE_PAYGO_PUBLIC_BASE_URL", "") or os.getenv("NEXT_PUBLIC_APP_BASE_URL", "") or os.getenv("PUBLIC_APP_BASE_URL", "") or "").strip().rstrip("/")
+STRIPE_PAYGO_PRODUCT_NAME_ELARALO = (os.getenv("STRIPE_PAYGO_PRODUCT_NAME_ELARALO", "Elaralo Connect Voice Minutes") or "Elaralo Connect Voice Minutes").strip()
+STRIPE_PAYGO_PRODUCT_NAME_DULCEMOON = (os.getenv("STRIPE_PAYGO_PRODUCT_NAME_DULCEMOON", "DulceMoon Connect Voice Minutes") or "DulceMoon Connect Voice Minutes").strip()
+
+
+
+def _stripe_paygo_clean_text(value: Any) -> str:
+    try:
+        s = str(value if value is not None else "").strip()
+    except Exception:
+        return ""
+    if s.lower() in {"", "none", "null", "undefined"}:
+        return ""
+    return s
+
+
+def _stripe_paygo_brand(value: Any) -> str:
+    raw = _stripe_paygo_clean_text(value)
+    if not raw:
+        return "Elaralo"
+    key = re.sub(r"[^a-z0-9]+", "", raw.lower())
+    if key == "dulcemoon":
+        return "DulceMoon"
+    if key == "elaralo":
+        return "Elaralo"
+    # Preserve custom white-label spelling, but remove dangerous whitespace.
+    return raw[:80]
+
+
+def _stripe_paygo_brand_key(brand: Any) -> str:
+    b = _stripe_paygo_brand(brand)
+    return re.sub(r"[^a-z0-9]+", "", b.lower()) or "elaralo"
+
+
+def _stripe_paygo_is_anon_member_id(member_id: Any) -> bool:
+    mid = _stripe_paygo_clean_text(member_id)
+    return bool(mid) and mid.lower().startswith("anon:")
+
+
+def _stripe_paygo_is_real_member_id(member_id: Any) -> bool:
+    mid = _stripe_paygo_clean_text(member_id)
+    return bool(mid) and not _stripe_paygo_is_anon_member_id(mid)
+
+
+def _stripe_paygo_email_norm(email: Any) -> str:
+    s = _stripe_paygo_clean_text(email).lower()
+    return s if ("@" in s and "." in s.split("@")[-1]) else ""
+
+
+def _stripe_paygo_hash(value: str, n: int = 16) -> str:
+    return hashlib.sha256((value or "").encode("utf-8", errors="ignore")).hexdigest()[:n]
+
+
+def _usage_identity_key_for_brand(
+    *,
+    brand: Any,
+    member_id: Any = "",
+    email: Any = "",
+    session_id: Any = "",
+    request: Optional[Request] = None,
+) -> str:
+    """Return the canonical brand-scoped usage key.
+
+    Brand scoping prevents a PayGo credit or subscription allowance on one brand
+    from increasing the available minutes on another brand for the same Wix member.
+    """
+    b = _stripe_paygo_brand(brand)
+    mid = _stripe_paygo_clean_text(member_id)
+    if mid:
+        if _stripe_paygo_is_anon_member_id(mid):
+            return f"brand_visitor::{b}::{mid}"
+        return f"brand_member::{b}::{mid}"
+    em = _stripe_paygo_email_norm(email)
+    if em:
+        return f"brand_email::{b}::{_stripe_paygo_hash(em, 24)}"
+    sid = _stripe_paygo_clean_text(session_id)
+    if sid:
+        return f"brand_session::{b}::{_stripe_paygo_hash(sid, 24)}"
+    ip = ""
+    if request is not None:
+        try:
+            ip = _get_client_ip(request)
+        except Exception:
+            ip = ""
+    return f"brand_ip::{b}::{ip or 'unknown'}"
+
+
+def _usage_brand_from_session_state(session_state: Dict[str, Any], rebranding_parsed: Optional[Dict[str, Any]] = None) -> str:
+    if not isinstance(session_state, dict):
+        session_state = {}
+    parsed = rebranding_parsed if isinstance(rebranding_parsed, dict) else {}
+    raw = (
+        _stripe_paygo_clean_text(session_state.get("brand"))
+        or _stripe_paygo_clean_text(session_state.get("companyName"))
+        or _stripe_paygo_clean_text(session_state.get("company_name"))
+        or _stripe_paygo_clean_text(session_state.get("rebranding"))
+        or _stripe_paygo_clean_text(parsed.get("rebranding"))
+        or _stripe_paygo_clean_text(parsed.get("brand"))
+        or "Elaralo"
+    )
+    return _stripe_paygo_brand(raw)
+
+
+def _stripe_paygo_units(raw: Any) -> int:
+    try:
+        units = int(raw)
+    except Exception:
+        units = 1
+    min_units = max(1, int(STRIPE_PAYGO_MIN_UNITS or 1))
+    max_units = max(min_units, int(STRIPE_PAYGO_MAX_UNITS or 12))
+    return max(min_units, min(max_units, units))
+
+
+def _stripe_paygo_unit_minutes(brand: Any) -> int:
+    key = _stripe_paygo_brand_key(brand)
+    if key == "dulcemoon":
+        return max(1, int(STRIPE_PAYGO_MINUTES_DULCEMOON or 30))
+    return max(1, int(STRIPE_PAYGO_MINUTES_ELARALO or 30))
+
+
+def _stripe_paygo_unit_amount_cents(brand: Any) -> int:
+    key = _stripe_paygo_brand_key(brand)
+    if key == "dulcemoon":
+        return max(50, int(STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON or 499))
+    return max(50, int(STRIPE_PAYGO_AMOUNT_CENTS_ELARALO or 699))
+
+
+def _stripe_paygo_product_name(brand: Any) -> str:
+    key = _stripe_paygo_brand_key(brand)
+    if key == "dulcemoon":
+        return STRIPE_PAYGO_PRODUCT_NAME_DULCEMOON or "DulceMoon Connect Voice Minutes"
+    return STRIPE_PAYGO_PRODUCT_NAME_ELARALO or "Elaralo Connect Voice Minutes"
+
+
+def _stripe_paygo_return_origin(request: Request, raw: Dict[str, Any]) -> str:
+    explicit = _stripe_paygo_clean_text(raw.get("return_origin") or raw.get("returnOrigin") or raw.get("origin"))
+    if explicit.startswith("https://") or explicit.startswith("http://"):
+        return explicit.rstrip("/")
+    if STRIPE_PAYGO_PUBLIC_BASE_URL:
+        return STRIPE_PAYGO_PUBLIC_BASE_URL.rstrip("/")
+    origin = _stripe_paygo_clean_text(request.headers.get("origin"))
+    if origin:
+        return origin.rstrip("/")
+    referer = _stripe_paygo_clean_text(request.headers.get("referer") or request.headers.get("referrer"))
+    if referer:
+        try:
+            p = urlparse(referer)
+            if p.scheme and p.netloc:
+                return f"{p.scheme}://{p.netloc}"
+        except Exception:
+            pass
+    try:
+        return str(request.base_url).rstrip("/")
+    except Exception:
+        return ""
 
 def _extract_plan_name(session_state: Dict[str, Any]) -> str:
     plan = (
@@ -9418,7 +9604,15 @@ async def chat(request: Request):
                 session_state["pending_consent"] = None
 
     is_trial = (not bool(member_id)) or is_anon
-    identity_key = f"member::{member_id}" if member_id else f"ip::{_get_client_ip(request) or session_id or 'unknown'}"
+    brand_for_usage = _usage_brand_from_session_state(session_state, rebranding_parsed)
+    email_for_usage = _session_get_str(session_state, "email", "customerEmail", "customer_email")
+    identity_key = _usage_identity_key_for_brand(
+        brand=brand_for_usage,
+        member_id=member_id,
+        email=email_for_usage,
+        session_id=session_id,
+        request=request,
+    )
 
     # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
     minutes_allowed_override: Optional[int] = None
@@ -13420,6 +13614,528 @@ async def livekit_join_request_status(requestId: str):
         "name": r.get("name") or "",
         "displayName": r.get("name") or "",
         "memberId": r.get("memberId") or "",
+    }
+
+
+# ============================================================
+# STRIPE PAYGO TOP-UP — Embedded Checkout + hosted fallback
+# ============================================================
+# Additive v9.2.33 flow. This is independent of legacy Wix Pay Links.
+
+_STRIPE_PAYGO_LOCK = threading.RLock()
+
+
+def _stripe_paygo_db_ensure_schema_sync() -> None:
+    with _STRIPE_PAYGO_LOCK:
+        conn = _econnect_conn()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stripe_paygo_transactions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  create_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  update_datetime datetime DEFAULT CURRENT_TIMESTAMP,
+                  paygo_group_id TEXT,
+                  brand TEXT NOT NULL,
+                  member_id TEXT,
+                  email TEXT,
+                  identity_key TEXT NOT NULL,
+                  connect_session_id TEXT,
+                  avatar TEXT,
+                  companion_key TEXT,
+                  companion_type TEXT,
+                  units INTEGER NOT NULL,
+                  minutes_per_unit INTEGER NOT NULL,
+                  minutes_total INTEGER NOT NULL,
+                  unit_amount_cents INTEGER NOT NULL,
+                  amount_total_cents INTEGER NOT NULL,
+                  currency TEXT NOT NULL,
+                  stripe_checkout_session_id TEXT NOT NULL UNIQUE,
+                  stripe_payment_intent_id TEXT,
+                  stripe_customer_id TEXT,
+                  stripe_ui_mode TEXT,
+                  status TEXT NOT NULL,
+                  credited_at INTEGER,
+                  raw_event_json TEXT,
+                  failure_reason TEXT
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_paygo_brand_member ON stripe_paygo_transactions(brand, member_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_paygo_identity ON stripe_paygo_transactions(identity_key);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_paygo_group ON stripe_paygo_transactions(paygo_group_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_paygo_status ON stripe_paygo_transactions(status);")
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _stripe_paygo_insert_transaction_sync(row: Dict[str, Any]) -> None:
+    _stripe_paygo_db_ensure_schema_sync()
+    with _STRIPE_PAYGO_LOCK:
+        conn = _econnect_conn()
+        try:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO stripe_paygo_transactions (
+                  paygo_group_id, brand, member_id, email, identity_key, connect_session_id,
+                  avatar, companion_key, companion_type, units, minutes_per_unit, minutes_total,
+                  unit_amount_cents, amount_total_cents, currency, stripe_checkout_session_id,
+                  stripe_payment_intent_id, stripe_customer_id, stripe_ui_mode, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    row.get("paygo_group_id"), row.get("brand"), row.get("member_id"), row.get("email"), row.get("identity_key"),
+                    row.get("connect_session_id"), row.get("avatar"), row.get("companion_key"), row.get("companion_type"),
+                    int(row.get("units") or 1), int(row.get("minutes_per_unit") or 30), int(row.get("minutes_total") or 30),
+                    int(row.get("unit_amount_cents") or 0), int(row.get("amount_total_cents") or 0), row.get("currency"),
+                    row.get("stripe_checkout_session_id"), row.get("stripe_payment_intent_id"), row.get("stripe_customer_id"),
+                    row.get("stripe_ui_mode"), row.get("status") or "created",
+                ),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _stripe_paygo_session_row_sync(session_id: str) -> Optional[Dict[str, Any]]:
+    _stripe_paygo_db_ensure_schema_sync()
+    sid = _stripe_paygo_clean_text(session_id)
+    if not sid:
+        return None
+    with _STRIPE_PAYGO_LOCK:
+        conn = _econnect_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM stripe_paygo_transactions WHERE stripe_checkout_session_id = ? LIMIT 1;",
+                (sid,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _stripe_paygo_group_already_credited_sync(group_id: str) -> bool:
+    gid = _stripe_paygo_clean_text(group_id)
+    if not gid:
+        return False
+    _stripe_paygo_db_ensure_schema_sync()
+    with _STRIPE_PAYGO_LOCK:
+        conn = _econnect_conn()
+        try:
+            row = conn.execute(
+                """
+                SELECT 1 FROM stripe_paygo_transactions
+                 WHERE paygo_group_id = ? AND lower(COALESCE(status, '')) = 'credited'
+                 LIMIT 1;
+                """,
+                (gid,),
+            ).fetchone()
+            return row is not None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _stripe_paygo_mark_sync(session_id: str, *, status: str, payment_intent: str = "", customer: str = "", raw_event: Any = None, failure_reason: str = "", credited: bool = False) -> None:
+    _stripe_paygo_db_ensure_schema_sync()
+    sid = _stripe_paygo_clean_text(session_id)
+    if not sid:
+        return
+    raw_json = ""
+    if raw_event is not None:
+        try:
+            raw_json = json.dumps(raw_event, ensure_ascii=False, default=str)[:20000]
+        except Exception:
+            raw_json = str(raw_event)[:20000]
+    with _STRIPE_PAYGO_LOCK:
+        conn = _econnect_conn()
+        try:
+            conn.execute(
+                """
+                UPDATE stripe_paygo_transactions
+                   SET status = ?,
+                       stripe_payment_intent_id = COALESCE(NULLIF(?, ''), stripe_payment_intent_id),
+                       stripe_customer_id = COALESCE(NULLIF(?, ''), stripe_customer_id),
+                       credited_at = CASE WHEN ? THEN ? ELSE credited_at END,
+                       raw_event_json = COALESCE(NULLIF(?, ''), raw_event_json),
+                       failure_reason = COALESCE(NULLIF(?, ''), failure_reason),
+                       update_datetime = CURRENT_TIMESTAMP
+                 WHERE stripe_checkout_session_id = ?;
+                """,
+                (
+                    _stripe_paygo_clean_text(status) or "updated",
+                    _stripe_paygo_clean_text(payment_intent),
+                    _stripe_paygo_clean_text(customer),
+                    1 if credited else 0,
+                    int(time.time()) if credited else None,
+                    raw_json,
+                    _stripe_paygo_clean_text(failure_reason),
+                    sid,
+                ),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _stripe_request_form_sync(path: str, form: Dict[str, Any]) -> Dict[str, Any]:
+    if not STRIPE_SECRET_KEY:
+        raise RuntimeError("STRIPE_SECRET_KEY is not configured")
+    import requests  # type: ignore
+    url = "https://api.stripe.com" + path
+    data: Dict[str, str] = {}
+    for k, v in (form or {}).items():
+        if v is None:
+            continue
+        data[str(k)] = str(v)
+    resp = requests.post(url, data=data, auth=(STRIPE_SECRET_KEY, ""), timeout=30)
+    try:
+        obj = resp.json()
+    except Exception:
+        obj = {"raw": resp.text}
+    if resp.status_code >= 400:
+        detail = obj.get("error") if isinstance(obj, dict) else obj
+        raise RuntimeError(f"Stripe API error {resp.status_code}: {detail}")
+    return obj if isinstance(obj, dict) else {"value": obj}
+
+
+def _stripe_create_checkout_session_sync(
+    *,
+    ui_mode: str,
+    brand: str,
+    member_id: str,
+    email: str,
+    identity_key: str,
+    connect_session_id: str,
+    avatar: str,
+    companion_key: str,
+    companion_type: str,
+    units: int,
+    minutes_per_unit: int,
+    unit_amount_cents: int,
+    currency: str,
+    product_name: str,
+    return_origin: str,
+    paygo_group_id: str,
+) -> Dict[str, Any]:
+    minutes_total = int(units) * int(minutes_per_unit)
+    amount_total = int(units) * int(unit_amount_cents)
+    metadata = {
+        "source": "connect_paygo",
+        "brand": brand,
+        "member_id": member_id,
+        "email": email,
+        "identity_key": identity_key,
+        "connect_session_id": connect_session_id,
+        "avatar": avatar,
+        "companion_key": companion_key,
+        "companion_type": companion_type,
+        "units": str(units),
+        "minutes_per_unit": str(minutes_per_unit),
+        "minutes_total": str(minutes_total),
+        "paygo_group_id": paygo_group_id,
+    }
+    form: Dict[str, Any] = {
+        "mode": "payment",
+        "client_reference_id": paygo_group_id,
+        "payment_method_types[0]": "card",
+        "line_items[0][quantity]": str(units),
+        "line_items[0][price_data][currency]": currency,
+        "line_items[0][price_data][unit_amount]": str(unit_amount_cents),
+        "line_items[0][price_data][product_data][name]": product_name,
+        "metadata[source]": metadata["source"],
+        "metadata[brand]": metadata["brand"],
+        "metadata[member_id]": metadata["member_id"],
+        "metadata[email]": metadata["email"],
+        "metadata[identity_key]": metadata["identity_key"],
+        "metadata[connect_session_id]": metadata["connect_session_id"],
+        "metadata[avatar]": metadata["avatar"],
+        "metadata[companion_key]": metadata["companion_key"],
+        "metadata[companion_type]": metadata["companion_type"],
+        "metadata[units]": metadata["units"],
+        "metadata[minutes_per_unit]": metadata["minutes_per_unit"],
+        "metadata[minutes_total]": metadata["minutes_total"],
+        "metadata[paygo_group_id]": metadata["paygo_group_id"],
+        "payment_intent_data[metadata][source]": metadata["source"],
+        "payment_intent_data[metadata][brand]": metadata["brand"],
+        "payment_intent_data[metadata][member_id]": metadata["member_id"],
+        "payment_intent_data[metadata][identity_key]": metadata["identity_key"],
+        "payment_intent_data[metadata][paygo_group_id]": metadata["paygo_group_id"],
+        "payment_intent_data[metadata][minutes_total]": metadata["minutes_total"],
+    }
+    if email:
+        form["customer_email"] = email
+    origin = (return_origin or "").rstrip("/")
+    if ui_mode == "embedded":
+        form["ui_mode"] = "embedded"
+        form["return_url"] = f"{origin}/?stripe_paygo=return&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=return&checkout_session_id={CHECKOUT_SESSION_ID}"
+    else:
+        form["success_url"] = f"{origin}/?stripe_paygo=success&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=success&checkout_session_id={CHECKOUT_SESSION_ID}"
+        form["cancel_url"] = f"{origin}/?stripe_paygo=cancel&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=cancel&checkout_session_id={CHECKOUT_SESSION_ID}"
+
+    session = _stripe_request_form_sync("/v1/checkout/sessions", form)
+    sid = _stripe_paygo_clean_text(session.get("id"))
+    _stripe_paygo_insert_transaction_sync(
+        {
+            "paygo_group_id": paygo_group_id,
+            "brand": brand,
+            "member_id": member_id,
+            "email": email,
+            "identity_key": identity_key,
+            "connect_session_id": connect_session_id,
+            "avatar": avatar,
+            "companion_key": companion_key,
+            "companion_type": companion_type,
+            "units": units,
+            "minutes_per_unit": minutes_per_unit,
+            "minutes_total": minutes_total,
+            "unit_amount_cents": unit_amount_cents,
+            "amount_total_cents": amount_total,
+            "currency": currency,
+            "stripe_checkout_session_id": sid,
+            "stripe_payment_intent_id": _stripe_paygo_clean_text(session.get("payment_intent")),
+            "stripe_customer_id": _stripe_paygo_clean_text(session.get("customer")),
+            "stripe_ui_mode": ui_mode,
+            "status": "created",
+        }
+    )
+    return session
+
+
+@app.post("/stripe/paygo/create-checkout-session")
+async def stripe_paygo_create_checkout_session(request: Request):
+    if not STRIPE_PAYGO_ENABLED:
+        raise HTTPException(status_code=503, detail="Stripe PayGo is not enabled")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY is not configured")
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    brand = _stripe_paygo_brand(raw.get("brand") or raw.get("rebranding") or "Elaralo")
+    member_id = _stripe_paygo_clean_text(raw.get("member_id") or raw.get("memberId") or "")
+    email = _stripe_paygo_email_norm(raw.get("email") or raw.get("customer_email") or raw.get("customerEmail") or "")
+    if not _stripe_paygo_is_real_member_id(member_id) and not email:
+        raise HTTPException(status_code=400, detail="email is required before visitor PayGo checkout")
+
+    connect_session_id = _stripe_paygo_clean_text(raw.get("session_id") or raw.get("sessionId") or "")
+    avatar = _stripe_paygo_clean_text(raw.get("avatar") or raw.get("mappingAvatar") or raw.get("companionName") or "")
+    companion_key = _stripe_paygo_clean_text(raw.get("companion_key") or raw.get("companionKey") or raw.get("companion") or avatar)
+    companion_type = _stripe_paygo_clean_text(raw.get("companion_type") or raw.get("companionType") or "")
+    units = _stripe_paygo_units(raw.get("units") or raw.get("quantity") or 1)
+    minutes_per_unit = _stripe_paygo_unit_minutes(brand)
+    unit_amount_cents = _stripe_paygo_unit_amount_cents(brand)
+    currency = STRIPE_CURRENCY or "usd"
+    product_name = _stripe_paygo_product_name(brand)
+    return_origin = _stripe_paygo_return_origin(request, raw)
+    identity_key = _usage_identity_key_for_brand(
+        brand=brand,
+        member_id=member_id,
+        email=email,
+        session_id=connect_session_id,
+        request=request,
+    )
+    paygo_group_id = str(uuid.uuid4())
+
+    def _work() -> Dict[str, Any]:
+        embedded = _stripe_create_checkout_session_sync(
+            ui_mode="embedded",
+            brand=brand,
+            member_id=member_id,
+            email=email,
+            identity_key=identity_key,
+            connect_session_id=connect_session_id,
+            avatar=avatar,
+            companion_key=companion_key,
+            companion_type=companion_type,
+            units=units,
+            minutes_per_unit=minutes_per_unit,
+            unit_amount_cents=unit_amount_cents,
+            currency=currency,
+            product_name=product_name,
+            return_origin=return_origin,
+            paygo_group_id=paygo_group_id,
+        )
+        hosted = _stripe_create_checkout_session_sync(
+            ui_mode="hosted",
+            brand=brand,
+            member_id=member_id,
+            email=email,
+            identity_key=identity_key,
+            connect_session_id=connect_session_id,
+            avatar=avatar,
+            companion_key=companion_key,
+            companion_type=companion_type,
+            units=units,
+            minutes_per_unit=minutes_per_unit,
+            unit_amount_cents=unit_amount_cents,
+            currency=currency,
+            product_name=product_name,
+            return_origin=return_origin,
+            paygo_group_id=paygo_group_id,
+        )
+        return {"embedded": embedded, "hosted": hosted}
+
+    try:
+        created = await run_in_threadpool(_work)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    embedded = created.get("embedded") or {}
+    hosted = created.get("hosted") or {}
+    minutes_total = int(units) * int(minutes_per_unit)
+    amount_total = int(units) * int(unit_amount_cents)
+    return {
+        "ok": True,
+        "brand": brand,
+        "units": units,
+        "minutes_per_unit": minutes_per_unit,
+        "minutes_total": minutes_total,
+        "unit_amount_cents": unit_amount_cents,
+        "amount_total_cents": amount_total,
+        "currency": currency,
+        "identity_key": identity_key,
+        "paygo_group_id": paygo_group_id,
+        "checkout_session_id": _stripe_paygo_clean_text(embedded.get("id")),
+        "client_secret": _stripe_paygo_clean_text(embedded.get("client_secret")),
+        "publishable_key": STRIPE_PUBLISHABLE_KEY,
+        "hosted_checkout_session_id": _stripe_paygo_clean_text(hosted.get("id")),
+        "hosted_url": _stripe_paygo_clean_text(hosted.get("url")),
+    }
+
+
+def _stripe_verify_signature(raw: bytes, sig_header: str, secret: str) -> bool:
+    if not secret:
+        return True
+    import hmac
+    header = _stripe_paygo_clean_text(sig_header)
+    parts = {}
+    for item in header.split(","):
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        parts.setdefault(k.strip(), []).append(v.strip())
+    ts = (parts.get("t") or [""])[0]
+    sigs = parts.get("v1") or []
+    if not ts or not sigs:
+        return False
+    signed = (ts + ".").encode("utf-8") + (raw or b"")
+    expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(expected, s) for s in sigs)
+
+
+def _stripe_paygo_process_completed_session_sync(session_obj: Dict[str, Any], event_obj: Dict[str, Any]) -> Dict[str, Any]:
+    sid = _stripe_paygo_clean_text(session_obj.get("id"))
+    if not sid:
+        return {"ok": False, "error": "missing session id"}
+    row = _stripe_paygo_session_row_sync(sid)
+    if not row:
+        _stripe_paygo_mark_sync(sid, status="ignored_missing_local_row", raw_event=event_obj)
+        return {"ok": True, "ignored": True, "reason": "missing local transaction row"}
+
+    group_id = _stripe_paygo_clean_text(row.get("paygo_group_id"))
+    payment_intent = _stripe_paygo_clean_text(session_obj.get("payment_intent"))
+    customer = _stripe_paygo_clean_text(session_obj.get("customer"))
+
+    if _stripe_paygo_group_already_credited_sync(group_id):
+        _stripe_paygo_mark_sync(sid, status="duplicate_group_completed", payment_intent=payment_intent, customer=customer, raw_event=event_obj)
+        return {"ok": True, "duplicate": True}
+
+    identity_key = _stripe_paygo_clean_text(row.get("identity_key"))
+    minutes = int(row.get("minutes_total") or 0)
+    if not identity_key or minutes <= 0:
+        _stripe_paygo_mark_sync(sid, status="failed", payment_intent=payment_intent, customer=customer, raw_event=event_obj, failure_reason="missing identity_key or invalid minutes")
+        return {"ok": False, "error": "missing identity key or invalid minutes"}
+
+    credit_res = _usage_credit_minutes_sync(identity_key, minutes)
+    if not credit_res.get("ok"):
+        _stripe_paygo_mark_sync(sid, status="failed", payment_intent=payment_intent, customer=customer, raw_event=event_obj, failure_reason=_stripe_paygo_clean_text(credit_res.get("error") or credit_res))
+        return {"ok": False, "error": "usage credit failed", "credit": credit_res}
+
+    _stripe_paygo_mark_sync(sid, status="credited", payment_intent=payment_intent, customer=customer, raw_event=event_obj, credited=True)
+    return {"ok": True, "credited": True, "minutes": minutes, "identity_key": identity_key}
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    raw = await request.body()
+    sig = request.headers.get("stripe-signature") or request.headers.get("Stripe-Signature") or ""
+    if STRIPE_WEBHOOK_SECRET and not _stripe_verify_signature(raw, sig, STRIPE_WEBHOOK_SECRET):
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+    try:
+        event = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    event_type = _stripe_paygo_clean_text(event.get("type"))
+    obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
+    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"} and isinstance(obj, dict):
+        result = await run_in_threadpool(_stripe_paygo_process_completed_session_sync, obj, event)
+        return {"received": True, **(result if isinstance(result, dict) else {})}
+    if event_type == "checkout.session.expired" and isinstance(obj, dict):
+        sid = _stripe_paygo_clean_text(obj.get("id"))
+        await run_in_threadpool(_stripe_paygo_mark_sync, sid, status="expired", raw_event=event)
+    return {"received": True, "ignored": event_type}
+
+
+@app.get("/stripe/paygo/session-status")
+async def stripe_paygo_session_status(request: Request):
+    checkout_session_id = _stripe_paygo_clean_text(
+        request.query_params.get("checkout_session_id")
+        or request.query_params.get("session_id")
+        or request.query_params.get("checkoutSessionId")
+        or ""
+    )
+    if not checkout_session_id:
+        raise HTTPException(status_code=400, detail="checkout_session_id is required")
+    row = await run_in_threadpool(_stripe_paygo_session_row_sync, checkout_session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="PayGo transaction not found")
+    return {
+        "ok": True,
+        "checkout_session_id": checkout_session_id,
+        "brand": row.get("brand"),
+        "member_id": row.get("member_id"),
+        "identity_key": row.get("identity_key"),
+        "units": row.get("units"),
+        "minutes_total": row.get("minutes_total"),
+        "amount_total_cents": row.get("amount_total_cents"),
+        "currency": row.get("currency"),
+        "status": row.get("status"),
+        "credited_at": row.get("credited_at"),
+    }
+
+
+@app.get("/stripe/paygo/config")
+async def stripe_paygo_config(brand: str = "Elaralo"):
+    brand_label = _stripe_paygo_brand(brand)
+    return {
+        "ok": True,
+        "enabled": bool(STRIPE_PAYGO_ENABLED),
+        "brand": brand_label,
+        "unit_minutes": _stripe_paygo_unit_minutes(brand_label),
+        "unit_amount_cents": _stripe_paygo_unit_amount_cents(brand_label),
+        "currency": STRIPE_CURRENCY,
+        "min_units": int(STRIPE_PAYGO_MIN_UNITS or 1),
+        "max_units": int(STRIPE_PAYGO_MAX_UNITS or 12),
+        "publishable_key_configured": bool(STRIPE_PUBLISHABLE_KEY),
     }
 
 # ============================================================

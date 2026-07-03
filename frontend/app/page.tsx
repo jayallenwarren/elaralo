@@ -204,7 +204,7 @@ type CompanionMappingRow = {
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
 // PayGo top-up UI state (used to correlate non-member payments via email)
-type TopupStage = "idle" | "collect_email" | "creating" | "waiting" | "credited" | "error";
+type TopupStage = "idle" | "collect_email" | "creating" | "checkout" | "waiting" | "credited" | "error";
 
 
 type SessionState = {
@@ -1422,6 +1422,7 @@ function joinUrlPrefix(prefix: string, path: string): string {
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+const STRIPE_PUBLISHABLE_KEY = String(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY || "").trim();
 
 
 const API_BASE_TRIM = String(API_BASE || "").replace(/\/+$/, "");
@@ -3716,6 +3717,63 @@ function HostOnboardingRouteSwitch() {
   }, []);
   if (mode === "host-onboarding") return <HostOnboardingApp />;
   return <ConnectPage />;
+}
+
+
+
+declare global {
+  interface Window {
+    Stripe?: any;
+  }
+}
+
+let __stripeJsPromise: Promise<any> | null = null;
+
+function loadStripeJs(publishableKey: string): Promise<any> {
+  const key = String(publishableKey || "").trim();
+  if (!key) return Promise.reject(new Error("Stripe publishable key is not configured"));
+  if (typeof window === "undefined") return Promise.reject(new Error("Stripe can only load in the browser"));
+  if (window.Stripe) return Promise.resolve(window.Stripe(key));
+  if (!__stripeJsPromise) {
+    __stripeJsPromise = new Promise((resolve, reject) => {
+      try {
+        const existing = document.querySelector('script[src="https://js.stripe.com/v3/"]') as HTMLScriptElement | null;
+        if (existing) {
+          existing.addEventListener("load", () => {
+            try { resolve(window.Stripe ? window.Stripe(key) : null); } catch (e) { reject(e); }
+          });
+          existing.addEventListener("error", () => reject(new Error("Stripe.js failed to load")));
+          return;
+        }
+        const script = document.createElement("script");
+        script.src = "https://js.stripe.com/v3/";
+        script.async = true;
+        script.onload = () => {
+          try {
+            if (!window.Stripe) reject(new Error("Stripe.js loaded without Stripe global"));
+            else resolve(window.Stripe(key));
+          } catch (e) {
+            reject(e);
+          }
+        };
+        script.onerror = () => reject(new Error("Stripe.js failed to load"));
+        document.head.appendChild(script);
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+  return __stripeJsPromise;
+}
+
+function formatCents(amountCents: any, currency: any): string {
+  const cents = Number(amountCents || 0) || 0;
+  const cur = String(currency || "usd").toUpperCase();
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: cur }).format(cents / 100);
+  } catch {
+    return `$${(cents / 100).toFixed(2)}`;
+  }
 }
 
 export default function Page() {
@@ -8156,6 +8214,16 @@ useEffect(() => {
   const [topupExpiresAt, setTopupExpiresAt] = useState<number | null>(null);
   const [topupError, setTopupError] = useState<string>("");
   const [topupLastCreditedMinutes, setTopupLastCreditedMinutes] = useState<number | null>(null);
+  const [topupUnits, setTopupUnits] = useState<number>(1);
+  const [topupMinutesPerUnit, setTopupMinutesPerUnit] = useState<number>(30);
+  const [topupUnitAmountCents, setTopupUnitAmountCents] = useState<number>(0);
+  const [topupAmountTotalCents, setTopupAmountTotalCents] = useState<number>(0);
+  const [topupCurrency, setTopupCurrency] = useState<string>("usd");
+  const [topupCheckoutClientSecret, setTopupCheckoutClientSecret] = useState<string>("");
+  const [topupCheckoutSessionId, setTopupCheckoutSessionId] = useState<string>("");
+  const [topupHostedUrl, setTopupHostedUrl] = useState<string>("");
+  const topupCheckoutContainerRef = useRef<HTMLDivElement | null>(null);
+  const embeddedCheckoutRef = useRef<any>(null);
   const topupPollTimerRef = useRef<number | null>(null);
 
   // Members: auto-unlock PayGo without requiring a page refresh.
@@ -8195,6 +8263,11 @@ useEffect(() => {
     if (mid) return mid;
     return getOrCreateAnonMemberId(brandKeyForAnon);
   }, [memberId, brandKeyForAnon]);
+
+  const topupRequiresEmail = useMemo(() => {
+    const mid = String(memberIdForLiveChat || "").trim();
+    return !mid || isAnonMemberId(mid);
+  }, [memberIdForLiveChat]);
 
 
   // ---------------------------------------------------------------------------
@@ -8360,33 +8433,16 @@ useEffect(() => {
     setTopupModalOpen(true);
   }, []);
 
-  // Members do NOT enter email. We just watch for the webhook credit.
+  // Start an in-app Stripe PayGo flow. Members skip email capture; visitors must provide email.
   const beginPaygoTopupForMember = useCallback(() => {
-    // Only start watching if the backend has told us minutes are exhausted.
-    // Otherwise, we could falsely interpret a non-zero balance as "payment credited".
-    const mr = Number((sessionStateRef.current as any)?.minutes_remaining ?? (sessionStateRef.current as any)?.minutesRemaining ?? 0) || 0;
-    const remainingSeconds = Number((sessionStateRef.current as any)?.remaining_seconds ?? (sessionStateRef.current as any)?.remainingSeconds ?? NaN);
-    const exhausted =
-      Boolean((sessionStateRef.current as any)?.minutes_exhausted ?? (sessionStateRef.current as any)?.minutesExhausted) ||
-      (Number.isFinite(remainingSeconds) ? remainingSeconds <= 0 : mr <= 0);
-    if (!exhausted) return;
-
-    setMemberTopupError("");
-    setMemberTopupStartedAt(Date.now());
-    setMemberTopupWatching((prev) => {
-      // Only add the hint once per watch session.
-      if (!prev) {
-        setMessages((msgs) => [
-          ...msgs,
-          {
-            role: "assistant",
-            content:
-              "💳 After checkout completes, return to this tab — I’ll unlock your chat as soon as minutes are credited.",
-          },
-        ]);
-      }
-      return true;
-    });
+    setTopupPayUrl("");
+    setTopupError("");
+    setTopupLastCreditedMinutes(null);
+    setTopupCheckoutClientSecret("");
+    setTopupCheckoutSessionId("");
+    setTopupHostedUrl("");
+    setTopupStage("collect_email");
+    setTopupModalOpen(true);
   }, []);
 
   const closeTopupModal = useCallback(() => {
@@ -8677,115 +8733,172 @@ useEffect(() => {
       return;
     }
 
+    const brandNow = String(companyName || rebranding || DEFAULT_COMPANY_NAME || "Elaralo").trim() || "Elaralo";
+    const memberIdNow = String(memberIdRef.current || memberIdForLiveChat || memberId || "").trim();
+    const isRealMemberNow = Boolean(memberIdNow) && !isAnonMemberId(memberIdNow);
     const email = String(topupEmail || "").trim();
-    if (!email || !email.includes("@")) {
-      setTopupError("Please enter a valid email address.");
+
+    if (!isRealMemberNow && (!email || !email.includes("@"))) {
+      setTopupError("Please enter a valid email address before checkout.");
       setTopupStage("collect_email");
       setTopupModalOpen(true);
       return;
     }
 
-    const payUrl = String(topupPayUrl || "").trim() || String(rebrandingInfo?.payGoLink || "").trim();
-    if (!payUrl) {
-      setTopupError("PayGo payment link is not available.");
-      setTopupStage("error");
-      setTopupModalOpen(true);
-      return;
-    }
-
-    // Visitors use an anon:... id. (Members are not prompted for email.)
-    const memberIdForPending = String(memberIdForLiveChat || "").trim();
-    if (!memberIdForPending || !isAnonMemberId(memberIdForPending)) {
-      setTopupError("Visitor identity is not available. Please refresh and try again.");
-      setTopupStage("error");
-      setTopupModalOpen(true);
-      return;
-    }
-
+    const units = Math.max(1, Math.min(12, Number(topupUnits || 1) || 1));
+    setTopupUnits(units);
     setTopupStage("creating");
     setTopupError("");
     setTopupLastCreditedMinutes(null);
+    setTopupCheckoutClientSecret("");
+    setTopupCheckoutSessionId("");
+    setTopupHostedUrl("");
 
-    persistTopupEmail(email);
+    if (!isRealMemberNow) persistTopupEmail(email);
 
-    const session_state: any = {
-      rebrandingKey: normalizeRebrandingKeyValue(rebrandingKey),
-      rebranding_key: normalizeRebrandingKeyValue(rebrandingKey),
-      RebrandingKey: normalizeRebrandingKeyValue(rebrandingKey),
-      rebranding: (rebranding || "").trim(),
-      // Provide PayGo overrides when present
-      payGoLink: payUrl,
-      payGoPrice: String(rebrandingInfo?.payGoPrice || "").trim(),
-      payGoMinutes: String(rebrandingInfo?.payGoMinutes || "").trim(),
+    const payload = {
+      brand: brandNow,
+      memberId: memberIdNow,
+      member_id: memberIdNow,
+      email: isRealMemberNow ? "" : email,
+      session_id: sessionIdRef.current || "",
+      sessionId: sessionIdRef.current || "",
+      avatar: String(selectedMappingAvatar || companionName || "").trim(),
+      mappingAvatar: String(selectedMappingAvatar || companionName || "").trim(),
+      companionName: String(companionName || "").trim(),
+      companion_key: String(companionKey || companionName || "").trim(),
+      companionKey: String(companionKey || companionName || "").trim(),
+      companion_type: String(selectedCompanionType || "").trim(),
+      companionType: String(selectedCompanionType || "").trim(),
+      units,
+      quantity: units,
+      return_origin: (() => {
+        try { return window.location.origin; } catch { return ""; }
+      })(),
     };
 
     try {
-      const res = await fetch(`${API_BASE}/topup/pending`, {
+      const res = await fetch(`${API_BASE}/stripe/paygo/create-checkout-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          email,
-          memberId: memberIdForPending,
-          session_state,
-        }),
+        body: JSON.stringify(payload),
       });
-
       const raw = await res.text().catch(() => "");
       let json: any = null;
-      try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
-
-      if (res.ok) {
-        const pid = String(json?.pendingId || "").trim();
-        const exp = Number(json?.expiresAt || 0) || null;
-        const payUrlResp = String(json?.payUrl || payUrl).trim() || payUrl;
-
-        if (pid) setTopupPendingId(pid);
-        setTopupExpiresAt(exp && exp > 0 ? exp : null);
-
-        setTopupStage("waiting");
-        setTopupModalOpen(true);
-
-        openPaygoUrl(payUrlResp);
-        return;
+      try { json = raw ? JSON.parse(raw) : null; } catch { json = null; }
+      if (!res.ok) {
+        const err = typeof json?.detail === "string" ? json.detail : raw;
+        throw new Error(err || `Stripe checkout setup failed (${res.status})`);
       }
 
-      // Concurrent pending by email: use the existing pendingId
-      if (res.status === 409 && json?.detail?.error === "PENDING_EXISTS") {
-        const pid = String(json?.detail?.pendingId || "").trim();
-        const exp = Number(json?.detail?.expiresAt || 0) || null;
-        const payUrlResp = String(json?.detail?.payUrl || payUrl).trim() || payUrl;
+      const clientSecret = String(json?.client_secret || json?.clientSecret || "").trim();
+      const hostedUrl = String(json?.hosted_url || json?.hostedUrl || "").trim();
+      const checkoutSessionId = String(json?.checkout_session_id || json?.checkoutSessionId || "").trim();
+      const minutesPerUnit = Number(json?.minutes_per_unit ?? json?.minutesPerUnit ?? 30) || 30;
+      const minutesTotal = Number(json?.minutes_total ?? json?.minutesTotal ?? minutesPerUnit * units) || minutesPerUnit * units;
+      const unitAmountCents = Number(json?.unit_amount_cents ?? json?.unitAmountCents ?? 0) || 0;
+      const amountTotalCents = Number(json?.amount_total_cents ?? json?.amountTotalCents ?? unitAmountCents * units) || unitAmountCents * units;
+      const currency = String(json?.currency || "usd").trim() || "usd";
 
-        if (pid) setTopupPendingId(pid);
-        setTopupExpiresAt(exp && exp > 0 ? exp : null);
-
-        setTopupError("A top-up is already pending for this email. We'll keep watching for your payment.");
-        setTopupStage("waiting");
-        setTopupModalOpen(true);
-
-        openPaygoUrl(payUrlResp);
-        return;
-      }
-
-      const err = String(json?.detail || raw || "").trim();
-      setTopupError(err || `Top-up request failed (${res.status}).`);
-      setTopupStage("error");
+      setTopupMinutesPerUnit(minutesPerUnit);
+      setTopupLastCreditedMinutes(minutesTotal);
+      setTopupUnitAmountCents(unitAmountCents);
+      setTopupAmountTotalCents(amountTotalCents);
+      setTopupCurrency(currency);
+      setTopupCheckoutClientSecret(clientSecret);
+      setTopupCheckoutSessionId(checkoutSessionId);
+      setTopupHostedUrl(hostedUrl);
       setTopupModalOpen(true);
+
+      if (clientSecret && STRIPE_PUBLISHABLE_KEY) {
+        setTopupStage("checkout");
+      } else if (hostedUrl) {
+        setTopupStage("waiting");
+        openPaygoUrl(hostedUrl);
+        setMemberTopupStartedAt(Date.now());
+        setMemberTopupWatching(true);
+      } else {
+        throw new Error("Stripe checkout was created, but no embedded client secret or hosted URL was returned.");
+      }
     } catch (e: any) {
-      setTopupError(String(e?.message || e || "Top-up request failed"));
+      setTopupError(String(e?.message || e || "Stripe checkout setup failed"));
       setTopupStage("error");
       setTopupModalOpen(true);
     }
   }, [
     API_BASE,
-    topupEmail,
-    topupPayUrl,
-    memberIdForLiveChat,
-    rebrandingKey,
+    companyName,
     rebranding,
-    rebrandingInfo,
+    memberIdForLiveChat,
+    memberId,
+    topupEmail,
+    topupUnits,
     persistTopupEmail,
+    selectedMappingAvatar,
+    companionName,
+    companionKey,
+    selectedCompanionType,
     openPaygoUrl,
   ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!topupModalOpen) return;
+    if (topupStage !== "checkout") return;
+    if (!topupCheckoutClientSecret) return;
+    const container = topupCheckoutContainerRef.current;
+    if (!container) return;
+
+    let cancelled = false;
+    let checkoutInstance: any = null;
+    try { container.innerHTML = ""; } catch {}
+
+    const startEmbedded = async () => {
+      try {
+        const stripe = await loadStripeJs(STRIPE_PUBLISHABLE_KEY);
+        if (cancelled) return;
+        if (!stripe || typeof stripe.initEmbeddedCheckout !== "function") {
+          throw new Error("Stripe Embedded Checkout is not available in this browser.");
+        }
+        checkoutInstance = await stripe.initEmbeddedCheckout({
+          clientSecret: topupCheckoutClientSecret,
+          onComplete: () => {
+            setTopupStage("waiting");
+            setMemberTopupStartedAt(Date.now());
+            setMemberTopupWatching(true);
+            void refreshUsageStatusOnce();
+          },
+        });
+        if (cancelled) {
+          try { checkoutInstance?.destroy?.(); } catch {}
+          return;
+        }
+        embeddedCheckoutRef.current = checkoutInstance;
+        checkoutInstance.mount(container);
+      } catch (e: any) {
+        if (cancelled) return;
+        const hosted = String(topupHostedUrl || "").trim();
+        if (hosted) {
+          setTopupError("Embedded Checkout could not open here. I opened Stripe Checkout in a new tab instead.");
+          setTopupStage("waiting");
+          openPaygoUrl(hosted);
+          setMemberTopupStartedAt(Date.now());
+          setMemberTopupWatching(true);
+        } else {
+          setTopupError(String(e?.message || e || "Embedded Checkout failed"));
+          setTopupStage("error");
+        }
+      }
+    };
+
+    void startEmbedded();
+
+    return () => {
+      cancelled = true;
+      try { checkoutInstance?.destroy?.(); } catch {}
+      try { if (embeddedCheckoutRef.current === checkoutInstance) embeddedCheckoutRef.current = null; } catch {}
+    };
+  }, [topupModalOpen, topupStage, topupCheckoutClientSecret, topupHostedUrl, openPaygoUrl, refreshUsageStatusOnce]);
 
   // Poll the backend pending record so we can show "credited" immediately without requiring a page refresh.
   useEffect(() => {
@@ -8856,9 +8969,9 @@ useEffect(() => {
     if (!API_BASE) return;
     if (!memberTopupWatching) return;
 
-    // Only meaningful for real members.
-    const mid = String(memberIdRef.current || "").trim();
-    if (!mid || isAnonMemberId(mid)) return;
+    // Meaningful for real members and visitor anon identities created by Connect.
+    const mid = String(memberIdRef.current || memberIdForLiveChat || "").trim();
+    if (!mid) return;
 
     let cancelled = false;
     const startedAt = memberTopupStartedAt || Date.now();
@@ -8881,7 +8994,7 @@ useEffect(() => {
 
         const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
         const brandKey = safeBrandKey(rawBrand);
-        const memberIdForBackend = (memberId || "").trim() || getOrCreateAnonMemberId(brandKey);
+        const memberIdForBackend = (memberId || memberIdForLiveChat || "").trim() || getOrCreateAnonMemberId(brandKey);
 
         const session_state: any = {
           ...(sessionStateRef.current as any),
@@ -8946,7 +9059,7 @@ useEffect(() => {
       cancelled = true;
       try { window.clearInterval(t); } catch (e) {}
     };
-  }, [API_BASE, memberTopupWatching, memberTopupStartedAt, memberId, companionKey, companionName, planName, planLabelOverride, rebrandingKey, rebranding, applyUsageStatusSnapshot]);
+  }, [API_BASE, memberTopupWatching, memberTopupStartedAt, memberId, memberIdForLiveChat, companionKey, companionName, planName, planLabelOverride, rebrandingKey, rebranding, applyUsageStatusSnapshot]);
 
 
   // Upgrade polling: while the user is in the upgrade flow, keep requesting the latest MEMBER_PLAN payload
@@ -13777,6 +13890,27 @@ const modePillControls = (
           </button>
 ) : null}
 
+          <button
+            type="button"
+            onClick={() => {
+              try { beginPaygoTopupForMember(); } catch (e) {}
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Add Minutes
+          </button>
+
           {/* Persistent Upgrade button (always visible; uses rebrandingKey UpgradeLink override, else Elaralo default). */}
           <button
             type="button"
@@ -13888,6 +14022,25 @@ const modePillControls = (
               </button>
             );
           })}
+
+          <button
+            key="add-minutes"
+            onClick={() => {
+              setShowModePicker(false);
+              try { beginPaygoTopupForMember(); } catch (e) {}
+            }}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 999,
+              border: "1px solid #ddd",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Add Minutes
+          </button>
 
           {/* Upgrade is always available (white-label URL override via rebrandingKey). */}
           <button
@@ -14024,6 +14177,13 @@ const modePillControls = (
     ui.usageBarHeight,
   ]);
 
+  const topupMinutesTotal = Math.max(1, Number(topupUnits || 1) || 1) * Math.max(1, Number(topupMinutesPerUnit || 30) || 30);
+  const topupEstimatedUnitAmountCents = /dulcemoon/i.test(String(companyName || rebranding || "")) ? 499 : 699;
+  const topupPriceText = formatCents(
+    topupAmountTotalCents > 0 ? topupAmountTotalCents : topupEstimatedUnitAmountCents * Math.max(1, Number(topupUnits || 1) || 1),
+    topupCurrency || "usd"
+  );
+
   return (
     <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={mainContainerStyle}>
 
@@ -14081,7 +14241,7 @@ const modePillControls = (
             padding: 16,
           }}
           onClick={() => {
-            if (topupStage !== "creating") closeTopupModal();
+            if (topupStage !== "creating" && topupStage !== "checkout") closeTopupModal();
           }}
         >
           <div
@@ -14098,75 +14258,106 @@ const modePillControls = (
           >
             {topupStage === "collect_email" ? (
               <>
-                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Add minutes to continue</div>
+                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Add Connect Voice Minutes</div>
                 <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35, marginBottom: 12 }}>
-                  Enter the <b>email you will use during the payment process</b>.
-                  <br />
-                  <b>The email must match the email used at checkout or the credit will not occur.</b>
+                  Each unit adds <b>{topupMinutesPerUnit}</b> minutes. Increase the unit count if you want to buy more.
+                  {topupRequiresEmail ? (
+                    <>
+                      <br />
+                      Enter the <b>email you will use during checkout</b> so your visitor minutes can be credited.
+                    </>
+                  ) : null}
                 </div>
 
-                <div
-                  style={{
-                    marginBottom: 12,
-                    padding: 12,
-                    borderRadius: 12,
-                    border: "1px solid rgba(255,255,255,0.14)",
-                    background: "rgba(255,255,255,0.06)",
-                  }}
-                >
-                  <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 4 }}>Want 1‑click top‑ups?</div>
-                  <div style={{ opacity: 0.9, fontSize: 12, lineHeight: 1.35 }}>
-                    Become a member to top up without typing your email. Members get instant credit after payment.
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                  <label style={{ fontWeight: 800, fontSize: 13, minWidth: 90 }}>Units</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={12}
+                    step={1}
+                    value={topupUnits}
+                    onChange={(e) => {
+                      const n = Math.max(1, Math.min(12, Number(e.target.value || 1) || 1));
+                      setTopupUnits(n);
+                      setTopupError("");
+                    }}
+                    style={{
+                      width: 92,
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "rgba(255,255,255,0.06)",
+                      color: "#fff",
+                      outline: "none",
+                    }}
+                  />
+                  <div style={{ opacity: 0.9, fontSize: 13 }}>
+                    {topupMinutesTotal} minutes{topupPriceText ? ` • ${topupPriceText}` : ""}
                   </div>
-                  <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                    <button
-                      type="button"
-                      onClick={() => handleBecomeMemberCta()}
+                </div>
+
+                {topupRequiresEmail ? (
+                  <>
+                    <div
                       style={{
-                        padding: "9px 11px",
+                        marginBottom: 12,
+                        padding: 12,
+                        borderRadius: 12,
+                        border: "1px solid rgba(255,255,255,0.14)",
+                        background: "rgba(255,255,255,0.06)",
+                      }}
+                    >
+                      <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 4 }}>Want 1-click top-ups?</div>
+                      <div style={{ opacity: 0.9, fontSize: 12, lineHeight: 1.35 }}>
+                        Become a member to top up without typing your email. Members get instant credit after payment.
+                      </div>
+                      <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                        <button
+                          type="button"
+                          onClick={() => handleBecomeMemberCta()}
+                          style={{
+                            padding: "9px 11px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(255,255,255,0.18)",
+                            background: "rgba(255,255,255,0.10)",
+                            color: "#ffffff",
+                            cursor: "pointer",
+                            fontWeight: 800,
+                          }}
+                          title="Upgrade or sign up to remove the email step"
+                        >
+                          Upgrade / Sign up
+                        </button>
+                      </div>
+                    </div>
+
+                    <input
+                      type="text"
+                      inputMode="email"
+                      autoComplete="email"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      value={topupEmail}
+                      onChange={(e) => {
+                        setTopupEmail(e.target.value);
+                        setTopupError("");
+                      }}
+                      placeholder="you@example.com"
+                      style={{
+                        width: "100%",
+                        padding: "10px 12px",
                         borderRadius: 10,
                         border: "1px solid rgba(255,255,255,0.18)",
-                        background: "rgba(255,255,255,0.10)",
-                        color: "#ffffff",
-                        cursor: "pointer",
-                        fontWeight: 800,
+                        background: "rgba(255,255,255,0.06)",
+                        color: "#fff",
+                        outline: "none",
+                        marginBottom: 10,
                       }}
-                      title="Upgrade or sign up to remove the email step"
-                    >
-                      Upgrade / Sign up
-                    </button>
-                  </div>
-                  <div style={{ opacity: 0.75, fontSize: 11, lineHeight: 1.35, marginTop: 8 }}>
-                    Tip: This opens the Upgrade page in a new tab. After you sign up/log in, come back here.
-                  </div>
-                </div>
-
-                <input
-                  // NOTE: type="text" avoids any browser/device-level character filtering.
-                  // We validate the email on submit; do not restrict characters while typing.
-                  type="text"
-                  inputMode="email"
-                  autoComplete="email"
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  spellCheck={false}
-                  value={topupEmail}
-                  onChange={(e) => {
-                    setTopupEmail(e.target.value);
-                    setTopupError("");
-                  }}
-                  placeholder="you@example.com"
-                  style={{
-                    width: "100%",
-                    padding: "10px 12px",
-                    borderRadius: 10,
-                    border: "1px solid rgba(255,255,255,0.18)",
-                    background: "rgba(255,255,255,0.06)",
-                    color: "#fff",
-                    outline: "none",
-                    marginBottom: 10,
-                  }}
-                />
+                    />
+                  </>
+                ) : null}
 
                 {topupError ? (
                   <div style={{ color: "#ffb4b4", fontSize: 12, marginBottom: 10, lineHeight: 1.35 }}>
@@ -14211,14 +14402,72 @@ const modePillControls = (
               <>
                 <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Preparing checkout…</div>
                 <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35 }}>
-                  Creating a pending top-up record so we can credit your minutes as soon as Wix confirms payment.
+                  Creating a secure Stripe Checkout session. If embedded checkout cannot open here, a hosted checkout tab will open automatically.
+                </div>
+              </>
+            ) : topupStage === "checkout" ? (
+              <>
+                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Secure checkout</div>
+                <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35, marginBottom: 10 }}>
+                  Complete payment below. If embedded checkout cannot open, use the hosted checkout fallback.
+                </div>
+                {topupError ? (
+                  <div style={{ color: "#ffe082", fontSize: 12, marginBottom: 10, lineHeight: 1.35 }}>{topupError}</div>
+                ) : null}
+                <div
+                  ref={topupCheckoutContainerRef}
+                  style={{
+                    minHeight: 420,
+                    borderRadius: 12,
+                    background: "#ffffff",
+                    overflow: "hidden",
+                    marginBottom: 12,
+                  }}
+                />
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  {topupHostedUrl ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTopupStage("waiting");
+                        openPaygoUrl(topupHostedUrl);
+                        setMemberTopupStartedAt(Date.now());
+                        setMemberTopupWatching(true);
+                      }}
+                      style={{
+                        padding: "10px 12px",
+                        borderRadius: 10,
+                        border: "1px solid rgba(255,255,255,0.18)",
+                        background: "rgba(255,255,255,0.10)",
+                        color: "#ffffff",
+                        cursor: "pointer",
+                        fontWeight: 700,
+                      }}
+                    >
+                      Open hosted checkout
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => closeTopupModal()}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      background: "transparent",
+                      color: "#ffffff",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Close
+                  </button>
                 </div>
               </>
             ) : topupStage === "waiting" ? (
               <>
                 <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Waiting for payment…</div>
                 <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35, marginBottom: 10 }}>
-                  Your payment link opens in a new tab. Once the payment completes, minutes will be credited automatically.
+                  Once Stripe confirms payment, minutes will be credited automatically. If a hosted checkout tab opened, return here after checkout completes.
                 </div>
 
                 {topupError ? (
