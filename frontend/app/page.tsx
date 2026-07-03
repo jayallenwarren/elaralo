@@ -1759,19 +1759,18 @@ const MODE_LABELS: Record<Mode, string> = {
 // - Intro  = internal friend
 // - Mate   = internal romantic
 // - Mature = internal intimate
-// DulceMoon current public plans:
-// - Free Trial -> Intro + Mate only; Mature is excluded
-// - Discover / Explore / Encounter -> Intro + Mate + Mature
+// Brand-aware plan -> mode availability mapping:
+// - DulceMoon Free Trial / visitors -> Intro + Mate only; Mature is excluded.
+// - DulceMoon paid subscribers, including hidden legacy plans such as Friend, -> Intro + Mate + Mature.
+// - Elaralo remains tiered: Discover=Intro, Explore=Intro+Mate, Encounter=Intro+Mate+Mature.
 // Legacy Intro/Mate/Intimate plan names are retained as hidden/backward-compatible aliases.
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Trial",
-  "Discover",
   "Explore",
   "Encounter",
   "Romantic",
   "Mature",
   "Pay as You Go",
-  "Test - Discover",
   "Test - Explore",
   "Test - Encounter",
   "Test - Romantic",
@@ -1779,23 +1778,24 @@ const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Test - Pay as You Go",
 ];
 
+const INTIMATE_ALLOWED_PLANS: PlanName[] = [
+  "Encounter",
+  "Mature",
+  "Pay as You Go",
+  "Test - Encounter",
+  "Test - Mature",
+  "Test - Pay as You Go",
+];
 
 function allowedModesForPlan(planName: PlanName): Mode[] {
+  // Elaralo tiered entitlement fallback:
+  //   Trial      -> Intro + Mate
+  //   Discover   -> Intro only
+  //   Explore    -> Intro + Mate
+  //   Encounter  -> Intro + Mate + Mature
   const modes: Mode[] = ["friend"];
   if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (
-    planName === "Discover" ||
-    planName === "Explore" ||
-    planName === "Encounter" ||
-    planName === "Test - Discover" ||
-    planName === "Test - Explore" ||
-    planName === "Test - Encounter" ||
-    planName === "Mature" ||
-    planName === "Test - Mature" ||
-    planName === "Pay as You Go" ||
-    planName === "Test - Pay as You Go"
-  )
-    modes.push("intimate");
+  if (INTIMATE_ALLOWED_PLANS.includes(planName)) modes.push("intimate");
   return modes;
 }
 
@@ -1818,6 +1818,42 @@ function clampAllowedModesForIdentity(memberId: string, modes: Mode[]): Mode[] {
   const mid = String(memberId || "").trim();
   if (!mid || isAnonMemberId(mid)) return ["friend", "romantic"];
   return modes;
+}
+
+function brandKeyForModeEntitlements(raw: unknown): string {
+  return String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function isDulceMoonBrandForModes(raw: unknown): boolean {
+  return brandKeyForModeEntitlements(raw) === "dulcemoon";
+}
+
+function isPaidSubscriberForBrandModes(memberId: string, planName: PlanName, loggedInValue: boolean): boolean {
+  const mid = String(memberId || "").trim();
+  if (!loggedInValue || !mid || isAnonMemberId(mid)) return false;
+  const plan = String(planName || "").trim().toLowerCase();
+  if (!plan || plan === "trial" || plan === "free trial" || plan === "visitor") return false;
+  return true;
+}
+
+function allowedModesForBrandContext(
+  brandName: unknown,
+  memberId: string,
+  loggedInValue: boolean,
+  planName: PlanName,
+  rawPlanMap: unknown,
+): Mode[] {
+  // DulceMoon business rule: every paid subscriber has all modes regardless of
+  // legacy/hidden Wix plan labels such as Friend, Premium, Romantic, etc.
+  if (isDulceMoonBrandForModes(brandName) && isPaidSubscriberForBrandModes(memberId, planName, loggedInValue)) {
+    return ["friend", "romantic", "intimate"];
+  }
+
+  // Free Trial / visitor still excludes Mature; Elaralo keeps its tiered plan map.
+  return clampAllowedModesForIdentity(memberId, allowedModesFromElaraloPlanMap(rawPlanMap, planName));
 }
 
 function fallbackModeForAllowedModes(modes: Mode[]): Mode {
@@ -11204,9 +11240,12 @@ useEffect(() => {
       // Requirement: the *Elaralo* entitlement plan determines how many mode pills exist.
       // The Wix `modePill` selects the initially-active mode (if allowed), but does NOT change how many pills are shown.
 
-      const nextAllowed = clampAllowedModesForIdentity(
+      const nextAllowed = allowedModesForBrandContext(
+        effectiveIncomingBrandName || incomingBrandName || companyName || rebranding,
         effectiveMemberId,
-        allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan)
+        incomingLoggedIn !== false,
+        effectivePlan,
+        rkParts?.elaraloPlanMap,
       );
       const desiredStartMode: Mode =
         nextAllowed.includes(desiredStartModeRaw) ? desiredStartModeRaw : fallbackModeForAllowedModes(nextAllowed);

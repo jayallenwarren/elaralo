@@ -5135,16 +5135,88 @@ def _contextual_mode_from_messages(user_text: str, current_mode: str, messages: 
 _MODE_ORDER: List[str] = ["friend", "romantic", "intimate"]
 
 
-def _allowed_modes_from_session_state(session_state: Dict[str, Any]) -> Optional[List[str]]:
-    """Read frontend entitlement mode limits from session_state.
+def _mode_brand_key_from_session_state(session_state: Dict[str, Any]) -> str:
+    """Return a compact brand key for mode-entitlement decisions.
 
-    The Connect UI is still the primary entitlement UI, but the backend must also
-    honor the same limits because context-mode switching can be triggered by the
-    conversation rather than a button click.  If no allowed-modes list is present,
-    return None to preserve legacy behavior.
+    This deliberately mirrors the Connect-side brand distinction:
+    - DulceMoon paid subscribers are entitled to all public modes.
+    - Elaralo keeps its tiered entitlement mapping.
+    """
+    state = session_state if isinstance(session_state, dict) else {}
+    try:
+        brand = _brand_from_session_state(state)
+    except Exception:
+        brand = ""
+    if not brand:
+        try:
+            brand = _usage_brand_from_session_state(state, {})
+        except Exception:
+            brand = ""
+    try:
+        return _compact_brand_key(_host_onboarding_safe_str(brand) or "")
+    except Exception:
+        return str(brand or "").strip().lower().replace(" ", "")
+
+
+def _mode_plan_key_from_session_state(session_state: Dict[str, Any]) -> str:
+    state = session_state if isinstance(session_state, dict) else {}
+    plan = ""
+    try:
+        plan = _extract_plan_name(state)
+    except Exception:
+        plan = ""
+    if not plan:
+        try:
+            rk = _extract_rebranding_key(state)
+            parsed = _parse_rebranding_key(rk) if rk else {}
+            plan = str(parsed.get("plan") or parsed.get("elaralo_plan_map") or "").strip()
+        except Exception:
+            plan = ""
+    try:
+        return _normalize_plan_name_for_limits(plan).strip().lower()
+    except Exception:
+        return str(plan or "").strip().lower()
+
+
+def _dulcemoon_paid_subscriber_all_modes(session_state: Dict[str, Any]) -> bool:
+    """DulceMoon paid subscribers have Intro + Mate + Mature.
+
+    Free Trial / visitors remain limited to Intro + Mate.
+    Elaralo remains tiered.
+    """
+    state = session_state if isinstance(session_state, dict) else {}
+    if _mode_brand_key_from_session_state(state) != "dulcemoon":
+        return False
+    try:
+        member_id = _extract_member_id(state)
+    except Exception:
+        member_id = ""
+    if not member_id or _is_anon_member_id(member_id):
+        return False
+    plan_key = _mode_plan_key_from_session_state(state)
+    if not plan_key or plan_key in {"trial", "free trial", "free", "visitor"}:
+        return False
+    return True
+
+
+def _allowed_modes_from_session_state(session_state: Dict[str, Any]) -> Optional[List[str]]:
+    """Read backend-enforced mode entitlements from session_state.
+
+    Brand-specific rule:
+      - DulceMoon paid subscribers: Intro + Mate + Mature.
+      - DulceMoon Free Trial / visitors: Intro + Mate.
+      - Elaralo: use the tiered mode list supplied by Connect.
+
+    The backend must be at least as permissive as the intended brand entitlement for
+    DulceMoon so a stale/legacy Wix mode map such as Friend/Intro cannot block Mate
+    for paying DulceMoon subscribers.
     """
     if not isinstance(session_state, dict):
         return None
+
+    if _dulcemoon_paid_subscriber_all_modes(session_state):
+        return list(_MODE_ORDER)
+
     raw = (
         session_state.get("allowed_modes")
         or session_state.get("allowedModes")
