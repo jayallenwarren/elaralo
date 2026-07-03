@@ -660,8 +660,8 @@ USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
 # ----------------------------
 # Dynamic price_data is used instead of Stripe Price IDs.
 # Brand-specific defaults match current product decisions:
-#   Elaralo:   30 minutes/unit @ $6.99
-#   DulceMoon: 30 minutes/unit @ $4.99
+#   Elaralo:   30 minutes/unit @ $4.99
+#   DulceMoon: 30 minutes/unit @ $6.99
 STRIPE_PAYGO_ENABLED = str(os.getenv("STRIPE_PAYGO_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 STRIPE_SECRET_KEY = (os.getenv("STRIPE_SECRET_KEY", "") or "").strip()
 STRIPE_PUBLISHABLE_KEY = (os.getenv("STRIPE_PUBLISHABLE_KEY", "") or os.getenv("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY", "") or "").strip()
@@ -672,8 +672,8 @@ STRIPE_PAYGO_MIN_UNITS = _env_int("STRIPE_PAYGO_MIN_UNITS", 1)
 STRIPE_PAYGO_MAX_UNITS = _env_int("STRIPE_PAYGO_MAX_UNITS", 12)
 STRIPE_PAYGO_MINUTES_ELARALO = _env_int("STRIPE_PAYGO_MINUTES_ELARALO", _env_int("STRIPE_PAYGO_UNIT_MINUTES_ELARALO", 30))
 STRIPE_PAYGO_MINUTES_DULCEMOON = _env_int("STRIPE_PAYGO_MINUTES_DULCEMOON", _env_int("STRIPE_PAYGO_UNIT_MINUTES_DULCEMOON", 30))
-STRIPE_PAYGO_AMOUNT_CENTS_ELARALO = _env_int("STRIPE_PAYGO_AMOUNT_CENTS_ELARALO", _env_int("STRIPE_PAYGO_UNIT_AMOUNT_CENTS_ELARALO", 699))
-STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON = _env_int("STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON", _env_int("STRIPE_PAYGO_UNIT_AMOUNT_CENTS_DULCEMOON", 499))
+STRIPE_PAYGO_AMOUNT_CENTS_ELARALO = _env_int("STRIPE_PAYGO_AMOUNT_CENTS_ELARALO", _env_int("STRIPE_PAYGO_UNIT_AMOUNT_CENTS_ELARALO", 499))
+STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON = _env_int("STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON", _env_int("STRIPE_PAYGO_UNIT_AMOUNT_CENTS_DULCEMOON", 699))
 STRIPE_PAYGO_PUBLIC_BASE_URL = (os.getenv("STRIPE_PAYGO_PUBLIC_BASE_URL", "") or os.getenv("NEXT_PUBLIC_APP_BASE_URL", "") or os.getenv("PUBLIC_APP_BASE_URL", "") or "").strip().rstrip("/")
 STRIPE_PAYGO_PRODUCT_NAME_ELARALO = (os.getenv("STRIPE_PAYGO_PRODUCT_NAME_ELARALO", "Elaralo Connect Voice Minutes") or "Elaralo Connect Voice Minutes").strip()
 STRIPE_PAYGO_PRODUCT_NAME_DULCEMOON = (os.getenv("STRIPE_PAYGO_PRODUCT_NAME_DULCEMOON", "DulceMoon Connect Voice Minutes") or "DulceMoon Connect Voice Minutes").strip()
@@ -797,8 +797,8 @@ def _stripe_paygo_unit_minutes(brand: Any) -> int:
 def _stripe_paygo_unit_amount_cents(brand: Any) -> int:
     key = _stripe_paygo_brand_key(brand)
     if key == "dulcemoon":
-        return max(50, int(STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON or 499))
-    return max(50, int(STRIPE_PAYGO_AMOUNT_CENTS_ELARALO or 699))
+        return max(50, int(STRIPE_PAYGO_AMOUNT_CENTS_DULCEMOON or 699))
+    return max(50, int(STRIPE_PAYGO_AMOUNT_CENTS_ELARALO or 499))
 
 
 def _stripe_paygo_product_name(brand: Any) -> str:
@@ -13881,12 +13881,19 @@ def _stripe_create_checkout_session_sync(
     if email:
         form["customer_email"] = email
     origin = (return_origin or "").rstrip("/")
-    if ui_mode == "embedded":
-        form["ui_mode"] = "embedded"
+    ui_mode_key = re.sub(r"[^a-z0-9]+", "_", str(ui_mode or "").strip().lower()).strip("_")
+    if ui_mode_key in {"embedded", "embedded_page"}:
+        # Stripe's newer API versions replaced the old `embedded` enum with
+        # `embedded_page`.  Sending the legacy value now returns a 400.
+        form["ui_mode"] = "embedded_page"
         form["return_url"] = f"{origin}/?stripe_paygo=return&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=return&checkout_session_id={CHECKOUT_SESSION_ID}"
+        ui_mode_store = "embedded_page"
     else:
+        # Be explicit for the hosted fallback on newer Stripe API versions.
+        form["ui_mode"] = "hosted_page"
         form["success_url"] = f"{origin}/?stripe_paygo=success&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=success&checkout_session_id={CHECKOUT_SESSION_ID}"
         form["cancel_url"] = f"{origin}/?stripe_paygo=cancel&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=cancel&checkout_session_id={CHECKOUT_SESSION_ID}"
+        ui_mode_store = "hosted_page"
 
     session = _stripe_request_form_sync("/v1/checkout/sessions", form)
     sid = _stripe_paygo_clean_text(session.get("id"))
@@ -13910,7 +13917,7 @@ def _stripe_create_checkout_session_sync(
             "stripe_checkout_session_id": sid,
             "stripe_payment_intent_id": _stripe_paygo_clean_text(session.get("payment_intent")),
             "stripe_customer_id": _stripe_paygo_clean_text(session.get("customer")),
-            "stripe_ui_mode": ui_mode,
+            "stripe_ui_mode": ui_mode_store,
             "status": "created",
         }
     )
@@ -13956,43 +13963,61 @@ async def stripe_paygo_create_checkout_session(request: Request):
     paygo_group_id = str(uuid.uuid4())
 
     def _work() -> Dict[str, Any]:
-        embedded = _stripe_create_checkout_session_sync(
-            ui_mode="embedded",
-            brand=brand,
-            member_id=member_id,
-            email=email,
-            identity_key=identity_key,
-            connect_session_id=connect_session_id,
-            avatar=avatar,
-            companion_key=companion_key,
-            companion_type=companion_type,
-            units=units,
-            minutes_per_unit=minutes_per_unit,
-            unit_amount_cents=unit_amount_cents,
-            currency=currency,
-            product_name=product_name,
-            return_origin=return_origin,
-            paygo_group_id=paygo_group_id,
-        )
-        hosted = _stripe_create_checkout_session_sync(
-            ui_mode="hosted",
-            brand=brand,
-            member_id=member_id,
-            email=email,
-            identity_key=identity_key,
-            connect_session_id=connect_session_id,
-            avatar=avatar,
-            companion_key=companion_key,
-            companion_type=companion_type,
-            units=units,
-            minutes_per_unit=minutes_per_unit,
-            unit_amount_cents=unit_amount_cents,
-            currency=currency,
-            product_name=product_name,
-            return_origin=return_origin,
-            paygo_group_id=paygo_group_id,
-        )
-        return {"embedded": embedded, "hosted": hosted}
+        embedded: Dict[str, Any] = {}
+        hosted: Dict[str, Any] = {}
+        embedded_error = ""
+        hosted_error = ""
+
+        try:
+            embedded = _stripe_create_checkout_session_sync(
+                ui_mode="embedded_page",
+                brand=brand,
+                member_id=member_id,
+                email=email,
+                identity_key=identity_key,
+                connect_session_id=connect_session_id,
+                avatar=avatar,
+                companion_key=companion_key,
+                companion_type=companion_type,
+                units=units,
+                minutes_per_unit=minutes_per_unit,
+                unit_amount_cents=unit_amount_cents,
+                currency=currency,
+                product_name=product_name,
+                return_origin=return_origin,
+                paygo_group_id=paygo_group_id,
+            )
+        except Exception as exc:
+            embedded_error = str(exc)
+
+        # Create the hosted-page fallback even if embedded-page creation fails.
+        # That lets the browser continue by opening Stripe Checkout in a new tab.
+        try:
+            hosted = _stripe_create_checkout_session_sync(
+                ui_mode="hosted_page",
+                brand=brand,
+                member_id=member_id,
+                email=email,
+                identity_key=identity_key,
+                connect_session_id=connect_session_id,
+                avatar=avatar,
+                companion_key=companion_key,
+                companion_type=companion_type,
+                units=units,
+                minutes_per_unit=minutes_per_unit,
+                unit_amount_cents=unit_amount_cents,
+                currency=currency,
+                product_name=product_name,
+                return_origin=return_origin,
+                paygo_group_id=paygo_group_id,
+            )
+        except Exception as exc:
+            hosted_error = str(exc)
+
+        if not embedded and not hosted:
+            detail = "; ".join([x for x in [f"embedded_page: {embedded_error}" if embedded_error else "", f"hosted_page: {hosted_error}" if hosted_error else ""] if x])
+            raise RuntimeError(detail or "Stripe checkout setup failed")
+        return {"embedded": embedded, "hosted": hosted, "embedded_error": embedded_error, "hosted_error": hosted_error}
 
     try:
         created = await run_in_threadpool(_work)
@@ -14019,6 +14044,8 @@ async def stripe_paygo_create_checkout_session(request: Request):
         "publishable_key": STRIPE_PUBLISHABLE_KEY,
         "hosted_checkout_session_id": _stripe_paygo_clean_text(hosted.get("id")),
         "hosted_url": _stripe_paygo_clean_text(hosted.get("url")),
+        "embedded_error": _stripe_paygo_clean_text(created.get("embedded_error")),
+        "hosted_error": _stripe_paygo_clean_text(created.get("hosted_error")),
     }
 
 

@@ -56,6 +56,10 @@ function safeLower(value: any): string {
   return safeText(value).toLowerCase();
 }
 
+function isAnonMemberId(value: any): boolean {
+  return safeLower(value).startsWith("anon:");
+}
+
 function stripAvatarCollisionSuffix(value: any): string {
   return safeText(value).replace(/-\d{9}$/, "");
 }
@@ -406,7 +410,13 @@ export default function MyElaraloCompanionSelectorClient() {
   const displayName = safeText(memberPayload.displayName || memberPayload.display_name || memberPayload.userName || memberPayload.user_name);
   const loggedIn = Boolean(memberPayload.loggedIn ?? memberPayload.logged_in);
   const brandName = safeText(memberPayload.brand) || "Elaralo";
-  const isElaraloCoreBrand = safeLower(brandName || "Elaralo") === "elaralo";
+  const brandKey = safeLower(brandName || "Elaralo").replace(/[^a-z0-9]+/g, "");
+  const isElaraloCoreBrand = brandKey === "elaralo";
+  // DulceMoon should behave like the Elaralo companion architecture while
+  // preserving the current product UX: when there is only one visible
+  // companion, open Connect directly for both members and visitors.
+  const shouldAutoOpenSingle = autoOpenSingle || (!isElaraloCoreBrand && brandKey === "dulcemoon");
+  const sessionDisplayName = displayName || (memberId && !isAnonMemberId(memberId) ? memberId : "");
 
   useEffect(() => {
     let cancelled = false;
@@ -427,7 +437,7 @@ export default function MyElaraloCompanionSelectorClient() {
         // access.  When auto-opening a single companion, briefly wait for the
         // Wix MEMBER_PLAN payload so the Connect handoff carries plan minutes,
         // mode entitlement, rebrandingKey, and member/visitor identity.
-        if (autoOpenSingle && !externalPayloadSeen && !contextGraceElapsed) {
+        if (shouldAutoOpenSingle && !externalPayloadSeen && !contextGraceElapsed) {
           setError("");
           setLoading(true);
           return;
@@ -464,7 +474,7 @@ export default function MyElaraloCompanionSelectorClient() {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, autoOpenSingle, brandName, contextGraceElapsed, externalPayloadSeen, isElaraloCoreBrand, loggedIn, memberId]);
+  }, [API_BASE, brandName, contextGraceElapsed, externalPayloadSeen, isElaraloCoreBrand, loggedIn, memberId, shouldAutoOpenSingle]);
 
   const companionTypeOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.companionType).filter(Boolean))).sort(), [cards]);
   const generationOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.generation).filter(Boolean))).sort(), [cards]);
@@ -613,12 +623,12 @@ export default function MyElaraloCompanionSelectorClient() {
 
 
   useEffect(() => {
-    if (!autoOpenSingle || loading || error || autoOpenedSingleRef.current) return;
+    if (!shouldAutoOpenSingle || loading || error || autoOpenedSingleRef.current) return;
     if (cards.length !== 1) return;
     autoOpenedSingleRef.current = true;
     const timer = window.setTimeout(() => openConnect(cards[0]), 80);
     return () => window.clearTimeout(timer);
-  }, [autoOpenSingle, cards, error, loading, openConnect]);
+  }, [shouldAutoOpenSingle, cards, error, loading, openConnect]);
 
   const containerStyle: React.CSSProperties = {
     minHeight: "100vh",
@@ -720,7 +730,7 @@ export default function MyElaraloCompanionSelectorClient() {
             </div>
             <div style={{ minWidth: 220, textAlign: "right" }}>
               <div style={{ fontSize: 13, color: "#64748b", marginBottom: 4 }}>Member session</div>
-              <div style={{ fontSize: 28, fontWeight: 800 }}>{displayName || memberId || ""}</div>
+              <div style={{ fontSize: 28, fontWeight: 800 }}>{sessionDisplayName}</div>
               <div style={{ fontSize: 13, color: "#64748b", marginTop: 4 }}>{brandName || "Elaralo"}</div>
             </div>
           </div>

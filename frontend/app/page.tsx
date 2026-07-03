@@ -14178,7 +14178,7 @@ const modePillControls = (
   ]);
 
   const topupMinutesTotal = Math.max(1, Number(topupUnits || 1) || 1) * Math.max(1, Number(topupMinutesPerUnit || 30) || 30);
-  const topupEstimatedUnitAmountCents = /dulcemoon/i.test(String(companyName || rebranding || "")) ? 499 : 699;
+  const topupEstimatedUnitAmountCents = /dulcemoon/i.test(String(companyName || rebranding || "")) ? 699 : 499;
   const topupPriceText = formatCents(
     topupAmountTotalCents > 0 ? topupAmountTotalCents : topupEstimatedUnitAmountCents * Math.max(1, Number(topupUnits || 1) || 1),
     topupCurrency || "usd"
