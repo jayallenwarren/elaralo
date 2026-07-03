@@ -684,6 +684,23 @@ STRIPE_PAYGO_PUBLIC_BASE_URL = (os.getenv("STRIPE_PAYGO_PUBLIC_BASE_URL", "") or
 STRIPE_PAYGO_PRODUCT_NAME_ELARALO = (os.getenv("STRIPE_PAYGO_PRODUCT_NAME_ELARALO", "Elaralo Connect Voice Minutes") or "Elaralo Connect Voice Minutes").strip()
 STRIPE_PAYGO_PRODUCT_NAME_DULCEMOON = (os.getenv("STRIPE_PAYGO_PRODUCT_NAME_DULCEMOON", "DulceMoon Connect Voice Minutes") or "DulceMoon Connect Voice Minutes").strip()
 
+# Stripe PayGo purchase receipt email.
+# The purchase itself must never fail because receipt email delivery fails; email
+# status is persisted on stripe_paygo_transactions for operational review/resend.
+PAYGO_EMAIL_ENABLED = str(os.getenv("PAYGO_EMAIL_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+PAYGO_EMAIL_PROVIDER = (os.getenv("PAYGO_EMAIL_PROVIDER", "sendgrid") or "sendgrid").strip().lower()
+PAYGO_EMAIL_FROM = (os.getenv("PAYGO_EMAIL_FROM", "") or "").strip()
+PAYGO_EMAIL_FROM_NAME = (os.getenv("PAYGO_EMAIL_FROM_NAME", "Elaralo Connect") or "Elaralo Connect").strip()
+PAYGO_EMAIL_REPLY_TO = (os.getenv("PAYGO_EMAIL_REPLY_TO", "") or "").strip()
+PAYGO_EMAIL_BCC = (os.getenv("PAYGO_EMAIL_BCC", "") or "").strip()
+PAYGO_EMAIL_SUBJECT_PREFIX = (os.getenv("PAYGO_EMAIL_SUBJECT_PREFIX", "Your Connect minutes purchase") or "Your Connect minutes purchase").strip()
+SENDGRID_API_KEY = (os.getenv("SENDGRID_API_KEY", "") or "").strip()
+SMTP_HOST = (os.getenv("SMTP_HOST", "") or "").strip()
+SMTP_PORT = _env_int("SMTP_PORT", 587)
+SMTP_USERNAME = (os.getenv("SMTP_USERNAME", "") or "").strip()
+SMTP_PASSWORD = (os.getenv("SMTP_PASSWORD", "") or "").strip()
+SMTP_USE_TLS = str(os.getenv("SMTP_USE_TLS", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+SMTP_USE_SSL = str(os.getenv("SMTP_USE_SSL", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _stripe_paygo_clean_text(value: Any) -> str:
@@ -13692,6 +13709,12 @@ def _stripe_paygo_db_ensure_schema_sync() -> None:
                   status TEXT NOT NULL,
                   credited_at INTEGER,
                   raw_event_json TEXT,
+                  receipt_email TEXT,
+                  receipt_email_status TEXT,
+                  receipt_email_sent_at INTEGER,
+                  receipt_email_provider TEXT,
+                  receipt_email_message_id TEXT,
+                  receipt_email_error TEXT,
                   failure_reason TEXT
                 );
                 """
@@ -13700,6 +13723,19 @@ def _stripe_paygo_db_ensure_schema_sync() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_paygo_identity ON stripe_paygo_transactions(identity_key);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_paygo_group ON stripe_paygo_transactions(paygo_group_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_paygo_status ON stripe_paygo_transactions(status);")
+            # v9.2.37 receipt-email columns for existing deployments.
+            existing_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(stripe_paygo_transactions);").fetchall()}
+            for col_name, col_type in [
+                ("receipt_email", "TEXT"),
+                ("receipt_email_status", "TEXT"),
+                ("receipt_email_sent_at", "INTEGER"),
+                ("receipt_email_provider", "TEXT"),
+                ("receipt_email_message_id", "TEXT"),
+                ("receipt_email_error", "TEXT"),
+            ]:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE stripe_paygo_transactions ADD COLUMN {col_name} {col_type};")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_paygo_receipt_status ON stripe_paygo_transactions(receipt_email_status);")
             conn.commit()
         finally:
             try:
@@ -13719,8 +13755,8 @@ def _stripe_paygo_insert_transaction_sync(row: Dict[str, Any]) -> None:
                   paygo_group_id, brand, member_id, email, identity_key, connect_session_id,
                   avatar, companion_key, companion_type, units, minutes_per_unit, minutes_total,
                   unit_amount_cents, amount_total_cents, currency, stripe_checkout_session_id,
-                  stripe_payment_intent_id, stripe_customer_id, stripe_ui_mode, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                  stripe_payment_intent_id, stripe_customer_id, stripe_ui_mode, status, receipt_email, receipt_email_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     row.get("paygo_group_id"), row.get("brand"), row.get("member_id"), row.get("email"), row.get("identity_key"),
@@ -13729,6 +13765,8 @@ def _stripe_paygo_insert_transaction_sync(row: Dict[str, Any]) -> None:
                     int(row.get("unit_amount_cents") or 0), int(row.get("amount_total_cents") or 0), row.get("currency"),
                     row.get("stripe_checkout_session_id"), row.get("stripe_payment_intent_id"), row.get("stripe_customer_id"),
                     row.get("stripe_ui_mode"), row.get("status") or "created",
+                    row.get("receipt_email") or row.get("email") or "",
+                    row.get("receipt_email_status") or "pending",
                 ),
             )
             conn.commit()
@@ -13828,6 +13866,263 @@ def _stripe_paygo_mark_sync(session_id: str, *, status: str, payment_intent: str
                 pass
 
 
+
+def _stripe_paygo_mark_receipt_sync(
+    session_id: str,
+    *,
+    email: str = "",
+    status: str = "",
+    provider: str = "",
+    message_id: str = "",
+    error: str = "",
+    sent: bool = False,
+) -> None:
+    _stripe_paygo_db_ensure_schema_sync()
+    sid = _stripe_paygo_clean_text(session_id)
+    if not sid:
+        return
+    with _STRIPE_PAYGO_LOCK:
+        conn = _econnect_conn()
+        try:
+            conn.execute(
+                """
+                UPDATE stripe_paygo_transactions
+                   SET receipt_email = COALESCE(NULLIF(?, ''), receipt_email),
+                       receipt_email_status = COALESCE(NULLIF(?, ''), receipt_email_status),
+                       receipt_email_provider = COALESCE(NULLIF(?, ''), receipt_email_provider),
+                       receipt_email_message_id = COALESCE(NULLIF(?, ''), receipt_email_message_id),
+                       receipt_email_error = COALESCE(NULLIF(?, ''), receipt_email_error),
+                       receipt_email_sent_at = CASE WHEN ? THEN ? ELSE receipt_email_sent_at END,
+                       update_datetime = CURRENT_TIMESTAMP
+                 WHERE stripe_checkout_session_id = ?;
+                """,
+                (
+                    _stripe_paygo_email_norm(email),
+                    _stripe_paygo_clean_text(status),
+                    _stripe_paygo_clean_text(provider),
+                    _stripe_paygo_clean_text(message_id),
+                    _stripe_paygo_clean_text(error)[:1000],
+                    1 if sent else 0,
+                    int(time.time()) if sent else None,
+                    sid,
+                ),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _paygo_email_money(cents: Any, currency: Any) -> str:
+    try:
+        amount = int(cents or 0) / 100.0
+    except Exception:
+        amount = 0.0
+    cur = _stripe_paygo_clean_text(currency or "usd").upper() or "USD"
+    if cur == "USD":
+        return f"${amount:,.2f}"
+    return f"{amount:,.2f} {cur}"
+
+
+def _paygo_email_html_escape(value: Any) -> str:
+    text = _stripe_paygo_clean_text(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _paygo_email_subject(brand: str, minutes: int) -> str:
+    b = _stripe_paygo_brand(brand)
+    prefix = PAYGO_EMAIL_SUBJECT_PREFIX or "Your Connect minutes purchase"
+    return f"{prefix}: {minutes} {b} Connect minutes added"
+
+
+def _paygo_email_body(row: Dict[str, Any], session_obj: Dict[str, Any]) -> Tuple[str, str]:
+    brand = _stripe_paygo_brand(row.get("brand") or (session_obj.get("metadata") or {}).get("brand") or "Elaralo")
+    minutes = int(row.get("minutes_total") or (session_obj.get("metadata") or {}).get("minutes_total") or 0)
+    units = int(row.get("units") or (session_obj.get("metadata") or {}).get("units") or 1)
+    unit_minutes = int(row.get("minutes_per_unit") or 30)
+    amount_cents = int(row.get("amount_total_cents") or session_obj.get("amount_total") or 0)
+    currency = _stripe_paygo_clean_text(row.get("currency") or session_obj.get("currency") or STRIPE_CURRENCY or "usd")
+    checkout_id = _stripe_paygo_clean_text(row.get("stripe_checkout_session_id") or session_obj.get("id"))
+    avatar = _stripe_paygo_clean_text(row.get("avatar") or (session_obj.get("metadata") or {}).get("avatar"))
+    companion_key = _stripe_paygo_clean_text(row.get("companion_key") or (session_obj.get("metadata") or {}).get("companion_key"))
+    display_companion = avatar or companion_key
+    money = _paygo_email_money(amount_cents, currency)
+    when = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        f"Thank you for your {brand} Connect minutes purchase.",
+        "",
+        f"Minutes added: {minutes}",
+        f"Units purchased: {units} unit(s) × {unit_minutes} minutes",
+        f"Amount: {money}",
+    ]
+    if display_companion:
+        lines.append(f"Companion: {display_companion}")
+    lines.extend([
+        f"Checkout session: {checkout_id}",
+        f"Processed: {when}",
+        "",
+        "Your minutes have been added to your Connect balance. You can return to Connect and continue chatting.",
+    ])
+    text = "\n".join(lines)
+
+    html = f"""
+<!doctype html>
+<html><body style="margin:0;padding:24px;background:#f6f7fb;font-family:Arial,sans-serif;color:#1f2937;">
+  <div style="max-width:620px;margin:0 auto;background:#ffffff;border-radius:18px;padding:24px;border:1px solid #e5e7eb;">
+    <h2 style="margin:0 0 12px;color:#111827;">{_paygo_email_html_escape(brand)} Connect minutes added</h2>
+    <p style="margin:0 0 18px;">Thank you for your purchase. Your minutes have been added to your Connect balance.</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+      <tr><td style="padding:8px 0;color:#6b7280;">Minutes added</td><td style="padding:8px 0;text-align:right;font-weight:700;">{minutes}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;">Units purchased</td><td style="padding:8px 0;text-align:right;">{units} × {unit_minutes} minutes</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280;">Amount</td><td style="padding:8px 0;text-align:right;">{_paygo_email_html_escape(money)}</td></tr>
+      {f'<tr><td style="padding:8px 0;color:#6b7280;">Companion</td><td style="padding:8px 0;text-align:right;">{_paygo_email_html_escape(display_companion)}</td></tr>' if display_companion else ''}
+      <tr><td style="padding:8px 0;color:#6b7280;">Processed</td><td style="padding:8px 0;text-align:right;">{_paygo_email_html_escape(when)}</td></tr>
+    </table>
+    <p style="font-size:12px;color:#6b7280;margin-top:22px;">Checkout session: {_paygo_email_html_escape(checkout_id)}</p>
+  </div>
+</body></html>
+""".strip()
+    return text, html
+
+
+def _paygo_email_send_sendgrid_sync(to_email: str, subject: str, text_body: str, html_body: str) -> Dict[str, Any]:
+    if not SENDGRID_API_KEY:
+        return {"ok": False, "error": "SENDGRID_API_KEY is not configured"}
+    if not PAYGO_EMAIL_FROM:
+        return {"ok": False, "error": "PAYGO_EMAIL_FROM is not configured"}
+    import requests  # type: ignore
+    personalizations: Dict[str, Any] = {"to": [{"email": to_email}]}
+    if PAYGO_EMAIL_BCC:
+        personalizations["bcc"] = [{"email": e.strip()} for e in PAYGO_EMAIL_BCC.split(",") if e.strip()]
+    payload: Dict[str, Any] = {
+        "personalizations": [personalizations],
+        "from": {"email": PAYGO_EMAIL_FROM, "name": PAYGO_EMAIL_FROM_NAME or PAYGO_EMAIL_FROM},
+        "subject": subject,
+        "content": [
+            {"type": "text/plain", "value": text_body},
+            {"type": "text/html", "value": html_body},
+        ],
+    }
+    if PAYGO_EMAIL_REPLY_TO:
+        payload["reply_to"] = {"email": PAYGO_EMAIL_REPLY_TO}
+    resp = requests.post(
+        "https://api.sendgrid.com/v3/mail/send",
+        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    message_id = resp.headers.get("x-message-id", "")
+    if resp.status_code not in (200, 202):
+        return {"ok": False, "error": f"SendGrid error {resp.status_code}: {resp.text[:500]}", "message_id": message_id}
+    return {"ok": True, "provider": "sendgrid", "message_id": message_id}
+
+
+def _paygo_email_send_smtp_sync(to_email: str, subject: str, text_body: str, html_body: str) -> Dict[str, Any]:
+    if not SMTP_HOST:
+        return {"ok": False, "error": "SMTP_HOST is not configured"}
+    if not PAYGO_EMAIL_FROM:
+        return {"ok": False, "error": "PAYGO_EMAIL_FROM is not configured"}
+    import smtplib
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{PAYGO_EMAIL_FROM_NAME} <{PAYGO_EMAIL_FROM}>" if PAYGO_EMAIL_FROM_NAME else PAYGO_EMAIL_FROM
+    msg["To"] = to_email
+    if PAYGO_EMAIL_REPLY_TO:
+        msg["Reply-To"] = PAYGO_EMAIL_REPLY_TO
+    if PAYGO_EMAIL_BCC:
+        msg["Bcc"] = PAYGO_EMAIL_BCC
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+    if SMTP_USE_SSL:
+        server = smtplib.SMTP_SSL(SMTP_HOST, int(SMTP_PORT or 465), timeout=30)
+    else:
+        server = smtplib.SMTP(SMTP_HOST, int(SMTP_PORT or 587), timeout=30)
+    try:
+        if SMTP_USE_TLS and not SMTP_USE_SSL:
+            server.starttls()
+        if SMTP_USERNAME or SMTP_PASSWORD:
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg)
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    return {"ok": True, "provider": "smtp", "message_id": ""}
+
+
+def _paygo_email_send_sync(to_email: str, subject: str, text_body: str, html_body: str) -> Dict[str, Any]:
+    email = _stripe_paygo_email_norm(to_email)
+    if not email:
+        return {"ok": False, "skipped": True, "error": "missing recipient email"}
+    if not PAYGO_EMAIL_ENABLED:
+        return {"ok": False, "skipped": True, "error": "PAYGO_EMAIL_ENABLED is not enabled"}
+    provider = (PAYGO_EMAIL_PROVIDER or "sendgrid").strip().lower()
+    try:
+        if provider == "sendgrid":
+            return _paygo_email_send_sendgrid_sync(email, subject, text_body, html_body)
+        if provider == "smtp":
+            return _paygo_email_send_smtp_sync(email, subject, text_body, html_body)
+        return {"ok": False, "skipped": True, "error": f"unsupported PAYGO_EMAIL_PROVIDER: {provider}"}
+    except Exception as exc:
+        return {"ok": False, "provider": provider, "error": str(exc)}
+
+
+def _stripe_paygo_receipt_email_from_session(row: Dict[str, Any], session_obj: Dict[str, Any]) -> str:
+    candidates: List[Any] = [
+        row.get("receipt_email"),
+        row.get("email"),
+        session_obj.get("customer_email"),
+    ]
+    details = session_obj.get("customer_details") if isinstance(session_obj.get("customer_details"), dict) else {}
+    candidates.append(details.get("email"))
+    meta = session_obj.get("metadata") if isinstance(session_obj.get("metadata"), dict) else {}
+    candidates.append(meta.get("email"))
+    for c in candidates:
+        em = _stripe_paygo_email_norm(c)
+        if em:
+            return em
+    return ""
+
+
+def _stripe_paygo_send_receipt_for_session_sync(session_id: str, session_obj: Optional[Dict[str, Any]] = None, *, force: bool = False, override_email: str = "") -> Dict[str, Any]:
+    sid = _stripe_paygo_clean_text(session_id)
+    if not sid:
+        return {"ok": False, "error": "missing checkout_session_id"}
+    row = _stripe_paygo_session_row_sync(sid)
+    if not row:
+        return {"ok": False, "error": "PayGo transaction not found"}
+    if not force and _stripe_paygo_clean_text(row.get("receipt_email_status")).lower() == "sent":
+        return {"ok": True, "skipped": True, "reason": "receipt already sent"}
+    session_obj = session_obj if isinstance(session_obj, dict) else {}
+    email = _stripe_paygo_email_norm(override_email) or _stripe_paygo_receipt_email_from_session(row, session_obj)
+    if not email:
+        _stripe_paygo_mark_receipt_sync(sid, status="skipped", error="missing customer email")
+        return {"ok": False, "skipped": True, "error": "missing customer email"}
+    text_body, html_body = _paygo_email_body(row, session_obj)
+    subject = _paygo_email_subject(str(row.get("brand") or "Elaralo"), int(row.get("minutes_total") or 0))
+    res = _paygo_email_send_sync(email, subject, text_body, html_body)
+    provider = _stripe_paygo_clean_text(res.get("provider") or PAYGO_EMAIL_PROVIDER)
+    message_id = _stripe_paygo_clean_text(res.get("message_id"))
+    if res.get("ok"):
+        _stripe_paygo_mark_receipt_sync(sid, email=email, status="sent", provider=provider, message_id=message_id, error="", sent=True)
+        return {"ok": True, "sent": True, "email": email, "provider": provider, "message_id": message_id}
+    status = "skipped" if res.get("skipped") else "failed"
+    err = _stripe_paygo_clean_text(res.get("error") or res)
+    _stripe_paygo_mark_receipt_sync(sid, email=email, status=status, provider=provider, error=err, sent=False)
+    return {"ok": False, "email": email, "status": status, "provider": provider, "error": err}
+
+
 def _stripe_request_form_sync(path: str, form: Dict[str, Any]) -> Dict[str, Any]:
     if not STRIPE_SECRET_KEY:
         raise RuntimeError("STRIPE_SECRET_KEY is not configured")
@@ -13915,6 +14210,11 @@ def _stripe_create_checkout_session_sync(
     }
     if email:
         form["customer_email"] = email
+        # Also ask Stripe to attach a receipt email to the PaymentIntent.
+        # Custom PayGo receipt email is sent by our webhook below; this is a
+        # harmless additional hint for Stripe-native receipts if enabled on the
+        # Stripe account.
+        form["payment_intent_data[receipt_email]"] = email
     checkout_return_base = (return_origin or "").strip()
     ui_mode_key = re.sub(r"[^a-z0-9]+", "_", str(ui_mode or "").strip().lower()).strip("_")
     if ui_mode_key in {"embedded", "embedded_page"}:
@@ -13956,6 +14256,8 @@ def _stripe_create_checkout_session_sync(
             "stripe_customer_id": _stripe_paygo_clean_text(session.get("customer")),
             "stripe_ui_mode": ui_mode_store,
             "status": "created",
+            "receipt_email": email,
+            "receipt_email_status": "pending",
         }
     )
     return session
@@ -14142,7 +14444,10 @@ def _stripe_paygo_process_completed_session_sync(session_obj: Dict[str, Any], ev
         return {"ok": False, "error": "usage credit failed", "credit": credit_res}
 
     _stripe_paygo_mark_sync(sid, status="credited", payment_intent=payment_intent, customer=customer, raw_event=event_obj, credited=True)
-    return {"ok": True, "credited": True, "minutes": minutes, "identity_key": identity_key}
+    # Receipt email is intentionally best-effort: crediting minutes is the
+    # source-of-truth transaction, and email failures must not roll back credit.
+    receipt_result = _stripe_paygo_send_receipt_for_session_sync(sid, session_obj)
+    return {"ok": True, "credited": True, "minutes": minutes, "identity_key": identity_key, "receipt_email": receipt_result}
 
 
 @app.post("/stripe/webhook")
@@ -14191,7 +14496,48 @@ async def stripe_paygo_session_status(request: Request):
         "currency": row.get("currency"),
         "status": row.get("status"),
         "credited_at": row.get("credited_at"),
+        "receipt_email": row.get("receipt_email"),
+        "receipt_email_status": row.get("receipt_email_status"),
+        "receipt_email_sent_at": row.get("receipt_email_sent_at"),
+        "receipt_email_provider": row.get("receipt_email_provider"),
+        "receipt_email_error": row.get("receipt_email_error"),
     }
+
+
+@app.get("/stripe/paygo/email-config")
+async def stripe_paygo_email_config():
+    return {
+        "ok": True,
+        "enabled": bool(PAYGO_EMAIL_ENABLED),
+        "provider": PAYGO_EMAIL_PROVIDER,
+        "from_configured": bool(PAYGO_EMAIL_FROM),
+        "reply_to_configured": bool(PAYGO_EMAIL_REPLY_TO),
+        "sendgrid_configured": bool(SENDGRID_API_KEY),
+        "smtp_configured": bool(SMTP_HOST),
+    }
+
+
+@app.post("/stripe/paygo/resend-receipt")
+async def stripe_paygo_resend_receipt(request: Request):
+    token = (request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token") or "").strip()
+    if not USAGE_ADMIN_TOKEN or token != USAGE_ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    checkout_session_id = _stripe_paygo_clean_text(
+        raw.get("checkout_session_id") or raw.get("checkoutSessionId") or raw.get("session_id") or raw.get("sessionId") or ""
+    )
+    email = _stripe_paygo_email_norm(raw.get("email") or raw.get("customer_email") or raw.get("customerEmail") or "")
+    if not checkout_session_id:
+        raise HTTPException(status_code=400, detail="checkout_session_id is required")
+    result = await run_in_threadpool(_stripe_paygo_send_receipt_for_session_sync, checkout_session_id, {}, force=True, override_email=email)
+    if not result.get("ok") and not result.get("skipped"):
+        raise HTTPException(status_code=502, detail=result)
+    return result
 
 
 @app.get("/stripe/paygo/config")
