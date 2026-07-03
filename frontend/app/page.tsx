@@ -1759,18 +1759,19 @@ const MODE_LABELS: Record<Mode, string> = {
 // - Intro  = internal friend
 // - Mate   = internal romantic
 // - Mature = internal intimate
-// Brand-aware plan -> mode availability mapping:
-// - DulceMoon Free Trial / visitors -> Intro + Mate only; Mature is excluded.
-// - DulceMoon paid subscribers, including hidden legacy plans such as Friend, -> Intro + Mate + Mature.
-// - Elaralo remains tiered: Discover=Intro, Explore=Intro+Mate, Encounter=Intro+Mate+Mature.
+// DulceMoon current public plans:
+// - Free Trial -> Intro + Mate only; Mature is excluded
+// - Discover / Explore / Encounter -> Intro + Mate + Mature
 // Legacy Intro/Mate/Intimate plan names are retained as hidden/backward-compatible aliases.
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Trial",
+  "Discover",
   "Explore",
   "Encounter",
   "Romantic",
   "Mature",
   "Pay as You Go",
+  "Test - Discover",
   "Test - Explore",
   "Test - Encounter",
   "Test - Romantic",
@@ -1778,24 +1779,23 @@ const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Test - Pay as You Go",
 ];
 
-const INTIMATE_ALLOWED_PLANS: PlanName[] = [
-  "Encounter",
-  "Mature",
-  "Pay as You Go",
-  "Test - Encounter",
-  "Test - Mature",
-  "Test - Pay as You Go",
-];
 
 function allowedModesForPlan(planName: PlanName): Mode[] {
-  // Elaralo tiered entitlement fallback:
-  //   Trial      -> Intro + Mate
-  //   Discover   -> Intro only
-  //   Explore    -> Intro + Mate
-  //   Encounter  -> Intro + Mate + Mature
   const modes: Mode[] = ["friend"];
   if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (INTIMATE_ALLOWED_PLANS.includes(planName)) modes.push("intimate");
+  if (
+    planName === "Discover" ||
+    planName === "Explore" ||
+    planName === "Encounter" ||
+    planName === "Test - Discover" ||
+    planName === "Test - Explore" ||
+    planName === "Test - Encounter" ||
+    planName === "Mature" ||
+    planName === "Test - Mature" ||
+    planName === "Pay as You Go" ||
+    planName === "Test - Pay as You Go"
+  )
+    modes.push("intimate");
   return modes;
 }
 
@@ -1818,42 +1818,6 @@ function clampAllowedModesForIdentity(memberId: string, modes: Mode[]): Mode[] {
   const mid = String(memberId || "").trim();
   if (!mid || isAnonMemberId(mid)) return ["friend", "romantic"];
   return modes;
-}
-
-function brandKeyForModeEntitlements(raw: unknown): string {
-  return String(raw || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
-}
-
-function isDulceMoonBrandForModes(raw: unknown): boolean {
-  return brandKeyForModeEntitlements(raw) === "dulcemoon";
-}
-
-function isPaidSubscriberForBrandModes(memberId: string, planName: PlanName, loggedInValue: boolean): boolean {
-  const mid = String(memberId || "").trim();
-  if (!loggedInValue || !mid || isAnonMemberId(mid)) return false;
-  const plan = String(planName || "").trim().toLowerCase();
-  if (!plan || plan === "trial" || plan === "free trial" || plan === "visitor") return false;
-  return true;
-}
-
-function allowedModesForBrandContext(
-  brandName: unknown,
-  memberId: string,
-  loggedInValue: boolean,
-  planName: PlanName,
-  rawPlanMap: unknown,
-): Mode[] {
-  // DulceMoon business rule: every paid subscriber has all modes regardless of
-  // legacy/hidden Wix plan labels such as Friend, Premium, Romantic, etc.
-  if (isDulceMoonBrandForModes(brandName) && isPaidSubscriberForBrandModes(memberId, planName, loggedInValue)) {
-    return ["friend", "romantic", "intimate"];
-  }
-
-  // Free Trial / visitor still excludes Mature; Elaralo keeps its tiered plan map.
-  return clampAllowedModesForIdentity(memberId, allowedModesFromElaraloPlanMap(rawPlanMap, planName));
 }
 
 function fallbackModeForAllowedModes(modes: Mode[]): Mode {
@@ -10867,8 +10831,8 @@ useEffect(() => {
     const msg = requestedMode === "intimate"
       ? isVisitorNow
         ? "Mature mode is available only to signed-in members. Visitors can use Intro and Mate modes."
-        : `Mature isn't available on your current plan. Please upgrade or purchase Pay as You Go here: ${upgradeUrl} (or click the Upgrade button in the top-right).`
-      : `The requested mode (${modeLabel}) isn't available on your current plan. Please upgrade here: ${upgradeUrl} (or click the Upgrade button in the top-right).`;
+        : "Mature is not available on your current plan. Please select the Upgrade button to change plans."
+      : `The requested mode (${modeLabel}) is not available on your current plan. Please select the Upgrade button to change plans.`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
@@ -11240,12 +11204,9 @@ useEffect(() => {
       // Requirement: the *Elaralo* entitlement plan determines how many mode pills exist.
       // The Wix `modePill` selects the initially-active mode (if allowed), but does NOT change how many pills are shown.
 
-      const nextAllowed = allowedModesForBrandContext(
-        effectiveIncomingBrandName || incomingBrandName || companyName || rebranding,
+      const nextAllowed = clampAllowedModesForIdentity(
         effectiveMemberId,
-        incomingLoggedIn !== false,
-        effectivePlan,
-        rkParts?.elaraloPlanMap,
+        allowedModesFromElaraloPlanMap(rkParts?.elaraloPlanMap, effectivePlan)
       );
       const desiredStartMode: Mode =
         nextAllowed.includes(desiredStartModeRaw) ? desiredStartModeRaw : fallbackModeForAllowedModes(nextAllowed);
@@ -14344,10 +14305,13 @@ const modePillControls = (
             inset: 0,
             background: "rgba(0,0,0,0.55)",
             display: "flex",
-            alignItems: "center",
+            alignItems: topupStage === "checkout" ? "flex-start" : "center",
             justifyContent: "center",
             zIndex: 99999,
-            padding: 16,
+            padding: isMobileUI ? "10px 10px calc(18px + env(safe-area-inset-bottom))" : 16,
+            overflowY: "auto",
+            WebkitOverflowScrolling: "touch" as any,
+            overscrollBehavior: "contain",
           }}
           onClick={() => {
             if (topupStage !== "creating" && topupStage !== "checkout") closeTopupModal();
@@ -14355,13 +14319,17 @@ const modePillControls = (
         >
           <div
             style={{
-              width: "min(560px, 100%)",
+              width: topupStage === "checkout" ? "min(760px, 100%)" : "min(560px, 100%)",
               background: "#111827",
               color: "#ffffff",
               border: "1px solid rgba(255,255,255,0.12)",
               borderRadius: 14,
               padding: 16,
               boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+              maxHeight: "calc(100dvh - 20px)",
+              overflowY: "auto",
+              WebkitOverflowScrolling: "touch" as any,
+              overscrollBehavior: "contain",
             }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -14526,10 +14494,13 @@ const modePillControls = (
                 <div
                   ref={topupCheckoutContainerRef}
                   style={{
-                    minHeight: 420,
+                    height: "min(780px, calc(100dvh - 190px))",
+                    minHeight: "min(520px, calc(100dvh - 190px))",
                     borderRadius: 12,
                     background: "#ffffff",
-                    overflow: "hidden",
+                    overflowY: "auto",
+                    WebkitOverflowScrolling: "touch" as any,
+                    overscrollBehavior: "contain",
                     marginBottom: 12,
                   }}
                 />

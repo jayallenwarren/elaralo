@@ -4526,39 +4526,23 @@ def _usage_paywall_message(
 ) -> str:
     """Generate the user-facing message when minutes are exhausted.
 
-    Supports per-request overrides (RebrandingKey) for:
-      - upgrade_url
-      - payg_pay_url
-      - payg_increment_minutes
-      - payg_price_text
+    v9.2.39: Do not expose legacy PayGo/Upgrade URLs in chat.  Connect now has
+    persistent in-frame controls for Add Minutes and Upgrade, so the assistant
+    should point the viewer to those buttons instead of rendering raw pay links.
     """
-    # Keep this short and plain so it can be spoken via TTS.
     lines: List[str] = []
-
-    resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
-    resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
-    resolved_payg_minutes = (
-        int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
-    )
-    resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
 
     if is_trial:
         lines.append(f"Your Free Trial time has ended ({minutes_allowed} minutes).")
     else:
         nice_plan = (plan_name or "").strip()
-        if not nice_plan:
-            lines.append("Your membership plan is Unknown / Not Provided, so minutes cannot be allocated.")
-        else:
+        if nice_plan:
             lines.append(f"You have no minutes remaining for your plan ({nice_plan}).")
+        else:
+            lines.append("You have no minutes remaining on your current plan.")
 
-    if resolved_payg_pay_url and resolved_payg_minutes > 0:
-        price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
-        lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
-
-    if resolved_upgrade_url:
-        lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
-
-    lines.append("Once you have more minutes, come back here and continue our conversation.")
+    lines.append("Please select the Add Minutes button or the Upgrade button to purchase more time.")
+    lines.append("Once you have more minutes, you can continue our conversation here.")
     return " ".join([ln.strip() for ln in lines if ln.strip()])
 def _usage_status_message(
     *,
@@ -4575,12 +4559,8 @@ def _usage_status_message(
 ) -> str:
     """Generate a short, deterministic answer about remaining minutes.
 
-    This is used when the user asks questions like:
-      - "How many minutes do I have left?"
-      - "How many more minutes can we talk?"
-      - "How much time do I have remaining on my plan?"
-
-    The response is intentionally plain so it can be spoken via TTS.
+    v9.2.39: When exhausted, reference the in-frame Add Minutes / Upgrade
+    buttons instead of returning raw legacy PayGo/Upgrade URLs.
     """
     lines: List[str] = []
 
@@ -4605,28 +4585,13 @@ def _usage_status_message(
         m_total = max(m_used + m_rem, m_allowed)
         lines.append(f"Used: {m_used} of {m_total} minutes.")
 
-
     if (not is_trial) and int(cycle_days or 0) > 0:
         lines.append(f"Your usage cycle resets every {int(cycle_days)} days.")
 
-    # If exhausted, include the same upgrade/pay links used by the paywall.
     if m_rem <= 0:
-        resolved_upgrade_url = (upgrade_url or "").strip() or UPGRADE_URL
-        resolved_payg_pay_url = (payg_pay_url or "").strip() or PAYG_PAY_URL
-        resolved_payg_minutes = (
-            int(payg_increment_minutes) if payg_increment_minutes is not None else int(PAYG_INCREMENT_MINUTES or 0)
-        )
-        resolved_payg_price_text = (payg_price_text or "").strip() or PAYG_PRICE_TEXT
-
-        if resolved_payg_pay_url and resolved_payg_minutes > 0:
-            price_part = f" ({resolved_payg_price_text})" if resolved_payg_price_text else ""
-            lines.append(f"Add {resolved_payg_minutes} minutes{price_part}: {resolved_payg_pay_url}")
-
-        if resolved_upgrade_url:
-            lines.append(f"Upgrade your membership: {resolved_upgrade_url}")
+        lines.append("Please select the Add Minutes button or the Upgrade button to purchase more time.")
 
     return " ".join([ln.strip() for ln in lines if ln.strip()])
-
 
 def _usage_charge_and_check_sync(identity_key: str, *, is_trial: bool, plan_name: str, minutes_allowed_override: Optional[int] = None, cycle_days_override: Optional[int] = None) -> Tuple[bool, Dict[str, Any]]:
     """Charge usage time and determine whether the identity still has minutes.
