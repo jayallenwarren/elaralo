@@ -3775,6 +3775,30 @@ function formatCents(amountCents: any, currency: any): string {
     return `$${(cents / 100).toFixed(2)}`;
   }
 }
+function paygoSafeReturnUrl(brandRaw: any): string {
+  if (typeof window === "undefined") return "";
+  const brand = String(brandRaw || "").trim().toLowerCase();
+  try {
+    const ref = String(document.referrer || "").trim();
+    // When Connect is embedded from a Wix brand page, return hosted/redirect
+    // checkouts to that Wix page rather than the bare Static App root. This
+    // prevents a completed fallback Checkout from landing on the default
+    // Elaralo Connect screen.
+    if (/^https:\/\//i.test(ref)) {
+      const u = new URL(ref);
+      const host = u.hostname.toLowerCase();
+      if ((brand.includes("dulcemoon") && host.endsWith("dulcemoon.net")) || host.endsWith("elaralo.com")) {
+        return u.toString();
+      }
+    }
+  } catch {}
+  try {
+    return window.location.href;
+  } catch {
+    return "";
+  }
+}
+
 
 export default function Page() {
   return <HostOnboardingRouteSwitch />;
@@ -8222,6 +8246,7 @@ useEffect(() => {
   const [topupCheckoutClientSecret, setTopupCheckoutClientSecret] = useState<string>("");
   const [topupCheckoutSessionId, setTopupCheckoutSessionId] = useState<string>("");
   const [topupHostedUrl, setTopupHostedUrl] = useState<string>("");
+  const [topupPublishableKey, setTopupPublishableKey] = useState<string>("");
   const topupCheckoutContainerRef = useRef<HTMLDivElement | null>(null);
   const embeddedCheckoutRef = useRef<any>(null);
   const topupPollTimerRef = useRef<number | null>(null);
@@ -8441,6 +8466,7 @@ useEffect(() => {
     setTopupCheckoutClientSecret("");
     setTopupCheckoutSessionId("");
     setTopupHostedUrl("");
+    setTopupPublishableKey("");
     setTopupStage("collect_email");
     setTopupModalOpen(true);
   }, []);
@@ -8772,9 +8798,20 @@ useEffect(() => {
       companionType: String(selectedCompanionType || "").trim(),
       units,
       quantity: units,
+      // Keep Checkout return/navigation brand-scoped. For DulceMoon this is
+      // usually https://www.dulcemoon.net/dulce-connect from document.referrer;
+      // otherwise it falls back to the current Connect URL.
+      return_url: paygoSafeReturnUrl(brandNow),
+      returnUrl: paygoSafeReturnUrl(brandNow),
+      parent_url: (() => { try { return String(document.referrer || "").trim(); } catch { return ""; } })(),
+      parentUrl: (() => { try { return String(document.referrer || "").trim(); } catch { return ""; } })(),
       return_origin: (() => {
         try { return window.location.origin; } catch { return ""; }
       })(),
+      // Do not auto-create/auto-open hosted Checkout. The primary PayGo
+      // experience must remain inside the Connect iframe.
+      allow_hosted_fallback: false,
+      allowHostedFallback: false,
     };
 
     try {
@@ -8794,6 +8831,7 @@ useEffect(() => {
       const clientSecret = String(json?.client_secret || json?.clientSecret || "").trim();
       const hostedUrl = String(json?.hosted_url || json?.hostedUrl || "").trim();
       const checkoutSessionId = String(json?.checkout_session_id || json?.checkoutSessionId || "").trim();
+      const responsePublishableKey = String(json?.publishable_key || json?.publishableKey || json?.stripe_publishable_key || "").trim();
       const minutesPerUnit = Number(json?.minutes_per_unit ?? json?.minutesPerUnit ?? 30) || 30;
       const minutesTotal = Number(json?.minutes_total ?? json?.minutesTotal ?? minutesPerUnit * units) || minutesPerUnit * units;
       const unitAmountCents = Number(json?.unit_amount_cents ?? json?.unitAmountCents ?? 0) || 0;
@@ -8808,17 +8846,16 @@ useEffect(() => {
       setTopupCheckoutClientSecret(clientSecret);
       setTopupCheckoutSessionId(checkoutSessionId);
       setTopupHostedUrl(hostedUrl);
+      setTopupPublishableKey(responsePublishableKey);
       setTopupModalOpen(true);
 
-      if (clientSecret && STRIPE_PUBLISHABLE_KEY) {
+      const effectivePublishableKey = STRIPE_PUBLISHABLE_KEY || responsePublishableKey;
+      if (clientSecret && effectivePublishableKey) {
         setTopupStage("checkout");
-      } else if (hostedUrl) {
-        setTopupStage("waiting");
-        openPaygoUrl(hostedUrl);
-        setMemberTopupStartedAt(Date.now());
-        setMemberTopupWatching(true);
+      } else if (clientSecret && !effectivePublishableKey) {
+        throw new Error("Stripe publishable key is not configured for embedded Checkout.");
       } else {
-        throw new Error("Stripe checkout was created, but no embedded client secret or hosted URL was returned.");
+        throw new Error("Stripe Embedded Checkout was not created. Payment was not opened so the user stays inside Connect.");
       }
     } catch (e: any) {
       setTopupError(String(e?.message || e || "Stripe checkout setup failed"));
@@ -8838,7 +8875,6 @@ useEffect(() => {
     companionName,
     companionKey,
     selectedCompanionType,
-    openPaygoUrl,
   ]);
 
   useEffect(() => {
@@ -8855,7 +8891,8 @@ useEffect(() => {
 
     const startEmbedded = async () => {
       try {
-        const stripe = await loadStripeJs(STRIPE_PUBLISHABLE_KEY);
+        const effectivePublishableKey = STRIPE_PUBLISHABLE_KEY || topupPublishableKey;
+        const stripe = await loadStripeJs(effectivePublishableKey);
         if (cancelled) return;
         if (!stripe || typeof stripe.initEmbeddedCheckout !== "function") {
           throw new Error("Stripe Embedded Checkout is not available in this browser.");
@@ -8877,17 +8914,11 @@ useEffect(() => {
         checkoutInstance.mount(container);
       } catch (e: any) {
         if (cancelled) return;
-        const hosted = String(topupHostedUrl || "").trim();
-        if (hosted) {
-          setTopupError("Embedded Checkout could not open here. I opened Stripe Checkout in a new tab instead.");
-          setTopupStage("waiting");
-          openPaygoUrl(hosted);
-          setMemberTopupStartedAt(Date.now());
-          setMemberTopupWatching(true);
-        } else {
-          setTopupError(String(e?.message || e || "Embedded Checkout failed"));
-          setTopupStage("error");
-        }
+        // Keep the PayGo process inside the Connect iframe. Do not
+        // automatically open hosted Checkout in a new window/tab; that path can
+        // return to the bare Static App and show the default Elaralo screen.
+        setTopupError(String(e?.message || e || "Embedded Checkout failed"));
+        setTopupStage("error");
       }
     };
 
@@ -8898,7 +8929,7 @@ useEffect(() => {
       try { checkoutInstance?.destroy?.(); } catch {}
       try { if (embeddedCheckoutRef.current === checkoutInstance) embeddedCheckoutRef.current = null; } catch {}
     };
-  }, [topupModalOpen, topupStage, topupCheckoutClientSecret, topupHostedUrl, openPaygoUrl, refreshUsageStatusOnce]);
+  }, [topupModalOpen, topupStage, topupCheckoutClientSecret, topupPublishableKey, refreshUsageStatusOnce]);
 
   // Poll the backend pending record so we can show "credited" immediately without requiring a page refresh.
   useEffect(() => {
@@ -14402,14 +14433,14 @@ const modePillControls = (
               <>
                 <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Preparing checkout…</div>
                 <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35 }}>
-                  Creating a secure Stripe Checkout session. If embedded checkout cannot open here, a hosted checkout tab will open automatically.
+                  Creating a secure Stripe Embedded Checkout session inside Connect.
                 </div>
               </>
             ) : topupStage === "checkout" ? (
               <>
                 <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>Secure checkout</div>
                 <div style={{ opacity: 0.9, fontSize: 13, lineHeight: 1.35, marginBottom: 10 }}>
-                  Complete payment below. If embedded checkout cannot open, use the hosted checkout fallback.
+                  Complete payment below without leaving Connect.
                 </div>
                 {topupError ? (
                   <div style={{ color: "#ffe082", fontSize: 12, marginBottom: 10, lineHeight: 1.35 }}>{topupError}</div>
@@ -14425,7 +14456,7 @@ const modePillControls = (
                   }}
                 />
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                  {topupHostedUrl ? (
+                  {false && topupHostedUrl ? (
                     <button
                       type="button"
                       onClick={() => {

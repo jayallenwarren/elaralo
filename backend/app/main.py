@@ -809,26 +809,55 @@ def _stripe_paygo_product_name(brand: Any) -> str:
 
 
 def _stripe_paygo_return_origin(request: Request, raw: Dict[str, Any]) -> str:
+    """Resolve the Checkout return target.
+
+    Prefer a full return URL supplied by Connect. This matters for Wix-hosted
+    brands such as DulceMoon: if hosted Checkout is ever used as an explicit
+    fallback, Stripe should return to the DulceMoon page, not to the bare Azure
+    Static Apps origin where Connect defaults to Elaralo.
+    """
+    explicit_url = _stripe_paygo_clean_text(
+        raw.get("return_url") or raw.get("returnUrl") or raw.get("success_url") or raw.get("successUrl")
+    )
+    if explicit_url.startswith("https://") or explicit_url.startswith("http://"):
+        return explicit_url
+
+    parent_url = _stripe_paygo_clean_text(raw.get("parent_url") or raw.get("parentUrl") or raw.get("wix_url") or raw.get("wixUrl"))
+    if parent_url.startswith("https://") or parent_url.startswith("http://"):
+        return parent_url
+
     explicit = _stripe_paygo_clean_text(raw.get("return_origin") or raw.get("returnOrigin") or raw.get("origin"))
     if explicit.startswith("https://") or explicit.startswith("http://"):
-        return explicit.rstrip("/")
+        return explicit.rstrip("/") + "/"
     if STRIPE_PAYGO_PUBLIC_BASE_URL:
-        return STRIPE_PAYGO_PUBLIC_BASE_URL.rstrip("/")
+        return STRIPE_PAYGO_PUBLIC_BASE_URL.rstrip("/") + "/"
     origin = _stripe_paygo_clean_text(request.headers.get("origin"))
     if origin:
-        return origin.rstrip("/")
+        return origin.rstrip("/") + "/"
     referer = _stripe_paygo_clean_text(request.headers.get("referer") or request.headers.get("referrer"))
     if referer:
         try:
             p = urlparse(referer)
             if p.scheme and p.netloc:
-                return f"{p.scheme}://{p.netloc}"
+                return f"{p.scheme}://{p.netloc}/"
         except Exception:
             pass
     try:
-        return str(request.base_url).rstrip("/")
+        return str(request.base_url).rstrip("/") + "/"
     except Exception:
         return ""
+
+def _stripe_paygo_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def _stripe_paygo_append_checkout_params(base_url: str, status: str) -> str:
+    base = _stripe_paygo_clean_text(base_url)
+    if not base:
+        base = "https://example.com/"
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}stripe_paygo={status}&checkout_session_id={{CHECKOUT_SESSION_ID}}"
 
 def _extract_plan_name(session_state: Dict[str, Any]) -> str:
     plan = (
@@ -13880,19 +13909,21 @@ def _stripe_create_checkout_session_sync(
     }
     if email:
         form["customer_email"] = email
-    origin = (return_origin or "").rstrip("/")
+    checkout_return_base = (return_origin or "").strip()
     ui_mode_key = re.sub(r"[^a-z0-9]+", "_", str(ui_mode or "").strip().lower()).strip("_")
     if ui_mode_key in {"embedded", "embedded_page"}:
         # Stripe's newer API versions replaced the old `embedded` enum with
         # `embedded_page`.  Sending the legacy value now returns a 400.
         form["ui_mode"] = "embedded_page"
-        form["return_url"] = f"{origin}/?stripe_paygo=return&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=return&checkout_session_id={CHECKOUT_SESSION_ID}"
+        form["return_url"] = _stripe_paygo_append_checkout_params(checkout_return_base, "return")
         ui_mode_store = "embedded_page"
     else:
-        # Be explicit for the hosted fallback on newer Stripe API versions.
+        # Hosted Checkout is now an explicit fallback only.  When used, send the
+        # user back to the brand page/full Connect URL rather than to the bare
+        # Azure Static Apps root.
         form["ui_mode"] = "hosted_page"
-        form["success_url"] = f"{origin}/?stripe_paygo=success&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=success&checkout_session_id={CHECKOUT_SESSION_ID}"
-        form["cancel_url"] = f"{origin}/?stripe_paygo=cancel&checkout_session_id={{CHECKOUT_SESSION_ID}}" if origin else "https://example.com/?stripe_paygo=cancel&checkout_session_id={CHECKOUT_SESSION_ID}"
+        form["success_url"] = _stripe_paygo_append_checkout_params(checkout_return_base, "success")
+        form["cancel_url"] = _stripe_paygo_append_checkout_params(checkout_return_base, "cancel")
         ui_mode_store = "hosted_page"
 
     session = _stripe_request_form_sync("/v1/checkout/sessions", form)
@@ -13953,6 +13984,10 @@ async def stripe_paygo_create_checkout_session(request: Request):
     currency = STRIPE_CURRENCY or "usd"
     product_name = _stripe_paygo_product_name(brand)
     return_origin = _stripe_paygo_return_origin(request, raw)
+    allow_hosted_fallback = _stripe_paygo_bool(
+        raw.get("allow_hosted_fallback") or raw.get("allowHostedFallback"),
+        default=False,
+    )
     identity_key = _usage_identity_key_for_brand(
         brand=brand,
         member_id=member_id,
@@ -13990,29 +14025,31 @@ async def stripe_paygo_create_checkout_session(request: Request):
         except Exception as exc:
             embedded_error = str(exc)
 
-        # Create the hosted-page fallback even if embedded-page creation fails.
-        # That lets the browser continue by opening Stripe Checkout in a new tab.
-        try:
-            hosted = _stripe_create_checkout_session_sync(
-                ui_mode="hosted_page",
-                brand=brand,
-                member_id=member_id,
-                email=email,
-                identity_key=identity_key,
-                connect_session_id=connect_session_id,
-                avatar=avatar,
-                companion_key=companion_key,
-                companion_type=companion_type,
-                units=units,
-                minutes_per_unit=minutes_per_unit,
-                unit_amount_cents=unit_amount_cents,
-                currency=currency,
-                product_name=product_name,
-                return_origin=return_origin,
-                paygo_group_id=paygo_group_id,
-            )
-        except Exception as exc:
-            hosted_error = str(exc)
+        # Keep the normal PayGo path inside the Connect iframe via Embedded
+        # Checkout. Hosted Checkout is only created when explicitly requested by
+        # the frontend; do not auto-open a new tab/window as the primary path.
+        if allow_hosted_fallback:
+            try:
+                hosted = _stripe_create_checkout_session_sync(
+                    ui_mode="hosted_page",
+                    brand=brand,
+                    member_id=member_id,
+                    email=email,
+                    identity_key=identity_key,
+                    connect_session_id=connect_session_id,
+                    avatar=avatar,
+                    companion_key=companion_key,
+                    companion_type=companion_type,
+                    units=units,
+                    minutes_per_unit=minutes_per_unit,
+                    unit_amount_cents=unit_amount_cents,
+                    currency=currency,
+                    product_name=product_name,
+                    return_origin=return_origin,
+                    paygo_group_id=paygo_group_id,
+                )
+            except Exception as exc:
+                hosted_error = str(exc)
 
         if not embedded and not hosted:
             detail = "; ".join([x for x in [f"embedded_page: {embedded_error}" if embedded_error else "", f"hosted_page: {hosted_error}" if hosted_error else ""] if x])

@@ -493,6 +493,23 @@ export default function MyElaraloCompanionSelectorClient() {
 
   const companionPayloadHeadshotUrl = useMemo(() => payloadHeadshotUrl(memberPayload), [memberPayload]);
 
+  const autoOpenCard = useMemo(() => {
+    if (!shouldAutoOpenSingle) return null;
+    const visibleCards = filteredCards.filter((card) => !card.catalogHidden);
+    if (visibleCards.length === 1) return visibleCards[0];
+
+    // DulceMoon product rule: while only one Human companion exists for the
+    // brand, open that Human companion directly for both members and visitors.
+    // This keeps the current one-companion DulceMoon UX while still allowing a
+    // selector when more visible Human companions are added later.
+    if (brandKey === "dulcemoon") {
+      const visibleHumans = visibleCards.filter((card) => safeLower(card.companionType) === "human");
+      if (visibleHumans.length === 1) return visibleHumans[0];
+    }
+
+    return null;
+  }, [brandKey, filteredCards, shouldAutoOpenSingle]);
+
   const imageUrlForCard = useCallback(
     (card: CompanionCardItem) => {
       const raw = (card?.raw && typeof card.raw === "object") ? card.raw : {};
@@ -624,11 +641,11 @@ export default function MyElaraloCompanionSelectorClient() {
 
   useEffect(() => {
     if (!shouldAutoOpenSingle || loading || error || autoOpenedSingleRef.current) return;
-    if (cards.length !== 1) return;
+    if (!autoOpenCard) return;
     autoOpenedSingleRef.current = true;
-    const timer = window.setTimeout(() => openConnect(cards[0]), 80);
+    const timer = window.setTimeout(() => openConnect(autoOpenCard), 80);
     return () => window.clearTimeout(timer);
-  }, [shouldAutoOpenSingle, cards, error, loading, openConnect]);
+  }, [shouldAutoOpenSingle, autoOpenCard, error, loading, openConnect]);
 
   const containerStyle: React.CSSProperties = {
     minHeight: "100vh",
