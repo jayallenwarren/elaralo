@@ -192,6 +192,96 @@ function normalizeCard(item: any, defaultBrand: string): CompanionCardItem {
   };
 }
 
+
+function isDefaultOrLogoHeadshot(value: any): boolean {
+  const raw = safeText(value);
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  return lower === DEFAULT_HEADSHOT.toLowerCase() || /(^|\/)elaralo-logo\.(png|jpg|jpeg|webp)(\?|#|$)/i.test(lower);
+}
+
+function firstMeaningfulImageUrl(...values: any[]): string {
+  for (const value of values) {
+    const text = safeText(value);
+    if (!text) continue;
+    if (isDefaultOrLogoHeadshot(text)) continue;
+    return text;
+  }
+  return "";
+}
+
+function companionKeyFirstToken(value: any): string {
+  const raw = safeText(value)
+    .split("?", 1)[0]
+    .split("#", 1)[0]
+    .replace(/^.*[\\/]/, "")
+    .replace(/\.(png|jpg|jpeg|webp)$/i, "")
+    .trim();
+  const first = safeText(raw.split("-", 1)[0]);
+  return first;
+}
+
+function payloadCompanionKey(payload: MemberPlanPayload): string {
+  const p = payload && typeof payload === "object" ? payload : {};
+  return (
+    safeText((p as any).companionKey) ||
+    safeText((p as any).companion_key) ||
+    safeText((p as any).selectedCompanionKey) ||
+    safeText((p as any).selected_companion_key) ||
+    safeText((p as any).companion) ||
+    safeText((p as any).companionName) ||
+    safeText((p as any).companion_name) ||
+    safeText((p as any).avatar) ||
+    safeText((p as any).avatarName) ||
+    safeText((p as any).avatar_name)
+  );
+}
+
+function payloadMappingAvatar(payload: MemberPlanPayload): string {
+  const p = payload && typeof payload === "object" ? payload : {};
+  return (
+    safeText((p as any).mappingAvatar) ||
+    safeText((p as any).mapping_avatar) ||
+    safeText((p as any).sqlAvatar) ||
+    safeText((p as any).sql_avatar) ||
+    safeText((p as any).avatar) ||
+    safeText((p as any).avatarName) ||
+    safeText((p as any).avatar_name) ||
+    companionKeyFirstToken(payloadCompanionKey(payload))
+  );
+}
+
+function payloadHeadshotUrl(payload: MemberPlanPayload): string {
+  const p = payload && typeof payload === "object" ? payload : {};
+  return firstMeaningfulImageUrl(
+    (p as any).headshotUrl,
+    (p as any).headshot_url,
+    (p as any).imageUrl,
+    (p as any).image_url,
+    (p as any).photoUrl,
+    (p as any).photo_url,
+    (p as any).avatarUrl,
+    (p as any).avatar_url
+  );
+}
+
+function cardMatchesPayloadCompanion(card: CompanionCardItem | null | undefined, payload: MemberPlanPayload): boolean {
+  if (!card) return false;
+  const key = canonicalCompanionKeyForCard(card);
+  const mappingAvatar = companionMappingAvatarForCard(card);
+  const displayName = companionDisplayNameForCard(card);
+  const payloadKey = payloadCompanionKey(payload);
+  const payloadMapping = payloadMappingAvatar(payload);
+  const candidates = [key, mappingAvatar, displayName, card.avatar, (card.raw || {}).avatar, (card.raw || {}).companion_key, (card.raw || {}).companionKey]
+    .map((v) => safeLower(v))
+    .filter(Boolean);
+  const incoming = [payloadKey, payloadMapping, companionKeyFirstToken(payloadKey)]
+    .map((v) => safeLower(v))
+    .filter(Boolean);
+  if (!incoming.length) return false;
+  return incoming.some((v) => candidates.includes(v));
+}
+
 function firstLine(text: string): string {
   const t = safeText(text);
   if (!t) return "";
@@ -391,6 +481,27 @@ export default function MyElaraloCompanionSelectorClient() {
     });
   }, [cards, companionTypeFilter, ethnicityFilter, genderFilter, generationFilter]);
 
+  const companionPayloadHeadshotUrl = useMemo(() => payloadHeadshotUrl(memberPayload), [memberPayload]);
+
+  const imageUrlForCard = useCallback(
+    (card: CompanionCardItem) => {
+      const raw = (card?.raw && typeof card.raw === "object") ? card.raw : {};
+      const fromCard = firstMeaningfulImageUrl(
+        card?.headshotUrl,
+        raw?.headshot_url,
+        raw?.headshotUrl,
+        raw?.image_url,
+        raw?.imageUrl,
+        raw?.photo_url,
+        raw?.photoUrl
+      );
+      if (fromCard) return fromCard;
+      if (companionPayloadHeadshotUrl && cardMatchesPayloadCompanion(card, memberPayload)) return companionPayloadHeadshotUrl;
+      return DEFAULT_HEADSHOT;
+    },
+    [companionPayloadHeadshotUrl, memberPayload],
+  );
+
   const openConnect = useCallback(
     (card: CompanionCardItem) => {
       const companionKey = canonicalCompanionKeyForCard(card);
@@ -436,8 +547,15 @@ export default function MyElaraloCompanionSelectorClient() {
         url.searchParams.set("companionDisplayName", companionDisplayName);
         url.searchParams.set("companion_display_name", companionDisplayName);
         if (card.companionType) url.searchParams.set("companionType", card.companionType);
-        const headshotUrl = safeText(card.headshotUrl) || safeText(raw?.headshot_url) || safeText(raw?.headshotUrl);
-        if (headshotUrl) url.searchParams.set("headshotUrl", headshotUrl);
+        const headshotUrl = imageUrlForCard(card);
+        if (headshotUrl && !isDefaultOrLogoHeadshot(headshotUrl)) {
+          url.searchParams.set("headshotUrl", headshotUrl);
+          url.searchParams.set("headshot_url", headshotUrl);
+          url.searchParams.set("imageUrl", headshotUrl);
+          url.searchParams.set("image_url", headshotUrl);
+          url.searchParams.set("photoUrl", headshotUrl);
+          url.searchParams.set("photo_url", headshotUrl);
+        }
 
         const passthroughParamMap: Array<[string, string[]]> = [
           ["planName", ["planName", "plan_name", "plan"]],
@@ -467,7 +585,7 @@ export default function MyElaraloCompanionSelectorClient() {
         // ignore
       }
     },
-    [brandName, displayName, loggedIn, memberId, memberPayload],
+    [brandName, displayName, imageUrlForCard, loggedIn, memberId, memberPayload],
   );
 
   const openSummaryPublic = useCallback((card: CompanionCardItem) => {
@@ -686,7 +804,7 @@ export default function MyElaraloCompanionSelectorClient() {
                 <article key={card.id} style={cardStyle}>
                   <button type="button" style={imageButtonStyle} onClick={() => openConnect(card)} title="Open in Connect">
                     <img
-                      src={card.headshotUrl || DEFAULT_HEADSHOT}
+                      src={imageUrlForCard(card)}
                       alt={card.displayName || "Companion"}
                       style={{ width: "100%", aspectRatio: "1 / 1", objectFit: "cover", display: "block", background: "#e2e8f0" }}
                       onError={(e) => {
