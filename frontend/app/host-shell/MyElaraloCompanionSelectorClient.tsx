@@ -266,6 +266,8 @@ export default function MyElaraloCompanionSelectorClient() {
   const [generationFilter, setGenerationFilter] = useState<string>("");
   const [ethnicityFilter, setEthnicityFilter] = useState<string>("");
   const [genderFilter, setGenderFilter] = useState<string>("");
+  const [externalPayloadSeen, setExternalPayloadSeen] = useState<boolean>(false);
+  const [contextGraceElapsed, setContextGraceElapsed] = useState<boolean>(false);
   const autoOpenedSingleRef = useRef<boolean>(false);
   const autoOpenSingle = useMemo(() => readQueryFlag("autoOpenSingle", "auto_open_single", "autoOpen", "auto_open"), []);
 
@@ -274,8 +276,15 @@ export default function MyElaraloCompanionSelectorClient() {
       try {
         const data: any = event?.data || {};
         const type = safeText(data?.type);
-        const payload = (type === "MEMBER_PLAN" ? data?.payload : data) || {};
+        // Wix Website Address iframes commonly post MEMBER_PLAN fields at the
+        // top level, while the Elaralo HTML bridge can wrap them in data.payload.
+        // Accept both shapes.  This is required for DulceMoon, whose Wix page
+        // posts { type: "MEMBER_PLAN", memberId, brand, ... } directly.
+        const directPayload = data && typeof data === "object" ? data : {};
+        const nestedPayload = directPayload?.payload && typeof directPayload.payload === "object" ? directPayload.payload : null;
+        const payload = (type === "MEMBER_PLAN" ? (nestedPayload || directPayload) : directPayload) || {};
         if (type === "MEMBER_PLAN" || type === "MY_ELARALO_CONTEXT" || payload?.memberId || payload?.member_id) {
+          setExternalPayloadSeen(true);
           setMemberPayload((prev) => mergeMemberPayload(prev, payload));
           try {
             window.parent?.postMessage({ type: "MY_ELARALO_CONTEXT_ACK" }, "*");
@@ -298,10 +307,16 @@ export default function MyElaraloCompanionSelectorClient() {
     return () => window.removeEventListener("message", handler);
   }, []);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => setContextGraceElapsed(true), 1200);
+    return () => window.clearTimeout(timer);
+  }, []);
+
   const memberId = safeText(memberPayload.memberId || memberPayload.member_id);
   const displayName = safeText(memberPayload.displayName || memberPayload.display_name || memberPayload.userName || memberPayload.user_name);
   const loggedIn = Boolean(memberPayload.loggedIn ?? memberPayload.logged_in);
   const brandName = safeText(memberPayload.brand) || "Elaralo";
+  const isElaraloCoreBrand = safeLower(brandName || "Elaralo") === "elaralo";
 
   useEffect(() => {
     let cancelled = false;
@@ -313,9 +328,20 @@ export default function MyElaraloCompanionSelectorClient() {
         return;
       }
       if (!memberId) {
-        setError(loggedIn ? "Waiting for member context..." : "Please sign in through the Elaralo member area.");
-        setLoading(false);
-        return;
+        if (isElaraloCoreBrand) {
+          setError(loggedIn ? "Waiting for member context..." : "Please sign in through the Elaralo member area.");
+          setLoading(false);
+          return;
+        }
+        // White-label brands such as DulceMoon must support visitor/free-trial
+        // access.  When auto-opening a single companion, briefly wait for the
+        // Wix MEMBER_PLAN payload so the Connect handoff carries plan minutes,
+        // mode entitlement, rebrandingKey, and member/visitor identity.
+        if (autoOpenSingle && !externalPayloadSeen && !contextGraceElapsed) {
+          setError("");
+          setLoading(true);
+          return;
+        }
       }
 
       setLoading(true);
@@ -323,7 +349,7 @@ export default function MyElaraloCompanionSelectorClient() {
 
       try {
         const qs = new URLSearchParams();
-        qs.set("memberId", memberId);
+        if (memberId) qs.set("memberId", memberId);
         qs.set("brand", brandName || "Elaralo");
         const res = await fetch(`${API_BASE}/my-elaralo/companions/catalog?${qs.toString()}`, {
           method: "GET",
@@ -348,7 +374,7 @@ export default function MyElaraloCompanionSelectorClient() {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, brandName, loggedIn, memberId]);
+  }, [API_BASE, autoOpenSingle, brandName, contextGraceElapsed, externalPayloadSeen, isElaraloCoreBrand, loggedIn, memberId]);
 
   const companionTypeOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.companionType).filter(Boolean))).sort(), [cards]);
   const generationOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.generation).filter(Boolean))).sort(), [cards]);
@@ -634,7 +660,7 @@ export default function MyElaraloCompanionSelectorClient() {
           </section>
         ) : error ? (
           <section style={{ ...heroStyle, borderColor: "rgba(239,68,68,0.25)", background: "rgba(254,242,242,0.9)" }}>
-            <div style={{ fontSize: 16, fontWeight: 700, color: "#991b1b", marginBottom: 8 }}>Unable to load My Elaralo companions</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: "#991b1b", marginBottom: 8 }}>Unable to load {isElaraloCoreBrand ? "My Elaralo" : brandName} companions</div>
             <div style={{ fontSize: 14, color: "#7f1d1d" }}>{error}</div>
           </section>
         ) : filteredCards.length === 0 ? (

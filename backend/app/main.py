@@ -24553,9 +24553,14 @@ async def my_elaralo_companions_catalog(
     gender: Optional[str] = None,
 ):
     resolved_member_id = _host_onboarding_normalize_member_id(memberId or member_id)
-    if not resolved_member_id:
-        raise HTTPException(status_code=400, detail="memberId is required")
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
+    # The Elaralo member area remains member-scoped because hidden Human Host
+    # owner cards and Host/Profile Studio integration depend on memberId.
+    # White-label public brands such as DulceMoon must also support visitor/free
+    # trial catalog loading so their selector can auto-open the single visible
+    # companion before a Wix member payload is available.
+    if not resolved_member_id and _is_elaralo_core_brand(brand_name):
+        raise HTTPException(status_code=400, detail="memberId is required")
     items = _my_elaralo_companion_cards_sync(
         brand=brand_name,
         member_id=resolved_member_id,
