@@ -692,10 +692,14 @@ PAYGO_EMAIL_PROVIDER = (os.getenv("PAYGO_EMAIL_PROVIDER", "sendgrid") or "sendgr
 PAYGO_EMAIL_FROM = (os.getenv("PAYGO_EMAIL_FROM", "") or "").strip()
 PAYGO_EMAIL_FROM_NAME = (os.getenv("PAYGO_EMAIL_FROM_NAME", "Elaralo Connect") or "Elaralo Connect").strip()
 PAYGO_EMAIL_REPLY_TO = (os.getenv("PAYGO_EMAIL_REPLY_TO", "") or "").strip()
-# Optional brand-specific Reply-To values. These allow each brand to keep its
-# own customer-response address while preserving the existing global From,
-# From Name, BCC, subject prefix, and provider settings.
+# Optional brand-specific sender values. These allow each white-label brand
+# to send receipts from its own verified SendGrid Single Sender/domain while
+# preserving the existing global values as fallbacks.
+PAYGO_EMAIL_FROM_ELARALO = (os.getenv("PAYGO_EMAIL_FROM_ELARALO", "") or "").strip()
+PAYGO_EMAIL_FROM_NAME_ELARALO = (os.getenv("PAYGO_EMAIL_FROM_NAME_ELARALO", "") or "").strip()
 PAYGO_EMAIL_REPLY_TO_ELARALO = (os.getenv("PAYGO_EMAIL_REPLY_TO_ELARALO", "") or "").strip()
+PAYGO_EMAIL_FROM_DULCEMOON = (os.getenv("PAYGO_EMAIL_FROM_DULCEMOON", "") or "").strip()
+PAYGO_EMAIL_FROM_NAME_DULCEMOON = (os.getenv("PAYGO_EMAIL_FROM_NAME_DULCEMOON", "") or "").strip()
 PAYGO_EMAIL_REPLY_TO_DULCEMOON = (os.getenv("PAYGO_EMAIL_REPLY_TO_DULCEMOON", "") or "").strip()
 PAYGO_EMAIL_BCC = (os.getenv("PAYGO_EMAIL_BCC", "") or "").strip()
 PAYGO_EMAIL_SUBJECT_PREFIX = (os.getenv("PAYGO_EMAIL_SUBJECT_PREFIX", "Your Connect minutes purchase") or "Your Connect minutes purchase").strip()
@@ -13918,8 +13922,6 @@ def _paygo_email_reply_to_for_brand(brand: Any) -> str:
 
     Brand-specific values win when configured; the existing global
     PAYGO_EMAIL_REPLY_TO remains the fallback for compatibility.
-    The From address, From name, BCC, subject prefix, provider, and API key
-    settings are intentionally left unchanged by this helper.
     """
     key = _stripe_paygo_brand_key(brand)
     if key == "dulcemoon" and PAYGO_EMAIL_REPLY_TO_DULCEMOON:
@@ -13927,6 +13929,30 @@ def _paygo_email_reply_to_for_brand(brand: Any) -> str:
     if key == "elaralo" and PAYGO_EMAIL_REPLY_TO_ELARALO:
         return _stripe_paygo_email_norm(PAYGO_EMAIL_REPLY_TO_ELARALO)
     return _stripe_paygo_email_norm(PAYGO_EMAIL_REPLY_TO)
+
+
+def _paygo_email_from_for_brand(brand: Any) -> str:
+    """Resolve the From address for PayGo receipts.
+
+    SendGrid validates the From address, not just Reply-To. DulceMoon and
+    Elaralo can now each use their own verified sender/domain. The global
+    PAYGO_EMAIL_FROM remains the fallback for compatibility.
+    """
+    key = _stripe_paygo_brand_key(brand)
+    if key == "dulcemoon" and PAYGO_EMAIL_FROM_DULCEMOON:
+        return _stripe_paygo_email_norm(PAYGO_EMAIL_FROM_DULCEMOON)
+    if key == "elaralo" and PAYGO_EMAIL_FROM_ELARALO:
+        return _stripe_paygo_email_norm(PAYGO_EMAIL_FROM_ELARALO)
+    return _stripe_paygo_email_norm(PAYGO_EMAIL_FROM)
+
+
+def _paygo_email_from_name_for_brand(brand: Any, from_email: str = "") -> str:
+    key = _stripe_paygo_brand_key(brand)
+    if key == "dulcemoon" and PAYGO_EMAIL_FROM_NAME_DULCEMOON:
+        return _stripe_paygo_clean_text(PAYGO_EMAIL_FROM_NAME_DULCEMOON)
+    if key == "elaralo" and PAYGO_EMAIL_FROM_NAME_ELARALO:
+        return _stripe_paygo_clean_text(PAYGO_EMAIL_FROM_NAME_ELARALO)
+    return _stripe_paygo_clean_text(PAYGO_EMAIL_FROM_NAME or from_email)
 
 
 def _paygo_email_body(row: Dict[str, Any], session_obj: Dict[str, Any]) -> Tuple[str, str]:
@@ -13983,15 +14009,17 @@ def _paygo_email_body(row: Dict[str, Any], session_obj: Dict[str, Any]) -> Tuple
 def _paygo_email_send_sendgrid_sync(to_email: str, subject: str, text_body: str, html_body: str, *, brand: Any = "") -> Dict[str, Any]:
     if not SENDGRID_API_KEY:
         return {"ok": False, "error": "SENDGRID_API_KEY is not configured"}
-    if not PAYGO_EMAIL_FROM:
-        return {"ok": False, "error": "PAYGO_EMAIL_FROM is not configured"}
+    from_email = _paygo_email_from_for_brand(brand)
+    if not from_email:
+        return {"ok": False, "error": "PAYGO_EMAIL_FROM or brand-specific PayGo From address is not configured"}
+    from_name = _paygo_email_from_name_for_brand(brand, from_email)
     import requests  # type: ignore
     personalizations: Dict[str, Any] = {"to": [{"email": to_email}]}
     if PAYGO_EMAIL_BCC:
         personalizations["bcc"] = [{"email": e.strip()} for e in PAYGO_EMAIL_BCC.split(",") if e.strip()]
     payload: Dict[str, Any] = {
         "personalizations": [personalizations],
-        "from": {"email": PAYGO_EMAIL_FROM, "name": PAYGO_EMAIL_FROM_NAME or PAYGO_EMAIL_FROM},
+        "from": {"email": from_email, "name": from_name or from_email},
         "subject": subject,
         "content": [
             {"type": "text/plain", "value": text_body},
@@ -14016,13 +14044,15 @@ def _paygo_email_send_sendgrid_sync(to_email: str, subject: str, text_body: str,
 def _paygo_email_send_smtp_sync(to_email: str, subject: str, text_body: str, html_body: str, *, brand: Any = "") -> Dict[str, Any]:
     if not SMTP_HOST:
         return {"ok": False, "error": "SMTP_HOST is not configured"}
-    if not PAYGO_EMAIL_FROM:
-        return {"ok": False, "error": "PAYGO_EMAIL_FROM is not configured"}
+    from_email = _paygo_email_from_for_brand(brand)
+    if not from_email:
+        return {"ok": False, "error": "PAYGO_EMAIL_FROM or brand-specific PayGo From address is not configured"}
+    from_name = _paygo_email_from_name_for_brand(brand, from_email)
     import smtplib
     from email.message import EmailMessage
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = f"{PAYGO_EMAIL_FROM_NAME} <{PAYGO_EMAIL_FROM}>" if PAYGO_EMAIL_FROM_NAME else PAYGO_EMAIL_FROM
+    msg["From"] = f"{from_name} <{from_email}>" if from_name else from_email
     msg["To"] = to_email
     reply_to = _paygo_email_reply_to_for_brand(brand)
     if reply_to:
@@ -14094,6 +14124,16 @@ def _stripe_paygo_send_receipt_for_session_sync(session_id: str, session_obj: Op
         return {"ok": True, "skipped": True, "reason": "receipt already sent"}
     session_obj = session_obj if isinstance(session_obj, dict) else {}
     email = _stripe_paygo_email_norm(override_email) or _stripe_paygo_receipt_email_from_session(row, session_obj)
+    # Some webhook payloads can omit customer_details.email. Before skipping a
+    # receipt, retrieve the Checkout Session from Stripe so Elaralo and member
+    # purchases still get a receipt when Stripe has the email on the session.
+    if not email and not override_email:
+        fetched_session = _stripe_paygo_retrieve_session_for_receipt_sync(sid)
+        if fetched_session:
+            merged = dict(session_obj)
+            merged.update(fetched_session)
+            session_obj = merged
+            email = _stripe_paygo_receipt_email_from_session(row, session_obj)
     if not email:
         _stripe_paygo_mark_receipt_sync(sid, status="skipped", error="missing customer email")
         return {"ok": False, "skipped": True, "error": "missing customer email"}
@@ -14131,6 +14171,41 @@ def _stripe_request_form_sync(path: str, form: Dict[str, Any]) -> Dict[str, Any]
         detail = obj.get("error") if isinstance(obj, dict) else obj
         raise RuntimeError(f"Stripe API error {resp.status_code}: {detail}")
     return obj if isinstance(obj, dict) else {"value": obj}
+
+
+def _stripe_request_get_sync(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not STRIPE_SECRET_KEY:
+        raise RuntimeError("STRIPE_SECRET_KEY is not configured")
+    import requests  # type: ignore
+    url = "https://api.stripe.com" + path
+    clean_params: Dict[str, str] = {}
+    for k, v in (params or {}).items():
+        if v is None:
+            continue
+        clean_params[str(k)] = str(v)
+    resp = requests.get(url, params=clean_params, auth=(STRIPE_SECRET_KEY, ""), timeout=30)
+    try:
+        obj = resp.json()
+    except Exception:
+        obj = {"raw": resp.text}
+    if resp.status_code >= 400:
+        detail = obj.get("error") if isinstance(obj, dict) else obj
+        raise RuntimeError(f"Stripe API error {resp.status_code}: {detail}")
+    return obj if isinstance(obj, dict) else {"value": obj}
+
+
+def _stripe_paygo_retrieve_session_for_receipt_sync(session_id: str) -> Dict[str, Any]:
+    sid = _stripe_paygo_clean_text(session_id)
+    if not sid:
+        return {}
+    try:
+        return _stripe_request_get_sync(
+            f"/v1/checkout/sessions/{sid}",
+            {"expand[]": "payment_intent", "expand[1]": "customer"},
+        )
+    except Exception as exc:
+        print(f"[WARN] Stripe PayGo receipt: unable to retrieve checkout session {sid}: {exc}")
+        return {}
 
 
 def _stripe_create_checkout_session_sync(
@@ -14502,10 +14577,15 @@ async def stripe_paygo_email_config(brand: str = ""):
         "enabled": bool(PAYGO_EMAIL_ENABLED),
         "provider": PAYGO_EMAIL_PROVIDER,
         "from_configured": bool(PAYGO_EMAIL_FROM),
+        "from_elaralo_configured": bool(PAYGO_EMAIL_FROM_ELARALO),
+        "from_dulcemoon_configured": bool(PAYGO_EMAIL_FROM_DULCEMOON),
         "reply_to_configured": bool(PAYGO_EMAIL_REPLY_TO),
         "reply_to_elaralo_configured": bool(PAYGO_EMAIL_REPLY_TO_ELARALO),
         "reply_to_dulcemoon_configured": bool(PAYGO_EMAIL_REPLY_TO_DULCEMOON),
         "brand": brand_label,
+        "resolved_from_configured": bool(_paygo_email_from_for_brand(brand_label or "Elaralo")),
+        "resolved_from": _paygo_email_from_for_brand(brand_label or "Elaralo"),
+        "resolved_from_name": _paygo_email_from_name_for_brand(brand_label or "Elaralo", _paygo_email_from_for_brand(brand_label or "Elaralo")),
         "resolved_reply_to_configured": bool(resolved_reply_to),
         "resolved_reply_to": resolved_reply_to,
         "sendgrid_configured": bool(SENDGRID_API_KEY),
