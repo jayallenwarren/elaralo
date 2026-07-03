@@ -692,6 +692,11 @@ PAYGO_EMAIL_PROVIDER = (os.getenv("PAYGO_EMAIL_PROVIDER", "sendgrid") or "sendgr
 PAYGO_EMAIL_FROM = (os.getenv("PAYGO_EMAIL_FROM", "") or "").strip()
 PAYGO_EMAIL_FROM_NAME = (os.getenv("PAYGO_EMAIL_FROM_NAME", "Elaralo Connect") or "Elaralo Connect").strip()
 PAYGO_EMAIL_REPLY_TO = (os.getenv("PAYGO_EMAIL_REPLY_TO", "") or "").strip()
+# Optional brand-specific Reply-To values. These allow each brand to keep its
+# own customer-response address while preserving the existing global From,
+# From Name, BCC, subject prefix, and provider settings.
+PAYGO_EMAIL_REPLY_TO_ELARALO = (os.getenv("PAYGO_EMAIL_REPLY_TO_ELARALO", "") or "").strip()
+PAYGO_EMAIL_REPLY_TO_DULCEMOON = (os.getenv("PAYGO_EMAIL_REPLY_TO_DULCEMOON", "") or "").strip()
 PAYGO_EMAIL_BCC = (os.getenv("PAYGO_EMAIL_BCC", "") or "").strip()
 PAYGO_EMAIL_SUBJECT_PREFIX = (os.getenv("PAYGO_EMAIL_SUBJECT_PREFIX", "Your Connect minutes purchase") or "Your Connect minutes purchase").strip()
 SENDGRID_API_KEY = (os.getenv("SENDGRID_API_KEY", "") or "").strip()
@@ -5135,88 +5140,16 @@ def _contextual_mode_from_messages(user_text: str, current_mode: str, messages: 
 _MODE_ORDER: List[str] = ["friend", "romantic", "intimate"]
 
 
-def _mode_brand_key_from_session_state(session_state: Dict[str, Any]) -> str:
-    """Return a compact brand key for mode-entitlement decisions.
-
-    This deliberately mirrors the Connect-side brand distinction:
-    - DulceMoon paid subscribers are entitled to all public modes.
-    - Elaralo keeps its tiered entitlement mapping.
-    """
-    state = session_state if isinstance(session_state, dict) else {}
-    try:
-        brand = _brand_from_session_state(state)
-    except Exception:
-        brand = ""
-    if not brand:
-        try:
-            brand = _usage_brand_from_session_state(state, {})
-        except Exception:
-            brand = ""
-    try:
-        return _compact_brand_key(_host_onboarding_safe_str(brand) or "")
-    except Exception:
-        return str(brand or "").strip().lower().replace(" ", "")
-
-
-def _mode_plan_key_from_session_state(session_state: Dict[str, Any]) -> str:
-    state = session_state if isinstance(session_state, dict) else {}
-    plan = ""
-    try:
-        plan = _extract_plan_name(state)
-    except Exception:
-        plan = ""
-    if not plan:
-        try:
-            rk = _extract_rebranding_key(state)
-            parsed = _parse_rebranding_key(rk) if rk else {}
-            plan = str(parsed.get("plan") or parsed.get("elaralo_plan_map") or "").strip()
-        except Exception:
-            plan = ""
-    try:
-        return _normalize_plan_name_for_limits(plan).strip().lower()
-    except Exception:
-        return str(plan or "").strip().lower()
-
-
-def _dulcemoon_paid_subscriber_all_modes(session_state: Dict[str, Any]) -> bool:
-    """DulceMoon paid subscribers have Intro + Mate + Mature.
-
-    Free Trial / visitors remain limited to Intro + Mate.
-    Elaralo remains tiered.
-    """
-    state = session_state if isinstance(session_state, dict) else {}
-    if _mode_brand_key_from_session_state(state) != "dulcemoon":
-        return False
-    try:
-        member_id = _extract_member_id(state)
-    except Exception:
-        member_id = ""
-    if not member_id or _is_anon_member_id(member_id):
-        return False
-    plan_key = _mode_plan_key_from_session_state(state)
-    if not plan_key or plan_key in {"trial", "free trial", "free", "visitor"}:
-        return False
-    return True
-
-
 def _allowed_modes_from_session_state(session_state: Dict[str, Any]) -> Optional[List[str]]:
-    """Read backend-enforced mode entitlements from session_state.
+    """Read frontend entitlement mode limits from session_state.
 
-    Brand-specific rule:
-      - DulceMoon paid subscribers: Intro + Mate + Mature.
-      - DulceMoon Free Trial / visitors: Intro + Mate.
-      - Elaralo: use the tiered mode list supplied by Connect.
-
-    The backend must be at least as permissive as the intended brand entitlement for
-    DulceMoon so a stale/legacy Wix mode map such as Friend/Intro cannot block Mate
-    for paying DulceMoon subscribers.
+    The Connect UI is still the primary entitlement UI, but the backend must also
+    honor the same limits because context-mode switching can be triggered by the
+    conversation rather than a button click.  If no allowed-modes list is present,
+    return None to preserve legacy behavior.
     """
     if not isinstance(session_state, dict):
         return None
-
-    if _dulcemoon_paid_subscriber_all_modes(session_state):
-        return list(_MODE_ORDER)
-
     raw = (
         session_state.get("allowed_modes")
         or session_state.get("allowedModes")
@@ -14015,6 +13948,22 @@ def _paygo_email_subject(brand: str, minutes: int) -> str:
     return f"{prefix}: {minutes} {b} Connect minutes added"
 
 
+def _paygo_email_reply_to_for_brand(brand: Any) -> str:
+    """Resolve the Reply-To address for PayGo receipts.
+
+    Brand-specific values win when configured; the existing global
+    PAYGO_EMAIL_REPLY_TO remains the fallback for compatibility.
+    The From address, From name, BCC, subject prefix, provider, and API key
+    settings are intentionally left unchanged by this helper.
+    """
+    key = _stripe_paygo_brand_key(brand)
+    if key == "dulcemoon" and PAYGO_EMAIL_REPLY_TO_DULCEMOON:
+        return _stripe_paygo_email_norm(PAYGO_EMAIL_REPLY_TO_DULCEMOON)
+    if key == "elaralo" and PAYGO_EMAIL_REPLY_TO_ELARALO:
+        return _stripe_paygo_email_norm(PAYGO_EMAIL_REPLY_TO_ELARALO)
+    return _stripe_paygo_email_norm(PAYGO_EMAIL_REPLY_TO)
+
+
 def _paygo_email_body(row: Dict[str, Any], session_obj: Dict[str, Any]) -> Tuple[str, str]:
     brand = _stripe_paygo_brand(row.get("brand") or (session_obj.get("metadata") or {}).get("brand") or "Elaralo")
     minutes = int(row.get("minutes_total") or (session_obj.get("metadata") or {}).get("minutes_total") or 0)
@@ -14066,7 +14015,7 @@ def _paygo_email_body(row: Dict[str, Any], session_obj: Dict[str, Any]) -> Tuple
     return text, html
 
 
-def _paygo_email_send_sendgrid_sync(to_email: str, subject: str, text_body: str, html_body: str) -> Dict[str, Any]:
+def _paygo_email_send_sendgrid_sync(to_email: str, subject: str, text_body: str, html_body: str, *, brand: Any = "") -> Dict[str, Any]:
     if not SENDGRID_API_KEY:
         return {"ok": False, "error": "SENDGRID_API_KEY is not configured"}
     if not PAYGO_EMAIL_FROM:
@@ -14084,8 +14033,9 @@ def _paygo_email_send_sendgrid_sync(to_email: str, subject: str, text_body: str,
             {"type": "text/html", "value": html_body},
         ],
     }
-    if PAYGO_EMAIL_REPLY_TO:
-        payload["reply_to"] = {"email": PAYGO_EMAIL_REPLY_TO}
+    reply_to = _paygo_email_reply_to_for_brand(brand)
+    if reply_to:
+        payload["reply_to"] = {"email": reply_to}
     resp = requests.post(
         "https://api.sendgrid.com/v3/mail/send",
         headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
@@ -14098,7 +14048,7 @@ def _paygo_email_send_sendgrid_sync(to_email: str, subject: str, text_body: str,
     return {"ok": True, "provider": "sendgrid", "message_id": message_id}
 
 
-def _paygo_email_send_smtp_sync(to_email: str, subject: str, text_body: str, html_body: str) -> Dict[str, Any]:
+def _paygo_email_send_smtp_sync(to_email: str, subject: str, text_body: str, html_body: str, *, brand: Any = "") -> Dict[str, Any]:
     if not SMTP_HOST:
         return {"ok": False, "error": "SMTP_HOST is not configured"}
     if not PAYGO_EMAIL_FROM:
@@ -14109,8 +14059,9 @@ def _paygo_email_send_smtp_sync(to_email: str, subject: str, text_body: str, htm
     msg["Subject"] = subject
     msg["From"] = f"{PAYGO_EMAIL_FROM_NAME} <{PAYGO_EMAIL_FROM}>" if PAYGO_EMAIL_FROM_NAME else PAYGO_EMAIL_FROM
     msg["To"] = to_email
-    if PAYGO_EMAIL_REPLY_TO:
-        msg["Reply-To"] = PAYGO_EMAIL_REPLY_TO
+    reply_to = _paygo_email_reply_to_for_brand(brand)
+    if reply_to:
+        msg["Reply-To"] = reply_to
     if PAYGO_EMAIL_BCC:
         msg["Bcc"] = PAYGO_EMAIL_BCC
     msg.set_content(text_body)
@@ -14133,7 +14084,7 @@ def _paygo_email_send_smtp_sync(to_email: str, subject: str, text_body: str, htm
     return {"ok": True, "provider": "smtp", "message_id": ""}
 
 
-def _paygo_email_send_sync(to_email: str, subject: str, text_body: str, html_body: str) -> Dict[str, Any]:
+def _paygo_email_send_sync(to_email: str, subject: str, text_body: str, html_body: str, *, brand: Any = "") -> Dict[str, Any]:
     email = _stripe_paygo_email_norm(to_email)
     if not email:
         return {"ok": False, "skipped": True, "error": "missing recipient email"}
@@ -14142,9 +14093,9 @@ def _paygo_email_send_sync(to_email: str, subject: str, text_body: str, html_bod
     provider = (PAYGO_EMAIL_PROVIDER or "sendgrid").strip().lower()
     try:
         if provider == "sendgrid":
-            return _paygo_email_send_sendgrid_sync(email, subject, text_body, html_body)
+            return _paygo_email_send_sendgrid_sync(email, subject, text_body, html_body, brand=brand)
         if provider == "smtp":
-            return _paygo_email_send_smtp_sync(email, subject, text_body, html_body)
+            return _paygo_email_send_smtp_sync(email, subject, text_body, html_body, brand=brand)
         return {"ok": False, "skipped": True, "error": f"unsupported PAYGO_EMAIL_PROVIDER: {provider}"}
     except Exception as exc:
         return {"ok": False, "provider": provider, "error": str(exc)}
@@ -14181,9 +14132,10 @@ def _stripe_paygo_send_receipt_for_session_sync(session_id: str, session_obj: Op
     if not email:
         _stripe_paygo_mark_receipt_sync(sid, status="skipped", error="missing customer email")
         return {"ok": False, "skipped": True, "error": "missing customer email"}
+    receipt_brand = _stripe_paygo_brand(row.get("brand") or (session_obj.get("metadata") or {}).get("brand") or "Elaralo")
     text_body, html_body = _paygo_email_body(row, session_obj)
-    subject = _paygo_email_subject(str(row.get("brand") or "Elaralo"), int(row.get("minutes_total") or 0))
-    res = _paygo_email_send_sync(email, subject, text_body, html_body)
+    subject = _paygo_email_subject(receipt_brand, int(row.get("minutes_total") or 0))
+    res = _paygo_email_send_sync(email, subject, text_body, html_body, brand=receipt_brand)
     provider = _stripe_paygo_clean_text(res.get("provider") or PAYGO_EMAIL_PROVIDER)
     message_id = _stripe_paygo_clean_text(res.get("message_id"))
     if res.get("ok"):
@@ -14577,13 +14529,20 @@ async def stripe_paygo_session_status(request: Request):
 
 
 @app.get("/stripe/paygo/email-config")
-async def stripe_paygo_email_config():
+async def stripe_paygo_email_config(brand: str = ""):
+    brand_label = _stripe_paygo_brand(brand) if _stripe_paygo_clean_text(brand) else ""
+    resolved_reply_to = _paygo_email_reply_to_for_brand(brand_label or "Elaralo")
     return {
         "ok": True,
         "enabled": bool(PAYGO_EMAIL_ENABLED),
         "provider": PAYGO_EMAIL_PROVIDER,
         "from_configured": bool(PAYGO_EMAIL_FROM),
         "reply_to_configured": bool(PAYGO_EMAIL_REPLY_TO),
+        "reply_to_elaralo_configured": bool(PAYGO_EMAIL_REPLY_TO_ELARALO),
+        "reply_to_dulcemoon_configured": bool(PAYGO_EMAIL_REPLY_TO_DULCEMOON),
+        "brand": brand_label,
+        "resolved_reply_to_configured": bool(resolved_reply_to),
+        "resolved_reply_to": resolved_reply_to,
         "sendgrid_configured": bool(SENDGRID_API_KEY),
         "smtp_configured": bool(SMTP_HOST),
     }
