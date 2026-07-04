@@ -25800,7 +25800,8 @@ async def my_elaralo_companions_catalog(
 async def host_onboarding_catalog_visibility(request: Request):
     """Update the logged-in Host's Human Companion catalog visibility.
 
-    v9.2.42 hardening:
+    v9.2.43 hardening:
+      - Fixes the implicit SQLite transaction issue from schema repair before BEGIN IMMEDIATE.
       - Treat this as a lightweight preference update, not a page/navigation action.
       - Persist the value into the active Host/Profile Studio session completion JSON
         so the checkbox hydrates correctly after reload.
@@ -25843,6 +25844,19 @@ async def host_onboarding_catalog_visibility(request: Request):
         conn.execute("PRAGMA busy_timeout=5000;")
         _host_onboarding_ensure_schema(conn)
         _host_onboarding_ensure_companion_export_columns_on_conn(conn)
+
+        # Schema/trigger repair helpers can execute DDL/DML and may leave the
+        # sqlite3 connection inside an implicit transaction. Starting another
+        # BEGIN IMMEDIATE at that point raises:
+        #   sqlite3.OperationalError: cannot start a transaction within a transaction
+        # Commit the repair work before opening the lightweight catalog visibility
+        # transaction. This preserves the same write-lock behavior while avoiding
+        # the 500 seen when the checkbox is toggled.
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
 
