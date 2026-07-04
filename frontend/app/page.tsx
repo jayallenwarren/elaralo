@@ -820,16 +820,14 @@ function displayPlanLabel(planName: PlanName, memberId: string, planLabelOverrid
   const mid = String(memberId || "").trim();
   const hasMemberId = Boolean(mid) && !isAnonMemberId(mid) && Boolean(loggedIn);
 
-  // Requirement: If we do not have a memberId, the visitor is on Trial, shown as "Free Trial".
-  if (!hasMemberId) return "Free Trial";
+  // Product rule: absence of a paid plan is Trial for visitors and logged-in
+  // members alike.  Display both cases as Free Trial.
+  if (!hasMemberId || !planName || planName === "Trial") return "Free Trial";
 
   // White-label: show the rebranding site's plan label when provided (e.g., "Supreme"),
   // while still using ElaraloPlanMap for capability gating.
   const override = String(planLabelOverride || "").trim();
   if (override) return override;
-
-  // Requirement: Unknown / Not Provided only when the plan information for a member is not provided.
-  if (!planName) return "Unknown / Not Provided";
 
   return planName;
 }
@@ -1013,6 +1011,8 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
     const displayName = firstQueryValue(params, ["displayName", "display_name", "userName", "user_name", "username"]);
     const planName = firstQueryValue(params, ["planName", "plan_name", "plan"]);
     const modePill = firstQueryValue(params, ["modePill", "mode_pill", "modepill", "mode"]);
+    const freeMinutes = firstQueryValue(params, ["freeMinutes", "free_minutes", "includedMinutes", "included_minutes"]);
+    const cycleDays = firstQueryValue(params, ["cycleDays", "cycle_days"]);
     const preferredLanguage = firstQueryValue(params, ["preferredLanguage", "preferred_language", "userLanguage", "user_language", "language", "locale", "lang"]);
     const headshotUrl = firstQueryValue(params, ["headshotUrl", "headshot_url", "imageUrl", "image_url", "photoUrl", "photo_url"]);
     const loggedInValue = booleanFromQuery(firstQueryValue(params, ["loggedIn", "logged_in"]));
@@ -1050,6 +1050,27 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
       companion_key: companionKey,
     };
 
+    const isVisitorHandoff = !memberId && !loggedIn;
+    if (isVisitorHandoff && isElaraloBrandName(brand)) {
+      payload.planName = planName || "Trial";
+      payload.plan_name = planName || "Trial";
+      const trialMinutesOverride = freeMinutes || ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE;
+      if (trialMinutesOverride) {
+        payload.freeMinutes = trialMinutesOverride;
+        payload.free_minutes = trialMinutesOverride;
+        payload.includedMinutes = trialMinutesOverride;
+        payload.included_minutes = trialMinutesOverride;
+      }
+      if (cycleDays) {
+        payload.cycleDays = cycleDays;
+        payload.cycle_days = cycleDays;
+      }
+      if (!modePill) {
+        payload.modePill = "Mate";
+        payload.mode_pill = "Mate";
+      }
+    }
+
     if (companionTypeHint) {
       payload.companionType = companionTypeHint;
       payload.companion_type = companionTypeHint;
@@ -1067,6 +1088,16 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
     if (modePill) {
       payload.modePill = modePill;
       payload.mode_pill = modePill;
+    }
+    if (freeMinutes) {
+      payload.freeMinutes = freeMinutes;
+      payload.free_minutes = freeMinutes;
+      payload.includedMinutes = freeMinutes;
+      payload.included_minutes = freeMinutes;
+    }
+    if (cycleDays) {
+      payload.cycleDays = cycleDays;
+      payload.cycle_days = cycleDays;
     }
     if (preferredLanguage) {
       payload.preferredLanguage = preferredLanguage;
@@ -1195,6 +1226,10 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
 const DEFAULT_COMPANY_NAME = "Elaralo";
+// v9.1.28: Elaralo visitors are allowed 10 free Connect minutes before the same PayGo/Upgrade paywall used by DulceMoon.
+const ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE = String(
+  process.env.NEXT_PUBLIC_ELARALO_TRIAL_MINUTES || process.env.NEXT_PUBLIC_TRIAL_MINUTES_ELARALO || ""
+).trim();
 // Wix handoff / query param: a single "|" separated key (Rebranding|UpgradeLink|PayGoLink|PayGoPrice|PayGoMinutes|Plan|ElaraloPlanMap|FreeMinutes|CycleDays)
 const REBRANDING_KEY_QUERY_PARAM = "rebrandingKey";
 
@@ -8207,7 +8242,8 @@ useEffect(() => {
     setUserLanguagePreferenceKnown(true);
   }, []);
 
-  const [planName, setPlanName] = useState<PlanName>(null);
+  // Product rule: no paid plan is Trial for visitors and members alike.
+  const [planName, setPlanName] = useState<PlanName>("Trial");
   const latestPlanNameRef = useRef<PlanName>(planName);
   useEffect(() => {
     latestPlanNameRef.current = planName;
@@ -11650,7 +11686,7 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
       (companionName || DEFAULT_COMPANION_NAME).trim() ||
       DEFAULT_COMPANION_NAME;
 
-    const effectivePlanForBackend = (memberId || "").trim() ? String(planName || "").trim() : "Trial";
+    const effectivePlanForBackend = String(planName || "").trim() || "Trial";
 
     const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
     const brandKey = safeBrandKey(rawBrand);

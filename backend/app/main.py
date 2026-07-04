@@ -408,6 +408,27 @@ def health():
     return {"ok": True}
 
 
+
+@app.get("/brand/trial-config")
+async def brand_trial_config(brand: str = "Elaralo"):
+    """Return runtime Trial minute configuration for a brand.
+
+    This is a read-only diagnostics/bootstrap endpoint. The backend remains the
+    source of truth for Trial minutes. Frontends should not hardcode Elaralo's
+    10-minute default; if no explicit value is supplied, /chat and /usage/status
+    resolve the allowance with _trial_minutes_for_brand().
+    """
+    b = str(brand or "Elaralo").strip() or "Elaralo"
+    return {
+        "ok": True,
+        "brand": b,
+        "plan": "Trial",
+        "trial_minutes": int(_trial_minutes_for_brand(b)),
+        "trialMinutes": int(_trial_minutes_for_brand(b)),
+        "cycle_days": int(USAGE_CYCLE_DAYS or 30),
+        "cycleDays": int(USAGE_CYCLE_DAYS or 30),
+    }
+
 @app.get("/content/{brand}/{mode}/{filename}", name="content_file")
 async def content_file(request: Request, brand: str, mode: str, filename: str):
     """Serve scheduled media assets from the brand content library.
@@ -604,7 +625,9 @@ async def usage_status(request: Request):
             session_state["explicit_consent_persisted"] = True
             if session_state.get("pending_consent") == "intimate":
                 session_state["pending_consent"] = None
-    is_trial = (not bool(member_id)) or is_anon
+    # Product rule: no paid plan means Trial for visitors and logged-in members.
+    # Do not require a missing/empty plan to be treated as a paid plan with 0 minutes.
+    is_trial = (not bool(member_id)) or is_anon or _plan_is_absent_or_trial(plan_name_raw)
     brand_for_usage = _usage_brand_from_session_state(session_state, rebranding_parsed)
     email_for_usage = _session_get_str(session_state, "email", "customerEmail", "customer_email")
     identity_key = _usage_identity_key_for_brand(
@@ -615,10 +638,17 @@ async def usage_status(request: Request):
         request=request,
     )
 
-    minutes_allowed_override: Optional[int] = free_minutes if free_minutes is not None else None
+    # v9.2.45/v9.2.47: visitor AND logged-in Trial users get brand-specific
+    # free minutes when Wix/selector payload does not explicitly provide freeMinutes.
+    if free_minutes is not None:
+        minutes_allowed_override: Optional[int] = free_minutes
+    elif is_trial:
+        minutes_allowed_override = int(_trial_minutes_for_brand(brand_for_usage))
+    else:
+        minutes_allowed_override = None
     cycle_days_override: Optional[int] = cycle_days if cycle_days is not None else None
 
-    plan_name_for_limits = plan_map or plan_name_raw
+    plan_name_for_limits = plan_map or plan_name_raw or ("Trial" if is_trial else "")
 
     usage_ok, usage_info = await run_in_threadpool(
         _usage_peek_sync,
@@ -721,7 +751,88 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 # Minutes for visitors without a memberId
+# v9.2.45: trial/free minutes can now be brand-specific.
+# Elaralo visitors are allowed 10 free Connect minutes before PayGo/Upgrade paywalling.
+# v9.2.46: the absence of a paid plan is treated as Trial for visitors AND logged-in members.
+# v9.2.47: Elaralo Trial minutes remain backend-configurable; frontend no longer sends a hardcoded 10-minute override.
+# Keep TRIAL_MINUTES as the global legacy fallback so existing deployments do not break.
 TRIAL_MINUTES = _env_int("TRIAL_MINUTES", 15)
+TRIAL_MINUTES_ELARALO = _env_int("TRIAL_MINUTES_ELARALO", _env_int("ELARALO_TRIAL_MINUTES", 10))
+TRIAL_MINUTES_DULCEMOON = _env_int("TRIAL_MINUTES_DULCEMOON", _env_int("DULCEMOON_TRIAL_MINUTES", 10))
+
+def _trial_minutes_for_brand(brand: Any = "") -> int:
+    """Return visitor/free-trial Connect minutes for a brand.
+
+    The older code had one global TRIAL_MINUTES value.  That made direct
+    Elaralo visitor Connect sessions inherit whatever global/default value was
+    configured for other brands.  Keep the global setting as a fallback, but
+    make the product rule explicit for Elaralo and DulceMoon.
+    """
+    key = re.sub(r"[^a-z0-9]+", "", str(brand or "").strip().lower())
+    if key == "elaralo":
+        return int(TRIAL_MINUTES_ELARALO)
+    if key == "dulcemoon":
+        return int(TRIAL_MINUTES_DULCEMOON)
+    return int(TRIAL_MINUTES)
+
+
+
+
+def _usage_brand_from_identity_key(identity_key: Any = "") -> str:
+    """Best-effort brand extraction from brand-scoped usage keys.
+
+    PayGo and usage records use keys such as:
+      brand_member::Elaralo::<member_id>
+      brand_visitor::DulceMoon::<anon_id>
+      brand_email::Elaralo::<hash>
+      brand_session::Elaralo::<hash>
+      brand_ip::DulceMoon::<ip>
+
+    The helper keeps legacy keys supported by returning an empty string when the
+    key does not carry a brand.
+    """
+    raw = str(identity_key or "").strip()
+    if not raw:
+        return ""
+    parts = raw.split("::")
+    if len(parts) >= 3 and parts[0].lower() in {
+        "brand_member",
+        "brand_visitor",
+        "brand_email",
+        "brand_session",
+        "brand_ip",
+    }:
+        return str(parts[1] or "").strip()
+    return ""
+
+def _plan_is_absent_or_trial(plan_name: Any) -> bool:
+    """True when the caller has no paid subscription plan.
+
+    Product rule: absence of a paid plan is a Trial plan for visitors and
+    logged-in members alike. This keeps Elaralo aligned with DulceMoon: a
+    logged-in member with no active paid plan receives the brand Trial
+    allowance instead of being treated as a paid plan with zero minutes.
+    """
+    raw = str(plan_name or "").strip()
+    if not raw:
+        return True
+    try:
+        normalized = _normalize_plan_name_for_limits(raw).strip().lower()
+    except Exception:
+        normalized = raw.strip().lower()
+    compact = re.sub(r"[\s_\-]+", " ", normalized).strip()
+    return compact in {
+        "",
+        "trial",
+        "free trial",
+        "free",
+        "none",
+        "no plan",
+        "not provided",
+        "unknown",
+        "unknown / not provided",
+        "pay as you go",
+    }
 
 # Included minutes per subscription plan (set these in App Service Configuration)
 # Legacy Elaralo mode-aligned plans are retained for compatibility.
@@ -4935,7 +5046,7 @@ def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any
             # Determine whether this identity was exhausted before the credit.
             is_trial_rec = bool(rec.get("is_trial"))
             plan_for_limits = str(rec.get("plan_name") or "").strip()
-            minutes_allowed_before = int(TRIAL_MINUTES) if is_trial_rec else int(_included_minutes_for_plan(plan_for_limits))
+            minutes_allowed_before = int(_trial_minutes_for_brand(_usage_brand_from_identity_key(identity_key))) if is_trial_rec else int(_included_minutes_for_plan(plan_for_limits))
             allowed_seconds_before = max(0.0, (float(minutes_allowed_before) * 60.0) + float(purchased_seconds_before))
             exhausted_before = used_seconds_before >= (allowed_seconds_before - 1e-6)
 
@@ -9889,7 +10000,9 @@ async def chat(request: Request):
             if session_state.get("pending_consent") == "intimate":
                 session_state["pending_consent"] = None
 
-    is_trial = (not bool(member_id)) or is_anon
+    # Product rule: no paid plan means Trial for visitors and logged-in members.
+    plan_for_trial_decision = plan_external or plan_name_raw
+    is_trial = (not bool(member_id)) or is_anon or _plan_is_absent_or_trial(plan_for_trial_decision)
     brand_for_usage = _usage_brand_from_session_state(session_state, rebranding_parsed)
     email_for_usage = _session_get_str(session_state, "email", "customerEmail", "customer_email")
     identity_key = _usage_identity_key_for_brand(
@@ -9901,21 +10014,28 @@ async def chat(request: Request):
     )
 
     # Prefer using FreeMinutes/CycleDays from RebrandingKey when present.
+    # v9.2.45/v9.2.47: if this is a visitor/trial session and no explicit FreeMinutes
+    # was supplied, apply the brand-specific Trial allowance.  For Elaralo,
+    # that product rule is 10 free Connect minutes for visitors and logged-in
+    # members without a paid plan before the same Add Minutes / Upgrade paywall
+    # used by DulceMoon.
     minutes_allowed_override: Optional[int] = None
     if free_minutes is not None:
         minutes_allowed_override = free_minutes
+    elif is_trial:
+        minutes_allowed_override = int(_trial_minutes_for_brand(brand_for_usage))
     elif plan_map:
-        minutes_allowed_override = int(TRIAL_MINUTES) if is_trial else int(_included_minutes_for_plan(plan_map))
+        minutes_allowed_override = int(_included_minutes_for_plan(plan_map))
 
     cycle_days_override: Optional[int] = None
     if cycle_days is not None:
         cycle_days_override = cycle_days
 
     # Plan name used for quota purposes (fallback) should use the mapped plan if provided.
-    plan_name_for_limits = plan_map or plan_name_raw
+    plan_name_for_limits = plan_map or plan_name_raw or ("Trial" if is_trial else "")
 
     # Plan label shown to the user should use the external plan name (if provided).
-    plan_label_for_messages = plan_external or plan_name_raw
+    plan_label_for_messages = plan_external or plan_name_raw or ("Trial" if is_trial else "")
 
     # For rebranding, construct PAYG_PRICE_TEXT as:
     #   PayGoPrice + " per " + PayGoMinutes + " minutes"
@@ -9955,7 +10075,7 @@ async def chat(request: Request):
             or (
                 minutes_allowed_override
                 if minutes_allowed_override is not None
-                else (TRIAL_MINUTES if is_trial else _included_minutes_for_plan(plan_name_for_limits))
+                else (_trial_minutes_for_brand(brand_for_usage) if is_trial else _included_minutes_for_plan(plan_name_for_limits))
             )
             or 0
         )
@@ -26034,13 +26154,11 @@ async def my_elaralo_companions_catalog(
 ):
     resolved_member_id = _host_onboarding_normalize_member_id(memberId or member_id)
     brand_name = _host_onboarding_safe_str(brand) or "Elaralo"
-    # The Elaralo member area remains member-scoped because hidden Human Host
-    # owner cards and Host/Profile Studio integration depend on memberId.
-    # White-label public brands such as DulceMoon must also support visitor/free
-    # trial catalog loading so their selector can auto-open the single visible
-    # companion before a Wix member payload is available.
-    if not resolved_member_id and _is_elaralo_core_brand(brand_name):
-        raise HTTPException(status_code=400, detail="memberId is required")
+    # v9.2.45: Elaralo visitors can browse/select AI companions and open
+    # Connect using the brand-specific free-minute allowance.  Member-scoped
+    # hidden Host owner cards still require memberId and are only included when
+    # resolved_member_id is present; public/visitor catalog calls receive AI
+    # cards plus any explicitly visible Human cards.
     items = _my_elaralo_companion_cards_sync(
         brand=brand_name,
         member_id=resolved_member_id,

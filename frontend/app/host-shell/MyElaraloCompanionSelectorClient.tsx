@@ -47,6 +47,12 @@ type CatalogResponse = {
 const API_BASE = String(process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
 const APP_BASE = String(process.env.NEXT_PUBLIC_APP_BASE_URL || "").replace(/\/+$/, "");
 const DEFAULT_HEADSHOT = "/elaralo-logo.png";
+const ELARALO_TRIAL_PLAN_NAME = "Trial";
+// v9.2.47: Elaralo Trial minutes are backend-configurable.
+// Do not send a hardcoded 10-minute override unless an explicit query/env override is supplied.
+const ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE = String(
+  process.env.NEXT_PUBLIC_ELARALO_TRIAL_MINUTES || process.env.NEXT_PUBLIC_TRIAL_MINUTES_ELARALO || ""
+).trim();
 
 function safeText(value: any): string {
   return String(value ?? "").trim();
@@ -54,6 +60,20 @@ function safeText(value: any): string {
 
 function safeLower(value: any): string {
   return safeText(value).toLowerCase();
+}
+
+function payloadHasPaidPlan(payload: MemberPlanPayload): boolean {
+  const raw = safeText((payload as any)?.planName || (payload as any)?.plan_name || (payload as any)?.plan);
+  if (!raw) return false;
+  const normalized = raw
+    .replace(/\s*\([^)]*\)\s*$/g, "")
+    .replace(/[-–—_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\s*membership\s*$/i, "")
+    .replace(/^test\s+/i, "")
+    .trim()
+    .toLowerCase();
+  return !["", "trial", "free trial", "free", "none", "no plan", "unknown", "not provided", "pay as you go"].includes(normalized);
 }
 
 function isAnonMemberId(value: any): boolean {
@@ -428,9 +448,13 @@ export default function MyElaraloCompanionSelectorClient() {
         return;
       }
       if (!memberId) {
-        if (isElaraloCoreBrand) {
-          setError(loggedIn ? "Waiting for member context..." : "Please sign in through the Elaralo member area.");
-          setLoading(false);
+        // v9.2.17: Elaralo visitors are allowed to browse/select companions and
+        // enter Connect using the brand-level free-minute allowance.  If Wix says
+        // the viewer is logged in but member context has not arrived yet, wait
+        // briefly; otherwise treat the request as a visitor/free-trial session.
+        if (isElaraloCoreBrand && loggedIn && !externalPayloadSeen && !contextGraceElapsed) {
+          setError("");
+          setLoading(true);
           return;
         }
         // White-label brands such as DulceMoon must support visitor/free-trial
@@ -605,6 +629,28 @@ export default function MyElaraloCompanionSelectorClient() {
         for (const [target, sources] of passthroughParamMap) {
           const value = sources.map((key) => safeText((memberPayload as any)?.[key])).find(Boolean) || "";
           if (value) url.searchParams.set(target, value);
+        }
+
+        // v9.2.18: for Elaralo visitors OR logged-in members with no paid
+        // plan, explicitly pass the Trial free-minute allowance into Connect
+        // so the UI/session payload and backend usage logic agree from the
+        // first turn.  The backend also enforces this by brand, so these query
+        // params are a UX/bootstrap convenience, not the security source of truth.
+        const brandKeyForConnect = safeLower(brand).replace(/[^a-z0-9]+/g, "");
+        const hasPaidPlanForConnect = payloadHasPaidPlan(memberPayload);
+        if (brandKeyForConnect === "elaralo" && !hasPaidPlanForConnect) {
+          if (!url.searchParams.get("planName")) url.searchParams.set("planName", ELARALO_TRIAL_PLAN_NAME);
+          if (!url.searchParams.get("plan_name")) url.searchParams.set("plan_name", ELARALO_TRIAL_PLAN_NAME);
+          // Trial minutes are enforced by the backend per brand. Only pass an explicit
+          // free-minute override if one was supplied to the app or build config.
+          if (ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE) {
+            if (!url.searchParams.get("freeMinutes")) url.searchParams.set("freeMinutes", ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE);
+            if (!url.searchParams.get("free_minutes")) url.searchParams.set("free_minutes", ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE);
+            if (!url.searchParams.get("includedMinutes")) url.searchParams.set("includedMinutes", ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE);
+            if (!url.searchParams.get("included_minutes")) url.searchParams.set("included_minutes", ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE);
+          }
+          if (!url.searchParams.get("modePill")) url.searchParams.set("modePill", "Mate");
+          if (!url.searchParams.get("mode_pill")) url.searchParams.set("mode_pill", "Mate");
         }
 
         window.location.assign(url.toString());
