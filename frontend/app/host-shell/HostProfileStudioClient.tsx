@@ -828,6 +828,7 @@ export default function HostProfileStudioClient() {
     skipped_sections: {},
   });
   const [showCompletionPhysicalDescriptionEditor, setShowCompletionPhysicalDescriptionEditor] = useState<boolean>(false);
+  const [catalogVisibilitySaving, setCatalogVisibilitySaving] = useState<boolean>(false);
 
   const hydrateFromSession = useCallback((payload: HostOnboardingSession | null, readinessIn?: HostOnboardingReadiness | null) => {
     setSession(payload);
@@ -1274,6 +1275,57 @@ export default function HostProfileStudioClient() {
       setSaving(false);
     }
   }, [context.memberId, hydrateFromSession, reviewForm, session?.session_id]);
+
+  const saveCatalogVisibilityPreference = useCallback(async (nextVisible: boolean) => {
+    // Keep the catalog-listing toggle as a lightweight preference update.
+    // It should not navigate the iframe, submit the completion form, or move steps.
+    if (!context.memberId) {
+      setError("Unable to save catalog visibility because member context is missing.");
+      return;
+    }
+    setCatalogVisibilitySaving(true);
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/catalog-visibility`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          memberId: context.memberId,
+          brand: context.brand,
+          avatar: context.avatar,
+          sessionId: session?.session_id || "",
+          visible: Boolean(nextVisible),
+          list_in_companion_catalog: Boolean(nextVisible),
+          catalog_visible: Boolean(nextVisible),
+          show_in_companion_catalog: Boolean(nextVisible),
+        }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
+      setNotice(
+        data?.mapping_missing
+          ? "Catalog visibility preference saved. The public catalog row will be updated after this Host profile is exported."
+          : Boolean(nextVisible)
+            ? "Your Host profile will be listed in the Companion catalog."
+            : "Your Host profile is hidden from the Companion catalog."
+      );
+    } catch (err: any) {
+      setCompletionForm((p) => ({ ...p, list_in_companion_catalog: !Boolean(nextVisible) }));
+      setError(String(err?.message || "Unable to save catalog visibility."));
+    } finally {
+      setCatalogVisibilitySaving(false);
+    }
+  }, [context.avatar, context.brand, context.memberId, session?.session_id]);
+
+  const handleCatalogVisibilityChange = useCallback((nextVisible: boolean) => {
+    setCompletionForm((p) => ({
+      ...p,
+      list_in_companion_catalog: Boolean(nextVisible),
+      catalog_visible: Boolean(nextVisible),
+      show_in_companion_catalog: Boolean(nextVisible),
+    }));
+    void saveCatalogVisibilityPreference(Boolean(nextVisible));
+  }, [saveCatalogVisibilityPreference]);
 
   const saveCompletion = useCallback(async () => {
     if (!session?.session_id) return;
@@ -1992,20 +2044,24 @@ export default function HostProfileStudioClient() {
                 Optional. Use this only when the host's first name should be pronounced differently from its spelling. If left blank, Elaralo will not derive a phonetic value from the first name.
               </span>,
             )}
-            <label style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)", cursor: "pointer" }}>
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)" }}>
               <input
                 type="checkbox"
                 checked={Boolean(completionForm.list_in_companion_catalog)}
-                onChange={(e) => setCompletionForm((p) => ({ ...p, list_in_companion_catalog: e.currentTarget.checked }))}
+                disabled={catalogVisibilitySaving}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => handleCatalogVisibilityChange(e.currentTarget.checked)}
                 style={{ marginTop: 3 }}
+                aria-label="List my Host profile in the Companion catalog"
               />
               <span style={{ display: "grid", gap: 4 }}>
                 <span style={{ fontWeight: 800 }}>List my Host profile in the Companion catalog</span>
                 <span style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
                   Optional and off by default. When unchecked, your Human Companion remains available to you for management/testing, but ordinary members and visitors will not see it on the Companion page.
                 </span>
+                {catalogVisibilitySaving ? <span style={{ fontSize: 12, color: "#6b7280" }}>Saving catalog visibility…</span> : null}
               </span>
-            </label>
+            </div>
             <div style={{ ...cardStyle, padding: 16, display: "grid", gap: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <div>

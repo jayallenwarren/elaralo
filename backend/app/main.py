@@ -25798,15 +25798,27 @@ async def my_elaralo_companions_catalog(
 
 @app.post("/host-onboarding/catalog-visibility")
 async def host_onboarding_catalog_visibility(request: Request):
-    """Update the logged-in Host's Human Companion catalog visibility."""
+    """Update the logged-in Host's Human Companion catalog visibility.
+
+    v9.2.42 hardening:
+      - Treat this as a lightweight preference update, not a page/navigation action.
+      - Persist the value into the active Host/Profile Studio session completion JSON
+        so the checkbox hydrates correctly after reload.
+      - Update the Human companion_mappings row when it exists.
+      - If a mapping row does not exist yet, do not hard-fail the UI; the row will be
+        created during the normal Host Onboarding/Profile Studio approval/export path.
+    """
     try:
         raw = await request.json()
     except Exception:
         raw = {}
     if not isinstance(raw, dict):
         raw = {}
+
     member_id = _host_onboarding_normalize_member_id(raw.get("memberId") or raw.get("member_id"))
     brand_name = _host_onboarding_safe_str(raw.get("brand") or raw.get("brandId") or raw.get("brand_id") or "Elaralo") or "Elaralo"
+    session_id = _host_onboarding_safe_str(raw.get("sessionId") or raw.get("session_id"))
+
     visible = _host_onboarding_catalog_visible_from_objs(raw)
     if visible is None:
         visible = _bool_from_any(raw.get("visible"), default=None)
@@ -25814,16 +25826,74 @@ async def host_onboarding_catalog_visibility(request: Request):
         raise HTTPException(status_code=400, detail="visible/list_in_companion_catalog is required")
     if not member_id:
         raise HTTPException(status_code=400, detail="memberId is required")
+
     db_path = _get_companion_mappings_db_path(for_write=True) or _ensure_econnect_db_seeded()
     if not db_path:
         raise HTTPException(status_code=500, detail="companion mappings database is not configured")
+
+    visible_int = 1 if bool(visible) else 0
+    now_epoch = int(_host_onboarding_now())
+    mapping_updated = 0
+    session_updated = 0
+    latest_session_id = ""
+
     conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA busy_timeout=5000;")
+        _host_onboarding_ensure_schema(conn)
         _host_onboarding_ensure_companion_export_columns_on_conn(conn)
-        visible_int = 1 if bool(visible) else 0
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+
+        # First persist the preference into the active session completion JSON. This
+        # prevents the UI from hydrating back to the previous value after reload.
+        session_row = None
+        if session_id:
+            session_row = cur.execute(
+                f"SELECT * FROM {_HOST_ONBOARDING_SESSIONS_TABLE} WHERE session_id = ? AND member_id = ? LIMIT 1",
+                (session_id, member_id),
+            ).fetchone()
+        if session_row is None:
+            session_row = cur.execute(
+                f"""
+                SELECT *
+                  FROM {_HOST_ONBOARDING_SESSIONS_TABLE}
+                 WHERE member_id = ?
+                   AND lower(COALESCE(brand, '')) = lower(?)
+                 ORDER BY updated_epoch DESC, created_epoch DESC
+                 LIMIT 1
+                """,
+                (member_id, brand_name),
+            ).fetchone()
+
+        if session_row is not None:
+            try:
+                completion = _host_onboarding_json_loads(session_row["completion_json"], {})
+                if not isinstance(completion, dict):
+                    completion = {}
+            except Exception:
+                completion = {}
+            completion["list_in_companion_catalog"] = bool(visible_int)
+            completion["catalog_visible"] = bool(visible_int)
+            completion["show_in_companion_catalog"] = bool(visible_int)
+            completion["catalog_visibility_updated_at"] = now_epoch
+            completion["catalog_visibility_updated_by"] = member_id
+            latest_session_id = _host_onboarding_safe_str(session_row["session_id"])
+            cur.execute(
+                f"""
+                UPDATE {_HOST_ONBOARDING_SESSIONS_TABLE}
+                   SET completion_json = ?,
+                       updated_epoch = ?
+                 WHERE session_id = ?
+                   AND member_id = ?
+                """,
+                (_host_onboarding_json_dumps(completion), now_epoch, latest_session_id, member_id),
+            )
+            session_updated = int(cur.rowcount or 0)
+
+        # Then update the exported Human mapping when it exists. Do not allow AI rows
+        # to be touched by this preference route.
         cur.execute(
             """
             UPDATE companion_mappings
@@ -25835,19 +25905,41 @@ async def host_onboarding_catalog_visibility(request: Request):
                AND lower(COALESCE(companion_type, '')) = 'human'
                AND lower(COALESCE(host_member_id, '')) = lower(?)
             """,
-            (visible_int, visible_int, int(_host_onboarding_now()), member_id, brand_name, member_id),
+            (visible_int, visible_int, now_epoch, member_id, brand_name, member_id),
         )
-        updated = int(cur.rowcount or 0)
+        mapping_updated = int(cur.rowcount or 0)
+
         conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
     try:
         _load_companion_mappings_sync()
     except Exception:
         pass
-    if updated <= 0:
-        raise HTTPException(status_code=404, detail="No Human Companion mapping row found for this host")
-    return {"ok": True, "brand": brand_name, "member_id": member_id, "list_in_companion_catalog": bool(visible_int), "updated": updated}
+
+    return {
+        "ok": True,
+        "brand": brand_name,
+        "member_id": member_id,
+        "session_id": latest_session_id or session_id,
+        "list_in_companion_catalog": bool(visible_int),
+        "catalog_visible": bool(visible_int),
+        "mapping_updated": mapping_updated,
+        "session_updated": session_updated,
+        "updated": mapping_updated + session_updated,
+        "mapping_missing": mapping_updated <= 0,
+        "message": "Catalog visibility saved. Human Companion mapping will be updated after Host profile export if it does not exist yet." if mapping_updated <= 0 else "Catalog visibility saved.",
+    }
 
 
 @app.get("/host-onboarding/public/summary")
