@@ -3864,6 +3864,40 @@ function ConnectPage() {
     }
   }, []);
 
+
+  // v9.1.27 latency optimization: shared visibility flag for adaptive polling.
+  // Polling now slows/stops when the tab is backgrounded, which is especially
+  // helpful inside Wix iframes on iOS/iPadOS.
+  const pageVisibleRef = useRef<boolean>(true);
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const sync = () => {
+      pageVisibleRef.current = !document.hidden;
+    };
+    sync();
+    document.addEventListener("visibilitychange", sync);
+    return () => document.removeEventListener("visibilitychange", sync);
+  }, []);
+
+  const adaptiveRelayPollDelayMs = useCallback(() => {
+    if (!pageVisibleRef.current) return 15000;
+    const overrideActive = Boolean((sessionStateRef.current as any)?.host_override_active);
+    const hasMessages = (messagesRef.current?.length || 0) > 0;
+    if (overrideActive) return 1000;
+    if (hasMessages) return 4000;
+    return 8000;
+  }, []);
+
+  const adaptiveHostListPollDelayMs = useCallback((activeCount: number) => {
+    if (!pageVisibleRef.current) return 15000;
+    return activeCount > 0 ? 2500 : 6000;
+  }, []);
+
+  const adaptiveHostTranscriptPollDelayMs = useCallback((hasSelection: boolean) => {
+    if (!pageVisibleRef.current) return 15000;
+    return hasSelection ? 1000 : 4000;
+  }, []);
+
   // Elaralo launches Connect from the My Elaralo selector by navigating the same
   // Wix-hosted iframe and passing a direct query-string payload. DulceMoon's
   // Connect payload is still supplied by Wix postMessage and must remain on the
@@ -7353,7 +7387,7 @@ useEffect(() => {
   const tick = async () => {
     if (cancelled) return;
     await pollOnce();
-    timer = setTimeout(tick, 1200);
+    timer = setTimeout(tick, adaptiveRelayPollDelayMs());
   };
 
   tick();
@@ -7376,6 +7410,7 @@ useEffect(() => {
   sttLanguageHintCode,
   assistantConversationLanguageCode,
   assistantConversationLanguageName,
+  adaptiveRelayPollDelayMs,
 ]);
 
   const [loading, setLoading] = useState(false);
@@ -7446,7 +7481,7 @@ useEffect(() => {
   const tick = async () => {
     if (cancelled) return;
     await fetchActive();
-    timer = setTimeout(tick, 2000);
+    timer = setTimeout(tick, adaptiveHostListPollDelayMs(hostActiveChats.length));
   };
 
   tick();
@@ -7455,7 +7490,7 @@ useEffect(() => {
     cancelled = true;
     if (timer) clearTimeout(timer);
   };
-}, [API_BASE, hostConsoleOpen, isHost, companyName, companionName, hostActiveChats.length]);
+}, [API_BASE, hostConsoleOpen, isHost, companyName, companionName, hostActiveChats.length, adaptiveHostListPollDelayMs]);
 
 useEffect(() => {
   if (!hostConsoleOpen) return;
@@ -7603,7 +7638,7 @@ useEffect(() => {
   const tick = async () => {
     if (cancelled) return;
     await pollSelected();
-    timer = setTimeout(tick, 900);
+    timer = setTimeout(tick, adaptiveHostTranscriptPollDelayMs(Boolean(hostSelectedSessionId)));
   };
 
   tick();
@@ -7619,6 +7654,7 @@ useEffect(() => {
   companyName,
   companionName,
   hostSelectedSessionId,
+  adaptiveHostTranscriptPollDelayMs,
 ]);
 
 const hostSelectSession = (sid: string) => {

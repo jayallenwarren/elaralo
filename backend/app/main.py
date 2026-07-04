@@ -12,6 +12,8 @@ import mimetypes
 import math
 import asyncio
 import threading
+import contextvars
+from functools import lru_cache
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -58,6 +60,156 @@ STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
 
 app = FastAPI(title="Elaralo API")
+
+
+# ----------------------------
+# v9.2.44 Performance tracing and low-risk latency helpers
+# ----------------------------
+# Disabled by default. Enable in Azure App Service with:
+#   PERF_TIMING_ENABLED=1
+# Optional:
+#   PERF_TIMING_SAMPLE_RATE=1.0   (0.0-1.0)
+#   PERF_TIMING_SLOW_MS=750
+#   PERF_TIMING_VERBOSE=0|1
+_PERF_TIMING_ENABLED = (os.getenv("PERF_TIMING_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    _PERF_TIMING_SAMPLE_RATE = max(0.0, min(1.0, float(os.getenv("PERF_TIMING_SAMPLE_RATE", "1.0") or "1.0")))
+except Exception:
+    _PERF_TIMING_SAMPLE_RATE = 1.0
+try:
+    _PERF_TIMING_SLOW_MS = float(os.getenv("PERF_TIMING_SLOW_MS", "750") or "750")
+except Exception:
+    _PERF_TIMING_SLOW_MS = 750.0
+_PERF_TIMING_VERBOSE = (os.getenv("PERF_TIMING_VERBOSE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+_PERF_TRACE_CTX: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar("elaralo_perf_trace", default=None)
+
+def _perf_now_ms() -> float:
+    return time.perf_counter() * 1000.0
+
+def _perf_should_sample(path: str = "") -> bool:
+    if not _PERF_TIMING_ENABLED:
+        return False
+    if _PERF_TIMING_SAMPLE_RATE >= 1.0:
+        return True
+    if _PERF_TIMING_SAMPLE_RATE <= 0.0:
+        return False
+    try:
+        # Stable-ish deterministic sampling by path + current second, avoids importing random.
+        key = f"{path}:{int(time.time())}".encode("utf-8")
+        bucket = int(hashlib.sha1(key).hexdigest()[:8], 16) / 0xFFFFFFFF
+        return bucket <= _PERF_TIMING_SAMPLE_RATE
+    except Exception:
+        return True
+
+def _perf_stage(name: str, **extra: Any) -> None:
+    trace = _PERF_TRACE_CTX.get()
+    if not trace:
+        return
+    try:
+        stages = trace.setdefault("stages", [])
+        item = {"name": str(name), "t_ms": round(_perf_now_ms() - float(trace.get("start_ms") or 0.0), 2)}
+        if extra:
+            safe_extra: Dict[str, Any] = {}
+            for k, v in extra.items():
+                if isinstance(v, (str, int, float, bool)) or v is None:
+                    safe_extra[str(k)] = v
+                else:
+                    safe_extra[str(k)] = str(v)
+            item["extra"] = safe_extra
+        stages.append(item)
+    except Exception:
+        pass
+
+@app.middleware("http")
+async def _perf_timing_middleware(request: Request, call_next):
+    if not _perf_should_sample(str(request.url.path)):
+        return await call_next(request)
+    trace: Dict[str, Any] = {
+        "request_id": request.headers.get("x-request-id") or str(uuid.uuid4()),
+        "method": request.method,
+        "path": request.url.path,
+        "query": str(request.url.query or "")[:500],
+        "start_ms": _perf_now_ms(),
+        "stages": [],
+    }
+    token = _PERF_TRACE_CTX.set(trace)
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = getattr(response, "status_code", 0) or 0
+        return response
+    finally:
+        try:
+            elapsed = round(_perf_now_ms() - float(trace.get("start_ms") or 0.0), 2)
+            if _PERF_TIMING_VERBOSE or elapsed >= _PERF_TIMING_SLOW_MS:
+                payload = {
+                    "kind": "perf_trace",
+                    "request_id": trace.get("request_id"),
+                    "method": trace.get("method"),
+                    "path": trace.get("path"),
+                    "status": status_code,
+                    "elapsed_ms": elapsed,
+                    "stages": trace.get("stages") or [],
+                }
+                print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+        except Exception:
+            pass
+        try:
+            _PERF_TRACE_CTX.reset(token)
+        except Exception:
+            pass
+
+# Memoized static policy blocks used by /chat. This avoids rebuilding identical large
+# policy strings every turn and centralizes the most commonly inserted instructions.
+_CHAT_MEMORY_CAPABILITY_POLICY = (
+    "Memory rule: Only reference cross-session history if a 'Saved conversation summary' is provided. "
+    "If no saved summary is provided and the user asks about past conversations, say you do not have a saved summary for this companion.\n"
+    "Capability rule: Your replies may be spoken aloud in this app (audio TTS and/or a live avatar). "
+    "Do not say you lack text-to-speech; instead explain that you generate text and the platform voices it."
+)
+_CHAT_LANGUAGE_CAPABILITY_POLICY = (
+    "Language capability rule: This app can translate between the user's preferred language and English. "
+    "Do not claim that translation is unavailable, and do not say that you can speak only English. "
+    "English remains the assistant's source speech language unless the host configured otherwise, while the platform may localize displayed text for the user."
+)
+_CHAT_VISION_POLICY = (
+    "Vision rule: User image attachments may be supplied to you as direct image input. "
+    "When image input is present, inspect it and answer based on what you see. "
+    "You may describe visible, non-identifying details in a user-supplied photo, including the setting, pose, clothing, objects, and other observable scene details. "
+    "Do not identify a real person in a photo, do not confirm identity, and do not infer sensitive or private attributes from the image. "
+    "Do not use broad refusal wording such as saying you cannot provide information about individuals in photos when you can still describe allowed visible details. "
+    "If the user asks who a real person is, say you cannot identify the real person and then continue with any allowed non-identifying observations. "
+    "Do not say that you cannot view attachments or images when the platform has provided image input."
+)
+_CHAT_CONTENT_DELIVERY_POLICY = (
+    "Content delivery rule: Never invent, promise, or format media attachments, filenames, file numbers, or /content/ links. "
+    "Only the platform may deliver scheduled photos or videos, and only when a real file exists in the active content library. "
+    "If the user asks for media, respond conversationally without URLs, without attachment blocks, and without claiming that content has been sent unless the platform actually attaches it."
+)
+
+@lru_cache(maxsize=64)
+def _chat_translation_policy_cached(user_language_code: str, user_language_name: str) -> str:
+    code = (user_language_code or "").strip() or "en"
+    name = (user_language_name or "").strip() or _language_name_from_code(code) or "the user's preferred language"
+    return (
+        f"Translation rule: The user prefers {name} ({code}). "
+        "Write your canonical assistant reply in English only. "
+        "Do not produce bilingual output, and do not self-translate your reply. "
+        "The platform will render the display translation for the user. "
+        "Do not claim that you can speak only English or that translation is unavailable. "
+        "If the user's language is neither English nor Spanish, the platform may add a brief one-time translator notice after the initial greeting."
+    )
+
+@lru_cache(maxsize=16)
+def _chat_provider_switch_policy_cached(llm_provider: str, effective_mode: str) -> str:
+    provider_label = "xAI" if str(llm_provider or "").lower() == "xai" else "OpenAI"
+    mode_label = str(effective_mode or "").title() or "Current"
+    return (
+        f"System routing note: The app switched the underlying model provider to {provider_label} "
+        f"because the user is now in {mode_label} mode. "
+        "Review any provided summaries and continue seamlessly while respecting the current mode's boundaries."
+    )
 # v9.2.28: Public Connect mode labels are Intro/Mate/Mature; internal routing remains friend/romantic/intimate.
 # v9.2.27: DulceMoon Discover/Explore/Encounter plan support.
 # v9.2.26: v9.2.25 plus /chat persistent Mature-consent initialization fix.
@@ -364,6 +516,7 @@ async def usage_credit(request: Request):
     """
     try:
         raw = await request.json()
+        _perf_stage("usage.credit.parse_json")
     except Exception:
         raw = {}
 
@@ -9193,6 +9346,12 @@ _TTS_PREWARM_ENABLED = (os.getenv("TTS_PREWARM_ENABLED", "1") or "1").strip().lo
 # We deliberately do NOT guess a voice_id from companion here because this is backend-only and we want
 # to avoid unintended cross-companion behavior. If you want prewarm for a specific voice, set it explicitly.
 _TTS_PREWARM_VOICE_ID = (os.getenv("TTS_PREWARM_VOICE_ID", "") or "").strip()
+_TTS_PREWARM_VOICE_IDS_RAW = (os.getenv("TTS_PREWARM_VOICE_IDS", "") or "").strip()
+_TTS_PREWARM_FROM_MAPPINGS = (os.getenv("TTS_PREWARM_FROM_COMPANION_MAPPINGS", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+try:
+    _TTS_PREWARM_MAX_VOICES = max(1, int(os.getenv("TTS_PREWARM_MAX_VOICES", "8") or "8"))
+except Exception:
+    _TTS_PREWARM_MAX_VOICES = 8
 
 _DEFAULT_PREWARM_PHRASES: list[str] = [
     "Hello!",
@@ -9221,23 +9380,120 @@ def _load_prewarm_phrases() -> list[str]:
         pass
     return list(_DEFAULT_PREWARM_PHRASES)
 
+
+def _tts_prewarm_voice_targets() -> list[dict[str, str]]:
+    """Return prewarm targets as {voice_id, brand, avatar, phonetic} dictionaries.
+
+    Supports explicit env configuration and, by default, a safe best-effort scan of
+    loaded companion_mappings rows. This keeps cold-start prewarm aligned with the
+    actual active voices without hard-coding companion names.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add_target(voice_id: str, brand: str = "", avatar: str = "", phonetic: str = "") -> None:
+        vid = str(voice_id or "").strip()
+        if not vid or vid in seen:
+            return
+        seen.add(vid)
+        out.append({"voice_id": vid, "brand": str(brand or "").strip(), "avatar": str(avatar or "").strip(), "phonetic": str(phonetic or "").strip()})
+
+    if _TTS_PREWARM_VOICE_ID:
+        add_target(_TTS_PREWARM_VOICE_ID)
+
+    if _TTS_PREWARM_VOICE_IDS_RAW:
+        for part in re.split(r"[,\s]+", _TTS_PREWARM_VOICE_IDS_RAW):
+            add_target(part)
+
+    if _TTS_PREWARM_FROM_MAPPINGS:
+        try:
+            # Prioritize Human/video rows first, then stable order by brand/avatar.
+            rows = []
+            for (_brand_key, _avatar_key), row in list((_COMPANION_MAPPINGS or {}).items()):
+                vid = str((row or {}).get("eleven_voice_id") or "").strip()
+                if not vid:
+                    continue
+                ctype = str((row or {}).get("companion_type") or "").strip().lower()
+                cap = str((row or {}).get("channel_cap") or "").strip().lower()
+                priority = 0
+                if ctype == "human":
+                    priority -= 10
+                if cap == "video":
+                    priority -= 2
+                rows.append((priority, str((row or {}).get("brand") or ""), str((row or {}).get("avatar") or ""), row))
+            rows.sort(key=lambda item: (item[0], item[1].lower(), item[2].lower()))
+            for _priority, _brand, _avatar, row in rows:
+                if len(out) >= _TTS_PREWARM_MAX_VOICES:
+                    break
+                add_target(
+                    str((row or {}).get("eleven_voice_id") or ""),
+                    str((row or {}).get("brand") or ""),
+                    str((row or {}).get("avatar") or ""),
+                    str((row or {}).get("phonetic") or ""),
+                )
+        except Exception:
+            pass
+
+    return out[:_TTS_PREWARM_MAX_VOICES]
+
+def _tts_prewarm_phrases_for_target(target: dict[str, str], base_phrases: list[str]) -> list[str]:
+    phrases = list(base_phrases or [])
+    avatar = str((target or {}).get("avatar") or "").strip()
+    if avatar:
+        phrases.insert(0, f"Hi, {avatar} here. What's on your mind?")
+    # De-dupe while preserving order.
+    out: list[str] = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        p = str(phrase or "").strip()
+        key = p.lower()
+        if not p or key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
 async def _tts_prewarm_task() -> None:
     if not _TTS_PREWARM_ENABLED:
         return
-    if not _TTS_PREWARM_VOICE_ID:
-        # No explicit voice configured; skip prewarm to avoid generating for the wrong companion.
+    targets = _tts_prewarm_voice_targets()
+    if not targets:
         return
 
-    phrases = _load_prewarm_phrases()
+    base_phrases = _load_prewarm_phrases()
     # Use a fixed session id; caching ignores session id when _TTS_CACHE_ENABLED is on.
     sid = "prewarm"
-    for phrase in phrases:
-        try:
-            # run the synchronous generator in a thread to avoid blocking the event loop
-            await run_in_threadpool(_tts_audio_url_sync, sid, _TTS_PREWARM_VOICE_ID, phrase)
-        except Exception:
-            # fail-open: ignore
+    warmed = 0
+    for target in targets:
+        voice_id = str(target.get("voice_id") or "").strip()
+        if not voice_id:
             continue
+        for phrase in _tts_prewarm_phrases_for_target(target, base_phrases):
+            try:
+                text_for_tts = _normalize_tts_generation_text(
+                    phrase,
+                    brand=str(target.get("brand") or ""),
+                    avatar=str(target.get("avatar") or ""),
+                    mapping_phonetic=str(target.get("phonetic") or ""),
+                )
+                # run the synchronous generator in a thread to avoid blocking the event loop
+                await run_in_threadpool(
+                    _tts_audio_url_sync,
+                    sid,
+                    voice_id,
+                    text_for_tts,
+                    str(target.get("brand") or ""),
+                    str(target.get("avatar") or ""),
+                    str(target.get("phonetic") or ""),
+                )
+                warmed += 1
+            except Exception:
+                # fail-open: ignore
+                continue
+    try:
+        print(f"[tts-prewarm] warmed {warmed} phrase/voice combinations across {len(targets)} voices")
+    except Exception:
+        pass
 
 @app.on_event("startup")
 async def _startup_tts_prewarm() -> None:
@@ -9550,7 +9806,9 @@ async def chat(request: Request):
     debug = bool(getattr(settings, "DEBUG", False))
 
     raw = await request.json()
+    _perf_stage("chat.parse_json")
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
+    _perf_stage("chat.normalize_payload", session_id=session_id)
     
     voice_id = _extract_voice_id(raw)
 
@@ -9560,6 +9818,7 @@ async def chat(request: Request):
         pass
 
     translation_ctx = _session_translation_context(session_state)
+    _perf_stage("chat.translation_context")
     messages, last_user_turn_translation = _prepare_messages_for_english_context(
         messages,
         translation_ctx=translation_ctx,
@@ -9680,6 +9939,7 @@ async def chat(request: Request):
         minutes_allowed_override=minutes_allowed_override,
         cycle_days_override=cycle_days_override,
     )
+    _perf_stage("chat.usage_charge_check", usage_ok=bool(usage_ok), plan=plan_name_for_limits, brand=brand_for_usage)
 
 
     # Special-case: allow "minutes remaining" questions to return a status message
@@ -9742,6 +10002,7 @@ async def chat(request: Request):
                 )
 
             if _ai_override_is_active(session_id):
+                _perf_stage("chat.host_override_active")
                 _ai_override_append_event(
                     session_id,
                     role="system",
@@ -9878,6 +10139,7 @@ async def chat(request: Request):
     except Exception:
         saved_summary = None
         memory_key = None
+    _perf_stage("chat.summary_lookup", has_summary=bool(saved_summary))
 
     # Helper to build responses consistently and optionally include audio_url.
     async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any], content: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -9915,9 +10177,11 @@ async def chat(request: Request):
         state_out["translationNoticeSent"] = bool(notice_sent)
 
         display_reply, reply_translation = await run_in_threadpool(_assistant_display_text, reply_text, translation_state)
+        _perf_stage("chat.display_text_ready")
 
         audio_url: Optional[str] = None
         if voice_id and reply_text.strip():
+            _perf_stage("chat.tts_start")
             try:
                 tts_brand, tts_avatar = _resolved_tts_brand_avatar(state_out)
                 if not tts_brand or not tts_avatar:
@@ -9952,7 +10216,10 @@ async def chat(request: Request):
                 _dbg(debug, "TTS generation failed:", repr(e))
                 state_out = dict(state_out)
                 state_out["tts_error"] = f"{type(e).__name__}: {e}"
+            finally:
+                _perf_stage("chat.tts_complete", has_audio=bool(audio_url))
 
+        _perf_stage("chat.respond_ready")
         return {
             "session_id": session_id,
             "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
@@ -10302,6 +10569,7 @@ async def chat(request: Request):
             intimate_allowed=intimate_allowed,
             debug=debug,
         )
+        _perf_stage("chat.base_prompt_built", provider=llm_provider, mode=effective_mode)
 
         # ----------------------------------------------------------
         # Representative context injection (onboarding + public site)
@@ -10319,6 +10587,7 @@ async def chat(request: Request):
         if avatar_name:
             # Cached: avoids repeated SQLite joins + string building.
             extra_system_blocks = await run_in_threadpool(_get_hco_system_blocks_cached_sync, avatar_name)
+            _perf_stage("chat.hco_blocks_loaded", count=len(extra_system_blocks or []))
             if not extra_system_blocks:
                 _dbg(debug, f"[hco] no onboarding/site blocks for avatar={avatar_name!r}")
         else:
@@ -10337,6 +10606,7 @@ async def chat(request: Request):
         if brand_name and avatar_name:
             try:
                 host_guidelines = await run_in_threadpool(_get_companion_guidelines_sync, brand_name, avatar_name)
+                _perf_stage("chat.guidelines_loaded", has_guidelines=bool(host_guidelines))
             except Exception:
                 host_guidelines = ""
         if host_guidelines:
@@ -10401,51 +10671,26 @@ async def chat(request: Request):
         # - If no saved summary is injected, explicitly say no saved summary is available if asked.
         # Platform capability policy:
         # - This app can speak your replies via TTS / Live Avatar. Do not claim you "don't have TTS".
-        memory_policy = (
-            "Memory rule: Only reference cross-session history if a 'Saved conversation summary' is provided. "
-            "If no saved summary is provided and the user asks about past conversations, say you do not have a saved summary for this companion.\n"
-            "Capability rule: Your replies may be spoken aloud in this app (audio TTS and/or a live avatar). "
-            "Do not say you lack text-to-speech; instead explain that you generate text and the platform voices it."
-        )
+        memory_policy = _CHAT_MEMORY_CAPABILITY_POLICY
         llm_messages.insert(insert_at, {"role": "system", "content": memory_policy})
         insert_at += 1
 
-        language_capability_policy = (
-            "Language capability rule: This app can translate between the user's preferred language and English. "
-            "Do not claim that translation is unavailable, and do not say that you can speak only English. "
-            "English remains the assistant's source speech language unless the host configured otherwise, while the platform may localize displayed text for the user."
-        )
+        language_capability_policy = _CHAT_LANGUAGE_CAPABILITY_POLICY
         llm_messages.insert(insert_at, {"role": "system", "content": language_capability_policy})
         insert_at += 1
 
-        vision_policy = (
-            "Vision rule: User image attachments may be supplied to you as direct image input. "
-            "When image input is present, inspect it and answer based on what you see. "
-            "You may describe visible, non-identifying details in a user-supplied photo, including the setting, pose, clothing, objects, and other observable scene details. "
-            "Do not identify a real person in a photo, do not confirm identity, and do not infer sensitive or private attributes from the image. "
-            "Do not use broad refusal wording such as saying you cannot provide information about individuals in photos when you can still describe allowed visible details. "
-            "If the user asks who a real person is, say you cannot identify the real person and then continue with any allowed non-identifying observations. "
-            "Do not say that you cannot view attachments or images when the platform has provided image input."
-        )
+        vision_policy = _CHAT_VISION_POLICY
         llm_messages.insert(insert_at, {"role": "system", "content": vision_policy})
         insert_at += 1
 
-        content_delivery_policy = (
-            "Content delivery rule: Never invent, promise, or format media attachments, filenames, file numbers, or /content/ links. "
-            "Only the platform may deliver scheduled photos or videos, and only when a real file exists in the active content library. "
-            "If the user asks for media, respond conversationally without URLs, without attachment blocks, and without claiming that content has been sent unless the platform actually attaches it."
-        )
+        content_delivery_policy = _CHAT_CONTENT_DELIVERY_POLICY
         llm_messages.insert(insert_at, {"role": "system", "content": content_delivery_policy})
         insert_at += 1
 
         if bool(translation_ctx.get("enabled")) and not _is_english_language(translation_ctx.get("user_language_code")):
-            translation_policy = (
-                f"Translation rule: The user prefers {str(translation_ctx.get('user_language_name') or _language_name_from_code(translation_ctx.get('user_language_code') or '')).strip()} ({str(translation_ctx.get('user_language_code') or '').strip() or 'en'}). "
-                "Write your canonical assistant reply in English only. "
-                "Do not produce bilingual output, and do not self-translate your reply. "
-                "The platform will render the display translation for the user. "
-                "Do not claim that you can speak only English or that translation is unavailable. "
-                "If the user's language is neither English nor Spanish, the platform may add a brief one-time translator notice after the initial greeting."
+            translation_policy = _chat_translation_policy_cached(
+                str(translation_ctx.get("user_language_code") or "en"),
+                str(translation_ctx.get("user_language_name") or ""),
             )
             llm_messages.insert(insert_at, {"role": "system", "content": translation_policy})
             insert_at += 1
@@ -10455,11 +10700,7 @@ async def chat(request: Request):
                 insert_at,
                 {
                     "role": "system",
-                    "content": (
-                        f"System routing note: The app switched the underlying model provider to {('xAI' if llm_provider == 'xai' else 'OpenAI')} "
-                        f"because the user is now in {effective_mode.title()} mode. "
-                        "Review any provided summaries and continue seamlessly while respecting the current mode's boundaries."
-                    ),
+                    "content": _chat_provider_switch_policy_cached(llm_provider, effective_mode),
                 },
             )
             insert_at += 1
@@ -10494,15 +10735,19 @@ async def chat(request: Request):
             llm_messages.insert(insert_at, {"role": "system", "content": handoff_note})
             insert_at += 1
 
+        _perf_stage("chat.prompt_injection_complete", messages=len(llm_messages))
+
         # Final server-side compaction pass (frontend already trims, but this prevents
         # occasional oversized payloads from regressing latency).
         llm_messages = _compact_llm_messages(llm_messages, provider_switched=provider_switched)
 
         had_user_image_input = _llm_messages_have_user_image_input(llm_messages)
+        _perf_stage("chat.prompt_ready", messages=len(llm_messages), provider=llm_provider)
         if llm_provider == "xai":
             assistant_reply = _call_xai_chat(llm_messages)
         else:
             assistant_reply = _call_gpt4o(llm_messages)
+        _perf_stage("chat.llm_complete", provider=llm_provider)
         assistant_reply = _sanitize_assistant_reply_for_platform_content(assistant_reply)
         assistant_reply = _sanitize_assistant_reply_for_image_policy(
             assistant_reply,
@@ -10559,6 +10804,7 @@ async def chat(request: Request):
         delivered_content = _content_merge_delivery_payloads(friend_first_turn_content, mode_specific_content)
     except Exception:
         delivered_content = None
+    _perf_stage("chat.content_delivery", has_content=bool(delivered_content))
     response_payload = await _respond(
         assistant_reply,
         STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
@@ -12439,6 +12685,7 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
     """
     try:
         body = await request.json()
+        _perf_stage("tts.parse_json")
     except Exception:
         body = {}
 
@@ -12493,6 +12740,7 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
         # STEP B: if another worker/request is already generating the same cached blob, wait briefly.
         audio_url: Optional[str] = None
         if _TTS_CACHE_ENABLED and voice_id and text_for_tts:
+            _perf_stage("tts.cache_check")
             try:
                 cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text_for_tts)
                 if _inflight_marker_is_fresh(cache_blob):
@@ -12501,13 +12749,18 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
                         peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text_for_tts)
                         if peek:
                             audio_url = peek
+                            _perf_stage("tts.cache_wait_hit")
                             break
                         await asyncio.sleep(0.15)
                         waited += 150
             except Exception:
                 pass
         if audio_url is None:
+            _perf_stage("tts.generate_start")
             audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text_for_tts, brand, avatar, mapping_phonetic)
+            _perf_stage("tts.generate_complete")
+        else:
+            _perf_stage("tts.cache_hit")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
 
@@ -12579,11 +12832,14 @@ async def stt_transcribe(request: Request):
             or ""
         )
         audio_bytes = await request.body()
+        _perf_stage("stt.body_read", bytes=len(audio_bytes or b""), lang=language_code or "en")
 
         if not audio_bytes or len(audio_bytes) < 16:
             raise HTTPException(status_code=400, detail="No audio received")
 
+        _perf_stage("stt.transcribe_start")
         text = await run_in_threadpool(_stt_transcribe_sync, audio_bytes, content_type, language_code)
+        _perf_stage("stt.transcribe_complete", chars=len(text or ""))
         return {"text": text, "language_code": language_code or "en"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -14336,6 +14592,7 @@ async def stripe_paygo_create_checkout_session(request: Request):
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY is not configured")
     try:
         raw = await request.json()
+        _perf_stage("stripe.create_checkout.parse_json")
     except Exception:
         raw = {}
     if not isinstance(raw, dict):
@@ -14430,7 +14687,9 @@ async def stripe_paygo_create_checkout_session(request: Request):
         return {"embedded": embedded, "hosted": hosted, "embedded_error": embedded_error, "hosted_error": hosted_error}
 
     try:
+        _perf_stage("stripe.create_checkout.work_start", brand=brand, units=units)
         created = await run_in_threadpool(_work)
+        _perf_stage("stripe.create_checkout.work_complete")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -14518,6 +14777,7 @@ def _stripe_paygo_process_completed_session_sync(session_obj: Dict[str, Any], ev
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
     raw = await request.body()
+    _perf_stage("stripe.webhook.body_read", bytes=len(raw or b""))
     sig = request.headers.get("stripe-signature") or request.headers.get("Stripe-Signature") or ""
     if STRIPE_WEBHOOK_SECRET and not _stripe_verify_signature(raw, sig, STRIPE_WEBHOOK_SECRET):
         raise HTTPException(status_code=400, detail="Invalid Stripe signature")
@@ -14528,7 +14788,9 @@ async def stripe_webhook(request: Request):
     event_type = _stripe_paygo_clean_text(event.get("type"))
     obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
     if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"} and isinstance(obj, dict):
+        _perf_stage("stripe.webhook.process_start", event=event_type)
         result = await run_in_threadpool(_stripe_paygo_process_completed_session_sync, obj, event)
+        _perf_stage("stripe.webhook.process_complete")
         return {"received": True, **(result if isinstance(result, dict) else {})}
     if event_type == "checkout.session.expired" and isinstance(obj, dict):
         sid = _stripe_paygo_clean_text(obj.get("id"))
@@ -17126,6 +17388,7 @@ async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
 
 @app.post("/chat/relay/poll")
 async def chat_relay_poll(req: ChatRelayPollRequest):
+    _perf_stage("relay.poll.start")
     sid = (req.session_id or "").strip()
     if not sid:
         raise HTTPException(status_code=400, detail="session_id is required")
