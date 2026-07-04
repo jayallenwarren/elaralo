@@ -2298,6 +2298,7 @@ async def get_companion_mapping(
     cap_out = "Video" if cap_lc == "video" else "Audio"
     live_out = "Stream" if live_lc == "stream" else ("D-ID" if live_lc == "d-id" else "")
     ctype_out = "Human" if ctype_lc == "human" else "AI"
+    resolved_host_member_id = _resolve_host_member_id(b, a, m) if ctype_lc == "human" else str(m.get("host_member_id") or "").strip()
     resolved_for_url = (resolved_ai_key if is_elaralo_ai_media else a) or a
     headshot_url = _ai_headshot_url_from_mapping_or_file(b, resolved_for_url, m, public_base_url=public_base)
     asset_for_file = _elaralo_ai_companion_asset_for_key(b, resolved_for_url, public_base_url=public_base) if is_elaralo else {}
@@ -2308,8 +2309,8 @@ async def get_companion_mapping(
         "avatar": str(m.get("avatar") or a),
         "companionKey": str(m.get("companion_key") or resolved_for_url or a),
         "companion_key": str(m.get("companion_key") or resolved_for_url or a),
-        "hostMemberId": str(m.get("host_member_id") or ""),
-        "host_member_id": str(m.get("host_member_id") or ""),
+        "hostMemberId": resolved_host_member_id,
+        "host_member_id": resolved_host_member_id,
         "companionType": ctype_out,
         "companion_type": ctype_out,
         "channel_cap": cap_out,
@@ -2964,7 +2965,7 @@ async def beestreamed_start_webrtc(request: Request) -> Dict[str, Any]:
 # - If `event_ref` is missing, ONLY the host will create it (via BeeStreamed API) and we will best-effort persist it.
 # ---------------------------------------------------------------------------
 
-DULCE_HOST_MEMBER_ID_FALLBACK = "1dc3fe06-c351-4678-8fe4-6a4b1350c556"
+DULCE_HOST_MEMBER_ID_FALLBACK = (os.getenv("DULCEMOON_HOST_MEMBER_ID_FALLBACK", "") or "1dc3fe06-c351-4678-8fe4-6a4b1350c556").strip()
 
 def _beestreamed_api_base() -> str:
     return (os.getenv("BEESTREAMED_API_BASE", "") or "https://api.beestreamed.com").strip().rstrip("/")
