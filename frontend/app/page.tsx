@@ -919,6 +919,71 @@ function booleanFromQuery(raw: string): boolean | null {
   return null;
 }
 
+type CompanionListReturnContext = {
+  enabled: boolean;
+  count: number;
+  url: string;
+};
+
+function readCompanionListReturnContextFromUrl(): CompanionListReturnContext {
+  if (typeof window === "undefined") return { enabled: false, count: 0, url: "" };
+  try {
+    const params = new URLSearchParams(window.location.search || "");
+    const countRaw = firstQueryValue(params, [
+      "selectableCompanionCount",
+      "selectable_companion_count",
+      "companionCount",
+      "companion_count",
+    ]);
+    const count = Math.max(0, Number.parseInt(countRaw || "0", 10) || 0);
+
+    const wantsReturnButton = booleanFromQuery(firstQueryValue(params, [
+      "returnToCompanions",
+      "return_to_companions",
+      "showCompanionListButton",
+      "show_companion_list_button",
+    ])) === true;
+
+    if (count <= 1 || !wantsReturnButton) return { enabled: false, count, url: "" };
+
+    const rawUrl = firstQueryValue(params, ["companionListUrl", "companion_list_url", "returnUrl", "return_url"]);
+    let target: URL | null = null;
+    if (rawUrl) {
+      try {
+        const candidate = new URL(rawUrl, window.location.origin);
+        if (candidate.origin === window.location.origin) target = candidate;
+      } catch {
+        target = null;
+      }
+    }
+
+    if (!target) {
+      target = new URL("/my-elaralo", window.location.origin);
+      const brand = firstQueryValue(params, ["brand", "rebranding", "companyName", "company_name", "company"]) || DEFAULT_COMPANY_NAME;
+      target.searchParams.set("brand", brand);
+      const loggedInRaw = firstQueryValue(params, ["loggedIn", "logged_in"]);
+      if (loggedInRaw) target.searchParams.set("loggedIn", loggedInRaw);
+      const memberId = firstQueryValue(params, ["memberId", "member_id"]);
+      if (memberId) target.searchParams.set("memberId", memberId);
+      const displayName = firstQueryValue(params, ["displayName", "display_name", "userName", "user_name"]);
+      if (displayName) target.searchParams.set("displayName", displayName);
+      const email = firstQueryValue(params, ["email"]);
+      if (email) target.searchParams.set("email", email);
+    }
+
+    for (const name of ["autoOpenSingle", "auto_open_single", "autoOpen", "auto_open"]) {
+      target.searchParams.delete(name);
+    }
+    target.searchParams.set("forceSelector", "1");
+    target.searchParams.set("showCompanionList", "1");
+    target.searchParams.set("returningFromConnect", "1");
+
+    return { enabled: true, count, url: target.toString() };
+  } catch {
+    return { enabled: false, count: 0, url: "" };
+  }
+}
+
 function readableError(value: any): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "string") return value.trim();
@@ -3939,6 +4004,8 @@ function ConnectPage() {
   // existing path. Keep this flag narrow so microphone handling changes only
   // apply to the Elaralo app-sourced handoff.
   const directCompanionHandoff = useMemo(() => readDirectCompanionHandoffFromUrl(), []);
+  const companionListReturnContext = useMemo(() => readCompanionListReturnContextFromUrl(), []);
+  const canReturnToCompanionList = companionListReturnContext.enabled && companionListReturnContext.count > 1;
 
   const isDirectElaraloConnectLaunch = useMemo(() => {
     const handoff = directCompanionHandoff || {};
@@ -10416,6 +10483,21 @@ const goToMyElaralo = useCallback(() => {
     window.location.href = url;
   }, []);
 
+  const goToCompanionList = useCallback(() => {
+    const target = String(companionListReturnContext.url || "").trim();
+    if (!canReturnToCompanionList || !target) return;
+    try {
+      window.location.assign(target);
+      return;
+    } catch {
+      try {
+        window.location.href = target;
+      } catch {
+        // ignore
+      }
+    }
+  }, [canReturnToCompanionList, companionListReturnContext.url]);
+
   // NOTE: Upgrade navigation is handled by `openUpgradeUrl()` near the RebrandingKey section
   // so the chat session can stay loaded while the user upgrades in a new tab.
 
@@ -14121,13 +14203,13 @@ const modePillControls = (
 
 
 
-          {false && (
+          {canReturnToCompanionList ? (
             <button
               type="button"
               onClick={() => {
                 setSwitchCompanionFlash(true);
                 window.setTimeout(() => {
-                  goToMyElaralo();
+                  goToCompanionList();
                   setSwitchCompanionFlash(false);
                 }, 120);
               }}
@@ -14143,10 +14225,11 @@ const modePillControls = (
                 display: "inline-flex",
                 alignItems: "center",
               }}
+              title="Return to the Companion list"
             >
-              Switch Companion
+              Companion List
             </button>
-          )}
+          ) : null}
         </div>
       ) : (
         <>
@@ -14173,6 +14256,32 @@ const modePillControls = (
               </button>
             );
           })}
+
+          {canReturnToCompanionList ? (
+            <button
+              key="companion-list"
+              onClick={() => {
+                setShowModePicker(false);
+                setSwitchCompanionFlash(true);
+                window.setTimeout(() => {
+                  goToCompanionList();
+                  setSwitchCompanionFlash(false);
+                }, 120);
+              }}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 999,
+                border: "1px solid #ddd",
+                background: switchCompanionFlash ? "#111" : "#fff",
+                color: switchCompanionFlash ? "#fff" : "#111",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+              title="Return to the Companion list"
+            >
+              Companion List
+            </button>
+          ) : null}
 
           <button
             key="add-minutes"

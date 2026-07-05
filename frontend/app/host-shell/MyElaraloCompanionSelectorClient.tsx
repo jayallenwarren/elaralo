@@ -370,6 +370,36 @@ function resolveButtonUrl(rawTarget: string, fallbackPath: string): URL | null {
   }
 }
 
+function buildCompanionListReturnUrl(brand: string): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const url = new URL(window.location.href);
+
+    // Returning from Connect should show the list and must not immediately
+    // auto-open the same single human companion again.
+    for (const name of ["autoOpenSingle", "auto_open_single", "autoOpen", "auto_open"]) {
+      url.searchParams.delete(name);
+    }
+    url.searchParams.set("brand", safeText(brand) || "Elaralo");
+    url.searchParams.set("forceSelector", "1");
+    url.searchParams.set("showCompanionList", "1");
+    url.searchParams.set("returningFromConnect", "1");
+    return url.toString();
+  } catch {
+    try {
+      const base = safeText(APP_BASE) || window.location.origin;
+      const url = new URL("/my-elaralo", base);
+      url.searchParams.set("brand", safeText(brand) || "Elaralo");
+      url.searchParams.set("forceSelector", "1");
+      url.searchParams.set("showCompanionList", "1");
+      url.searchParams.set("returningFromConnect", "1");
+      return url.toString();
+    } catch {
+      return "";
+    }
+  }
+}
+
 
 export default function MyElaraloCompanionSelectorClient() {
   const [memberPayload, setMemberPayload] = useState<MemberPlanPayload>(() => readQueryContext());
@@ -384,6 +414,7 @@ export default function MyElaraloCompanionSelectorClient() {
   const [contextGraceElapsed, setContextGraceElapsed] = useState<boolean>(false);
   const autoOpenedSingleRef = useRef<boolean>(false);
   const autoOpenSingle = useMemo(() => readQueryFlag("autoOpenSingle", "auto_open_single", "autoOpen", "auto_open"), []);
+  const forceSelector = useMemo(() => readQueryFlag("forceSelector", "force_selector", "showSelector", "show_selector", "showCompanionList", "show_companion_list"), []);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
@@ -435,7 +466,7 @@ export default function MyElaraloCompanionSelectorClient() {
   // DulceMoon should behave like the Elaralo companion architecture while
   // preserving the current product UX: when there is only one visible
   // companion, open Connect directly for both members and visitors.
-  const shouldAutoOpenSingle = autoOpenSingle || (!isElaraloCoreBrand && brandKey === "dulcemoon");
+  const shouldAutoOpenSingle = !forceSelector && (autoOpenSingle || (!isElaraloCoreBrand && brandKey === "dulcemoon"));
   const sessionDisplayName = displayName || (memberId && !isAnonMemberId(memberId) ? memberId : "");
 
   useEffect(() => {
@@ -516,6 +547,7 @@ export default function MyElaraloCompanionSelectorClient() {
   }, [cards, companionTypeFilter, ethnicityFilter, genderFilter, generationFilter]);
 
   const companionPayloadHeadshotUrl = useMemo(() => payloadHeadshotUrl(memberPayload), [memberPayload]);
+  const selectableCompanionCount = useMemo(() => cards.length, [cards]);
 
   const autoOpenCard = useMemo(() => {
     if (!shouldAutoOpenSingle) return null;
@@ -567,6 +599,19 @@ export default function MyElaraloCompanionSelectorClient() {
 
         url.searchParams.set("source", "my-elaralo");
         url.searchParams.set("loggedIn", loggedIn ? "1" : "0");
+        if (selectableCompanionCount > 1) {
+          const returnUrl = buildCompanionListReturnUrl(brand);
+          if (returnUrl) {
+            url.searchParams.set("returnToCompanions", "1");
+            url.searchParams.set("return_to_companions", "1");
+            url.searchParams.set("companionListUrl", returnUrl);
+            url.searchParams.set("companion_list_url", returnUrl);
+          }
+          url.searchParams.set("companionCount", String(selectableCompanionCount));
+          url.searchParams.set("companion_count", String(selectableCompanionCount));
+          url.searchParams.set("selectableCompanionCount", String(selectableCompanionCount));
+          url.searchParams.set("selectable_companion_count", String(selectableCompanionCount));
+        }
         if (memberId) {
           url.searchParams.set("memberId", memberId);
           url.searchParams.set("member_id", memberId);
@@ -658,7 +703,7 @@ export default function MyElaraloCompanionSelectorClient() {
         // ignore
       }
     },
-    [brandName, displayName, imageUrlForCard, loggedIn, memberId, memberPayload],
+    [brandName, displayName, imageUrlForCard, loggedIn, memberId, memberPayload, selectableCompanionCount],
   );
 
   const openSummaryPublic = useCallback((card: CompanionCardItem) => {
