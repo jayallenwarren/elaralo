@@ -14086,7 +14086,7 @@ const sttControls =
             justifyContent: "center",
             whiteSpace: "nowrap",
           }}
-          title="Return to the Companion list"
+          title="Swap companion"
         >
           Swap Companion
         </button>
@@ -14920,12 +14920,25 @@ const modePillControls = (
       ) : null}
 
       <header style={{ display: "flex", alignItems: isMobileUI ? "flex-start" : "center", gap: isMobileUI ? 10 : 12, marginBottom: isMobileUI ? 8 : 10, flexWrap: "wrap", rowGap: isMobileUI ? 6 : 0 }}>
-        <div aria-hidden onClick={secretDebugTap} style={{ width: ui.avatar, height: ui.avatar, borderRadius: "50%", overflow: "hidden" }}>
+        <div
+          aria-hidden
+          onClick={secretDebugTap}
+          style={{
+            width: Math.round(ui.avatar * 1.35),
+            height: ui.avatar,
+            borderRadius: 14,
+            overflow: "hidden",
+            border: "1px solid rgba(17,17,17,0.14)",
+            background: "#fff",
+            boxSizing: "border-box",
+            flex: "0 0 auto",
+          }}
+        >
           <img
             // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
             src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
             alt={companyName}
-            style={{ width: "100%", height: "100%" }}
+            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
             onError={(e) => {
               const fallback = (companyLogoSrc || DEFAULT_AVATAR);
               const current = String((e.currentTarget as HTMLImageElement).src || avatarSrc || "").trim();
