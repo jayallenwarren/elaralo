@@ -14059,6 +14059,38 @@ const sttControls =
           <StopIcon size={ICON_18} />
         </button>
       )}
+
+      {canReturnToCompanionList ? (
+        <button
+          type="button"
+          onClick={() => {
+            setSwitchCompanionFlash(true);
+            window.setTimeout(() => {
+              goToCompanionList();
+              setSwitchCompanionFlash(false);
+            }, 120);
+          }}
+          style={{
+            height: ICON_BTN_SIZE,
+            minHeight: ICON_BTN_SIZE,
+            padding: "0 12px",
+            borderRadius: 10,
+            border: "1px solid #111",
+            boxSizing: "border-box",
+            background: switchCompanionFlash ? "#111" : "#fff",
+            color: switchCompanionFlash ? "#fff" : "#111",
+            cursor: "pointer",
+            fontWeight: 700,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            whiteSpace: "nowrap",
+          }}
+          title="Return to the Companion list"
+        >
+          Companion List
+        </button>
+      ) : null}
 </>
   );
 
@@ -14200,36 +14232,6 @@ const modePillControls = (
               {broadcastPreparing ? "Broadcast…" : "Broadcast"}
             </button>
           ) : null}
-
-
-
-          {canReturnToCompanionList ? (
-            <button
-              type="button"
-              onClick={() => {
-                setSwitchCompanionFlash(true);
-                window.setTimeout(() => {
-                  goToCompanionList();
-                  setSwitchCompanionFlash(false);
-                }, 120);
-              }}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: switchCompanionFlash ? "#111" : "#fff",
-                color: switchCompanionFlash ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 400,
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-              }}
-              title="Return to the Companion list"
-            >
-              Companion List
-            </button>
-          ) : null}
         </div>
       ) : (
         <>
@@ -14256,32 +14258,6 @@ const modePillControls = (
               </button>
             );
           })}
-
-          {canReturnToCompanionList ? (
-            <button
-              key="companion-list"
-              onClick={() => {
-                setShowModePicker(false);
-                setSwitchCompanionFlash(true);
-                window.setTimeout(() => {
-                  goToCompanionList();
-                  setSwitchCompanionFlash(false);
-                }, 120);
-              }}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                background: switchCompanionFlash ? "#111" : "#fff",
-                color: switchCompanionFlash ? "#fff" : "#111",
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-              }}
-              title="Return to the Companion list"
-            >
-              Companion List
-            </button>
-          ) : null}
 
           <button
             key="add-minutes"
@@ -14978,6 +14954,11 @@ const modePillControls = (
               <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
             ) : null}
           </div>
+          <div style={{ fontSize: ui.meta, color: "#666" }}>
+            {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}: {" "}
+            <b>{avatarStatus}</b>
+            {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+          </div>
 	          {/* On mobile, push usage to the bottom to maximize above-the-fold space. */}
 	          {!isMobileUI && usageMeterEl}
           {liveProvider === "stream" ? (
@@ -15244,11 +15225,6 @@ const modePillControls = (
         </button>
       ) : null}
 
-      <div style={{ fontSize: ui.meta, color: "#666" }}>
-        {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}:{" "}
-        <b>{avatarStatus}</b>
-        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
-      </div>
     </div>
 
     {/* Right-justified Mode controls */}
