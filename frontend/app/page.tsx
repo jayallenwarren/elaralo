@@ -14088,7 +14088,7 @@ const sttControls =
           }}
           title="Return to the Companion list"
         >
-          Companion List
+          Change Companion
         </button>
       ) : null}
 </>
