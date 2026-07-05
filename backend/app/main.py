@@ -9338,7 +9338,13 @@ def _tts_lookup_phonetic_context(brand: str, avatar: str, explicit_phonetic: str
     except Exception:
         row = {}
 
-    phonetic = str(explicit_phonetic or (row or {}).get("phonetic") or "").strip()
+    # The database is authoritative for pronunciation.  The browser may still
+    # carry an older mappingPhonetic value after a DBA updates companion_mappings,
+    # so never let a stale client payload override a curated DB phonetic.  Use
+    # explicit payload guidance only when the DB row has no phonetic value.
+    row_phonetic = str((row or {}).get("phonetic") or "").strip()
+    payload_phonetic = str(explicit_phonetic or "").strip()
+    phonetic = row_phonetic or payload_phonetic
     # Use the SQL avatar identity/first name as the replacement target so a
     # hyphenated companion key still normalizes spoken text containing "Dulce".
     target = str(
@@ -9367,6 +9373,115 @@ def _normalize_tts_generation_text(text: str, *, brand: str, avatar: str, mappin
     except Exception:
         pass
     return raw
+
+def _chat_phonetic_context_from_session_state(session_state: Dict[str, Any]) -> Dict[str, str]:
+    """Resolve the authoritative companion pronunciation context for chat.
+
+    This is intentionally backend-authoritative: companion_mappings.phonetic wins
+    over any client-supplied phonetic value so a manual DB correction takes effect
+    after API restart and a fresh request, even if an old browser session still
+    carries stale mappingPhonetic in session_state.
+    """
+    ss = session_state if isinstance(session_state, dict) else {}
+    brand = _brand_from_session_state(ss)
+    avatar = str(
+        ss.get("mappingAvatar")
+        or ss.get("mapping_avatar")
+        or ss.get("avatar")
+        or ss.get("companionName")
+        or ss.get("companion")
+        or ""
+    ).strip()
+    if not avatar:
+        avatar = _avatar_from_session_state(ss)
+
+    requested_type = str(
+        ss.get("companionType")
+        or ss.get("companion_type")
+        or ss.get("selectedCompanionType")
+        or ""
+    ).strip()
+
+    row: Dict[str, Any] = {}
+    if brand and avatar:
+        try:
+            row = _lookup_companion_mapping_with_aliases(brand, avatar, requested_type) or {}
+        except Exception:
+            row = {}
+
+    row_phonetic = str((row or {}).get("phonetic") or "").strip()
+    payload_phonetic = _tts_explicit_phonetic_from_payload(ss)
+    phonetic = row_phonetic or payload_phonetic
+
+    mapping_avatar = str(
+        (row or {}).get("mapping_avatar")
+        or (row or {}).get("avatar")
+        or _companion_avatar_first_name(avatar)
+        or avatar
+    ).strip()
+    display_name = _companion_avatar_first_name(mapping_avatar) or mapping_avatar
+    companion_key = str((row or {}).get("companion_key") or avatar or "").strip()
+
+    return {
+        "brand": str(brand or "").strip(),
+        "avatar": mapping_avatar,
+        "display_name": display_name,
+        "phonetic": phonetic[:160] if phonetic else "",
+        "companion_key": companion_key,
+        "source": "db" if row_phonetic else ("payload" if payload_phonetic else ""),
+    }
+
+
+def _chat_phonetic_guidance_block(session_state: Dict[str, Any]) -> str:
+    """System prompt block that makes the LLM use the curated phonetic value.
+
+    TTS already uses companion_mappings.phonetic for speech.  This block makes
+    the language model use the same source of truth when the user asks about the
+    companion's name pronunciation, while preserving the display name in normal
+    visible text.
+    """
+    ctx = _chat_phonetic_context_from_session_state(session_state)
+    name = str(ctx.get("display_name") or ctx.get("avatar") or "").strip()
+    phonetic = str(ctx.get("phonetic") or "").strip()
+    if not name or not phonetic:
+        return ""
+
+    return (
+        "Companion name pronunciation rule (authoritative):\n"
+        f"- Display name: {name}\n"
+        f"- Phonetic pronunciation: {phonetic}\n"
+        "Use the display name in normal visible chat text. "
+        "If the user asks how to pronounce your name, answer using the phonetic pronunciation exactly as written. "
+        "Do not invent, vary, reinterpret, or provide alternate pronunciations. "
+        "This phonetic value comes from the companion_mappings.phonetic field and is the only allowed pronunciation answer."
+    )
+
+
+
+def _chat_user_asks_companion_name_pronunciation(text: str) -> bool:
+    """Detect direct pronunciation questions for the companion's own name."""
+    t = str(text or "").strip().lower()
+    if not t:
+        return False
+    if not any(k in t for k in ("pronounce", "pronunciation", "say your name", "saying your name")):
+        return False
+    return any(k in t for k in ("your name", "name", "you pronounced", "you pronounce"))
+
+
+def _chat_authoritative_phonetic_reply(session_state: Dict[str, Any], user_text: str) -> str:
+    """Return a deterministic pronunciation answer when the user asks directly.
+
+    This avoids the LLM inventing variants such as ah-LEE-yah vs uh-LEE-yah.
+    """
+    if not _chat_user_asks_companion_name_pronunciation(user_text):
+        return ""
+    ctx = _chat_phonetic_context_from_session_state(session_state)
+    name = str(ctx.get("display_name") or ctx.get("avatar") or "").strip()
+    phonetic = str(ctx.get("phonetic") or "").strip()
+    if not name or not phonetic:
+        return ""
+    return f'My name, {name}, is pronounced "{phonetic}."'
+
 
 def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "", mapping_phonetic: str = "") -> str:
     # Pronunciation normalization runs before caching/audio generation.
@@ -10400,6 +10515,13 @@ async def chat(request: Request):
     user_display_text = str(last_user_display_text or user_text).strip()
     normalized_text = user_text.lower().strip()
 
+    authoritative_phonetic_reply = _chat_authoritative_phonetic_reply(session_state, user_text)
+    if authoritative_phonetic_reply:
+        session_state_out = dict(session_state)
+        session_state_out["mode"] = session_state_out.get("mode") or "friend"
+        session_state_out["phonetic_source"] = "companion_mappings"
+        return await _respond(authoritative_phonetic_reply, STATUS_SAFE, session_state_out)
+
     # Allow explicit text-based mode switching. When there is no explicit switch,
     # infer the mode from recent AI Connect context for both Elaralo and DulceMoon.
     # Backend also respects the mode entitlements supplied by Connect so automatic
@@ -10784,6 +10906,11 @@ async def chat(request: Request):
         identity_blocks = _chat_identity_system_blocks(session_state)
         for block in identity_blocks:
             llm_messages.insert(insert_at, {"role": "system", "content": block})
+            insert_at += 1
+
+        phonetic_guidance_block = _chat_phonetic_guidance_block(session_state)
+        if phonetic_guidance_block:
+            llm_messages.insert(insert_at, {"role": "system", "content": phonetic_guidance_block})
             insert_at += 1
 
         # Memory policy: do not guess about prior conversations.
