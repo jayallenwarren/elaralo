@@ -9049,8 +9049,14 @@ def _normalize_tts_text_for_cache(text: str) -> str:
     return t
 
 
-def _tts_cache_blob_name(voice_id: str, text: str) -> str:
-    """Deterministic blob name for caching across sessions and workers."""
+def _tts_cache_blob_name(voice_id: str, text: str, cache_context: str = "") -> str:
+    """Deterministic blob name for caching across sessions and workers.
+
+    cache_context is not spoken.  It is part of the cache key only.  We use it
+    for phonetic pronunciation state so a manual update to
+    companion_mappings.phonetic cannot keep serving an older cached greeting
+    or reply for the same visible text and voice.
+    """
     safe_voice = re.sub(r"[^A-Za-z0-9_-]", "_", (voice_id or "voice"))[:48]
 
     model_id = (os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2") or "eleven_multilingual_v2").strip()
@@ -9058,8 +9064,9 @@ def _tts_cache_blob_name(voice_id: str, text: str) -> str:
     silence = str(_TTS_LEADING_SILENCE_COPIES)
 
     norm_text = _normalize_tts_text_for_cache(text)
+    norm_context = _normalize_tts_text_for_cache(cache_context or "")
     h = hashlib.sha256(
-        (safe_voice + "|" + model_id + "|" + output_format + "|" + silence + "|" + norm_text).encode("utf-8")
+        (safe_voice + "|" + model_id + "|" + output_format + "|" + silence + "|" + norm_context + "|" + norm_text).encode("utf-8")
     ).hexdigest()[:40]
 
     # Keep under a predictable prefix; safe_voice helps partition blobs for listing/debug.
@@ -9374,6 +9381,26 @@ def _normalize_tts_generation_text(text: str, *, brand: str, avatar: str, mappin
         pass
     return raw
 
+def _tts_phonetic_cache_context(brand: str, avatar: str, mapping_phonetic: str = "") -> str:
+    """Return non-spoken cache-key context for current phonetic state.
+
+    This prevents stale TTS cache hits after a pronunciation correction.  The
+    generated audio text is still produced by _normalize_tts_generation_text;
+    this context only changes the deterministic blob name.
+    """
+    try:
+        resolved_brand, pronunciation_target, phonetic = _tts_lookup_phonetic_context(brand, avatar, mapping_phonetic)
+    except Exception:
+        resolved_brand, pronunciation_target, phonetic = str(brand or ""), str(avatar or ""), str(mapping_phonetic or "")
+    b = str(resolved_brand or brand or "").strip().lower()
+    a = str(pronunciation_target or avatar or "").strip().lower()
+    p = str(phonetic or mapping_phonetic or "").strip()
+    if not (b or a or p):
+        return ""
+    digest = hashlib.sha256((b + "|" + a + "|" + p).encode("utf-8")).hexdigest()[:16]
+    return f"phonetic:{b}:{a}:{digest}"
+
+
 def _chat_phonetic_context_from_session_state(session_state: Dict[str, Any]) -> Dict[str, str]:
     """Resolve the authoritative companion pronunciation context for chat.
 
@@ -9483,7 +9510,7 @@ def _chat_authoritative_phonetic_reply(session_state: Dict[str, Any], user_text:
     return f'My name, {name}, is pronounced "{phonetic}."'
 
 
-def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "", mapping_phonetic: str = "") -> str:
+def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "", mapping_phonetic: str = "", cache_context: str = "") -> str:
     # Pronunciation normalization runs before caching/audio generation.
     # This is intentionally alias-aware so initial greetings sent from Wix/Connect
     # use companion_mappings.phonetic from the very first spoken line.
@@ -9493,7 +9520,7 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = 
 
     # Cache path: deterministic blob name, cross-session.
     if _TTS_CACHE_ENABLED:
-        cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
+        cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text, cache_context=cache_context)
         try:
             from azure.storage.blob import BlobServiceClient  # type: ignore
 
@@ -9780,14 +9807,14 @@ def _inflight_marker_is_fresh(cache_blob_name: str) -> bool:
     except Exception:
         return False
 
-def _tts_cache_peek_sync(voice_id: str, text: str) -> Optional[str]:
+def _tts_cache_peek_sync(voice_id: str, text: str, cache_context: str = "") -> Optional[str]:
     """Cache-only lookup: returns SAS URL if deterministic cache blob exists, else None."""
     if not _TTS_CACHE_ENABLED:
         return None
     t = (text or "").strip()
     if not t:
         return None
-    cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=t)
+    cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=t, cache_context=cache_context)
     try:
         from azure.storage.blob import BlobServiceClient  # type: ignore
         storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
@@ -10434,8 +10461,9 @@ async def chat(request: Request):
                     mapping_phonetic=tts_mapping_phonetic,
                 )
 
+                tts_cache_context = _tts_phonetic_cache_context(tts_brand, tts_avatar, tts_mapping_phonetic)
                 if _TTS_CHAT_CACHE_FIRST and _TTS_CACHE_ENABLED:
-                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, tts_reply_text)
+                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, tts_reply_text, tts_cache_context)
                 if audio_url is None:
                     audio_url = await run_in_threadpool(
                         _tts_audio_url_sync,
@@ -10445,6 +10473,7 @@ async def chat(request: Request):
                         tts_brand,
                         tts_avatar,
                         tts_mapping_phonetic,
+                        tts_cache_context,
                     )
             except Exception as e:
                 # Fail-open: never break chat because TTS failed
@@ -12983,17 +13012,18 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
             avatar=avatar,
             mapping_phonetic=mapping_phonetic,
         )
+        tts_cache_context = _tts_phonetic_cache_context(brand, avatar, mapping_phonetic)
 
         # STEP B: if another worker/request is already generating the same cached blob, wait briefly.
         audio_url: Optional[str] = None
         if _TTS_CACHE_ENABLED and voice_id and text_for_tts:
             _perf_stage("tts.cache_check")
             try:
-                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text_for_tts)
+                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text_for_tts, cache_context=tts_cache_context)
                 if _inflight_marker_is_fresh(cache_blob):
                     waited = 0
                     while waited < _TTS_INFLIGHT_WAIT_MS:
-                        peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text_for_tts)
+                        peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text_for_tts, tts_cache_context)
                         if peek:
                             audio_url = peek
                             _perf_stage("tts.cache_wait_hit")
@@ -13004,7 +13034,7 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
                 pass
         if audio_url is None:
             _perf_stage("tts.generate_start")
-            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text_for_tts, brand, avatar, mapping_phonetic)
+            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text_for_tts, brand, avatar, mapping_phonetic, tts_cache_context)
             _perf_stage("tts.generate_complete")
         else:
             _perf_stage("tts.cache_hit")

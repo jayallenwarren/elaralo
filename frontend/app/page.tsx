@@ -13392,7 +13392,11 @@ const speakGreetingIfNeeded = useCallback(
     }
 
     const name = (companionName || "").trim() || "Companion";
-    const key = `ELARALO_GREET_SPOKEN:${name}`;
+    // Include the current phonetic value in the spoken-greeting once-key.  If a DBA corrects
+    // companion_mappings.phonetic, the corrected greeting is allowed to play in the same
+    // browser session instead of being suppressed by an older name-only key.
+    const phoneticKeyPart = normalizeKeyForFile(String(companionPhonetic || "no-phonetic").trim() || "no-phonetic");
+    const key = `ELARALO_GREET_SPOKEN:${name}:${phoneticKeyPart}`;
 
     // Already spoken this session?
     try {
@@ -13405,7 +13409,11 @@ const speakGreetingIfNeeded = useCallback(
 
     // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
     // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
-    const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
+    // For the spoken greeting only, use the curated phonetic value when available. The visible chat bubble
+    // still displays the companion name normally, but the first audio line will not rely on the TTS backend
+    // finding/replacing the display name before playback.
+    const spokenGreetingName = String(companionPhonetic || "").trim() || name;
+    const greetText = `Hi, I'm ${spokenGreetingName}. I'm here with you. How are you feeling today?`;
     // Local audio-only greeting must always use the companion's ElevenLabs voice.
     // (Live avatar uses its own configured voice via the DID agent.)
     const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
@@ -13465,6 +13473,7 @@ const speakGreetingIfNeeded = useCallback(
   [
     companionName,
     companionKey,
+    companionPhonetic,
     companionMapping,
     companionMappingResolved,
     handoffReady,
