@@ -14919,13 +14919,15 @@ const modePillControls = (
         </div>
       ) : null}
 
-      <header style={{ display: "flex", alignItems: isMobileUI ? "flex-start" : "center", gap: isMobileUI ? 10 : 12, marginBottom: isMobileUI ? 8 : 10, flexWrap: "wrap", rowGap: isMobileUI ? 6 : 0 }}>
+      <header style={{ display: "flex", alignItems: "flex-start", gap: isMobileUI ? 10 : 12, marginBottom: isMobileUI ? 8 : 10, flexWrap: "wrap", rowGap: isMobileUI ? 6 : 0 }}>
         <div
           aria-hidden
           onClick={secretDebugTap}
           style={{
-            width: Math.round(ui.avatar * 1.35),
-            height: ui.avatar,
+            // Match the image height to the information block: from the top of the brand name
+            // through the bottom of the Usage meter.  Keep the frame rectangular, not circular.
+            width: isMobileUI ? 74 : isTabletUI ? 84 : 92,
+            height: isMobileUI ? 104 : isTabletUI ? 112 : 118,
             borderRadius: 14,
             overflow: "hidden",
             border: "1px solid rgba(17,17,17,0.14)",
