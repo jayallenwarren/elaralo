@@ -1553,10 +1553,32 @@ export default function HostProfileStudioClient() {
     minWidth: 18,
     marginTop: 2,
     position: "relative",
-    zIndex: 3,
+    zIndex: 20,
     pointerEvents: "auto",
     cursor: "pointer",
     touchAction: "manipulation",
+  };
+
+  const clickSafeButtonStyle: React.CSSProperties = {
+    ...secondaryButtonStyle,
+    width: "100%",
+    minHeight: 44,
+    position: "relative",
+    zIndex: 50,
+    pointerEvents: "auto",
+    userSelect: "none",
+  };
+
+  const visuallyHiddenFileInputStyle: React.CSSProperties = {
+    position: "absolute",
+    width: 1,
+    height: 1,
+    padding: 0,
+    margin: -1,
+    overflow: "hidden",
+    clip: "rect(0 0 0 0)",
+    whiteSpace: "nowrap",
+    border: 0,
   };
 
   const renderLabeledInput = (label: string, value: any, onChange: (next: string) => void, placeholder: string, extra?: React.ReactNode) => (
@@ -1750,7 +1772,7 @@ export default function HostProfileStudioClient() {
   }
 
   return (
-    <main style={{ maxWidth: 1120, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui", color: "#111827" }}>
+    <main style={{ maxWidth: 1120, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui", color: "#111827", position: "relative", zIndex: 1, isolation: "isolate" }}>
       <div style={{ display: "grid", gap: 16 }}>
         <div style={{ ...cardStyle, display: "grid", gap: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
@@ -1912,15 +1934,30 @@ export default function HostProfileStudioClient() {
                         <div style={{ fontWeight: 800 }}>{slot.label}</div>
                         <div style={{ fontSize: 12, color: slot.required ? "#991b1b" : "#6b7280" }}>{slot.required ? "Required" : "Optional"}</div>
                       </div>
-                      <button type="button" style={secondaryButtonStyle} onClick={() => openSlotPicker(slot.key)} disabled={uploadingSlot === slot.key}>
+                      <label
+                        htmlFor={`host-photo-upload-${slot.key}`}
+                        role="button"
+                        tabIndex={uploadingSlot === slot.key ? -1 : 0}
+                        aria-disabled={uploadingSlot === slot.key}
+                        style={{ ...clickSafeButtonStyle, opacity: uploadingSlot === slot.key ? 0.65 : 1, cursor: uploadingSlot === slot.key ? "not-allowed" : "pointer" }}
+                        onKeyDown={(e) => {
+                          if (uploadingSlot === slot.key) return;
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            openSlotPicker(slot.key);
+                          }
+                        }}
+                      >
                         {uploadingSlot === slot.key ? "Uploading…" : asset?.url ? "Replace" : "Upload"}
-                      </button>
+                      </label>
                     </div>
                     <input
+                      id={`host-photo-upload-${slot.key}`}
                       ref={(node) => { uploadInputRefs.current[slot.key] = node; }}
                       type="file"
                       accept="image/png,image/jpeg,image/jpg,image/webp,image/heic,image/heif"
-                      style={{ display: "none" }}
+                      style={visuallyHiddenFileInputStyle}
+                      disabled={uploadingSlot === slot.key}
                       onChange={(e) => {
                         const file = e.target.files && e.target.files.length ? e.target.files[0] : null;
                         try { e.target.value = ""; } catch {}
@@ -2084,12 +2121,11 @@ export default function HostProfileStudioClient() {
                 Optional. Use this only when the host's first name should be pronounced differently from its spelling. If left blank, Elaralo will not derive a phonetic value from the first name.
               </span>,
             )}
-            <div style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)" }}>
+            <label style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)", cursor: catalogVisibilitySaving ? "wait" : "pointer", position: "relative", zIndex: 50, pointerEvents: "auto", touchAction: "manipulation", userSelect: "none" }}>
               <input
                 type="checkbox"
                 checked={Boolean(completionForm.list_in_companion_catalog)}
                 disabled={catalogVisibilitySaving}
-                onClick={(e) => e.stopPropagation()}
                 onChange={(e) => handleCatalogVisibilityChange(e.currentTarget.checked)}
                 style={{ ...checkboxStyle, marginTop: 3 }}
                 aria-label="List my Host profile in the Companion catalog"
@@ -2101,7 +2137,7 @@ export default function HostProfileStudioClient() {
                 </span>
                 {catalogVisibilitySaving ? <span style={{ fontSize: 12, color: "#6b7280" }}>Saving catalog visibility…</span> : null}
               </span>
-            </div>
+            </label>
             <div style={{ ...cardStyle, padding: 16, display: "grid", gap: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <div>
@@ -2297,14 +2333,29 @@ export default function HostProfileStudioClient() {
                           {asset.file_name ? <div style={{ fontSize: 13, color: "#4b5563" }}>{asset.file_name}</div> : null}
                         </div>
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                          <button type="button" style={secondaryButtonStyle} onClick={() => openSlotPicker(slotKey)} disabled={uploadingSlot === slotKey || saving}>
+                          <label
+                            htmlFor={`host-gallery-upload-${slotKey}`}
+                            role="button"
+                            tabIndex={uploadingSlot === slotKey || saving ? -1 : 0}
+                            aria-disabled={uploadingSlot === slotKey || saving}
+                            style={{ ...clickSafeButtonStyle, opacity: uploadingSlot === slotKey || saving ? 0.65 : 1, cursor: uploadingSlot === slotKey || saving ? "not-allowed" : "pointer" }}
+                            onKeyDown={(e) => {
+                              if (uploadingSlot === slotKey || saving) return;
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                openSlotPicker(slotKey);
+                              }
+                            }}
+                          >
                             {uploadingSlot === slotKey ? "Uploading…" : "Replace / update photo"}
-                          </button>
+                          </label>
                           <input
+                            id={`host-gallery-upload-${slotKey}`}
                             ref={(node) => { uploadInputRefs.current[slotKey] = node; }}
                             type="file"
                             accept="image/*"
-                            style={{ display: "none" }}
+                            style={visuallyHiddenFileInputStyle}
+                            disabled={uploadingSlot === slotKey || saving}
                             onChange={(e) => {
                               const file = e.currentTarget.files && e.currentTarget.files[0] ? e.currentTarget.files[0] : null;
                               void handleReplacePublicGalleryAsset(slotKey, file);
