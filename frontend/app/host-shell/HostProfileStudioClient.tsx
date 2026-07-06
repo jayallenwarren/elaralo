@@ -1707,7 +1707,15 @@ export default function HostProfileStudioClient() {
     ? "✓ Profile approved"
     : saving
       ? "Saving…"
-      : "Approve full profile";
+      : session?.approved_version_id
+        ? "Approve again"
+        : "Approve full profile";
+
+  const fullProfileApprovalButtonTitle = fullProfileApprovalIsCurrent
+    ? "Profile is approved. Edit any field to approve again."
+    : session?.approved_version_id
+      ? "Approve again to publish the latest edits."
+      : "Approve the full profile.";
 
   const handleApproveLimitedClick = useCallback(() => {
     if (saving) return;
@@ -2258,24 +2266,10 @@ export default function HostProfileStudioClient() {
                 style={fullProfileApprovalIsCurrent ? { ...secondaryButtonStyle, cursor: "default", opacity: 0.8 } : buttonStyle}
                 onClick={handleApproveFullClick}
                 disabled={saving || fullProfileApprovalIsCurrent}
-                title={fullProfileApprovalIsCurrent ? "The current full profile is already approved. Edit any field to re-enable approval." : "Approve the full profile from the preview section."}
+                title={fullProfileApprovalButtonTitle}
               >
                 {fullProfileApprovalButtonLabel}
               </button>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14 }}>
-              <div style={cardStyle}>
-                <div style={{ fontWeight: 800, marginBottom: 10 }}>Private profile</div>
-                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
-{JSON.stringify(privateProfile, null, 2)}
-                </pre>
-              </div>
-              <div style={cardStyle}>
-                <div style={{ fontWeight: 800, marginBottom: 10 }}>Public profile</div>
-                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
-{JSON.stringify(publicProfile, null, 2)}
-                </pre>
-              </div>
             </div>
             <div style={{ display: "grid", gap: 8 }}>
               <div style={{ color: Boolean(readiness.limited_publish_allowed) ? "#065f46" : "#92400e", fontWeight: 700 }}>
@@ -2402,7 +2396,7 @@ export default function HostProfileStudioClient() {
                   style={fullProfileApprovalIsCurrent ? { ...secondaryButtonStyle, cursor: "default", opacity: 0.8 } : buttonStyle}
                   onClick={handleApproveFullClick}
                   disabled={saving || fullProfileApprovalIsCurrent}
-                  title={fullProfileApprovalIsCurrent ? "The current full profile is already approved. Edit any field to re-enable approval." : "Approve the full profile."}
+                  title={fullProfileApprovalButtonTitle}
                 >
                   {fullProfileApprovalButtonLabel}
                 </button>
