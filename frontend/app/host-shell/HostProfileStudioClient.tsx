@@ -829,6 +829,7 @@ export default function HostProfileStudioClient() {
   });
   const [showCompletionPhysicalDescriptionEditor, setShowCompletionPhysicalDescriptionEditor] = useState<boolean>(false);
   const [catalogVisibilitySaving, setCatalogVisibilitySaving] = useState<boolean>(false);
+  const [localProfileDirty, setLocalProfileDirty] = useState<boolean>(false);
 
   const hydrateFromSession = useCallback((payload: HostOnboardingSession | null, readinessIn?: HostOnboardingReadiness | null) => {
     setSession(payload);
@@ -1410,6 +1411,7 @@ export default function HostProfileStudioClient() {
       if (!res.ok || !data?.session) throw new Error(String(data?.detail || `HTTP ${res.status}`));
       hydrateFromSession(data.session as HostOnboardingSession, (data?.readiness || {}) as HostOnboardingReadiness);
       setPreviewData(data.preview || null);
+      if (scope === "full") setLocalProfileDirty(false);
       setNotice(scope === "full" ? "Full profile approved." : "Limited profile approved.");
       setStep("preview");
     } catch (err: any) {
@@ -1553,32 +1555,10 @@ export default function HostProfileStudioClient() {
     minWidth: 18,
     marginTop: 2,
     position: "relative",
-    zIndex: 20,
+    zIndex: 3,
     pointerEvents: "auto",
     cursor: "pointer",
     touchAction: "manipulation",
-  };
-
-  const clickSafeButtonStyle: React.CSSProperties = {
-    ...secondaryButtonStyle,
-    width: "100%",
-    minHeight: 44,
-    position: "relative",
-    zIndex: 50,
-    pointerEvents: "auto",
-    userSelect: "none",
-  };
-
-  const visuallyHiddenFileInputStyle: React.CSSProperties = {
-    position: "absolute",
-    width: 1,
-    height: 1,
-    padding: 0,
-    margin: -1,
-    overflow: "hidden",
-    clip: "rect(0 0 0 0)",
-    whiteSpace: "nowrap",
-    border: 0,
   };
 
   const renderLabeledInput = (label: string, value: any, onChange: (next: string) => void, placeholder: string, extra?: React.ReactNode) => (
@@ -1705,6 +1685,30 @@ export default function HostProfileStudioClient() {
     try { return window.self !== window.top; } catch { return true; }
   })() : false;
 
+
+  const markLocalProfileDirty = useCallback((event: React.SyntheticEvent<HTMLElement>) => {
+    const target = event.target as HTMLElement | null;
+    const tagName = String(target?.tagName || "").toLowerCase();
+    if (tagName === "input" || tagName === "textarea" || tagName === "select") {
+      setLocalProfileDirty(true);
+    }
+  }, []);
+
+  const fullProfileApprovalIsCurrent = useMemo(() => {
+    const approvedVersionId = String(session?.approved_version_id || "").trim();
+    if (!approvedVersionId || localProfileDirty) return false;
+    const workflowState = String(session?.workflow_state || "").trim().toLowerCase();
+    const publishStatus = String(session?.publish_status || "").trim().toLowerCase();
+    const hasPendingEdits = workflowState.includes("pending") || publishStatus.includes("pending");
+    return Boolean(readiness.full_publish_ready) && !hasPendingEdits;
+  }, [localProfileDirty, readiness.full_publish_ready, session?.approved_version_id, session?.publish_status, session?.workflow_state]);
+
+  const fullProfileApprovalButtonLabel = fullProfileApprovalIsCurrent
+    ? "✓ Profile approved"
+    : saving
+      ? "Saving…"
+      : "Approve full profile";
+
   const handleApproveLimitedClick = useCallback(() => {
     if (saving) return;
     if (!Boolean(readiness.limited_publish_allowed)) {
@@ -1729,7 +1733,7 @@ export default function HostProfileStudioClient() {
   }, [approveProfile, limitedPublishMissingSections, readiness.limited_publish_allowed, saving, voiceCaptureBlockers, voiceCaptureMeetsMinimum, voiceCaptureMinSeconds]);
 
   const handleApproveFullClick = useCallback(() => {
-    if (saving) return;
+    if (saving || fullProfileApprovalIsCurrent) return;
     if (!Boolean(readiness.full_publish_ready)) {
       const missing = dedupeLabels([...limitedPublishMissingSections, ...fullPublishMissingSections]);
       const voiceDetails = voiceCaptureBlockers.length ? ` ${voiceCaptureBlockers.join(" ")}` : "";
@@ -1743,7 +1747,7 @@ export default function HostProfileStudioClient() {
       return;
     }
     void approveProfile("full");
-  }, [approveProfile, fullPublishMissingSections, limitedPublishMissingSections, readiness.full_publish_ready, saving, voiceCaptureBlockers]);
+  }, [approveProfile, fullProfileApprovalIsCurrent, fullPublishMissingSections, limitedPublishMissingSections, readiness.full_publish_ready, saving, voiceCaptureBlockers]);
 
   if (waitingForContext && embedded && !context.memberId) {
     return (
@@ -1772,7 +1776,11 @@ export default function HostProfileStudioClient() {
   }
 
   return (
-    <main style={{ maxWidth: 1120, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui", color: "#111827", position: "relative", zIndex: 1, isolation: "isolate" }}>
+    <main
+      style={{ maxWidth: 1120, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui", color: "#111827" }}
+      onInputCapture={markLocalProfileDirty}
+      onChangeCapture={markLocalProfileDirty}
+    >
       <div style={{ display: "grid", gap: 16 }}>
         <div style={{ ...cardStyle, display: "grid", gap: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
@@ -1934,30 +1942,15 @@ export default function HostProfileStudioClient() {
                         <div style={{ fontWeight: 800 }}>{slot.label}</div>
                         <div style={{ fontSize: 12, color: slot.required ? "#991b1b" : "#6b7280" }}>{slot.required ? "Required" : "Optional"}</div>
                       </div>
-                      <label
-                        htmlFor={`host-photo-upload-${slot.key}`}
-                        role="button"
-                        tabIndex={uploadingSlot === slot.key ? -1 : 0}
-                        aria-disabled={uploadingSlot === slot.key}
-                        style={{ ...clickSafeButtonStyle, opacity: uploadingSlot === slot.key ? 0.65 : 1, cursor: uploadingSlot === slot.key ? "not-allowed" : "pointer" }}
-                        onKeyDown={(e) => {
-                          if (uploadingSlot === slot.key) return;
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.preventDefault();
-                            openSlotPicker(slot.key);
-                          }
-                        }}
-                      >
+                      <button type="button" style={secondaryButtonStyle} onClick={() => openSlotPicker(slot.key)} disabled={uploadingSlot === slot.key}>
                         {uploadingSlot === slot.key ? "Uploading…" : asset?.url ? "Replace" : "Upload"}
-                      </label>
+                      </button>
                     </div>
                     <input
-                      id={`host-photo-upload-${slot.key}`}
                       ref={(node) => { uploadInputRefs.current[slot.key] = node; }}
                       type="file"
                       accept="image/png,image/jpeg,image/jpg,image/webp,image/heic,image/heif"
-                      style={visuallyHiddenFileInputStyle}
-                      disabled={uploadingSlot === slot.key}
+                      style={{ display: "none" }}
                       onChange={(e) => {
                         const file = e.target.files && e.target.files.length ? e.target.files[0] : null;
                         try { e.target.value = ""; } catch {}
@@ -2121,11 +2114,12 @@ export default function HostProfileStudioClient() {
                 Optional. Use this only when the host's first name should be pronounced differently from its spelling. If left blank, Elaralo will not derive a phonetic value from the first name.
               </span>,
             )}
-            <label style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)", cursor: catalogVisibilitySaving ? "wait" : "pointer", position: "relative", zIndex: 50, pointerEvents: "auto", touchAction: "manipulation", userSelect: "none" }}>
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: 14, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, background: "rgba(17,24,39,0.03)" }}>
               <input
                 type="checkbox"
                 checked={Boolean(completionForm.list_in_companion_catalog)}
                 disabled={catalogVisibilitySaving}
+                onClick={(e) => e.stopPropagation()}
                 onChange={(e) => handleCatalogVisibilityChange(e.currentTarget.checked)}
                 style={{ ...checkboxStyle, marginTop: 3 }}
                 aria-label="List my Host profile in the Companion catalog"
@@ -2137,7 +2131,7 @@ export default function HostProfileStudioClient() {
                 </span>
                 {catalogVisibilitySaving ? <span style={{ fontSize: 12, color: "#6b7280" }}>Saving catalog visibility…</span> : null}
               </span>
-            </label>
+            </div>
             <div style={{ ...cardStyle, padding: 16, display: "grid", gap: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <div>
@@ -2259,6 +2253,29 @@ export default function HostProfileStudioClient() {
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("photos")}>Edit photos</button>
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("review")}>Edit derived review</button>
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("completion")}>Edit completion</button>
+              <button
+                type="button"
+                style={fullProfileApprovalIsCurrent ? { ...secondaryButtonStyle, cursor: "default", opacity: 0.8 } : buttonStyle}
+                onClick={handleApproveFullClick}
+                disabled={saving || fullProfileApprovalIsCurrent}
+                title={fullProfileApprovalIsCurrent ? "The current full profile is already approved. Edit any field to re-enable approval." : "Approve the full profile from the preview section."}
+              >
+                {fullProfileApprovalButtonLabel}
+              </button>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14 }}>
+              <div style={cardStyle}>
+                <div style={{ fontWeight: 800, marginBottom: 10 }}>Private profile</div>
+                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
+{JSON.stringify(privateProfile, null, 2)}
+                </pre>
+              </div>
+              <div style={cardStyle}>
+                <div style={{ fontWeight: 800, marginBottom: 10 }}>Public profile</div>
+                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
+{JSON.stringify(publicProfile, null, 2)}
+                </pre>
+              </div>
             </div>
             <div style={{ display: "grid", gap: 8 }}>
               <div style={{ color: Boolean(readiness.limited_publish_allowed) ? "#065f46" : "#92400e", fontWeight: 700 }}>
@@ -2319,29 +2336,14 @@ export default function HostProfileStudioClient() {
                           {asset.file_name ? <div style={{ fontSize: 13, color: "#4b5563" }}>{asset.file_name}</div> : null}
                         </div>
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                          <label
-                            htmlFor={`host-gallery-upload-${slotKey}`}
-                            role="button"
-                            tabIndex={uploadingSlot === slotKey || saving ? -1 : 0}
-                            aria-disabled={uploadingSlot === slotKey || saving}
-                            style={{ ...clickSafeButtonStyle, opacity: uploadingSlot === slotKey || saving ? 0.65 : 1, cursor: uploadingSlot === slotKey || saving ? "not-allowed" : "pointer" }}
-                            onKeyDown={(e) => {
-                              if (uploadingSlot === slotKey || saving) return;
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                openSlotPicker(slotKey);
-                              }
-                            }}
-                          >
+                          <button type="button" style={secondaryButtonStyle} onClick={() => openSlotPicker(slotKey)} disabled={uploadingSlot === slotKey || saving}>
                             {uploadingSlot === slotKey ? "Uploading…" : "Replace / update photo"}
-                          </label>
+                          </button>
                           <input
-                            id={`host-gallery-upload-${slotKey}`}
                             ref={(node) => { uploadInputRefs.current[slotKey] = node; }}
                             type="file"
                             accept="image/*"
-                            style={visuallyHiddenFileInputStyle}
-                            disabled={uploadingSlot === slotKey || saving}
+                            style={{ display: "none" }}
                             onChange={(e) => {
                               const file = e.currentTarget.files && e.currentTarget.files[0] ? e.currentTarget.files[0] : null;
                               void handleReplacePublicGalleryAsset(slotKey, file);
@@ -2395,23 +2397,15 @@ export default function HostProfileStudioClient() {
                 <button type="button" style={secondaryButtonStyle} onClick={handleApproveLimitedClick} disabled={saving}>
                   {saving ? "Saving…" : "Approve limited profile"}
                 </button>
-                <button type="button" style={buttonStyle} onClick={handleApproveFullClick} disabled={saving}>
-                  {saving ? "Saving…" : "Approve full profile"}
+                <button
+                  type="button"
+                  style={fullProfileApprovalIsCurrent ? { ...secondaryButtonStyle, cursor: "default", opacity: 0.8 } : buttonStyle}
+                  onClick={handleApproveFullClick}
+                  disabled={saving || fullProfileApprovalIsCurrent}
+                  title={fullProfileApprovalIsCurrent ? "The current full profile is already approved. Edit any field to re-enable approval." : "Approve the full profile."}
+                >
+                  {fullProfileApprovalButtonLabel}
                 </button>
-              </div>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14 }}>
-              <div style={cardStyle}>
-                <div style={{ fontWeight: 800, marginBottom: 10 }}>Private Profile Preview (HTML)</div>
-                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
-{JSON.stringify(privateProfile, null, 2)}
-                </pre>
-              </div>
-              <div style={cardStyle}>
-                <div style={{ fontWeight: 800, marginBottom: 10 }}>Public Profile Preview (HTML)</div>
-                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
-{JSON.stringify(publicProfile, null, 2)}
-                </pre>
               </div>
             </div>
           </div>
