@@ -204,12 +204,13 @@ def _chat_translation_policy_cached(user_language_code: str, user_language_name:
 @lru_cache(maxsize=16)
 def _chat_provider_switch_policy_cached(llm_provider: str, effective_mode: str) -> str:
     provider_label = "xAI" if str(llm_provider or "").lower() == "xai" else "OpenAI"
-    mode_label = str(effective_mode or "").title() or "Current"
+    mode_label = _public_mode_label(effective_mode)
     return (
         f"System routing note: The app switched the underlying model provider to {provider_label} "
         f"because the user is now in {mode_label} mode. "
         "Review any provided summaries and continue seamlessly while respecting the current mode's boundaries."
     )
+# v9.2.56: Host-facing summaries/replies use public Intro/Mate/Mature labels; internal routing remains friend/romantic/intimate.
 # v9.2.28: Public Connect mode labels are Intro/Mate/Mature; internal routing remains friend/romantic/intimate.
 # v9.2.27: DulceMoon Discover/Explore/Encounter plan support.
 # v9.2.26: v9.2.25 plus /chat persistent Mature-consent initialization fix.
@@ -5094,6 +5095,58 @@ def _normalize_mode(raw: str) -> str:
     if t in {"intro", "friend", "friendly"}:
         return "friend"
     return "friend"
+
+
+
+
+def _public_mode_label(mode: Any) -> str:
+    """Customer-facing mode label.
+
+    Internal mode keys remain friend/romantic/intimate for routing, content
+    folders, provider selection, and consent gates.  User-facing text must use
+    Intro/Mate/Mature.
+    """
+    m = _normalize_mode(str(mode or "friend"))
+    if m == "intimate":
+        return "Mature"
+    if m == "romantic":
+        return "Mate"
+    return "Intro"
+
+
+def _sanitize_public_mode_labels_text(text: Any) -> str:
+    """Replace legacy/internal mode labels in customer-facing text.
+
+    This is intentionally narrow: it rewrites mode-label phrases only, not
+    ordinary uses of words like romantic/relationship.
+    """
+    body = str(text or "")
+    if not body:
+        return body
+    replacements = [
+        (r"\bfriend\s+mode\b", "Intro mode"),
+        (r"\bfriendly\s+mode\b", "Intro mode"),
+        (r"\bromantic\s+mode\b", "Mate mode"),
+        (r"\bromance\s+mode\b", "Mate mode"),
+        (r"\bintimate\s*(?:\(\s*18\+\s*\))?\s+mode\b", "Mature mode"),
+        (r"\bexplicit\s+mode\b", "Mature mode"),
+        (r"\badult\s+mode\b", "Mature mode"),
+    ]
+    for pattern, repl in replacements:
+        body = re.sub(pattern, repl, body, flags=re.IGNORECASE)
+    return body
+
+
+def _sanitize_public_mode_labels_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        item = dict(ev)
+        if "content" in item:
+            item["content"] = _sanitize_public_mode_labels_text(item.get("content"))
+        out.append(item)
+    return out
 
 
 def _detect_mode_switch_from_text(text: str) -> Optional[str]:
@@ -10348,6 +10401,7 @@ async def chat(request: Request):
             delivered_content = None
 
         reply = "" if delivered_content else paywall_reply
+        reply = _sanitize_public_mode_labels_text(reply)
         display_reply, reply_translation = await run_in_threadpool(_assistant_display_text, reply, translation_ctx)
         session_state_out["translator_enabled"] = bool(translation_ctx.get("enabled"))
         session_state_out["translation_enabled"] = bool(translation_ctx.get("enabled"))
@@ -10430,7 +10484,7 @@ async def chat(request: Request):
         state_out["assistantLanguageCode"] = "en"
 
         notice_sent = _translation_notice_already_sent(state_out)
-        reply_text = str(reply or "")
+        reply_text = _sanitize_public_mode_labels_text(reply)
         if reply_text.strip() and status_mode in (STATUS_SAFE, STATUS_ALLOWED) and _translation_notice_needed(state_out, translation_state):
             notice_prefix = _translation_notice_prefix(translation_state).strip()
             reply_text = f"{notice_prefix}\n\n{reply_text.strip()}"
@@ -11029,6 +11083,7 @@ async def chat(request: Request):
             assistant_reply,
             had_image_input=had_user_image_input,
         )
+        assistant_reply = _sanitize_public_mode_labels_text(assistant_reply)
     except Exception as e:
         _dbg(debug, "LLM call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"LLM call failed: {type(e).__name__}: {e}")
@@ -12886,6 +12941,8 @@ async def save_chat_summary(request: Request):
         "You are a concise assistant that creates a server-side chat summary for future context. "
         "Write a compact summary in English that captures: relationship tone, key facts, user preferences/boundaries, "
         "names/roles, and any commitments or plans. Avoid quoting long passages. "
+        "Use only the customer-facing mode labels Intro, Mate, and Mature. "
+        "Never write Friend mode, Romantic mode, Romance mode, Intimate mode, Explicit mode, or Adult mode; rewrite them as Intro mode, Mate mode, or Mature mode as appropriate. "
         "If scheduled/platform content was delivered during the session, explicitly mention the delivered file name(s). "
         "Output plain text only."
     )
@@ -12904,6 +12961,7 @@ async def save_chat_summary(request: Request):
 
     summary = _repair_generated_summary_for_platform_content(summary, platform_filenames)
     summary = _append_platform_content_note_to_summary(summary, platform_filenames)
+    summary = _sanitize_public_mode_labels_text(summary)
     summary_header = _translation_header_for_summary(session_state)
     if summary_header:
         summary = f"{summary_header}\n\n{str(summary or '').strip()}".strip()
@@ -17561,9 +17619,9 @@ def _host_insights_list_summaries_sync(
             "createDatetime": str(row.get("createDatetime") or "").strip(),
             "sessionId": sid,
             "reason": str(row.get("reason") or "").strip(),
-            "summary": str(row.get("summary") or "").strip(),
+            "summary": _sanitize_public_mode_labels_text(str(row.get("summary") or "").strip()),
             "userName": str(row.get("userName") or "").strip(),
-            "messages": _dedupe_override_events(transcript_map.get(sid, [])),
+            "messages": _sanitize_public_mode_labels_events(_dedupe_override_events(transcript_map.get(sid, []))),
         }
         sig = _host_insights_summary_signature(item)
         if sig and sig in seen_signatures:
@@ -17636,6 +17694,8 @@ async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
         f"You are {companion_label}, the AI Companion. You are helping the HOST review historical session summaries. "
         "You will be given a JSON object containing saved session summaries. "
         "Answer the host's question using ONLY the provided summaries. "
+        "Use only the customer-facing mode labels Intro, Mate, and Mature. "
+        "Never use Friend mode, Romantic mode, Romance mode, Intimate mode, Explicit mode, or Adult mode in host-facing answers. "
         "If the summaries do not contain enough information, say so clearly. "
         "If asked to list members/visitors, produce a clean bullet list. "
         "Do not fabricate names, details, or events that are not in the summaries."
@@ -17659,7 +17719,7 @@ async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to answer: {type(e).__name__}: {e}")
 
-    return {"ok": True, "hostMemberId": host_id, "answer": str(answer or "")} 
+    return {"ok": True, "hostMemberId": host_id, "answer": _sanitize_public_mode_labels_text(answer)} 
 
 
 

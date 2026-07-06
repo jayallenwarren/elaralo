@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// v9.2.21: honor payloadPending/waitForPayload so DulceMoon paid members do not auto-open as Trial before Wix plan payload arrives.
 
 type MemberPlanPayload = {
   loggedIn?: boolean;
@@ -415,6 +416,8 @@ export default function MyElaraloCompanionSelectorClient() {
   const autoOpenedSingleRef = useRef<boolean>(false);
   const autoOpenSingle = useMemo(() => readQueryFlag("autoOpenSingle", "auto_open_single", "autoOpen", "auto_open"), []);
   const forceSelector = useMemo(() => readQueryFlag("forceSelector", "force_selector", "showSelector", "show_selector", "showCompanionList", "show_companion_list"), []);
+  const payloadPending = useMemo(() => readQueryFlag("payloadPending", "payload_pending", "waitForPayload", "wait_for_payload"), []);
+  const [payloadPendingGraceElapsed, setPayloadPendingGraceElapsed] = useState<boolean>(!payloadPending);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
@@ -457,6 +460,15 @@ export default function MyElaraloCompanionSelectorClient() {
     return () => window.clearTimeout(timer);
   }, []);
 
+  useEffect(() => {
+    if (!payloadPending) {
+      setPayloadPendingGraceElapsed(true);
+      return;
+    }
+    const timer = window.setTimeout(() => setPayloadPendingGraceElapsed(true), 12000);
+    return () => window.clearTimeout(timer);
+  }, [payloadPending]);
+
   const memberId = safeText(memberPayload.memberId || memberPayload.member_id);
   const displayName = safeText(memberPayload.displayName || memberPayload.display_name || memberPayload.userName || memberPayload.user_name);
   const loggedIn = Boolean(memberPayload.loggedIn ?? memberPayload.logged_in);
@@ -478,6 +490,16 @@ export default function MyElaraloCompanionSelectorClient() {
         setLoading(false);
         return;
       }
+      if (payloadPending && !externalPayloadSeen && !payloadPendingGraceElapsed) {
+        // The Wix parent is still resolving the member/plan payload.  Do not
+        // auto-open a single companion as Trial until the paid-plan context has
+        // had a chance to arrive.  This is especially important for DulceMoon
+        // legacy Host plans such as Test - Exclusive.
+        setError("");
+        setLoading(true);
+        return;
+      }
+
       if (!memberId) {
         // v9.2.17: Elaralo visitors are allowed to browse/select companions and
         // enter Connect using the brand-level free-minute allowance.  If Wix says
@@ -529,7 +551,7 @@ export default function MyElaraloCompanionSelectorClient() {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, brandName, contextGraceElapsed, externalPayloadSeen, isElaraloCoreBrand, loggedIn, memberId, shouldAutoOpenSingle]);
+  }, [API_BASE, brandName, contextGraceElapsed, externalPayloadSeen, isElaraloCoreBrand, loggedIn, memberId, payloadPending, payloadPendingGraceElapsed, shouldAutoOpenSingle]);
 
   const companionTypeOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.companionType).filter(Boolean))).sort(), [cards]);
   const generationOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.generation).filter(Boolean))).sort(), [cards]);

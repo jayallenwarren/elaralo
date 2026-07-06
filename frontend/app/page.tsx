@@ -3,6 +3,7 @@
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// v9.1.38: immediate DulceMoon Host Console plan handling + public Intro/Mate/Mature label sanitation for Host Console.
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
@@ -424,14 +425,26 @@ type PlanName =
   | "Explore"
   | "Encounter"
   | "Friend"
+  | "Premium"
+  | "Elite"
   | "Romantic"
+  | "Supreme"
+  | "Ultimate"
+  | "Intimate"
+  | "Exclusive"
   | "Mature"
   | "Pay as You Go"
   | "Test - Discover"
   | "Test - Explore"
   | "Test - Encounter"
   | "Test - Friend"
+  | "Test - Premium"
+  | "Test - Elite"
   | "Test - Romantic"
+  | "Test - Supreme"
+  | "Test - Ultimate"
+  | "Test - Intimate"
+  | "Test - Exclusive"
   | "Test - Mature"
   | "Test - Pay as You Go"
   | null;
@@ -772,21 +785,25 @@ function normalizePlanName(raw: any): PlanName {
     explore: "Explore",
     encounter: "Encounter",
     friend: "Friend",
+    premium: "Premium",
+    elite: "Elite",
     romantic: "Romantic",
-    intimate: "Mature",
-    "intimate 18+": "Mature",
+    supreme: "Supreme",
+    ultimate: "Ultimate",
+    intimate: "Intimate",
+    "intimate 18+": "Intimate",
+    exclusive: "Exclusive",
+    mature: "Mature",
     "pay as you go": "Pay as You Go",
   };
 
   const mapped = canonical[key];
   if (!mapped) return null;
-  if (!isTest || mapped === "Trial" || mapped === "Pay as You Go") return mapped;
-  if (mapped === "Discover") return "Test - Discover";
-  if (mapped === "Explore") return "Test - Explore";
-  if (mapped === "Encounter") return "Test - Encounter";
-  if (mapped === "Friend") return "Test - Friend";
-  if (mapped === "Romantic") return "Test - Romantic";
-  if (mapped === "Mature") return "Test - Mature";
+
+  // Wix test plans such as "Test - Exclusive" are legacy operational plans.
+  // Normalize them to the paid canonical plan so Connect does not fall back to Trial
+  // and so the Host Console can unlock immediately for the actual member payload.
+  if (isTest) return mapped;
   return mapped;
 }
 
@@ -1854,6 +1871,27 @@ const MODE_LABELS: Record<Mode, string> = {
   intimate: "Mature",
 };
 
+function sanitizePublicModeLabelsText(value: any): string {
+  let body = String(value ?? "");
+  if (!body) return body;
+
+  const replacements: Array<[RegExp, string]> = [
+    [/\bfriend\s+mode\b/gi, "Intro mode"],
+    [/\bfriendly\s+mode\b/gi, "Intro mode"],
+    [/\bromantic\s+mode\b/gi, "Mate mode"],
+    [/\bromance\s+mode\b/gi, "Mate mode"],
+    [/\bintimate\s*(?:\(\s*18\+\s*\))?\s+mode\b/gi, "Mature mode"],
+    [/\bexplicit\s+mode\b/gi, "Mature mode"],
+    [/\badult\s+mode\b/gi, "Mature mode"],
+  ];
+
+  for (const [rx, replacement] of replacements) {
+    body = body.replace(rx, replacement);
+  }
+
+  return body;
+}
+
 // Plan → mode availability mapping (UI pills)
 // Public labels shown in the UI:
 // - Intro  = internal friend
@@ -1868,34 +1906,60 @@ const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Discover",
   "Explore",
   "Encounter",
+  "Friend",
+  "Premium",
+  "Elite",
   "Romantic",
+  "Supreme",
+  "Ultimate",
+  "Intimate",
+  "Exclusive",
   "Mature",
   "Pay as You Go",
   "Test - Discover",
   "Test - Explore",
   "Test - Encounter",
+  "Test - Friend",
+  "Test - Premium",
+  "Test - Elite",
   "Test - Romantic",
+  "Test - Supreme",
+  "Test - Ultimate",
+  "Test - Intimate",
+  "Test - Exclusive",
   "Test - Mature",
   "Test - Pay as You Go",
 ];
 
+const MATURE_ALLOWED_PLANS: PlanName[] = [
+  "Discover",
+  "Explore",
+  "Encounter",
+  "Premium",
+  "Elite",
+  "Supreme",
+  "Ultimate",
+  "Intimate",
+  "Exclusive",
+  "Mature",
+  "Pay as You Go",
+  "Test - Discover",
+  "Test - Explore",
+  "Test - Encounter",
+  "Test - Premium",
+  "Test - Elite",
+  "Test - Supreme",
+  "Test - Ultimate",
+  "Test - Intimate",
+  "Test - Exclusive",
+  "Test - Mature",
+  "Test - Pay as You Go",
+];
 
 function allowedModesForPlan(planName: PlanName): Mode[] {
   const modes: Mode[] = ["friend"];
   if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (
-    planName === "Discover" ||
-    planName === "Explore" ||
-    planName === "Encounter" ||
-    planName === "Test - Discover" ||
-    planName === "Test - Explore" ||
-    planName === "Test - Encounter" ||
-    planName === "Mature" ||
-    planName === "Test - Mature" ||
-    planName === "Pay as You Go" ||
-    planName === "Test - Pay as You Go"
-  )
-    modes.push("intimate");
+  if (MATURE_ALLOWED_PLANS.includes(planName)) modes.push("intimate");
   return modes;
 }
 
@@ -5684,7 +5748,7 @@ const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
     });
     const json = await res.json().catch(() => ({}));
     if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
-    setHostInsightsAnswer(String(json?.answer || ""));
+    setHostInsightsAnswer(sanitizePublicModeLabelsText(json?.answer || ""));
     return true;
   } catch (e: any) {
     setHostInsightsError(e?.message || String(e));
@@ -11061,6 +11125,28 @@ useEffect(() => {
 
       // loggedIn must come from Wix; do NOT infer from memberId.
       const incomingLoggedIn = typeof (data as any).loggedIn === "boolean" ? Boolean((data as any).loggedIn) : null;
+
+      const hasMemberIdFieldForDowngradeGuard = "memberId" in (data as any) || "member_id" in (data as any);
+      const incomingMemberIdForDowngradeGuard =
+        typeof (data as any).memberId === "string"
+          ? String((data as any).memberId).trim()
+          : typeof (data as any).member_id === "string"
+            ? String((data as any).member_id).trim()
+            : "";
+      const existingRealMemberIdForDowngradeGuard = String(memberIdRef.current || "").trim();
+      const hasExistingRealMemberForDowngradeGuard = Boolean(existingRealMemberIdForDowngradeGuard) && !isAnonMemberId(existingRealMemberIdForDowngradeGuard);
+      const incomingLooksVisitorForDowngradeGuard =
+        incomingLoggedIn === false ||
+        (hasMemberIdFieldForDowngradeGuard && (!incomingMemberIdForDowngradeGuard || isAnonMemberId(incomingMemberIdForDowngradeGuard)));
+
+      // DulceMoon posts periodic MEMBER_PLAN payloads.  A stale visitor/Trial payload
+      // can arrive after a real member payload and used to clear memberId/plan, which
+      // hides Host Console and makes a paid Host look like Free Trial.  Never let a
+      // visitor payload downgrade an already-established real member session.
+      if (incomingLooksVisitorForDowngradeGuard && hasExistingRealMemberForDowngradeGuard) {
+        return;
+      }
+
       if (incomingLoggedIn !== null) {
         setLoggedIn(incomingLoggedIn);
       }
@@ -16607,7 +16693,7 @@ const modePillControls = (
                     <div style={{ opacity: 0.7 }}>No summaries loaded.</div>
                   ) : (
                     hostInsightsSummaries.map((s, idx) => {
-                      const summaryText = String(s.summary || "").trim();
+                      const summaryText = sanitizePublicModeLabelsText(s.summary || "").trim();
                       const transcript = Array.isArray(s.messages) ? s.messages : [];
                       return (
                         <div key={`${s.sessionId || ""}-${idx}`} style={{ marginBottom: 12, paddingBottom: 10, borderBottom: "1px solid rgba(0,0,0,0.06)" }}>
@@ -16643,7 +16729,7 @@ const modePillControls = (
                                       {label}
                                     </div>
                                     <div style={{ whiteSpace: "pre-wrap" }}>
-                                      {String(m.content || "").trim() || <span style={{ opacity: 0.55 }}>(empty)</span>}
+                                      {sanitizePublicModeLabelsText(m.content || "").trim() || <span style={{ opacity: 0.55 }}>(empty)</span>}
                                     </div>
                                   </div>
                                 );
@@ -16779,7 +16865,7 @@ const modePillControls = (
                         touchAction: "pan-y",
                       }}
                     >
-                      {hostInsightsAnswer}
+                      {sanitizePublicModeLabelsText(hostInsightsAnswer)}
                     </div>
                   </div>
                 ) : null}
@@ -17000,7 +17086,7 @@ const modePillControls = (
 
                   {c.summary ? (
                     <div style={{ marginTop: 8, fontSize: 12, opacity: 0.9, whiteSpace: "pre-wrap" }}>
-                      {c.summary}
+                      {sanitizePublicModeLabelsText(c.summary)}
                     </div>
                   ) : (
                     <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7 }}>
