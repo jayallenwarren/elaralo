@@ -1307,6 +1307,7 @@ function resolveCompanionForBackend(opts: { companionKey?: string; companionName
 
 const GREET_ONCE_KEY = "ELARALO_GREETED";
 const DEFAULT_AVATAR = elaraLogo.src;
+const TRANSPARENT_PIXEL = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 const DEFAULT_COMPANY_NAME = "Elaralo";
 // v9.1.28: Elaralo visitors are allowed 10 free Connect minutes before the same PayGo/Upgrade paywall used by DulceMoon.
 const ELARALO_TRIAL_MINUTES_QUERY_OVERRIDE = String(
@@ -4273,6 +4274,12 @@ const startupOverlayTimerRef = useRef<number | null>(null);
 const startupOverlayHardCapTimerRef = useRef<number | null>(null);
 const startupOverlayStartedRef = useRef<boolean>(false);
 
+// v10.0.0-alpha2.2: Keep the startup cover up until the selected companion visual is ready.
+// This prevents the default Elaralo logo from flashing while Wix/member payloads,
+// rebranding, and headshot probes settle.
+const [startupVisualReady, setStartupVisualReady] = useState<boolean>(() => !isEmbedded);
+const startupVisualReadyRef = useRef<boolean>(!isEmbedded);
+
 const startStartupOverlayCountdown = useCallback(() => {
   if (startupOverlayStartedRef.current) return;
   startupOverlayStartedRef.current = true;
@@ -4301,15 +4308,25 @@ const armStartupOverlay = useCallback(
       startupOverlayHardCapTimerRef.current = null;
     }
 
-    // Start the 800ms countdown once (first time we learn the companion name from Wix).
-    // If the name is not yet available, we keep the overlay (message hidden) until the hard-cap triggers.
+    // v10.0.0-alpha2.2: Receiving the name is not enough to uncover the UI.
+    // Wait until a selected companion headshot/logo has resolved, otherwise the
+    // default Elaralo shell can flash underneath the cover.
     if (!nm) return;
-
-    startStartupOverlayCountdown();
   },
-  [startStartupOverlayCountdown],
+  [],
 );
 
+
+const markStartupVisualReady = useCallback(
+  (name: string = "") => {
+    startupVisualReadyRef.current = true;
+    setStartupVisualReady(true);
+    const nm = String(name || "").trim();
+    if (nm) armStartupOverlay(nm);
+    startStartupOverlayCountdown();
+  },
+  [armStartupOverlay, startStartupOverlayCountdown],
+);
 
 const markStartupIdentityResolved = useCallback(
   (name: string = "") => {
@@ -5372,7 +5389,8 @@ useEffect(() => {
       if (p === mappedHeadshot) return prev;
       return mappedHeadshot;
     });
-  }, [preferredMappingHeadshot]);
+    markStartupVisualReady(companionName || startupOverlayName);
+  }, [preferredMappingHeadshot, companionName, startupOverlayName, markStartupVisualReady]);
 
   // Auto-join active LiveKit stream as a viewer (subscribe-only)
   // Read `?rebrandingKey=...` for direct testing (outside Wix).
@@ -11434,9 +11452,16 @@ useEffect(() => {
         // immediately and do not let later static-app probe failures replace it with the logo.
         if (incomingHeadshotUrl) {
           setAvatarSrc(incomingHeadshotUrl);
+          markStartupVisualReady(resolvedCompanionName);
         }
 
         pickFirstLoadableImage(avatarCandidates).then((picked) => {
+          const pickedTrimmed = String(picked || "").trim();
+          if (pickedTrimmed && pickedTrimmed !== DEFAULT_AVATAR) {
+            markStartupVisualReady(resolvedCompanionName);
+          } else if (incomingHeadshotUrl) {
+            markStartupVisualReady(resolvedCompanionName);
+          }
           setAvatarSrc((prev) => {
             const current = String(prev || "").trim();
             const next = String(picked || "").trim();
@@ -11539,7 +11564,7 @@ useEffect(() => {
     }
 
     return () => window.removeEventListener("message", onMessage);
-  }, [directCompanionHandoff, getMemberPlanCacheKey, markStartupIdentityResolved]);
+  }, [directCompanionHandoff, getMemberPlanCacheKey, markStartupIdentityResolved, markStartupVisualReady]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -15049,11 +15074,15 @@ const modePillControls = (
         >
           <img
             // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
-            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
+            src={
+              (isEmbedded && !startupVisualReady && (!avatarSrc || avatarSrc === DEFAULT_AVATAR))
+                ? TRANSPARENT_PIXEL
+                : (((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR)
+            }
             alt={companyName}
             style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
             onError={(e) => {
-              const fallback = (companyLogoSrc || DEFAULT_AVATAR);
+              const fallback = (isEmbedded && !startupVisualReady) ? TRANSPARENT_PIXEL : (companyLogoSrc || DEFAULT_AVATAR);
               const current = String((e.currentTarget as HTMLImageElement).src || avatarSrc || "").trim();
               (e.currentTarget as HTMLImageElement).src = fallback;
 
