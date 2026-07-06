@@ -2726,6 +2726,13 @@ const HO_CARD: React.CSSProperties = {
 };
 const HO_INPUT: React.CSSProperties = {
   width: "100%",
+  boxSizing: "border-box",
+  position: "relative",
+  zIndex: 2,
+  pointerEvents: "auto",
+  WebkitUserSelect: "text",
+  userSelect: "text",
+  touchAction: "manipulation",
   borderRadius: 12,
   border: "1px solid rgba(0,0,0,0.16)",
   padding: "12px 14px",
@@ -2748,6 +2755,15 @@ const HO_BTN_PRIMARY: React.CSSProperties = {
   background: "#111",
   color: "#fff",
   cursor: "pointer",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  boxSizing: "border-box",
+  position: "relative",
+  zIndex: 2,
+  pointerEvents: "auto",
+  touchAction: "manipulation",
+  WebkitTapHighlightColor: "transparent",
 };
 const HO_BTN_SECONDARY: React.CSSProperties = {
   borderRadius: 12,
@@ -2758,6 +2774,15 @@ const HO_BTN_SECONDARY: React.CSSProperties = {
   background: "#fff",
   color: "#111",
   cursor: "pointer",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  boxSizing: "border-box",
+  position: "relative",
+  zIndex: 2,
+  pointerEvents: "auto",
+  touchAction: "manipulation",
+  WebkitTapHighlightColor: "transparent",
 };
 const HO_BADGE = (bg: string): React.CSSProperties => ({
   display: "inline-flex",
@@ -4236,8 +4261,9 @@ const startupIdentityResolvedRef = useRef<boolean>(!isEmbedded);
 // Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
 // until the companionName has been received from the Wix MEMBER_PLAN payload.
 const STARTUP_OVERLAY_MS = 800;
-// Hard cap: do not block the UI for more than ~2s if the Wix payload / companion name arrives late.
-const STARTUP_OVERLAY_MAX_WAIT_MS = 1200;
+// Hard cap: do not block the UI indefinitely if the Wix payload / companion image arrives late.
+// v10.0.0-alpha2: keep this long enough to prevent Elaralo/Elara logo flashes during DulceMoon boot.
+const STARTUP_OVERLAY_MAX_WAIT_MS = 3000;
 
 // Brief startup overlay (covers the iframe on initial refresh).
 // Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
@@ -4276,13 +4302,13 @@ const armStartupOverlay = useCallback(
       startupOverlayHardCapTimerRef.current = null;
     }
 
-    // Start the 800ms countdown once (first time we learn the companion name from Wix).
-    // If the name is not yet available, we keep the overlay (message hidden) until the hard-cap triggers.
+    // v10.0.0-alpha2:
+    // In embedded white-label launches, do not start the countdown merely because the name arrived.
+    // Wait until the selected companion visual is also ready so the default Elaralo/Elara image never flashes.
     if (!nm) return;
-
-    startStartupOverlayCountdown();
+    if (!isEmbedded) startStartupOverlayCountdown();
   },
-  [startStartupOverlayCountdown],
+  [isEmbedded, startStartupOverlayCountdown],
 );
 
 
@@ -4679,8 +4705,8 @@ useEffect(() => {
 
 
   // Companion identity (drives persona + companion mapping)
-  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
-  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
+  const [companionName, setCompanionName] = useState<string>(() => (isEmbedded ? "" : DEFAULT_COMPANION_NAME));
+  const [avatarSrc, setAvatarSrc] = useState<string>(() => (isEmbedded ? "" : DEFAULT_AVATAR));
   // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
   // IMPORTANT: This must never alter STT/TTS start/stop code paths.
   const [rebrandingKey, setRebrandingKey] = useState<string>("");
@@ -4895,7 +4921,26 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     }
   }, [upgradeUrl]);
 
-  const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
+  const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(() => (isEmbedded ? "" : DEFAULT_AVATAR));
+  const startupCompanionVisualReady = useMemo(() => {
+    if (!isEmbedded) return true;
+    const currentAvatar = String(avatarSrc || "").trim();
+    const currentLogo = String(companyLogoSrc || "").trim();
+    if (!currentAvatar) return false;
+    if (currentAvatar === DEFAULT_AVATAR) return false;
+    if (currentLogo && currentAvatar === currentLogo) return false;
+    if (currentAvatar.includes("-logo.")) return false;
+    return true;
+  }, [avatarSrc, companyLogoSrc, isEmbedded]);
+
+  useEffect(() => {
+    if (!startupOverlayOpen) return;
+    if (!startupIdentityResolved) return;
+    if (!startupOverlayName) return;
+    if (!startupCompanionVisualReady) return;
+    startStartupOverlayCountdown();
+  }, [startupOverlayOpen, startupIdentityResolved, startupOverlayName, startupCompanionVisualReady, startStartupOverlayCountdown]);
+
   const companyName = useMemo(() => {
     const derived = String(
       rebrandingName ||
@@ -15024,7 +15069,7 @@ const modePillControls = (
         >
           <img
             // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
-            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
+            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || (isEmbedded && startupOverlayOpen ? "" : DEFAULT_AVATAR)}
             alt={companyName}
             style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
             onError={(e) => {
