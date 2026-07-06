@@ -2260,20 +2260,6 @@ export default function HostProfileStudioClient() {
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("review")}>Edit derived review</button>
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("completion")}>Edit completion</button>
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14 }}>
-              <div style={cardStyle}>
-                <div style={{ fontWeight: 800, marginBottom: 10 }}>Private profile</div>
-                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
-{JSON.stringify(privateProfile, null, 2)}
-                </pre>
-              </div>
-              <div style={cardStyle}>
-                <div style={{ fontWeight: 800, marginBottom: 10 }}>Public profile</div>
-                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
-{JSON.stringify(publicProfile, null, 2)}
-                </pre>
-              </div>
-            </div>
             <div style={{ display: "grid", gap: 8 }}>
               <div style={{ color: Boolean(readiness.limited_publish_allowed) ? "#065f46" : "#92400e", fontWeight: 700 }}>
                 Limited publish: {Boolean(readiness.limited_publish_allowed) ? "Ready" : "Not ready"}
@@ -2412,6 +2398,20 @@ export default function HostProfileStudioClient() {
                 <button type="button" style={buttonStyle} onClick={handleApproveFullClick} disabled={saving}>
                   {saving ? "Saving…" : "Approve full profile"}
                 </button>
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14 }}>
+              <div style={cardStyle}>
+                <div style={{ fontWeight: 800, marginBottom: 10 }}>Private Profile Preview (HTML)</div>
+                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
+{JSON.stringify(privateProfile, null, 2)}
+                </pre>
+              </div>
+              <div style={cardStyle}>
+                <div style={{ fontWeight: 800, marginBottom: 10 }}>Public Profile Preview (HTML)</div>
+                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "#374151" }}>
+{JSON.stringify(publicProfile, null, 2)}
+                </pre>
               </div>
             </div>
           </div>
