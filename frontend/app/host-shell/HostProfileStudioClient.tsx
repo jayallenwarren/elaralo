@@ -1486,25 +1486,15 @@ export default function HostProfileStudioClient() {
     background: "#fff",
     boxShadow: "0 8px 24px rgba(0,0,0,0.06)",
     padding: 18,
-    position: "relative",
-    zIndex: 0,
-    isolation: "isolate",
   };
   const inputStyle: React.CSSProperties = {
     width: "100%",
-    boxSizing: "border-box",
     borderRadius: 12,
     border: "1px solid rgba(0,0,0,0.16)",
     padding: "12px 14px",
     fontSize: 14,
     outline: "none",
     background: "#fff",
-    position: "relative",
-    zIndex: 2,
-    pointerEvents: "auto",
-    WebkitUserSelect: "text",
-    userSelect: "text",
-    touchAction: "manipulation",
   };
   const textareaStyle: React.CSSProperties = {
     ...inputStyle,
@@ -1519,15 +1509,6 @@ export default function HostProfileStudioClient() {
     color: "white",
     fontWeight: 700,
     cursor: "pointer",
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    boxSizing: "border-box",
-    position: "relative",
-    zIndex: 2,
-    pointerEvents: "auto",
-    touchAction: "manipulation",
-    WebkitTapHighlightColor: "transparent",
   };
   const secondaryButtonStyle: React.CSSProperties = {
     borderRadius: 12,
@@ -1537,32 +1518,12 @@ export default function HostProfileStudioClient() {
     color: "#111827",
     fontWeight: 700,
     cursor: "pointer",
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    boxSizing: "border-box",
-    position: "relative",
-    zIndex: 2,
-    pointerEvents: "auto",
-    touchAction: "manipulation",
-    WebkitTapHighlightColor: "transparent",
-  };
-  const checkboxStyle: React.CSSProperties = {
-    width: 18,
-    height: 18,
-    minWidth: 18,
-    marginTop: 2,
-    position: "relative",
-    zIndex: 3,
-    pointerEvents: "auto",
-    cursor: "pointer",
-    touchAction: "manipulation",
   };
 
   const renderLabeledInput = (label: string, value: any, onChange: (next: string) => void, placeholder: string, extra?: React.ReactNode) => (
     <label style={{ display: "grid", gap: 6 }}>
       <span style={{ fontWeight: 700 }}>{label}</span>
-      <input value={String(value || "")} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} style={inputStyle} onClick={(e) => e.currentTarget.focus()} />
+      <input value={String(value || "")} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} style={inputStyle} />
       {extra}
     </label>
   );
@@ -1577,13 +1538,12 @@ export default function HostProfileStudioClient() {
               type="checkbox"
               checked={Boolean((completionForm.skipped_sections || {})[skipKey])}
               onChange={(e) => updateCompletionSkip(skipKey, e.target.checked)}
-              style={checkboxStyle}
             />
             Skip for now (limited publish only)
           </label>
         ) : null}
       </div>
-      <textarea value={String(value || "")} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} style={textareaStyle} onClick={(e) => e.currentTarget.focus()} />
+      <textarea value={String(value || "")} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} style={textareaStyle} />
     </div>
   );
 
@@ -1895,8 +1855,8 @@ export default function HostProfileStudioClient() {
             <div style={{ color: "#4b5563", lineHeight: 1.6 }}>
               Upload at least five photos in English-labeled slots. One person only, no heavy filters, plain or low-distraction background preferred, and face unobstructed.
             </div>
-            <label style={{ display: "inline-flex", gap: 10, alignItems: "flex-start", padding: 12, border: "1px solid rgba(0,0,0,0.1)", borderRadius: 14, background: "rgba(17,24,39,0.03)", cursor: "pointer", position: "relative", zIndex: 2, pointerEvents: "auto", touchAction: "manipulation" }}>
-              <input type="checkbox" checked={threeDOptIn} onChange={(e) => void savePhotosConfig(e.target.checked)} style={checkboxStyle} />
+            <label style={{ display: "inline-flex", gap: 10, alignItems: "flex-start", padding: 12, border: "1px solid rgba(0,0,0,0.1)", borderRadius: 14, background: "rgba(17,24,39,0.03)" }}>
+              <input type="checkbox" checked={threeDOptIn} onChange={(e) => void savePhotosConfig(e.target.checked)} />
               <span style={{ lineHeight: 1.6 }}>
                 Host confirms these photos may be used later for 3D character generation only if host opts in to this service.
               </span>
@@ -2091,7 +2051,7 @@ export default function HostProfileStudioClient() {
                 disabled={catalogVisibilitySaving}
                 onClick={(e) => e.stopPropagation()}
                 onChange={(e) => handleCatalogVisibilityChange(e.currentTarget.checked)}
-                style={{ ...checkboxStyle, marginTop: 3 }}
+                style={{ marginTop: 3 }}
                 aria-label="List my Host profile in the Companion catalog"
               />
               <span style={{ display: "grid", gap: 4 }}>
@@ -2130,7 +2090,6 @@ export default function HostProfileStudioClient() {
                   readOnly
                   value={voiceCaptureScript}
                   style={{ ...textareaStyle, minHeight: 180, background: "#fff" }}
-                  onClick={(e) => e.currentTarget.focus()}
                 />
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                   <button
