@@ -8481,6 +8481,125 @@ def _build_public_reference_page_system_block(avatar: str, url: str, summary: st
     return header + safe_summary
 
 
+def _persona_profile_text(value: Any, max_chars: int = 2400) -> str:
+    """Return compact text for persona/profile prompt blocks."""
+    try:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False, indent=2)
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(text) > int(max_chars):
+            return text[: max(0, int(max_chars) - 3)].rstrip() + "..."
+        return text
+    except Exception:
+        return ""
+
+
+def _fetch_latest_host_profile_studio_profile_sync(brand: str, avatar: str) -> Dict[str, Any]:
+    """Fetch latest approved Host Profile Studio profile for brand/avatar.
+
+    Host AI Guidelines remain the highest authority. This approved Host Profile
+    Studio record is the second-line source of truth for identity/persona facts.
+    """
+    b = (brand or "").strip()
+    a = (avatar or "").strip()
+    if not a:
+        return {}
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = _econnect_conn()
+        conn.row_factory = sqlite3.Row
+        _host_onboarding_ensure_schema(conn)
+        sql = f"""
+            SELECT v.profile_json, v.version_no, v.approved_epoch, s.brand, s.avatar, s.member_id
+            FROM {_HOST_ONBOARDING_VERSIONS_TABLE} v
+            JOIN {_HOST_ONBOARDING_SESSIONS_TABLE} s ON s.session_id = v.session_id
+            WHERE lower(COALESCE(s.avatar,'')) = lower(?)
+        """
+        params: List[Any] = [a]
+        if b:
+            sql += " AND lower(COALESCE(s.brand,'')) = lower(?)"
+            params.append(b)
+        sql += " ORDER BY v.approved_epoch DESC, v.version_no DESC LIMIT 1"
+        row = conn.execute(sql, tuple(params)).fetchone()
+        if not row:
+            return {}
+        profile = _host_onboarding_json_loads(row["profile_json"], {})
+        if not isinstance(profile, dict):
+            return {}
+        profile["_persona_source"] = {
+            "source": "host_profile_studio",
+            "brand": str(row["brand"] or ""),
+            "avatar": str(row["avatar"] or ""),
+            "version_no": int(row["version_no"] or 0),
+            "approved_epoch": float(row["approved_epoch"] or 0),
+        }
+        return profile
+    except Exception as e:
+        try:
+            print(f"[persona] host profile fetch failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return {}
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _build_host_profile_studio_system_block(profile: Dict[str, Any]) -> str:
+    """Build a safe Host Profile Studio persona block for the AI runtime."""
+    if not isinstance(profile, dict) or not profile:
+        return ""
+    public_profile = dict(profile.get("public_profile") or {})
+    public_page = dict(profile.get("public_page") or {})
+    ai_profile = dict(profile.get("ai_profile") or {})
+    private_profile = dict(profile.get("private_profile") or {})
+    persona_source = dict(profile.get("_persona_source") or {})
+    display_name = str(public_profile.get("public_display_name") or public_profile.get("stage_name") or persona_source.get("avatar") or "the host").strip()
+
+    parts: List[str] = []
+    parts.append(
+        "Host Profile Studio persona block (second-line source of truth after Host AI Guidelines). "
+        "Use this approved profile to represent the host's identity, personality, background, values, and communication style. "
+        "If this block conflicts with Host AI Guidelines, follow Host AI Guidelines. Do not expose private fields that guidelines say to hide."
+    )
+    parts.append(f"Representative identity: {display_name}.")
+
+    public_text = _persona_profile_text(public_profile, 3200)
+    if public_text:
+        parts.append("Approved public/persona profile: " + public_text)
+    page_text = _persona_profile_text(public_page, 1800)
+    if page_text:
+        parts.append("Approved public page profile: " + page_text)
+
+    private_subset = {
+        "legal_name": private_profile.get("legal_name"),
+        "birth_city": private_profile.get("birth_city"),
+        "birth_state_region": private_profile.get("birth_state_region"),
+        "birth_country": private_profile.get("birth_country"),
+        "nationalities": private_profile.get("nationalities"),
+        "race_primary": private_profile.get("race_primary"),
+        "race_detail": private_profile.get("race_detail"),
+        "ethnicity_bucket": private_profile.get("ethnicity_bucket"),
+        "ethnicity_detail": private_profile.get("ethnicity_detail"),
+        "phonetic_pronunciation": private_profile.get("phonetic_pronunciation"),
+    }
+    private_text = _persona_profile_text({k: v for k, v in private_subset.items() if v not in (None, "", [])}, 1800)
+    if private_text:
+        parts.append("Private/internal grounding facts (do not disclose unless permitted by Host AI Guidelines): " + private_text)
+
+    ai_text = _persona_profile_text(ai_profile, 2200)
+    if ai_text:
+        parts.append("AI representative profile: " + ai_text)
+
+    return "\n\n".join(p for p in parts if p).strip()
+
 def _build_guideline_reference_page_blocks_sync(avatar: str, website_url: str, host_guidelines: str) -> List[str]:
     a = (avatar or "").strip()
     g = str(host_guidelines or "").strip()
@@ -10985,6 +11104,21 @@ async def chat(request: Request):
                 llm_messages.insert(insert_at, {"role": "system", "content": block})
                 insert_at += 1
 
+
+        # Host Profile Studio persona block (second-line source of truth after Host AI Guidelines).
+        # This keeps the deployed AI Guidelines as the canonical rule source while allowing
+        # approved Host Profile Studio data to ground identity/persona consistently.
+        try:
+            host_profile_for_persona = await run_in_threadpool(_fetch_latest_host_profile_studio_profile_sync, brand_name, avatar_name)
+            host_profile_block = await run_in_threadpool(_build_host_profile_studio_system_block, host_profile_for_persona)
+        except Exception:
+            host_profile_block = ""
+        if host_profile_block:
+            llm_messages.insert(insert_at, {"role": "system", "content": host_profile_block})
+            insert_at += 1
+            _perf_stage("chat.host_profile_studio_persona_loaded", has_profile=True)
+        else:
+            _perf_stage("chat.host_profile_studio_persona_loaded", has_profile=False)
 
         identity_blocks = _chat_identity_system_blocks(session_state)
         for block in identity_blocks:
