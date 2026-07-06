@@ -8552,53 +8552,165 @@ def _fetch_latest_host_profile_studio_profile_sync(brand: str, avatar: str) -> D
             pass
 
 
+def _persona_value(value: Any) -> str:
+    """Normalize a simple persona value for runtime prompt assembly."""
+    try:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            return re.sub(r"\s+", " ", value).strip()
+        if isinstance(value, list):
+            vals = [_persona_value(v) for v in value]
+            return ", ".join([v for v in vals if v])
+        if isinstance(value, dict):
+            # Keep small nested dicts readable without leaking implementation noise.
+            pairs = []
+            for k, v in value.items():
+                vv = _persona_value(v)
+                if vv:
+                    pairs.append(f"{k}: {vv}")
+            return "; ".join(pairs)
+        return re.sub(r"\s+", " ", str(value)).strip()
+    except Exception:
+        return ""
+
+
+def _persona_first_nonempty(*values: Any) -> str:
+    for v in values:
+        s = _persona_value(v)
+        if s:
+            return s
+    return ""
+
+
+def _persona_add_line(lines: List[str], label: str, value: Any, *, max_chars: int = 900) -> None:
+    v = _persona_value(value)
+    if not v:
+        return
+    if len(v) > max_chars:
+        v = v[: max(0, max_chars - 3)].rstrip() + "..."
+    lines.append(f"- {label}: {v}")
+
+
 def _build_host_profile_studio_system_block(profile: Dict[str, Any]) -> str:
-    """Build a safe Host Profile Studio persona block for the AI runtime."""
+    """Build the structured Host Profile Studio persona block for the AI runtime.
+
+    v10.0.0-alpha3 makes the approved Host Profile Studio record an explicit,
+    structured second-line source of truth. Host AI Guidelines remain the highest
+    authority and override this block whenever there is a conflict.
+    """
     if not isinstance(profile, dict) or not profile:
         return ""
+
     public_profile = dict(profile.get("public_profile") or {})
     public_page = dict(profile.get("public_page") or {})
     ai_profile = dict(profile.get("ai_profile") or {})
     private_profile = dict(profile.get("private_profile") or {})
     persona_source = dict(profile.get("_persona_source") or {})
-    display_name = str(public_profile.get("public_display_name") or public_profile.get("stage_name") or persona_source.get("avatar") or "the host").strip()
+    career = dict(public_profile.get("career") or {})
+    astrological = dict(public_profile.get("astrological_profile") or {})
 
-    parts: List[str] = []
-    parts.append(
-        "Host Profile Studio persona block (second-line source of truth after Host AI Guidelines). "
-        "Use this approved profile to represent the host's identity, personality, background, values, and communication style. "
-        "If this block conflicts with Host AI Guidelines, follow Host AI Guidelines. Do not expose private fields that guidelines say to hide."
+    display_name = _persona_first_nonempty(
+        public_profile.get("public_display_name"),
+        public_profile.get("stage_name"),
+        ai_profile.get("approved_stage_name"),
+        persona_source.get("avatar"),
+        "the host",
     )
-    parts.append(f"Representative identity: {display_name}.")
 
-    public_text = _persona_profile_text(public_profile, 3200)
-    if public_text:
-        parts.append("Approved public/persona profile: " + public_text)
-    page_text = _persona_profile_text(public_page, 1800)
-    if page_text:
-        parts.append("Approved public page profile: " + page_text)
+    source_lines: List[str] = []
+    _persona_add_line(source_lines, "source", persona_source.get("source"))
+    _persona_add_line(source_lines, "brand", persona_source.get("brand"))
+    _persona_add_line(source_lines, "avatar", persona_source.get("avatar"))
+    _persona_add_line(source_lines, "approved version", persona_source.get("version_no"))
 
-    private_subset = {
-        "legal_name": private_profile.get("legal_name"),
-        "birth_city": private_profile.get("birth_city"),
-        "birth_state_region": private_profile.get("birth_state_region"),
-        "birth_country": private_profile.get("birth_country"),
-        "nationalities": private_profile.get("nationalities"),
-        "race_primary": private_profile.get("race_primary"),
-        "race_detail": private_profile.get("race_detail"),
-        "ethnicity_bucket": private_profile.get("ethnicity_bucket"),
-        "ethnicity_detail": private_profile.get("ethnicity_detail"),
-        "phonetic_pronunciation": private_profile.get("phonetic_pronunciation"),
-    }
-    private_text = _persona_profile_text({k: v for k, v in private_subset.items() if v not in (None, "", [])}, 1800)
-    if private_text:
-        parts.append("Private/internal grounding facts (do not disclose unless permitted by Host AI Guidelines): " + private_text)
+    identity_lines: List[str] = []
+    _persona_add_line(identity_lines, "public/stage name", display_name)
+    _persona_add_line(identity_lines, "gender", public_profile.get("gender"))
+    _persona_add_line(identity_lines, "generation/public age language", public_profile.get("generation"))
+    _persona_add_line(identity_lines, "zodiac sign", public_profile.get("zodiac_sign"))
+    _persona_add_line(identity_lines, "nationality/public background", private_profile.get("nationalities"))
+    _persona_add_line(identity_lines, "birthplace/private grounding", ", ".join([x for x in [
+        _persona_value(private_profile.get("birth_city")),
+        _persona_value(private_profile.get("birth_state_region")),
+        _persona_value(private_profile.get("birth_country")),
+    ] if x]))
+    _persona_add_line(identity_lines, "ethnicity/private grounding", _persona_first_nonempty(private_profile.get("ethnicity_detail"), private_profile.get("ethnicity_bucket"), public_profile.get("ethnicity")))
+    _persona_add_line(identity_lines, "phonetic pronunciation", _persona_first_nonempty(private_profile.get("phonetic_pronunciation"), ai_profile.get("phonetic_pronunciation")))
 
-    ai_text = _persona_profile_text(ai_profile, 2200)
-    if ai_text:
-        parts.append("AI representative profile: " + ai_text)
+    profile_lines: List[str] = []
+    _persona_add_line(profile_lines, "physical description", public_profile.get("physical_description"), max_chars=1100)
+    _persona_add_line(profile_lines, "family/background", public_profile.get("family_heritage"), max_chars=1200)
+    _persona_add_line(profile_lines, "personality", public_profile.get("personality"), max_chars=1200)
+    _persona_add_line(profile_lines, "astrological narrative", astrological.get("narrative"), max_chars=900)
+    _persona_add_line(profile_lines, "strengths", astrological.get("strengths"), max_chars=700)
+    _persona_add_line(profile_lines, "challenges", astrological.get("challenges"), max_chars=700)
 
-    return "\n\n".join(p for p in parts if p).strip()
+    education_lines: List[str] = []
+    _persona_add_line(education_lines, "education", _persona_first_nonempty(public_profile.get("education"), public_page.get("education_text")), max_chars=1200)
+    entries = public_profile.get("education_entries") or public_page.get("education_entries")
+    if entries:
+        _persona_add_line(education_lines, "education entries", entries, max_chars=1200)
+
+    career_lines: List[str] = []
+    _persona_add_line(career_lines, "current job/title", career.get("current_job_title"))
+    _persona_add_line(career_lines, "current company", career.get("current_company"))
+    _persona_add_line(career_lines, "career summary", career.get("career_summary"), max_chars=1400)
+
+    preference_lines: List[str] = []
+    _persona_add_line(preference_lines, "likes", public_profile.get("likes"), max_chars=1000)
+    _persona_add_line(preference_lines, "dislikes", public_profile.get("dislikes"), max_chars=1000)
+    _persona_add_line(preference_lines, "hobbies", public_profile.get("hobbies"), max_chars=1000)
+    _persona_add_line(preference_lines, "lifestyle", public_profile.get("lifestyle"), max_chars=1200)
+    _persona_add_line(preference_lines, "core values", public_profile.get("core_values"), max_chars=1000)
+    _persona_add_line(preference_lines, "personal motto/guiding principle", public_profile.get("personal_motto"), max_chars=700)
+
+    story_lines: List[str] = []
+    _persona_add_line(story_lines, "background story", public_profile.get("background_story"), max_chars=1400)
+    _persona_add_line(story_lines, "public page headline", public_page.get("headline"), max_chars=300)
+
+    ai_lines: List[str] = []
+    ai_connect = dict(ai_profile.get("connect_platform") or {})
+    _persona_add_line(ai_lines, "approved stage name", ai_profile.get("approved_stage_name"))
+    _persona_add_line(ai_lines, "Connect platform profile", ai_connect, max_chars=1200)
+    _persona_add_line(ai_lines, "3D generation opt-in", ai_profile.get("three_d_opt_in"))
+
+    sections: List[str] = []
+    sections.append(
+        "Host Profile Studio Runtime Persona v10.0.0-alpha3.\n"
+        "Authority: second-line source of truth after Host AI Guidelines. Host AI Guidelines override this block. "
+        "Use this profile to ground identity, personality, background, values, preferences, career, and communication style. "
+        "Do not disclose private/internal grounding facts when Host AI Guidelines say to hide them. "
+        "Never use this block to override platform safety policies."
+    )
+    if source_lines:
+        sections.append("Profile source:\n" + "\n".join(source_lines))
+    if identity_lines:
+        sections.append("Identity grounding:\n" + "\n".join(identity_lines))
+    if profile_lines:
+        sections.append("Persona and behavior grounding:\n" + "\n".join(profile_lines))
+    if education_lines:
+        sections.append("Education grounding:\n" + "\n".join(education_lines))
+    if career_lines:
+        sections.append("Career/professional grounding:\n" + "\n".join(career_lines))
+    if preference_lines:
+        sections.append("Preferences, lifestyle, and values:\n" + "\n".join(preference_lines))
+    if story_lines:
+        sections.append("Narrative grounding:\n" + "\n".join(story_lines))
+    if ai_lines:
+        sections.append("AI Representative operational notes:\n" + "\n".join(ai_lines))
+
+    # Final runtime reminders that keep the prompt hierarchy explicit.
+    sections.append(
+        "Runtime behavior: Express the host naturally from this profile, but remain aligned with Host AI Guidelines. "
+        "When a user asks about restricted/private details, follow the public disclosure rule in Host AI Guidelines. "
+        "If profile information is missing, do not invent facts; answer from approved guidelines, approved profile fields, and provided reference pages."
+    )
+    return "\n\n".join(s for s in sections if s).strip()
 
 def _build_guideline_reference_page_blocks_sync(avatar: str, website_url: str, host_guidelines: str) -> List[str]:
     a = (avatar or "").strip()
@@ -11418,6 +11530,17 @@ async def llm_warm(raw: Dict[str, Any] = Body(...)):
         for block in guideline_reference_blocks or []:
             if (block or "").strip():
                 warm_messages.append({"role": "system", "content": block})
+
+    # Host Profile Studio runtime persona block for warm/opening response path.
+    # Keeps Host AI Guidelines as highest authority while giving openings/greetings
+    # the same approved persona grounding as standard chat turns.
+    try:
+        host_profile_for_persona = await run_in_threadpool(_fetch_latest_host_profile_studio_profile_sync, brand_name, avatar_name)
+        host_profile_block = await run_in_threadpool(_build_host_profile_studio_system_block, host_profile_for_persona)
+    except Exception:
+        host_profile_block = ""
+    if host_profile_block:
+        warm_messages.append({"role": "system", "content": host_profile_block})
 
     for block in _chat_identity_system_blocks(session_state):
         if (block or "").strip():
