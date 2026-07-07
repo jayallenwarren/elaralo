@@ -17785,7 +17785,32 @@ def _host_insights_list_users_sync(brand: str, avatar: str, limit: int = 100) ->
             }
         )
 
-    out.sort(key=lambda item: float(item.get("lastSeenEpoch") or 0.0), reverse=True)
+    # v10.0.0-alpha4: Session Insights left-pane ordering must track the
+    # same summary timeline shown in the right pane.  Usage last_seen_epoch can
+    # lag behind or point to a different activity source, which caused recent
+    # summaries to appear in the right pane without their member/visitor rising
+    # to the top of the Members / Visitors pane.  Sort primarily by the latest
+    # saved summary timestamp (newest first), with usage lastSeenEpoch only as a
+    # fallback tie-breaker for legacy rows.
+    def _host_insights_user_sort_key(item: Dict[str, Any]) -> Tuple[float, float]:
+        summary_dt = str(item.get("summaryLastSeen") or "").strip()
+        summary_epoch = 0.0
+        if summary_dt:
+            try:
+                summary_epoch = datetime.fromisoformat(summary_dt.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                try:
+                    summary_epoch = datetime.strptime(summary_dt[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+                except Exception:
+                    summary_epoch = 0.0
+        usage_epoch = 0.0
+        try:
+            usage_epoch = float(item.get("lastSeenEpoch") or 0.0)
+        except Exception:
+            usage_epoch = 0.0
+        return (summary_epoch, usage_epoch)
+
+    out.sort(key=_host_insights_user_sort_key, reverse=True)
     return out
 
 
