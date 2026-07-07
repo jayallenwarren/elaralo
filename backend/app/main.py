@@ -15366,28 +15366,61 @@ def _stripe_paygo_process_completed_session_sync(session_obj: Dict[str, Any], ev
     return {"ok": True, "credited": True, "minutes": minutes, "identity_key": identity_key, "receipt_email": receipt_result}
 
 
+def _stripe_webhook_process_event_background(event: Dict[str, Any]) -> None:
+    """Process Stripe webhook work after the HTTP 2xx acknowledgement.
+
+    Stripe treats non-2xx responses, slow responses, dropped connections, and
+    unhandled exceptions as failed deliveries.  PayGo fulfillment must remain
+    durable, but webhook acknowledgement should not depend on receipt email,
+    local DB latency, or downstream processing.  This background worker logs all
+    processing failures and lets Stripe see a fast 2xx for any valid webhook.
+    """
+    try:
+        event_type = _stripe_paygo_clean_text(event.get("type"))
+        obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
+        if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"} and isinstance(obj, dict):
+            _perf_stage("stripe.webhook.bg_process_start", event=event_type)
+            result = _stripe_paygo_process_completed_session_sync(obj, event)
+            _perf_stage("stripe.webhook.bg_process_complete", event=event_type, result=result)
+            return
+        if event_type == "checkout.session.expired" and isinstance(obj, dict):
+            sid = _stripe_paygo_clean_text(obj.get("id"))
+            _stripe_paygo_mark_sync(sid, status="expired", raw_event=event)
+            _perf_stage("stripe.webhook.bg_expired_marked", checkout_session_id=sid)
+            return
+        _perf_stage("stripe.webhook.bg_ignored", event=event_type)
+    except Exception as e:
+        logger.exception("Stripe webhook background processing failed: %s", e)
+
+
+@app.get("/stripe/webhook")
+async def stripe_webhook_health():
+    """Lightweight health check for the Stripe webhook route."""
+    return {"ok": True, "endpoint": "/stripe/webhook", "mode": "ack_first_background_process"}
+
+
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
     raw = await request.body()
     _perf_stage("stripe.webhook.body_read", bytes=len(raw or b""))
     sig = request.headers.get("stripe-signature") or request.headers.get("Stripe-Signature") or ""
     if STRIPE_WEBHOOK_SECRET and not _stripe_verify_signature(raw, sig, STRIPE_WEBHOOK_SECRET):
+        # Invalid signatures should remain 400 so Stripe/security diagnostics are accurate.
         raise HTTPException(status_code=400, detail="Invalid Stripe signature")
     try:
         event = json.loads(raw.decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
+
     event_type = _stripe_paygo_clean_text(event.get("type"))
-    obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
-    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"} and isinstance(obj, dict):
-        _perf_stage("stripe.webhook.process_start", event=event_type)
-        result = await run_in_threadpool(_stripe_paygo_process_completed_session_sync, obj, event)
-        _perf_stage("stripe.webhook.process_complete")
-        return {"received": True, **(result if isinstance(result, dict) else {})}
-    if event_type == "checkout.session.expired" and isinstance(obj, dict):
-        sid = _stripe_paygo_clean_text(obj.get("id"))
-        await run_in_threadpool(_stripe_paygo_mark_sync, sid, status="expired", raw_event=event)
-    return {"received": True, "ignored": event_type}
+    event_id = _stripe_paygo_clean_text(event.get("id"))
+    _perf_stage("stripe.webhook.ack", event=event_type, event_id=event_id)
+
+    # Acknowledge valid Stripe events immediately and process fulfillment in the
+    # background.  This prevents transient DB/email/downstream exceptions from
+    # causing Stripe delivery failures and retry storms.
+    threading.Thread(target=_stripe_webhook_process_event_background, args=(event,), daemon=True).start()
+    return {"received": True, "queued": True, "event": event_type, "event_id": event_id}
 
 
 @app.get("/stripe/paygo/session-status")
