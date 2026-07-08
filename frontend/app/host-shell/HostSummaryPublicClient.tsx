@@ -613,22 +613,21 @@ export default function HostSummaryPublicClient() {
         {galleryAssets.map((asset, idx) => (
           <figure
             key={`${safeText(asset.asset_id || asset.url || idx)}`}
-            style={{ margin: 0, display: "grid", gap: 8 }}
+            style={{ margin: 0, display: "grid" }}
           >
             <img
               src={safeText(asset.url)}
               alt={slotLabel(safeText(asset.slot_key))}
               style={{
                 width: "100%",
-                aspectRatio: "4 / 5",
-                objectFit: "cover",
+                aspectRatio: "2 / 3",
+                objectFit: "contain",
+                objectPosition: "center center",
+                background: "#f8fafc",
                 borderRadius: 16,
                 border: "1px solid rgba(0,0,0,0.08)",
               }}
             />
-            <figcaption style={{ fontSize: 13, color: "#4b5563" }}>
-              {slotLabel(safeText(asset.slot_key))}
-            </figcaption>
           </figure>
         ))}
       </div>
@@ -875,6 +874,20 @@ export default function HostSummaryPublicClient() {
                       {quickReference.race ? (
                         <div>Race: {safeText(quickReference.race)}</div>
                       ) : null}
+                      {personalMotto && !isAiCompanionCard ? (
+                        <blockquote
+                          style={{
+                            margin: "10px 0 0",
+                            padding: "12px 16px",
+                            borderLeft: "4px solid #111827",
+                            background: "rgba(17,24,39,0.03)",
+                            borderRadius: 8,
+                            color: "#374151",
+                          }}
+                        >
+                          “{personalMotto}”
+                        </blockquote>
+                      ) : null}
                     </div>
                   ) : null}
                 </>
@@ -894,18 +907,7 @@ export default function HostSummaryPublicClient() {
               <div style={{ width: "100%", maxWidth: 220 }}>
                 {connectButton}
               </div>
-              <blockquote
-                style={{
-                  margin: 0,
-                  padding: "12px 16px",
-                  borderLeft: "4px solid #111827",
-                  background: "rgba(17,24,39,0.03)",
-                  borderRadius: 8,
-                  color: "#374151",
-                }}
-              >
-                “{personalMotto}”
-              </blockquote>
+              <div />
             </div>
           ) : null}
         </section>
