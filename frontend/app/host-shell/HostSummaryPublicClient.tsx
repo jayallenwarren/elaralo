@@ -751,8 +751,9 @@ export default function HostSummaryPublicClient() {
                   style={{
                     width: "100%",
                     maxWidth: 220,
-                    aspectRatio: "1 / 1",
+                    aspectRatio: "2 / 3",
                     objectFit: "cover",
+                    objectPosition: "center top",
                     borderRadius: 22,
                     border: "1px solid rgba(0,0,0,0.08)",
                   }}
@@ -762,7 +763,7 @@ export default function HostSummaryPublicClient() {
                   style={{
                     width: "100%",
                     maxWidth: 220,
-                    aspectRatio: "1 / 1",
+                    aspectRatio: "2 / 3",
                     borderRadius: 22,
                     border: "1px dashed rgba(0,0,0,0.18)",
                     display: "grid",
