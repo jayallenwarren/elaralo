@@ -702,7 +702,7 @@ export default function HostSummaryPublicClient() {
               alignItems: "start",
             }}
           >
-            <div>
+            <div style={{ display: "grid", gap: 12, justifyItems: "start" }}>
               {headshotUrl ? (
                 <img
                   src={headshotUrl}
@@ -736,6 +736,30 @@ export default function HostSummaryPublicClient() {
                   No headshot available
                 </div>
               )}
+
+              {connectHref ? (
+                <a
+                  href={connectHref}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    width: "100%",
+                    maxWidth: 220,
+                    minHeight: 44,
+                    padding: "11px 18px",
+                    borderRadius: 999,
+                    background: "#111827",
+                    color: "#fff",
+                    textDecoration: "none",
+                    fontWeight: 800,
+                    boxShadow: "0 10px 22px rgba(17,24,39,0.16)",
+                  }}
+                  aria-label={`Connect with ${displayNameForConnect || "this companion"}`}
+                >
+                  Connect
+                </a>
+              ) : null}
             </div>
             <div style={{ display: "grid", gap: 12 }}>
               <h1 style={{ margin: 0, fontSize: 42, lineHeight: 1.1 }}>
@@ -775,36 +799,6 @@ export default function HostSummaryPublicClient() {
                 ) : null}
               </div>
 
-              {connectHref ? (
-                <div
-                  style={{
-                    display: "flex",
-                    flexWrap: "wrap",
-                    gap: 10,
-                    alignItems: "center",
-                  }}
-                >
-                  <a
-                    href={connectHref}
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      minHeight: 44,
-                      padding: "11px 18px",
-                      borderRadius: 999,
-                      background: "#111827",
-                      color: "#fff",
-                      textDecoration: "none",
-                      fontWeight: 800,
-                      boxShadow: "0 10px 22px rgba(17,24,39,0.16)",
-                    }}
-                    aria-label={`Connect with ${displayNameForConnect || "this companion"}`}
-                  >
-                    Connect with {displayNameForConnect || "this companion"}
-                  </a>
-                </div>
-              ) : null}
 
               {isAiCompanionCard ? (
                 <div
