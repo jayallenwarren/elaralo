@@ -702,7 +702,15 @@ export default function HostSummaryPublicClient() {
               alignItems: "start",
             }}
           >
-            <div style={{ display: "grid", gap: 12, justifyItems: "start" }}>
+            <div
+              style={{
+                display: "grid",
+                gap: 8,
+                justifyItems: "stretch",
+                width: "100%",
+                maxWidth: 220,
+              }}
+            >
               {headshotUrl ? (
                 <img
                   src={headshotUrl}
@@ -746,14 +754,18 @@ export default function HostSummaryPublicClient() {
                     justifyContent: "center",
                     width: "100%",
                     maxWidth: 220,
-                    minHeight: 44,
-                    padding: "11px 18px",
+                    height: 34,
+                    minHeight: 0,
+                    padding: "0 14px",
+                    boxSizing: "border-box",
                     borderRadius: 999,
                     background: "#111827",
                     color: "#fff",
                     textDecoration: "none",
+                    fontSize: 14,
+                    lineHeight: 1,
                     fontWeight: 800,
-                    boxShadow: "0 10px 22px rgba(17,24,39,0.16)",
+                    boxShadow: "0 6px 14px rgba(17,24,39,0.14)",
                   }}
                   aria-label={`Connect with ${displayNameForConnect || "this companion"}`}
                 >
