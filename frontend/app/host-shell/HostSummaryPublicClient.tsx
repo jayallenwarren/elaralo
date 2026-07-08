@@ -474,6 +474,7 @@ export default function HostSummaryPublicClient() {
   const quickReference = (publicProfile.quick_reference_summary ||
     {}) as Record<string, any>;
   const approvedLabel = formatApprovedDate(payload?.version?.approved_epoch);
+  const personalMotto = safeText(publicProfile.personal_motto);
 
   const sectionStyle: React.CSSProperties = {
     border: "1px solid rgba(0,0,0,0.1)",
@@ -634,6 +635,34 @@ export default function HostSummaryPublicClient() {
     </section>
   ) : null;
 
+  const connectButton = connectHref ? (
+    <a
+      href={connectHref}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: "100%",
+        maxWidth: 220,
+        height: 24,
+        minHeight: 0,
+        padding: "0 12px",
+        boxSizing: "border-box",
+        borderRadius: 999,
+        background: "#111827",
+        color: "#fff",
+        textDecoration: "none",
+        fontSize: 13,
+        lineHeight: 1,
+        fontWeight: 800,
+        boxShadow: "0 4px 10px rgba(17,24,39,0.12)",
+      }}
+      aria-label={`Connect with ${displayNameForConnect || "this companion"}`}
+    >
+      Connect
+    </a>
+  ) : null;
+
   if (loading) {
     return (
       <main
@@ -705,7 +734,7 @@ export default function HostSummaryPublicClient() {
             <div
               style={{
                 display: "grid",
-                gap: 8,
+                gap: 4,
                 justifyItems: "stretch",
                 width: "100%",
                 maxWidth: 220,
@@ -745,33 +774,8 @@ export default function HostSummaryPublicClient() {
                 </div>
               )}
 
-              {connectHref ? (
-                <a
-                  href={connectHref}
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    width: "100%",
-                    maxWidth: 220,
-                    height: 34,
-                    minHeight: 0,
-                    padding: "0 14px",
-                    boxSizing: "border-box",
-                    borderRadius: 999,
-                    background: "#111827",
-                    color: "#fff",
-                    textDecoration: "none",
-                    fontSize: 14,
-                    lineHeight: 1,
-                    fontWeight: 800,
-                    boxShadow: "0 6px 14px rgba(17,24,39,0.14)",
-                  }}
-                  aria-label={`Connect with ${displayNameForConnect || "this companion"}`}
-                >
-                  Connect
-                </a>
-              ) : null}
+
+              {!personalMotto || isAiCompanionCard ? connectButton : null}
             </div>
             <div style={{ display: "grid", gap: 12 }}>
               <h1 style={{ margin: 0, fontSize: 42, lineHeight: 1.1 }}>
@@ -872,25 +876,37 @@ export default function HostSummaryPublicClient() {
                       ) : null}
                     </div>
                   ) : null}
-
-                  {safeText(publicProfile.personal_motto) ? (
-                    <blockquote
-                      style={{
-                        margin: 0,
-                        padding: "12px 16px",
-                        borderLeft: "4px solid #111827",
-                        background: "rgba(17,24,39,0.03)",
-                        borderRadius: 8,
-                        color: "#374151",
-                      }}
-                    >
-                      “{safeText(publicProfile.personal_motto)}”
-                    </blockquote>
-                  ) : null}
                 </>
               )}
             </div>
           </div>
+
+          {personalMotto && !isAiCompanionCard ? (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(0, 220px) minmax(0, 1fr)",
+                gap: 20,
+                alignItems: "start",
+              }}
+            >
+              <div style={{ width: "100%", maxWidth: 220 }}>
+                {connectButton}
+              </div>
+              <blockquote
+                style={{
+                  margin: 0,
+                  padding: "12px 16px",
+                  borderLeft: "4px solid #111827",
+                  background: "rgba(17,24,39,0.03)",
+                  borderRadius: 8,
+                  color: "#374151",
+                }}
+              >
+                “{personalMotto}”
+              </blockquote>
+            </div>
+          ) : null}
         </section>
 
         {gallerySection}
