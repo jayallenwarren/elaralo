@@ -15366,61 +15366,28 @@ def _stripe_paygo_process_completed_session_sync(session_obj: Dict[str, Any], ev
     return {"ok": True, "credited": True, "minutes": minutes, "identity_key": identity_key, "receipt_email": receipt_result}
 
 
-def _stripe_webhook_process_event_background(event: Dict[str, Any]) -> None:
-    """Process Stripe webhook work after the HTTP 2xx acknowledgement.
-
-    Stripe treats non-2xx responses, slow responses, dropped connections, and
-    unhandled exceptions as failed deliveries.  PayGo fulfillment must remain
-    durable, but webhook acknowledgement should not depend on receipt email,
-    local DB latency, or downstream processing.  This background worker logs all
-    processing failures and lets Stripe see a fast 2xx for any valid webhook.
-    """
-    try:
-        event_type = _stripe_paygo_clean_text(event.get("type"))
-        obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
-        if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"} and isinstance(obj, dict):
-            _perf_stage("stripe.webhook.bg_process_start", event=event_type)
-            result = _stripe_paygo_process_completed_session_sync(obj, event)
-            _perf_stage("stripe.webhook.bg_process_complete", event=event_type, result=result)
-            return
-        if event_type == "checkout.session.expired" and isinstance(obj, dict):
-            sid = _stripe_paygo_clean_text(obj.get("id"))
-            _stripe_paygo_mark_sync(sid, status="expired", raw_event=event)
-            _perf_stage("stripe.webhook.bg_expired_marked", checkout_session_id=sid)
-            return
-        _perf_stage("stripe.webhook.bg_ignored", event=event_type)
-    except Exception as e:
-        logger.exception("Stripe webhook background processing failed: %s", e)
-
-
-@app.get("/stripe/webhook")
-async def stripe_webhook_health():
-    """Lightweight health check for the Stripe webhook route."""
-    return {"ok": True, "endpoint": "/stripe/webhook", "mode": "ack_first_background_process"}
-
-
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
     raw = await request.body()
     _perf_stage("stripe.webhook.body_read", bytes=len(raw or b""))
     sig = request.headers.get("stripe-signature") or request.headers.get("Stripe-Signature") or ""
     if STRIPE_WEBHOOK_SECRET and not _stripe_verify_signature(raw, sig, STRIPE_WEBHOOK_SECRET):
-        # Invalid signatures should remain 400 so Stripe/security diagnostics are accurate.
         raise HTTPException(status_code=400, detail="Invalid Stripe signature")
     try:
         event = json.loads(raw.decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
-
     event_type = _stripe_paygo_clean_text(event.get("type"))
-    event_id = _stripe_paygo_clean_text(event.get("id"))
-    _perf_stage("stripe.webhook.ack", event=event_type, event_id=event_id)
-
-    # Acknowledge valid Stripe events immediately and process fulfillment in the
-    # background.  This prevents transient DB/email/downstream exceptions from
-    # causing Stripe delivery failures and retry storms.
-    threading.Thread(target=_stripe_webhook_process_event_background, args=(event,), daemon=True).start()
-    return {"received": True, "queued": True, "event": event_type, "event_id": event_id}
+    obj = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
+    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"} and isinstance(obj, dict):
+        _perf_stage("stripe.webhook.process_start", event=event_type)
+        result = await run_in_threadpool(_stripe_paygo_process_completed_session_sync, obj, event)
+        _perf_stage("stripe.webhook.process_complete")
+        return {"received": True, **(result if isinstance(result, dict) else {})}
+    if event_type == "checkout.session.expired" and isinstance(obj, dict):
+        sid = _stripe_paygo_clean_text(obj.get("id"))
+        await run_in_threadpool(_stripe_paygo_mark_sync, sid, status="expired", raw_event=event)
+    return {"received": True, "ignored": event_type}
 
 
 @app.get("/stripe/paygo/session-status")
@@ -17818,32 +17785,7 @@ def _host_insights_list_users_sync(brand: str, avatar: str, limit: int = 100) ->
             }
         )
 
-    # v10.0.0-alpha4: Session Insights left-pane ordering must track the
-    # same summary timeline shown in the right pane.  Usage last_seen_epoch can
-    # lag behind or point to a different activity source, which caused recent
-    # summaries to appear in the right pane without their member/visitor rising
-    # to the top of the Members / Visitors pane.  Sort primarily by the latest
-    # saved summary timestamp (newest first), with usage lastSeenEpoch only as a
-    # fallback tie-breaker for legacy rows.
-    def _host_insights_user_sort_key(item: Dict[str, Any]) -> Tuple[float, float]:
-        summary_dt = str(item.get("summaryLastSeen") or "").strip()
-        summary_epoch = 0.0
-        if summary_dt:
-            try:
-                summary_epoch = datetime.fromisoformat(summary_dt.replace("Z", "+00:00")).timestamp()
-            except Exception:
-                try:
-                    summary_epoch = datetime.strptime(summary_dt[:19], "%Y-%m-%d %H:%M:%S").timestamp()
-                except Exception:
-                    summary_epoch = 0.0
-        usage_epoch = 0.0
-        try:
-            usage_epoch = float(item.get("lastSeenEpoch") or 0.0)
-        except Exception:
-            usage_epoch = 0.0
-        return (summary_epoch, usage_epoch)
-
-    out.sort(key=_host_insights_user_sort_key, reverse=True)
+    out.sort(key=lambda item: float(item.get("lastSeenEpoch") or 0.0), reverse=True)
     return out
 
 
@@ -23552,10 +23494,14 @@ def _host_onboarding_find_existing_human_mapping_row_on_conn(
 ) -> Optional[sqlite3.Row]:
     """Find the existing Human mapping row for a host/version.
 
-    Safety rule: host_member_id alone is not enough to select a row. Historical
-    contamination put a host_member_id on an AI row, so a candidate must also be
-    explicitly Human and have the same first-name avatar base as the host profile
-    being exported.
+    Invariant: a Host/Profile Studio public-stage-name change must update the
+    existing Human companion_mappings row for the same host_member_id. It must
+    not create a second row just because the stage/public name changed and the
+    first-name avatar key is now different.
+
+    Safety rule: still never overwrite AI rows. A selectable candidate must be
+    explicitly companion_type='Human'. Historical AI-row contamination is avoided
+    by filtering on companion_type before considering host_member_id.
     """
     try:
         conn.row_factory = sqlite3.Row
@@ -23571,32 +23517,45 @@ def _host_onboarding_find_existing_human_mapping_row_on_conn(
              WHERE lower(COALESCE(brand, '')) = lower(?)
                AND lower(COALESCE(companion_type, '')) = 'human'
                AND (
-                    (? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?))
+                    (? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?))
+                 OR (? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?))
                  OR (? <> '' AND lower(COALESCE(avatar, '')) = lower(?))
-                 OR (? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?))
                )
              ORDER BY
                CASE
-                 WHEN ? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?) THEN 0
-                 WHEN ? <> '' AND lower(COALESCE(avatar, '')) = lower(?) THEN 1
-                 WHEN ? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?) THEN 2
+                 WHEN ? <> '' AND lower(COALESCE(host_member_id, '')) = lower(?) THEN 0
+                 WHEN ? <> '' AND lower(COALESCE(approved_version_id, '')) = lower(?) THEN 1
+                 WHEN ? <> '' AND lower(COALESCE(avatar, '')) = lower(?) THEN 2
                  ELSE 3
                END,
-               rowid
+               rowid DESC
              LIMIT 20
             """,
             (
                 "Elaralo",
-                version_norm, version_norm,
-                legacy_norm, legacy_norm,
                 member_norm, member_norm,
                 version_norm, version_norm,
                 legacy_norm, legacy_norm,
                 member_norm, member_norm,
+                version_norm, version_norm,
+                legacy_norm, legacy_norm,
             ),
         ).fetchall()
         if not rows:
             return None
+
+        # Primary rule for this hotfix: the host_member_id owns the Human mapping
+        # row. A public/stage-name change is an update to that row's avatar, not
+        # a request to create a new mapping. If previous releases already created
+        # multiple Human rows for this host, use the most recent rowid because it
+        # is most likely the row currently surfaced in the UI/catalog.
+        for row in rows:
+            try:
+                if member_norm and _host_onboarding_normalize_member_id(row["host_member_id"]).lower() == member_norm.lower():
+                    return row
+            except Exception:
+                pass
+
         if not expected_base:
             return rows[0]
         expected_lc = expected_base.lower()
@@ -23604,7 +23563,7 @@ def _host_onboarding_find_existing_human_mapping_row_on_conn(
             row_base = _companion_avatar_first_name(row["avatar"] if "avatar" in row.keys() else "")
             if row_base.lower() == expected_lc:
                 return row
-        return None
+        return rows[0]
     except Exception:
         return None
 
