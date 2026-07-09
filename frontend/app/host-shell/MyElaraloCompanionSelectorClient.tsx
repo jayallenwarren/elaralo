@@ -59,6 +59,12 @@ function safeText(value: any): string {
   return String(value ?? "").trim();
 }
 
+function firstNameFromDisplayName(value: any): string {
+  const text = safeText(value).replace(/\s+/g, " ");
+  if (!text) return "Companion";
+  return text.split(" ")[0] || text;
+}
+
 function safeLower(value: any): string {
   return safeText(value).toLowerCase();
 }
@@ -931,6 +937,7 @@ export default function MyElaraloCompanionSelectorClient() {
             {filteredCards.map((card) => {
               const companionKey = canonicalCompanionKeyForCard(card);
               const canOpenConnect = Boolean(companionKey);
+              const connectButtonLabel = `Connect to ${firstNameFromDisplayName(card.displayName)}`;
               const canViewSummary = Boolean(companionKey || safeText(card.summaryPublicUrl));
               const lines = [
                 card.companionType,
@@ -942,7 +949,7 @@ export default function MyElaraloCompanionSelectorClient() {
               const isHiddenCard = Boolean(card.catalogHidden);
               return (
                 <article key={card.id} style={cardStyle}>
-                  <button type="button" style={imageButtonStyle} onClick={() => openConnect(card)} title="Open in Connect">
+                  <button type="button" style={imageButtonStyle} onClick={() => openConnect(card)} title={connectButtonLabel}>
                     <img
                       src={imageUrlForCard(card)}
                       alt={card.displayName || "Companion"}
@@ -982,7 +989,7 @@ export default function MyElaraloCompanionSelectorClient() {
                           cursor: canOpenConnect ? "pointer" : "not-allowed",
                         }}
                       >
-                        Open Connect
+                        {connectButtonLabel}
                       </button>
                       <button
                         type="button"

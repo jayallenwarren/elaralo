@@ -219,6 +219,17 @@ function firstNameFromDisplayName(value: string): string {
   return text.split(" ")[0] || text;
 }
 
+function firstNameOrBlank(value: any): string {
+  const text = safeText(value).replace(/\s+/g, " ");
+  if (!text) return "";
+  return text.split(" ")[0] || text;
+}
+
+function publicGalleryLabel(asset: PublicAsset): string {
+  const label = safeText((asset as any).slot_label) || slotLabel(safeText(asset.slot_key));
+  return label || "Gallery image";
+}
+
 function isDefaultOrLogoHeadshot(url: string): boolean {
   const text = safeText(url).toLowerCase();
   if (!text) return true;
@@ -451,7 +462,7 @@ export default function HostSummaryPublicClient() {
     return url.toString();
   }, [brand, companionDisplayName, companionFirstName, companionKey, companionTypeValue, configuredConnectUrl, headshotUrl, mappingAvatar]);
 
-  const connectLabel = `Connect with ${companionFirstName}`;
+  const connectLabel = `Connect to ${companionFirstName}`;
 
   const sectionStyle: React.CSSProperties = {
     border: "1px solid rgba(0,0,0,0.1)",
@@ -467,8 +478,29 @@ export default function HostSummaryPublicClient() {
     safeText(publicProfile.generation),
   ].filter(Boolean);
 
+  const publicNameValue =
+    safeText(quickReference.public_name || publicProfile.public_display_name || publicProfile.stage_name || companionDisplayName) ||
+    companionDisplayName;
+  const realFirstNameValue =
+    firstNameOrBlank(
+      quickReference.real_name ||
+        quickReference.realName ||
+        quickReference.real_first_name ||
+        quickReference.realFirstName ||
+        publicProfile.real_name ||
+        publicProfile.realName ||
+        publicProfile.real_first_name ||
+        publicProfile.realFirstName ||
+        publicProfile.first_name ||
+        publicProfile.firstName ||
+        publicProfile.private_identity?.legal_name ||
+        publicProfile.privateIdentity?.legalName ||
+        publicNameValue,
+    ) || companionFirstName;
+
   const quickSummaryItems = [
-    displayLine("Public name", quickReference.public_name || publicProfile.public_display_name || publicProfile.stage_name),
+    displayLine("Public name", publicNameValue),
+    displayLine("Real name", realFirstNameValue),
     displayLine("Birth location", quickReference.birth_location),
     displayLine("Ethnicity", quickReference.ethnicity),
     displayLine("Race", quickReference.race),
@@ -479,35 +511,47 @@ export default function HostSummaryPublicClient() {
     .hsp-stack { display: grid; gap: 18px; }
     .hsp-section { border: 1px solid rgba(0,0,0,0.1); border-radius: 18px; background: #fff; padding: 20px; box-shadow: 0 8px 22px rgba(0,0,0,0.05); }
     .hsp-eyebrow { font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: #6b7280; }
-    .hsp-hero-grid { display: grid; grid-template-columns: minmax(0, 320px) minmax(0, 1fr); gap: 28px; align-items: start; }
-    .hsp-photo { width: 100%; max-width: 320px; aspect-ratio: 4 / 5; object-fit: cover; border-radius: 22px; border: 1px solid rgba(0,0,0,0.08); display: block; }
-    .hsp-photo-placeholder { width: 100%; max-width: 320px; aspect-ratio: 4 / 5; border-radius: 22px; border: 1px dashed rgba(0,0,0,0.18); display: grid; place-items: center; color: #6b7280; background: #f8fafc; }
-    .hsp-detail { display: grid; gap: 16px; }
+    .hsp-hero-grid { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 28px; align-items: start; }
+    .hsp-media-column, .hsp-detail { display: grid; gap: 16px; align-content: start; }
+    .hsp-photo { width: 100%; max-width: 340px; aspect-ratio: 4 / 5; object-fit: cover; border-radius: 22px; border: 1px solid rgba(0,0,0,0.08); display: block; }
+    .hsp-photo-placeholder { width: 100%; max-width: 340px; aspect-ratio: 4 / 5; border-radius: 22px; border: 1px dashed rgba(0,0,0,0.18); display: grid; place-items: center; color: #6b7280; background: #f8fafc; }
     .hsp-title { margin: 0; font-size: clamp(42px, 7vw, 74px); line-height: .98; letter-spacing: -0.04em; }
     .hsp-chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
     .hsp-chip { padding: 8px 12px; border-radius: 999px; background: rgba(17,24,39,0.06); font-size: 14px; color: #374151; }
     .hsp-cta { display: inline-flex; align-items: center; justify-content: center; width: fit-content; min-height: 46px; padding: 12px 18px; border-radius: 999px; background: #111827; color: #fff; text-decoration: none; font-weight: 800; box-shadow: 0 10px 22px rgba(17,24,39,0.18); }
     .hsp-cta:hover { background: #0f172a; }
-    .hsp-summary-card, .hsp-quote-card { border: 1px solid rgba(17,24,39,0.08); border-radius: 16px; background: rgba(17,24,39,0.025); padding: 16px; }
+    .hsp-summary-card, .hsp-quote-card, .hsp-gallery-card { border: 1px solid rgba(17,24,39,0.08); border-radius: 16px; background: rgba(17,24,39,0.025); padding: 16px; }
     .hsp-summary-title { font-weight: 800; font-size: 20px; margin: 0 0 12px; }
     .hsp-summary-list { display: grid; gap: 10px; }
     .hsp-summary-item { display: grid; gap: 3px; line-height: 1.45; color: #374151; }
     .hsp-summary-label { font-size: 13px; font-weight: 800; color: #111827; }
-    .hsp-quote-card { border-left: 5px solid #111827; color: #374151; font-size: 18px; line-height: 1.55; }
+    .hsp-quote-card { border-left: 5px solid #111827; color: #374151; font-size: 17px; line-height: 1.55; }
+    .hsp-gallery-title { font-weight: 800; font-size: 20px; margin: 0 0 12px; }
+    .hsp-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 12px; }
+    .hsp-gallery-thumb { margin: 0; min-width: 0; display: grid; gap: 6px; }
+    .hsp-gallery-frame { width: 100%; aspect-ratio: 4 / 5; border-radius: 14px; overflow: hidden; background: #eef2f7; border: 1px solid rgba(17,24,39,0.08); }
+    .hsp-gallery-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .hsp-gallery-caption { font-size: 12px; line-height: 1.25; color: #4b5563; min-height: 2.5em; }
+    .hsp-mobile-only { display: none; }
+    .hsp-desktop-only { display: block; }
+    .hsp-under-photo { display: grid; gap: 16px; }
     .hsp-sticky-cta { display: none; }
     @media (max-width: 760px) {
       .hsp-main { margin: 14px auto 96px; padding: 0 14px; }
       .hsp-section { padding: 18px; border-radius: 20px; box-shadow: 0 10px 28px rgba(15,23,42,0.06); }
       .hsp-eyebrow { padding-top: max(8px, env(safe-area-inset-top)); }
       .hsp-hero-grid { grid-template-columns: 1fr; gap: 18px; }
+      .hsp-media-column, .hsp-detail { gap: 14px; }
       .hsp-photo, .hsp-photo-placeholder { max-width: none; width: 100%; aspect-ratio: 4 / 5; border-radius: 22px; }
-      .hsp-detail { gap: 14px; }
+      .hsp-desktop-only { display: none; }
+      .hsp-mobile-only { display: grid; gap: 14px; }
       .hsp-title { font-size: clamp(40px, 14vw, 60px); line-height: 1; }
       .hsp-chip { font-size: 13px; padding: 7px 11px; }
       .hsp-cta { width: 100%; min-height: 50px; }
       .hsp-summary-title { font-size: 19px; }
-      .hsp-summary-card, .hsp-quote-card { padding: 15px; border-radius: 16px; }
+      .hsp-summary-card, .hsp-quote-card, .hsp-gallery-card { padding: 15px; border-radius: 16px; }
       .hsp-quote-card { font-size: 16px; }
+      .hsp-gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .hsp-sticky-cta { display: block; position: fixed; z-index: 50; left: 0; right: 0; bottom: 0; padding: 12px 14px calc(12px + env(safe-area-inset-bottom)); background: rgba(255,255,255,0.94); backdrop-filter: blur(12px); border-top: 1px solid rgba(17,24,39,0.1); box-shadow: 0 -10px 26px rgba(15,23,42,0.08); }
       .hsp-sticky-cta .hsp-cta { width: 100%; }
     }
@@ -540,7 +584,7 @@ export default function HostSummaryPublicClient() {
           <section className="hsp-section hsp-stack">
             <div className="hsp-eyebrow">{isAiCompanionCard ? "Companion Card" : "Summary Public Page"}</div>
             <div className="hsp-hero-grid">
-              <div>
+              <div className="hsp-media-column">
                 {headshotUrl ? (
                   <img
                     src={headshotUrl}
@@ -550,6 +594,28 @@ export default function HostSummaryPublicClient() {
                 ) : (
                   <div className="hsp-photo-placeholder">No headshot available</div>
                 )}
+
+                <div className="hsp-under-photo hsp-desktop-only">
+                  {isAiCompanionCard ? null : quickSummaryItems.length ? (
+                    <div className="hsp-summary-card">
+                      <h2 className="hsp-summary-title">Quick Summary</h2>
+                      <div className="hsp-summary-list">
+                        {quickSummaryItems.map((item) => (
+                          <div key={`desktop-${item.label}-${item.value}`} className="hsp-summary-item">
+                            <span className="hsp-summary-label">{item.label}</span>
+                            <span>{item.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {!isAiCompanionCard && safeText(publicProfile.personal_motto) ? (
+                    <blockquote className="hsp-quote-card">
+                      “{safeText(publicProfile.personal_motto)}”
+                    </blockquote>
+                  ) : null}
+                </div>
               </div>
 
               <div className="hsp-detail">
@@ -568,23 +634,14 @@ export default function HostSummaryPublicClient() {
                   </a>
                 ) : null}
 
-                {isAiCompanionCard ? (
-                  <div className="hsp-summary-card">
-                    <h2 className="hsp-summary-title">Companion Details</h2>
-                    <div className="hsp-summary-list">
-                      {safeText(publicProfile.gender) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Gender</span><span>{safeText(publicProfile.gender)}</span></div> : null}
-                      {safeText(publicProfile.ethnicity) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Ethnicity</span><span>{safeText(publicProfile.ethnicity)}</span></div> : null}
-                      {safeText(publicProfile.generation) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Generation</span><span>{safeText(publicProfile.generation)}</span></div> : null}
-                    </div>
-                  </div>
-                ) : (
-                  <>
+                {!isAiCompanionCard ? (
+                  <div className="hsp-mobile-only">
                     {quickSummaryItems.length ? (
                       <div className="hsp-summary-card">
                         <h2 className="hsp-summary-title">Quick Summary</h2>
                         <div className="hsp-summary-list">
                           {quickSummaryItems.map((item) => (
-                            <div key={`${item.label}-${item.value}`} className="hsp-summary-item">
+                            <div key={`mobile-${item.label}-${item.value}`} className="hsp-summary-item">
                               <span className="hsp-summary-label">{item.label}</span>
                               <span>{item.value}</span>
                             </div>
@@ -598,8 +655,33 @@ export default function HostSummaryPublicClient() {
                         “{safeText(publicProfile.personal_motto)}”
                       </blockquote>
                     ) : null}
-                  </>
-                )}
+                  </div>
+                ) : null}
+
+                {isAiCompanionCard ? (
+                  <div className="hsp-summary-card">
+                    <h2 className="hsp-summary-title">Companion Details</h2>
+                    <div className="hsp-summary-list">
+                      {safeText(publicProfile.gender) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Gender</span><span>{safeText(publicProfile.gender)}</span></div> : null}
+                      {safeText(publicProfile.ethnicity) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Ethnicity</span><span>{safeText(publicProfile.ethnicity)}</span></div> : null}
+                      {safeText(publicProfile.generation) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Generation</span><span>{safeText(publicProfile.generation)}</span></div> : null}
+                    </div>
+                  </div>
+                ) : galleryAssets.length ? (
+                  <div className="hsp-gallery-card">
+                    <h2 className="hsp-gallery-title">Public Gallery</h2>
+                    <div className="hsp-gallery-grid">
+                      {galleryAssets.map((asset, idx) => (
+                        <figure key={`${safeText(asset.asset_id || asset.url || idx)}`} className="hsp-gallery-thumb">
+                          <div className="hsp-gallery-frame">
+                            <img src={safeText(asset.url)} alt={publicGalleryLabel(asset)} />
+                          </div>
+                          <figcaption className="hsp-gallery-caption">{publicGalleryLabel(asset)}</figcaption>
+                        </figure>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </div>
           </section>
@@ -653,9 +735,9 @@ export default function HostSummaryPublicClient() {
             </section>
           ) : null}
 
-          {galleryAssets.length ? (
+          {isAiCompanionCard && galleryAssets.length ? (
             <section style={sectionStyle}>
-              <h2 style={{ marginTop: 0 }}>{isAiCompanionCard ? "Additional Photos" : "Public Gallery"}</h2>
+              <h2 style={{ marginTop: 0 }}>Additional Photos</h2>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 14 }}>
                 {galleryAssets.map((asset, idx) => (
                   <figure key={`${safeText(asset.asset_id || asset.url || idx)}`} style={{ margin: 0, display: "grid", gap: 8 }}>
