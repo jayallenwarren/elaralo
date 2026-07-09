@@ -937,7 +937,7 @@ export default function MyElaraloCompanionSelectorClient() {
             {filteredCards.map((card) => {
               const companionKey = canonicalCompanionKeyForCard(card);
               const canOpenConnect = Boolean(companionKey);
-              const connectButtonLabel = `Connect to ${firstNameFromDisplayName(card.displayName)}`;
+              const connectButtonLabel = `Connect with ${firstNameFromDisplayName(card.displayName)}`;
               const canViewSummary = Boolean(companionKey || safeText(card.summaryPublicUrl));
               const lines = [
                 card.companionType,

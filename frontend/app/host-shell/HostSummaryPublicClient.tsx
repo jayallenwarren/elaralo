@@ -462,7 +462,7 @@ export default function HostSummaryPublicClient() {
     return url.toString();
   }, [brand, companionDisplayName, companionFirstName, companionKey, companionTypeValue, configuredConnectUrl, headshotUrl, mappingAvatar]);
 
-  const connectLabel = `Connect to ${companionFirstName}`;
+  const connectLabel = `Connect with ${companionFirstName}`;
 
   const sectionStyle: React.CSSProperties = {
     border: "1px solid rgba(0,0,0,0.1)",
@@ -481,22 +481,34 @@ export default function HostSummaryPublicClient() {
   const publicNameValue =
     safeText(quickReference.public_name || publicProfile.public_display_name || publicProfile.stage_name || companionDisplayName) ||
     companionDisplayName;
-  const realFirstNameValue =
-    firstNameOrBlank(
+  const hostProfileRealNameSource = safeText(
+    publicProfile.real_first_name ||
+      publicProfile.realFirstName ||
+      publicProfile.real_name ||
+      publicProfile.realName ||
+      publicPage.real_first_name ||
+      publicPage.realFirstName ||
+      publicPage.real_name ||
+      publicPage.realName ||
+      publicProfile.host_real_name_private ||
+      publicProfile.hostRealNamePrivate ||
+      publicProfile.private_profile?.legal_name ||
+      publicProfile.privateProfile?.legalName ||
+      publicProfile.private_identity?.legal_name ||
+      publicProfile.privateIdentity?.legalName ||
+      publicProfile.ai_profile?.host_real_name_private ||
+      publicProfile.aiProfile?.hostRealNamePrivate ||
+      publicProfile.ai_profile?.private_identity?.legal_name ||
+      publicProfile.aiProfile?.privateIdentity?.legalName ||
+      publicProfile.first_name ||
+      publicProfile.firstName ||
+      quickReference.real_first_name ||
+      quickReference.realFirstName ||
       quickReference.real_name ||
-        quickReference.realName ||
-        quickReference.real_first_name ||
-        quickReference.realFirstName ||
-        publicProfile.real_name ||
-        publicProfile.realName ||
-        publicProfile.real_first_name ||
-        publicProfile.realFirstName ||
-        publicProfile.first_name ||
-        publicProfile.firstName ||
-        publicProfile.private_identity?.legal_name ||
-        publicProfile.privateIdentity?.legalName ||
-        publicNameValue,
-    ) || companionFirstName;
+      quickReference.realName ||
+      "",
+  );
+  const realFirstNameValue = firstNameOrBlank(hostProfileRealNameSource) || companionFirstName;
 
   const quickSummaryItems = [
     displayLine("Public name", publicNameValue),
@@ -528,10 +540,9 @@ export default function HostSummaryPublicClient() {
     .hsp-quote-card { border-left: 5px solid #111827; color: #374151; font-size: 17px; line-height: 1.55; }
     .hsp-gallery-title { font-weight: 800; font-size: 20px; margin: 0 0 12px; }
     .hsp-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 12px; }
-    .hsp-gallery-thumb { margin: 0; min-width: 0; display: grid; gap: 6px; }
+    .hsp-gallery-thumb { margin: 0; min-width: 0; display: block; }
     .hsp-gallery-frame { width: 100%; aspect-ratio: 4 / 5; border-radius: 14px; overflow: hidden; background: #eef2f7; border: 1px solid rgba(17,24,39,0.08); }
     .hsp-gallery-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .hsp-gallery-caption { font-size: 12px; line-height: 1.25; color: #4b5563; min-height: 2.5em; }
     .hsp-mobile-only { display: none; }
     .hsp-desktop-only { display: block; }
     .hsp-under-photo { display: grid; gap: 16px; }
@@ -610,11 +621,6 @@ export default function HostSummaryPublicClient() {
                     </div>
                   ) : null}
 
-                  {!isAiCompanionCard && safeText(publicProfile.personal_motto) ? (
-                    <blockquote className="hsp-quote-card">
-                      “{safeText(publicProfile.personal_motto)}”
-                    </blockquote>
-                  ) : null}
                 </div>
               </div>
 
@@ -676,11 +682,16 @@ export default function HostSummaryPublicClient() {
                           <div className="hsp-gallery-frame">
                             <img src={safeText(asset.url)} alt={publicGalleryLabel(asset)} />
                           </div>
-                          <figcaption className="hsp-gallery-caption">{publicGalleryLabel(asset)}</figcaption>
                         </figure>
                       ))}
                     </div>
                   </div>
+                ) : null}
+
+                {!isAiCompanionCard && safeText(publicProfile.personal_motto) ? (
+                  <blockquote className="hsp-quote-card hsp-desktop-only">
+                    “{safeText(publicProfile.personal_motto)}”
+                  </blockquote>
                 ) : null}
               </div>
             </div>
