@@ -42,14 +42,7 @@ type PublicVersionPayload = {
 const DEFAULT_AVATAR = "/elaralo-logo.png";
 const HEADSHOT_DIR = "/companion/headshot";
 const REBRANDING_PUBLIC_DIR = "/rebranding";
-const API_BASE = String(process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(
-  /\/+$/,
-  "",
-);
-const APP_BASE = String(process.env.NEXT_PUBLIC_APP_BASE_URL || "").replace(
-  /\/+$/,
-  "",
-);
+const API_BASE = String(process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
 
 function safeText(value: any): string {
   return String(value ?? "").trim();
@@ -58,17 +51,14 @@ function safeText(value: any): string {
 function queryParam(name: string): string {
   if (typeof window === "undefined") return "";
   try {
-    return safeText(
-      new URLSearchParams(window.location.search || "").get(name),
-    );
+    return safeText(new URLSearchParams(window.location.search || "").get(name));
   } catch {
     return "";
   }
 }
 
 function listFromLooseValue(value: any): string[] {
-  if (Array.isArray(value))
-    return value.map((x) => safeText(x)).filter(Boolean);
+  if (Array.isArray(value)) return value.map((x) => safeText(x)).filter(Boolean);
   const text = safeText(value);
   return text
     ? text
@@ -89,15 +79,8 @@ function formatApprovedDate(epoch: any): string {
 }
 
 function educationLine(entry: PublicEducationEntry): string {
-  const degreeAndField = [
-    safeText(entry.degree),
-    safeText(entry.field_of_study),
-  ]
-    .filter(Boolean)
-    .join(" in ");
-  const left = [degreeAndField, safeText(entry.institution)]
-    .filter(Boolean)
-    .join(" — ");
+  const degreeAndField = [safeText(entry.degree), safeText(entry.field_of_study)].filter(Boolean).join(" in ");
+  const left = [degreeAndField, safeText(entry.institution)].filter(Boolean).join(" — ");
   const withYear = safeText(entry.graduation_year)
     ? left
       ? `${left} (${safeText(entry.graduation_year)})`
@@ -134,47 +117,10 @@ function joinUrlPrefix(prefix: string, path: string): string {
   return pre + p;
 }
 
-function resolveButtonUrl(rawTarget: string, fallbackPath: string): URL | null {
-  if (typeof window === "undefined") return null;
-  const target = safeText(rawTarget) || fallbackPath;
-  if (!target) return null;
-  const base = safeText(APP_BASE) || window.location.origin;
-  try {
-    return new URL(target, base);
-  } catch {
-    try {
-      return new URL(fallbackPath, base);
-    } catch {
-      return null;
-    }
-  }
-}
-
-function companionKeyFromDisplayName(value: any): string {
-  return safeText(value)
-    .replace(/\s+/g, "-")
-    .replace(/[^A-Za-z0-9_-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
-function isDefaultOrLogoHeadshot(value: any): boolean {
-  const raw = safeText(value);
-  if (!raw) return false;
-  const lower = raw.toLowerCase();
-  return (
-    lower === DEFAULT_AVATAR.toLowerCase() ||
-    /(^|\/)elaralo-logo\.(png|jpg|jpeg|webp)(\?|#|$)/i.test(lower)
-  );
-}
-
 const APP_BASE_PATH = getAppBasePathFromAsset(DEFAULT_AVATAR);
 
 function stripExt(s: string) {
-  let out = String(s || "")
-    .trim()
-    .split("?", 1)[0]
-    .split("#", 1)[0];
+  let out = String(s || "").trim().split("?", 1)[0].split("#", 1)[0];
   while (true) {
     const next = out.replace(/\.(png|jpg|jpeg|webp)$/i, "");
     if (next === out) break;
@@ -185,16 +131,11 @@ function stripExt(s: string) {
 
 function stripTrailingUuid(raw: string): string {
   const s = String(raw || "").trim();
-  return s.replace(
-    /-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
-    "",
-  );
+  return s.replace(/-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, "");
 }
 
 function normalizeKeyForFile(raw: string) {
-  return String(raw || "")
-    .trim()
-    .replace(/\s+/g, "-");
+  return String(raw || "").trim().replace(/\s+/g, "-");
 }
 
 function titleCaseToken(token: string): string {
@@ -215,20 +156,10 @@ function toTitleCaseHyphenated(s: string): string {
 }
 
 function buildAvatarCandidates(companionKeyOrName: string, brand?: string) {
-  const raw = stripExt(
-    String(companionKeyOrName || "")
-      .split("/")
-      .pop() || "",
-  );
+  const raw = stripExt(String(companionKeyOrName || "").split("/").pop() || "");
   if (!raw) return [DEFAULT_AVATAR];
 
-  const baseInputs = Array.from(
-    new Set(
-      [raw, stripTrailingUuid(raw)]
-        .map((v) => String(v || "").trim())
-        .filter(Boolean),
-    ),
-  );
+  const baseInputs = Array.from(new Set([raw, stripTrailingUuid(raw)].map((v) => String(v || "").trim()).filter(Boolean)));
   const encVariants: string[] = [];
   const seenEnc = new Set<string>();
 
@@ -249,24 +180,12 @@ function buildAvatarCandidates(companionKeyOrName: string, brand?: string) {
 
   const slug = normalizeRebrandingSlug(brand || "");
   const slugEnc = slug ? encodeURIComponent(slug) : "";
-  const exts = [
-    "jpeg",
-    "JPEG",
-    "jpg",
-    "JPG",
-    "png",
-    "PNG",
-    "webp",
-    "WEBP",
-  ] as const;
+  const exts = ["jpeg", "JPEG", "jpg", "JPG", "png", "PNG", "webp", "WEBP"] as const;
   const candidates: string[] = [];
 
   for (const enc of encVariants) {
     if (slugEnc && slug !== "elaralo") {
-      const rebrandBase = joinUrlPrefix(
-        APP_BASE_PATH,
-        `${REBRANDING_PUBLIC_DIR}/${slugEnc}${HEADSHOT_DIR}/${enc}`,
-      );
+      const rebrandBase = joinUrlPrefix(APP_BASE_PATH, `${REBRANDING_PUBLIC_DIR}/${slugEnc}${HEADSHOT_DIR}/${enc}`);
       candidates.push(rebrandBase);
       for (const ext of exts) candidates.push(`${rebrandBase}.${ext}`);
     }
@@ -294,6 +213,53 @@ function pickFirstLoadableImage(urls: string[]): Promise<string> {
   });
 }
 
+function firstNameFromDisplayName(value: string): string {
+  const text = safeText(value).replace(/\s+/g, " ");
+  if (!text) return "Companion";
+  return text.split(" ")[0] || text;
+}
+
+function isDefaultOrLogoHeadshot(url: string): boolean {
+  const text = safeText(url).toLowerCase();
+  if (!text) return true;
+  return text.endsWith("/elaralo-logo.png") || text === "elaralo-logo.png" || text === DEFAULT_AVATAR.toLowerCase();
+}
+
+function resolveButtonUrl(configuredUrl: string, fallbackPath: string): URL | null {
+  if (typeof window === "undefined") return null;
+  const raw = safeText(configuredUrl);
+  try {
+    if (raw) return new URL(raw, window.location.origin);
+    return new URL(fallbackPath || "/", window.location.origin);
+  } catch {
+    try {
+      return new URL("/", window.location.origin);
+    } catch {
+      return null;
+    }
+  }
+}
+
+function compactApprovedDate(epoch: any): string {
+  const value = Number(epoch || 0);
+  if (!value) return "";
+  try {
+    return new Date(value * 1000).toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+    });
+  } catch {
+    return "";
+  }
+}
+
+function displayLine(label: string, value: any): { label: string; value: string } | null {
+  const v = safeText(value);
+  if (!v) return null;
+  return { label, value: v };
+}
+
 export default function HostSummaryPublicClient() {
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string>("");
@@ -303,15 +269,8 @@ export default function HostSummaryPublicClient() {
   const versionId = queryParam("versionId") || queryParam("version_id");
   const memberId = queryParam("memberId") || queryParam("member_id");
   const brand = queryParam("brand") || queryParam("brandId") || "Elaralo";
-  const avatar =
-    queryParam("avatar") ||
-    queryParam("companion") ||
-    queryParam("companionKey") ||
-    queryParam("companion_key");
-  const headshot =
-    queryParam("headshot") ||
-    queryParam("headshotFile") ||
-    queryParam("headshot_file");
+  const avatar = queryParam("avatar") || queryParam("companion") || queryParam("companionKey") || queryParam("companion_key");
+  const headshot = queryParam("headshot") || queryParam("headshotFile") || queryParam("headshot_file");
 
   useEffect(() => {
     let cancelled = false;
@@ -323,9 +282,7 @@ export default function HostSummaryPublicClient() {
         return;
       }
       if (!versionId && !memberId && !avatar && !headshot) {
-        setError(
-          "A public summary link requires versionId, memberId, avatar, or headshot in the URL.",
-        );
+        setError("A public summary link requires versionId, memberId, avatar, or headshot in the URL.");
         setLoading(false);
         return;
       }
@@ -341,28 +298,19 @@ export default function HostSummaryPublicClient() {
         if (avatar) qs.set("avatar", avatar);
         if (headshot) qs.set("headshot", headshot);
 
-        const res = await fetch(
-          `${API_BASE}/host-onboarding/public/summary?${qs.toString()}`,
-          {
-            method: "GET",
-            headers: { Accept: "application/json" },
-          },
-        );
-        const data = (await res
-          .json()
-          .catch(() => ({}) as any)) as PublicVersionPayload;
+        const res = await fetch(`${API_BASE}/host-onboarding/public/summary?${qs.toString()}`, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        const data = (await res.json().catch(() => ({} as any))) as PublicVersionPayload;
         if (!res.ok || !data?.public_profile) {
-          throw new Error(
-            String(data?.detail || data?.message || `HTTP ${res.status}`),
-          );
+          throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
         }
         if (cancelled) return;
         setPayload(data);
       } catch (err: any) {
         if (cancelled) return;
-        setError(
-          String(err?.message || "Unable to load the public summary page."),
-        );
+        setError(String(err?.message || "Unable to load the public summary page."));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -377,38 +325,13 @@ export default function HostSummaryPublicClient() {
   const publicProfile = payload?.public_profile || {};
   const publicPage = payload?.public_page || {};
   const isAiCompanionCard = useMemo(() => {
-    const cardType = safeText(
-      publicPage.card_type ||
-        publicProfile.summary_mode ||
-        publicProfile.card_type,
-    ).toLowerCase();
-    const companionType = safeText(
-      publicProfile.companion_type || publicPage.companion_type,
-    ).toLowerCase();
-    return (
-      cardType === "ai_companion" ||
-      cardType === "ai_companion_card" ||
-      companionType === "ai"
-    );
-  }, [
-    publicPage.card_type,
-    publicPage.companion_type,
-    publicProfile.card_type,
-    publicProfile.companion_type,
-    publicProfile.summary_mode,
-  ]);
+    const cardType = safeText(publicPage.card_type || publicProfile.summary_mode || publicProfile.card_type).toLowerCase();
+    const companionType = safeText(publicProfile.companion_type || publicPage.companion_type).toLowerCase();
+    return cardType === "ai_companion" || cardType === "ai_companion_card" || companionType === "ai";
+  }, [publicPage.card_type, publicPage.companion_type, publicProfile.card_type, publicProfile.companion_type, publicProfile.summary_mode]);
 
-  const directHeadshotUrl = safeText(
-    publicPage.headshot_asset?.url || publicProfile.headshot_asset?.url || "",
-  );
-  const avatarKey = safeText(
-    publicProfile.avatar ||
-      avatar ||
-      headshot ||
-      publicPage.headshot_asset?.file_name ||
-      publicProfile.headshot_asset?.file_name ||
-      "",
-  );
+  const directHeadshotUrl = safeText(publicPage.headshot_asset?.url || publicProfile.headshot_asset?.url || "");
+  const avatarKey = safeText(publicProfile.avatar || avatar || headshot || publicPage.headshot_asset?.file_name || publicProfile.headshot_asset?.file_name || "");
 
   useEffect(() => {
     let cancelled = false;
@@ -425,11 +348,8 @@ export default function HostSummaryPublicClient() {
         setResolvedHeadshot("");
         return;
       }
-      const picked = await pickFirstLoadableImage(
-        buildAvatarCandidates(avatarKey, brand),
-      );
-      if (!cancelled)
-        setResolvedHeadshot(picked && picked !== DEFAULT_AVATAR ? picked : "");
+      const picked = await pickFirstLoadableImage(buildAvatarCandidates(avatarKey, brand));
+      if (!cancelled) setResolvedHeadshot(picked && picked !== DEFAULT_AVATAR ? picked : "");
     }
     void resolveImage();
     return () => {
@@ -437,16 +357,15 @@ export default function HostSummaryPublicClient() {
     };
   }, [avatarKey, brand, directHeadshotUrl, isAiCompanionCard]);
 
-  const headshotUrl = isAiCompanionCard
-    ? resolvedHeadshot || directHeadshotUrl
-    : directHeadshotUrl;
+  const headshotUrl = isAiCompanionCard ? (resolvedHeadshot || directHeadshotUrl) : directHeadshotUrl;
   const galleryAssets = useMemo(
     () =>
-      (Array.isArray(publicPage.gallery_assets)
-        ? publicPage.gallery_assets
-        : Array.isArray(publicProfile.gallery_assets)
-          ? publicProfile.gallery_assets
-          : []
+      (
+        Array.isArray(publicPage.gallery_assets)
+          ? publicPage.gallery_assets
+          : Array.isArray(publicProfile.gallery_assets)
+            ? publicProfile.gallery_assets
+            : []
       ).filter((asset: any) => safeText(asset?.url)),
     [publicPage.gallery_assets, publicProfile.gallery_assets],
   ) as PublicAsset[];
@@ -457,24 +376,82 @@ export default function HostSummaryPublicClient() {
       : Array.isArray(publicProfile.education_entries)
         ? publicProfile.education_entries
         : [];
-    const normalized = raw
-      .map((entry: any) => educationLine(entry || {}))
-      .filter(Boolean);
+    const normalized = raw.map((entry: any) => educationLine(entry || {})).filter(Boolean);
     if (normalized.length) return normalized;
-    return listFromLooseValue(
-      publicPage.education_text || publicProfile.education,
-    );
-  }, [
-    publicPage.education_entries,
-    publicPage.education_text,
-    publicProfile.education,
-    publicProfile.education_entries,
-  ]);
+    return listFromLooseValue(publicPage.education_text || publicProfile.education);
+  }, [publicPage.education_entries, publicPage.education_text, publicProfile.education, publicProfile.education_entries]);
 
-  const quickReference = (publicProfile.quick_reference_summary ||
-    {}) as Record<string, any>;
+  const quickReference = (publicProfile.quick_reference_summary || {}) as Record<string, any>;
   const approvedLabel = formatApprovedDate(payload?.version?.approved_epoch);
-  const personalMotto = safeText(publicProfile.personal_motto);
+  const approvedMobileLabel = compactApprovedDate(payload?.version?.approved_epoch);
+  const companionDisplayName = safeText(publicProfile.public_display_name || publicProfile.stage_name || publicProfile.avatar || avatar || "Companion profile");
+  const companionFirstName = firstNameFromDisplayName(companionDisplayName);
+  const companionTypeValue = safeText(publicProfile.companion_type || publicPage.companion_type || (isAiCompanionCard ? "AI" : "Human"));
+  const mappingAvatar = safeText(
+    publicProfile.mapping_avatar ||
+      publicProfile.mappingAvatar ||
+      publicPage.mapping_avatar ||
+      publicPage.mappingAvatar ||
+      publicProfile.avatar ||
+      publicPage.avatar ||
+      avatar ||
+      companionFirstName,
+  );
+  const companionKey = safeText(
+    publicProfile.companion_key ||
+      publicProfile.companionKey ||
+      publicPage.companion_key ||
+      publicPage.companionKey ||
+      avatar ||
+      mappingAvatar,
+  );
+  const configuredConnectUrl = safeText((process.env.NEXT_PUBLIC_CONNECT_URL as any) || (process.env.NEXT_PUBLIC_CONNECT_BASE_URL as any));
+  const connectHref = useMemo(() => {
+    const url = resolveButtonUrl(configuredConnectUrl, "/");
+    if (!url) return "";
+    const resolvedBrand = safeText(brand) || "Elaralo";
+    const displayName = companionDisplayName;
+    const lookupAvatar = mappingAvatar || companionKey || companionFirstName;
+    const key = companionKey || lookupAvatar;
+
+    url.searchParams.set("source", "summary-public");
+    url.searchParams.set("loggedIn", "0");
+    url.searchParams.set("logged_in", "0");
+    url.searchParams.set("brand", resolvedBrand);
+    url.searchParams.set("rebranding", resolvedBrand);
+    if (lookupAvatar) {
+      url.searchParams.set("avatar", lookupAvatar);
+      url.searchParams.set("avatarName", lookupAvatar);
+      url.searchParams.set("avatar_name", lookupAvatar);
+      url.searchParams.set("mappingAvatar", lookupAvatar);
+      url.searchParams.set("mapping_avatar", lookupAvatar);
+      url.searchParams.set("sqlAvatar", lookupAvatar);
+      url.searchParams.set("sql_avatar", lookupAvatar);
+      url.searchParams.set("companion", lookupAvatar);
+      url.searchParams.set("companionName", lookupAvatar);
+      url.searchParams.set("companion_name", lookupAvatar);
+    }
+    if (key) {
+      url.searchParams.set("companionKey", key);
+      url.searchParams.set("companion_key", key);
+    }
+    if (displayName) {
+      url.searchParams.set("companionDisplayName", displayName);
+      url.searchParams.set("companion_display_name", displayName);
+    }
+    if (companionTypeValue) url.searchParams.set("companionType", companionTypeValue);
+    if (headshotUrl && !isDefaultOrLogoHeadshot(headshotUrl)) {
+      url.searchParams.set("headshotUrl", headshotUrl);
+      url.searchParams.set("headshot_url", headshotUrl);
+      url.searchParams.set("imageUrl", headshotUrl);
+      url.searchParams.set("image_url", headshotUrl);
+      url.searchParams.set("photoUrl", headshotUrl);
+      url.searchParams.set("photo_url", headshotUrl);
+    }
+    return url.toString();
+  }, [brand, companionDisplayName, companionFirstName, companionKey, companionTypeValue, configuredConnectUrl, headshotUrl, mappingAvatar]);
+
+  const connectLabel = `Connect with ${companionFirstName}`;
 
   const sectionStyle: React.CSSProperties = {
     border: "1px solid rgba(0,0,0,0.1)",
@@ -485,214 +462,70 @@ export default function HostSummaryPublicClient() {
   };
 
   const chips = [
-    safeText(
-      publicProfile.companion_type || (isAiCompanionCard ? "AI Companion" : ""),
-    ),
     safeText(publicProfile.gender),
     safeText(publicProfile.ethnicity),
     safeText(publicProfile.generation),
   ].filter(Boolean);
 
-  const displayNameForConnect = safeText(
-    publicProfile.public_display_name ||
-      publicProfile.stage_name ||
-      quickReference.public_name ||
-      "Companion",
-  );
-  const connectCompanionKey =
-    safeText(
-      queryParam("avatar") ||
-        queryParam("companion") ||
-        queryParam("companionKey") ||
-        queryParam("companion_key") ||
-        publicProfile.companion_key ||
-        publicProfile.companionKey ||
-        publicProfile.selected_companion_key ||
-        publicProfile.selectedCompanionKey ||
-        publicProfile.avatar ||
-        publicProfile.avatar_key ||
-        publicProfile.avatarKey ||
-        publicPage.companion_key ||
-        publicPage.companionKey ||
-        publicPage.avatar,
-    ) || companionKeyFromDisplayName(displayNameForConnect);
-  const connectMappingAvatar =
-    safeText(
-      publicProfile.mapping_avatar ||
-        publicProfile.mappingAvatar ||
-        publicProfile.sql_avatar ||
-        publicProfile.sqlAvatar ||
-        publicProfile.avatar ||
-        publicPage.avatar,
-    ) || connectCompanionKey;
-  const connectCompanionType = safeText(
-    publicProfile.companion_type ||
-      publicPage.companion_type ||
-      (isAiCompanionCard ? "AI" : "Human"),
-  );
-  const connectHeadshotUrl = safeText(
-    directHeadshotUrl ||
-      headshotUrl ||
-      publicPage.headshot_asset?.url ||
-      publicProfile.headshot_asset?.url ||
-      "",
-  );
-  const connectHref = useMemo(() => {
-    if (!connectCompanionKey && !connectMappingAvatar) return "";
-    const configuredConnectUrl = safeText(
-      process.env.NEXT_PUBLIC_CONNECT_URL ||
-        process.env.NEXT_PUBLIC_CONNECT_BASE_URL,
-    );
-    const url = resolveButtonUrl(configuredConnectUrl, "/");
-    if (!url) return "";
-    const mappingAvatar = connectMappingAvatar || connectCompanionKey;
-    const companionKey = connectCompanionKey || mappingAvatar;
-    url.searchParams.set("source", "my-elaralo");
-    url.searchParams.set("handoffSource", "summary-public");
-    url.searchParams.set("handoff_source", "summary-public");
-    url.searchParams.set("origin", "summary-public");
-    url.searchParams.set("loggedIn", "0");
-    url.searchParams.set("logged_in", "0");
-    url.searchParams.set("brand", brand || "Elaralo");
-    url.searchParams.set("rebranding", brand || "Elaralo");
-    url.searchParams.set("avatar", mappingAvatar);
-    url.searchParams.set("avatarName", mappingAvatar);
-    url.searchParams.set("avatar_name", mappingAvatar);
-    url.searchParams.set("mappingAvatar", mappingAvatar);
-    url.searchParams.set("mapping_avatar", mappingAvatar);
-    url.searchParams.set("sqlAvatar", mappingAvatar);
-    url.searchParams.set("sql_avatar", mappingAvatar);
-    url.searchParams.set("companion", mappingAvatar);
-    url.searchParams.set("companionName", mappingAvatar);
-    url.searchParams.set("companion_name", mappingAvatar);
-    url.searchParams.set("companionKey", companionKey);
-    url.searchParams.set("companion_key", companionKey);
-    if (displayNameForConnect) {
-      url.searchParams.set("companionDisplayName", displayNameForConnect);
-      url.searchParams.set("companion_display_name", displayNameForConnect);
-    }
-    if (connectCompanionType) {
-      url.searchParams.set("companionType", connectCompanionType);
-      url.searchParams.set("companion_type", connectCompanionType);
-    }
-    if (versionId) {
-      url.searchParams.set("profileVersionId", versionId);
-      url.searchParams.set("profile_version_id", versionId);
-    }
-    if (connectHeadshotUrl && !isDefaultOrLogoHeadshot(connectHeadshotUrl)) {
-      url.searchParams.set("headshotUrl", connectHeadshotUrl);
-      url.searchParams.set("headshot_url", connectHeadshotUrl);
-      url.searchParams.set("imageUrl", connectHeadshotUrl);
-      url.searchParams.set("image_url", connectHeadshotUrl);
-      url.searchParams.set("photoUrl", connectHeadshotUrl);
-      url.searchParams.set("photo_url", connectHeadshotUrl);
-    }
-    return url.toString();
-  }, [
-    brand,
-    connectCompanionKey,
-    connectCompanionType,
-    connectHeadshotUrl,
-    connectMappingAvatar,
-    displayNameForConnect,
-    versionId,
-  ]);
+  const quickSummaryItems = [
+    displayLine("Public name", quickReference.public_name || publicProfile.public_display_name || publicProfile.stage_name),
+    displayLine("Birth location", quickReference.birth_location),
+    displayLine("Ethnicity", quickReference.ethnicity),
+    displayLine("Race", quickReference.race),
+  ].filter(Boolean) as Array<{ label: string; value: string }>;
 
-  const gallerySection = galleryAssets.length ? (
-    <section style={sectionStyle}>
-      <h2 style={{ marginTop: 0 }}>
-        {isAiCompanionCard ? "Additional Photos" : "Public Gallery"}
-      </h2>
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-          gap: 14,
-        }}
-      >
-        {galleryAssets.map((asset, idx) => (
-          <figure
-            key={`${safeText(asset.asset_id || asset.url || idx)}`}
-            style={{ margin: 0, display: "grid" }}
-          >
-            <img
-              src={safeText(asset.url)}
-              alt={slotLabel(safeText(asset.slot_key))}
-              style={{
-                width: "100%",
-                aspectRatio: "2 / 3",
-                objectFit: "contain",
-                objectPosition: "center center",
-                background: "#f8fafc",
-                borderRadius: 16,
-                border: "1px solid rgba(0,0,0,0.08)",
-              }}
-            />
-          </figure>
-        ))}
-      </div>
-    </section>
-  ) : null;
-
-  const connectButton = connectHref ? (
-    <a
-      href={connectHref}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        width: "100%",
-        maxWidth: 220,
-        height: 48,
-        minHeight: 48,
-        padding: "0 12px",
-        boxSizing: "border-box",
-        borderRadius: 999,
-        background: "#111827",
-        color: "#fff",
-        textDecoration: "none",
-        fontSize: 13,
-        lineHeight: 1,
-        fontWeight: 800,
-        boxShadow: "0 4px 10px rgba(17,24,39,0.12)",
-      }}
-      aria-label={`Connect with ${displayNameForConnect || "this companion"}`}
-    >
-      Connect
-    </a>
-  ) : null;
+  const publicSummaryCss = `
+    .hsp-main { max-width: 1180px; margin: 24px auto 48px; padding: 0 16px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #111827; }
+    .hsp-stack { display: grid; gap: 18px; }
+    .hsp-section { border: 1px solid rgba(0,0,0,0.1); border-radius: 18px; background: #fff; padding: 20px; box-shadow: 0 8px 22px rgba(0,0,0,0.05); }
+    .hsp-eyebrow { font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: #6b7280; }
+    .hsp-hero-grid { display: grid; grid-template-columns: minmax(0, 320px) minmax(0, 1fr); gap: 28px; align-items: start; }
+    .hsp-photo { width: 100%; max-width: 320px; aspect-ratio: 4 / 5; object-fit: cover; border-radius: 22px; border: 1px solid rgba(0,0,0,0.08); display: block; }
+    .hsp-photo-placeholder { width: 100%; max-width: 320px; aspect-ratio: 4 / 5; border-radius: 22px; border: 1px dashed rgba(0,0,0,0.18); display: grid; place-items: center; color: #6b7280; background: #f8fafc; }
+    .hsp-detail { display: grid; gap: 16px; }
+    .hsp-title { margin: 0; font-size: clamp(42px, 7vw, 74px); line-height: .98; letter-spacing: -0.04em; }
+    .hsp-chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .hsp-chip { padding: 8px 12px; border-radius: 999px; background: rgba(17,24,39,0.06); font-size: 14px; color: #374151; }
+    .hsp-cta { display: inline-flex; align-items: center; justify-content: center; width: fit-content; min-height: 46px; padding: 12px 18px; border-radius: 999px; background: #111827; color: #fff; text-decoration: none; font-weight: 800; box-shadow: 0 10px 22px rgba(17,24,39,0.18); }
+    .hsp-cta:hover { background: #0f172a; }
+    .hsp-summary-card, .hsp-quote-card { border: 1px solid rgba(17,24,39,0.08); border-radius: 16px; background: rgba(17,24,39,0.025); padding: 16px; }
+    .hsp-summary-title { font-weight: 800; font-size: 20px; margin: 0 0 12px; }
+    .hsp-summary-list { display: grid; gap: 10px; }
+    .hsp-summary-item { display: grid; gap: 3px; line-height: 1.45; color: #374151; }
+    .hsp-summary-label { font-size: 13px; font-weight: 800; color: #111827; }
+    .hsp-quote-card { border-left: 5px solid #111827; color: #374151; font-size: 18px; line-height: 1.55; }
+    .hsp-sticky-cta { display: none; }
+    @media (max-width: 760px) {
+      .hsp-main { margin: 14px auto 96px; padding: 0 14px; }
+      .hsp-section { padding: 18px; border-radius: 20px; box-shadow: 0 10px 28px rgba(15,23,42,0.06); }
+      .hsp-eyebrow { padding-top: max(8px, env(safe-area-inset-top)); }
+      .hsp-hero-grid { grid-template-columns: 1fr; gap: 18px; }
+      .hsp-photo, .hsp-photo-placeholder { max-width: none; width: 100%; aspect-ratio: 4 / 5; border-radius: 22px; }
+      .hsp-detail { gap: 14px; }
+      .hsp-title { font-size: clamp(40px, 14vw, 60px); line-height: 1; }
+      .hsp-chip { font-size: 13px; padding: 7px 11px; }
+      .hsp-cta { width: 100%; min-height: 50px; }
+      .hsp-summary-title { font-size: 19px; }
+      .hsp-summary-card, .hsp-quote-card { padding: 15px; border-radius: 16px; }
+      .hsp-quote-card { font-size: 16px; }
+      .hsp-sticky-cta { display: block; position: fixed; z-index: 50; left: 0; right: 0; bottom: 0; padding: 12px 14px calc(12px + env(safe-area-inset-bottom)); background: rgba(255,255,255,0.94); backdrop-filter: blur(12px); border-top: 1px solid rgba(17,24,39,0.1); box-shadow: 0 -10px 26px rgba(15,23,42,0.08); }
+      .hsp-sticky-cta .hsp-cta { width: 100%; }
+    }
+  `;
 
   if (loading) {
     return (
-      <main
-        style={{
-          maxWidth: 1120,
-          margin: "24px auto",
-          padding: "0 16px",
-          fontFamily: "system-ui",
-        }}
-      >
-        <div style={sectionStyle}>
-          Loading {isAiCompanionCard ? "companion card" : "public summary"}…
-        </div>
+      <main style={{ maxWidth: 1120, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
+        <div style={sectionStyle}>Loading {isAiCompanionCard ? "companion card" : "public summary"}…</div>
       </main>
     );
   }
 
   if (error) {
     return (
-      <main
-        style={{
-          maxWidth: 1120,
-          margin: "24px auto",
-          padding: "0 16px",
-          fontFamily: "system-ui",
-        }}
-      >
+      <main style={{ maxWidth: 1120, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
         <div style={sectionStyle}>
-          <h1 style={{ marginTop: 0 }}>
-            {isAiCompanionCard ? "Companion Card" : "Summary Public Page"}
-          </h1>
+          <h1 style={{ marginTop: 0 }}>{isAiCompanionCard ? "Companion Card" : "Summary Public Page"}</h1>
           <div style={{ color: "#b91c1c", lineHeight: 1.6 }}>{error}</div>
         </div>
       </main>
@@ -700,332 +533,150 @@ export default function HostSummaryPublicClient() {
   }
 
   return (
-    <main
-      style={{
-        maxWidth: 1180,
-        margin: "24px auto 48px",
-        padding: "0 16px",
-        fontFamily: "system-ui",
-        color: "#111827",
-      }}
-    >
-      <div style={{ display: "grid", gap: 18 }}>
-        <section style={{ ...sectionStyle, display: "grid", gap: 18 }}>
-          <div
-            style={{
-              fontSize: 12,
-              fontWeight: 700,
-              letterSpacing: 0.4,
-              textTransform: "uppercase",
-              color: "#6b7280",
-            }}
-          >
-            {isAiCompanionCard ? "Companion Card" : "Summary Public Page"}
-          </div>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "minmax(0, 220px) minmax(0, 1fr)",
-              gap: 20,
-              alignItems: "start",
-            }}
-          >
-            <div
-              style={{
-                display: "grid",
-                gap: 4,
-                justifyItems: "stretch",
-                width: "100%",
-                maxWidth: 220,
-              }}
-            >
-              {headshotUrl ? (
-                <img
-                  src={headshotUrl}
-                  alt={safeText(
-                    publicProfile.public_display_name ||
-                      publicProfile.stage_name ||
-                      "Companion headshot",
-                  )}
-                  style={{
-                    width: "100%",
-                    maxWidth: 220,
-                    aspectRatio: "2 / 3",
-                    objectFit: "cover",
-                    objectPosition: "center top",
-                    borderRadius: 22,
-                    border: "1px solid rgba(0,0,0,0.08)",
-                  }}
-                />
-              ) : (
-                <div
-                  style={{
-                    width: "100%",
-                    maxWidth: 220,
-                    aspectRatio: "2 / 3",
-                    borderRadius: 22,
-                    border: "1px dashed rgba(0,0,0,0.18)",
-                    display: "grid",
-                    placeItems: "center",
-                    color: "#6b7280",
-                  }}
-                >
-                  No headshot available
-                </div>
-              )}
-
-
-              {!personalMotto || isAiCompanionCard ? connectButton : null}
-            </div>
-            <div style={{ display: "grid", gap: 12 }}>
-              <h1 style={{ margin: 0, fontSize: 42, lineHeight: 1.1 }}>
-                {safeText(
-                  publicProfile.public_display_name ||
-                    publicProfile.stage_name ||
-                    "Companion profile",
+    <>
+      <style dangerouslySetInnerHTML={{ __html: publicSummaryCss }} />
+      <main className="hsp-main">
+        <div className="hsp-stack">
+          <section className="hsp-section hsp-stack">
+            <div className="hsp-eyebrow">{isAiCompanionCard ? "Companion Card" : "Summary Public Page"}</div>
+            <div className="hsp-hero-grid">
+              <div>
+                {headshotUrl ? (
+                  <img
+                    src={headshotUrl}
+                    alt={safeText(publicProfile.public_display_name || publicProfile.stage_name || "Companion headshot")}
+                    className="hsp-photo"
+                  />
+                ) : (
+                  <div className="hsp-photo-placeholder">No headshot available</div>
                 )}
-              </h1>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {chips.map((chip) => (
-                  <span
-                    key={chip}
-                    style={{
-                      padding: "6px 10px",
-                      borderRadius: 999,
-                      background: "rgba(17,24,39,0.06)",
-                      fontSize: 13,
-                      color: "#374151",
-                    }}
-                  >
-                    {chip}
-                  </span>
-                ))}
-                {approvedLabel ? (
-                  <span
-                    style={{
-                      padding: "6px 10px",
-                      borderRadius: 999,
-                      background: "rgba(17,24,39,0.06)",
-                      fontSize: 13,
-                      color: "#374151",
-                    }}
-                  >
-                    Approved {approvedLabel}
-                  </span>
+              </div>
+
+              <div className="hsp-detail">
+                <h1 className="hsp-title">{companionDisplayName}</h1>
+
+                <div className="hsp-chip-row">
+                  {chips.map((chip) => (
+                    <span key={chip} className="hsp-chip">{chip}</span>
+                  ))}
+                  {approvedMobileLabel ? <span className="hsp-chip">Approved {approvedMobileLabel}</span> : null}
+                </div>
+
+                {connectHref ? (
+                  <a href={connectHref} className="hsp-cta" aria-label={connectLabel}>
+                    {connectLabel}
+                  </a>
                 ) : null}
-              </div>
 
-
-              {isAiCompanionCard ? (
-                <div
-                  style={{
-                    display: "grid",
-                    gap: 6,
-                    color: "#374151",
-                    lineHeight: 1.6,
-                  }}
-                >
-                  {safeText(publicProfile.gender) ? (
-                    <div>
-                      <b>Gender:</b> {safeText(publicProfile.gender)}
+                {isAiCompanionCard ? (
+                  <div className="hsp-summary-card">
+                    <h2 className="hsp-summary-title">Companion Details</h2>
+                    <div className="hsp-summary-list">
+                      {safeText(publicProfile.gender) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Gender</span><span>{safeText(publicProfile.gender)}</span></div> : null}
+                      {safeText(publicProfile.ethnicity) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Ethnicity</span><span>{safeText(publicProfile.ethnicity)}</span></div> : null}
+                      {safeText(publicProfile.generation) ? <div className="hsp-summary-item"><span className="hsp-summary-label">Generation</span><span>{safeText(publicProfile.generation)}</span></div> : null}
                     </div>
-                  ) : null}
-                  {safeText(publicProfile.ethnicity) ? (
-                    <div>
-                      <b>Ethnicity:</b> {safeText(publicProfile.ethnicity)}
-                    </div>
-                  ) : null}
-                  {safeText(publicProfile.generation) ? (
-                    <div>
-                      <b>Generation:</b> {safeText(publicProfile.generation)}
-                    </div>
-                  ) : null}
-                </div>
-              ) : (
-                <>
-                  {quickReference && Object.keys(quickReference).length ? (
-                    <div
-                      style={{
-                        display: "grid",
-                        gap: 6,
-                        color: "#374151",
-                        lineHeight: 1.6,
-                      }}
-                    >
-                      <div style={{ fontWeight: 700 }}>Quick summary</div>
-                      <div>
-                        {safeText(
-                          quickReference.public_name ||
-                            publicProfile.public_display_name ||
-                            publicProfile.stage_name,
-                        )}
+                  </div>
+                ) : (
+                  <>
+                    {quickSummaryItems.length ? (
+                      <div className="hsp-summary-card">
+                        <h2 className="hsp-summary-title">Quick Summary</h2>
+                        <div className="hsp-summary-list">
+                          {quickSummaryItems.map((item) => (
+                            <div key={`${item.label}-${item.value}`} className="hsp-summary-item">
+                              <span className="hsp-summary-label">{item.label}</span>
+                              <span>{item.value}</span>
+                            </div>
+                          ))}
+                        </div>
                       </div>
-                      {quickReference.birth_location ? (
-                        <div>
-                          Birth location:{" "}
-                          {safeText(quickReference.birth_location)}
-                        </div>
-                      ) : null}
-                      {quickReference.ethnicity ? (
-                        <div>
-                          Ethnicity: {safeText(quickReference.ethnicity)}
-                        </div>
-                      ) : null}
-                      {quickReference.race ? (
-                        <div>Race: {safeText(quickReference.race)}</div>
-                      ) : null}
-                      {personalMotto && !isAiCompanionCard ? (
-                        <blockquote
-                          style={{
-                            margin: "10px 0 0",
-                            padding: "12px 16px",
-                            borderLeft: "4px solid #111827",
-                            background: "rgba(17,24,39,0.03)",
-                            borderRadius: 8,
-                            color: "#374151",
-                          }}
-                        >
-                          “{personalMotto}”
-                        </blockquote>
-                      ) : null}
-                    </div>
-                  ) : null}
-                </>
-              )}
-            </div>
-          </div>
+                    ) : null}
 
-          {personalMotto && !isAiCompanionCard ? (
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "minmax(0, 220px) minmax(0, 1fr)",
-                gap: 20,
-                alignItems: "start",
-              }}
-            >
-              <div style={{ width: "100%", maxWidth: 220 }}>
-                {connectButton}
+                    {safeText(publicProfile.personal_motto) ? (
+                      <blockquote className="hsp-quote-card">
+                        “{safeText(publicProfile.personal_motto)}”
+                      </blockquote>
+                    ) : null}
+                  </>
+                )}
               </div>
-              <div />
             </div>
+          </section>
+
+          {!isAiCompanionCard && safeText(publicProfile.physical_description) ? (
+            <section style={sectionStyle}>
+              <h2 style={{ marginTop: 0 }}>Physical Description</h2>
+              <div style={{ color: "#374151", lineHeight: 1.75 }}>{safeText(publicProfile.physical_description)}</div>
+            </section>
           ) : null}
-        </section>
 
-        {gallerySection}
+          {!isAiCompanionCard && safeText(publicProfile.personality) ? (
+            <section style={sectionStyle}>
+              <h2 style={{ marginTop: 0 }}>Personality</h2>
+              <div style={{ color: "#374151", lineHeight: 1.75 }}>{safeText(publicProfile.personality)}</div>
+            </section>
+          ) : null}
 
-        {!isAiCompanionCard && safeText(publicProfile.physical_description) ? (
-          <section style={sectionStyle}>
-            <h2 style={{ marginTop: 0 }}>Physical Description</h2>
-            <div style={{ color: "#374151", lineHeight: 1.75 }}>
-              {safeText(publicProfile.physical_description)}
-            </div>
-          </section>
-        ) : null}
+          {!isAiCompanionCard && educationEntries.length ? (
+            <section style={sectionStyle}>
+              <h2 style={{ marginTop: 0 }}>Education</h2>
+              <div style={{ display: "grid", gap: 10 }}>
+                {educationEntries.map((line, idx) => (
+                  <div key={`${line}-${idx}`} style={{ color: "#374151", lineHeight: 1.7 }}>{line}</div>
+                ))}
+              </div>
+            </section>
+          ) : null}
 
-        {!isAiCompanionCard && safeText(publicProfile.personality) ? (
-          <section style={sectionStyle}>
-            <h2 style={{ marginTop: 0 }}>Personality</h2>
-            <div style={{ color: "#374151", lineHeight: 1.75 }}>
-              {safeText(publicProfile.personality)}
-            </div>
-          </section>
-        ) : null}
+          {!isAiCompanionCard && (safeText(publicProfile.career?.current_job_title) || safeText(publicProfile.career?.career_summary)) ? (
+            <section style={sectionStyle}>
+              <h2 style={{ marginTop: 0 }}>Career</h2>
+              <div style={{ display: "grid", gap: 8, color: "#374151", lineHeight: 1.7 }}>
+                {safeText(publicProfile.career?.current_job_title) ? <div><b>Current position:</b> {safeText(publicProfile.career?.current_job_title)}</div> : null}
+                {safeText(publicProfile.career?.current_company) ? <div><b>Company:</b> {safeText(publicProfile.career?.current_company)}</div> : null}
+                {safeText(publicProfile.career?.career_summary) ? <div>{safeText(publicProfile.career?.career_summary)}</div> : null}
+              </div>
+            </section>
+          ) : null}
 
-        {!isAiCompanionCard && educationEntries.length ? (
-          <section style={sectionStyle}>
-            <h2 style={{ marginTop: 0 }}>Education</h2>
-            <div style={{ display: "grid", gap: 10 }}>
-              {educationEntries.map((line, idx) => (
-                <div
-                  key={`${line}-${idx}`}
-                  style={{ color: "#374151", lineHeight: 1.7 }}
-                >
-                  {line}
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
+          {!isAiCompanionCard && (safeText(publicProfile.likes) || safeText(publicProfile.hobbies) || safeText(publicProfile.lifestyle) || safeText(publicProfile.background_story) || safeText(publicProfile.core_values)) ? (
+            <section style={sectionStyle}>
+              <h2 style={{ marginTop: 0 }}>Profile Highlights</h2>
+              <div style={{ display: "grid", gap: 12, color: "#374151", lineHeight: 1.75 }}>
+                {safeText(publicProfile.likes) ? <div><b>Likes:</b> {safeText(publicProfile.likes)}</div> : null}
+                {safeText(publicProfile.hobbies) ? <div><b>Hobbies:</b> {safeText(publicProfile.hobbies)}</div> : null}
+                {safeText(publicProfile.lifestyle) ? <div><b>Lifestyle:</b> {safeText(publicProfile.lifestyle)}</div> : null}
+                {safeText(publicProfile.background_story) ? <div><b>Background:</b> {safeText(publicProfile.background_story)}</div> : null}
+                {safeText(publicProfile.core_values) ? <div><b>Core values:</b> {safeText(publicProfile.core_values)}</div> : null}
+              </div>
+            </section>
+          ) : null}
 
-        {!isAiCompanionCard &&
-        (safeText(publicProfile.career?.current_job_title) ||
-          safeText(publicProfile.career?.career_summary)) ? (
-          <section style={sectionStyle}>
-            <h2 style={{ marginTop: 0 }}>Career</h2>
-            <div
-              style={{
-                display: "grid",
-                gap: 8,
-                color: "#374151",
-                lineHeight: 1.7,
-              }}
-            >
-              {safeText(publicProfile.career?.current_job_title) ? (
-                <div>
-                  <b>Current position:</b>{" "}
-                  {safeText(publicProfile.career?.current_job_title)}
-                </div>
-              ) : null}
-              {safeText(publicProfile.career?.current_company) ? (
-                <div>
-                  <b>Company:</b>{" "}
-                  {safeText(publicProfile.career?.current_company)}
-                </div>
-              ) : null}
-              {safeText(publicProfile.career?.career_summary) ? (
-                <div>{safeText(publicProfile.career?.career_summary)}</div>
-              ) : null}
-            </div>
-          </section>
-        ) : null}
+          {galleryAssets.length ? (
+            <section style={sectionStyle}>
+              <h2 style={{ marginTop: 0 }}>{isAiCompanionCard ? "Additional Photos" : "Public Gallery"}</h2>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 14 }}>
+                {galleryAssets.map((asset, idx) => (
+                  <figure key={`${safeText(asset.asset_id || asset.url || idx)}`} style={{ margin: 0, display: "grid", gap: 8 }}>
+                    <img src={safeText(asset.url)} alt={slotLabel(safeText(asset.slot_key))} style={{ width: "100%", aspectRatio: "4 / 5", objectFit: "cover", borderRadius: 16, border: "1px solid rgba(0,0,0,0.08)" }} />
+                    <figcaption style={{ fontSize: 13, color: "#4b5563" }}>{slotLabel(safeText(asset.slot_key))}</figcaption>
+                  </figure>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+      </main>
 
-        {!isAiCompanionCard &&
-        (safeText(publicProfile.likes) ||
-          safeText(publicProfile.hobbies) ||
-          safeText(publicProfile.lifestyle) ||
-          safeText(publicProfile.background_story) ||
-          safeText(publicProfile.core_values)) ? (
-          <section style={sectionStyle}>
-            <h2 style={{ marginTop: 0 }}>Profile Highlights</h2>
-            <div
-              style={{
-                display: "grid",
-                gap: 12,
-                color: "#374151",
-                lineHeight: 1.75,
-              }}
-            >
-              {safeText(publicProfile.likes) ? (
-                <div>
-                  <b>Likes:</b> {safeText(publicProfile.likes)}
-                </div>
-              ) : null}
-              {safeText(publicProfile.hobbies) ? (
-                <div>
-                  <b>Hobbies:</b> {safeText(publicProfile.hobbies)}
-                </div>
-              ) : null}
-              {safeText(publicProfile.lifestyle) ? (
-                <div>
-                  <b>Lifestyle:</b> {safeText(publicProfile.lifestyle)}
-                </div>
-              ) : null}
-              {safeText(publicProfile.background_story) ? (
-                <div>
-                  <b>Background:</b> {safeText(publicProfile.background_story)}
-                </div>
-              ) : null}
-              {safeText(publicProfile.core_values) ? (
-                <div>
-                  <b>Core values:</b> {safeText(publicProfile.core_values)}
-                </div>
-              ) : null}
-            </div>
-          </section>
-        ) : null}
-      </div>
-    </main>
+      {connectHref ? (
+        <div className="hsp-sticky-cta">
+          <a href={connectHref} className="hsp-cta" aria-label={connectLabel}>
+            {connectLabel}
+          </a>
+        </div>
+      ) : null}
+    </>
   );
 }
 
