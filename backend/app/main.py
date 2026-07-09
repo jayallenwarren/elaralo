@@ -23491,6 +23491,7 @@ def _host_onboarding_find_existing_human_mapping_row_on_conn(
     approved_version_id: str = "",
     legacy_avatar: str = "",
     expected_avatar: str = "",
+    brand_name: str = "Elaralo",
 ) -> Optional[sqlite3.Row]:
     """Find the existing Human mapping row for a host/version.
 
@@ -23532,7 +23533,7 @@ def _host_onboarding_find_existing_human_mapping_row_on_conn(
              LIMIT 20
             """,
             (
-                "Elaralo",
+                _host_onboarding_safe_str(brand_name) or "Elaralo",
                 member_norm, member_norm,
                 version_norm, version_norm,
                 legacy_norm, legacy_norm,
@@ -23870,6 +23871,7 @@ def _companion_mapping_is_hidden_for_owner(mapping: Any) -> bool:
 _STARTUP_MIGRATION_COMPANION_AVATAR_IDENTITY_V9_2_18 = "v9_2_18_companion_avatar_identity_generation_ethnicity"
 _STARTUP_MIGRATION_AI_ROW_OWNERSHIP_HYGIENE_V9_2_22 = "v9_2_22_companion_ai_row_ownership_hygiene"
 _STARTUP_MIGRATION_COMPANION_CATALOG_VISIBILITY_V9_2_30 = "v9_2_30_companion_catalog_visibility_defaults"
+_STARTUP_MIGRATION_HUMAN_MAPPING_BRAND_HOST_DEDUPE_V10_ALPHA7 = "v10_0_0_alpha7_human_mapping_brand_host_dedupe"
 
 
 def _startup_migrations_ensure_table_on_conn(conn: sqlite3.Connection) -> None:
@@ -24151,6 +24153,227 @@ def _startup_run_companion_catalog_visibility_defaults_on_conn(conn: sqlite3.Con
         updates.append({"rowid": rowid, "brand": brand, "avatar": avatar, "companion_type": ctype, "visible": bool(visible)})
     return {"rows_scanned": len(rows or []), "visibility_updates": len(updates), "updates": updates}
 
+
+
+def _human_mapping_row_score_on_conn(conn: sqlite3.Connection, row: sqlite3.Row) -> Tuple[int, float, int]:
+    """Score Human mapping rows for duplicate cleanup; higher is better."""
+    score = 0
+    try:
+        if _host_onboarding_safe_str(row["headshot_url"]):
+            score += 10
+        if _host_onboarding_safe_str(row["voice_capture_url"]):
+            score += 8
+        if _host_onboarding_safe_str(row["eleven_voice_id"]):
+            score += 4
+        if _host_onboarding_safe_str(row["approved_version_id"]):
+            score += 2
+        if _companion_catalog_visibility_value(row["list_in_companion_catalog"], default=False):
+            score += 1
+    except Exception:
+        pass
+    approved_epoch = 0.0
+    try:
+        vid = _host_onboarding_safe_str(row["approved_version_id"])
+        if vid:
+            vr = conn.execute(
+                f"SELECT approved_epoch FROM {_HOST_ONBOARDING_VERSIONS_TABLE} WHERE lower(version_id)=lower(?) LIMIT 1",
+                (vid,),
+            ).fetchone()
+            if vr is not None:
+                approved_epoch = float(vr[0] or 0.0)
+    except Exception:
+        approved_epoch = 0.0
+    try:
+        rowid = int(row["_rowid"])
+    except Exception:
+        rowid = 0
+    return (score, approved_epoch, rowid)
+
+
+def _merge_human_mapping_row_on_conn(conn: sqlite3.Connection, *, keep_rowid: int, drop_rowid: int) -> Dict[str, Any]:
+    """Merge useful non-empty Human mapping fields from drop row into keep row, then delete drop row."""
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    keep = cur.execute("SELECT rowid AS _rowid, * FROM companion_mappings WHERE rowid=?", (keep_rowid,)).fetchone()
+    drop = cur.execute("SELECT rowid AS _rowid, * FROM companion_mappings WHERE rowid=?", (drop_rowid,)).fetchone()
+    if keep is None or drop is None:
+        return {"keep": keep_rowid, "drop": drop_rowid, "skipped": True, "reason": "missing_row"}
+    merge_columns = [
+        "brand_id", "companion_id", "eleven_voice_name", "channel_cap", "phonetic", "eleven_voice_id", "live",
+        "did_embed_code", "did_agent_link", "did_agent_id", "did_client_key", "event_ref",
+        "headshot_url", "voice_capture_url", "public_gallery_json", "approved_version_id",
+        "voice_clone_status", "voice_clone_error", "list_in_companion_catalog", "catalog_hidden_reason",
+        "catalog_visibility_updated_at", "catalog_visibility_updated_by",
+    ]
+    updates: Dict[str, Any] = {}
+    for col in merge_columns:
+        try:
+            keep_val = keep[col]
+            drop_val = drop[col]
+        except Exception:
+            continue
+        keep_s = _host_onboarding_safe_str(keep_val)
+        drop_s = _host_onboarding_safe_str(drop_val)
+        if col == "list_in_companion_catalog":
+            # Preserve explicit visible=true if either row was visible.
+            if _companion_catalog_visibility_value(keep_val, default=False) or _companion_catalog_visibility_value(drop_val, default=False):
+                if int(keep_val or 0) != 1:
+                    updates[col] = 1
+            continue
+        if col in ("catalog_visibility_updated_at",):
+            try:
+                if float(drop_val or 0) > float(keep_val or 0):
+                    updates[col] = drop_val
+            except Exception:
+                pass
+            continue
+        if not keep_s and drop_s:
+            updates[col] = drop_val
+    if updates:
+        set_sql = ", ".join([f"{col}=?" for col in updates.keys()])
+        cur.execute(f"UPDATE companion_mappings SET {set_sql} WHERE rowid=?", tuple(updates.values()) + (keep_rowid,))
+    cur.execute("DELETE FROM companion_mappings WHERE rowid=?", (drop_rowid,))
+    return {"keep": keep_rowid, "drop": drop_rowid, "merged_columns": sorted(updates.keys())}
+
+
+def _latest_host_session_brand_for_avatar_on_conn(conn: sqlite3.Connection, member_id: str, avatar_base: str) -> str:
+    """Return the latest Host/Profile Studio session brand for this host/avatar base."""
+    mid = _host_onboarding_normalize_member_id(member_id)
+    base = _companion_avatar_first_name(avatar_base).lower()
+    if not mid or not base:
+        return ""
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT brand, avatar, host_display_name, basics_json, updated_epoch
+              FROM {_HOST_ONBOARDING_SESSIONS_TABLE}
+             WHERE lower(COALESCE(member_id, '')) = lower(?)
+             ORDER BY updated_epoch DESC
+             LIMIT 25
+            """,
+            (mid,),
+        ).fetchall()
+        for row in rows or []:
+            candidates = [row["avatar"], row["host_display_name"]]
+            try:
+                basics = _host_onboarding_json_loads(row["basics_json"], {})
+                if isinstance(basics, dict):
+                    candidates.extend([basics.get("stage_name"), basics.get("public_display_name")])
+            except Exception:
+                pass
+            if any(_companion_avatar_first_name(c).lower() == base for c in candidates if _host_onboarding_safe_str(c)):
+                b = _host_onboarding_safe_str(row["brand"])
+                if _compact_brand_key(b) == "dulcemoon":
+                    return "DulceMoon"
+                if _compact_brand_key(b) == "elaralo":
+                    return "Elaralo"
+                if b:
+                    return b
+    except Exception:
+        return ""
+    return ""
+
+
+def _startup_run_human_mapping_brand_host_dedupe_on_conn(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Repair Human companion_mappings brand/host invariants.
+
+    Fixes two historical bugs:
+      1) Host/Profile Studio exports were hard-coded to Elaralo, allowing DulceMoon
+         Host rows to be created under Elaralo.
+      2) The public catalog repair loop could recreate older Human rows such as
+         Sera after they were manually removed, producing multiple Human rows for
+         the same Elaralo host.
+    """
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    _host_onboarding_ensure_schema(conn)
+    _host_onboarding_ensure_companion_export_columns_on_conn(conn)
+    rows = cur.execute(
+        """
+        SELECT rowid AS _rowid, *
+          FROM companion_mappings
+         WHERE lower(COALESCE(companion_type, '')) = 'human'
+         ORDER BY rowid
+        """
+    ).fetchall()
+    changes: List[Dict[str, Any]] = []
+
+    # Cross-brand duplicate repair: when the same host/avatar exists in multiple
+    # brands and the latest Host/Profile Studio session indicates a different
+    # owning brand, merge the misplaced row into the canonical-brand row.
+    rows_by_key: Dict[Tuple[str, str], List[sqlite3.Row]] = {}
+    for row in rows or []:
+        host = _host_onboarding_normalize_member_id(row["host_member_id"])
+        base = _companion_avatar_first_name(row["avatar"]).lower()
+        if host and base:
+            rows_by_key.setdefault((host.lower(), base), []).append(row)
+    for (host_lc, base), group in list(rows_by_key.items()):
+        if len(group) < 2:
+            continue
+        canonical_brand = _latest_host_session_brand_for_avatar_on_conn(conn, host_lc, base)
+        if not canonical_brand:
+            continue
+        keep_candidates = [r for r in group if _compact_brand_key(r["brand"]) == _compact_brand_key(canonical_brand)]
+        if not keep_candidates:
+            continue
+        keep = sorted(keep_candidates, key=lambda r: _human_mapping_row_score_on_conn(conn, r), reverse=True)[0]
+        keep_rowid = int(keep["_rowid"])
+        for row in group:
+            rowid = int(row["_rowid"])
+            if rowid == keep_rowid:
+                continue
+            if _compact_brand_key(row["brand"]) != _compact_brand_key(canonical_brand):
+                changes.append({
+                    "action": "merge_cross_brand_duplicate",
+                    "canonical_brand": canonical_brand,
+                    "avatar_base": base,
+                    **_merge_human_mapping_row_on_conn(conn, keep_rowid=keep_rowid, drop_rowid=rowid),
+                })
+
+    # Refresh rows after cross-brand deletes.
+    rows = cur.execute(
+        """
+        SELECT rowid AS _rowid, *
+          FROM companion_mappings
+         WHERE lower(COALESCE(companion_type, '')) = 'human'
+           AND trim(COALESCE(host_member_id, '')) <> ''
+         ORDER BY rowid
+        """
+    ).fetchall()
+    rows_by_brand_host: Dict[Tuple[str, str], List[sqlite3.Row]] = {}
+    for row in rows or []:
+        key = (_compact_brand_key(row["brand"]), _host_onboarding_normalize_member_id(row["host_member_id"]).lower())
+        if key[0] and key[1]:
+            rows_by_brand_host.setdefault(key, []).append(row)
+    for (brand_key, host_lc), group in list(rows_by_brand_host.items()):
+        if len(group) < 2:
+            continue
+        keep = sorted(group, key=lambda r: _human_mapping_row_score_on_conn(conn, r), reverse=True)[0]
+        keep_rowid = int(keep["_rowid"])
+        for row in group:
+            rowid = int(row["_rowid"])
+            if rowid == keep_rowid:
+                continue
+            changes.append({
+                "action": "merge_same_brand_host_duplicate",
+                "brand_key": brand_key,
+                "host_member_id": host_lc,
+                **_merge_human_mapping_row_on_conn(conn, keep_rowid=keep_rowid, drop_rowid=rowid),
+            })
+
+    try:
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_companion_mappings_human_brand_host_unique
+              ON companion_mappings(lower(COALESCE(brand, '')), lower(COALESCE(host_member_id, '')))
+             WHERE lower(COALESCE(companion_type, '')) = 'human'
+               AND trim(COALESCE(host_member_id, '')) <> ''
+            """
+        )
+    except Exception as exc:
+        changes.append({"action": "unique_index_create_failed", "error": repr(exc)})
+    return {"changes": changes, "change_count": len(changes)}
+
 def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
     """Run deployment-time DB migrations once per DB.
 
@@ -24190,6 +24413,10 @@ def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
                     (
                         _STARTUP_MIGRATION_COMPANION_CATALOG_VISIBILITY_V9_2_30,
                         lambda c: _startup_run_companion_catalog_visibility_defaults_on_conn(c),
+                    ),
+                    (
+                        _STARTUP_MIGRATION_HUMAN_MAPPING_BRAND_HOST_DEDUPE_V10_ALPHA7,
+                        lambda c: _startup_run_human_mapping_brand_host_dedupe_on_conn(c),
                     ),
                 ]
 
@@ -24338,6 +24565,7 @@ def _lookup_companion_mapping_by_avatar_base_typed(brand: str, avatar_base: Any,
 
 def _host_onboarding_upsert_connect_companion_mapping(
     *,
+    brand_name: str = "Elaralo",
     member_id: str,
     avatar_key: str,
     headshot_url: str,
@@ -24361,6 +24589,7 @@ def _host_onboarding_upsert_connect_companion_mapping(
     name/brand uses the bare first name; later rows receive -######### suffixes.
     """
     proposed_avatar = _companion_avatar_first_name(avatar_key) or _host_onboarding_safe_str(avatar_key)
+    brand_name_norm = _host_onboarding_safe_str(brand_name) or "Elaralo"
     member_id = _host_onboarding_normalize_member_id(member_id)
     approved_version_id_norm = _host_onboarding_safe_str(approved_version_id)
     if not proposed_avatar or not member_id:
@@ -24384,13 +24613,14 @@ def _host_onboarding_upsert_connect_companion_mapping(
         _host_onboarding_ensure_companion_export_columns_on_conn(conn)
         cur = conn.cursor()
 
-        brand_id = _host_onboarding_resolve_brand_id_for_brand_on_conn(conn, "Elaralo")
+        brand_id = _host_onboarding_resolve_brand_id_for_brand_on_conn(conn, brand_name_norm)
         existing = _host_onboarding_find_existing_human_mapping_row_on_conn(
             conn,
             member_id=member_id,
             approved_version_id=approved_version_id_norm,
             legacy_avatar=_host_onboarding_safe_str(avatar_key),
             expected_avatar=proposed_avatar,
+            brand_name=brand_name_norm,
         )
         # Defense in depth: Host Onboarding must never overwrite an AI mapping row.
         # If a historical/corrupt row is marked AI, create a distinct Human row
@@ -24409,7 +24639,7 @@ def _host_onboarding_upsert_connect_companion_mapping(
 
         final_avatar = _host_onboarding_unique_avatar_for_brand_on_conn(
             conn,
-            "Elaralo",
+            brand_name_norm,
             proposed_avatar,
             current_rowid=current_rowid,
         )
@@ -24418,12 +24648,12 @@ def _host_onboarding_upsert_connect_companion_mapping(
             if brand_id is not None:
                 cur.execute(
                     "INSERT INTO companion_mappings (brand, avatar, brand_id) VALUES (?, ?, ?)",
-                    ("Elaralo", final_avatar, brand_id),
+(brand_name_norm, final_avatar, brand_id),
                 )
             else:
                 cur.execute(
                     "INSERT INTO companion_mappings (brand, avatar) VALUES (?, ?)",
-                    ("Elaralo", final_avatar),
+(brand_name_norm, final_avatar),
                 )
             current_rowid = int(cur.lastrowid)
 
@@ -24514,6 +24744,37 @@ def _host_onboarding_upsert_connect_companion_mapping(
         except Exception:
             pass
     return final_avatar
+
+
+
+def _host_onboarding_brand_from_session_profile(session: Dict[str, Any], profile: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve the brand that owns a Host/Profile Studio export.
+
+    Host exports must be brand-scoped. Older code wrote every Human export to
+    Elaralo, which allowed DulceMoon Host profiles to create Elaralo Human rows.
+    """
+    session_obj = dict(session or {}) if isinstance(session, dict) else {}
+    profile_obj = dict(profile or {}) if isinstance(profile, dict) else {}
+    profile_session = dict(profile_obj.get("session") or {}) if isinstance(profile_obj, dict) else {}
+    connect_platform = dict(profile_obj.get("connect_platform") or {}) if isinstance(profile_obj, dict) else {}
+    ai_profile = dict(profile_obj.get("ai_profile") or {}) if isinstance(profile_obj, dict) else {}
+    ai_connect = dict(ai_profile.get("connect_platform") or {}) if isinstance(ai_profile, dict) else {}
+    candidates = [
+        session_obj.get("brand"),
+        profile_session.get("brand"),
+        connect_platform.get("brand"),
+        ai_connect.get("brand"),
+    ]
+    for value in candidates:
+        s = _host_onboarding_safe_str(value)
+        if s:
+            # Preserve known external brand spelling.
+            if _compact_brand_key(s) == "dulcemoon":
+                return "DulceMoon"
+            if _compact_brand_key(s) == "elaralo":
+                return "Elaralo"
+            return s
+    return "Elaralo"
 
 def _host_onboarding_upsert_hco_row(
     *,
@@ -24630,6 +24891,7 @@ def _host_onboarding_upsert_hco_row(
 
 
 def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Dict[str, Any], version_id: str, db_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    brand_name = _host_onboarding_brand_from_session_profile(session, profile)
     assets = list(session.get("assets") or [])
     public_profile = dict(profile.get("public_profile") or {})
     public_page = dict(profile.get("public_page") or {})
@@ -24644,11 +24906,12 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
                 approved_version_id=version_id,
                 legacy_avatar=avatar_key,
                 expected_avatar=avatar_key,
+                brand_name=brand_name,
             )
             existing_rowid = int(existing_mapping["_rowid"]) if existing_mapping is not None else None
             avatar_key = _host_onboarding_unique_avatar_for_brand_on_conn(
                 db_conn,
-                "Elaralo",
+                brand_name,
                 avatar_key,
                 current_rowid=existing_rowid,
             )
@@ -24703,6 +24966,7 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         profile,
     )
     saved_avatar_key = _host_onboarding_upsert_connect_companion_mapping(
+        brand_name=brand_name,
         member_id=_host_onboarding_safe_str(session.get("member_id")),
         avatar_key=avatar_key,
         headshot_url=_host_onboarding_safe_str((exported_headshot or {}).get("url")),
@@ -24732,7 +24996,7 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
     public_page["headshot_asset"] = exported_headshot or public_page.get("headshot_asset")
     public_page["gallery_assets"] = exported_gallery or public_page.get("gallery_assets") or []
     connect_export = {
-        "brand": "Elaralo",
+        "brand": brand_name,
         "avatar": avatar_key,
         "headshot_asset": exported_headshot,
         "voice_capture_asset": exported_voice,
@@ -24746,7 +25010,7 @@ def _host_onboarding_export_connect_profile(session: Dict[str, Any], profile: Di
         **profile,
         "session": {
             **dict(profile.get("session") or {}),
-            "brand": "Elaralo",
+            "brand": brand_name,
             "avatar": avatar_key,
         },
         "private_profile": private_profile,
@@ -24775,8 +25039,7 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
     This repair path handles profiles approved before that export was reliable, so the
     current host's Human card can appear and Connect can find the SQL mapping.
     """
-    if not _is_elaralo_core_brand(brand_name):
-        return {}
+    brand_name_norm = _host_onboarding_safe_str(brand_name) or "Elaralo"
     resolved_member_id = _host_onboarding_normalize_member_id(member_id)
     approved_version_id = _host_onboarding_safe_str(version_id)
     if not resolved_member_id or not approved_version_id or not isinstance(profile, dict):
@@ -24841,6 +25104,7 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
         dict(session or {}).get("completion") if isinstance(session, dict) else {},
     )
     saved_avatar_key = _host_onboarding_upsert_connect_companion_mapping(
+        brand_name=brand_name_norm,
         member_id=resolved_member_id,
         avatar_key=avatar_key,
         headshot_url=headshot_url,
@@ -24867,7 +25131,7 @@ def _host_onboarding_repair_connect_companion_mapping_from_approved_profile(
         pass
 
     return _lookup_companion_mapping("Elaralo", avatar_key) or {
-        "brand": "Elaralo",
+        "brand": brand_name,
         "avatar": avatar_key,
         "host_member_id": resolved_member_id,
         "companion_type": "Human",
@@ -26430,6 +26694,13 @@ def _my_elaralo_member_human_cards_sync(
         except Exception:
             version_rows = []
 
+        latest_version_id = ""
+        try:
+            if version_rows:
+                latest_version_id = _host_onboarding_safe_str(_my_elaralo_row_value(version_rows[0], "version_id", "versionId")).lower()
+        except Exception:
+            latest_version_id = ""
+
         # If the mapping references an approved version that was not returned by the member query
         # due to historical member-id normalization differences, fetch it explicitly.
         known_version_ids = {
@@ -26487,7 +26758,10 @@ def _my_elaralo_member_human_cards_sync(
                 or not _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "headshot_url", "headshotUrl"))
                 or _host_onboarding_safe_str(_my_elaralo_row_value(mapping, "companion_type", "companionType")).lower() != "human"
             )
-            if needs_mapping_repair:
+            # Only repair the latest approved Host profile. Older approved versions are
+            # historical snapshots; repairing them from a read/catalog path can resurrect
+            # deprecated public names such as Sera after the current profile has become Sierra.
+            if needs_mapping_repair and latest_version_id and version_id.lower() == latest_version_id:
                 try:
                     if not profile_for_repair:
                         profile_for_repair = _host_onboarding_json_loads(_my_elaralo_row_value(vr, "profile_json", "profileJson"), {})
