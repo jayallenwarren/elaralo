@@ -213,8 +213,17 @@ function normalizeCard(item: any, defaultBrand: string): CompanionCardItem {
     headshotUrl,
     summaryPublicUrl,
     gender: safeText(item?.gender),
-    ethnicity: safeText(item?.ethnicity),
-    generation: safeText(item?.generation),
+    ethnicity:
+      safeText(item?.companion_catalog_ethnicity) ||
+      safeText(item?.companionCatalogEthnicity) ||
+      safeText(item?.race_label) ||
+      safeText(item?.raceLabel) ||
+      safeText(item?.race) ||
+      safeText(item?.ethnicity),
+    generation:
+      safeText(item?.generation) ||
+      safeText(item?.generation_label) ||
+      safeText(item?.generationLabel),
     shortSummary:
       safeText(item?.summary) || safeText(item?.short_summary) || safeText(item?.shortSummary) || safeText(item?.tagline),
     catalogHidden: Boolean(item?.catalog_hidden || item?.hidden || item?.is_hidden || item?.isHidden),

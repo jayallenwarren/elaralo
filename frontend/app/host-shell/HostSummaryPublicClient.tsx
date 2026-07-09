@@ -537,7 +537,9 @@ export default function HostSummaryPublicClient() {
     .hsp-summary-list { display: grid; gap: 10px; }
     .hsp-summary-item { display: grid; gap: 3px; line-height: 1.45; color: #374151; }
     .hsp-summary-label { font-size: 13px; font-weight: 800; color: #111827; }
-    .hsp-quote-card { border-left: 5px solid #111827; color: #374151; font-size: 17px; line-height: 1.55; }
+    .hsp-motto-card { border: 1px solid rgba(17,24,39,0.08); border-radius: 16px; background: rgba(17,24,39,0.025); padding: 16px; text-align: left; }
+    .hsp-motto-title { font-weight: 800; font-size: 20px; margin: 0 0 12px; color: #111827; text-align: left; }
+    .hsp-quote-card { margin: 0; padding: 0 0 0 18px; border-left: 5px solid #111827; color: #374151; font-size: 17px; line-height: 1.55; text-align: left; }
     .hsp-gallery-title { font-weight: 800; font-size: 20px; margin: 0 0 12px; }
     .hsp-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 12px; }
     .hsp-gallery-thumb { margin: 0; min-width: 0; display: block; }
@@ -560,7 +562,7 @@ export default function HostSummaryPublicClient() {
       .hsp-chip { font-size: 13px; padding: 7px 11px; }
       .hsp-cta { width: 100%; min-height: 50px; }
       .hsp-summary-title { font-size: 19px; }
-      .hsp-summary-card, .hsp-quote-card, .hsp-gallery-card { padding: 15px; border-radius: 16px; }
+      .hsp-summary-card, .hsp-motto-card, .hsp-gallery-card { padding: 15px; border-radius: 16px; }
       .hsp-quote-card { font-size: 16px; }
       .hsp-gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .hsp-sticky-cta { display: block; position: fixed; z-index: 50; left: 0; right: 0; bottom: 0; padding: 12px 14px calc(12px + env(safe-area-inset-bottom)); background: rgba(255,255,255,0.94); backdrop-filter: blur(12px); border-top: 1px solid rgba(17,24,39,0.1); box-shadow: 0 -10px 26px rgba(15,23,42,0.08); }
@@ -657,9 +659,12 @@ export default function HostSummaryPublicClient() {
                     ) : null}
 
                     {safeText(publicProfile.personal_motto) ? (
-                      <blockquote className="hsp-quote-card">
-                        “{safeText(publicProfile.personal_motto)}”
-                      </blockquote>
+                      <div className="hsp-motto-card">
+                        <h2 className="hsp-motto-title">Motto</h2>
+                        <blockquote className="hsp-quote-card">
+                          “{safeText(publicProfile.personal_motto)}”
+                        </blockquote>
+                      </div>
                     ) : null}
                   </div>
                 ) : null}
@@ -689,9 +694,12 @@ export default function HostSummaryPublicClient() {
                 ) : null}
 
                 {!isAiCompanionCard && safeText(publicProfile.personal_motto) ? (
-                  <blockquote className="hsp-quote-card hsp-desktop-only">
-                    “{safeText(publicProfile.personal_motto)}”
-                  </blockquote>
+                  <div className="hsp-motto-card hsp-desktop-only">
+                    <h2 className="hsp-motto-title">Motto</h2>
+                    <blockquote className="hsp-quote-card">
+                      “{safeText(publicProfile.personal_motto)}”
+                    </blockquote>
+                  </div>
                 ) : null}
               </div>
             </div>

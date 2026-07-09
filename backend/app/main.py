@@ -26242,9 +26242,129 @@ async def host_onboarding_preview(session_id: str, request: Request):
 
 
 
+
+def _host_onboarding_companion_catalog_generation_from_profile(profile: Dict[str, Any], session: Optional[Dict[str, Any]] = None) -> str:
+    """Return the Human Companion generation facet used by the Companion catalog.
+
+    The public Companion catalog should use the same compact Generation labels as AI
+    metadata.  For Human Host profiles, the source of truth is Host Profile Studio:
+    first an explicit generation if one is already present, otherwise the generation
+    derived from the Host birthdate.
+    """
+    profile = dict(profile or {}) if isinstance(profile, dict) else {}
+    session_obj = dict(session or {}) if isinstance(session, dict) else {}
+    public_profile = dict(profile.get("public_profile") or {})
+    quick_ref = dict(public_profile.get("quick_reference_summary") or {})
+    private_profile = dict(profile.get("private_profile") or {})
+    ai_profile = dict(profile.get("ai_profile") or {})
+    ai_private = dict(ai_profile.get("private_identity") or {})
+    basics = dict(session_obj.get("basics") or {})
+
+    explicit = _normalize_companion_generation_label(
+        public_profile.get("generation")
+        or quick_ref.get("generation")
+        or ai_profile.get("generation")
+    )
+    if explicit:
+        return explicit
+
+    birthdate = (
+        private_profile.get("birthdate")
+        or ai_private.get("birthdate")
+        or basics.get("birthdate")
+        or quick_ref.get("birthdate")
+    )
+    return _normalize_companion_generation_label(_host_onboarding_generation_label(birthdate))
+
+
+def _host_onboarding_companion_catalog_ethnicity_from_profile(profile: Dict[str, Any], session: Optional[Dict[str, Any]] = None) -> str:
+    """Return the Human Companion ethnicity/race facet used by the Companion catalog.
+
+    The Companion page dropdowns and card pills should stay aligned with AI metadata
+    values such as Caucasian, Black, Asian, Hispanic, etc.  Therefore Human cards use
+    Race detail when supplied, otherwise the prescriptive Race field.  Heritage text
+    such as "French, English, Irish..." remains public-summary content, not the
+    catalog/dropdown facet.
+    """
+    profile = dict(profile or {}) if isinstance(profile, dict) else {}
+    session_obj = dict(session or {}) if isinstance(session, dict) else {}
+    public_profile = dict(profile.get("public_profile") or {})
+    quick_ref = dict(public_profile.get("quick_reference_summary") or {})
+    private_profile = dict(profile.get("private_profile") or {})
+    ai_profile = dict(profile.get("ai_profile") or {})
+    ai_private = dict(ai_profile.get("private_identity") or {})
+    basics = dict(session_obj.get("basics") or {})
+
+    race_source = (
+        private_profile.get("race_detail")
+        or ai_private.get("race_detail")
+        or basics.get("race_detail")
+        or private_profile.get("race_primary")
+        or ai_private.get("race_primary")
+        or basics.get("race_primary")
+        or public_profile.get("race_label")
+        or public_profile.get("raceLabel")
+        or public_profile.get("race")
+        or quick_ref.get("race")
+    )
+    race_label = _normalize_companion_ethnicity_label(_host_onboarding_race_label(race_source)) if _host_onboarding_safe_str(race_source) else ""
+    if race_label:
+        return race_label
+
+    # Last-resort compatibility for older approved profiles that do not carry any
+    # race fields. Prefer an existing normalized compact value if one is already present.
+    fallback = (
+        public_profile.get("companion_catalog_ethnicity")
+        or public_profile.get("companionCatalogEthnicity")
+        or public_profile.get("ethnicity")
+        or quick_ref.get("ethnicity")
+    )
+    return _normalize_companion_ethnicity_label(fallback)
+
 def _host_onboarding_public_payload_from_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     public_profile = dict(profile.get("public_profile") or {})
     public_page = dict(profile.get("public_page") or {})
+
+    # v10.0.0-alpha10: expose the Host Profile Studio legal first name as a
+    # public-summary display field when a Host profile intentionally includes a
+    # Real Name line. The source of truth remains Host Profile Studio basics /
+    # compiled profile, not the public/stage name. Only the first name is exposed.
+    private_profile = dict(profile.get("private_profile") or {})
+    ai_profile = dict(profile.get("ai_profile") or {})
+    ai_private_identity = dict(ai_profile.get("private_identity") or {})
+    legal_name_source = _host_onboarding_safe_str(
+        private_profile.get("legal_name")
+        or private_profile.get("legalName")
+        or ai_profile.get("host_real_name_private")
+        or ai_profile.get("hostRealNamePrivate")
+        or ai_private_identity.get("legal_name")
+        or ai_private_identity.get("legalName")
+        or ""
+    )
+    real_first_name = _companion_avatar_first_name(legal_name_source) if legal_name_source else ""
+    if real_first_name:
+        public_profile["real_first_name"] = real_first_name
+        public_profile["realFirstName"] = real_first_name
+        # Keep legacy consumers that read real_name working, but expose only the first name.
+        public_profile["real_name"] = real_first_name
+        public_profile["realName"] = real_first_name
+        public_page["real_first_name"] = real_first_name
+        public_page["realFirstName"] = real_first_name
+
+    catalog_generation = _host_onboarding_companion_catalog_generation_from_profile(profile)
+    if catalog_generation:
+        public_profile["generation"] = catalog_generation
+        public_profile["generationLabel"] = catalog_generation
+
+    catalog_ethnicity = _host_onboarding_companion_catalog_ethnicity_from_profile(profile)
+    if catalog_ethnicity:
+        # Preserve public_profile.ethnicity for public-summary heritage text, but expose
+        # a compact catalog facet for Companion cards/dropdowns.
+        public_profile["race_label"] = catalog_ethnicity
+        public_profile["raceLabel"] = catalog_ethnicity
+        public_profile["companion_catalog_ethnicity"] = catalog_ethnicity
+        public_profile["companionCatalogEthnicity"] = catalog_ethnicity
+
     education_entries = _host_onboarding_normalize_education_entries(public_profile.get("education_entries") or public_page.get("education_entries") or public_profile.get("education") or public_page.get("education_text"))
     education_text = _host_onboarding_format_education_entries_text(education_entries) or _host_onboarding_safe_str(public_profile.get("education") or public_page.get("education_text"))
     headshot_asset, gallery_assets = _host_onboarding_split_public_assets(public_profile.get("assets") or public_page.get("gallery_assets") or [])
@@ -26345,8 +26465,8 @@ def _my_elaralo_companion_cards_db_sync(brand: str, companion_type: str = "", ge
                 "display_name": display_name,
                 "headline": _host_onboarding_safe_str(public_page.get("headline") or display_name),
                 "gender": _host_onboarding_safe_str(public_profile.get("gender") or quick_ref.get("gender")),
-                "ethnicity": _normalize_companion_ethnicity_label(public_profile.get("ethnicity") or quick_ref.get("ethnicity")),
-                "generation": _normalize_companion_generation_label(public_profile.get("generation") or quick_ref.get("generation")),
+                "ethnicity": _host_onboarding_companion_catalog_ethnicity_from_profile(profile) or _normalize_companion_ethnicity_label(public_profile.get("ethnicity") or quick_ref.get("ethnicity")),
+                "generation": _host_onboarding_companion_catalog_generation_from_profile(profile) or _normalize_companion_generation_label(public_profile.get("generation") or quick_ref.get("generation")),
                 "headshot_url": _host_onboarding_safe_str(((public_page.get("headshot_asset") or {}).get("url")) or row["headshot_url"]),
                 "approved_version_id": _host_onboarding_safe_str(row["approved_version_id"]),
                 "elevenVoiceId": _host_onboarding_safe_str(row["eleven_voice_id"]),
@@ -26544,28 +26664,18 @@ def _my_elaralo_human_profile_card_from_version(
         or basics.get("birthdate")
         or quick_ref.get("birthdate")
     )
-    generation = _normalize_companion_generation_label(
+    generation = _host_onboarding_companion_catalog_generation_from_profile(profile, session=session) or _normalize_companion_generation_label(
         public_profile.get("generation")
         or quick_ref.get("generation")
         or _host_onboarding_generation_label(birthdate)
     )
-    race_source = (
-        public_profile.get("race")
-        or quick_ref.get("race")
-        or private_profile.get("race_primary")
-        or basics.get("race_primary")
-        or private_profile.get("race_detail")
-        or basics.get("race_detail")
-    )
-    ethnicity = _normalize_companion_ethnicity_label(
-        _host_onboarding_race_label(race_source) if _host_onboarding_safe_str(race_source) else (
-            public_profile.get("ethnicity")
-            or quick_ref.get("ethnicity")
-            or private_profile.get("ethnicity_detail")
-            or private_profile.get("ethnicity_bucket")
-            or basics.get("ethnicity_detail")
-            or basics.get("ethnicity_bucket")
-        )
+    ethnicity = _host_onboarding_companion_catalog_ethnicity_from_profile(profile, session=session) or _normalize_companion_ethnicity_label(
+        public_profile.get("ethnicity")
+        or quick_ref.get("ethnicity")
+        or private_profile.get("ethnicity_detail")
+        or private_profile.get("ethnicity_bucket")
+        or basics.get("ethnicity_detail")
+        or basics.get("ethnicity_bucket")
     )
     gender = _host_onboarding_safe_str(
         public_profile.get("gender")
