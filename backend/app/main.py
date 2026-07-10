@@ -21166,6 +21166,42 @@ def _human_photo_db_ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_human_photo_request_phrases_lookup ON human_companion_photo_request_phrases(brand, companion_mapping_id, normalized_phrase, status)"
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_companion_photo_pending_confirmations (
+              pending_id TEXT PRIMARY KEY,
+              brand TEXT NOT NULL,
+              companion_mapping_id INTEGER NOT NULL,
+              viewer_key TEXT NOT NULL,
+              member_id TEXT,
+              session_id TEXT,
+              normalized_phrase TEXT NOT NULL,
+              phrase_text TEXT NOT NULL,
+              requested_tags_json TEXT NOT NULL DEFAULT '[]',
+              status TEXT NOT NULL DEFAULT 'active',
+              created_epoch REAL NOT NULL,
+              updated_epoch REAL NOT NULL,
+              expires_epoch REAL NOT NULL
+            )
+            """
+        )
+        for name, coldef in [
+            ("viewer_key", "viewer_key TEXT NOT NULL DEFAULT ''"),
+            ("member_id", "member_id TEXT"),
+            ("session_id", "session_id TEXT"),
+            ("normalized_phrase", "normalized_phrase TEXT NOT NULL DEFAULT ''"),
+            ("phrase_text", "phrase_text TEXT NOT NULL DEFAULT ''"),
+            ("requested_tags_json", "requested_tags_json TEXT NOT NULL DEFAULT '[]'"),
+            ("status", "status TEXT NOT NULL DEFAULT 'active'"),
+            ("created_epoch", "created_epoch REAL NOT NULL DEFAULT 0"),
+            ("updated_epoch", "updated_epoch REAL NOT NULL DEFAULT 0"),
+            ("expires_epoch", "expires_epoch REAL NOT NULL DEFAULT 0"),
+        ]:
+            _human_photo_ensure_column(conn, "human_companion_photo_pending_confirmations", name, coldef)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_human_photo_pending_lookup ON human_companion_photo_pending_confirmations(brand, companion_mapping_id, viewer_key, session_id, status, expires_epoch)"
+        )
         _HUMAN_PHOTO_DB_READY = True
 
 
@@ -21251,23 +21287,169 @@ def _human_photo_pending_from_state(session_state: Dict[str, Any]) -> Dict[str, 
     }
 
 
+def _human_photo_db_pending_lookup_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    brand: str,
+    companion_mapping_id: int,
+    viewer_key: str,
+    session_id: str,
+    now_epoch: Optional[float] = None,
+) -> Dict[str, Any]:
+    now = float(now_epoch or time.time())
+    b = str(brand or "").strip() or "Elaralo"
+    viewer = str(viewer_key or "").strip()
+    sid = str(session_id or "").strip()
+    if not viewer and not sid:
+        return {}
+    try:
+        conn.execute(
+            """
+            UPDATE human_companion_photo_pending_confirmations
+               SET status='expired', updated_epoch=?
+             WHERE brand=?
+               AND companion_mapping_id=?
+               AND status='active'
+               AND expires_epoch < ?
+            """,
+            (now, b, int(companion_mapping_id), now),
+        )
+    except Exception:
+        pass
+    row = conn.execute(
+        """
+        SELECT *
+          FROM human_companion_photo_pending_confirmations
+         WHERE brand=?
+           AND companion_mapping_id=?
+           AND status='active'
+           AND expires_epoch >= ?
+           AND (viewer_key=? OR (? <> '' AND session_id=?))
+         ORDER BY updated_epoch DESC, created_epoch DESC
+         LIMIT 1
+        """,
+        (b, int(companion_mapping_id), now, viewer, sid, sid),
+    ).fetchone()
+    if row is None:
+        return {}
+    data = dict(row)
+    return {
+        "pending_id": str(data.get("pending_id") or ""),
+        "phrase": str(data.get("phrase_text") or ""),
+        "normalized_phrase": str(data.get("normalized_phrase") or ""),
+        "terms": _human_photo_safe_json_list(data.get("requested_tags_json") or "[]"),
+        "asked_at_epoch": data.get("created_epoch"),
+        "source": "db",
+    }
+
+
+def _human_photo_db_store_pending_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    brand: str,
+    companion_mapping_id: int,
+    viewer_key: str,
+    member_id: str,
+    session_id: str,
+    pending_payload: Dict[str, Any],
+    now_epoch: Optional[float] = None,
+) -> None:
+    now = float(now_epoch or time.time())
+    b = str(brand or "").strip() or "Elaralo"
+    viewer = str(viewer_key or "").strip()
+    sid = str(session_id or "").strip()
+    if not viewer and not sid:
+        return
+    phrase = str((pending_payload or {}).get("phrase") or "").strip()[:500]
+    normalized = _human_photo_normalize_phrase((pending_payload or {}).get("normalized_phrase") or phrase)
+    terms = _human_photo_safe_json_list((pending_payload or {}).get("terms") or [])
+    if not phrase and not normalized:
+        return
+    conn.execute(
+        """
+        UPDATE human_companion_photo_pending_confirmations
+           SET status='superseded', updated_epoch=?
+         WHERE brand=?
+           AND companion_mapping_id=?
+           AND status='active'
+           AND (viewer_key=? OR (? <> '' AND session_id=?))
+        """,
+        (now, b, int(companion_mapping_id), viewer, sid, sid),
+    )
+    conn.execute(
+        """
+        INSERT INTO human_companion_photo_pending_confirmations
+        (pending_id, brand, companion_mapping_id, viewer_key, member_id, session_id,
+         normalized_phrase, phrase_text, requested_tags_json, status, created_epoch, updated_epoch, expires_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        """,
+        (
+            uuid.uuid4().hex,
+            b,
+            int(companion_mapping_id),
+            viewer,
+            str(member_id or ""),
+            sid,
+            normalized,
+            phrase,
+            json.dumps(list(terms or []), separators=(",", ":")),
+            now,
+            now,
+            now + float(_HUMAN_PHOTO_PENDING_TTL_SECONDS or 1800),
+        ),
+    )
+
+
+def _human_photo_db_clear_pending_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    brand: str,
+    companion_mapping_id: int,
+    viewer_key: str,
+    session_id: str,
+    status: str = "resolved",
+    now_epoch: Optional[float] = None,
+) -> None:
+    now = float(now_epoch or time.time())
+    b = str(brand or "").strip() or "Elaralo"
+    viewer = str(viewer_key or "").strip()
+    sid = str(session_id or "").strip()
+    if not viewer and not sid:
+        return
+    safe_status = str(status or "resolved").strip()[:40] or "resolved"
+    conn.execute(
+        """
+        UPDATE human_companion_photo_pending_confirmations
+           SET status=?, updated_epoch=?
+         WHERE brand=?
+           AND companion_mapping_id=?
+           AND status='active'
+           AND (viewer_key=? OR (? <> '' AND session_id=?))
+        """,
+        (safe_status, now, b, int(companion_mapping_id), viewer, sid, sid),
+    )
+
+
 def _human_photo_terms_for_confirmed_pending(pending: Dict[str, Any], request_text: Any) -> List[str]:
     if not isinstance(pending, dict):
         return []
     phrase = str(pending.get("phrase") or request_text or "").strip()
     has_stored_terms = "terms" in pending
     stored_terms = _human_photo_safe_json_list(pending.get("terms")) if has_stored_terms else []
-    recomputed_terms = _human_photo_request_terms(phrase)
 
-    # If the current parser sees no visual terms, keep the confirmed request
-    # generic even if an older alpha15.2 pending payload or learned phrase stored
-    # stale terms such as "possible". This makes a follow-up "Yes, I am" deliver
-    # the next photo instead of doing a metadata no-match.
+    # An explicit empty terms list means the backend asked for confirmation of a
+    # generic mention such as "photo" or "photo of you". A later "Yes" must stay
+    # generic. Recomputing tags from the whole earlier sentence can pick up
+    # non-visual words such as "architect", "software", "capability", or
+    # "correctly" and incorrectly return the canned no-photo response while
+    # inventory is still available.
+    if has_stored_terms and not stored_terms:
+        return []
+
+    recomputed_terms = _human_photo_request_terms(phrase)
     if not recomputed_terms:
         return []
     if not has_stored_terms:
-        return recomputed_terms
-    if not stored_terms:
         return recomputed_terms
 
     recomputed_set = set(recomputed_terms)
@@ -21279,7 +21461,6 @@ def _human_photo_terms_for_confirmed_pending(pending: Dict[str, Any], request_te
                 seen.add(term)
                 filtered.append(term)
     return filtered or recomputed_terms
-
 
 def _human_photo_yes_no_intent(text: Any) -> str:
     low = _human_photo_normalize_phrase(text)
@@ -21305,21 +21486,45 @@ def _human_photo_yes_no_intent(text: Any) -> str:
     return ""
 
 
+def _human_photo_has_current_delivery_request(low: str) -> bool:
+    """Detect an explicit current-turn instruction/request to deliver a photo."""
+    value = re.sub(r"\s+", " ", str(low or "").lower()).strip()
+    if not value or not _human_photo_has_media_word(value):
+        return False
+    media_word = _HUMAN_PHOTO_MEDIA_WORD_RE_SRC
+    delivery_verbs = r"(?:send|sending|show|showing|share|sharing|give|text|post|upload|attach|display|get|see|have|receive)"
+    patterns = [
+        r"\b(?:can|could|will|would)\s+you\b.{0,60}\b" + delivery_verbs + r"\b.{0,120}\b" + media_word + r"\b",
+        r"\bwould\s+you\s+mind\b.{0,60}\b" + delivery_verbs + r"\b.{0,120}\b" + media_word + r"\b",
+        r"\b(?:can|could|may)\s+i\b.{0,60}\b(?:see|get|have|receive)\b.{0,120}\b" + media_word + r"\b",
+        r"\b(?:(?:would|could|can)\s+it\s+be\s+possible|is\s+it\s+possible)\b.{0,120}\b" + delivery_verbs + r"\b.{0,120}\b" + media_word + r"\b",
+        r"\b(?:i\s+want|i\s+would\s+like|i'd\s+like|i\s+need)\b.{0,120}\b" + media_word + r"\b",
+        r"(?:^|[.!?;:]|\b(?:so|then|now|please|correctly|today)\s+)(?:please\s+)?(?:send|show|share|give|text|post|upload|attach|display)\b.{0,100}\b" + media_word + r"\b",
+    ]
+    return any(re.search(pattern, value) for pattern in patterns)
+
+
 def _human_photo_is_meta_reference(text: Any) -> bool:
     low = re.sub(r"\s+", " ", str(text or "").lower()).strip()
     if not low or not _human_photo_has_media_word(low):
         return False
     media_word = _HUMAN_PHOTO_MEDIA_WORD_RE_SRC
+
+    # Current delivery requests must win over earlier QA/test wording in the same
+    # sentence. Example: "test your ability to send photos so is it possible for
+    # you to send me a photo" is a live request, not only a test reference.
+    if _human_photo_has_current_delivery_request(low):
+        return False
+
     patterns = [
         r"\b(?:test|testing|tested|check|checking|confirm|verify|make\s+sure|making\s+sure|wanted\s+to\s+test|wanted\s+to\s+check)\b.{0,140}\b(?:able|ability|could|can|would|were|was)?\b.{0,80}\b(?:send|sent|sending|show|showed|showing|share|shared|sharing|deliver|delivered|delivering)\b.{0,80}\b" + media_word + r"\b",
-        r"\b(?:able|ability)\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
+        r"\b(?:able|ability|capability)\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
         r"\b(?:you\s+were|you\s+are|you're)\s+able\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
         r"\b(?:not|wasn't|was\s+not|isn't|is\s+not)\s+(?:the\s+)?(?:question|request)\b.{0,120}\b" + media_word + r"\b",
         r"\bhow\s+many\b.{0,60}\b" + media_word + r"\b.{0,120}\b(?:requested|received|gotten|got|sent|shared|shown|delivered|used|consumed)\b",
         r"\b(?:count|number)\s+of\b.{0,60}\b" + media_word + r"\b.{0,80}\b(?:requested|received|sent|shared|shown|delivered|used|consumed)\b",
     ]
     return any(re.search(pattern, low) for pattern in patterns)
-
 
 def _human_photo_is_ambiguous_photo_mention(text: Any) -> bool:
     raw = str(text or "").strip()
@@ -21377,7 +21582,7 @@ def _human_photo_request_terms(text: Any) -> List[str]:
     # Discard preamble before the actual media-request anchor. Without this,
     # conversational lead-ins such as "It's going very well" or "Yes, thank you"
     # can become false metadata terms and cause no_match.
-    request_anchor_re = r"\b(?:would\s+you\s+mind|can\s+you|could\s+you|will\s+you|would\s+you|may\s+i|can\s+i|could\s+i|do\s+you|did\s+you|would\s+it\s+be\s+possible|could\s+it\s+be\s+possible|can\s+it\s+be\s+possible|is\s+it\s+possible|i\s+want|i\s+would\s+like|i'd\s+like|i\s+need)\b"
+    request_anchor_re = r"\b(?:would\s+you\s+mind|can\s+you|could\s+you|will\s+you|would\s+you|may\s+i|can\s+i|could\s+i|do\s+you|did\s+you|would\s+it\s+be\s+possible|could\s+it\s+be\s+possible|can\s+it\s+be\s+possible|is\s+it\s+possible|i\s+want|i\s+would\s+like|i'd\s+like|i\s+need|send\s+(?:me|us|a|an|the|some|one|another|photo|photos|picture|pictures|pic|pics|selfie|selfies)|show\s+(?:me|us|a|an|the|some|one|another|photo|photos|picture|pictures|pic|pics|selfie|selfies)|share\s+(?:me|with\s+me|a|an|the|some|one|another|photo|photos|picture|pictures|pic|pics|selfie|selfies))\b"
     anchors = list(re.finditer(request_anchor_re, scoped))
     if anchors:
         scoped = scoped[anchors[-1].start():]
@@ -21479,7 +21684,7 @@ def _human_photo_detect_request(text: Any) -> Tuple[bool, List[str]]:
         if terms:
             concise_specific = True
 
-    delivery_intent = bool(direct_command or polite_request or desire_request or possible_request or concise_specific)
+    delivery_intent = bool(direct_command or polite_request or desire_request or possible_request or concise_specific or _human_photo_has_current_delivery_request(low))
     if not delivery_intent:
         return False, []
     return True, _human_photo_request_terms(low)
