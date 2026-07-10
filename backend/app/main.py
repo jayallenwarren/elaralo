@@ -10798,7 +10798,12 @@ async def chat(request: Request):
         _perf_stage("chat.display_text_ready")
 
         audio_url: Optional[str] = None
-        if voice_id and reply_text.strip():
+        # Do not assign to the outer `voice_id` variable inside this nested helper.
+        # Assigning to it would make Python treat it as a local variable for the whole
+        # function, causing an UnboundLocalError on normal /chat responses.  Keep a
+        # request-local effective voice instead, then let the DB mapping override it.
+        effective_voice_id = str(voice_id or "").strip()
+        if effective_voice_id and reply_text.strip():
             _perf_stage("chat.tts_start")
             try:
                 tts_brand, tts_avatar = _resolved_tts_brand_avatar(state_out)
@@ -10825,7 +10830,7 @@ async def chat(request: Request):
                 if tts_ctx.get("phonetic"):
                     tts_mapping_phonetic = tts_ctx.get("phonetic", tts_mapping_phonetic)
                 if tts_ctx.get("voice_id"):
-                    voice_id = tts_ctx.get("voice_id", voice_id)
+                    effective_voice_id = str(tts_ctx.get("voice_id") or effective_voice_id).strip()
 
                 tts_reply_text = _normalize_tts_generation_text(
                     reply_text,
@@ -10836,12 +10841,12 @@ async def chat(request: Request):
 
                 tts_cache_context = _tts_phonetic_cache_context(tts_brand, tts_avatar, tts_mapping_phonetic)
                 if _TTS_CHAT_CACHE_FIRST and _TTS_CACHE_ENABLED:
-                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, tts_reply_text, tts_cache_context)
+                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, effective_voice_id, tts_reply_text, tts_cache_context)
                 if audio_url is None:
                     audio_url = await run_in_threadpool(
                         _tts_audio_url_sync,
                         session_id,
-                        voice_id,
+                        effective_voice_id,
                         tts_reply_text,
                         tts_brand,
                         tts_avatar,
