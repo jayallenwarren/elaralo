@@ -6897,6 +6897,18 @@ const playLocalTtsUrl = useCallback(
           m.volume = 1;
         } catch (e) {}
 
+        // Defensive pace reset for iOS/Safari hidden-media playback. The backend
+        // does not intentionally speed up ElevenLabs audio, but resetting the
+        // media element every time prevents a stale browser playbackRate from
+        // carrying into a new AI Representative response.
+        try {
+          m.defaultPlaybackRate = 1;
+          m.playbackRate = 1;
+          (m as any).preservesPitch = true;
+          (m as any).mozPreservesPitch = true;
+          (m as any).webkitPreservesPitch = true;
+        } catch (e) {}
+
         // Local (audio-only) TTS stays on the hidden VIDEO element, but we do not
         // route it through WebAudio (can cause silence with non-CORS media).
         try { m.muted = false; m.volume = 1; } catch (e) {}

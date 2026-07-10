@@ -20891,6 +20891,14 @@ _HUMAN_PHOTO_STOPWORDS = {
     "picture", "pictures", "please", "send", "share", "show", "snapshot", "selfie", "some", "that", "the", "them",
     "to", "want", "with", "would", "you", "your", "see", "looking", "look", "give", "get", "take", "taking",
     "new", "another", "more", "any", "something", "thing", "file", "attachment", "attached", "like", "looks",
+    # Generic request/chit-chat terms must not turn a normal "photo of yourself" request
+    # into a metadata-specific request.  Otherwise the selector returns no_match even
+    # when inventory exists, because these words are not visual metadata tags.
+    "about", "again", "all", "anything", "appreciate", "back", "bit", "chance", "check", "come", "day",
+    "else", "going", "good", "hello", "hey", "hi", "how", "later", "little", "mind", "much", "name",
+    "nothing", "ok", "okay", "problem", "question", "re", "reply", "response", "self", "sharing", "sending",
+    "talk", "talking", "there", "was", "were", "what", "when", "whenever", "where", "which", "who", "why",
+    "yourself", "myself", "herself", "himself", "itself", "ourselves", "themselves",
 }
 _HUMAN_PHOTO_DELIVERY_KIND = "requested_human_photo"
 
@@ -21161,8 +21169,26 @@ def _human_photo_is_paid_subscriber(*, is_trial: bool, plan_name_raw: Any, plan_
 def _human_photo_request_terms(text: Any) -> List[str]:
     raw = str(text or "").lower()
     raw = re.sub(r"https?://\S+", " ", raw)
-    raw = re.sub(r"[^a-z0-9\s-]+", " ", raw)
-    tokens = [t.strip("- ") for t in re.split(r"\s+", raw) if t.strip("- ")]
+
+    # Scope term extraction to the clause that actually contains the media request.
+    # Example fixed by v10.0.0-alpha15.1:
+    #   "It's going good ... would you mind sharing a photo of yourself with me"
+    # should be a generic photo request, not a metadata-specific search for
+    # "going/good/question/mind/sharing/yourself".
+    media_word_re = r"(?:photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)"
+    clauses = [c for c in re.split(r"[.!?;\n\r]+", raw) if re.search(r"\b" + media_word_re + r"\b", c)]
+    scoped = " ".join(clauses).strip() or raw
+
+    # Remove common request scaffolding. Keep visual descriptors such as
+    # "yellow dress", "beach", "sailing", "smiling", etc.
+    scoped = re.sub(r"\b(?:would\s+you\s+mind|can\s+you|could\s+you|will\s+you|may\s+i|can\s+i|could\s+i|do\s+you|did\s+you)\b", " ", scoped)
+    scoped = re.sub(r"\b(?:send|sending|show|share|sharing|give|text|post|upload|attach|display|see|get|have|take|taking)\b", " ", scoped)
+    scoped = re.sub(r"\b" + media_word_re + r"\b", " ", scoped)
+    scoped = re.sub(r"\b(?:of|with|for)\s+(?:me|you|yourself|myself|herself|himself|itself|ourselves|themselves|us|them)\b", " ", scoped)
+    scoped = re.sub(r"\b(?:of|with|for)\s+(?:your\s+own|your\s+self|my\s+self)\b", " ", scoped)
+
+    scoped = re.sub(r"[^a-z0-9\s-]+", " ", scoped)
+    tokens = [t.strip("- ") for t in re.split(r"\s+", scoped) if t.strip("- ")]
     terms: List[str] = []
     seen: Set[str] = set()
     for token in tokens:
@@ -21178,7 +21204,6 @@ def _human_photo_request_terms(text: Any) -> List[str]:
             seen.add(phrase)
             terms.append(phrase)
     return terms[:12]
-
 
 def _human_photo_detect_request(text: Any) -> Tuple[bool, List[str]]:
     raw = str(text or "").strip()
