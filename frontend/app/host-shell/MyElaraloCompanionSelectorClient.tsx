@@ -948,8 +948,9 @@ export default function MyElaraloCompanionSelectorClient() {
               const canOpenConnect = Boolean(companionKey);
               const connectButtonLabel = `Connect with ${firstNameFromDisplayName(card.displayName)}`;
               const canViewSummary = Boolean(companionKey || safeText(card.summaryPublicUrl));
+              // Companion type already appears as the badge at the top-right of the
+              // card.  Do not repeat "Human"/"AI" in the metadata chip row.
               const lines = [
-                card.companionType,
                 card.gender,
                 card.ethnicity,
                 card.generation,

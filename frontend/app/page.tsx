@@ -961,39 +961,7 @@ function readCompanionListReturnContextFromUrl(): CompanionListReturnContext {
       "show_companion_list_button",
     ])) === true;
 
-    // v10.0.0-alpha5:
-    // Summary Public handoff can arrive without selectableCompanionCount/return flags.
-    // In that case, the selected companion was still launched from the Elaralo
-    // companion surface and should retain the Swap Companion return affordance.
-    const sourceRaw = firstQueryValue(params, ["source", "handoffSource", "handoff_source", "origin"]);
-    const normalizedSource = sourceRaw.toLowerCase().replace(/[^a-z0-9]+/g, "");
-    const handoffSourceRaw = firstQueryValue(params, ["handoffSource", "handoff_source", "origin"]);
-    const normalizedHandoffSource = handoffSourceRaw.toLowerCase().replace(/[^a-z0-9]+/g, "");
-    const brandRaw = firstQueryValue(params, ["brand", "rebranding", "companyName", "company_name", "company"]) || DEFAULT_COMPANY_NAME;
-    const hasSelectedCompanion = Boolean(firstQueryValue(params, [
-      "avatar",
-      "avatarName",
-      "avatar_name",
-      "companion",
-      "companionName",
-      "companion_name",
-      "selectedAvatar",
-      "selected_avatar",
-      "selectedCompanion",
-      "selected_companion",
-      "companionKey",
-      "companion_key",
-    ]));
-    const selectorLikeSources = ["myelaralo", "elaraloapp", "elaralocatalog", "elaralo", "summarypublic"];
-    const inferredElaraloSelectorReturn =
-      isElaraloBrandName(brandRaw) &&
-      hasSelectedCompanion &&
-      (selectorLikeSources.includes(normalizedSource) || selectorLikeSources.includes(normalizedHandoffSource));
-
-    const shouldShowReturnButton = wantsReturnButton || inferredElaraloSelectorReturn;
-    const effectiveCount = count > 1 ? count : (inferredElaraloSelectorReturn ? 2 : count);
-
-    if (effectiveCount <= 1 || !shouldShowReturnButton) return { enabled: false, count: effectiveCount, url: "" };
+    if (count <= 1 || !wantsReturnButton) return { enabled: false, count, url: "" };
 
     const rawUrl = firstQueryValue(params, ["companionListUrl", "companion_list_url", "returnUrl", "return_url"]);
     let target: URL | null = null;
@@ -1027,7 +995,7 @@ function readCompanionListReturnContextFromUrl(): CompanionListReturnContext {
     target.searchParams.set("showCompanionList", "1");
     target.searchParams.set("returningFromConnect", "1");
 
-    return { enabled: true, count: effectiveCount, url: target.toString() };
+    return { enabled: true, count, url: target.toString() };
   } catch {
     return { enabled: false, count: 0, url: "" };
   }
@@ -2758,13 +2726,6 @@ const HO_CARD: React.CSSProperties = {
 };
 const HO_INPUT: React.CSSProperties = {
   width: "100%",
-  boxSizing: "border-box",
-  position: "relative",
-  zIndex: 2,
-  pointerEvents: "auto",
-  WebkitUserSelect: "text",
-  userSelect: "text",
-  touchAction: "manipulation",
   borderRadius: 12,
   border: "1px solid rgba(0,0,0,0.16)",
   padding: "12px 14px",
@@ -2787,15 +2748,6 @@ const HO_BTN_PRIMARY: React.CSSProperties = {
   background: "#111",
   color: "#fff",
   cursor: "pointer",
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  boxSizing: "border-box",
-  position: "relative",
-  zIndex: 2,
-  pointerEvents: "auto",
-  touchAction: "manipulation",
-  WebkitTapHighlightColor: "transparent",
 };
 const HO_BTN_SECONDARY: React.CSSProperties = {
   borderRadius: 12,
@@ -2806,15 +2758,6 @@ const HO_BTN_SECONDARY: React.CSSProperties = {
   background: "#fff",
   color: "#111",
   cursor: "pointer",
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  boxSizing: "border-box",
-  position: "relative",
-  zIndex: 2,
-  pointerEvents: "auto",
-  touchAction: "manipulation",
-  WebkitTapHighlightColor: "transparent",
 };
 const HO_BADGE = (bg: string): React.CSSProperties => ({
   display: "inline-flex",
@@ -4293,9 +4236,8 @@ const startupIdentityResolvedRef = useRef<boolean>(!isEmbedded);
 // Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
 // until the companionName has been received from the Wix MEMBER_PLAN payload.
 const STARTUP_OVERLAY_MS = 800;
-// Hard cap: do not block the UI indefinitely if the Wix payload / companion image arrives late.
-// v10.0.0-alpha2: keep this long enough to prevent Elaralo/Elara logo flashes during DulceMoon boot.
-const STARTUP_OVERLAY_MAX_WAIT_MS = 3000;
+// Hard cap: do not block the UI for more than ~2s if the Wix payload / companion name arrives late.
+const STARTUP_OVERLAY_MAX_WAIT_MS = 1200;
 
 // Brief startup overlay (covers the iframe on initial refresh).
 // Requirement: do not display the "...waiting on <companionName>" message (or start the 800ms timer)
@@ -4334,13 +4276,13 @@ const armStartupOverlay = useCallback(
       startupOverlayHardCapTimerRef.current = null;
     }
 
-    // v10.0.0-alpha2:
-    // In embedded white-label launches, do not start the countdown merely because the name arrived.
-    // Wait until the selected companion visual is also ready so the default Elaralo/Elara image never flashes.
+    // Start the 800ms countdown once (first time we learn the companion name from Wix).
+    // If the name is not yet available, we keep the overlay (message hidden) until the hard-cap triggers.
     if (!nm) return;
-    if (!isEmbedded) startStartupOverlayCountdown();
+
+    startStartupOverlayCountdown();
   },
-  [isEmbedded, startStartupOverlayCountdown],
+  [startStartupOverlayCountdown],
 );
 
 
@@ -4737,8 +4679,8 @@ useEffect(() => {
 
 
   // Companion identity (drives persona + companion mapping)
-  const [companionName, setCompanionName] = useState<string>(() => (isEmbedded ? "" : DEFAULT_COMPANION_NAME));
-  const [avatarSrc, setAvatarSrc] = useState<string>(() => (isEmbedded ? "" : DEFAULT_AVATAR));
+  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
+  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   // Optional white-label rebranding (RebrandingKey from Wix or ?rebrandingKey=...).
   // IMPORTANT: This must never alter STT/TTS start/stop code paths.
   const [rebrandingKey, setRebrandingKey] = useState<string>("");
@@ -4953,26 +4895,7 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     }
   }, [upgradeUrl]);
 
-  const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(() => (isEmbedded ? "" : DEFAULT_AVATAR));
-  const startupCompanionVisualReady = useMemo(() => {
-    if (!isEmbedded) return true;
-    const currentAvatar = String(avatarSrc || "").trim();
-    const currentLogo = String(companyLogoSrc || "").trim();
-    if (!currentAvatar) return false;
-    if (currentAvatar === DEFAULT_AVATAR) return false;
-    if (currentLogo && currentAvatar === currentLogo) return false;
-    if (currentAvatar.includes("-logo.")) return false;
-    return true;
-  }, [avatarSrc, companyLogoSrc, isEmbedded]);
-
-  useEffect(() => {
-    if (!startupOverlayOpen) return;
-    if (!startupIdentityResolved) return;
-    if (!startupOverlayName) return;
-    if (!startupCompanionVisualReady) return;
-    startStartupOverlayCountdown();
-  }, [startupOverlayOpen, startupIdentityResolved, startupOverlayName, startupCompanionVisualReady, startStartupOverlayCountdown]);
-
+  const [companyLogoSrc, setCompanyLogoSrc] = useState<string>(DEFAULT_AVATAR);
   const companyName = useMemo(() => {
     const derived = String(
       rebrandingName ||
@@ -13637,11 +13560,13 @@ const speakGreetingIfNeeded = useCallback(
     }
 
     const name = (companionName || "").trim() || "Companion";
-    // Include the current phonetic value in the spoken-greeting once-key.  If a DBA corrects
-    // companion_mappings.phonetic, the corrected greeting is allowed to play in the same
-    // browser session instead of being suppressed by an older name-only key.
-    const phoneticKeyPart = normalizeKeyForFile(String(companionPhonetic || "no-phonetic").trim() || "no-phonetic");
-    const key = `ELARALO_GREET_SPOKEN:${name}:${phoneticKeyPart}`;
+    // Include backend mapping load/voice context in the spoken-greeting once-key.
+    // This avoids suppressing a corrected pronunciation after the API reloads the
+    // companion_mappings row, while still keeping the greeting once-per-session.
+    const mappingLoadedAtKey = normalizeKeyForFile(String((companionMapping as any)?.loadedAt || "no-loaded-at"));
+    const voiceKeyPart = normalizeKeyForFile(String((companionMapping as any)?.elevenVoiceId || (companionMapping as any)?.eleven_voice_id || "no-voice"));
+    const phoneticKeyPart = normalizeKeyForFile(String(companionPhonetic || "backend-authoritative").trim() || "backend-authoritative");
+    const key = `ELARALO_GREET_SPOKEN:${name}:${voiceKeyPart}:${phoneticKeyPart}:${mappingLoadedAtKey}`;
 
     // Already spoken this session?
     try {
@@ -13652,13 +13577,12 @@ const speakGreetingIfNeeded = useCallback(
     if (greetInFlightRef.current) return;
     greetInFlightRef.current = true;
 
-    // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
-    // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
-    // For the spoken greeting only, use the curated phonetic value when available. The visible chat bubble
-    // still displays the companion name normally, but the first audio line will not rely on the TTS backend
-    // finding/replacing the display name before playback.
-    const spokenGreetingName = String(companionPhonetic || "").trim() || name;
-    const greetText = `Hi, I'm ${spokenGreetingName}. I'm here with you. How are you feeling today?`;
+    // IMPORTANT: do NOT pre-substitute the phonetic value in the browser.
+    // The backend is the authority for both the current ElevenLabs voice and the
+    // current companion_mappings.phonetic value. Sending the visible display name
+    // here lets /tts/audio-url resolve the fresh DB row and prevents stale
+    // mappingPhonetic values from the browser from driving the first greeting.
+    const greetText = greetingFor(name);
     // Local audio-only greeting must always use the companion's ElevenLabs voice.
     // (Live avatar uses its own configured voice via the DID agent.)
     const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
@@ -15101,7 +15025,7 @@ const modePillControls = (
         >
           <img
             // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
-            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || (isEmbedded && startupOverlayOpen ? "" : DEFAULT_AVATAR)}
+            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
             alt={companyName}
             style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
             onError={(e) => {
@@ -15119,21 +15043,7 @@ const modePillControls = (
           />
         </div>
         <div>
-          <h1 style={{ margin: 0, fontSize: ui.title }}>
-            {isElaraloBrandName(companyName) ? (
-              <a
-                href="https://www.elaralo.com"
-                target="_top"
-                rel="noopener noreferrer"
-                style={{ color: "inherit", textDecoration: "none" }}
-                title="Return to Elaralo.com"
-              >
-                {companyName}
-              </a>
-            ) : (
-              companyName
-            )}
-          </h1>
+          <h1 style={{ margin: 0, fontSize: ui.title }}>{companyName}</h1>
           <div style={{ fontSize: ui.meta, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
             <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>

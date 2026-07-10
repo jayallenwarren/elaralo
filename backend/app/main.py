@@ -9794,7 +9794,78 @@ def _chat_authoritative_phonetic_reply(session_state: Dict[str, Any], user_text:
     return f'My name, {name}, is pronounced "{phonetic}."'
 
 
+
+def _tts_authoritative_companion_context(
+    brand: str,
+    avatar: str,
+    mapping_phonetic: str = "",
+    requested_type: str = "",
+) -> Dict[str, str]:
+    """Resolve the current DB voice + phonetic context for TTS.
+
+    This function is intentionally database-authoritative.  Browser sessions can
+    keep stale companionPhonetic/mappingPhonetic values after an admin updates
+    companion_mappings.phonetic, and the Connect route can also briefly have an
+    older or fallback voice id while the mapping request is settling.  For every
+    backend TTS generation/cache lookup, prefer the current companion_mappings
+    row for:
+      - eleven_voice_id
+      - phonetic
+      - SQL avatar / mapping_avatar
+
+    The requested payload values remain fallback only when no DB row exists.
+    """
+    b = str(brand or "").strip()
+    a = str(avatar or "").strip()
+    requested = str(requested_type or "").strip()
+    out: Dict[str, str] = {
+        "brand": b,
+        "avatar": a,
+        "phonetic": str(mapping_phonetic or "").strip(),
+        "voice_id": "",
+        "source": "payload",
+    }
+    if not b or not a:
+        return out
+
+    row: Dict[str, Any] = {}
+    try:
+        row = _lookup_companion_mapping_with_aliases(b, a, requested) or {}
+    except Exception:
+        row = {}
+    if not row:
+        return out
+
+    row_avatar = str((row or {}).get("mapping_avatar") or (row or {}).get("avatar") or "").strip()
+    row_phonetic = str((row or {}).get("phonetic") or "").strip()
+    row_voice_id = str((row or {}).get("eleven_voice_id") or "").strip()
+    row_brand = str((row or {}).get("brand") or b).strip()
+
+    if row_brand:
+        out["brand"] = row_brand
+    if row_avatar:
+        out["avatar"] = row_avatar
+    if row_phonetic:
+        out["phonetic"] = row_phonetic
+    if row_voice_id:
+        out["voice_id"] = row_voice_id
+    out["source"] = "db"
+    return out
+
 def _tts_audio_url_sync(session_id: str, voice_id: str, text: str, brand: str = "", avatar: str = "", mapping_phonetic: str = "", cache_context: str = "") -> str:
+    # Backend authority: resolve the active DB mapping for voice + phonetic every time.
+    # This prevents the first greeting from using a stale browser phonetic or a
+    # fallback/front-end voice that differs from subsequent chat replies.
+    tts_ctx = _tts_authoritative_companion_context(brand, avatar, mapping_phonetic)
+    if tts_ctx.get("brand"):
+        brand = tts_ctx.get("brand", brand)
+    if tts_ctx.get("avatar"):
+        avatar = tts_ctx.get("avatar", avatar)
+    if tts_ctx.get("phonetic"):
+        mapping_phonetic = tts_ctx.get("phonetic", mapping_phonetic)
+    if tts_ctx.get("voice_id"):
+        voice_id = tts_ctx.get("voice_id", voice_id)
+
     # Pronunciation normalization runs before caching/audio generation.
     # This is intentionally alias-aware so initial greetings sent from Wix/Connect
     # use companion_mappings.phonetic from the very first spoken line.
@@ -10739,6 +10810,23 @@ async def chat(request: Request):
                     _tts_explicit_phonetic_from_payload(state_out)
                     or _tts_explicit_phonetic_from_payload(session_state)
                 )
+                tts_requested_type = str(
+                    state_out.get("companionType")
+                    or state_out.get("companion_type")
+                    or session_state.get("companionType")
+                    or session_state.get("companion_type")
+                    or ""
+                ).strip() if isinstance(state_out, dict) and isinstance(session_state, dict) else ""
+                tts_ctx = _tts_authoritative_companion_context(tts_brand, tts_avatar, tts_mapping_phonetic, tts_requested_type)
+                if tts_ctx.get("brand"):
+                    tts_brand = tts_ctx.get("brand", tts_brand)
+                if tts_ctx.get("avatar"):
+                    tts_avatar = tts_ctx.get("avatar", tts_avatar)
+                if tts_ctx.get("phonetic"):
+                    tts_mapping_phonetic = tts_ctx.get("phonetic", tts_mapping_phonetic)
+                if tts_ctx.get("voice_id"):
+                    voice_id = tts_ctx.get("voice_id", voice_id)
+
                 tts_reply_text = _normalize_tts_generation_text(
                     reply_text,
                     brand=tts_brand,
@@ -13321,6 +13409,27 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
             _tts_explicit_phonetic_from_payload(body)
             or _tts_explicit_phonetic_from_payload(tts_state)
         )
+
+        # Prefer current DB mapping for both voice and pronunciation before
+        # computing the TTS cache key.  A stale client value must not keep an old
+        # pronunciation or a fallback voice alive for the initial greeting.
+        requested_type = str(
+            body.get("companionType")
+            or body.get("companion_type")
+            or tts_state.get("companionType")
+            or tts_state.get("companion_type")
+            or ""
+        ).strip()
+        tts_ctx = _tts_authoritative_companion_context(brand, avatar, mapping_phonetic, requested_type)
+        if tts_ctx.get("brand"):
+            brand = tts_ctx.get("brand", brand)
+        if tts_ctx.get("avatar"):
+            avatar = tts_ctx.get("avatar", avatar)
+        if tts_ctx.get("phonetic"):
+            mapping_phonetic = tts_ctx.get("phonetic", mapping_phonetic)
+        if tts_ctx.get("voice_id"):
+            voice_id = tts_ctx.get("voice_id", voice_id)
+
         text_for_tts = _normalize_tts_generation_text(
             text,
             brand=brand,
