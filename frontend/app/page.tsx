@@ -13697,7 +13697,8 @@ const speakGreetingIfNeeded = useCallback(
         await speakAssistantReply(greetText);
       } else {
         // Local audio-only (video element on iOS; audio element on desktop)
-        await speakLocalTtsReply(greetText, voiceId, hooks, { playbackRate: 0.88 });
+        // Restored to the manifest baseline: no greeting-specific playbackRate override.
+        await speakLocalTtsReply(greetText, voiceId, hooks);
       }
 
       // Mark spoken ONLY after successful playback.

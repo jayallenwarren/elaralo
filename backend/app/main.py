@@ -20904,6 +20904,7 @@ _HUMAN_PHOTO_STOPWORDS = {
     "else", "going", "good", "hello", "hey", "hi", "how", "later", "little", "mind", "much", "name",
     "nothing", "ok", "okay", "problem", "question", "re", "reply", "response", "self", "sharing", "sending",
     "talk", "talking", "there", "was", "were", "what", "when", "whenever", "where", "which", "who", "why",
+    "able", "ability", "make", "many", "possible", "possibly", "requested", "requesting", "sure", "test", "thank", "thanks", "uh", "very", "volume", "well", "wonder", "wondering", "right", "suggesting",
     "yourself", "myself", "herself", "himself", "itself", "ourselves", "themselves",
 }
 _HUMAN_PHOTO_DELIVERY_KIND = "requested_human_photo"
@@ -21216,10 +21217,16 @@ def _human_photo_clear_pending_updates() -> Dict[str, Any]:
 
 def _human_photo_pending_payload(text: Any, terms: Optional[List[str]] = None) -> Dict[str, Any]:
     phrase = str(text or "").strip()[:500]
+    # Preserve an explicit empty term list. Generic pending requests such as
+    # "photo of you" or "would it be possible to get a photo of you" must stay
+    # generic after the viewer confirms them. Re-deriving terms from the full
+    # phrase can create false metadata terms and return a no-match canned reply
+    # even though inventory exists.
+    safe_terms = _human_photo_safe_json_list(terms) if terms is not None else _human_photo_request_terms(phrase)
     return {
         "phrase": phrase,
         "normalized_phrase": _human_photo_normalize_phrase(phrase),
-        "terms": list(terms or _human_photo_request_terms(phrase) or []),
+        "terms": list(safe_terms or []),
         "asked_at_epoch": time.time(),
     }
 
@@ -21242,6 +21249,36 @@ def _human_photo_pending_from_state(session_state: Dict[str, Any]) -> Dict[str, 
         "terms": _human_photo_safe_json_list(terms),
         "asked_at_epoch": raw.get("asked_at_epoch"),
     }
+
+
+def _human_photo_terms_for_confirmed_pending(pending: Dict[str, Any], request_text: Any) -> List[str]:
+    if not isinstance(pending, dict):
+        return []
+    phrase = str(pending.get("phrase") or request_text or "").strip()
+    has_stored_terms = "terms" in pending
+    stored_terms = _human_photo_safe_json_list(pending.get("terms")) if has_stored_terms else []
+    recomputed_terms = _human_photo_request_terms(phrase)
+
+    # If the current parser sees no visual terms, keep the confirmed request
+    # generic even if an older alpha15.2 pending payload or learned phrase stored
+    # stale terms such as "possible". This makes a follow-up "Yes, I am" deliver
+    # the next photo instead of doing a metadata no-match.
+    if not recomputed_terms:
+        return []
+    if not has_stored_terms:
+        return recomputed_terms
+    if not stored_terms:
+        return recomputed_terms
+
+    recomputed_set = set(recomputed_terms)
+    filtered: List[str] = []
+    seen: Set[str] = set()
+    for term in stored_terms:
+        if term in recomputed_set or any((term in r or r in term) for r in recomputed_terms):
+            if term not in seen:
+                seen.add(term)
+                filtered.append(term)
+    return filtered or recomputed_terms
 
 
 def _human_photo_yes_no_intent(text: Any) -> str:
@@ -21278,6 +21315,8 @@ def _human_photo_is_meta_reference(text: Any) -> bool:
         r"\b(?:able|ability)\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
         r"\b(?:you\s+were|you\s+are|you're)\s+able\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
         r"\b(?:not|wasn't|was\s+not|isn't|is\s+not)\s+(?:the\s+)?(?:question|request)\b.{0,120}\b" + media_word + r"\b",
+        r"\bhow\s+many\b.{0,60}\b" + media_word + r"\b.{0,120}\b(?:requested|received|gotten|got|sent|shared|shown|delivered|used|consumed)\b",
+        r"\b(?:count|number)\s+of\b.{0,60}\b" + media_word + r"\b.{0,80}\b(?:requested|received|sent|shared|shown|delivered|used|consumed)\b",
     ]
     return any(re.search(pattern, low) for pattern in patterns)
 
@@ -21335,9 +21374,17 @@ def _human_photo_request_terms(text: Any) -> List[str]:
     clauses = [c for c in re.split(r"[.!?;\n\r]+", raw) if re.search(r"\b" + media_word_re + r"\b", c)]
     scoped = " ".join(clauses).strip() or raw
 
+    # Discard preamble before the actual media-request anchor. Without this,
+    # conversational lead-ins such as "It's going very well" or "Yes, thank you"
+    # can become false metadata terms and cause no_match.
+    request_anchor_re = r"\b(?:would\s+you\s+mind|can\s+you|could\s+you|will\s+you|would\s+you|may\s+i|can\s+i|could\s+i|do\s+you|did\s+you|would\s+it\s+be\s+possible|could\s+it\s+be\s+possible|can\s+it\s+be\s+possible|is\s+it\s+possible|i\s+want|i\s+would\s+like|i'd\s+like|i\s+need)\b"
+    anchors = list(re.finditer(request_anchor_re, scoped))
+    if anchors:
+        scoped = scoped[anchors[-1].start():]
+
     # Remove common request scaffolding. Keep visual descriptors such as
     # "yellow dress", "beach", "sailing", "smiling", etc.
-    scoped = re.sub(r"\b(?:would\s+you\s+mind|can\s+you|could\s+you|will\s+you|may\s+i|can\s+i|could\s+i|do\s+you|did\s+you)\b", " ", scoped)
+    scoped = re.sub(r"\b(?:would\s+you\s+mind|can\s+you|could\s+you|will\s+you|would\s+you|may\s+i|can\s+i|could\s+i|do\s+you|did\s+you|would\s+it\s+be\s+possible|could\s+it\s+be\s+possible|can\s+it\s+be\s+possible|is\s+it\s+possible)\b", " ", scoped)
     scoped = re.sub(r"\b(?:send|sending|show|share|sharing|give|text|post|upload|attach|display|see|get|have|take|taking)\b", " ", scoped)
     scoped = re.sub(r"\b" + media_word_re + r"\b", " ", scoped)
     scoped = re.sub(r"\b(?:of|with|for)\s+(?:me|you|yourself|myself|herself|himself|itself|ourselves|themselves|us|them)\b", " ", scoped)
@@ -21415,13 +21462,24 @@ def _human_photo_detect_request(text: Any) -> Tuple[bool, List[str]]:
         low,
     )
 
+    # Natural live wording: "Would it be possible to get a photo of you?"
+    # That is a direct current-turn photo request, not merely an ambiguous
+    # mention that should ask for confirmation.
+    possible_request = re.search(
+        r"\b(?:would|could|can)\s+it\s+be\s+possible\b.{0,80}\b(?:to\s+)?(?:send|show|share|give|get|see|have|receive)\b.{0,120}\b" + media_word + r"\b",
+        low,
+    ) or re.search(
+        r"\bis\s+it\s+possible\b.{0,80}\b(?:to\s+)?(?:send|show|share|give|get|see|have|receive)\b.{0,120}\b" + media_word + r"\b",
+        low,
+    )
+
     concise_specific = False
     if len(words) <= 8:
         terms = _human_photo_request_terms(low)
         if terms:
             concise_specific = True
 
-    delivery_intent = bool(direct_command or polite_request or desire_request or concise_specific)
+    delivery_intent = bool(direct_command or polite_request or desire_request or possible_request or concise_specific)
     if not delivery_intent:
         return False, []
     return True, _human_photo_request_terms(low)
@@ -21430,7 +21488,19 @@ def _human_photo_detect_request(text: Any) -> Tuple[bool, List[str]]:
 def _human_photo_metadata_file_payload(photo_dir: str) -> Dict[str, Any]:
     if not photo_dir or not os.path.isdir(photo_dir):
         return {}
-    for name in _HUMAN_PHOTO_METADATA_FILENAMES:
+    candidate_names: List[str] = list(_HUMAN_PHOTO_METADATA_FILENAMES)
+    try:
+        for entry in os.listdir(photo_dir):
+            low = str(entry or "").strip().lower()
+            if not low.endswith(".json"):
+                continue
+            if "photo_metadata" not in low and "human_photo_metadata" not in low:
+                continue
+            if entry not in candidate_names:
+                candidate_names.append(entry)
+    except Exception:
+        pass
+    for name in candidate_names:
         path = os.path.join(photo_dir, name)
         if not os.path.isfile(path):
             continue
@@ -22157,7 +22227,7 @@ def _human_photo_requested_photo_turn_sync(
 
         if pending and pending_answer == "yes":
             request_text_for_delivery = str(pending.get("phrase") or request_text or "").strip()
-            terms = _human_photo_safe_json_list(pending.get("terms") or []) or _human_photo_request_terms(request_text_for_delivery)
+            terms = _human_photo_terms_for_confirmed_pending(pending, request_text_for_delivery)
             direct_request = True
             learning_confirmed = True
         else:
