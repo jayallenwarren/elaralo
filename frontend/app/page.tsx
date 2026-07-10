@@ -4391,17 +4391,17 @@ useEffect(() => {
   // This avoids TypeScript/TDZ issues where a callback dependency array would otherwise
   // reference `memberId` before its declaration.
   const memberIdRef = useRef<string>("");
-    // Keep the latest host memberId available for early callbacks (prevents TDZ issues).
-    const hostMemberIdRef = useRef<string>("");
+	  // Keep the latest host memberId available for early callbacks (prevents TDZ issues).
+	  const hostMemberIdRef = useRef<string>("");
 
   // Wix member id (empty for visitors). Declared early so it can be referenced
   // safely in dependency arrays above (prevents TS "used before its declaration").
   const [memberId, setMemberId] = useState<string>("");
 
   const autoJoinStreamRef = useRef<boolean>(false);
-  // Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
-  const stopInProgressRef = useRef<boolean>(false);
-  const sessionActiveRef = useRef<boolean>(false);
+	// Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
+	const stopInProgressRef = useRef<boolean>(false);
+	const sessionActiveRef = useRef<boolean>(false);
   const streamOptOutRef = useRef<boolean>(false);
   const conferenceOptOutRef = useRef<boolean>(false);
 
@@ -5566,19 +5566,35 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   useEffect(() => {
     sessionActiveRef.current = sessionActive;
   }, [sessionActive]);
-    const mappedHostMemberId = useMemo(() => {
-      const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
-      return String(v || "");
-    }, [companionMapping]);
+	  const [payloadHostMemberId, setPayloadHostMemberId] = useState<string>("");
+	  const [payloadIsHostUser, setPayloadIsHostUser] = useState<boolean>(false);
 
-    // Treat "host" as the *membership* that owns this companion.
-    // IMPORTANT: do NOT derive host-ness from `livekitRole` because `livekitRole` is updated asynchronously
-    // and the Host must never be prompted for a viewer username.
-    const isHost = Boolean(memberId && mappedHostMemberId && memberId === mappedHostMemberId);
-    const isViewer = Boolean(memberId && mappedHostMemberId && memberId !== mappedHostMemberId);
-    useEffect(() => {
-      hostMemberIdRef.current = String(mappedHostMemberId || "");
-    }, [mappedHostMemberId]);
+	  const mappedHostMemberId = useMemo(() => {
+	    const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
+	    return String(v || "");
+	  }, [companionMapping]);
+
+	  const effectiveHostMemberIdForConsole = useMemo(() => {
+	    const mapped = String(mappedHostMemberId || "").trim();
+	    const hinted = String(payloadHostMemberId || "").trim();
+	    return mapped || hinted;
+	  }, [mappedHostMemberId, payloadHostMemberId]);
+
+	  // Keep the existing mapping-based host flag unchanged for non-console behavior.
+	  // Host Console uses the Wix MEMBER_PLAN host hint so it can appear before
+	  // the async companion_mappings lookup completes.
+	  const isHost = Boolean(memberId && mappedHostMemberId && memberId === mappedHostMemberId);
+	  const isViewer = Boolean(memberId && mappedHostMemberId && memberId !== mappedHostMemberId);
+	  const isHostConsoleUser = Boolean(
+	    memberId &&
+	      (
+	        Boolean(mappedHostMemberId && memberId === mappedHostMemberId) ||
+	        Boolean(payloadIsHostUser && payloadHostMemberId && memberId === payloadHostMemberId)
+	      )
+	  );
+	  useEffect(() => {
+	    hostMemberIdRef.current = String(effectiveHostMemberIdForConsole || "");
+	  }, [effectiveHostMemberIdForConsole]);
 
 
 // ----------------------------
@@ -5660,7 +5676,7 @@ useEffect(() => {
 
 const loadHostGuidelines = useCallback(async () => {
   try {
-    if (!isHost) return;
+    if (!isHostConsoleUser) return;
     if (!API_BASE) return;
 
     const brand = String(companyName || "").trim();
@@ -5695,11 +5711,11 @@ const loadHostGuidelines = useCallback(async () => {
     setHostGuidelinesStatus("");
     setHostGuidelinesError(String(e?.message || e || "Failed to load guidelines"));
   }
-}, [API_BASE, isHost, companyName, companionName]);
+}, [API_BASE, isHostConsoleUser, companyName, companionName]);
 
 const saveHostGuidelines = useCallback(async () => {
   try {
-    if (!isHost) return;
+    if (!isHostConsoleUser) return;
     if (!API_BASE) return;
 
     const brand = String(companyName || "").trim();
@@ -5734,11 +5750,11 @@ const saveHostGuidelines = useCallback(async () => {
     setHostGuidelinesStatus("");
     setHostGuidelinesError(String(e?.message || e || "Failed to save guidelines"));
   }
-}, [API_BASE, isHost, companyName, companionName, hostGuidelinesText]);
+}, [API_BASE, isHostConsoleUser, companyName, companionName, hostGuidelinesText]);
 
 
 const loadHostInsightsUsers = useCallback(async () => {
-  if (!API_BASE || !isHost || !companyName || !companionName || !memberId) return;
+  if (!API_BASE || !isHostConsoleUser || !companyName || !companionName || !memberId) return;
   setHostInsightsLoading(true);
   setHostInsightsError("");
   try {
@@ -5755,11 +5771,11 @@ const loadHostInsightsUsers = useCallback(async () => {
   } finally {
     setHostInsightsLoading(false);
   }
-}, [API_BASE, isHost, companyName, companionName, memberId]);
+}, [API_BASE, isHostConsoleUser, companyName, companionName, memberId]);
 
 const loadHostInsightsSummaries = useCallback(
   async (targetMemberId: string) => {
-    if (!API_BASE || !isHost || !companyName || !companionName || !memberId) return;
+    if (!API_BASE || !isHostConsoleUser || !companyName || !companionName || !memberId) return;
     setHostInsightsLoading(true);
     setHostInsightsError("");
     try {
@@ -5777,11 +5793,11 @@ const loadHostInsightsSummaries = useCallback(
       setHostInsightsLoading(false);
     }
   },
-  [API_BASE, isHost, companyName, companionName, memberId]
+  [API_BASE, isHostConsoleUser, companyName, companionName, memberId]
 );
 
 const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
-  if (!API_BASE || !isHost || !companyName || !companionName || !memberId) return false;
+  if (!API_BASE || !isHostConsoleUser || !companyName || !companionName || !memberId) return false;
   const q = String(rawQuestion || "").trim();
   if (!q) return false;
   setHostInsightsLoading(true);
@@ -5808,7 +5824,7 @@ const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
   } finally {
     setHostInsightsLoading(false);
   }
-}, [API_BASE, isHost, companyName, companionName, memberId, hostInsightsSelectedMemberId]);
+}, [API_BASE, isHostConsoleUser, companyName, companionName, memberId, hostInsightsSelectedMemberId]);
 
 const askHostInsights = useCallback(async () => {
   const q = (hostInsightsQuestion || "").trim();
@@ -5821,15 +5837,15 @@ const askHostInsights = useCallback(async () => {
   const [livekitJoinRequestId, setLivekitJoinRequestId] = useState<string>("");
 
   const [livekitPending, setLivekitPending] = useState<Array<any>>([]);
-  const livekitPendingUnique = useMemo(() => {
-    const byKey = new Map<string, any>();
-    for (const r of livekitPending || []) {
-      const key = String(r?.memberId || r?.requestId || "");
-      if (!key) continue;
-      if (!byKey.has(key)) byKey.set(key, r);
-    }
-    return Array.from(byKey.values());
-  }, [livekitPending]);
+	const livekitPendingUnique = useMemo(() => {
+		const byKey = new Map<string, any>();
+		for (const r of livekitPending || []) {
+			const key = String(r?.memberId || r?.requestId || "");
+			if (!key) continue;
+			if (!byKey.has(key)) byKey.set(key, r);
+		}
+		return Array.from(byKey.values());
+	}, [livekitPending]);
   // Viewers must press Play to join live streams.
   // We only reset the auto-join guard when a live stream ends.
   useEffect(() => {
@@ -6415,11 +6431,11 @@ if (liveProvider === "stream") {
   try {
     const embedDomain = typeof window !== "undefined" ? window.location.hostname : "";
 
-      // Ask server to resolve room + determine host vs viewer.
-      // NOTE: Never prompt the Host for a username.
-      const displayNameForToken = isViewer
-        ? String(ensureViewerLiveChatName() || preferredViewerDisplayName || "Viewer").trim()
-        : String(companionName || "Host").trim();
+	    // Ask server to resolve room + determine host vs viewer.
+	    // NOTE: Never prompt the Host for a username.
+	    const displayNameForToken = isViewer
+	      ? String(ensureViewerLiveChatName() || preferredViewerDisplayName || "Viewer").trim()
+	      : String(companionName || "Host").trim();
 
 const res = await fetch(`${API_BASE}/stream/livekit/start_embed`, {
       method: "POST",
@@ -7646,7 +7662,7 @@ useEffect(() => {
 // Host console polling (list + selected transcript)
 useEffect(() => {
   if (!hostConsoleOpen) return;
-  if (!isHost) return;
+  if (!isHostConsoleUser) return;
   if (!API_BASE) return;
 
   let cancelled = false;
@@ -7709,7 +7725,7 @@ useEffect(() => {
     cancelled = true;
     if (timer) clearTimeout(timer);
   };
-}, [API_BASE, hostConsoleOpen, isHost, companyName, companionName, hostActiveChats.length, adaptiveHostListPollDelayMs]);
+}, [API_BASE, hostConsoleOpen, isHostConsoleUser, companyName, companionName, hostActiveChats.length, adaptiveHostListPollDelayMs]);
 
 useEffect(() => {
   if (!hostConsoleOpen) return;
@@ -7746,7 +7762,7 @@ useEffect(() => {
 
 useEffect(() => {
   if (!hostConsoleOpen) return;
-  if (!isHost) return;
+  if (!isHostConsoleUser) return;
   if (!API_BASE) return;
   if (!hostSelectedSessionId) return;
 
@@ -7869,7 +7885,7 @@ useEffect(() => {
 }, [
   API_BASE,
   hostConsoleOpen,
-  isHost,
+  isHostConsoleUser,
   companyName,
   companionName,
   hostSelectedSessionId,
@@ -9931,20 +9947,20 @@ const startConferenceSession = useCallback(async () => {
     setLivekitMicEnabled(true);
   setLivekitCameraEnabled(true);
 
-      // Host: prime A/V permissions on the Play click (iOS/Safari requirement).
-      // Viewers are subscribe-only for now, so we do NOT require mic/cam permissions to request access.
-      if (isHost) {
-        const ok = await requestLivekitAvPermissions({
-          audio: true,
-          video: true,
-          reason: "starting a Private conference",
-        });
-        if (!ok) {
-          setAvatarStatus("error");
-          setAvatarError("Microphone and camera permissions are required to host the private conference.");
-          return;
-        }
-      }
+	    // Host: prime A/V permissions on the Play click (iOS/Safari requirement).
+	    // Viewers are subscribe-only for now, so we do NOT require mic/cam permissions to request access.
+	    if (isHost) {
+	      const ok = await requestLivekitAvPermissions({
+	        audio: true,
+	        video: true,
+	        reason: "starting a Private conference",
+	      });
+	      if (!ok) {
+	        setAvatarStatus("error");
+	        setAvatarError("Microphone and camera permissions are required to host the private conference.");
+	        return;
+	      }
+	    }
 
     // Viewers request to join a private session. The host must admit them.
     if (!isHost) {
@@ -10001,14 +10017,14 @@ const startConferenceSession = useCallback(async () => {
       setMessages((prev) => prev.filter((m) => !m?.meta?.liveChat));
       liveChatSeenIdsRef.current = new Set();
 
-        try {
-          const requestedDisplayName = String(
-            ensureViewerLiveChatName({
-              promptText: "Please enter your name to enter the the session",
-            }) ||
-              preferredViewerDisplayName ||
-              "",
-          ).trim();
+	      try {
+	        const requestedDisplayName = String(
+	          ensureViewerLiveChatName({
+	            promptText: "Please enter your name to enter the the session",
+	          }) ||
+	            preferredViewerDisplayName ||
+	            "",
+	        ).trim();
 
         const resp = await fetch(`${API_BASE}/livekit/join_request`, {
           method: "POST",
@@ -11293,6 +11309,32 @@ useEffect(() => {
           ? normalizedIncomingMemberId
           : String(memberIdRef.current || "").trim();
 
+      const hasHostMemberIdField = "hostMemberId" in (data as any) || "host_member_id" in (data as any);
+      const incomingHostMemberId =
+        typeof (data as any).hostMemberId === "string"
+          ? String((data as any).hostMemberId).trim()
+          : typeof (data as any).host_member_id === "string"
+            ? String((data as any).host_member_id).trim()
+            : "";
+      const hasIsHostUserField = "isHostUser" in (data as any) || "is_host_user" in (data as any);
+      const incomingIsHostUser = Boolean((data as any).isHostUser === true || (data as any).is_host_user === true);
+
+      // Immediate Host Console eligibility from Wix MEMBER_PLAN. This state is
+      // consumed only by Host Console gates; it does not change the existing
+      // mapping-derived `isHost` used elsewhere.
+      if (incomingLoggedIn === false) {
+        setPayloadHostMemberId("");
+        setPayloadIsHostUser(false);
+      } else {
+        if (hasHostMemberIdField || incomingIsHostUser) {
+          setPayloadHostMemberId(incomingHostMemberId || (incomingIsHostUser ? effectiveMemberId : ""));
+        }
+        if (hasIsHostUserField) {
+          const hostIdForCheck = incomingHostMemberId || effectiveMemberId;
+          setPayloadIsHostUser(Boolean(incomingIsHostUser && effectiveMemberId && hostIdForCheck === effectiveMemberId));
+        }
+      }
+
       const hasDisplayNameField =
         "displayName" in (data as any) ||
         "display_name" in (data as any) ||
@@ -11714,9 +11756,9 @@ const companionForBackend =
 
 
 // NOTE:
-  // - `rebranding` (legacy) is not guaranteed to be present in this build.
-  // - Use RebrandingKey as the single source of truth for brand identity.
-  const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
+	// - `rebranding` (legacy) is not guaranteed to be present in this build.
+	// - Use RebrandingKey as the single source of truth for brand identity.
+	const rawBrand = (parseRebrandingKey(rebrandingKey || "")?.rebranding || DEFAULT_COMPANY_NAME).trim();
 const brandKey = safeBrandKey(rawBrand);
 
 // For visitors (no Wix memberId), generate a stable anon id so we can track freeMinutes usage.
@@ -12186,11 +12228,11 @@ async function send(textOverride?: string, stateOverride?: Partial<SessionState>
     if (uploadingAttachment) return;
     if (!rawText && !hasAttachment) return;
 
-      // Hard rule: no attachments during Live Stream sessions.
-      if (sessionKind === "stream" && (uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
-        try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
-        return;
-      }
+	    // Hard rule: no attachments during Live Stream sessions.
+	    if (sessionKind === "stream" && (uploadsDisabled || hostInStreamUi || viewerInStreamUi) && hasAttachment) {
+	      try { window.alert("Attachments are disabled during Shared Live streaming."); } catch (e) {}
+	      return;
+	    }
 
     // If the user clears messages mid-flight, we "invalidate" any in-progress send()
     // so the assistant reply doesn't append into a cleared chat.
@@ -14123,12 +14165,12 @@ const hostInStreamUi =
     avatarStatus === "reconnecting");
 
 const viewerInStreamUi = viewerHasJoinedStream;
-    // Attachments are disabled during Live Stream sessions, but should remain enabled for Live Private Conference.
-    const attachmentButtonDisabled =
-      loading ||
-      uploadingAttachment ||
-      uploadsDisabled ||
-      (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
+		// Attachments are disabled during Live Stream sessions, but should remain enabled for Live Private Conference.
+		const attachmentButtonDisabled =
+		  loading ||
+		  uploadingAttachment ||
+		  uploadsDisabled ||
+		  (sessionKind === "stream" && (hostInStreamUi || viewerInStreamUi));
 
 useEffect(() => {
   // Viewer STT must be disabled while in the LegacyStream stream UI to avoid transcribing the host audio.
@@ -15134,8 +15176,8 @@ const modePillControls = (
             <b>{avatarStatus}</b>
             {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
           </div>
-            {/* On mobile, push usage to the bottom to maximize above-the-fold space. */}
-            {!isMobileUI && usageMeterEl}
+	          {/* On mobile, push usage to the bottom to maximize above-the-fold space. */}
+	          {!isMobileUI && usageMeterEl}
           {liveProvider === "stream" ? (
             <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
               {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
@@ -15170,7 +15212,7 @@ const modePillControls = (
                     fontWeight: 700,
                   }}
                 >
-          ● {hostInStreamUi ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}` : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
+					● {hostInStreamUi ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}` : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
                 </span>
               ) : null}
             </div>
@@ -15306,58 +15348,58 @@ const modePillControls = (
       
       {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
       {sttControls}
-        {liveProvider === "stream" &&
-          ((isHost &&
-            ((sessionKind === "conference" && Boolean(livekitToken)) ||
-              (sessionKind === "stream" && sessionActive))) ||
-            (!isHost && sessionKind === "conference" && Boolean(livekitToken))) ? (	          <button
-              type="button"
-              onClick={async () => {
-                const next = !livekitMicEnabled;
-                if (next) {
-                  const ok = await requestLivekitAvPermissions({
-                    audio: true,
-                    video: sessionKind === "conference",
-                    reason: "enabling microphone/camera",
-                  });
-                  if (!ok) return;
-                }
-                setLivekitMicEnabled(next);
-                if (sessionKind === "conference") {
-                  setLivekitCameraEnabled(next);
-                }
-              }}
-              style={{
-                ...smallBtn,
-                background: livekitMicEnabled ? "#1b5e20" : "#eee",
-                color: livekitMicEnabled ? "#fff" : "#222",
-              }}
-              title={livekitMicEnabled ? "Mute Mic" : "Unmute Mic"}
-            >
-              🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
-            </button>
-          ) : null}
+	      {liveProvider === "stream" &&
+	        ((isHost &&
+	          ((sessionKind === "conference" && Boolean(livekitToken)) ||
+	            (sessionKind === "stream" && sessionActive))) ||
+	          (!isHost && sessionKind === "conference" && Boolean(livekitToken))) ? (	          <button
+	            type="button"
+	            onClick={async () => {
+	              const next = !livekitMicEnabled;
+	              if (next) {
+	                const ok = await requestLivekitAvPermissions({
+	                  audio: true,
+	                  video: sessionKind === "conference",
+	                  reason: "enabling microphone/camera",
+	                });
+	                if (!ok) return;
+	              }
+	              setLivekitMicEnabled(next);
+	              if (sessionKind === "conference") {
+	                setLivekitCameraEnabled(next);
+	              }
+	            }}
+	            style={{
+	              ...smallBtn,
+	              background: livekitMicEnabled ? "#1b5e20" : "#eee",
+	              color: livekitMicEnabled ? "#fff" : "#222",
+	            }}
+	            title={livekitMicEnabled ? "Mute Mic" : "Unmute Mic"}
+	          >
+	            🎙️ {livekitMicEnabled ? "Mic On" : "Mic Off"}
+	          </button>
+	        ) : null}
 
-        {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
-          <button
-            type="button"
-            onClick={() => {
-              setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
-            }}
-            style={{
-              ...smallBtn,
-              background: conferenceViewMode === "focus" ? "#111" : "#eee",
-              color: conferenceViewMode === "focus" ? "#fff" : "#222",
-            }}
-            title={
-              conferenceViewMode === "focus"
-                ? "Show split view (both participants)"
-                : "Show full view (other participant only)"
-            }
-          >
-            {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
-          </button>
-        ) : null}
+	      {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
+	        <button
+	          type="button"
+	          onClick={() => {
+	            setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
+	          }}
+	          style={{
+	            ...smallBtn,
+	            background: conferenceViewMode === "focus" ? "#111" : "#eee",
+	            color: conferenceViewMode === "focus" ? "#fff" : "#222",
+	          }}
+	          title={
+	            conferenceViewMode === "focus"
+	              ? "Show split view (both participants)"
+	              : "Show full view (other participant only)"
+	          }
+	        >
+	          {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
+	        </button>
+	      ) : null}
 {liveProvider === "stream" &&
         ((isHost && sessionActive) ||
           (!isHost &&
@@ -15419,13 +15461,13 @@ const modePillControls = (
         >
           {showAvatarFrame ? (
             <div
-                style={{
-                  flex:
-                    liveProvider === "stream" && sessionKind === "conference"
-                      ? "2 1 0"
-                      : liveProvider === "stream" && !isHost
-                        ? "2 1 0"
-                        : "0 0 360px",
+	              style={{
+	                flex:
+	                  liveProvider === "stream" && sessionKind === "conference"
+	                    ? "2 1 0"
+	                    : liveProvider === "stream" && !isHost
+	                      ? "2 1 0"
+	                      : "0 0 360px",
                 minWidth: liveProvider === "stream" && !isHost ? 320 : 280,
                 maxWidth: "100%",
               }}
@@ -15446,11 +15488,11 @@ const modePillControls = (
                     token={livekitToken}
                     serverUrl={livekitServerUrl || LIVEKIT_URL}
                     connect={Boolean(livekitToken)}
-                      audio={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
-                      video={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
+	                    audio={(sessionKind === "conference" ? true : isHost) && livekitMicEnabled}
+	                    video={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                     onConnected={() => {
-                        // Host: once connected we treat the session as active.
-                        if (isHost) setSessionActive(true);
+	                      // Host: once connected we treat the session as active.
+	                      if (isHost) setSessionActive(true);
                       // Conference: track that we've joined the room.
                       if (sessionKind === "conference") setConferenceJoined(true);
                     }}
@@ -15477,22 +15519,22 @@ const modePillControls = (
                       cameraEnabled={(sessionKind === "conference" ? true : isHost) && (sessionKind === "conference" ? livekitCameraEnabled : true)}
                       onError={(msg) => setStreamNotice(msg)}
                     />
-                      {sessionKind === "conference" ? (
-                        <LiveKitPrivateConferenceStage viewMode={conferenceViewMode} />
-                      ) : livekitRole === "viewer" && sessionKind === "stream" ? (
-                        <LiveKitStreamViewerStage />
-                      ) : (
-                        <VideoConference
-                          chatMessageFormatter={undefined as any}
-                          onError={(e: any) => {
-                            console.warn("LiveKit UI error", e);
-                          }}
-                        />
-                      )}
+	                    {sessionKind === "conference" ? (
+	                      <LiveKitPrivateConferenceStage viewMode={conferenceViewMode} />
+	                    ) : livekitRole === "viewer" && sessionKind === "stream" ? (
+	                      <LiveKitStreamViewerStage />
+	                    ) : (
+	                      <VideoConference
+	                        chatMessageFormatter={undefined as any}
+	                        onError={(e: any) => {
+	                          console.warn("LiveKit UI error", e);
+	                        }}
+	                      />
+	                    )}
 
                     {livekitRole === "viewer" && (sessionKind === "stream" || sessionKind === "conference") ? null : <StartAudio label="Enable audio" />}
 
-            {livekitRole === "host" && livekitPendingUnique.length > 0 ? (
+						{livekitRole === "host" && livekitPendingUnique.length > 0 ? (
                       <div
                         style={{
                           position: "absolute",
@@ -15517,7 +15559,7 @@ const modePillControls = (
                         >
                           <div style={{ fontWeight: 700, marginBottom: 8 }}>Join Requests</div>
                           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {livekitPendingUnique.map((req) => (
+							{livekitPendingUnique.map((req) => (
                               <div
                                 key={req.requestId}
                                 style={{
@@ -15670,7 +15712,7 @@ const modePillControls = (
                   ) : null
                 ) : null}
 
-        {showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
+				{showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
                   <div
                     style={{
                       position: "absolute",
@@ -15700,13 +15742,13 @@ const modePillControls = (
 
           <div
                     style={{
-                      flex: showAvatarFrame
-                        ? (liveProvider === "stream" && sessionKind === "conference"
-                            ? "1 1 0"
-                            : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
-                              ? "1 1 0"
-                              : "2 1 0")
-                        : "1 1 0",
+	                    flex: showAvatarFrame
+	                      ? (liveProvider === "stream" && sessionKind === "conference"
+	                          ? "1 1 0"
+	                          : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
+	                            ? "1 1 0"
+	                            : "2 1 0")
+	                      : "1 1 0",
                       minWidth: 280,
                       height: conversationHeight,
                       display: "flex",
@@ -15783,7 +15825,7 @@ const modePillControls = (
                     <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>
                       {/** Input line with mode pills moved to the right (layout-only). */}
 
-{isHost ? (
+{isHostConsoleUser ? (
   <button
     type="button"
     onClick={() => {
@@ -15834,31 +15876,31 @@ const modePillControls = (
                         style={{ display: "none" }}
                         onChange={onAttachmentSelected}
                       />
-                    <button
-                      onClick={openUploadPicker}
-                      disabled={attachmentButtonDisabled}
+	                  <button
+	                    onClick={openUploadPicker}
+	                    disabled={attachmentButtonDisabled}
                         title={
                           uploadsDisabled || hostInStreamUi || viewerInStreamUi
                             ? "Attachments are disabled during Shared Live streaming."
                             : "Attach a file"
                         }
-                      style={{
-                        width: ICON_BTN_SIZE,
-                        height: ICON_BTN_SIZE,
-                        minWidth: ICON_BTN_SIZE,
-                        padding: 0,
-                        borderRadius: 10,
-                        border: "1px solid #bbb",
-                        boxSizing: "border-box",
-                        display: "inline-flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
-                        cursor: attachmentButtonDisabled ? "not-allowed" : "pointer",
-                        opacity: attachmentButtonDisabled ? 0.6 : 1,
-                        lineHeight: "18px",
-                        fontSize: 18,
-                      }}
+	                    style={{
+	                      width: ICON_BTN_SIZE,
+	                      height: ICON_BTN_SIZE,
+	                      minWidth: ICON_BTN_SIZE,
+	                      padding: 0,
+	                      borderRadius: 10,
+	                      border: "1px solid #bbb",
+	                      boxSizing: "border-box",
+	                      display: "inline-flex",
+	                      alignItems: "center",
+	                      justifyContent: "center",
+	                      background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
+	                      cursor: attachmentButtonDisabled ? "not-allowed" : "pointer",
+	                      opacity: attachmentButtonDisabled ? 0.6 : 1,
+	                      lineHeight: "18px",
+	                      fontSize: 18,
+	                    }}
                         type="button"
                       >
                         {uploadingAttachment ? "⏳" : "📎"}
@@ -16006,12 +16048,12 @@ const modePillControls = (
 
                     </div>
 
-                      {sttError ? (
-                        <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-                      ) : null}
+          	          {sttError ? (
+          	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+          	          ) : null}
 
-            {/* Mobile: move the usage meter below the input box to maximize above-the-fold space. */}
-            {isMobileUI ? usageMeterEl : null}
+	          {/* Mobile: move the usage meter below the input box to maximize above-the-fold space. */}
+	          {isMobileUI ? usageMeterEl : null}
 
                     {/* LiveKit Broadcast overlay (Host-only) */}
                     {showBroadcastButton && showBroadcasterOverlay ? (
@@ -16253,7 +16295,7 @@ const modePillControls = (
 
 
 {/* Host console overlay (AI chat takeover) */}
-{hostConsoleOpen && isHost ? (
+{hostConsoleOpen && isHostConsoleUser ? (
   <div
     style={{
       position: "fixed",

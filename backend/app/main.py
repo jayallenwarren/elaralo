@@ -17239,7 +17239,16 @@ def _require_host_member(brand: str, avatar: str, member_id: str) -> str:
     if not brand_s or not avatar_s:
         raise HTTPException(status_code=400, detail="brand and avatar are required")
 
-    mapping = _lookup_companion_mapping(brand_s, avatar_s) or {}
+    # Host Console surfaces may display a public/persona name such as
+    # "Sierra Sun" while companion_mappings.avatar stores the canonical
+    # provider key/first name such as "Sierra". Host authorization should
+    # resolve through the same alias-aware mapping helper used by runtime
+    # companion resolution instead of requiring an exact display-name match.
+    mapping = (
+        _lookup_companion_mapping_with_aliases(brand_s, avatar_s, "human")
+        or _lookup_companion_mapping_with_aliases(brand_s, avatar_s)
+        or {}
+    )
     host_id = str(mapping.get("host_member_id") or mapping.get("hostMemberId") or "").strip()
     if not host_id:
         raise HTTPException(status_code=404, detail="No host_member_id configured for this companion mapping")
