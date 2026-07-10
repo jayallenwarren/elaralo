@@ -58,6 +58,49 @@ type HostOnboardingReadiness = {
   full_publish_skipped_sections?: string[];
 };
 
+type HostConnectMediaItem = {
+  media_id?: number;
+  mediaId?: number;
+  media_type?: string;
+  mediaType?: string;
+  file_name?: string;
+  fileName?: string;
+  relative_path?: string;
+  relativePath?: string;
+  sequence_number?: number;
+  sequenceNumber?: number;
+  status?: string;
+  description?: string;
+  tags?: string[];
+  duration_seconds?: number;
+  durationSeconds?: number;
+  width?: number;
+  height?: number;
+  content_type?: string;
+  preview_url?: string;
+};
+
+type HostConnectMediaContext = {
+  ok?: boolean;
+  available?: boolean;
+  reason?: string;
+  brand?: string;
+  avatar?: string;
+  companion_mapping_id?: number;
+  companionMappingId?: number;
+  counts?: Record<string, any>;
+};
+
+type PendingConnectMediaUpload = {
+  id: string;
+  file: File;
+  mediaType: "photo" | "video";
+  description: string;
+  tags: string;
+  status: string;
+  error?: string;
+};
+
 type HostOnboardingStep = "welcome" | "basics" | "photos" | "review" | "completion" | "preview";
 
 type HostOnboardingContext = {
@@ -830,6 +873,14 @@ export default function HostProfileStudioClient() {
   const [showCompletionPhysicalDescriptionEditor, setShowCompletionPhysicalDescriptionEditor] = useState<boolean>(false);
   const [catalogVisibilitySaving, setCatalogVisibilitySaving] = useState<boolean>(false);
   const [localProfileDirty, setLocalProfileDirty] = useState<boolean>(false);
+  const [previewPanel, setPreviewPanel] = useState<"preview" | "media">("preview");
+  const [mediaContext, setMediaContext] = useState<HostConnectMediaContext | null>(null);
+  const [mediaItems, setMediaItems] = useState<HostConnectMediaItem[]>([]);
+  const [mediaLoading, setMediaLoading] = useState<boolean>(false);
+  const [mediaUploading, setMediaUploading] = useState<boolean>(false);
+  const [mediaStatusMessage, setMediaStatusMessage] = useState<string>("");
+  const [pendingMediaUploads, setPendingMediaUploads] = useState<PendingConnectMediaUpload[]>([]);
+  const mediaUploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const hydrateFromSession = useCallback((payload: HostOnboardingSession | null, readinessIn?: HostOnboardingReadiness | null) => {
     setSession(payload);
@@ -1399,6 +1450,198 @@ export default function HostProfileStudioClient() {
     }
   }, [handleUploadForSlot, loadPreview, session?.session_id]);
 
+  const normalizeMediaItem = useCallback((raw: any): HostConnectMediaItem => {
+    const mediaId = Number(raw?.media_id ?? raw?.mediaId ?? 0) || 0;
+    const mediaType = String(raw?.media_type || raw?.mediaType || "photo").toLowerCase() === "video" ? "video" : "photo";
+    return {
+      media_id: mediaId,
+      mediaId,
+      media_type: mediaType,
+      mediaType,
+      file_name: String(raw?.file_name || raw?.fileName || ""),
+      fileName: String(raw?.file_name || raw?.fileName || ""),
+      relative_path: String(raw?.relative_path || raw?.relativePath || ""),
+      relativePath: String(raw?.relative_path || raw?.relativePath || ""),
+      sequence_number: Number(raw?.sequence_number ?? raw?.sequenceNumber ?? 0) || 0,
+      sequenceNumber: Number(raw?.sequence_number ?? raw?.sequenceNumber ?? 0) || 0,
+      status: String(raw?.status || ""),
+      description: String(raw?.description || ""),
+      tags: Array.isArray(raw?.tags) ? raw.tags.map((x: any) => String(x || "").trim()).filter(Boolean) : [],
+      duration_seconds: Number(raw?.duration_seconds ?? raw?.durationSeconds ?? 0) || 0,
+      durationSeconds: Number(raw?.duration_seconds ?? raw?.durationSeconds ?? 0) || 0,
+      width: Number(raw?.width || 0) || 0,
+      height: Number(raw?.height || 0) || 0,
+      content_type: String(raw?.content_type || raw?.contentType || ""),
+      preview_url: String(raw?.preview_url || raw?.previewUrl || ""),
+    };
+  }, []);
+
+  const loadMediaContext = useCallback(async () => {
+    if (!API_BASE || !session?.session_id || !context.memberId) return;
+    setMediaLoading(true);
+    try {
+      const qs = new URLSearchParams({ memberId: context.memberId, sessionId: session.session_id });
+      const res = await fetch(`${API_BASE}/host-onboarding/media/context?${qs.toString()}`);
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
+      setMediaContext(data as HostConnectMediaContext);
+      if (data?.available) {
+        const listRes = await fetch(`${API_BASE}/host-onboarding/media/list?${qs.toString()}`);
+        const listData = await listRes.json().catch(() => ({} as any));
+        if (!listRes.ok || listData?.ok === false) throw new Error(String(listData?.detail || listData?.message || `HTTP ${listRes.status}`));
+        setMediaItems((Array.isArray(listData?.items) ? listData.items : []).map(normalizeMediaItem));
+        setMediaContext((prev) => ({ ...(prev || {}), counts: listData?.counts || data?.counts || {} }));
+      } else {
+        setMediaItems([]);
+      }
+    } catch (err: any) {
+      setMediaContext({ ok: false, available: false, reason: String(err?.message || "Unable to load Media tab context.") });
+    } finally {
+      setMediaLoading(false);
+    }
+  }, [context.memberId, normalizeMediaItem, session?.session_id]);
+
+  const refreshMediaList = useCallback(async () => {
+    if (!API_BASE || !session?.session_id || !context.memberId) return;
+    setMediaLoading(true);
+    setMediaStatusMessage("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/media/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ memberId: context.memberId, sessionId: session.session_id }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
+      setMediaItems((Array.isArray(data?.items) ? data.items : []).map(normalizeMediaItem));
+      setMediaContext((prev) => ({ ...(prev || {}), available: true, counts: data?.counts || prev?.counts || {} }));
+      setMediaStatusMessage("Media library synced.");
+    } catch (err: any) {
+      setError(String(err?.message || "Unable to sync Media library."));
+    } finally {
+      setMediaLoading(false);
+    }
+  }, [context.memberId, normalizeMediaItem, session?.session_id]);
+
+  useEffect(() => {
+    if (step === "preview" && session?.session_id) {
+      void loadMediaContext();
+    }
+  }, [loadMediaContext, session?.session_id, step]);
+
+  const mediaTabAvailable = Boolean(mediaContext?.available === true);
+
+  const handleMediaFileSelection = useCallback((files: FileList | null) => {
+    const selected = Array.from(files || []);
+    if (!selected.length) return;
+    const next = selected.map((file) => {
+      const lower = String(file.name || "").toLowerCase();
+      const mediaType: "photo" | "video" = lower.endsWith(".mp4") || String(file.type || "").toLowerCase().startsWith("video/") ? "video" : "photo";
+      return {
+        id: `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+        file,
+        mediaType,
+        description: "",
+        tags: "",
+        status: "selected",
+      };
+    });
+    setPendingMediaUploads((prev) => [...prev, ...next]);
+  }, []);
+
+  const updatePendingMediaUpload = useCallback((id: string, patch: Partial<PendingConnectMediaUpload>) => {
+    setPendingMediaUploads((prev) => prev.map((item) => item.id === id ? { ...item, ...patch } : item));
+  }, []);
+
+  const removePendingMediaUpload = useCallback((id: string) => {
+    setPendingMediaUploads((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const uploadPendingMedia = useCallback(async (id: string) => {
+    const item = pendingMediaUploads.find((x) => x.id === id);
+    if (!item || !session?.session_id || !context.memberId) return;
+    setMediaUploading(true);
+    setError("");
+    setMediaStatusMessage("");
+    updatePendingMediaUpload(id, { status: "validating", error: "" });
+    try {
+      const fd = new FormData();
+      fd.append("memberId", context.memberId);
+      fd.append("sessionId", session.session_id);
+      fd.append("description", item.description || "");
+      fd.append("tags", item.tags || "");
+      fd.append("approve", "1");
+      fd.append("file", item.file, item.file.name || (item.mediaType === "video" ? "upload.mp4" : "upload.jpg"));
+      const res = await fetch(`${API_BASE}/host-onboarding/media/upload`, { method: "POST", body: fd });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
+      setMediaItems((Array.isArray(data?.items) ? data.items : []).map(normalizeMediaItem));
+      setMediaContext((prev) => ({ ...(prev || {}), available: true, counts: data?.counts || prev?.counts || {} }));
+      setPendingMediaUploads((prev) => prev.filter((x) => x.id !== id));
+      setMediaStatusMessage(`${item.mediaType === "video" ? "Video" : "Photo"} uploaded and approved.`);
+    } catch (err: any) {
+      updatePendingMediaUpload(id, { status: "error", error: String(err?.message || "Upload failed.") });
+      setError(String(err?.message || "Unable to upload Media item."));
+    } finally {
+      setMediaUploading(false);
+    }
+  }, [API_BASE, context.memberId, normalizeMediaItem, pendingMediaUploads, session?.session_id, updatePendingMediaUpload]);
+
+  const updateMediaItemDraft = useCallback((mediaId: number, patch: Partial<HostConnectMediaItem>) => {
+    setMediaItems((prev) => prev.map((item) => Number(item.media_id || item.mediaId || 0) === mediaId ? { ...item, ...patch } : item));
+  }, []);
+
+  const saveMediaMetadata = useCallback(async (item: HostConnectMediaItem) => {
+    const mediaId = Number(item.media_id || item.mediaId || 0);
+    if (!mediaId || !session?.session_id || !context.memberId) return;
+    setMediaLoading(true);
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/media/${mediaId}/metadata`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          memberId: context.memberId,
+          sessionId: session.session_id,
+          description: item.description || "",
+          tags: Array.isArray(item.tags) ? item.tags : [],
+        }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
+      setMediaItems((Array.isArray(data?.items) ? data.items : []).map(normalizeMediaItem));
+      setMediaContext((prev) => ({ ...(prev || {}), counts: data?.counts || prev?.counts || {} }));
+      setMediaStatusMessage("Media metadata saved.");
+    } catch (err: any) {
+      setError(String(err?.message || "Unable to save Media metadata."));
+    } finally {
+      setMediaLoading(false);
+    }
+  }, [context.memberId, normalizeMediaItem, session?.session_id]);
+
+  const setMediaStatus = useCallback(async (item: HostConnectMediaItem, action: "approve" | "deactivate" | "reactivate") => {
+    const mediaId = Number(item.media_id || item.mediaId || 0);
+    if (!mediaId || !session?.session_id || !context.memberId) return;
+    setMediaLoading(true);
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/host-onboarding/media/${mediaId}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ memberId: context.memberId, sessionId: session.session_id }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
+      setMediaItems((Array.isArray(data?.items) ? data.items : []).map(normalizeMediaItem));
+      setMediaContext((prev) => ({ ...(prev || {}), counts: data?.counts || prev?.counts || {} }));
+      setMediaStatusMessage(action === "deactivate" ? "Media deactivated." : "Media approved/reactivated.");
+    } catch (err: any) {
+      setError(String(err?.message || "Unable to update Media status."));
+    } finally {
+      setMediaLoading(false);
+    }
+  }, [context.memberId, normalizeMediaItem, session?.session_id]);
+
   const approveProfile = useCallback(async (scope: "limited" | "full") => {
     if (!session?.session_id) return;
     setSaving(true);
@@ -1681,6 +1924,181 @@ export default function HostProfileStudioClient() {
   }, [voiceCaptureGuidance, voiceCaptureScript]);
   const voiceCaptureMinSeconds = Number((voiceCaptureGuidance as any)?.minimum_seconds || readiness.voice_capture_min_seconds || VOICE_CAPTURE_MIN_SECONDS) || VOICE_CAPTURE_MIN_SECONDS;
   const voiceCaptureTargetSeconds = Number((voiceCaptureGuidance as any)?.target_seconds || VOICE_CAPTURE_TARGET_SECONDS) || VOICE_CAPTURE_TARGET_SECONDS;
+  const renderMediaPanel = () => {
+    const counts = mediaContext?.counts || {};
+    const approvedPhotos = Number(counts.approved_photos || counts.approvedPhotos || 0) || 0;
+    const approvedVideos = Number(counts.approved_videos || counts.approvedVideos || 0) || 0;
+    const inactivePhotos = Number(counts.inactive_photos || counts.inactivePhotos || 0) || 0;
+    const inactiveVideos = Number(counts.inactive_videos || counts.inactiveVideos || 0) || 0;
+    const pendingPhotos = Number(counts.pending_photos || counts.pendingPhotos || 0) || 0;
+    const pendingVideos = Number(counts.pending_videos || counts.pendingVideos || 0) || 0;
+    const companionMappingId = Number(mediaContext?.companion_mapping_id || mediaContext?.companionMappingId || 0) || 0;
+    const publicName = String(basicsForm.public_display_name || basicsForm.stage_name || publicProfile.public_display_name || publicProfile.stage_name || context.avatar || "Companion").trim();
+    const mediaPreviewUrl = (item: HostConnectMediaItem) => {
+      const raw = String(item.preview_url || "").trim();
+      if (!raw) return "";
+      return raw.startsWith("http") ? raw : `${API_BASE}${raw.startsWith("/") ? raw : `/${raw}`}`;
+    };
+    const tagText = (item: HostConnectMediaItem) => (Array.isArray(item.tags) ? item.tags.join(", ") : "");
+    return (
+      <div style={{ display: "grid", gap: 16 }}>
+        <div style={{ display: "grid", gap: 8 }}>
+          <h2 style={{ margin: 0 }}>Media</h2>
+          <div style={{ color: "#374151", lineHeight: 1.6 }}>
+            Photos and videos, once uploaded and approved, will be delivered inside Connect upon Subscriber and Non-Subscriber requests.
+          </div>
+          <div style={{ color: "#6b7280", lineHeight: 1.6, fontSize: 13 }}>
+            Uploads are validated before they are saved. Files that cannot be validated or that violate platform safety rules will not be accepted.
+          </div>
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 14, color: "#374151" }}>
+            <span><b>Companion:</b> {publicName}</span>
+            <span><b>Companion ID:</b> {companionMappingId || "Resolving"}</span>
+          </div>
+        </div>
+
+        <div style={{ ...cardStyle, padding: 14, display: "grid", gap: 10 }}>
+          <div style={{ fontWeight: 800 }}>Summary</div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+              <thead>
+                <tr>
+                  {['Media Type', 'Approved', 'Inactive', 'Pending'].map((label) => (
+                    <th key={label} style={{ textAlign: "left", padding: "8px 10px", borderBottom: "1px solid rgba(0,0,0,0.12)" }}>{label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid rgba(0,0,0,0.08)", fontWeight: 700 }}>Photos</td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid rgba(0,0,0,0.08)" }}>{approvedPhotos}</td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid rgba(0,0,0,0.08)" }}>{inactivePhotos}</td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid rgba(0,0,0,0.08)" }}>{pendingPhotos}</td>
+                </tr>
+                <tr>
+                  <td style={{ padding: "8px 10px", fontWeight: 700 }}>Short Videos</td>
+                  <td style={{ padding: "8px 10px" }}>{approvedVideos}</td>
+                  <td style={{ padding: "8px 10px" }}>{inactiveVideos}</td>
+                  <td style={{ padding: "8px 10px" }}>{pendingVideos}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div style={{ color: "#6b7280", fontSize: 13 }}>Alerts: photos at 4 remaining and 1 remaining; videos at 4 remaining and 1 remaining.</div>
+        </div>
+
+        <div style={{ ...cardStyle, padding: 14, display: "grid", gap: 12 }}>
+          <div style={{ fontWeight: 800 }}>Upload Media</div>
+          <div style={{ color: "#4b5563", lineHeight: 1.6, fontSize: 13 }}>
+            Accepted photos: JPG, JPEG, PNG, WEBP. Accepted videos: MP4 only, 15 seconds max, 720p max.
+          </div>
+          <div>
+            <button type="button" style={secondaryButtonStyle} onClick={() => mediaUploadInputRef.current?.click()} disabled={mediaUploading || mediaLoading}>
+              Choose Files
+            </button>
+            <input
+              ref={mediaUploadInputRef}
+              type="file"
+              multiple
+              accept="image/jpeg,image/png,image/webp,video/mp4,.jpg,.jpeg,.png,.webp,.mp4"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                handleMediaFileSelection(e.currentTarget.files);
+                e.currentTarget.value = "";
+              }}
+            />
+          </div>
+          {pendingMediaUploads.length ? (
+            <div style={{ display: "grid", gap: 12 }}>
+              <div style={{ fontWeight: 700 }}>Selected Uploads</div>
+              {pendingMediaUploads.map((item) => (
+                <div key={item.id} style={{ display: "grid", gap: 10, padding: 12, border: "1px solid rgba(0,0,0,0.1)", borderRadius: 14, background: "#fff" }}>
+                  <div style={{ display: "flex", gap: 10, justifyContent: "space-between", alignItems: "center", flexWrap: "wrap" }}>
+                    <div>
+                      <b>{item.mediaType === "video" ? "Video" : "Photo"}</b> • {item.file.name} • {(item.file.size / 1024 / 1024).toFixed(2)} MB
+                    </div>
+                    <div style={{ fontSize: 13, color: item.status === "error" ? "#b91c1c" : "#6b7280" }}>{item.error || item.status}</div>
+                  </div>
+                  <label style={{ display: "grid", gap: 6 }}>
+                    <span style={{ fontWeight: 700 }}>Description</span>
+                    <input value={item.description} onChange={(e) => updatePendingMediaUpload(item.id, { description: e.target.value })} style={inputStyle} placeholder="Describe what is visible in this media" />
+                  </label>
+                  <label style={{ display: "grid", gap: 6 }}>
+                    <span style={{ fontWeight: 700 }}>Tags</span>
+                    <input value={item.tags} onChange={(e) => updatePendingMediaUpload(item.id, { tags: e.target.value })} style={inputStyle} placeholder="outdoor, portrait, greeting" />
+                  </label>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button type="button" style={buttonStyle} onClick={() => void uploadPendingMedia(item.id)} disabled={mediaUploading || mediaLoading}>
+                      {mediaUploading ? "Uploading…" : "Validate, Save & Approve"}
+                    </button>
+                    <button type="button" style={secondaryButtonStyle} onClick={() => removePendingMediaUpload(item.id)} disabled={mediaUploading}>Remove</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+
+        <div style={{ ...cardStyle, padding: 14, display: "grid", gap: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <div style={{ fontWeight: 800 }}>Media Library</div>
+            <button type="button" style={secondaryButtonStyle} onClick={() => void refreshMediaList()} disabled={mediaLoading}>{mediaLoading ? "Syncing…" : "Sync Media Library"}</button>
+          </div>
+          {mediaStatusMessage ? <div style={{ color: "#065f46", fontWeight: 700 }}>{mediaStatusMessage}</div> : null}
+          {mediaItems.length ? (
+            <div style={{ display: "grid", gap: 12 }}>
+              {mediaItems.map((item) => {
+                const mediaId = Number(item.media_id || item.mediaId || 0);
+                const mediaType = String(item.media_type || item.mediaType || "photo").toLowerCase() === "video" ? "video" : "photo";
+                const previewUrl = mediaPreviewUrl(item);
+                const seq = Number(item.sequence_number || item.sequenceNumber || 0) || 0;
+                const tagsValue = tagText(item);
+                const status = String(item.status || "");
+                return (
+                  <div key={`${mediaType}-${mediaId}-${item.file_name || item.fileName}`} style={{ display: "grid", gridTemplateColumns: "minmax(120px, 160px) minmax(0, 1fr)", gap: 12, padding: 12, border: "1px solid rgba(0,0,0,0.1)", borderRadius: 14, background: "#fff" }}>
+                    <div style={{ display: "grid", gap: 8, alignContent: "start" }}>
+                      {mediaType === "photo" && previewUrl ? (
+                        <img src={previewUrl} alt={String(item.file_name || item.fileName || "Photo")} style={{ width: "100%", aspectRatio: "4 / 5", objectFit: "cover", borderRadius: 12, border: "1px solid rgba(0,0,0,0.08)" }} />
+                      ) : (
+                        <div style={{ width: "100%", aspectRatio: "4 / 5", borderRadius: 12, border: "1px dashed rgba(0,0,0,0.18)", display: "grid", placeItems: "center", color: "#6b7280", textAlign: "center", padding: 8 }}>
+                          {mediaType === "video" ? `MP4 video\n${Number(item.duration_seconds || item.durationSeconds || 0).toFixed(1)}s • ${item.width || 0}×${item.height || 0}` : "Photo"}
+                        </div>
+                      )}
+                      <div style={{ fontSize: 13, color: "#4b5563" }}>Seq {String(seq).padStart(3, "0")} • {status}</div>
+                    </div>
+                    <div style={{ display: "grid", gap: 8 }}>
+                      <div style={{ fontWeight: 800 }}>{String(item.relative_path || item.relativePath || item.file_name || item.fileName || "")}</div>
+                      <label style={{ display: "grid", gap: 6 }}>
+                        <span style={{ fontWeight: 700 }}>Description</span>
+                        <input value={String(item.description || "")} onChange={(e) => updateMediaItemDraft(mediaId, { description: e.target.value })} style={inputStyle} placeholder="Description" />
+                      </label>
+                      <label style={{ display: "grid", gap: 6 }}>
+                        <span style={{ fontWeight: 700 }}>Tags</span>
+                        <input value={tagsValue} onChange={(e) => updateMediaItemDraft(mediaId, { tags: e.target.value.split(/[,;]+/).map((x) => x.trim()).filter(Boolean) })} style={inputStyle} placeholder="tag1, tag2" />
+                      </label>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <button type="button" style={secondaryButtonStyle} onClick={() => void saveMediaMetadata(item)} disabled={mediaLoading}>Save metadata</button>
+                        {status === "inactive" ? (
+                          <button type="button" style={buttonStyle} onClick={() => void setMediaStatus(item, "reactivate")} disabled={mediaLoading}>Reactivate</button>
+                        ) : status === "pending_approval" ? (
+                          <button type="button" style={buttonStyle} onClick={() => void setMediaStatus(item, "approve")} disabled={mediaLoading}>Approve</button>
+                        ) : (
+                          <button type="button" style={secondaryButtonStyle} onClick={() => void setMediaStatus(item, "deactivate")} disabled={mediaLoading}>Deactivate</button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div style={{ color: "#6b7280", lineHeight: 1.6 }}>No Connect media is available yet. Upload approved photos or MP4 videos to make them available for requested delivery inside Connect.</div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+
   const voiceCaptureMeetsMinimum = Number(voiceCaptureAsset?.duration_seconds || 0) >= voiceCaptureMinSeconds && String(voiceCaptureAsset?.validation_status || "").toLowerCase() === "accepted";
 
 
@@ -2254,7 +2672,26 @@ export default function HostProfileStudioClient() {
           </div>
         ) : (
           <div style={{ ...cardStyle, display: "grid", gap: 16 }}>
-            <h2 style={{ margin: 0 }}>Final preview and approval</h2>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                onClick={() => setPreviewPanel("preview")}
+                style={previewPanel === "preview" || !mediaTabAvailable ? { ...buttonStyle, cursor: "default" } : secondaryButtonStyle}
+              >
+                Final preview and approval
+              </button>
+              {mediaTabAvailable ? (
+                <button
+                  type="button"
+                  onClick={() => setPreviewPanel("media")}
+                  style={previewPanel === "media" ? { ...buttonStyle, cursor: "default" } : secondaryButtonStyle}
+                >
+                  Media
+                </button>
+              ) : null}
+            </div>
+            {previewPanel === "media" && mediaTabAvailable ? renderMediaPanel() : (
+              <>
             <div style={{ color: "#4b5563", lineHeight: 1.6 }}>
               Review the compiled profile. Legal/private information is separated from the public/persona profile, and you can jump back to update any section before approval.
             </div>
@@ -2405,6 +2842,8 @@ export default function HostProfileStudioClient() {
                 </button>
               </div>
             </div>
+              </>
+            )}
           </div>
         )}
       </div>

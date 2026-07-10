@@ -599,6 +599,9 @@ export default function HostSummaryPublicClient() {
 
   const publicSummaryCss = `
     .hsp-main { max-width: 1180px; margin: 24px auto 48px; padding: 0 16px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #111827; }
+    .hsp-site-header { display: flex; align-items: center; justify-content: flex-start; margin: 0 0 12px; }
+    .hsp-brand-link { color: #111827; text-decoration: none; font-weight: 900; font-size: 30px; letter-spacing: -0.04em; line-height: 1; cursor: pointer; }
+    .hsp-brand-link:hover { text-decoration: underline; text-underline-offset: 4px; }
     .hsp-stack { display: grid; gap: 18px; }
     .hsp-section { border: 1px solid rgba(0,0,0,0.1); border-radius: 18px; background: #fff; padding: 20px; box-shadow: 0 8px 22px rgba(0,0,0,0.05); }
     .hsp-eyebrow { font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: #6b7280; }
@@ -672,6 +675,13 @@ export default function HostSummaryPublicClient() {
     <>
       <style dangerouslySetInnerHTML={{ __html: publicSummaryCss }} />
       <main className="hsp-main">
+        {normalizeRebrandingSlug(brand) === "elaralo" ? (
+          <header className="hsp-site-header">
+            <a href="https://www.elaralo.com/" target="_top" className="hsp-brand-link" aria-label="Open Elaralo home page">
+              Elaralo
+            </a>
+          </header>
+        ) : null}
         <div className="hsp-stack">
           <section className="hsp-section hsp-stack">
             <div className="hsp-eyebrow">{isAiCompanionCard ? "Companion Card" : "Summary Public Page"}</div>

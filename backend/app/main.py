@@ -13,9 +13,11 @@ import math
 import asyncio
 import threading
 import contextvars
+import tempfile
+import subprocess
 from functools import lru_cache
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set, Iterable
 
 # Pydantic (v1/v2 compatibility)
 try:
@@ -183,7 +185,7 @@ _CHAT_VISION_POLICY = (
     "Do not say that you cannot view attachments or images when the platform has provided image input."
 )
 _CHAT_CONTENT_DELIVERY_POLICY = (
-    "Content delivery rule: Never invent, promise, or format media attachments, filenames, file numbers, /content/ links, or /human-photo/ links. "
+    "Content delivery rule: Never invent, promise, or format media attachments, filenames, file numbers, /content/ links, or /connect-media/ links. "
     "Only the platform may deliver scheduled photos/videos or requested Elaralo Human Companion photos, and only when a real file exists in the active content library or approved Human Companion photo library. "
     "If the user asks for media, respond conversationally without URLs, without attachment blocks, and without claiming that content has been sent unless the platform actually attaches it."
 )
@@ -510,24 +512,24 @@ async def elaralo_ai_legacy_headshot_asset(request: Request, filename: str):
     return FileResponse(path, media_type=media_type, headers=headers)
 
 
-@app.get("/human-photo/{token}", name="elaralo_human_requested_photo")
-async def elaralo_human_requested_photo(request: Request, token: str):
-    """Serve a previously authorized requested Elaralo Human Companion photo.
+@app.get("/connect-media/{token}", name="elaralo_human_requested_connect_media")
+async def elaralo_human_requested_connect_media(request: Request, token: str):
+    """Serve previously authorized requested Elaralo Human Companion Connect media.
 
     The URL carries an unguessable delivery token. Raw filesystem paths and
-    directory listings are never exposed to the browser.
+    directory listings are never exposed to the browser. This generalized route
+    serves approved requested photos and short videos.
     """
     _ = request
-    path, resolved_name = await run_in_threadpool(_human_photo_file_path_for_token_sync, token)
+    path, resolved_name, media_type = await run_in_threadpool(_human_media_file_path_for_token_sync, token)
     if not path or not resolved_name or not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="human photo not found")
-    media_type = mimetypes.guess_type(path)[0] or "image/jpeg"
+        raise HTTPException(status_code=404, detail="connect media not found")
     headers = {
         "Content-Disposition": f'inline; filename="{resolved_name}"',
         "Cache-Control": "private, max-age=3600",
         "X-Content-Type-Options": "nosniff",
     }
-    return FileResponse(path, media_type=media_type, headers=headers)
+    return FileResponse(path, media_type=media_type or mimetypes.guess_type(path)[0] or "application/octet-stream", headers=headers)
 
 import json
 import logging
@@ -6636,9 +6638,9 @@ def _sanitize_summary_for_safe_mode(text: str) -> str:
     return t
 
 
-_PLATFORM_CONTENT_URL_RE = re.compile(r'https?://[^\s"\'<>]+?/(?:content|human-photo)/[^\s"\'<>]+', re.IGNORECASE)
+_PLATFORM_CONTENT_URL_RE = re.compile(r'https?://[^\s"\'<>]+?/(?:content|connect-media)/[^\s"\'<>]+', re.IGNORECASE)
 _PLATFORM_ATTACHMENT_BLOCK_RE = re.compile(
-    r'(?:^|\n)\s*Attachment:\s*[^\n]*\n\s*(?:https?://[^\s"\'<>]+?/(?:content|human-photo)/[^\s"\'<>]+|/(?:content|human-photo)/[^\s"\'<>]+)',
+    r'(?:^|\n)\s*Attachment:\s*[^\n]*\n\s*(?:https?://[^\s"\'<>]+?/(?:content|connect-media)/[^\s"\'<>]+|/(?:content|connect-media)/[^\s"\'<>]+)',
     re.IGNORECASE,
 )
 _PLATFORM_DELIVERY_LINE_RE = re.compile(
@@ -6948,11 +6950,11 @@ def _sanitize_message_content_for_llm(role: str, content: str) -> str:
         if (
             "attachment:" in lowered
             or "/content/" in lowered
-            or "/human-photo/" in lowered
+            or "/connect-media/" in lowered
             or "delivering photo" in lowered
             or "delivering video" in lowered
             or "delivering scheduled content" in lowered
-            or "requested human companion photo" in lowered
+            or "requested human companion media" in lowered
         ) and not cleaned:
             file_name = _platform_content_filename_from_text(content)
             return _platform_content_placeholder(file_name) if file_name else ""
@@ -20887,81 +20889,99 @@ def _content_mark_host_received(payload: Dict[str, Any]) -> None:
             pass
 
 
-# ---------------- Requested Elaralo Human Companion photo delivery ----------------
+
+# ---------------- Elaralo Human Companion Media delivery and Host Profile Studio Media tab ----------------
 
 HUMAN_PHOTO_CANNED_RESPONSE = "I do not take pictures often so will need to take some new ones when I have the chance"
-_HUMAN_PHOTO_FEATURE_ENABLED = str(os.getenv("ELARALO_HUMAN_REQUESTED_PHOTOS_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-_HUMAN_PHOTO_TRIAL_LIMIT = _env_int("ELARALO_HUMAN_PHOTO_TRIAL_LIMIT", 2)
-_HUMAN_PHOTO_TRIAL_WINDOW_DAYS = _env_int("ELARALO_HUMAN_PHOTO_TRIAL_WINDOW_DAYS", 30)
-_HUMAN_PHOTO_ALERT_EMAIL_ENABLED = str(os.getenv("HUMAN_PHOTO_ALERT_EMAIL_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-_HUMAN_PHOTO_ALERT_RECIPIENT_DEFAULT = (os.getenv("HUMAN_PHOTO_ALERT_DEFAULT_RECIPIENT", "info@elaralo.com") or "info@elaralo.com").strip()
-_HUMAN_PHOTO_ALERT_THRESHOLDS = (5, 1)
-_HUMAN_PHOTO_VALID_RE = re.compile(r"^IMG-(\d{9})\.(?:jpe?g|png|webp)$", re.IGNORECASE)
-_HUMAN_PHOTO_METADATA_FILENAMES = ("photo_metadata.json", "human_photo_metadata.json", "metadata.json")
-_HUMAN_PHOTO_DB_LOCK = threading.RLock()
-_HUMAN_PHOTO_DB_READY = False
-_HUMAN_PHOTO_STOPWORDS = {
+HUMAN_VIDEO_CANNED_RESPONSE = "I do not record videos often so will need to make some new ones when I have the chance"
+HUMAN_MEDIA_CANNED_RESPONSE = "I do not make new photos or videos often so will need to create some more when I have the chance"
+_HUMAN_MEDIA_FEATURE_ENABLED = str(os.getenv("ELARALO_HUMAN_REQUESTED_MEDIA_ENABLED", os.getenv("ELARALO_HUMAN_REQUESTED_PHOTOS_ENABLED", "1")) or "1").strip().lower() in {"1", "true", "yes", "on"}
+_HUMAN_MEDIA_TRIAL_LIMIT = _env_int("ELARALO_HUMAN_MEDIA_TRIAL_LIMIT", _env_int("ELARALO_HUMAN_PHOTO_TRIAL_LIMIT", 2))
+_HUMAN_MEDIA_TRIAL_WINDOW_DAYS = _env_int("ELARALO_HUMAN_MEDIA_TRIAL_WINDOW_DAYS", _env_int("ELARALO_HUMAN_PHOTO_TRIAL_WINDOW_DAYS", 30))
+_HUMAN_MEDIA_ALERT_EMAIL_ENABLED = str(os.getenv("HUMAN_MEDIA_ALERT_EMAIL_ENABLED", os.getenv("HUMAN_PHOTO_ALERT_EMAIL_ENABLED", "1")) or "1").strip().lower() in {"1", "true", "yes", "on"}
+_HUMAN_MEDIA_ALERT_RECIPIENT_DEFAULT = (os.getenv("HUMAN_MEDIA_ALERT_DEFAULT_RECIPIENT", os.getenv("HUMAN_PHOTO_ALERT_DEFAULT_RECIPIENT", "info@elaralo.com")) or "info@elaralo.com").strip()
+_HUMAN_MEDIA_ALERT_THRESHOLDS = (4, 1)
+_HUMAN_MEDIA_PHOTO_VALID_RE = re.compile(r"^IMG-(\d{9})\.(?:jpe?g|png|webp)$", re.IGNORECASE)
+_HUMAN_MEDIA_VIDEO_VALID_RE = re.compile(r"^VID-(\d{9})\.mp4$", re.IGNORECASE)
+_HUMAN_MEDIA_DB_LOCK = threading.RLock()
+_HUMAN_MEDIA_DB_READY = False
+_HUMAN_MEDIA_LEGACY_DROP_DONE = False
+_HUMAN_MEDIA_DELIVERY_KIND_PHOTO = "requested_human_photo"
+_HUMAN_MEDIA_DELIVERY_KIND_VIDEO = "requested_human_video"
+_HUMAN_MEDIA_CONFIRMATION_REPLY_PHOTO = (os.getenv("ELARALO_HUMAN_PHOTO_CONFIRMATION_REPLY", "Are you requesting a photo?") or "Are you requesting a photo?").strip()
+_HUMAN_MEDIA_CONFIRMATION_REPLY_VIDEO = (os.getenv("ELARALO_HUMAN_VIDEO_CONFIRMATION_REPLY", "Are you requesting a short video?") or "Are you requesting a short video?").strip()
+_HUMAN_MEDIA_CONFIRMATION_REPLY_CHOICE = (os.getenv("ELARALO_HUMAN_MEDIA_CHOICE_REPLY", "Would you like a photo or a short video?") or "Would you like a photo or a short video?").strip()
+_HUMAN_MEDIA_PENDING_STATE_KEY = "pending_human_media_confirmation"
+_HUMAN_MEDIA_PENDING_STATE_KEY_CAMEL = "pendingHumanMediaConfirmation"
+# Keep older frontend state keys cleared so alpha15.2/15.3 sessions cannot keep stale photo prompts alive.
+_HUMAN_PHOTO_PENDING_STATE_KEY = "pending_human_photo_confirmation"
+_HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL = "pendingHumanPhotoConfirmation"
+_HUMAN_MEDIA_LEARN_PHRASES_ENABLED = str(os.getenv("ELARALO_HUMAN_MEDIA_LEARN_CONFIRMED_PHRASES", os.getenv("ELARALO_HUMAN_PHOTO_LEARN_CONFIRMED_PHRASES", "1")) or "1").strip().lower() in {"1", "true", "yes", "on"}
+_HUMAN_MEDIA_PHOTO_WORD_RE_SRC = r"(?:photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)"
+_HUMAN_MEDIA_VIDEO_WORD_RE_SRC = r"(?:video|videos|clip|clips|short\s+video|short\s+clip)"
+_HUMAN_MEDIA_GENERIC_WORD_RE_SRC = r"(?:something|anything|media|content)"
+_HUMAN_MEDIA_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "can", "could", "do", "does", "for", "from", "got", "have",
     "i", "image", "images", "in", "is", "it", "me", "my", "of", "on", "one", "photo", "photos", "pic", "pics",
     "picture", "pictures", "please", "send", "share", "show", "snapshot", "selfie", "some", "that", "the", "them",
     "to", "want", "with", "would", "you", "your", "see", "looking", "look", "give", "get", "take", "taking",
     "new", "another", "more", "any", "something", "thing", "file", "attachment", "attached", "like", "looks",
-    # Generic request/chit-chat terms must not turn a normal "photo of yourself" request
-    # into a metadata-specific request.  Otherwise the selector returns no_match even
-    # when inventory exists, because these words are not visual metadata tags.
+    "video", "videos", "clip", "clips", "short", "content", "media",
     "about", "again", "all", "anything", "appreciate", "back", "bit", "chance", "check", "come", "day",
     "else", "going", "good", "hello", "hey", "hi", "how", "later", "little", "mind", "much", "name",
     "nothing", "ok", "okay", "problem", "question", "re", "reply", "response", "self", "sharing", "sending",
     "talk", "talking", "there", "was", "were", "what", "when", "whenever", "where", "which", "who", "why",
     "able", "ability", "make", "many", "possible", "possibly", "requested", "requesting", "sure", "test", "thank", "thanks", "uh", "very", "volume", "well", "wonder", "wondering", "right", "suggesting",
-    "yourself", "myself", "herself", "himself", "itself", "ourselves", "themselves",
+    "yourself", "myself", "herself", "himself", "itself", "ourselves", "themselves", "am",
 }
-_HUMAN_PHOTO_DELIVERY_KIND = "requested_human_photo"
-_HUMAN_PHOTO_CONFIRMATION_REPLY = (os.getenv("ELARALO_HUMAN_PHOTO_CONFIRMATION_REPLY", "Are you requesting a photo?") or "Are you requesting a photo?").strip()
-_HUMAN_PHOTO_PENDING_STATE_KEY = "pending_human_photo_confirmation"
-_HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL = "pendingHumanPhotoConfirmation"
-_HUMAN_PHOTO_LEARN_PHRASES_ENABLED = str(os.getenv("ELARALO_HUMAN_PHOTO_LEARN_CONFIRMED_PHRASES", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
-_HUMAN_PHOTO_MEDIA_WORD_RE_SRC = r"(?:photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)"
+_HUMAN_MEDIA_MAX_PHOTO_BYTES = _env_int("ELARALO_HUMAN_MEDIA_MAX_PHOTO_BYTES", 15 * 1024 * 1024)
+_HUMAN_MEDIA_MAX_VIDEO_BYTES = _env_int("ELARALO_HUMAN_MEDIA_MAX_VIDEO_BYTES", 60 * 1024 * 1024)
+_HUMAN_MEDIA_VIDEO_MAX_SECONDS = float(os.getenv("ELARALO_HUMAN_MEDIA_VIDEO_MAX_SECONDS", "15") or "15")
+_HUMAN_MEDIA_VIDEO_MAX_SHORT_SIDE = _env_int("ELARALO_HUMAN_MEDIA_VIDEO_MAX_SHORT_SIDE", 720)
+_HUMAN_MEDIA_VIDEO_MAX_LONG_SIDE = _env_int("ELARALO_HUMAN_MEDIA_VIDEO_MAX_LONG_SIDE", 1280)
+_HUMAN_MEDIA_REQUIRE_SAFETY_REVIEW = str(os.getenv("ELARALO_HUMAN_MEDIA_REQUIRE_SAFETY_REVIEW", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+_HUMAN_MEDIA_SAFETY_MODEL = (os.getenv("ELARALO_HUMAN_MEDIA_SAFETY_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
 
 
-def _human_photo_root_dir() -> str:
+def _human_media_root_dir() -> str:
     candidates = [
+        os.getenv("ELARALO_HUMAN_COMPANION_MEDIA_ROOT", ""),
         os.getenv("ELARALO_HUMAN_COMPANION_PHOTO_ROOT", ""),
         os.getenv("ELARALO_HUMAN_PHOTO_ROOT", ""),
         os.getenv("HUMAN_COMPANION_PHOTO_ROOT", ""),
-        os.getenv("ELARALO_HUMAN_COMPANION_IMAGE_DIR", ""),
         "/home/site/brand/elaralo/companion/human",
     ]
     for raw in candidates:
         p = str(raw or "").strip()
-        if not p:
-            continue
-        return os.path.abspath(os.path.expanduser(p))
+        if p:
+            return os.path.abspath(os.path.expanduser(p))
     return "/home/site/brand/elaralo/companion/human"
 
 
-def _human_photo_companion_dir(companion_mapping_id: Any) -> str:
+def _human_media_companion_dir(companion_mapping_id: Any) -> str:
     try:
         mid = int(companion_mapping_id)
     except Exception:
         mid = 0
-    if mid <= 0:
-        return ""
-    return os.path.join(_human_photo_root_dir(), f"companion-id-{mid}")
+    return os.path.join(_human_media_root_dir(), f"companion-id-{mid}") if mid > 0 else ""
 
 
-def _human_photo_is_valid_file_name(file_name: Any) -> Tuple[bool, int]:
-    name = os.path.basename(str(file_name or "").strip())
-    m = _HUMAN_PHOTO_VALID_RE.match(name)
-    if not m:
-        return False, 0
-    try:
-        return True, int(m.group(1))
-    except Exception:
-        return True, 0
+def _human_media_photos_dir(companion_mapping_id: Any) -> str:
+    base = _human_media_companion_dir(companion_mapping_id)
+    return os.path.join(base, "photos") if base else ""
 
 
-def _human_photo_safe_email(value: Any) -> str:
+def _human_media_videos_dir(companion_mapping_id: Any) -> str:
+    base = _human_media_companion_dir(companion_mapping_id)
+    return os.path.join(base, "videos") if base else ""
+
+
+def _human_media_metadata_path(companion_mapping_id: Any) -> str:
+    base = _human_media_companion_dir(companion_mapping_id)
+    return os.path.join(base, "media_metadata.json") if base else ""
+
+
+def _human_media_safe_email(value: Any) -> str:
     try:
         return _stripe_paygo_email_norm(value)
     except Exception:
@@ -20969,18 +20989,15 @@ def _human_photo_safe_email(value: Any) -> str:
         return s if ("@" in s and "." in s.split("@")[-1]) else ""
 
 
-def _human_photo_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+def _human_media_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     try:
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-            (str(table_name or "").strip(),),
-        ).fetchone()
+        row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (str(table_name or "").strip(),)).fetchone()
         return row is not None
     except Exception:
         return False
 
 
-def _human_photo_table_columns(conn: sqlite3.Connection, table_name: str) -> Set[str]:
+def _human_media_table_columns(conn: sqlite3.Connection, table_name: str) -> Set[str]:
     try:
         rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     except Exception:
@@ -20996,71 +21013,80 @@ def _human_photo_table_columns(conn: sqlite3.Connection, table_name: str) -> Set
     return out
 
 
-def _human_photo_ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
-    if column_name in _human_photo_table_columns(conn, table_name):
+def _human_media_ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
+    if column_name in _human_media_table_columns(conn, table_name):
         return
     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
 
 
-def _human_photo_db_ensure_schema(conn: sqlite3.Connection) -> None:
-    global _HUMAN_PHOTO_DB_READY
-    if _HUMAN_PHOTO_DB_READY:
+def _human_media_db_ensure_schema(conn: sqlite3.Connection) -> None:
+    global _HUMAN_MEDIA_DB_READY
+    if _HUMAN_MEDIA_DB_READY:
         return
-    with _HUMAN_PHOTO_DB_LOCK:
-        if _HUMAN_PHOTO_DB_READY:
+    with _HUMAN_MEDIA_DB_LOCK:
+        if _HUMAN_MEDIA_DB_READY:
             return
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS human_companion_photo_inventory (
-              photo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS human_companion_media_inventory (
+              media_id INTEGER PRIMARY KEY AUTOINCREMENT,
               brand TEXT NOT NULL,
               companion_mapping_id INTEGER NOT NULL,
               host_member_id TEXT,
               host_email TEXT,
+              media_type TEXT NOT NULL,
               source_dir TEXT,
+              relative_path TEXT NOT NULL,
               file_name TEXT NOT NULL,
               file_ext TEXT,
-              original_sequence INTEGER NOT NULL,
+              sequence_number INTEGER NOT NULL,
               file_size INTEGER NOT NULL DEFAULT 0,
               file_mtime REAL NOT NULL DEFAULT 0,
-              status TEXT NOT NULL DEFAULT 'available',
-              consumed_at_epoch REAL,
-              consumed_by_viewer_key TEXT,
-              delivery_token TEXT,
+              duration_seconds REAL NOT NULL DEFAULT 0,
+              width_px INTEGER NOT NULL DEFAULT 0,
+              height_px INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'approved',
+              review_status TEXT,
+              media_generation TEXT,
               created_epoch REAL NOT NULL,
               updated_epoch REAL NOT NULL,
-              UNIQUE(brand, companion_mapping_id, file_name)
+              UNIQUE(brand, companion_mapping_id, media_type, sequence_number),
+              UNIQUE(brand, companion_mapping_id, relative_path)
             )
             """
         )
         for name, coldef in [
             ("host_member_id", "host_member_id TEXT"),
             ("host_email", "host_email TEXT"),
+            ("media_type", "media_type TEXT NOT NULL DEFAULT 'photo'"),
             ("source_dir", "source_dir TEXT"),
+            ("relative_path", "relative_path TEXT NOT NULL DEFAULT ''"),
+            ("file_name", "file_name TEXT NOT NULL DEFAULT ''"),
             ("file_ext", "file_ext TEXT"),
-            ("original_sequence", "original_sequence INTEGER NOT NULL DEFAULT 0"),
+            ("sequence_number", "sequence_number INTEGER NOT NULL DEFAULT 0"),
             ("file_size", "file_size INTEGER NOT NULL DEFAULT 0"),
             ("file_mtime", "file_mtime REAL NOT NULL DEFAULT 0"),
-            ("status", "status TEXT NOT NULL DEFAULT 'available'"),
-            ("consumed_at_epoch", "consumed_at_epoch REAL"),
-            ("consumed_by_viewer_key", "consumed_by_viewer_key TEXT"),
-            ("delivery_token", "delivery_token TEXT"),
+            ("duration_seconds", "duration_seconds REAL NOT NULL DEFAULT 0"),
+            ("width_px", "width_px INTEGER NOT NULL DEFAULT 0"),
+            ("height_px", "height_px INTEGER NOT NULL DEFAULT 0"),
+            ("status", "status TEXT NOT NULL DEFAULT 'approved'"),
+            ("review_status", "review_status TEXT"),
+            ("media_generation", "media_generation TEXT"),
             ("created_epoch", "created_epoch REAL NOT NULL DEFAULT 0"),
             ("updated_epoch", "updated_epoch REAL NOT NULL DEFAULT 0"),
         ]:
-            _human_photo_ensure_column(conn, "human_companion_photo_inventory", name, coldef)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_human_photo_inventory_available ON human_companion_photo_inventory(brand, companion_mapping_id, status, original_sequence)"
-        )
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_human_photo_inventory_token ON human_companion_photo_inventory(delivery_token) WHERE delivery_token IS NOT NULL AND TRIM(delivery_token) <> ''"
-        )
+            _human_media_ensure_column(conn, "human_companion_media_inventory", name, coldef)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_media_inventory_lookup ON human_companion_media_inventory(brand, companion_mapping_id, media_type, status, sequence_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_media_inventory_host ON human_companion_media_inventory(host_member_id, companion_mapping_id)")
 
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS human_companion_photo_metadata (
+            CREATE TABLE IF NOT EXISTS human_companion_media_metadata (
               brand TEXT NOT NULL,
               companion_mapping_id INTEGER NOT NULL,
+              media_id INTEGER,
+              media_type TEXT NOT NULL,
+              relative_path TEXT NOT NULL,
               file_name TEXT NOT NULL,
               tags_json TEXT NOT NULL DEFAULT '[]',
               description TEXT,
@@ -21069,11 +21095,15 @@ def _human_photo_db_ensure_schema(conn: sqlite3.Connection) -> None:
               reviewed_at_epoch REAL,
               metadata_version TEXT,
               updated_epoch REAL NOT NULL,
-              PRIMARY KEY(brand, companion_mapping_id, file_name)
+              PRIMARY KEY(brand, companion_mapping_id, relative_path)
             )
             """
         )
         for name, coldef in [
+            ("media_id", "media_id INTEGER"),
+            ("media_type", "media_type TEXT NOT NULL DEFAULT 'photo'"),
+            ("relative_path", "relative_path TEXT NOT NULL DEFAULT ''"),
+            ("file_name", "file_name TEXT NOT NULL DEFAULT ''"),
             ("tags_json", "tags_json TEXT NOT NULL DEFAULT '[]'"),
             ("description", "description TEXT"),
             ("review_status", "review_status TEXT"),
@@ -21082,11 +21112,47 @@ def _human_photo_db_ensure_schema(conn: sqlite3.Connection) -> None:
             ("metadata_version", "metadata_version TEXT"),
             ("updated_epoch", "updated_epoch REAL NOT NULL DEFAULT 0"),
         ]:
-            _human_photo_ensure_column(conn, "human_companion_photo_metadata", name, coldef)
+            _human_media_ensure_column(conn, "human_companion_media_metadata", name, coldef)
 
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS human_companion_photo_requests (
+            CREATE TABLE IF NOT EXISTS human_companion_media_viewer_ledger (
+              ledger_id TEXT PRIMARY KEY,
+              brand TEXT NOT NULL,
+              companion_mapping_id INTEGER NOT NULL,
+              host_member_id TEXT,
+              viewer_key TEXT NOT NULL,
+              member_id TEXT,
+              session_id TEXT,
+              media_id INTEGER NOT NULL,
+              media_type TEXT NOT NULL,
+              sequence_number INTEGER NOT NULL,
+              event_type TEXT NOT NULL,
+              request_id TEXT,
+              delivery_token TEXT,
+              created_epoch REAL NOT NULL,
+              UNIQUE(brand, companion_mapping_id, viewer_key, media_id, event_type)
+            )
+            """
+        )
+        for name, coldef in [
+            ("host_member_id", "host_member_id TEXT"),
+            ("member_id", "member_id TEXT"),
+            ("session_id", "session_id TEXT"),
+            ("media_type", "media_type TEXT NOT NULL DEFAULT 'photo'"),
+            ("sequence_number", "sequence_number INTEGER NOT NULL DEFAULT 0"),
+            ("event_type", "event_type TEXT NOT NULL DEFAULT 'delivered'"),
+            ("request_id", "request_id TEXT"),
+            ("delivery_token", "delivery_token TEXT"),
+            ("created_epoch", "created_epoch REAL NOT NULL DEFAULT 0"),
+        ]:
+            _human_media_ensure_column(conn, "human_companion_media_viewer_ledger", name, coldef)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_human_media_ledger_token ON human_companion_media_viewer_ledger(delivery_token) WHERE delivery_token IS NOT NULL AND TRIM(delivery_token) <> ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_media_ledger_viewer ON human_companion_media_viewer_ledger(brand, companion_mapping_id, viewer_key, media_type, created_epoch)")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_companion_media_requests (
               request_id TEXT PRIMARY KEY,
               brand TEXT NOT NULL,
               companion_mapping_id INTEGER NOT NULL,
@@ -21097,6 +21163,7 @@ def _human_photo_db_ensure_schema(conn: sqlite3.Connection) -> None:
               plan_name TEXT,
               plan_class TEXT,
               request_text TEXT,
+              media_type TEXT,
               request_kind TEXT,
               requested_tags_json TEXT NOT NULL DEFAULT '[]',
               outcome TEXT NOT NULL,
@@ -21107,770 +21174,335 @@ def _human_photo_db_ensure_schema(conn: sqlite3.Connection) -> None:
             )
             """
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_human_photo_requests_viewer ON human_companion_photo_requests(brand, companion_mapping_id, viewer_key, created_epoch)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_human_photo_requests_companion ON human_companion_photo_requests(brand, companion_mapping_id, created_epoch)"
-        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_media_requests_viewer ON human_companion_media_requests(brand, companion_mapping_id, viewer_key, created_epoch)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_media_requests_companion ON human_companion_media_requests(brand, companion_mapping_id, media_type, created_epoch)")
 
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS human_companion_photo_alerts (
+            CREATE TABLE IF NOT EXISTS human_companion_media_alerts (
               alert_id TEXT PRIMARY KEY,
               brand TEXT NOT NULL,
               companion_mapping_id INTEGER NOT NULL,
+              media_type TEXT NOT NULL,
               threshold INTEGER NOT NULL,
-              inventory_generation TEXT NOT NULL,
-              remaining_count INTEGER NOT NULL,
+              media_generation TEXT,
+              remaining_count INTEGER,
               host_email TEXT,
-              sent_to_json TEXT NOT NULL DEFAULT '[]',
+              sent_to_json TEXT,
               send_status TEXT,
               send_error TEXT,
               sent_at_epoch REAL NOT NULL,
-              UNIQUE(brand, companion_mapping_id, threshold, inventory_generation)
+              UNIQUE(brand, companion_mapping_id, media_type, threshold, media_generation)
             )
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_media_alerts_companion ON human_companion_media_alerts(brand, companion_mapping_id, media_type, threshold, sent_at_epoch)")
+
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_human_photo_alerts_companion ON human_companion_photo_alerts(brand, companion_mapping_id, threshold, sent_at_epoch)"
+            """
+            CREATE TABLE IF NOT EXISTS human_companion_media_upload_audit (
+              audit_id TEXT PRIMARY KEY,
+              brand TEXT NOT NULL,
+              companion_mapping_id INTEGER NOT NULL,
+              host_member_id TEXT,
+              original_file_name TEXT,
+              assigned_file_name TEXT,
+              media_type TEXT,
+              mime_type TEXT,
+              file_size INTEGER,
+              status TEXT,
+              reason_code TEXT,
+              error_message TEXT,
+              created_epoch REAL NOT NULL
+            )
+            """
         )
 
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS human_companion_photo_request_phrases (
+            CREATE TABLE IF NOT EXISTS human_companion_media_request_phrases (
               phrase_id TEXT PRIMARY KEY,
               brand TEXT NOT NULL,
-              companion_mapping_id INTEGER NOT NULL DEFAULT 0,
+              companion_mapping_id INTEGER NOT NULL,
+              media_type TEXT NOT NULL,
               normalized_phrase TEXT NOT NULL,
-              phrase_text TEXT NOT NULL,
               requested_tags_json TEXT NOT NULL DEFAULT '[]',
               status TEXT NOT NULL DEFAULT 'active',
               confirmations INTEGER NOT NULL DEFAULT 1,
-              viewer_key TEXT,
-              member_id TEXT,
-              session_id TEXT,
+              created_by_viewer_key TEXT,
+              created_by_member_id TEXT,
               created_epoch REAL NOT NULL,
-              last_confirmed_epoch REAL NOT NULL,
               updated_epoch REAL NOT NULL,
-              UNIQUE(brand, companion_mapping_id, normalized_phrase)
+              UNIQUE(brand, companion_mapping_id, media_type, normalized_phrase)
             )
             """
         )
-        for name, coldef in [
-            ("companion_mapping_id", "companion_mapping_id INTEGER NOT NULL DEFAULT 0"),
-            ("normalized_phrase", "normalized_phrase TEXT NOT NULL DEFAULT ''"),
-            ("phrase_text", "phrase_text TEXT NOT NULL DEFAULT ''"),
-            ("requested_tags_json", "requested_tags_json TEXT NOT NULL DEFAULT '[]'"),
-            ("status", "status TEXT NOT NULL DEFAULT 'active'"),
-            ("confirmations", "confirmations INTEGER NOT NULL DEFAULT 1"),
-            ("viewer_key", "viewer_key TEXT"),
-            ("member_id", "member_id TEXT"),
-            ("session_id", "session_id TEXT"),
-            ("created_epoch", "created_epoch REAL NOT NULL DEFAULT 0"),
-            ("last_confirmed_epoch", "last_confirmed_epoch REAL NOT NULL DEFAULT 0"),
-            ("updated_epoch", "updated_epoch REAL NOT NULL DEFAULT 0"),
-        ]:
-            _human_photo_ensure_column(conn, "human_companion_photo_request_phrases", name, coldef)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_human_photo_request_phrases_lookup ON human_companion_photo_request_phrases(brand, companion_mapping_id, normalized_phrase, status)"
-        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_media_phrase_lookup ON human_companion_media_request_phrases(brand, companion_mapping_id, media_type, normalized_phrase, status)")
 
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS human_companion_photo_pending_confirmations (
+            CREATE TABLE IF NOT EXISTS human_companion_media_pending_confirmations (
               pending_id TEXT PRIMARY KEY,
               brand TEXT NOT NULL,
               companion_mapping_id INTEGER NOT NULL,
               viewer_key TEXT NOT NULL,
-              member_id TEXT,
               session_id TEXT,
-              normalized_phrase TEXT NOT NULL,
+              media_type TEXT NOT NULL,
               phrase_text TEXT NOT NULL,
+              normalized_phrase TEXT NOT NULL,
               requested_tags_json TEXT NOT NULL DEFAULT '[]',
-              status TEXT NOT NULL DEFAULT 'active',
+              status TEXT NOT NULL DEFAULT 'pending',
               created_epoch REAL NOT NULL,
-              updated_epoch REAL NOT NULL,
-              expires_epoch REAL NOT NULL
+              expires_epoch REAL NOT NULL,
+              resolved_epoch REAL,
+              UNIQUE(brand, companion_mapping_id, viewer_key, session_id, status)
             )
             """
         )
-        for name, coldef in [
-            ("viewer_key", "viewer_key TEXT NOT NULL DEFAULT ''"),
-            ("member_id", "member_id TEXT"),
-            ("session_id", "session_id TEXT"),
-            ("normalized_phrase", "normalized_phrase TEXT NOT NULL DEFAULT ''"),
-            ("phrase_text", "phrase_text TEXT NOT NULL DEFAULT ''"),
-            ("requested_tags_json", "requested_tags_json TEXT NOT NULL DEFAULT '[]'"),
-            ("status", "status TEXT NOT NULL DEFAULT 'active'"),
-            ("created_epoch", "created_epoch REAL NOT NULL DEFAULT 0"),
-            ("updated_epoch", "updated_epoch REAL NOT NULL DEFAULT 0"),
-            ("expires_epoch", "expires_epoch REAL NOT NULL DEFAULT 0"),
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_media_pending_lookup ON human_companion_media_pending_confirmations(brand, companion_mapping_id, viewer_key, session_id, status, expires_epoch)")
+        _HUMAN_MEDIA_DB_READY = True
+
+
+def _human_media_drop_legacy_photo_tables_on_conn(conn: sqlite3.Connection) -> None:
+    global _HUMAN_MEDIA_LEGACY_DROP_DONE
+    if _HUMAN_MEDIA_LEGACY_DROP_DONE:
+        return
+    with _HUMAN_MEDIA_DB_LOCK:
+        if _HUMAN_MEDIA_LEGACY_DROP_DONE:
+            return
+        for table_name in [
+            "human_companion_photo_inventory",
+            "human_companion_photo_metadata",
+            "human_companion_photo_requests",
+            "human_companion_photo_alerts",
+            "human_companion_photo_request_phrases",
+            "human_companion_photo_pending_confirmations",
         ]:
-            _human_photo_ensure_column(conn, "human_companion_photo_pending_confirmations", name, coldef)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_human_photo_pending_lookup ON human_companion_photo_pending_confirmations(brand, companion_mapping_id, viewer_key, session_id, status, expires_epoch)"
-        )
-        _HUMAN_PHOTO_DB_READY = True
+            try:
+                conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            except Exception as exc:
+                print(f"[human-media] WARNING: failed dropping legacy table {table_name}: {exc!r}")
+        _HUMAN_MEDIA_LEGACY_DROP_DONE = True
 
 
-def _human_photo_safe_json_list(value: Any) -> List[str]:
-    raw = value
+def _human_media_safe_json_list(value: Any) -> List[str]:
+    raw: Any = value
     if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
         try:
-            parsed = json.loads(raw)
+            raw = json.loads(text)
         except Exception:
-            parsed = [part.strip() for part in re.split(r"[,;|]+", raw) if part.strip()]
-    else:
-        parsed = raw
-    if isinstance(parsed, dict):
-        parsed = list(parsed.values())
-    if not isinstance(parsed, list):
-        parsed = []
+            raw = re.split(r"[,;\n]+", text)
+    if isinstance(raw, dict):
+        raw = list(raw.values())
+    if not isinstance(raw, list):
+        raw = [raw]
     out: List[str] = []
     seen: Set[str] = set()
-    for item in parsed:
-        s = re.sub(r"\s+", " ", str(item or "").strip()).lower()
+    for item in raw:
+        s = re.sub(r"\s+", " ", str(item or "").strip().lower())
+        s = re.sub(r"[^a-z0-9\- _]", "", s).strip()
         if not s or s in seen:
             continue
         seen.add(s)
-        out.append(s)
-    return out
+        out.append(s[:80])
+    return out[:40]
 
 
-def _human_photo_normalize_phrase(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    raw = re.sub(r"https?://\S+", " ", raw)
-    raw = re.sub(r"[^a-z0-9'\s-]+", " ", raw)
-    raw = re.sub(r"\s+", " ", raw).strip()
-    return raw[:500]
+def _human_media_normalize_phrase(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9'\s\-]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-def _human_photo_has_media_word(text: Any) -> bool:
-    low = str(text or "").strip().lower()
+def _human_media_has_photo_word(text: Any) -> bool:
+    return bool(re.search(r"\b" + _HUMAN_MEDIA_PHOTO_WORD_RE_SRC + r"\b", str(text or "").lower(), re.IGNORECASE))
+
+
+def _human_media_has_video_word(text: Any) -> bool:
+    return bool(re.search(r"\b" + _HUMAN_MEDIA_VIDEO_WORD_RE_SRC + r"\b", str(text or "").lower(), re.IGNORECASE))
+
+
+def _human_media_has_any_media_word(text: Any) -> bool:
+    low = str(text or "").lower()
+    return _human_media_has_photo_word(low) or _human_media_has_video_word(low) or bool(re.search(r"\b" + _HUMAN_MEDIA_GENERIC_WORD_RE_SRC + r"\b", low, re.IGNORECASE))
+
+
+def _human_media_request_terms(text: Any) -> List[str]:
+    low = _human_media_normalize_phrase(text)
     if not low:
+        return []
+    cleaned = re.sub(r"\b" + _HUMAN_MEDIA_PHOTO_WORD_RE_SRC + r"\b", " ", low, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b" + _HUMAN_MEDIA_VIDEO_WORD_RE_SRC + r"\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b" + _HUMAN_MEDIA_GENERIC_WORD_RE_SRC + r"\b", " ", cleaned, flags=re.IGNORECASE)
+    words = [w for w in re.split(r"\s+", cleaned) if w]
+    meaningful: List[str] = []
+    for w in words:
+        w = w.strip("'-_")
+        if len(w) < 3 or w in _HUMAN_MEDIA_STOPWORDS:
+            continue
+        if w.isdigit():
+            continue
+        meaningful.append(w)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for w in meaningful:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    for i in range(len(meaningful) - 1):
+        a, b = meaningful[i], meaningful[i + 1]
+        if a in _HUMAN_MEDIA_STOPWORDS or b in _HUMAN_MEDIA_STOPWORDS:
+            continue
+        phrase = f"{a} {b}"
+        if phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
+    return out[:12]
+
+
+def _human_media_is_meta_reference(text: Any) -> bool:
+    low = _human_media_normalize_phrase(text)
+    if not low or not _human_media_has_any_media_word(low):
         return False
-    return bool(re.search(r"\b" + _HUMAN_PHOTO_MEDIA_WORD_RE_SRC + r"\b", low))
+    if _human_media_has_current_delivery_request(low)[0]:
+        return False
+    patterns = [
+        r"\bhow\s+many\b.*\b(requested|sent|shown|received|got)\b",
+        r"\btest\b.*\b(able|ability|working|works|can)\b.*\b(send|show|share)\b",
+        r"\bmake\s+sure\b.*\b(able|working|works)\b.*\b(send|show|share)\b",
+        r"\bwhy\b.*\b(cannot|can't|cant|couldn't|could not|didn't|did not)\b.*\b(send|show|share)\b",
+    ]
+    return any(re.search(p, low) for p in patterns)
 
 
-def _human_photo_clear_pending_updates() -> Dict[str, Any]:
+def _human_media_has_current_delivery_request(low: str) -> Tuple[bool, str]:
+    value = _human_media_normalize_phrase(low)
+    if not value:
+        return False, ""
+    photo = _human_media_has_photo_word(value)
+    video = _human_media_has_video_word(value)
+    generic = bool(re.search(r"\b(?:send|show|share|give|get|see)\b.*\b" + _HUMAN_MEDIA_GENERIC_WORD_RE_SRC + r"\b", value, re.IGNORECASE))
+    command = bool(re.search(r"\b(?:send|show|share|give|lemme|let\s+me\s+see|get)\b", value))
+    polite = bool(re.search(r"\b(?:can|could|would|will|may)\b.{0,80}\b(?:send|show|share|see|get)\b", value))
+    desire = bool(re.search(r"\b(?:i\s+want|i\s+would\s+like|i'd\s+like|let\s+me\s+see)\b", value))
+    possible = bool(re.search(r"\b(?:is\s+it\s+possible|would\s+it\s+be\s+possible)\b.{0,80}\b(?:send|show|share|get|see)\b", value))
+    if (photo or video or generic) and (command or polite or desire or possible):
+        if photo and not video:
+            return True, "photo"
+        if video and not photo:
+            return True, "video"
+        return True, "generic"
+    # Concise specific media request, e.g. "yellow dress photo" or "greeting video".
+    # Bare ambiguous mentions such as "photo", "photo of you", or "video" should
+    # still ask for confirmation instead of immediately consuming media.
+    concise_terms = _human_media_request_terms(value)
+    if photo and concise_terms and len(value.split()) <= 6 and not re.search(r"\b(?:how|why|test|ability|able)\b", value):
+        return True, "photo"
+    if video and concise_terms and len(value.split()) <= 6 and not re.search(r"\b(?:how|why|test|ability|able)\b", value):
+        return True, "video"
+    return False, ""
+
+
+def _human_media_detect_request(text: Any) -> Tuple[bool, str, List[str]]:
+    low = _human_media_normalize_phrase(text)
+    if not low:
+        return False, "", []
+    if _human_media_is_meta_reference(low):
+        return False, "", []
+    direct, media_type = _human_media_has_current_delivery_request(low)
+    if direct:
+        return True, media_type or "generic", _human_media_request_terms(low)
+    learned_media = "photo" if _human_media_has_photo_word(low) else ("video" if _human_media_has_video_word(low) else "")
+    return False, learned_media, []
+
+
+def _human_media_is_ambiguous_mention(text: Any) -> Tuple[bool, str]:
+    low = _human_media_normalize_phrase(text)
+    if not low or _human_media_is_meta_reference(low):
+        return False, ""
+    direct, media_type, _terms = _human_media_detect_request(low)
+    if direct:
+        return False, ""
+    if re.fullmatch(r"(?:a\s+)?" + _HUMAN_MEDIA_PHOTO_WORD_RE_SRC + r"(?:\s+(?:of\s+)?(?:you|yourself))?\??", low, re.IGNORECASE):
+        return True, "photo"
+    if re.fullmatch(r"(?:a\s+)?" + _HUMAN_MEDIA_VIDEO_WORD_RE_SRC + r"(?:\s+(?:of\s+)?(?:you|yourself))?\??", low, re.IGNORECASE):
+        return True, "video"
+    if low in {"something", "anything", "send something", "show something", "show me something", "send me something"}:
+        return True, "generic"
+    return False, ""
+
+
+def _human_media_yes_no_intent(text: Any) -> str:
+    low = _human_media_normalize_phrase(text)
+    if not low:
+        return ""
+    yes = {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "yes i am", "yes please", "i am", "i am requesting", "correct", "that is correct"}
+    no = {"no", "n", "nope", "nah", "not", "not really", "cancel", "never mind", "nevermind"}
+    if low in yes:
+        return "yes"
+    if low in no:
+        return "no"
+    if re.fullmatch(r"(?:yes|yeah|yep|sure|ok|okay)[.!\s]*(?:please)?", low):
+        return "yes"
+    if re.fullmatch(r"(?:no|nope|nah)[.!\s]*(?:thanks)?", low):
+        return "no"
+    return ""
+
+
+def _human_media_pending_payload(text: Any, media_type: str, terms: Optional[List[str]] = None) -> Dict[str, Any]:
+    phrase = str(text or "").strip()
     return {
+        "phrase_text": phrase,
+        "normalized_phrase": _human_media_normalize_phrase(phrase),
+        "media_type": media_type if media_type in {"photo", "video", "generic"} else "photo",
+        "terms": _human_media_safe_json_list(terms if terms is not None else _human_media_request_terms(phrase)),
+        "created_epoch": time.time(),
+    }
+
+
+def _human_media_pending_from_state(session_state: Dict[str, Any]) -> Dict[str, Any]:
+    ss = session_state if isinstance(session_state, dict) else {}
+    raw = ss.get(_HUMAN_MEDIA_PENDING_STATE_KEY) or ss.get(_HUMAN_MEDIA_PENDING_STATE_KEY_CAMEL) or ss.get(_HUMAN_PHOTO_PENDING_STATE_KEY) or ss.get(_HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL)
+    if not isinstance(raw, dict):
+        return {}
+    phrase = str(raw.get("phrase_text") or raw.get("phrase") or "").strip()
+    normalized = _human_media_normalize_phrase(raw.get("normalized_phrase") or phrase)
+    media_type = str(raw.get("media_type") or "photo").strip().lower()
+    if media_type not in {"photo", "video", "generic"}:
+        media_type = "photo"
+    if not phrase and not normalized:
+        return {}
+    return {"phrase_text": phrase, "normalized_phrase": normalized, "media_type": media_type, "terms": _human_media_safe_json_list(raw.get("terms") or [])}
+
+
+def _human_media_clear_pending_updates() -> Dict[str, Any]:
+    return {
+        _HUMAN_MEDIA_PENDING_STATE_KEY: None,
+        _HUMAN_MEDIA_PENDING_STATE_KEY_CAMEL: None,
         _HUMAN_PHOTO_PENDING_STATE_KEY: None,
         _HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL: None,
     }
 
 
-def _human_photo_pending_payload(text: Any, terms: Optional[List[str]] = None) -> Dict[str, Any]:
-    phrase = str(text or "").strip()[:500]
-    # Preserve an explicit empty term list. Generic pending requests such as
-    # "photo of you" or "would it be possible to get a photo of you" must stay
-    # generic after the viewer confirms them. Re-deriving terms from the full
-    # phrase can create false metadata terms and return a no-match canned reply
-    # even though inventory exists.
-    safe_terms = _human_photo_safe_json_list(terms) if terms is not None else _human_photo_request_terms(phrase)
-    return {
-        "phrase": phrase,
-        "normalized_phrase": _human_photo_normalize_phrase(phrase),
-        "terms": list(safe_terms or []),
-        "asked_at_epoch": time.time(),
-    }
+def _human_media_normalize_plan_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
 
-def _human_photo_pending_from_state(session_state: Dict[str, Any]) -> Dict[str, Any]:
-    ss = session_state if isinstance(session_state, dict) else {}
-    raw = ss.get(_HUMAN_PHOTO_PENDING_STATE_KEY)
-    if not isinstance(raw, dict):
-        raw = ss.get(_HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL)
-    if not isinstance(raw, dict):
-        return {}
-    phrase = str(raw.get("phrase") or raw.get("question") or "").strip()
-    normalized = _human_photo_normalize_phrase(raw.get("normalized_phrase") or phrase)
-    if not phrase and not normalized:
-        return {}
-    terms = raw.get("terms")
-    return {
-        "phrase": phrase or normalized,
-        "normalized_phrase": normalized,
-        "terms": _human_photo_safe_json_list(terms),
-        "asked_at_epoch": raw.get("asked_at_epoch"),
-    }
-
-
-def _human_photo_db_pending_lookup_on_conn(
-    conn: sqlite3.Connection,
-    *,
-    brand: str,
-    companion_mapping_id: int,
-    viewer_key: str,
-    session_id: str,
-    now_epoch: Optional[float] = None,
-) -> Dict[str, Any]:
-    now = float(now_epoch or time.time())
-    b = str(brand or "").strip() or "Elaralo"
-    viewer = str(viewer_key or "").strip()
-    sid = str(session_id or "").strip()
-    if not viewer and not sid:
-        return {}
-    try:
-        conn.execute(
-            """
-            UPDATE human_companion_photo_pending_confirmations
-               SET status='expired', updated_epoch=?
-             WHERE brand=?
-               AND companion_mapping_id=?
-               AND status='active'
-               AND expires_epoch < ?
-            """,
-            (now, b, int(companion_mapping_id), now),
-        )
-    except Exception:
-        pass
-    row = conn.execute(
-        """
-        SELECT *
-          FROM human_companion_photo_pending_confirmations
-         WHERE brand=?
-           AND companion_mapping_id=?
-           AND status='active'
-           AND expires_epoch >= ?
-           AND (viewer_key=? OR (? <> '' AND session_id=?))
-         ORDER BY updated_epoch DESC, created_epoch DESC
-         LIMIT 1
-        """,
-        (b, int(companion_mapping_id), now, viewer, sid, sid),
-    ).fetchone()
-    if row is None:
-        return {}
-    data = dict(row)
-    return {
-        "pending_id": str(data.get("pending_id") or ""),
-        "phrase": str(data.get("phrase_text") or ""),
-        "normalized_phrase": str(data.get("normalized_phrase") or ""),
-        "terms": _human_photo_safe_json_list(data.get("requested_tags_json") or "[]"),
-        "asked_at_epoch": data.get("created_epoch"),
-        "source": "db",
-    }
-
-
-def _human_photo_db_store_pending_on_conn(
-    conn: sqlite3.Connection,
-    *,
-    brand: str,
-    companion_mapping_id: int,
-    viewer_key: str,
-    member_id: str,
-    session_id: str,
-    pending_payload: Dict[str, Any],
-    now_epoch: Optional[float] = None,
-) -> None:
-    now = float(now_epoch or time.time())
-    b = str(brand or "").strip() or "Elaralo"
-    viewer = str(viewer_key or "").strip()
-    sid = str(session_id or "").strip()
-    if not viewer and not sid:
-        return
-    phrase = str((pending_payload or {}).get("phrase") or "").strip()[:500]
-    normalized = _human_photo_normalize_phrase((pending_payload or {}).get("normalized_phrase") or phrase)
-    terms = _human_photo_safe_json_list((pending_payload or {}).get("terms") or [])
-    if not phrase and not normalized:
-        return
-    conn.execute(
-        """
-        UPDATE human_companion_photo_pending_confirmations
-           SET status='superseded', updated_epoch=?
-         WHERE brand=?
-           AND companion_mapping_id=?
-           AND status='active'
-           AND (viewer_key=? OR (? <> '' AND session_id=?))
-        """,
-        (now, b, int(companion_mapping_id), viewer, sid, sid),
-    )
-    conn.execute(
-        """
-        INSERT INTO human_companion_photo_pending_confirmations
-        (pending_id, brand, companion_mapping_id, viewer_key, member_id, session_id,
-         normalized_phrase, phrase_text, requested_tags_json, status, created_epoch, updated_epoch, expires_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
-        """,
-        (
-            uuid.uuid4().hex,
-            b,
-            int(companion_mapping_id),
-            viewer,
-            str(member_id or ""),
-            sid,
-            normalized,
-            phrase,
-            json.dumps(list(terms or []), separators=(",", ":")),
-            now,
-            now,
-            now + float(_HUMAN_PHOTO_PENDING_TTL_SECONDS or 1800),
-        ),
-    )
-
-
-def _human_photo_db_clear_pending_on_conn(
-    conn: sqlite3.Connection,
-    *,
-    brand: str,
-    companion_mapping_id: int,
-    viewer_key: str,
-    session_id: str,
-    status: str = "resolved",
-    now_epoch: Optional[float] = None,
-) -> None:
-    now = float(now_epoch or time.time())
-    b = str(brand or "").strip() or "Elaralo"
-    viewer = str(viewer_key or "").strip()
-    sid = str(session_id or "").strip()
-    if not viewer and not sid:
-        return
-    safe_status = str(status or "resolved").strip()[:40] or "resolved"
-    conn.execute(
-        """
-        UPDATE human_companion_photo_pending_confirmations
-           SET status=?, updated_epoch=?
-         WHERE brand=?
-           AND companion_mapping_id=?
-           AND status='active'
-           AND (viewer_key=? OR (? <> '' AND session_id=?))
-        """,
-        (safe_status, now, b, int(companion_mapping_id), viewer, sid, sid),
-    )
-
-
-def _human_photo_terms_for_confirmed_pending(pending: Dict[str, Any], request_text: Any) -> List[str]:
-    if not isinstance(pending, dict):
-        return []
-    phrase = str(pending.get("phrase") or request_text or "").strip()
-    has_stored_terms = "terms" in pending
-    stored_terms = _human_photo_safe_json_list(pending.get("terms")) if has_stored_terms else []
-
-    # An explicit empty terms list means the backend asked for confirmation of a
-    # generic mention such as "photo" or "photo of you". A later "Yes" must stay
-    # generic. Recomputing tags from the whole earlier sentence can pick up
-    # non-visual words such as "architect", "software", "capability", or
-    # "correctly" and incorrectly return the canned no-photo response while
-    # inventory is still available.
-    if has_stored_terms and not stored_terms:
-        return []
-
-    recomputed_terms = _human_photo_request_terms(phrase)
-    if not recomputed_terms:
-        return []
-    if not has_stored_terms:
-        return recomputed_terms
-
-    recomputed_set = set(recomputed_terms)
-    filtered: List[str] = []
-    seen: Set[str] = set()
-    for term in stored_terms:
-        if term in recomputed_set or any((term in r or r in term) for r in recomputed_terms):
-            if term not in seen:
-                seen.add(term)
-                filtered.append(term)
-    return filtered or recomputed_terms
-
-def _human_photo_yes_no_intent(text: Any) -> str:
-    low = _human_photo_normalize_phrase(text)
-    if not low:
-        return ""
-    yes_values = {
-        "yes", "yes please", "yes i am", "yes i do", "yes i would", "yes send it", "yes send one",
-        "yeah", "yeah please", "yep", "yep please", "sure", "sure please", "ok", "okay", "okay yes",
-        "please", "please do", "send it", "send one", "show me", "show one", "that's right", "that is right",
-    }
-    no_values = {
-        "no", "no thanks", "no thank you", "nope", "nah", "not now", "not right now", "cancel", "never mind", "nevermind",
-        "i am not", "i do not", "i don't", "not a photo", "not requesting a photo",
-    }
-    if low in yes_values:
-        return "yes"
-    if low in no_values:
-        return "no"
-    if re.match(r"^(?:yes|yeah|yep|sure|ok|okay)\b", low):
-        return "yes"
-    if re.match(r"^(?:no|nope|nah|cancel|never\s+mind|nevermind)\b", low):
-        return "no"
-    return ""
-
-
-def _human_photo_has_current_delivery_request(low: str) -> bool:
-    """Detect an explicit current-turn instruction/request to deliver a photo."""
-    value = re.sub(r"\s+", " ", str(low or "").lower()).strip()
-    if not value or not _human_photo_has_media_word(value):
-        return False
-    media_word = _HUMAN_PHOTO_MEDIA_WORD_RE_SRC
-    delivery_verbs = r"(?:send|sending|show|showing|share|sharing|give|text|post|upload|attach|display|get|see|have|receive)"
-    patterns = [
-        r"\b(?:can|could|will|would)\s+you\b.{0,60}\b" + delivery_verbs + r"\b.{0,120}\b" + media_word + r"\b",
-        r"\bwould\s+you\s+mind\b.{0,60}\b" + delivery_verbs + r"\b.{0,120}\b" + media_word + r"\b",
-        r"\b(?:can|could|may)\s+i\b.{0,60}\b(?:see|get|have|receive)\b.{0,120}\b" + media_word + r"\b",
-        r"\b(?:(?:would|could|can)\s+it\s+be\s+possible|is\s+it\s+possible)\b.{0,120}\b" + delivery_verbs + r"\b.{0,120}\b" + media_word + r"\b",
-        r"\b(?:i\s+want|i\s+would\s+like|i'd\s+like|i\s+need)\b.{0,120}\b" + media_word + r"\b",
-        r"(?:^|[.!?;:]|\b(?:so|then|now|please|correctly|today)\s+)(?:please\s+)?(?:send|show|share|give|text|post|upload|attach|display)\b.{0,100}\b" + media_word + r"\b",
-    ]
-    return any(re.search(pattern, value) for pattern in patterns)
-
-
-def _human_photo_is_meta_reference(text: Any) -> bool:
-    low = re.sub(r"\s+", " ", str(text or "").lower()).strip()
-    if not low or not _human_photo_has_media_word(low):
-        return False
-    media_word = _HUMAN_PHOTO_MEDIA_WORD_RE_SRC
-
-    # Current delivery requests must win over earlier QA/test wording in the same
-    # sentence. Example: "test your ability to send photos so is it possible for
-    # you to send me a photo" is a live request, not only a test reference.
-    if _human_photo_has_current_delivery_request(low):
-        return False
-
-    patterns = [
-        r"\b(?:test|testing|tested|check|checking|confirm|verify|make\s+sure|making\s+sure|wanted\s+to\s+test|wanted\s+to\s+check)\b.{0,140}\b(?:able|ability|could|can|would|were|was)?\b.{0,80}\b(?:send|sent|sending|show|showed|showing|share|shared|sharing|deliver|delivered|delivering)\b.{0,80}\b" + media_word + r"\b",
-        r"\b(?:able|ability|capability)\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
-        r"\b(?:you\s+were|you\s+are|you're)\s+able\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
-        r"\b(?:not|wasn't|was\s+not|isn't|is\s+not)\s+(?:the\s+)?(?:question|request)\b.{0,120}\b" + media_word + r"\b",
-        r"\bhow\s+many\b.{0,60}\b" + media_word + r"\b.{0,120}\b(?:requested|received|gotten|got|sent|shared|shown|delivered|used|consumed)\b",
-        r"\b(?:count|number)\s+of\b.{0,60}\b" + media_word + r"\b.{0,80}\b(?:requested|received|sent|shared|shown|delivered|used|consumed)\b",
-    ]
-    return any(re.search(pattern, low) for pattern in patterns)
-
-def _human_photo_is_ambiguous_photo_mention(text: Any) -> bool:
-    raw = str(text or "").strip()
-    if not raw or not _human_photo_has_media_word(raw):
-        return False
-    if _human_photo_is_meta_reference(raw):
-        return False
-    is_request, _terms = _human_photo_detect_request(raw)
-    if is_request:
-        return False
-    # A bare media mention, shorthand such as "photo of you", or a sentence that
-    # contains a media word but lacks a clear current-turn delivery verb is a good
-    # candidate for confirmation instead of the no-photo canned response.
-    return True
-
-
-def _human_photo_normalize_plan_token(value: Any) -> str:
-    try:
-        p = _normalize_plan_name_for_limits(str(value or "")).strip().lower()
-    except Exception:
-        p = str(value or "").strip().lower()
-    p = re.sub(r"\s+membership\s*$", "", p, flags=re.I).strip()
-    p = re.sub(r"^test\s*(?:-\s*)?", "", p, flags=re.I).strip()
-    p = re.sub(r"[^a-z0-9]+", " ", p).strip()
-    return p
-
-
-def _human_photo_is_paid_subscriber(*, is_trial: bool, plan_name_raw: Any, plan_external: Any, plan_map: Any, plan_name_for_limits: Any, session_state: Dict[str, Any]) -> bool:
+def _human_media_is_paid_subscriber(*, is_trial: bool, plan_name_raw: Any, plan_external: Any, plan_map: Any, plan_name_for_limits: Any, session_state: Dict[str, Any]) -> bool:
     if is_trial:
         return False
-    candidates: List[Any] = [plan_external, plan_map, plan_name_raw, plan_name_for_limits]
+    candidates = [plan_name_for_limits, plan_name_raw, plan_external, plan_map]
     if isinstance(session_state, dict):
-        for key in ("plan", "planName", "plan_name", "rebranding_plan", "rebrandingPlan", "elaralo_plan_map", "elaraloPlanMap"):
-            candidates.append(session_state.get(key))
-    for c in candidates:
-        token = _human_photo_normalize_plan_token(c)
-        if token in {"discover", "explore", "encounter"}:
-            return True
-    return False
+        candidates.extend([session_state.get("planName"), session_state.get("plan_name"), session_state.get("elaraloPlanMap"), session_state.get("elaralo_plan_map")])
+    paid = {"discover", "explore", "encounter"}
+    return any(_human_media_normalize_plan_token(c) in paid for c in candidates)
 
 
-def _human_photo_request_terms(text: Any) -> List[str]:
-    raw = str(text or "").lower()
-    raw = re.sub(r"https?://\S+", " ", raw)
-
-    # Scope term extraction to the clause that actually contains the media request.
-    # Example fixed by v10.0.0-alpha15.1:
-    #   "It's going good ... would you mind sharing a photo of yourself with me"
-    # should be a generic photo request, not a metadata-specific search for
-    # "going/good/question/mind/sharing/yourself".
-    media_word_re = r"(?:photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)"
-    clauses = [c for c in re.split(r"[.!?;\n\r]+", raw) if re.search(r"\b" + media_word_re + r"\b", c)]
-    scoped = " ".join(clauses).strip() or raw
-
-    # Discard preamble before the actual media-request anchor. Without this,
-    # conversational lead-ins such as "It's going very well" or "Yes, thank you"
-    # can become false metadata terms and cause no_match.
-    request_anchor_re = r"\b(?:would\s+you\s+mind|can\s+you|could\s+you|will\s+you|would\s+you|may\s+i|can\s+i|could\s+i|do\s+you|did\s+you|would\s+it\s+be\s+possible|could\s+it\s+be\s+possible|can\s+it\s+be\s+possible|is\s+it\s+possible|i\s+want|i\s+would\s+like|i'd\s+like|i\s+need|send\s+(?:me|us|a|an|the|some|one|another|photo|photos|picture|pictures|pic|pics|selfie|selfies)|show\s+(?:me|us|a|an|the|some|one|another|photo|photos|picture|pictures|pic|pics|selfie|selfies)|share\s+(?:me|with\s+me|a|an|the|some|one|another|photo|photos|picture|pictures|pic|pics|selfie|selfies))\b"
-    anchors = list(re.finditer(request_anchor_re, scoped))
-    if anchors:
-        scoped = scoped[anchors[-1].start():]
-
-    # Remove common request scaffolding. Keep visual descriptors such as
-    # "yellow dress", "beach", "sailing", "smiling", etc.
-    scoped = re.sub(r"\b(?:would\s+you\s+mind|can\s+you|could\s+you|will\s+you|would\s+you|may\s+i|can\s+i|could\s+i|do\s+you|did\s+you|would\s+it\s+be\s+possible|could\s+it\s+be\s+possible|can\s+it\s+be\s+possible|is\s+it\s+possible)\b", " ", scoped)
-    scoped = re.sub(r"\b(?:send|sending|show|share|sharing|give|text|post|upload|attach|display|see|get|have|take|taking)\b", " ", scoped)
-    scoped = re.sub(r"\b" + media_word_re + r"\b", " ", scoped)
-    scoped = re.sub(r"\b(?:of|with|for)\s+(?:me|you|yourself|myself|herself|himself|itself|ourselves|themselves|us|them)\b", " ", scoped)
-    scoped = re.sub(r"\b(?:of|with|for)\s+(?:your\s+own|your\s+self|my\s+self)\b", " ", scoped)
-
-    scoped = re.sub(r"[^a-z0-9\s-]+", " ", scoped)
-    tokens = [t.strip("- ") for t in re.split(r"\s+", scoped) if t.strip("- ")]
-    terms: List[str] = []
-    seen: Set[str] = set()
-    for token in tokens:
-        if len(token) <= 1 or token in _HUMAN_PHOTO_STOPWORDS:
-            continue
-        if token not in seen:
-            seen.add(token)
-            terms.append(token)
-    # Add short adjacent phrases from meaningful tokens so requests like "yellow dress" score well.
-    for i in range(len(terms) - 1):
-        phrase = f"{terms[i]} {terms[i + 1]}".strip()
-        if phrase and phrase not in seen:
-            seen.add(phrase)
-            terms.append(phrase)
-    return terms[:12]
-
-def _human_photo_detect_request(text: Any) -> Tuple[bool, List[str]]:
-    """Return True only for an explicit, current-turn photo-delivery request."""
-    raw = str(text or "").strip()
-    if not raw:
-        return False, []
-
-    low = re.sub(r"\s+", " ", raw.lower()).strip()
-    media_word = _HUMAN_PHOTO_MEDIA_WORD_RE_SRC
-    if not re.search(r"\b" + media_word + r"\b", low):
-        return False, []
-
-    if _human_photo_is_meta_reference(low):
-        return False, []
-
-    def _words(value: str) -> List[str]:
-        return [w for w in re.findall(r"[a-z0-9']+", value or "") if w]
-
-    words = _words(low)
-    media_only_words = {
-        "a", "an", "the", "my", "your", "you", "me", "of", "with", "for", "please",
-        "photo", "photos", "picture", "pictures", "pic", "pics", "image", "images",
-        "snapshot", "snapshots", "selfie", "selfies",
-    }
-
-    # "photo" / "a photo" / "photo of you" is ambiguous. Ask for confirmation
-    # instead of consuming inventory or returning the no-photo canned response.
-    if words and all(w in media_only_words for w in words):
-        return False, []
-
-    command_prefix = r"^(?:yes[,.! ]+|ok(?:ay)?[,.! ]+|sure[,.! ]+|please[,.! ]+|hey[,.! ]+|hi[,.! ]+|hello[,.! ]+)*"
-    direct_command = re.search(
-        command_prefix + r"(?:please\s+)?(?:send|show|share|give|text|post|upload|attach|display)\b.{0,100}\b" + media_word + r"\b",
-        low,
-    )
-
-    polite_request = re.search(
-        r"\b(?:can|could|will|would)\s+you\b.{0,40}\b(?:send|sending|show|showing|share|sharing|give|text|post|upload|attach|display)\b.{0,100}\b" + media_word + r"\b",
-        low,
-    ) or re.search(
-        r"\bwould\s+you\s+mind\b.{0,40}\b(?:send|sending|show|showing|share|sharing|giving)\b.{0,100}\b" + media_word + r"\b",
-        low,
-    ) or re.search(
-        r"\b(?:can|could|may)\s+i\b.{0,40}\b(?:see|get|have|receive)\b.{0,100}\b" + media_word + r"\b",
-        low,
-    ) or re.search(
-        r"\b(?:do|does)\s+you\b.{0,40}\bhave\b.{0,100}\b" + media_word + r"\b",
-        low,
-    )
-
-    desire_request = re.search(
-        r"\b(?:i\s+want|i\s+would\s+like|i'd\s+like|i\s+need)\b.{0,100}\b" + media_word + r"\b",
-        low,
-    )
-
-    # Natural live wording: "Would it be possible to get a photo of you?"
-    # That is a direct current-turn photo request, not merely an ambiguous
-    # mention that should ask for confirmation.
-    possible_request = re.search(
-        r"\b(?:would|could|can)\s+it\s+be\s+possible\b.{0,80}\b(?:to\s+)?(?:send|show|share|give|get|see|have|receive)\b.{0,120}\b" + media_word + r"\b",
-        low,
-    ) or re.search(
-        r"\bis\s+it\s+possible\b.{0,80}\b(?:to\s+)?(?:send|show|share|give|get|see|have|receive)\b.{0,120}\b" + media_word + r"\b",
-        low,
-    )
-
-    concise_specific = False
-    if len(words) <= 8:
-        terms = _human_photo_request_terms(low)
-        if terms:
-            concise_specific = True
-
-    delivery_intent = bool(direct_command or polite_request or desire_request or possible_request or concise_specific or _human_photo_has_current_delivery_request(low))
-    if not delivery_intent:
-        return False, []
-    return True, _human_photo_request_terms(low)
-
-
-def _human_photo_metadata_file_payload(photo_dir: str) -> Dict[str, Any]:
-    if not photo_dir or not os.path.isdir(photo_dir):
-        return {}
-    candidate_names: List[str] = list(_HUMAN_PHOTO_METADATA_FILENAMES)
-    try:
-        for entry in os.listdir(photo_dir):
-            low = str(entry or "").strip().lower()
-            if not low.endswith(".json"):
-                continue
-            if "photo_metadata" not in low and "human_photo_metadata" not in low:
-                continue
-            if entry not in candidate_names:
-                candidate_names.append(entry)
-    except Exception:
-        pass
-    for name in candidate_names:
-        path = os.path.join(photo_dir, name)
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception as exc:
-            print(f"[human-photo] WARNING: failed reading metadata file {path}: {exc!r}")
-            return {}
-    return {}
-
-
-def _human_photo_metadata_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return []
-    raw = payload.get("photos") or payload.get("items") or payload.get("metadata") or []
-    out: List[Dict[str, Any]] = []
-    if isinstance(raw, dict):
-        for file_name, meta in raw.items():
-            item = dict(meta or {}) if isinstance(meta, dict) else {"tags": meta}
-            item.setdefault("file_name", file_name)
-            out.append(item)
-    elif isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, dict):
-                out.append(dict(item))
-    return out
-
-
-def _human_photo_inventory_generation(files: List[Tuple[str, int, int, float]]) -> str:
-    h = hashlib.sha256()
-    for name, seq, size, mtime in sorted(files, key=lambda x: (x[1], x[0].lower())):
-        h.update(f"{name}|{seq}|{size}|{int(mtime)}\n".encode("utf-8", errors="ignore"))
-    return h.hexdigest()[:24]
-
-
-def _human_photo_sync_inventory_on_conn(
-    conn: sqlite3.Connection,
-    *,
-    brand: str,
-    companion_mapping_id: int,
-    host_member_id: str = "",
-    host_email: str = "",
-) -> Dict[str, Any]:
-    _human_photo_db_ensure_schema(conn)
-    b = _stripe_paygo_brand(brand or "Elaralo")
-    photo_dir = _human_photo_companion_dir(companion_mapping_id)
-    now = time.time()
-    current: List[Tuple[str, int, int, float]] = []
-    if photo_dir and os.path.isdir(photo_dir):
-        try:
-            entries = os.listdir(photo_dir)
-        except Exception:
-            entries = []
-        for entry in entries:
-            if str(entry or "").startswith("."):
-                continue
-            ok, seq = _human_photo_is_valid_file_name(entry)
-            if not ok:
-                continue
-            full = os.path.join(photo_dir, entry)
-            if not os.path.isfile(full):
-                continue
-            try:
-                st = os.stat(full)
-                size = int(st.st_size or 0)
-                mtime = float(st.st_mtime or 0.0)
-            except Exception:
-                size = 0
-                mtime = 0.0
-            current.append((entry, seq, size, mtime))
-
-    generation = _human_photo_inventory_generation(current)
-    current_names = {name for name, _seq, _size, _mtime in current}
-    current_names_lc = {name.lower(): name for name in current_names}
-    host_email_norm = _human_photo_safe_email(host_email)
-
-    for file_name, seq, size, mtime in current:
-        ext = os.path.splitext(file_name)[1].lower().lstrip(".")
-        conn.execute(
-            """
-            INSERT INTO human_companion_photo_inventory
-            (brand, companion_mapping_id, host_member_id, host_email, source_dir, file_name, file_ext, original_sequence, file_size, file_mtime, status, created_epoch, updated_epoch)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?)
-            ON CONFLICT(brand, companion_mapping_id, file_name) DO UPDATE SET
-              host_member_id=COALESCE(NULLIF(excluded.host_member_id, ''), human_companion_photo_inventory.host_member_id),
-              host_email=COALESCE(NULLIF(excluded.host_email, ''), human_companion_photo_inventory.host_email),
-              source_dir=excluded.source_dir,
-              file_ext=excluded.file_ext,
-              original_sequence=excluded.original_sequence,
-              file_size=excluded.file_size,
-              file_mtime=excluded.file_mtime,
-              status=CASE WHEN human_companion_photo_inventory.status='missing' THEN 'available' ELSE human_companion_photo_inventory.status END,
-              updated_epoch=excluded.updated_epoch
-            """,
-            (b, int(companion_mapping_id), str(host_member_id or "").strip(), host_email_norm, photo_dir, file_name, ext, int(seq), int(size), float(mtime), now, now),
-        )
-
-    existing_rows = conn.execute(
-        "SELECT file_name, status FROM human_companion_photo_inventory WHERE brand=? AND companion_mapping_id=?",
-        (b, int(companion_mapping_id)),
-    ).fetchall()
-    for row in existing_rows:
-        fn = str(row["file_name"] or "").strip()
-        status = str(row["status"] or "").strip().lower()
-        if fn and fn not in current_names and status == "available":
-            conn.execute(
-                "UPDATE human_companion_photo_inventory SET status='missing', updated_epoch=? WHERE brand=? AND companion_mapping_id=? AND file_name=?",
-                (now, b, int(companion_mapping_id), fn),
-            )
-
-    metadata_payload = _human_photo_metadata_file_payload(photo_dir)
-    metadata_version = str(metadata_payload.get("metadata_version") or metadata_payload.get("version") or "").strip() if isinstance(metadata_payload, dict) else ""
-    reviewed_by = str(metadata_payload.get("reviewed_by") or "").strip() if isinstance(metadata_payload, dict) else ""
-    for item in _human_photo_metadata_items(metadata_payload):
-        file_name = str(item.get("file_name") or item.get("filename") or item.get("name") or "").strip()
-        if not file_name:
-            continue
-        file_name = current_names_lc.get(file_name.lower(), file_name)
-        ok, _seq = _human_photo_is_valid_file_name(file_name)
-        if not ok:
-            continue
-        tags = _human_photo_safe_json_list(item.get("tags") or item.get("labels") or [])
-        description = re.sub(r"\s+", " ", str(item.get("description") or item.get("caption") or "").strip())
-        review_status = str(item.get("review_status") or item.get("status") or "reviewed").strip().lower()
-        item_reviewed_by = str(item.get("reviewed_by") or reviewed_by or "").strip()
-        try:
-            reviewed_at = float(item.get("reviewed_at_epoch") or now)
-        except Exception:
-            reviewed_at = now
-        conn.execute(
-            """
-            INSERT INTO human_companion_photo_metadata
-            (brand, companion_mapping_id, file_name, tags_json, description, review_status, reviewed_by, reviewed_at_epoch, metadata_version, updated_epoch)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(brand, companion_mapping_id, file_name) DO UPDATE SET
-              tags_json=excluded.tags_json,
-              description=excluded.description,
-              review_status=excluded.review_status,
-              reviewed_by=excluded.reviewed_by,
-              reviewed_at_epoch=excluded.reviewed_at_epoch,
-              metadata_version=excluded.metadata_version,
-              updated_epoch=excluded.updated_epoch
-            """,
-            (b, int(companion_mapping_id), file_name, json.dumps(tags, separators=(",", ":")), description, review_status, item_reviewed_by, reviewed_at, metadata_version, now),
-        )
-
-    remaining = int(conn.execute(
-        "SELECT COUNT(1) FROM human_companion_photo_inventory WHERE brand=? AND companion_mapping_id=? AND status='available'",
-        (b, int(companion_mapping_id)),
-    ).fetchone()[0] or 0)
-    return {"photo_dir": photo_dir, "generation": generation, "total_files": len(current), "remaining": remaining}
-
-
-def _human_photo_companion_mapping_table_name(conn: sqlite3.Connection) -> str:
+def _human_media_companion_mapping_table_name(conn: sqlite3.Connection) -> str:
     preferred = (str(_COMPANION_MAPPINGS_TABLE or "").strip(), "companion_mappings", "voice_video_mappings", "voice_video_mapping", "mappings")
     names: Dict[str, str] = {}
     try:
@@ -21887,60 +21519,63 @@ def _human_photo_companion_mapping_table_name(conn: sqlite3.Connection) -> str:
     return ""
 
 
-def _human_photo_mapping_row_from_session_state(conn: sqlite3.Connection, session_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _human_media_mapping_row_from_session_state(conn: sqlite3.Connection, session_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ss = session_state if isinstance(session_state, dict) else {}
     brand = _brand_from_session_state(ss) or "Elaralo"
     if not _is_elaralo_core_brand(brand):
         return None
-    requested_type = _host_onboarding_safe_str(
-        ss.get("companionType") or ss.get("companion_type") or ss.get("type") or ""
-    ).lower()
+    requested_type = _host_onboarding_safe_str(ss.get("companionType") or ss.get("companion_type") or ss.get("type") or "").lower()
     if requested_type in ("human_companion", "human-host", "host"):
         requested_type = "human"
     if requested_type and requested_type not in {"human", ""}:
         return None
-
     avatar = _avatar_from_session_state(ss) or _extract_companion_raw(ss)
     member_host = _host_onboarding_safe_str(ss.get("hostMemberId") or ss.get("host_member_id") or "")
-    table = _human_photo_companion_mapping_table_name(conn)
+    return _human_media_mapping_row_by_brand_avatar_host(conn, brand=brand, avatar=avatar, host_member_id=member_host)
+
+
+def _human_media_mapping_row_by_brand_avatar_host(conn: sqlite3.Connection, *, brand: Any, avatar: Any = "", host_member_id: Any = "") -> Optional[Dict[str, Any]]:
+    brand_s = _host_onboarding_safe_str(brand) or "Elaralo"
+    if not _is_elaralo_core_brand(brand_s):
+        return None
+    table = _human_media_companion_mapping_table_name(conn)
     if not table:
         return None
-    cols = _human_photo_table_columns(conn, table)
+    cols = {c.lower() for c in _human_media_table_columns(conn, table)}
     if not cols:
         return None
-    id_expr = "id" if "id" in {c.lower() for c in cols} else "rowid"
-    host_email_expr = "host_email" if "host_email" in {c.lower() for c in cols} else "''"
-    host_member_expr = "host_member_id" if "host_member_id" in {c.lower() for c in cols} else "''"
-    companion_type_expr = "companion_type" if "companion_type" in {c.lower() for c in cols} else "''"
-    brand_expr = "brand" if "brand" in {c.lower() for c in cols} else "''"
-    avatar_expr = "avatar" if "avatar" in {c.lower() for c in cols} else "''"
-    base_select = f"SELECT {id_expr} AS mapping_id, {brand_expr} AS brand, {avatar_expr} AS avatar, {host_member_expr} AS host_member_id, {host_email_expr} AS host_email, {companion_type_expr} AS companion_type FROM {table}"
-
+    id_expr = "id" if "id" in cols else "rowid"
+    host_email_expr = "host_email" if "host_email" in cols else "''"
+    host_member_expr = "host_member_id" if "host_member_id" in cols else "''"
+    companion_type_expr = "companion_type" if "companion_type" in cols else "''"
+    brand_expr = "brand" if "brand" in cols else "''"
+    avatar_expr = "avatar" if "avatar" in cols else "''"
+    phonetic_expr = "phonetic" if "phonetic" in cols else "''"
+    base_select = f"SELECT {id_expr} AS mapping_id, {brand_expr} AS brand, {avatar_expr} AS avatar, {host_member_expr} AS host_member_id, {host_email_expr} AS host_email, {companion_type_expr} AS companion_type, {phonetic_expr} AS phonetic FROM {table}"
     where_common = "lower(COALESCE(brand, 'Elaralo')) = lower(?) AND lower(COALESCE(companion_type, '')) = 'human'"
-    params: Tuple[Any, ...]
     row = None
-    if avatar:
-        avatar_candidates = _companion_mapping_lookup_avatar_candidates(avatar)
-        for candidate in avatar_candidates:
+    avatar_s = _host_onboarding_safe_str(avatar)
+    if avatar_s:
+        for candidate in _companion_mapping_lookup_avatar_candidates(avatar_s):
             row = conn.execute(
                 f"{base_select} WHERE {where_common} AND lower(COALESCE(avatar, '')) = lower(?) ORDER BY mapping_id DESC LIMIT 1",
-                (brand, candidate),
+                (brand_s, candidate),
             ).fetchone()
             if row is not None:
                 break
-    if row is None and member_host:
+    host_s = _host_onboarding_safe_str(host_member_id)
+    if row is None and host_s:
         row = conn.execute(
             f"{base_select} WHERE {where_common} AND COALESCE(host_member_id, '') = ? ORDER BY mapping_id DESC LIMIT 1",
-            (brand, member_host),
+            (brand_s, host_s),
         ).fetchone()
-    if row is None:
-        # Last resort: use in-memory alias lookup, then re-query by resolved avatar to recover the numeric id.
-        mapping = _lookup_companion_mapping_with_aliases(brand, avatar, "human") if avatar else None
-        resolved_avatar = str((mapping or {}).get("avatar") or (mapping or {}).get("mapping_avatar") or "").strip()
+    if row is None and avatar_s:
+        mapping = _lookup_companion_mapping_with_aliases(brand_s, avatar_s, "human")
+        resolved_avatar = _host_onboarding_safe_str((mapping or {}).get("avatar") or (mapping or {}).get("mapping_avatar"))
         if resolved_avatar:
             row = conn.execute(
                 f"{base_select} WHERE {where_common} AND lower(COALESCE(avatar, '')) = lower(?) ORDER BY mapping_id DESC LIMIT 1",
-                (brand, resolved_avatar),
+                (brand_s, resolved_avatar),
             ).fetchone()
     if row is None:
         return None
@@ -21949,58 +21584,503 @@ def _human_photo_mapping_row_from_session_state(conn: sqlite3.Connection, sessio
         out["mapping_id"] = int(out.get("mapping_id") or 0)
     except Exception:
         out["mapping_id"] = 0
-    if int(out.get("mapping_id") or 0) <= 0:
-        return None
-    return out
+    return out if int(out.get("mapping_id") or 0) > 0 else None
 
 
 def _human_photo_persist_host_email_on_conn(conn: sqlite3.Connection, *, brand: Any, avatar: Any, member_id: Any, host_email: Any) -> bool:
-    email = _human_photo_safe_email(host_email)
+    """Compatibility wrapper kept because Host/Profile Studio session start calls this helper."""
+    email = _human_media_safe_email(host_email)
     if not email:
         return False
-    table = _human_photo_companion_mapping_table_name(conn)
+    table = _human_media_companion_mapping_table_name(conn)
     if not table:
         return False
-    try:
-        if "host_email" not in {c.lower() for c in _human_photo_table_columns(conn, table)}:
+    cols = {c.lower() for c in _human_media_table_columns(conn, table)}
+    if "host_email" not in cols:
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN host_email TEXT")
-    except Exception:
-        return False
-    b = _host_onboarding_safe_str(brand) or "Elaralo"
-    a = _host_onboarding_safe_str(avatar)
-    mid = _host_onboarding_safe_str(member_id)
+            cols.add("host_email")
+        except Exception:
+            return False
+    brand_s = _host_onboarding_safe_str(brand) or "Elaralo"
+    avatar_s = _host_onboarding_safe_str(avatar)
+    member_s = _host_onboarding_safe_str(member_id)
     updated = 0
-    if a:
-        cur = conn.execute(
-            f"UPDATE {table} SET host_email=? WHERE lower(COALESCE(brand, 'Elaralo'))=lower(?) AND lower(COALESCE(avatar, ''))=lower(?) AND lower(COALESCE(companion_type, ''))='human'",
-            (email, b, a),
-        )
-        updated += int(cur.rowcount or 0)
-    if updated <= 0 and mid and "host_member_id" in {c.lower() for c in _human_photo_table_columns(conn, table)}:
-        cur = conn.execute(
-            f"UPDATE {table} SET host_email=? WHERE lower(COALESCE(brand, 'Elaralo'))=lower(?) AND COALESCE(host_member_id, '')=? AND lower(COALESCE(companion_type, ''))='human'",
-            (email, b, mid),
-        )
-        updated += int(cur.rowcount or 0)
+    if avatar_s:
+        try:
+            cur = conn.execute(
+                f"UPDATE {table} SET host_email=? WHERE lower(COALESCE(brand, ''))=lower(?) AND lower(COALESCE(avatar, ''))=lower(?) AND lower(COALESCE(companion_type, ''))='human'",
+                (email, brand_s, avatar_s),
+            )
+            updated += int(cur.rowcount or 0)
+        except Exception:
+            pass
+    if updated <= 0 and member_s and "host_member_id" in cols:
+        try:
+            cur = conn.execute(
+                f"UPDATE {table} SET host_email=? WHERE lower(COALESCE(brand, ''))=lower(?) AND COALESCE(host_member_id, '')=? AND lower(COALESCE(companion_type, ''))='human'",
+                (email, brand_s, member_s),
+            )
+            updated += int(cur.rowcount or 0)
+        except Exception:
+            pass
     return updated > 0
 
 
-def _human_photo_delivered_count_in_window(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, viewer_key: str, now_epoch: float) -> int:
-    since = float(now_epoch) - (max(1, int(_HUMAN_PHOTO_TRIAL_WINDOW_DAYS or 30)) * 86400.0)
+def _human_media_valid_name(file_name: Any, media_type: Optional[str] = None) -> Tuple[bool, str, int]:
+    name = os.path.basename(str(file_name or "").strip())
+    checks = []
+    if media_type in (None, "photo"):
+        checks.append(("photo", _HUMAN_MEDIA_PHOTO_VALID_RE))
+    if media_type in (None, "video"):
+        checks.append(("video", _HUMAN_MEDIA_VIDEO_VALID_RE))
+    for mt, rx in checks:
+        m = rx.match(name)
+        if not m:
+            continue
+        try:
+            seq = int(m.group(1))
+        except Exception:
+            seq = 0
+        return True, mt, seq
+    return False, "", 0
+
+
+def _human_media_relative_path(media_type: str, file_name: str) -> str:
+    folder = "videos" if media_type == "video" else "photos"
+    return f"{folder}/{os.path.basename(str(file_name or '').strip())}"
+
+
+def _human_media_file_path(companion_mapping_id: Any, media_type: str, file_name: str) -> str:
+    base = _human_media_videos_dir(companion_mapping_id) if media_type == "video" else _human_media_photos_dir(companion_mapping_id)
+    return os.path.abspath(os.path.join(base, os.path.basename(str(file_name or "").strip())))
+
+
+def _human_media_load_json_file(path: str) -> Any:
+    try:
+        if path and os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as exc:
+        print(f"[human-media] WARNING: failed reading JSON {path}: {exc!r}")
+    return None
+
+
+def _human_media_metadata_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        raw_items = payload
+    elif isinstance(payload, dict):
+        raw_items = payload.get("items") or payload.get("media") or payload.get("photos") or []
+        if isinstance(raw_items, dict):
+            tmp = []
+            for k, v in raw_items.items():
+                if isinstance(v, dict):
+                    tmp.append({"file_name": k, **v})
+            raw_items = tmp
+    else:
+        raw_items = []
+    out: List[Dict[str, Any]] = []
+    if not isinstance(raw_items, list):
+        return out
+    for item in raw_items:
+        if isinstance(item, str):
+            item = {"file_name": item}
+        if not isinstance(item, dict):
+            continue
+        file_name = os.path.basename(str(item.get("file_name") or item.get("filename") or item.get("name") or "").strip())
+        if not file_name:
+            continue
+        ok, media_type, seq = _human_media_valid_name(file_name)
+        if not ok:
+            # Legacy photo metadata may use root-relative names. Ignore anything else.
+            continue
+        relative_path = str(item.get("relative_path") or item.get("path") or _human_media_relative_path(media_type, file_name)).strip().replace("\\", "/")
+        out.append({
+            "media_type": media_type,
+            "file_name": file_name,
+            "relative_path": relative_path,
+            "sequence_number": int(item.get("sequence_number") or item.get("sequence") or seq or 0),
+            "description": _host_onboarding_safe_str(item.get("description") or item.get("caption") or item.get("summary") or ""),
+            "tags": _human_media_safe_json_list(item.get("tags") or item.get("labels") or []),
+            "status": _host_onboarding_safe_str(item.get("status") or "approved").lower() or "approved",
+            "review_status": _host_onboarding_safe_str(item.get("review_status") or item.get("reviewStatus") or "host_reviewed"),
+            "source": _host_onboarding_safe_str(item.get("source") or "media_metadata_json"),
+            "duration_seconds": float(item.get("duration_seconds") or 0.0) if str(item.get("duration_seconds") or "").strip() else 0.0,
+            "width": int(float(item.get("width") or item.get("width_px") or 0) or 0),
+            "height": int(float(item.get("height") or item.get("height_px") or 0) or 0),
+        })
+    return out
+
+
+def _human_media_read_metadata_items(companion_mapping_id: Any) -> List[Dict[str, Any]]:
+    return _human_media_metadata_items_from_payload(_human_media_load_json_file(_human_media_metadata_path(companion_mapping_id)))
+
+
+def _human_media_write_metadata_items(companion_mapping_id: Any, items: List[Dict[str, Any]]) -> None:
+    path = _human_media_metadata_path(companion_mapping_id)
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    safe_items: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        file_name = os.path.basename(str(item.get("file_name") or "").strip())
+        ok, media_type, seq = _human_media_valid_name(file_name)
+        if not ok:
+            continue
+        rel = str(item.get("relative_path") or _human_media_relative_path(media_type, file_name)).strip().replace("\\", "/")
+        safe_items.append({
+            "media_type": media_type,
+            "file_name": file_name,
+            "relative_path": rel,
+            "sequence_number": int(item.get("sequence_number") or seq or 0),
+            "description": _host_onboarding_safe_str(item.get("description") or ""),
+            "tags": _human_media_safe_json_list(item.get("tags") or item.get("tags_json") or []),
+            "status": _host_onboarding_safe_str(item.get("status") or "approved").lower() or "approved",
+            "review_status": _host_onboarding_safe_str(item.get("review_status") or "host_reviewed"),
+            "source": _host_onboarding_safe_str(item.get("source") or "host_profile_studio"),
+            "duration_seconds": float(item.get("duration_seconds") or 0.0),
+            "width": int(item.get("width") or item.get("width_px") or 0),
+            "height": int(item.get("height") or item.get("height_px") or 0),
+            "updated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        })
+    payload = {"version": "v10.0.0-alpha15.9", "items": sorted(safe_items, key=lambda x: (str(x.get("media_type")), int(x.get("sequence_number") or 0), str(x.get("file_name"))))}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _human_media_inventory_generation(files: List[Tuple[str, str, int, int, float]]) -> str:
+    h = hashlib.sha256()
+    for media_type, file_name, seq, size, mtime in sorted(files, key=lambda x: (x[0], x[2], x[1].lower())):
+        h.update(str(media_type).encode())
+        h.update(b"|")
+        h.update(str(file_name).encode())
+        h.update(b"|")
+        h.update(str(seq).encode())
+        h.update(b"|")
+        h.update(str(size).encode())
+        h.update(b"|")
+        h.update(str(int(mtime)).encode())
+        h.update(b"\n")
+    return h.hexdigest()[:24]
+
+
+def _human_media_migrate_photo_metadata_once(companion_mapping_id: int) -> None:
+    """One-time alpha15.9 migration source. Runtime never falls back to photo_metadata.json."""
+    base = _human_media_companion_dir(companion_mapping_id)
+    if not base:
+        return
+    photo_meta_path = os.path.join(base, "photo_metadata.json")
+    if not os.path.isfile(photo_meta_path):
+        return
+    existing_items = _human_media_read_metadata_items(companion_mapping_id)
+    existing_by_rel = {str(item.get("relative_path") or "").strip(): dict(item) for item in existing_items if isinstance(item, dict)}
+    payload = _human_media_load_json_file(photo_meta_path)
+    legacy = _human_media_metadata_items_from_payload(payload)
+    changed = False
+    for item in legacy:
+        if str(item.get("media_type") or "") != "photo":
+            continue
+        file_name = os.path.basename(str(item.get("file_name") or ""))
+        ok, _media_type, seq = _human_media_valid_name(file_name, "photo")
+        if not ok:
+            continue
+        rel = f"photos/{file_name}"
+        if rel in existing_by_rel and (existing_by_rel[rel].get("description") or existing_by_rel[rel].get("tags")):
+            continue
+        existing_by_rel[rel] = {
+            **existing_by_rel.get(rel, {}),
+            **item,
+            "media_type": "photo",
+            "file_name": file_name,
+            "relative_path": rel,
+            "sequence_number": int(item.get("sequence_number") or seq or 0),
+            "status": _host_onboarding_safe_str(existing_by_rel.get(rel, {}).get("status") or item.get("status") or "approved").lower() or "approved",
+            "review_status": _host_onboarding_safe_str(item.get("review_status") or "migrated_existing_photo"),
+            "source": "alpha15_9_photo_metadata_migration",
+        }
+        changed = True
+    if changed:
+        _human_media_write_metadata_items(companion_mapping_id, list(existing_by_rel.values()))
+
+
+def _human_media_move_root_files_once(companion_mapping_id: int) -> None:
+    base = _human_media_companion_dir(companion_mapping_id)
+    if not base or not os.path.isdir(base):
+        return
+    photos_dir = _human_media_photos_dir(companion_mapping_id)
+    videos_dir = _human_media_videos_dir(companion_mapping_id)
+    os.makedirs(photos_dir, exist_ok=True)
+    os.makedirs(videos_dir, exist_ok=True)
+    for entry in os.listdir(base):
+        src = os.path.join(base, entry)
+        if not os.path.isfile(src):
+            continue
+        ok, media_type, _seq = _human_media_valid_name(entry)
+        if not ok:
+            continue
+        dest_dir = photos_dir if media_type == "photo" else videos_dir
+        dest = os.path.join(dest_dir, os.path.basename(entry))
+        if os.path.abspath(src) == os.path.abspath(dest):
+            continue
+        if os.path.exists(dest):
+            continue
+        try:
+            os.replace(src, dest)
+        except Exception as exc:
+            print(f"[human-media] WARNING: failed moving {src} to {dest}: {exc!r}")
+
+
+def _human_media_probe_video(path: str) -> Tuple[float, int, int]:
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration", "-show_entries", "format=duration",
+            "-of", "json", path,
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+        if res.returncode != 0:
+            return 0.0, 0, 0
+        data = json.loads(res.stdout or "{}")
+        streams = data.get("streams") if isinstance(data, dict) else []
+        stream = streams[0] if isinstance(streams, list) and streams else {}
+        width = int(float(stream.get("width") or 0) or 0)
+        height = int(float(stream.get("height") or 0) or 0)
+        dur = stream.get("duration") or (data.get("format") or {}).get("duration") or 0
+        duration = float(dur or 0.0)
+        return duration, width, height
+    except Exception:
+        return 0.0, 0, 0
+
+
+def _human_media_scan_files(companion_mapping_id: int) -> Tuple[List[Dict[str, Any]], str]:
+    _human_media_move_root_files_once(companion_mapping_id)
+    _human_media_migrate_photo_metadata_once(companion_mapping_id)
+    files: List[Dict[str, Any]] = []
+    for media_type, folder in [("photo", _human_media_photos_dir(companion_mapping_id)), ("video", _human_media_videos_dir(companion_mapping_id))]:
+        os.makedirs(folder, exist_ok=True)
+        try:
+            entries = os.listdir(folder)
+        except Exception:
+            entries = []
+        for entry in entries:
+            ok, mt, seq = _human_media_valid_name(entry, media_type)
+            if not ok or mt != media_type:
+                continue
+            path = os.path.join(folder, entry)
+            if not os.path.isfile(path):
+                continue
+            try:
+                st = os.stat(path)
+                size = int(st.st_size or 0)
+                mtime = float(st.st_mtime or 0.0)
+            except Exception:
+                size = 0
+                mtime = 0.0
+            width = height = 0
+            duration = 0.0
+            if media_type == "photo":
+                try:
+                    with open(path, "rb") as f:
+                        width, height = _host_onboarding_try_read_image_size(f.read(1024 * 1024 * 16))
+                except Exception:
+                    width, height = (0, 0)
+            else:
+                duration, width, height = _human_media_probe_video(path)
+            files.append({
+                "media_type": media_type,
+                "file_name": entry,
+                "relative_path": _human_media_relative_path(media_type, entry),
+                "sequence_number": seq,
+                "file_size": size,
+                "file_mtime": mtime,
+                "duration_seconds": duration,
+                "width_px": width,
+                "height_px": height,
+                "source_dir": folder,
+            })
+    gen = _human_media_inventory_generation([(f["media_type"], f["file_name"], int(f["sequence_number"]), int(f["file_size"]), float(f["file_mtime"])) for f in files])
+    return files, gen
+
+
+def _human_media_sync_inventory_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, host_member_id: Any = "", host_email: Any = "") -> Dict[str, Any]:
+    _human_media_db_ensure_schema(conn)
+    brand_s = _host_onboarding_safe_str(brand) or "Elaralo"
+    files, generation = _human_media_scan_files(int(companion_mapping_id))
+    now = time.time()
+    host_email_norm = _human_media_safe_email(host_email)
+    host_member_norm = _host_onboarding_safe_str(host_member_id)
+    metadata_items = {str(item.get("relative_path") or "").strip(): item for item in _human_media_read_metadata_items(companion_mapping_id)}
+    seen_rel: Set[str] = set()
+    for f in files:
+        rel = str(f.get("relative_path") or "").strip()
+        seen_rel.add(rel)
+        meta = metadata_items.get(rel) or metadata_items.get(str(f.get("file_name") or "")) or {}
+        status = _host_onboarding_safe_str(meta.get("status") or "approved").lower() or "approved"
+        if status not in {"approved", "pending_approval", "inactive", "rejected", "missing"}:
+            status = "approved"
+        review_status = _host_onboarding_safe_str(meta.get("review_status") or "migrated_existing_photo")
+        conn.execute(
+            """
+            INSERT INTO human_companion_media_inventory
+            (brand, companion_mapping_id, host_member_id, host_email, media_type, source_dir, relative_path, file_name, file_ext, sequence_number, file_size, file_mtime, duration_seconds, width_px, height_px, status, review_status, media_generation, created_epoch, updated_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(brand, companion_mapping_id, relative_path) DO UPDATE SET
+              host_member_id=COALESCE(NULLIF(excluded.host_member_id, ''), human_companion_media_inventory.host_member_id),
+              host_email=COALESCE(NULLIF(excluded.host_email, ''), human_companion_media_inventory.host_email),
+              source_dir=excluded.source_dir,
+              file_name=excluded.file_name,
+              file_ext=excluded.file_ext,
+              sequence_number=excluded.sequence_number,
+              file_size=excluded.file_size,
+              file_mtime=excluded.file_mtime,
+              duration_seconds=excluded.duration_seconds,
+              width_px=excluded.width_px,
+              height_px=excluded.height_px,
+              status=CASE WHEN human_companion_media_inventory.status='missing' THEN excluded.status ELSE human_companion_media_inventory.status END,
+              review_status=COALESCE(NULLIF(human_companion_media_inventory.review_status, ''), excluded.review_status),
+              media_generation=excluded.media_generation,
+              updated_epoch=excluded.updated_epoch
+            """,
+            (brand_s, int(companion_mapping_id), host_member_norm, host_email_norm, f["media_type"], f["source_dir"], rel, f["file_name"], os.path.splitext(str(f["file_name"]))[1].lower(), int(f["sequence_number"]), int(f["file_size"]), float(f["file_mtime"]), float(f.get("duration_seconds") or 0.0), int(f.get("width_px") or 0), int(f.get("height_px") or 0), status, review_status, generation, now, now),
+        )
+    rows = conn.execute(
+        "SELECT media_id, relative_path FROM human_companion_media_inventory WHERE brand=? AND companion_mapping_id=?",
+        (brand_s, int(companion_mapping_id)),
+    ).fetchall()
+    for row in rows:
+        rel = str(row["relative_path"] if isinstance(row, sqlite3.Row) else row[1] or "")
+        if rel not in seen_rel:
+            conn.execute("UPDATE human_companion_media_inventory SET status='missing', updated_epoch=? WHERE brand=? AND companion_mapping_id=? AND relative_path=?", (now, brand_s, int(companion_mapping_id), rel))
+    # Upsert metadata from media_metadata.json and blank rows for files without metadata.
+    inv_rows = conn.execute(
+        "SELECT media_id, media_type, relative_path, file_name, sequence_number, status, review_status FROM human_companion_media_inventory WHERE brand=? AND companion_mapping_id=?",
+        (brand_s, int(companion_mapping_id)),
+    ).fetchall()
+    meta_by_rel = metadata_items
+    for row in inv_rows:
+        d = dict(row)
+        rel = str(d.get("relative_path") or "")
+        meta = meta_by_rel.get(rel) or {}
+        tags = _human_media_safe_json_list(meta.get("tags") or meta.get("tags_json") or [])
+        description = _host_onboarding_safe_str(meta.get("description") or "")
+        review_status = _host_onboarding_safe_str(meta.get("review_status") or d.get("review_status") or "host_reviewed")
+        conn.execute(
+            """
+            INSERT INTO human_companion_media_metadata
+            (brand, companion_mapping_id, media_id, media_type, relative_path, file_name, tags_json, description, review_status, reviewed_by, reviewed_at_epoch, metadata_version, updated_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(brand, companion_mapping_id, relative_path) DO UPDATE SET
+              media_id=excluded.media_id,
+              media_type=excluded.media_type,
+              file_name=excluded.file_name,
+              tags_json=excluded.tags_json,
+              description=excluded.description,
+              review_status=excluded.review_status,
+              metadata_version=excluded.metadata_version,
+              updated_epoch=excluded.updated_epoch
+            """,
+            (brand_s, int(companion_mapping_id), int(d.get("media_id") or 0), str(d.get("media_type") or "photo"), rel, str(d.get("file_name") or ""), json.dumps(tags), description, review_status, _host_onboarding_safe_str(meta.get("reviewed_by") or ""), float(meta.get("reviewed_at_epoch") or 0.0), "media_metadata.json", now),
+        )
+    counts = _human_media_counts_on_conn(conn, brand=brand_s, companion_mapping_id=int(companion_mapping_id))
+    return {"companion_dir": _human_media_companion_dir(companion_mapping_id), "generation": generation, **counts}
+
+
+def _human_media_counts_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, viewer_key: str = "") -> Dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT media_type, status, COUNT(1) AS c
+          FROM human_companion_media_inventory
+         WHERE brand=? AND companion_mapping_id=?
+         GROUP BY media_type, status
+        """,
+        (brand, int(companion_mapping_id)),
+    ).fetchall()
+    out = {
+        "approved_photos": 0,
+        "approved_videos": 0,
+        "inactive_photos": 0,
+        "inactive_videos": 0,
+        "pending_photos": 0,
+        "pending_videos": 0,
+        "total_photos": 0,
+        "total_videos": 0,
+    }
+    for row in rows:
+        mt = str(row["media_type"] if isinstance(row, sqlite3.Row) else row[0] or "").lower()
+        status = str(row["status"] if isinstance(row, sqlite3.Row) else row[1] or "").lower()
+        c = int(row["c"] if isinstance(row, sqlite3.Row) else row[2] or 0)
+        suffix = "photos" if mt == "photo" else "videos"
+        out[f"total_{suffix}"] += c
+        if status == "approved":
+            out[f"approved_{suffix}"] += c
+        elif status == "inactive":
+            out[f"inactive_{suffix}"] += c
+        elif status == "pending_approval":
+            out[f"pending_{suffix}"] += c
+    if viewer_key:
+        out["remaining_photos_for_viewer"] = _human_media_remaining_for_viewer(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer_key, media_type="photo")
+        out["remaining_videos_for_viewer"] = _human_media_remaining_for_viewer(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer_key, media_type="video")
+    return out
+
+
+def _human_media_migrate_old_photo_runtime_state_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int) -> None:
+    if not _human_media_table_exists(conn, "human_companion_photo_requests"):
+        return
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM human_companion_photo_requests
+             WHERE brand=? AND companion_mapping_id=? AND outcome='delivered' AND COALESCE(delivered_file_name, '') <> ''
+            """,
+            (brand, int(companion_mapping_id)),
+        ).fetchall()
+    except Exception:
+        rows = []
+    now = time.time()
+    for row in rows:
+        d = dict(row)
+        file_name = os.path.basename(str(d.get("delivered_file_name") or ""))
+        ok, media_type, seq = _human_media_valid_name(file_name, "photo")
+        if not ok:
+            continue
+        inv = conn.execute(
+            "SELECT media_id FROM human_companion_media_inventory WHERE brand=? AND companion_mapping_id=? AND relative_path=? LIMIT 1",
+            (brand, int(companion_mapping_id), f"photos/{file_name}"),
+        ).fetchone()
+        if inv is None:
+            continue
+        media_id = int(inv["media_id"] if isinstance(inv, sqlite3.Row) else inv[0] or 0)
+        viewer_key = str(d.get("viewer_key") or "").strip()
+        if not media_id or not viewer_key:
+            continue
+        ledger_id = hashlib.sha256(f"legacy-photo|{brand}|{companion_mapping_id}|{viewer_key}|{media_id}".encode()).hexdigest()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO human_companion_media_viewer_ledger
+            (ledger_id, brand, companion_mapping_id, host_member_id, viewer_key, member_id, session_id, media_id, media_type, sequence_number, event_type, request_id, delivery_token, created_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'photo', ?, 'delivered', ?, ?, ?)
+            """,
+            (ledger_id, brand, int(companion_mapping_id), str(d.get("host_member_id") or ""), viewer_key, str(d.get("member_id") or ""), str(d.get("session_id") or ""), media_id, seq, str(d.get("request_id") or ""), str(d.get("delivery_token") or ""), float(d.get("created_epoch") or now)),
+        )
+
+
+def _human_media_delivered_count_in_window(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, viewer_key: str, now_epoch: float) -> int:
+    since = float(now_epoch) - max(1, int(_HUMAN_MEDIA_TRIAL_WINDOW_DAYS or 30)) * 86400.0
     row = conn.execute(
         """
-        SELECT COUNT(1)
-          FROM human_companion_photo_requests
-         WHERE brand=? AND companion_mapping_id=? AND viewer_key=?
-           AND outcome='delivered'
-           AND created_epoch >= ?
+        SELECT COUNT(1) FROM human_companion_media_viewer_ledger
+         WHERE brand=? AND companion_mapping_id=? AND viewer_key=? AND event_type='delivered' AND created_epoch>=?
         """,
         (brand, int(companion_mapping_id), str(viewer_key or ""), since),
     ).fetchone()
-    return int(row[0] or 0) if row else 0
+    return int((row[0] if row is not None else 0) or 0)
 
 
-def _human_photo_insert_request_on_conn(
+def _human_media_insert_request_on_conn(
     conn: sqlite3.Connection,
     *,
     brand: str,
@@ -22012,133 +22092,76 @@ def _human_photo_insert_request_on_conn(
     plan_name: str,
     plan_class: str,
     request_text: str,
+    media_type: str,
     request_kind: str,
     requested_tags: List[str],
     outcome: str,
     delivered_file_name: str = "",
     delivery_token: str = "",
-    remaining_after_delivery: Optional[int] = None,
+    remaining_after_delivery: int = 0,
     now_epoch: Optional[float] = None,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO human_companion_photo_requests
-        (request_id, brand, companion_mapping_id, host_member_id, viewer_key, member_id, session_id, plan_name, plan_class,
-         request_text, request_kind, requested_tags_json, outcome, delivered_file_name, delivery_token, remaining_after_delivery, created_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            uuid.uuid4().hex,
-            brand,
-            int(companion_mapping_id),
-            str(host_member_id or ""),
-            str(viewer_key or ""),
-            str(member_id or ""),
-            str(session_id or ""),
-            str(plan_name or ""),
-            str(plan_class or ""),
-            str(request_text or "")[:4000],
-            str(request_kind or ""),
-            json.dumps(list(requested_tags or []), separators=(",", ":")),
-            str(outcome or ""),
-            str(delivered_file_name or ""),
-            str(delivery_token or ""),
-            int(remaining_after_delivery) if remaining_after_delivery is not None else None,
-            float(now_epoch or time.time()),
-        ),
-    )
-
-
-def _human_photo_learned_phrase_terms_on_conn(
-    conn: sqlite3.Connection,
-    *,
-    brand: str,
-    companion_mapping_id: int,
-    phrase_text: Any,
-) -> Optional[List[str]]:
-    normalized = _human_photo_normalize_phrase(phrase_text)
-    if not normalized:
-        return None
-    rows = conn.execute(
-        """
-        SELECT requested_tags_json
-          FROM human_companion_photo_request_phrases
-         WHERE brand=?
-           AND companion_mapping_id IN (?, 0)
-           AND normalized_phrase=?
-           AND status='active'
-         ORDER BY companion_mapping_id DESC, confirmations DESC, updated_epoch DESC
-         LIMIT 1
-        """,
-        (brand, int(companion_mapping_id), normalized),
-    ).fetchall()
-    if not rows:
-        return None
-    return _human_photo_safe_json_list(rows[0]["requested_tags_json"] if isinstance(rows[0], sqlite3.Row) else rows[0][0])
-
-
-def _human_photo_record_learned_phrase_on_conn(
-    conn: sqlite3.Connection,
-    *,
-    brand: str,
-    companion_mapping_id: int,
-    phrase_text: Any,
-    requested_tags: List[str],
-    viewer_key: str,
-    member_id: str,
-    session_id: str,
-    now_epoch: Optional[float] = None,
-) -> None:
-    if not _HUMAN_PHOTO_LEARN_PHRASES_ENABLED:
-        return
-    normalized = _human_photo_normalize_phrase(phrase_text)
-    if not normalized or not _human_photo_has_media_word(normalized):
-        return
+) -> str:
+    request_id = uuid.uuid4().hex
     now = float(now_epoch or time.time())
     conn.execute(
         """
-        INSERT INTO human_companion_photo_request_phrases
-        (phrase_id, brand, companion_mapping_id, normalized_phrase, phrase_text, requested_tags_json, status,
-         confirmations, viewer_key, member_id, session_id, created_epoch, last_confirmed_epoch, updated_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(brand, companion_mapping_id, normalized_phrase) DO UPDATE SET
-          phrase_text=excluded.phrase_text,
+        INSERT INTO human_companion_media_requests
+        (request_id, brand, companion_mapping_id, host_member_id, viewer_key, member_id, session_id, plan_name, plan_class, request_text, media_type, request_kind, requested_tags_json, outcome, delivered_file_name, delivery_token, remaining_after_delivery, created_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (request_id, brand, int(companion_mapping_id), host_member_id, viewer_key, member_id, session_id, plan_name, plan_class, request_text, media_type, request_kind, json.dumps(_human_media_safe_json_list(requested_tags)), outcome, delivered_file_name, delivery_token, int(remaining_after_delivery or 0), now),
+    )
+    return request_id
+
+
+def _human_media_learned_phrase_terms_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, media_type: str, phrase_text: Any) -> List[str]:
+    normalized = _human_media_normalize_phrase(phrase_text)
+    if not normalized:
+        return []
+    row = conn.execute(
+        """
+        SELECT requested_tags_json FROM human_companion_media_request_phrases
+         WHERE brand=? AND companion_mapping_id=? AND media_type=? AND normalized_phrase=? AND status='active'
+         LIMIT 1
+        """,
+        (brand, int(companion_mapping_id), media_type, normalized),
+    ).fetchone()
+    if row is None:
+        return []
+    return _human_media_safe_json_list(row["requested_tags_json"] if isinstance(row, sqlite3.Row) else row[0])
+
+
+def _human_media_record_learned_phrase_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, media_type: str, phrase_text: Any, requested_tags: List[str], viewer_key: str, member_id: str, now_epoch: float) -> None:
+    if not _HUMAN_MEDIA_LEARN_PHRASES_ENABLED:
+        return
+    normalized = _human_media_normalize_phrase(phrase_text)
+    if not normalized or not _human_media_has_any_media_word(normalized):
+        return
+    conn.execute(
+        """
+        INSERT INTO human_companion_media_request_phrases
+        (phrase_id, brand, companion_mapping_id, media_type, normalized_phrase, requested_tags_json, status, confirmations, created_by_viewer_key, created_by_member_id, created_epoch, updated_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?)
+        ON CONFLICT(brand, companion_mapping_id, media_type, normalized_phrase) DO UPDATE SET
           requested_tags_json=excluded.requested_tags_json,
+          confirmations=human_companion_media_request_phrases.confirmations + 1,
           status='active',
-          confirmations=human_companion_photo_request_phrases.confirmations + 1,
-          viewer_key=excluded.viewer_key,
-          member_id=excluded.member_id,
-          session_id=excluded.session_id,
-          last_confirmed_epoch=excluded.last_confirmed_epoch,
           updated_epoch=excluded.updated_epoch
         """,
-        (
-            uuid.uuid4().hex,
-            brand,
-            int(companion_mapping_id),
-            normalized,
-            str(phrase_text or "")[:500],
-            json.dumps(list(requested_tags or []), separators=(",", ":")),
-            str(viewer_key or ""),
-            str(member_id or ""),
-            str(session_id or ""),
-            now,
-            now,
-            now,
-        ),
+        (uuid.uuid4().hex, brand, int(companion_mapping_id), media_type, normalized, json.dumps(_human_media_safe_json_list(requested_tags)), viewer_key, member_id, now_epoch, now_epoch),
     )
 
 
-def _human_photo_row_metadata_text(row: Dict[str, Any]) -> Tuple[List[str], str]:
-    tags = _human_photo_safe_json_list(row.get("tags_json") or "[]")
+def _human_media_row_metadata_text(row: Dict[str, Any]) -> Tuple[List[str], str]:
+    tags = _human_media_safe_json_list(row.get("tags_json") or "[]")
     desc = re.sub(r"\s+", " ", str(row.get("description") or "").strip().lower())
     return tags, desc
 
 
-def _human_photo_score_metadata_match(row: Dict[str, Any], terms: List[str]) -> int:
+def _human_media_score_metadata_match(row: Dict[str, Any], terms: List[str]) -> int:
     if not terms:
         return 0
-    tags, desc = _human_photo_row_metadata_text(row)
+    tags, desc = _human_media_row_metadata_text(row)
     if not tags and not desc:
         return 0
     tag_blob = " | ".join(tags)
@@ -22158,93 +22181,176 @@ def _human_photo_score_metadata_match(row: Dict[str, Any], terms: List[str]) -> 
             score += 2
         elif len(t) >= 4 and t in text_blob:
             score += 1
+    # Guardrail: family/minor-present content should not match adult/suggestive requests.
+    adult_terms = {"sexy", "nude", "naked", "erotic", "hot", "seductive", "intimate", "adult"}
+    family_terms = {"child", "children", "kid", "kids", "family", "daughter", "son", "baby", "parent"}
+    if any(t in adult_terms for t in terms) and any(t in family_terms for t in tags):
+        return 0
     return score
 
 
-def _human_photo_available_rows(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int) -> List[Dict[str, Any]]:
+def _human_media_all_rows_for_type(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, media_type: str) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT inv.*, meta.tags_json, meta.description, meta.review_status, meta.metadata_version
-          FROM human_companion_photo_inventory inv
-          LEFT JOIN human_companion_photo_metadata meta
+        SELECT inv.*, meta.tags_json, meta.description, meta.review_status AS metadata_review_status
+          FROM human_companion_media_inventory inv
+          LEFT JOIN human_companion_media_metadata meta
             ON meta.brand=inv.brand
            AND meta.companion_mapping_id=inv.companion_mapping_id
-           AND meta.file_name=inv.file_name
+           AND meta.relative_path=inv.relative_path
          WHERE inv.brand=?
            AND inv.companion_mapping_id=?
-           AND inv.status='available'
-         ORDER BY inv.original_sequence ASC, inv.file_name ASC
+           AND inv.media_type=?
+           AND inv.status IN ('approved', 'inactive')
+         ORDER BY inv.sequence_number ASC, inv.file_name ASC
         """,
-        (brand, int(companion_mapping_id)),
+        (brand, int(companion_mapping_id), media_type),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
-def _human_photo_choose_row(available: List[Dict[str, Any]], terms: List[str]) -> Tuple[Optional[Dict[str, Any]], str]:
-    if not available:
+def _human_media_viewer_events(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, viewer_key: str, media_type: str) -> Dict[int, Set[str]]:
+    rows = conn.execute(
+        """
+        SELECT media_id, event_type FROM human_companion_media_viewer_ledger
+         WHERE brand=? AND companion_mapping_id=? AND viewer_key=? AND media_type=?
+        """,
+        (brand, int(companion_mapping_id), viewer_key, media_type),
+    ).fetchall()
+    out: Dict[int, Set[str]] = {}
+    for row in rows:
+        mid = int(row["media_id"] if isinstance(row, sqlite3.Row) else row[0] or 0)
+        ev = str(row["event_type"] if isinstance(row, sqlite3.Row) else row[1] or "").strip().lower()
+        if mid:
+            out.setdefault(mid, set()).add(ev)
+    return out
+
+
+def _human_media_mark_skipped_inactive_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, host_member_id: str, viewer_key: str, member_id: str, session_id: str, rows: Iterable[Dict[str, Any]], through_sequence: int, now_epoch: float) -> None:
+    for row in rows:
+        try:
+            seq = int(row.get("sequence_number") or 0)
+            media_id = int(row.get("media_id") or 0)
+        except Exception:
+            continue
+        if not media_id or seq > int(through_sequence or 0):
+            continue
+        if str(row.get("status") or "").lower() != "inactive":
+            continue
+        ledger_id = hashlib.sha256(f"skip|{brand}|{companion_mapping_id}|{viewer_key}|{media_id}".encode()).hexdigest()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO human_companion_media_viewer_ledger
+            (ledger_id, brand, companion_mapping_id, host_member_id, viewer_key, member_id, session_id, media_id, media_type, sequence_number, event_type, request_id, delivery_token, created_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped_inactive', '', '', ?)
+            """,
+            (ledger_id, brand, int(companion_mapping_id), host_member_id, viewer_key, member_id, session_id, media_id, str(row.get("media_type") or "photo"), seq, now_epoch),
+        )
+
+
+def _human_media_choose_row_for_viewer(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, host_member_id: str, viewer_key: str, member_id: str, session_id: str, media_type: str, terms: List[str], now_epoch: float) -> Tuple[Optional[Dict[str, Any]], str]:
+    rows = _human_media_all_rows_for_type(conn, brand=brand, companion_mapping_id=companion_mapping_id, media_type=media_type)
+    if not rows:
         return None, "exhausted"
+    events = _human_media_viewer_events(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer_key, media_type=media_type)
+    # Catch-up: skipped inactive items that have since been reactivated.
+    catchups: List[Dict[str, Any]] = []
+    future_active: List[Dict[str, Any]] = []
+    for row in rows:
+        media_id = int(row.get("media_id") or 0)
+        evs = events.get(media_id, set())
+        if "delivered" in evs:
+            continue
+        status = str(row.get("status") or "").lower()
+        if "skipped_inactive" in evs and status == "approved":
+            catchups.append(row)
+        elif not evs and status == "approved":
+            future_active.append(row)
     if terms:
-        scored: List[Tuple[int, int, str, Dict[str, Any]]] = []
-        for row in available:
-            status = str(row.get("review_status") or "").strip().lower()
-            # Metadata files authored for deployment default to reviewed. Blank metadata can still match if tags exist.
-            score = _human_photo_score_metadata_match(row, terms)
-            if score <= 0:
-                continue
-            if status and status not in {"reviewed", "approved", "active"}:
-                continue
-            try:
-                seq = int(row.get("original_sequence") or 0)
-            except Exception:
-                seq = 0
-            scored.append((score, seq, str(row.get("file_name") or ""), row))
+        scored: List[Tuple[int, int, int, str, Dict[str, Any]]] = []
+        for group_rank, candidates in [(0, catchups), (1, future_active)]:
+            for row in candidates:
+                score = _human_media_score_metadata_match(row, terms)
+                if score <= 0:
+                    continue
+                seq = int(row.get("sequence_number") or 0)
+                scored.append((score, group_rank, seq, str(row.get("file_name") or ""), row))
         if not scored:
             return None, "no_match"
-        scored.sort(key=lambda item: (-item[0], item[1], item[2].lower()))
-        return scored[0][3], "delivered"
-    return available[0], "delivered"
+        scored.sort(key=lambda item: (-item[0], item[1], item[2], item[3].lower()))
+        chosen = scored[0][4]
+        _human_media_mark_skipped_inactive_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer_key, member_id=member_id, session_id=session_id, rows=rows, through_sequence=int(chosen.get("sequence_number") or 0), now_epoch=now_epoch)
+        return chosen, "delivered"
+    if catchups:
+        catchups.sort(key=lambda r: (int(r.get("sequence_number") or 0), str(r.get("file_name") or "").lower()))
+        return catchups[0], "delivered"
+    # Generic next-in-sequence: skip inactive items as the viewer reaches them.
+    for row in rows:
+        media_id = int(row.get("media_id") or 0)
+        evs = events.get(media_id, set())
+        if "delivered" in evs or "skipped_inactive" in evs:
+            continue
+        if str(row.get("status") or "").lower() == "inactive":
+            _human_media_mark_skipped_inactive_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer_key, member_id=member_id, session_id=session_id, rows=[row], through_sequence=int(row.get("sequence_number") or 0), now_epoch=now_epoch)
+            events.setdefault(media_id, set()).add("skipped_inactive")
+            continue
+        return row, "delivered"
+    return None, "exhausted"
 
 
-def _human_photo_build_url(token: str, base_url: str = "") -> str:
+def _human_media_remaining_for_viewer(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, viewer_key: str, media_type: str) -> int:
+    rows = _human_media_all_rows_for_type(conn, brand=brand, companion_mapping_id=companion_mapping_id, media_type=media_type)
+    events = _human_media_viewer_events(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer_key, media_type=media_type)
+    remaining = 0
+    for row in rows:
+        media_id = int(row.get("media_id") or 0)
+        evs = events.get(media_id, set())
+        if "delivered" in evs:
+            continue
+        status = str(row.get("status") or "").lower()
+        if status == "approved":
+            remaining += 1
+    return remaining
+
+
+def _human_media_build_url(token: str, base_url: str = "") -> str:
     t = quote(str(token or "").strip(), safe="")
     if not t:
         return ""
-    base = str(base_url or "").strip()
-    if not base:
-        base = "/"
+    base = str(base_url or "").strip() or "/"
     if not base.endswith("/"):
         base += "/"
-    return base + f"human-photo/{t}"
+    return base + f"connect-media/{t}"
 
 
-def _human_photo_content_payload(
-    *,
-    token: str,
-    file_name: str,
-    content_url: str,
-    companion_mapping_id: int,
-    sequence: int,
-    remaining: int,
-    size: int,
-) -> Dict[str, Any]:
-    mime = mimetypes.guess_type(file_name)[0] or "image/jpeg"
+def _human_media_content_payload(*, token: str, file_name: str, content_url: str, companion_mapping_id: int, media_type: str, sequence: int, remaining: int, size: int) -> Dict[str, Any]:
+    mime = mimetypes.guess_type(file_name)[0] or ("video/mp4" if media_type == "video" else "image/jpeg")
+    kind = "video" if media_type == "video" else "image"
+    delivery_kind = _HUMAN_MEDIA_DELIVERY_KIND_VIDEO if media_type == "video" else _HUMAN_MEDIA_DELIVERY_KIND_PHOTO
+    title = "Requested short video" if media_type == "video" else "Requested photo"
+    container = "elaralo_human_companion_media"
+    rel_folder = "videos" if media_type == "video" else "photos"
     return {
         "sequence": int(sequence or 0),
         "filename": file_name,
         "fileName": file_name,
-        "type": "image",
-        "kind": "image",
-        "stage": _HUMAN_PHOTO_DELIVERY_KIND,
-        "title": "Requested photo",
+        "type": kind,
+        "kind": kind,
+        "stage": delivery_kind,
+        "title": title,
         "message": "Here's one.",
         "url": content_url,
         "triggerMinute": 0,
         "trigger_minute": 0,
         "folder": "human_requested",
-        "deliveryKind": _HUMAN_PHOTO_DELIVERY_KIND,
-        "delivery_kind": _HUMAN_PHOTO_DELIVERY_KIND,
-        "requestedHumanPhoto": True,
-        "requested_human_photo": True,
+        "deliveryKind": delivery_kind,
+        "delivery_kind": delivery_kind,
+        "requestedHumanMedia": True,
+        "requested_human_media": True,
+        "requestedHumanPhoto": media_type == "photo",
+        "requested_human_photo": media_type == "photo",
+        "requestedHumanVideo": media_type == "video",
+        "requested_human_video": media_type == "video",
         "companionMappingId": int(companion_mapping_id or 0),
         "companion_mapping_id": int(companion_mapping_id or 0),
         "remaining": int(remaining or 0),
@@ -22256,138 +22362,102 @@ def _human_photo_content_payload(
             "contentType": mime,
             "content_type": mime,
             "size": int(size or 0),
-            "container": "elaralo_human_companion_photo",
-            "blobName": f"companion-id-{int(companion_mapping_id or 0)}/{file_name}",
-            "blob_name": f"companion-id-{int(companion_mapping_id or 0)}/{file_name}",
+            "container": container,
+            "blobName": f"companion-id-{int(companion_mapping_id or 0)}/{rel_folder}/{file_name}",
+            "blob_name": f"companion-id-{int(companion_mapping_id or 0)}/{rel_folder}/{file_name}",
         },
     }
 
 
-def _human_photo_email_send_sync(to_email: str, subject: str, text_body: str, html_body: str, *, brand: Any = "Elaralo") -> Dict[str, Any]:
-    email = _human_photo_safe_email(to_email)
+def _human_media_email_send_sync(to_email: str, subject: str, text_body: str, html_body: str, *, brand: Any = "Elaralo") -> Dict[str, Any]:
+    email = _human_media_safe_email(to_email)
     if not email:
-        return {"ok": False, "skipped": True, "error": "missing recipient email"}
-    if not _HUMAN_PHOTO_ALERT_EMAIL_ENABLED:
-        return {"ok": False, "skipped": True, "error": "HUMAN_PHOTO_ALERT_EMAIL_ENABLED is not enabled"}
-    provider = (PAYGO_EMAIL_PROVIDER or "sendgrid").strip().lower()
+        return {"ok": False, "reason": "invalid_email"}
     try:
-        if provider == "sendgrid":
-            return _paygo_email_send_sendgrid_sync(email, subject, text_body, html_body, brand=brand)
-        if provider == "smtp":
-            return _paygo_email_send_smtp_sync(email, subject, text_body, html_body, brand=brand)
-        return {"ok": False, "skipped": True, "error": f"unsupported PAYGO_EMAIL_PROVIDER: {provider}"}
+        return _send_email_sync(email, subject, text_body, html_body, brand=brand)  # type: ignore[name-defined]
+    except NameError:
+        pass
     except Exception as exc:
-        return {"ok": False, "provider": provider, "error": str(exc)}
+        return {"ok": False, "reason": type(exc).__name__, "error": str(exc)}
+    try:
+        sendgrid_key = os.getenv("SENDGRID_API_KEY", "")
+        from_email = os.getenv("SENDGRID_FROM_EMAIL", os.getenv("MAIL_FROM", "info@elaralo.com"))
+        if not sendgrid_key:
+            return {"ok": False, "reason": "sendgrid_not_configured"}
+        import urllib.request
+        payload = json.dumps({"personalizations": [{"to": [{"email": email}]}], "from": {"email": from_email}, "subject": subject, "content": [{"type": "text/plain", "value": text_body}, {"type": "text/html", "value": html_body}]}).encode("utf-8")
+        req = urllib.request.Request("https://api.sendgrid.com/v3/mail/send", data=payload, method="POST", headers={"Authorization": f"Bearer {sendgrid_key}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return {"ok": 200 <= int(resp.status) < 300, "status": int(resp.status)}
+    except Exception as exc:
+        return {"ok": False, "reason": type(exc).__name__, "error": str(exc)}
 
 
-def _human_photo_alert_body(*, brand: str, companion_mapping_id: int, host_member_id: str, remaining: int, photo_dir: str) -> Tuple[str, str, str]:
-    subject = f"{brand} Human Companion photo inventory low: {remaining} remaining"
-    text = (
-        f"Human Companion photo inventory is low.\n\n"
-        f"Brand: {brand}\n"
-        f"Companion mapping id: {companion_mapping_id}\n"
-        f"Host member id: {host_member_id or 'unavailable'}\n"
-        f"Remaining available photo requests: {remaining}\n"
-        f"Photo directory: {photo_dir}\n\n"
-        f"Please upload additional reviewed photos when available."
-    )
-    html = (
-        "<div style='font-family:Arial,sans-serif;color:#111827'>"
-        f"<h2>{_paygo_email_html_escape(brand)} Human Companion photo inventory low</h2>"
-        "<table style='border-collapse:collapse'>"
-        f"<tr><td style='padding:6px 12px 6px 0;color:#6b7280'>Companion mapping id</td><td>{int(companion_mapping_id)}</td></tr>"
-        f"<tr><td style='padding:6px 12px 6px 0;color:#6b7280'>Remaining requests</td><td><strong>{int(remaining)}</strong></td></tr>"
-        f"<tr><td style='padding:6px 12px 6px 0;color:#6b7280'>Host member id</td><td>{_paygo_email_html_escape(host_member_id or 'unavailable')}</td></tr>"
-        f"<tr><td style='padding:6px 12px 6px 0;color:#6b7280'>Photo directory</td><td>{_paygo_email_html_escape(photo_dir)}</td></tr>"
-        "</table>"
-        "<p>Please upload additional reviewed photos when available.</p>"
-        "</div>"
-    )
+def _human_media_alert_body(*, brand: str, companion_mapping_id: int, host_member_id: str, media_type: str, remaining: int, companion_dir: str) -> Tuple[str, str, str]:
+    label = "photos" if media_type == "photo" else "short videos"
+    subject = f"{brand} Human Companion {label} inventory low: {remaining} remaining"
+    text = f"The requested {label} inventory for companion-id-{companion_mapping_id} has reached {remaining} remaining for at least one viewer.\n\nHost member id: {host_member_id}\nCompanion directory: {companion_dir}\n"
+    html = f"<p>The requested <b>{label}</b> inventory for <b>companion-id-{companion_mapping_id}</b> has reached <b>{remaining}</b> remaining for at least one viewer.</p><p>Host member id: {host_member_id or '(unknown)'}</p><p>Companion directory: {companion_dir}</p>"
     return subject, text, html
 
 
-def _human_photo_maybe_send_inventory_alert_sync(
-    *,
-    brand: str,
-    companion_mapping_id: int,
-    host_member_id: str,
-    host_email: str,
-    remaining: int,
-    inventory_generation: str,
-    photo_dir: str,
-) -> None:
-    if int(remaining) not in _HUMAN_PHOTO_ALERT_THRESHOLDS:
+def _human_media_maybe_send_inventory_alert_sync(*, brand: str, companion_mapping_id: int, host_member_id: str, host_email: str, media_type: str, remaining: int, media_generation: str, companion_dir: str) -> None:
+    if not _HUMAN_MEDIA_ALERT_EMAIL_ENABLED or int(remaining) not in _HUMAN_MEDIA_ALERT_THRESHOLDS:
         return
     conn = _econnect_conn()
-    alert_id = uuid.uuid4().hex
-    now = time.time()
-    recipients: List[str] = []
-    for email in (host_email, _HUMAN_PHOTO_ALERT_RECIPIENT_DEFAULT):
-        em = _human_photo_safe_email(email)
-        if em and em not in recipients:
-            recipients.append(em)
-    send_status = "pending"
-    send_error = ""
     try:
-        _human_photo_db_ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
+        _human_media_db_ensure_schema(conn)
+        now = time.time()
+        recipients: List[str] = []
+        for email in [host_email, _HUMAN_MEDIA_ALERT_RECIPIENT_DEFAULT]:
+            em = _human_media_safe_email(email)
+            if em and em not in recipients:
+                recipients.append(em)
+        if not recipients:
+            return
+        alert_id = hashlib.sha256(f"{brand}|{companion_mapping_id}|{media_type}|{remaining}|{media_generation}".encode()).hexdigest()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
-                INSERT INTO human_companion_photo_alerts
-                (alert_id, brand, companion_mapping_id, threshold, inventory_generation, remaining_count, host_email, sent_to_json, send_status, send_error, sent_at_epoch)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO human_companion_media_alerts
+                (alert_id, brand, companion_mapping_id, media_type, threshold, media_generation, remaining_count, host_email, sent_to_json, send_status, send_error, sent_at_epoch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', ?)
                 """,
-                (alert_id, brand, int(companion_mapping_id), int(remaining), str(inventory_generation or ""), int(remaining), _human_photo_safe_email(host_email), json.dumps(recipients), send_status, send_error, now),
+                (alert_id, brand, int(companion_mapping_id), media_type, int(remaining), str(media_generation or ""), int(remaining), _human_media_safe_email(host_email), json.dumps(recipients), now),
             )
-            inserted = True
+            conn.commit()
         except sqlite3.IntegrityError:
-            inserted = False
-        conn.commit()
-        if not inserted:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             return
-
-        if not recipients:
-            send_status = "skipped"
-            send_error = "no valid recipients"
-        else:
-            subject, text_body, html_body = _human_photo_alert_body(
-                brand=brand,
-                companion_mapping_id=int(companion_mapping_id),
-                host_member_id=host_member_id,
-                remaining=int(remaining),
-                photo_dir=photo_dir,
-            )
-            results = []
-            for recipient in recipients:
-                results.append(_human_photo_email_send_sync(recipient, subject, text_body, html_body, brand=brand))
-            ok_count = sum(1 for r in results if isinstance(r, dict) and r.get("ok"))
-            if ok_count == len(recipients):
-                send_status = "sent"
-                send_error = ""
-            elif ok_count > 0:
-                send_status = "partial"
-                send_error = json.dumps(results, default=str)[:1000]
-            else:
-                send_status = "failed"
-                send_error = json.dumps(results, default=str)[:1000]
-
-        conn.execute(
-            "UPDATE human_companion_photo_alerts SET send_status=?, send_error=?, sent_to_json=? WHERE alert_id=?",
-            (send_status, send_error, json.dumps(recipients), alert_id),
-        )
+        subject, text_body, html_body = _human_media_alert_body(brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, media_type=media_type, remaining=remaining, companion_dir=companion_dir)
+        results = [_human_media_email_send_sync(r, subject, text_body, html_body, brand=brand) for r in recipients]
+        ok = any(bool(r.get("ok")) for r in results if isinstance(r, dict))
+        err = "" if ok else json.dumps(results)[:1000]
+        conn.execute("UPDATE human_companion_media_alerts SET send_status=?, send_error=?, sent_to_json=? WHERE alert_id=?", ("sent" if ok else "failed", err, json.dumps(recipients), alert_id))
         conn.commit()
     except Exception as exc:
         try:
             conn.rollback()
         except Exception:
             pass
-        print(f"[human-photo] WARNING: inventory alert failed: {exc!r}")
+        print(f"[human-media] WARNING: inventory alert failed: {exc!r}")
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+
+def _human_media_reply_for_unavailable(media_type: str) -> str:
+    if media_type == "video":
+        return HUMAN_VIDEO_CANNED_RESPONSE
+    if media_type == "generic":
+        return HUMAN_MEDIA_CANNED_RESPONSE
+    return HUMAN_PHOTO_CANNED_RESPONSE
 
 
 def _human_photo_requested_photo_turn_sync(
@@ -22397,269 +22467,138 @@ def _human_photo_requested_photo_turn_sync(
     request_text: str,
     viewer_key: str,
     member_id: str,
-    plan_name_raw: str,
-    plan_external: str,
-    plan_map: str,
-    plan_name_for_limits: str,
+    plan_name_raw: Any,
+    plan_external: Any,
+    plan_map: Any,
+    plan_name_for_limits: Any,
     is_trial: bool,
-    base_url: str,
+    base_url: str = "",
 ) -> Optional[Dict[str, Any]]:
-    if not _HUMAN_PHOTO_FEATURE_ENABLED:
+    """Compatibility entry point: now handles Elaralo Human Companion Connect Media."""
+    if not _HUMAN_MEDIA_FEATURE_ENABLED:
         return None
-
-    pending = _human_photo_pending_from_state(session_state)
-    pending_answer = _human_photo_yes_no_intent(request_text) if pending else ""
-    direct_request, terms = _human_photo_detect_request(request_text)
-    ambiguous_photo_mention = (not direct_request) and _human_photo_is_ambiguous_photo_mention(request_text)
-
-    if pending and pending_answer == "no":
-        return {
-            "reply": "No problem.",
-            "content": None,
-            "outcome": "confirmation_declined",
-            "state_updates": _human_photo_clear_pending_updates(),
-        }
-
-    possible_photo_turn = bool(direct_request or ambiguous_photo_mention or (pending and pending_answer == "yes"))
-    if not possible_photo_turn:
-        return None
-
+    request_text_raw = str(request_text or "").strip()
     conn = _econnect_conn()
+    now = time.time()
     try:
-        _human_photo_db_ensure_schema(conn)
-        mapping = _human_photo_mapping_row_from_session_state(conn, session_state)
+        _human_media_db_ensure_schema(conn)
+        mapping = _human_media_mapping_row_from_session_state(conn, session_state)
         if not mapping:
             return None
-        brand = _stripe_paygo_brand(mapping.get("brand") or _brand_from_session_state(session_state) or "Elaralo")
-        if _stripe_paygo_brand_key(brand) != "elaralo":
-            return None
+        brand = _host_onboarding_safe_str(mapping.get("brand") or "Elaralo") or "Elaralo"
         companion_mapping_id = int(mapping.get("mapping_id") or 0)
         host_member_id = _host_onboarding_safe_str(mapping.get("host_member_id") or "")
-        host_email = _human_photo_safe_email(mapping.get("host_email") or "")
-        viewer = str(viewer_key or "").strip() or str(member_id or "").strip() or f"session::{session_id}"
-        now = time.time()
-
+        host_email = _human_media_safe_email(mapping.get("host_email") or "")
+        if companion_mapping_id <= 0:
+            return None
+        viewer = str(viewer_key or member_id or session_id or "").strip() or "anonymous"
+        direct_request, requested_media_type, terms = _human_media_detect_request(request_text_raw)
+        pending = _human_media_pending_from_state(session_state)
+        pending_answer = _human_media_yes_no_intent(request_text_raw) if pending else ""
+        ambiguous, ambiguous_media_type = _human_media_is_ambiguous_mention(request_text_raw)
+        if pending and pending_answer == "no":
+            return {"reply": "No problem.", "content": None, "outcome": "confirmation_declined", "state_updates": _human_media_clear_pending_updates()}
+        learning_confirmed = False
         if pending and pending_answer == "yes":
-            request_text_for_delivery = str(pending.get("phrase") or request_text or "").strip()
-            terms = _human_photo_terms_for_confirmed_pending(pending, request_text_for_delivery)
             direct_request = True
+            requested_media_type = str(pending.get("media_type") or "photo")
+            terms = _human_media_safe_json_list(pending.get("terms") or [])
+            request_text_for_delivery = str(pending.get("phrase_text") or request_text_raw)
             learning_confirmed = True
         else:
-            request_text_for_delivery = request_text
-            learning_confirmed = False
-            if not direct_request:
-                learned_terms = _human_photo_learned_phrase_terms_on_conn(
-                    conn,
-                    brand=brand,
-                    companion_mapping_id=companion_mapping_id,
-                    phrase_text=request_text,
-                )
-                if learned_terms is not None:
-                    terms = learned_terms
+            request_text_for_delivery = request_text_raw
+        # Learned phrases can turn an otherwise non-direct phrase into a request.
+        if not direct_request and requested_media_type in {"photo", "video"}:
+            learned = _human_media_learned_phrase_terms_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, media_type=requested_media_type, phrase_text=request_text_raw)
+            if learned or _human_media_normalize_phrase(request_text_raw):
+                if learned:
                     direct_request = True
-
-        if not direct_request:
-            pending_payload = _human_photo_pending_payload(request_text, terms=[])
+                    terms = learned
+        if not direct_request and ambiguous:
+            media_type_for_prompt = ambiguous_media_type or "photo"
+            pending_payload = _human_media_pending_payload(request_text_raw, media_type_for_prompt, terms=[])
             conn.execute("BEGIN IMMEDIATE")
-            sync_info = _human_photo_sync_inventory_on_conn(
-                conn,
-                brand=brand,
-                companion_mapping_id=companion_mapping_id,
-                host_member_id=host_member_id,
-                host_email=host_email,
-            )
-            _human_photo_insert_request_on_conn(
-                conn,
-                brand=brand,
-                companion_mapping_id=companion_mapping_id,
-                host_member_id=host_member_id,
-                viewer_key=viewer,
-                member_id=member_id,
-                session_id=session_id,
-                plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
-                plan_class="trial" if is_trial else "visitor",
-                request_text=request_text,
-                request_kind="ambiguous",
-                requested_tags=[],
-                outcome="confirmation_requested",
-                remaining_after_delivery=int(sync_info.get("remaining") or 0),
-                now_epoch=now,
-            )
+            sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, host_email=host_email)
+            _human_media_migrate_old_photo_runtime_state_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
+            _human_media_drop_legacy_photo_tables_on_conn(conn)
+            _human_media_insert_request_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer, member_id=member_id, session_id=session_id, plan_name=str(plan_name_for_limits or plan_name_raw or plan_external or ""), plan_class="trial" if is_trial else "visitor", request_text=request_text_raw, media_type=media_type_for_prompt, request_kind="ambiguous", requested_tags=[], outcome="confirmation_requested", remaining_after_delivery=0, now_epoch=now)
             conn.commit()
-            return {
-                "reply": _HUMAN_PHOTO_CONFIRMATION_REPLY,
-                "content": None,
-                "outcome": "confirmation_requested",
-                "state_updates": {
-                    _HUMAN_PHOTO_PENDING_STATE_KEY: pending_payload,
-                    _HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL: pending_payload,
-                },
-            }
+            reply = _HUMAN_MEDIA_CONFIRMATION_REPLY_CHOICE if media_type_for_prompt == "generic" else (_HUMAN_MEDIA_CONFIRMATION_REPLY_VIDEO if media_type_for_prompt == "video" else _HUMAN_MEDIA_CONFIRMATION_REPLY_PHOTO)
+            return {"reply": reply, "content": None, "outcome": "confirmation_requested", "state_updates": {_HUMAN_MEDIA_PENDING_STATE_KEY: pending_payload, _HUMAN_MEDIA_PENDING_STATE_KEY_CAMEL: pending_payload, _HUMAN_PHOTO_PENDING_STATE_KEY: None, _HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL: None}}
+        if not direct_request:
+            return None
 
-        # Paid-photo treatment is intentionally limited to real logged-in members
-        # with an active Discover, Explore, or Encounter plan.  Visitors and
-        # PayGo-only users remain on the two-photo rolling trial/visitor rule.
-        paid = bool(str(member_id or "").strip()) and _human_photo_is_paid_subscriber(
-            is_trial=bool(is_trial),
-            plan_name_raw=plan_name_raw,
-            plan_external=plan_external,
-            plan_map=plan_map,
-            plan_name_for_limits=plan_name_for_limits,
-            session_state=session_state,
-        )
+        paid = bool(str(member_id or "").strip()) and _human_media_is_paid_subscriber(is_trial=bool(is_trial), plan_name_raw=plan_name_raw, plan_external=plan_external, plan_map=plan_map, plan_name_for_limits=plan_name_for_limits, session_state=session_state)
         plan_class = "paid" if paid else ("trial" if is_trial else "visitor")
-        request_kind = "specific" if terms else "generic"
-        clear_pending = _human_photo_clear_pending_updates()
-
         conn.execute("BEGIN IMMEDIATE")
-        sync_info = _human_photo_sync_inventory_on_conn(
-            conn,
-            brand=brand,
-            companion_mapping_id=companion_mapping_id,
-            host_member_id=host_member_id,
-            host_email=host_email,
-        )
-
-        if learning_confirmed:
-            _human_photo_record_learned_phrase_on_conn(
-                conn,
-                brand=brand,
-                companion_mapping_id=companion_mapping_id,
-                phrase_text=request_text_for_delivery,
-                requested_tags=terms,
-                viewer_key=viewer,
-                member_id=member_id,
-                session_id=session_id,
-                now_epoch=now,
-            )
-
+        sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, host_email=host_email)
+        _human_media_migrate_old_photo_runtime_state_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
+        _human_media_drop_legacy_photo_tables_on_conn(conn)
+        if learning_confirmed and requested_media_type in {"photo", "video"}:
+            _human_media_record_learned_phrase_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, media_type=requested_media_type, phrase_text=request_text_for_delivery, requested_tags=terms, viewer_key=viewer, member_id=member_id, now_epoch=now)
         if not paid:
-            delivered_count = _human_photo_delivered_count_in_window(
-                conn,
-                brand=brand,
-                companion_mapping_id=companion_mapping_id,
-                viewer_key=viewer,
-                now_epoch=now,
-            )
-            if delivered_count >= max(0, int(_HUMAN_PHOTO_TRIAL_LIMIT or 2)):
-                _human_photo_insert_request_on_conn(
-                    conn,
-                    brand=brand,
-                    companion_mapping_id=companion_mapping_id,
-                    host_member_id=host_member_id,
-                    viewer_key=viewer,
-                    member_id=member_id,
-                    session_id=session_id,
-                    plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
-                    plan_class=plan_class,
-                    request_text=request_text_for_delivery,
-                    request_kind=request_kind,
-                    requested_tags=terms,
-                    outcome="capped",
-                    remaining_after_delivery=int(sync_info.get("remaining") or 0),
-                    now_epoch=now,
-                )
+            delivered_count = _human_media_delivered_count_in_window(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer, now_epoch=now)
+            if delivered_count >= max(0, int(_HUMAN_MEDIA_TRIAL_LIMIT or 2)):
+                mt_for_reply = requested_media_type if requested_media_type in {"photo", "video"} else "generic"
+                _human_media_insert_request_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer, member_id=member_id, session_id=session_id, plan_name=str(plan_name_for_limits or plan_name_raw or plan_external or ""), plan_class=plan_class, request_text=request_text_for_delivery, media_type=mt_for_reply, request_kind="specific" if terms else "generic", requested_tags=terms, outcome="capped", remaining_after_delivery=0, now_epoch=now)
                 conn.commit()
-                return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": "capped", "state_updates": clear_pending}
-
-        available = _human_photo_available_rows(conn, brand=brand, companion_mapping_id=companion_mapping_id)
-        chosen, outcome = _human_photo_choose_row(available, terms)
+                return {"reply": _human_media_reply_for_unavailable(mt_for_reply), "content": None, "outcome": "capped", "state_updates": _human_media_clear_pending_updates()}
+        media_type = requested_media_type if requested_media_type in {"photo", "video"} else "generic"
+        if media_type == "generic":
+            photo_remaining = _human_media_remaining_for_viewer(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer, media_type="photo")
+            video_remaining = _human_media_remaining_for_viewer(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer, media_type="video")
+            if photo_remaining > 0 and video_remaining > 0:
+                pending_payload = _human_media_pending_payload(request_text_raw, "generic", terms=[])
+                _human_media_insert_request_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer, member_id=member_id, session_id=session_id, plan_name=str(plan_name_for_limits or plan_name_raw or plan_external or ""), plan_class=plan_class, request_text=request_text_raw, media_type="generic", request_kind="ambiguous", requested_tags=[], outcome="choice_requested", remaining_after_delivery=photo_remaining + video_remaining, now_epoch=now)
+                conn.commit()
+                return {"reply": _HUMAN_MEDIA_CONFIRMATION_REPLY_CHOICE, "content": None, "outcome": "choice_requested", "state_updates": {_HUMAN_MEDIA_PENDING_STATE_KEY: pending_payload, _HUMAN_MEDIA_PENDING_STATE_KEY_CAMEL: pending_payload, _HUMAN_PHOTO_PENDING_STATE_KEY: None, _HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL: None}}
+            if photo_remaining > 0:
+                media_type = "photo"
+            elif video_remaining > 0:
+                media_type = "video"
+            else:
+                _human_media_insert_request_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer, member_id=member_id, session_id=session_id, plan_name=str(plan_name_for_limits or plan_name_raw or plan_external or ""), plan_class=plan_class, request_text=request_text_for_delivery, media_type="generic", request_kind="generic", requested_tags=terms, outcome="exhausted", remaining_after_delivery=0, now_epoch=now)
+                conn.commit()
+                return {"reply": HUMAN_MEDIA_CANNED_RESPONSE, "content": None, "outcome": "exhausted", "state_updates": _human_media_clear_pending_updates()}
+        request_kind = "specific" if terms else "generic"
+        chosen, outcome = _human_media_choose_row_for_viewer(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer, member_id=member_id, session_id=session_id, media_type=media_type, terms=terms, now_epoch=now)
         if not chosen:
-            remaining = len(available)
-            _human_photo_insert_request_on_conn(
-                conn,
-                brand=brand,
-                companion_mapping_id=companion_mapping_id,
-                host_member_id=host_member_id,
-                viewer_key=viewer,
-                member_id=member_id,
-                session_id=session_id,
-                plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
-                plan_class=plan_class,
-                request_text=request_text_for_delivery,
-                request_kind=request_kind,
-                requested_tags=terms,
-                outcome=outcome,
-                remaining_after_delivery=remaining,
-                now_epoch=now,
-            )
+            remaining = _human_media_remaining_for_viewer(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer, media_type=media_type)
+            _human_media_insert_request_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer, member_id=member_id, session_id=session_id, plan_name=str(plan_name_for_limits or plan_name_raw or plan_external or ""), plan_class=plan_class, request_text=request_text_for_delivery, media_type=media_type, request_kind=request_kind, requested_tags=terms, outcome=outcome, remaining_after_delivery=remaining, now_epoch=now)
             conn.commit()
-            return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": outcome, "state_updates": clear_pending}
-
+            return {"reply": _human_media_reply_for_unavailable(media_type), "content": None, "outcome": outcome, "state_updates": _human_media_clear_pending_updates()}
+        media_id = int(chosen.get("media_id") or 0)
+        sequence = int(chosen.get("sequence_number") or 0)
         file_name = str(chosen.get("file_name") or "").strip()
-        sequence = int(chosen.get("original_sequence") or 0)
         size = int(chosen.get("file_size") or 0)
         token = uuid.uuid4().hex + uuid.uuid4().hex[:8]
-        update_cur = conn.execute(
+        request_id = _human_media_insert_request_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, viewer_key=viewer, member_id=member_id, session_id=session_id, plan_name=str(plan_name_for_limits or plan_name_raw or plan_external or ""), plan_class=plan_class, request_text=request_text_for_delivery, media_type=media_type, request_kind=request_kind, requested_tags=terms, outcome="delivered", delivered_file_name=file_name, delivery_token=token, remaining_after_delivery=0, now_epoch=now)
+        ledger_id = uuid.uuid4().hex
+        conn.execute(
             """
-            UPDATE human_companion_photo_inventory
-               SET status='consumed',
-                   consumed_at_epoch=?,
-                   consumed_by_viewer_key=?,
-                   delivery_token=?,
-                   updated_epoch=?
-             WHERE photo_id=? AND status='available'
+            INSERT OR IGNORE INTO human_companion_media_viewer_ledger
+            (ledger_id, brand, companion_mapping_id, host_member_id, viewer_key, member_id, session_id, media_id, media_type, sequence_number, event_type, request_id, delivery_token, created_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?, ?, ?)
             """,
-            (now, viewer, token, now, int(chosen.get("photo_id") or 0)),
+            (ledger_id, brand, int(companion_mapping_id), host_member_id, viewer, member_id, session_id, media_id, media_type, sequence, request_id, token, now),
         )
-        if int(update_cur.rowcount or 0) < 1:
-            conn.rollback()
-            return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": "race_lost", "state_updates": clear_pending}
-        remaining = int(conn.execute(
-            "SELECT COUNT(1) FROM human_companion_photo_inventory WHERE brand=? AND companion_mapping_id=? AND status='available'",
-            (brand, companion_mapping_id),
-        ).fetchone()[0] or 0)
-        content_url = _human_photo_build_url(token, base_url)
-        content = _human_photo_content_payload(
-            token=token,
-            file_name=file_name,
-            content_url=content_url,
-            companion_mapping_id=companion_mapping_id,
-            sequence=sequence,
-            remaining=remaining,
-            size=size,
-        )
-        _human_photo_insert_request_on_conn(
-            conn,
-            brand=brand,
-            companion_mapping_id=companion_mapping_id,
-            host_member_id=host_member_id,
-            viewer_key=viewer,
-            member_id=member_id,
-            session_id=session_id,
-            plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
-            plan_class=plan_class,
-            request_text=request_text_for_delivery,
-            request_kind=request_kind,
-            requested_tags=terms,
-            outcome="delivered",
-            delivered_file_name=file_name,
-            delivery_token=token,
-            remaining_after_delivery=remaining,
-            now_epoch=now,
-        )
+        remaining = _human_media_remaining_for_viewer(conn, brand=brand, companion_mapping_id=companion_mapping_id, viewer_key=viewer, media_type=media_type)
+        conn.execute("UPDATE human_companion_media_requests SET remaining_after_delivery=? WHERE request_id=?", (remaining, request_id))
+        content_url = _human_media_build_url(token, base_url)
+        content = _human_media_content_payload(token=token, file_name=file_name, content_url=content_url, companion_mapping_id=companion_mapping_id, media_type=media_type, sequence=sequence, remaining=remaining, size=size)
+        media_generation = str(chosen.get("media_generation") or sync_info.get("generation") or "")
         conn.commit()
-
         try:
-            _human_photo_maybe_send_inventory_alert_sync(
-                brand=brand,
-                companion_mapping_id=companion_mapping_id,
-                host_member_id=host_member_id,
-                host_email=host_email,
-                remaining=remaining,
-                inventory_generation=str(sync_info.get("generation") or ""),
-                photo_dir=str(sync_info.get("photo_dir") or _human_photo_companion_dir(companion_mapping_id)),
-            )
+            _human_media_maybe_send_inventory_alert_sync(brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, host_email=host_email, media_type=media_type, remaining=remaining, media_generation=media_generation, companion_dir=str(sync_info.get("companion_dir") or _human_media_companion_dir(companion_mapping_id)))
         except Exception:
             pass
-
-        return {"reply": "Here's one.", "content": content, "outcome": "delivered", "remaining": remaining, "file_name": file_name, "state_updates": clear_pending}
+        return {"reply": "Here's one.", "content": content, "outcome": "delivered", "remaining": remaining, "file_name": file_name, "state_updates": _human_media_clear_pending_updates()}
     except Exception as exc:
         try:
             conn.rollback()
         except Exception:
             pass
-        print(f"[human-photo] WARNING: requested photo flow failed: {exc!r}")
+        print(f"[human-media] WARNING: requested media flow failed: {exc!r}")
         return None
     finally:
         try:
@@ -22668,44 +22607,43 @@ def _human_photo_requested_photo_turn_sync(
             pass
 
 
-def _human_photo_file_path_for_token_sync(token: Any) -> Tuple[str, str]:
+def _human_media_file_path_for_token_sync(token: Any) -> Tuple[str, str, str]:
     tok = str(token or "").strip()
     if not re.match(r"^[A-Za-z0-9_-]{24,128}$", tok):
-        return "", ""
+        return "", "", ""
     conn = _econnect_conn()
     try:
-        _human_photo_db_ensure_schema(conn)
+        _human_media_db_ensure_schema(conn)
         row = conn.execute(
             """
-            SELECT source_dir, file_name, status
-              FROM human_companion_photo_inventory
-             WHERE delivery_token=?
+            SELECT led.delivery_token, inv.source_dir, inv.file_name, inv.media_type, inv.status
+              FROM human_companion_media_viewer_ledger led
+              JOIN human_companion_media_inventory inv ON inv.media_id=led.media_id
+             WHERE led.delivery_token=? AND led.event_type='delivered'
              LIMIT 1
             """,
             (tok,),
         ).fetchone()
         if row is None:
-            return "", ""
-        status = str(row["status"] or "").strip().lower()
-        if status != "consumed":
-            return "", ""
-        source_dir = os.path.abspath(str(row["source_dir"] or "").strip())
-        file_name = os.path.basename(str(row["file_name"] or "").strip())
-        ok, _seq = _human_photo_is_valid_file_name(file_name)
-        if not ok or not source_dir:
-            return "", ""
-        root = os.path.abspath(_human_photo_root_dir())
+            return "", "", ""
+        source_dir = os.path.abspath(str(row["source_dir"] or ""))
+        file_name = os.path.basename(str(row["file_name"] or ""))
+        media_type = str(row["media_type"] or "photo").lower()
+        ok, mt, _seq = _human_media_valid_name(file_name, media_type)
+        if not ok or mt != media_type or not source_dir:
+            return "", "", ""
+        root = os.path.abspath(_human_media_root_dir())
         candidate = os.path.abspath(os.path.join(source_dir, file_name))
         try:
             if os.path.commonpath([root, candidate]) != root:
-                return "", ""
+                return "", "", ""
         except Exception:
-            return "", ""
+            return "", "", ""
         if not os.path.isfile(candidate):
-            return "", ""
-        return candidate, file_name
+            return "", "", ""
+        return candidate, file_name, (mimetypes.guess_type(candidate)[0] or ("video/mp4" if media_type == "video" else "image/jpeg"))
     except Exception:
-        return "", ""
+        return "", "", ""
     finally:
         try:
             conn.close()
@@ -22713,6 +22651,199 @@ def _human_photo_file_path_for_token_sync(token: Any) -> Tuple[str, str]:
             pass
 
 
+def _human_media_public_row(row: Dict[str, Any], *, member_id: str = "", session_id: str = "") -> Dict[str, Any]:
+    media_id = int(row.get("media_id") or 0)
+    mt = str(row.get("media_type") or "photo").lower()
+    file_name = str(row.get("file_name") or "")
+    return {
+        "media_id": media_id,
+        "mediaId": media_id,
+        "media_type": mt,
+        "mediaType": mt,
+        "file_name": file_name,
+        "fileName": file_name,
+        "relative_path": str(row.get("relative_path") or ""),
+        "relativePath": str(row.get("relative_path") or ""),
+        "sequence_number": int(row.get("sequence_number") or 0),
+        "sequenceNumber": int(row.get("sequence_number") or 0),
+        "status": str(row.get("status") or ""),
+        "description": str(row.get("description") or ""),
+        "tags": _human_media_safe_json_list(row.get("tags_json") or "[]"),
+        "duration_seconds": float(row.get("duration_seconds") or 0.0),
+        "durationSeconds": float(row.get("duration_seconds") or 0.0),
+        "width": int(row.get("width_px") or 0),
+        "height": int(row.get("height_px") or 0),
+        "content_type": mimetypes.guess_type(file_name)[0] or ("video/mp4" if mt == "video" else "image/jpeg"),
+        "preview_url": f"/host-onboarding/media/file/{media_id}?memberId={quote(member_id)}&sessionId={quote(session_id)}" if media_id and member_id else "",
+    }
+
+
+def _human_media_authorize_host_on_conn(conn: sqlite3.Connection, *, member_id: Any, session_id: Any = "", brand: Any = "", avatar: Any = "", companion_mapping_id: Any = 0) -> Dict[str, Any]:
+    member = _host_onboarding_normalize_member_id(member_id)
+    if not member:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    sess: Optional[Dict[str, Any]] = None
+    sid = _host_onboarding_safe_str(session_id)
+    if sid:
+        sess = _host_onboarding_get_session_by_id(conn, sid)
+        if not sess:
+            raise HTTPException(status_code=404, detail="Host onboarding session not found")
+        _host_onboarding_assert_member_access(sess, member)
+    brand_s = _host_onboarding_safe_str(brand) or _host_onboarding_safe_str((sess or {}).get("brand")) or "Elaralo"
+    avatar_s = _host_onboarding_safe_str(avatar) or _host_onboarding_safe_str((sess or {}).get("avatar"))
+    row: Optional[Dict[str, Any]] = None
+    try:
+        mid = int(companion_mapping_id or 0)
+    except Exception:
+        mid = 0
+    if mid > 0:
+        table = _human_media_companion_mapping_table_name(conn)
+        if table:
+            r = conn.execute(f"SELECT id AS mapping_id, brand, avatar, host_member_id, host_email, companion_type FROM {table} WHERE id=? LIMIT 1", (mid,)).fetchone()
+            row = dict(r) if r is not None else None
+    if row is None:
+        row = _human_media_mapping_row_by_brand_avatar_host(conn, brand=brand_s, avatar=avatar_s, host_member_id=member)
+    if not row or int(row.get("mapping_id") or 0) <= 0:
+        raise HTTPException(status_code=404, detail="Media tab is available after the companion has a companion_mappings id")
+    if not _is_elaralo_core_brand(str(row.get("brand") or brand_s or "Elaralo")):
+        raise HTTPException(status_code=403, detail="Media tab is available only for Elaralo Human Companions")
+    if str(row.get("companion_type") or "").strip().lower() != "human":
+        raise HTTPException(status_code=403, detail="Media tab is available only for Human Companions")
+    host_id = _host_onboarding_safe_str(row.get("host_member_id") or "")
+    if host_id and host_id != member:
+        raise HTTPException(status_code=403, detail="You are not authorized to manage this companion's media")
+    row["brand"] = _host_onboarding_safe_str(row.get("brand") or brand_s or "Elaralo")
+    row["avatar"] = _host_onboarding_safe_str(row.get("avatar") or avatar_s)
+    row["host_member_id"] = host_id or member
+    return row
+
+
+def _human_media_list_rows_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, member_id: str = "", session_id: str = "") -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT inv.*, meta.tags_json, meta.description, meta.review_status AS metadata_review_status
+          FROM human_companion_media_inventory inv
+          LEFT JOIN human_companion_media_metadata meta
+            ON meta.brand=inv.brand AND meta.companion_mapping_id=inv.companion_mapping_id AND meta.relative_path=inv.relative_path
+         WHERE inv.brand=? AND inv.companion_mapping_id=?
+         ORDER BY inv.media_type ASC, inv.sequence_number ASC, inv.file_name ASC
+        """,
+        (brand, int(companion_mapping_id)),
+    ).fetchall()
+    return [_human_media_public_row(dict(row), member_id=member_id, session_id=session_id) for row in rows]
+
+
+def _human_media_next_sequence_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, media_type: str) -> int:
+    row = conn.execute("SELECT MAX(sequence_number) FROM human_companion_media_inventory WHERE brand=? AND companion_mapping_id=? AND media_type=?", (brand, int(companion_mapping_id), media_type)).fetchone()
+    max_db = int((row[0] if row is not None else 0) or 0)
+    folder = _human_media_photos_dir(companion_mapping_id) if media_type == "photo" else _human_media_videos_dir(companion_mapping_id)
+    max_fs = 0
+    try:
+        for entry in os.listdir(folder):
+            ok, mt, seq = _human_media_valid_name(entry, media_type)
+            if ok and mt == media_type:
+                max_fs = max(max_fs, seq)
+    except Exception:
+        pass
+    return max(max_db, max_fs) + 1
+
+
+def _human_media_extension_and_type(filename: str, content_type: str) -> Tuple[str, str]:
+    ext = _infer_upload_ext(content_type or "", filename or "").lower()
+    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+        return (".jpg" if ext in {".jpeg", ".jpe"} else ext), "photo"
+    if ext == ".mp4":
+        return ".mp4", "video"
+    ct = str(content_type or "").split(";", 1)[0].lower().strip()
+    if ct in {"image/jpeg", "image/jpg", "image/png", "image/webp"}:
+        if ct in {"image/jpeg", "image/jpg"}:
+            return ".jpg", "photo"
+        if ct == "image/png":
+            return ".png", "photo"
+        return ".webp", "photo"
+    if ct == "video/mp4":
+        return ".mp4", "video"
+    return "", ""
+
+
+def _human_media_safety_payload_prompt(media_type: str) -> str:
+    return (
+        "You are reviewing a host-uploaded photo or short video frame before it is stored on a companion media platform. "
+        "Return strict JSON only with keys safe (boolean), reason_code (string), and notes (short string). "
+        "Reject child sexual exploitation, sexualized depiction of minors or apparent minors, sexual content involving animals/bestiality, torture, graphic abuse, extreme violence or mutilation, and non-consensual sexual violence. "
+        "Do not reject ordinary non-sexual, non-abusive family content merely because a child appears. "
+        "If the media cannot be reviewed, return safe=false and reason_code='unreviewable'."
+    )
+
+
+def _human_media_safety_review_images_data_uris(data_uris: List[str], media_type: str) -> Tuple[bool, str, str]:
+    if not _HUMAN_MEDIA_REQUIRE_SAFETY_REVIEW:
+        return True, "safety_review_disabled", "Safety review disabled by environment"
+    if not data_uris:
+        return False, "unreviewable", "No reviewable image data"
+    try:
+        if not _resolve_openai_api_key():
+            return False, "safety_provider_unavailable", "OpenAI API key unavailable"
+        client = _get_openai_client()
+        content: List[Dict[str, Any]] = [{"type": "text", "text": _human_media_safety_payload_prompt(media_type)}]
+        for uri in data_uris[:4]:
+            content.append({"type": "image_url", "image_url": {"url": uri}})
+        resp = client.chat.completions.create(
+            model=_HUMAN_MEDIA_SAFETY_MODEL,
+            messages=[{"role": "user", "content": content}],
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=160,
+        )
+        raw = str(resp.choices[0].message.content or "").strip()
+        data = json.loads(raw) if raw else {}
+        safe = bool(data.get("safe") is True)
+        reason = _host_onboarding_safe_str(data.get("reason_code") or ("safe" if safe else "unsafe"))
+        notes = _host_onboarding_safe_str(data.get("notes") or "")
+        return safe, reason, notes
+    except Exception as exc:
+        return False, "safety_review_failed", f"{type(exc).__name__}: {exc}"
+
+
+def _human_media_photo_data_uri(data: bytes, mime: str) -> str:
+    mt = str(mime or "").split(";", 1)[0].strip().lower() or "image/jpeg"
+    return f"data:{mt};base64," + base64.b64encode(data).decode("ascii")
+
+
+def _human_media_video_frame_data_uris(path: str) -> List[str]:
+    duration, _w, _h = _human_media_probe_video(path)
+    points = [0.5]
+    if duration > 3:
+        points.append(max(0.5, duration / 2.0))
+    if duration > 7:
+        points.append(max(0.5, duration - 0.75))
+    out: List[str] = []
+    with tempfile.TemporaryDirectory(prefix="elaralo_media_review_") as td:
+        for idx, point in enumerate(points[:3]):
+            frame_path = os.path.join(td, f"frame_{idx}.jpg")
+            try:
+                cmd = ["ffmpeg", "-y", "-ss", f"{float(point):.3f}", "-i", path, "-frames:v", "1", "-q:v", "3", frame_path]
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+                if res.returncode == 0 and os.path.isfile(frame_path):
+                    with open(frame_path, "rb") as f:
+                        out.append("data:image/jpeg;base64," + base64.b64encode(f.read()).decode("ascii"))
+            except Exception:
+                continue
+    return out
+
+
+def _human_media_audit_upload_on_conn(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, host_member_id: str, original_file_name: str, assigned_file_name: str, media_type: str, mime_type: str, file_size: int, status: str, reason_code: str = "", error_message: str = "") -> None:
+    try:
+        conn.execute(
+            """
+            INSERT INTO human_companion_media_upload_audit
+            (audit_id, brand, companion_mapping_id, host_member_id, original_file_name, assigned_file_name, media_type, mime_type, file_size, status, reason_code, error_message, created_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (uuid.uuid4().hex, brand, int(companion_mapping_id), host_member_id, _safe_filename(original_file_name or "upload"), assigned_file_name, media_type, mime_type, int(file_size or 0), status, reason_code, error_message[:1000], time.time()),
+        )
+    except Exception:
+        pass
 
 def _usage_db_connect() -> sqlite3.Connection:
     path = _usage_db_path()
@@ -28063,6 +28194,367 @@ async def host_onboarding_files_upload(request: Request) -> Dict[str, Any]:
         except Exception:
             pass
 
+
+
+@app.get("/host-onboarding/media/context")
+async def host_onboarding_media_context(memberId: str = "", member_id: str = "", sessionId: str = "", session_id: str = "") -> Dict[str, Any]:
+    member = _host_onboarding_normalize_member_id(memberId or member_id)
+    sid = _host_onboarding_safe_str(sessionId or session_id)
+    if not member:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        _human_media_db_ensure_schema(conn)
+        try:
+            mapping = _human_media_authorize_host_on_conn(conn, member_id=member, session_id=sid)
+        except HTTPException as exc:
+            if exc.status_code in (403, 404):
+                return {"ok": True, "available": False, "reason": str(exc.detail or "Media tab is not available yet")}
+            raise
+        brand = _host_onboarding_safe_str(mapping.get("brand") or "Elaralo")
+        companion_mapping_id = int(mapping.get("mapping_id") or 0)
+        conn.execute("BEGIN IMMEDIATE")
+        sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=_host_onboarding_safe_str(mapping.get("host_member_id") or member), host_email=_human_media_safe_email(mapping.get("host_email") or ""))
+        _human_media_migrate_old_photo_runtime_state_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
+        _human_media_drop_legacy_photo_tables_on_conn(conn)
+        conn.commit()
+        return {
+            "ok": True,
+            "available": True,
+            "brand": brand,
+            "avatar": _host_onboarding_safe_str(mapping.get("avatar") or ""),
+            "companion_mapping_id": companion_mapping_id,
+            "companionMappingId": companion_mapping_id,
+            "host_member_id": _host_onboarding_safe_str(mapping.get("host_member_id") or member),
+            "companion_dir": _human_media_companion_dir(companion_mapping_id),
+            "photos_dir": _human_media_photos_dir(companion_mapping_id),
+            "videos_dir": _human_media_videos_dir(companion_mapping_id),
+            "metadata_file": _human_media_metadata_path(companion_mapping_id),
+            "counts": sync_info,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/host-onboarding/media/list")
+async def host_onboarding_media_list(memberId: str = "", member_id: str = "", sessionId: str = "", session_id: str = "") -> Dict[str, Any]:
+    member = _host_onboarding_normalize_member_id(memberId or member_id)
+    sid = _host_onboarding_safe_str(sessionId or session_id)
+    if not member:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        _human_media_db_ensure_schema(conn)
+        mapping = _human_media_authorize_host_on_conn(conn, member_id=member, session_id=sid)
+        brand = _host_onboarding_safe_str(mapping.get("brand") or "Elaralo")
+        companion_mapping_id = int(mapping.get("mapping_id") or 0)
+        conn.execute("BEGIN IMMEDIATE")
+        sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=_host_onboarding_safe_str(mapping.get("host_member_id") or member), host_email=_human_media_safe_email(mapping.get("host_email") or ""))
+        _human_media_migrate_old_photo_runtime_state_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
+        _human_media_drop_legacy_photo_tables_on_conn(conn)
+        conn.commit()
+        items = _human_media_list_rows_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, member_id=member, session_id=sid)
+        return {"ok": True, "items": items, "counts": sync_info, "companion_mapping_id": companion_mapping_id, "companionMappingId": companion_mapping_id}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/host-onboarding/media/file/{media_id}")
+async def host_onboarding_media_file(media_id: int, memberId: str = "", member_id: str = "", sessionId: str = "", session_id: str = ""):
+    member = _host_onboarding_normalize_member_id(memberId or member_id)
+    sid = _host_onboarding_safe_str(sessionId or session_id)
+    if not member:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        _human_media_db_ensure_schema(conn)
+        # Authorize by the session/member first, then ensure the requested media belongs to that mapping.
+        mapping = _human_media_authorize_host_on_conn(conn, member_id=member, session_id=sid)
+        row = conn.execute("SELECT * FROM human_companion_media_inventory WHERE media_id=? LIMIT 1", (int(media_id),)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Media not found")
+        d = dict(row)
+        if int(d.get("companion_mapping_id") or 0) != int(mapping.get("mapping_id") or 0):
+            raise HTTPException(status_code=403, detail="Media access denied")
+        path = os.path.abspath(os.path.join(str(d.get("source_dir") or ""), os.path.basename(str(d.get("file_name") or ""))))
+        root = os.path.abspath(_human_media_root_dir())
+        try:
+            if os.path.commonpath([root, path]) != root:
+                raise HTTPException(status_code=403, detail="Invalid media path")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=403, detail="Invalid media path")
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="Media file missing")
+        media_type = mimetypes.guess_type(path)[0] or ("video/mp4" if str(d.get("media_type") or "") == "video" else "image/jpeg")
+        headers = {"Content-Disposition": f'inline; filename="{os.path.basename(path)}"', "Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"}
+        return FileResponse(path, media_type=media_type, headers=headers)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/media/sync")
+async def host_onboarding_media_sync(request: Request) -> Dict[str, Any]:
+    raw = await request.json()
+    member = _host_onboarding_normalize_member_id((raw or {}).get("memberId") or (raw or {}).get("member_id"))
+    sid = _host_onboarding_safe_str((raw or {}).get("sessionId") or (raw or {}).get("session_id"))
+    if not member:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        _human_media_db_ensure_schema(conn)
+        mapping = _human_media_authorize_host_on_conn(conn, member_id=member, session_id=sid)
+        brand = _host_onboarding_safe_str(mapping.get("brand") or "Elaralo")
+        companion_mapping_id = int(mapping.get("mapping_id") or 0)
+        conn.execute("BEGIN IMMEDIATE")
+        sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=_host_onboarding_safe_str(mapping.get("host_member_id") or member), host_email=_human_media_safe_email(mapping.get("host_email") or ""))
+        _human_media_migrate_old_photo_runtime_state_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
+        _human_media_drop_legacy_photo_tables_on_conn(conn)
+        conn.commit()
+        items = _human_media_list_rows_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, member_id=member, session_id=sid)
+        return {"ok": True, "items": items, "counts": sync_info}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/host-onboarding/media/upload")
+async def host_onboarding_media_upload(request: Request) -> Dict[str, Any]:
+    try:
+        form = await request.form()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Multipart form data is required")
+    member = _host_onboarding_normalize_member_id(form.get("memberId") or form.get("member_id"))
+    sid = _host_onboarding_safe_str(form.get("sessionId") or form.get("session_id"))
+    description = _host_onboarding_safe_str(form.get("description") or "")
+    tags = _human_media_safe_json_list(form.get("tags") or "")
+    approve = str(form.get("approve") or form.get("approved") or "1").strip().lower() not in {"0", "false", "no"}
+    upload = form.get("file")
+    if not member:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=400, detail="file is required")
+    original_name = _safe_filename(str(getattr(upload, "filename", "upload") or "upload"))
+    content_type = _host_onboarding_safe_str(str(getattr(upload, "content_type", "application/octet-stream") or "application/octet-stream"))
+    data = await upload.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload body")
+    ext, media_type = _human_media_extension_and_type(original_name, content_type)
+    if media_type not in {"photo", "video"}:
+        raise HTTPException(status_code=400, detail="Unsupported media type. Use JPG, JPEG, PNG, WEBP, or MP4.")
+    if media_type == "photo" and len(data) > int(_HUMAN_MEDIA_MAX_PHOTO_BYTES or 0):
+        raise HTTPException(status_code=413, detail="Photo upload exceeds the size limit")
+    if media_type == "video" and len(data) > int(_HUMAN_MEDIA_MAX_VIDEO_BYTES or 0):
+        raise HTTPException(status_code=413, detail="Video upload exceeds the size limit")
+
+    temp_video_path = ""
+    width = height = 0
+    duration = 0.0
+    data_uris: List[str] = []
+    try:
+        if media_type == "photo":
+            width, height = _host_onboarding_try_read_image_size(data)
+            if width <= 0 or height <= 0:
+                raise HTTPException(status_code=400, detail="Uploaded photo could not be decoded")
+            data_uris = [_human_media_photo_data_uri(data, content_type)]
+        else:
+            fd, temp_video_path = tempfile.mkstemp(prefix="elaralo_media_upload_", suffix=".mp4")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            duration, width, height = _human_media_probe_video(temp_video_path)
+            if duration <= 0 or width <= 0 or height <= 0:
+                raise HTTPException(status_code=400, detail="Uploaded video could not be validated")
+            if duration > float(_HUMAN_MEDIA_VIDEO_MAX_SECONDS or 15.0) + 0.05:
+                raise HTTPException(status_code=400, detail="Video must be no more than 15 seconds")
+            short_side, long_side = sorted([int(width), int(height)])
+            if short_side > int(_HUMAN_MEDIA_VIDEO_MAX_SHORT_SIDE or 720) or long_side > int(_HUMAN_MEDIA_VIDEO_MAX_LONG_SIDE or 1280):
+                raise HTTPException(status_code=400, detail="Video resolution must be 720p or lower")
+            data_uris = _human_media_video_frame_data_uris(temp_video_path)
+        safe, reason, notes = _human_media_safety_review_images_data_uris(data_uris, media_type)
+        if not safe:
+            conn_audit = _econnect_conn()
+            try:
+                _human_media_db_ensure_schema(conn_audit)
+                # Mapping lookup may fail; audit only if it succeeds.
+                try:
+                    mapping_audit = _human_media_authorize_host_on_conn(conn_audit, member_id=member, session_id=sid)
+                    _human_media_audit_upload_on_conn(conn_audit, brand=_host_onboarding_safe_str(mapping_audit.get("brand") or "Elaralo"), companion_mapping_id=int(mapping_audit.get("mapping_id") or 0), host_member_id=_host_onboarding_safe_str(mapping_audit.get("host_member_id") or member), original_file_name=original_name, assigned_file_name="", media_type=media_type, mime_type=content_type, file_size=len(data), status="rejected_pre_storage", reason_code=reason, error_message=notes)
+                    conn_audit.commit()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    conn_audit.close()
+                except Exception:
+                    pass
+            raise HTTPException(status_code=400, detail="This file cannot be accepted for Media upload.")
+
+        conn = _econnect_conn()
+        try:
+            _host_onboarding_ensure_schema(conn)
+            _human_media_db_ensure_schema(conn)
+            mapping = _human_media_authorize_host_on_conn(conn, member_id=member, session_id=sid)
+            brand = _host_onboarding_safe_str(mapping.get("brand") or "Elaralo")
+            companion_mapping_id = int(mapping.get("mapping_id") or 0)
+            host_member_id = _host_onboarding_safe_str(mapping.get("host_member_id") or member)
+            conn.execute("BEGIN IMMEDIATE")
+            _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, host_email=_human_media_safe_email(mapping.get("host_email") or ""))
+            next_seq = _human_media_next_sequence_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, media_type=media_type)
+            prefix = "VID" if media_type == "video" else "IMG"
+            final_ext = ".MP4" if media_type == "video" else ext.upper().replace(".JPG", ".JPG")
+            if media_type == "photo" and final_ext == ".JPEG":
+                final_ext = ".JPG"
+            file_name = f"{prefix}-{next_seq:09d}{final_ext}"
+            dest_dir = _human_media_videos_dir(companion_mapping_id) if media_type == "video" else _human_media_photos_dir(companion_mapping_id)
+            os.makedirs(dest_dir, exist_ok=True)
+            dest_path = os.path.abspath(os.path.join(dest_dir, file_name))
+            root = os.path.abspath(_human_media_root_dir())
+            if os.path.commonpath([root, dest_path]) != root:
+                raise HTTPException(status_code=403, detail="Invalid media destination")
+            if os.path.exists(dest_path):
+                raise HTTPException(status_code=409, detail="Assigned media filename already exists")
+            with open(dest_path, "wb") as f:
+                f.write(data)
+            status = "approved" if approve else "pending_approval"
+            items = _human_media_read_metadata_items(companion_mapping_id)
+            items = [item for item in items if str(item.get("relative_path") or "") != _human_media_relative_path(media_type, file_name)]
+            items.append({
+                "media_type": media_type,
+                "file_name": file_name,
+                "relative_path": _human_media_relative_path(media_type, file_name),
+                "sequence_number": next_seq,
+                "description": description,
+                "tags": tags,
+                "status": status,
+                "review_status": "host_reviewed",
+                "source": "host_profile_studio",
+                "duration_seconds": duration,
+                "width": width,
+                "height": height,
+            })
+            _human_media_write_metadata_items(companion_mapping_id, items)
+            sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, host_email=_human_media_safe_email(mapping.get("host_email") or ""))
+            _human_media_audit_upload_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=host_member_id, original_file_name=original_name, assigned_file_name=file_name, media_type=media_type, mime_type=content_type, file_size=len(data), status="stored", reason_code="safety_passed", error_message="")
+            conn.commit()
+            items_public = _human_media_list_rows_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, member_id=member, session_id=sid)
+            uploaded = next((x for x in items_public if int(x.get("sequence_number") or 0) == next_seq and x.get("media_type") == media_type), None)
+            return {"ok": True, "uploaded": uploaded, "items": items_public, "counts": sync_info}
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    finally:
+        if temp_video_path:
+            try:
+                os.remove(temp_video_path)
+            except Exception:
+                pass
+
+
+async def _host_onboarding_media_update_status_or_metadata(request: Request, media_id: int, action: str) -> Dict[str, Any]:
+    raw = await request.json()
+    member = _host_onboarding_normalize_member_id((raw or {}).get("memberId") or (raw or {}).get("member_id"))
+    sid = _host_onboarding_safe_str((raw or {}).get("sessionId") or (raw or {}).get("session_id"))
+    if not member:
+        raise HTTPException(status_code=400, detail="memberId is required")
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        _human_media_db_ensure_schema(conn)
+        mapping = _human_media_authorize_host_on_conn(conn, member_id=member, session_id=sid)
+        brand = _host_onboarding_safe_str(mapping.get("brand") or "Elaralo")
+        companion_mapping_id = int(mapping.get("mapping_id") or 0)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM human_companion_media_inventory WHERE media_id=? AND brand=? AND companion_mapping_id=? LIMIT 1", (int(media_id), brand, companion_mapping_id)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Media not found")
+        d = dict(row)
+        items = _human_media_read_metadata_items(companion_mapping_id)
+        by_rel = {str(item.get("relative_path") or ""): item for item in items if isinstance(item, dict)}
+        rel = str(d.get("relative_path") or "")
+        item = dict(by_rel.get(rel) or {})
+        item.update({
+            "media_type": str(d.get("media_type") or "photo"),
+            "file_name": str(d.get("file_name") or ""),
+            "relative_path": rel,
+            "sequence_number": int(d.get("sequence_number") or 0),
+            "duration_seconds": float(d.get("duration_seconds") or 0.0),
+            "width": int(d.get("width_px") or 0),
+            "height": int(d.get("height_px") or 0),
+        })
+        if action == "metadata":
+            item["description"] = _host_onboarding_safe_str((raw or {}).get("description") or "")
+            item["tags"] = _human_media_safe_json_list((raw or {}).get("tags") or "")
+        elif action == "approve":
+            item["status"] = "approved"
+            conn.execute("UPDATE human_companion_media_inventory SET status='approved', updated_epoch=? WHERE media_id=?", (time.time(), int(media_id)))
+        elif action == "deactivate":
+            item["status"] = "inactive"
+            conn.execute("UPDATE human_companion_media_inventory SET status='inactive', updated_epoch=? WHERE media_id=?", (time.time(), int(media_id)))
+        elif action == "reactivate":
+            item["status"] = "approved"
+            conn.execute("UPDATE human_companion_media_inventory SET status='approved', updated_epoch=? WHERE media_id=?", (time.time(), int(media_id)))
+        item["review_status"] = _host_onboarding_safe_str(item.get("review_status") or "host_reviewed")
+        item["source"] = _host_onboarding_safe_str(item.get("source") or "host_profile_studio")
+        by_rel[rel] = item
+        _human_media_write_metadata_items(companion_mapping_id, list(by_rel.values()))
+        sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=_host_onboarding_safe_str(mapping.get("host_member_id") or member), host_email=_human_media_safe_email(mapping.get("host_email") or ""))
+        conn.commit()
+        return {"ok": True, "items": _human_media_list_rows_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, member_id=member, session_id=sid), "counts": sync_info}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.patch("/host-onboarding/media/{media_id}/metadata")
+async def host_onboarding_media_metadata(media_id: int, request: Request) -> Dict[str, Any]:
+    return await _host_onboarding_media_update_status_or_metadata(request, media_id, "metadata")
+
+
+@app.post("/host-onboarding/media/{media_id}/approve")
+async def host_onboarding_media_approve(media_id: int, request: Request) -> Dict[str, Any]:
+    return await _host_onboarding_media_update_status_or_metadata(request, media_id, "approve")
+
+
+@app.post("/host-onboarding/media/{media_id}/deactivate")
+async def host_onboarding_media_deactivate(media_id: int, request: Request) -> Dict[str, Any]:
+    return await _host_onboarding_media_update_status_or_metadata(request, media_id, "deactivate")
+
+
+@app.post("/host-onboarding/media/{media_id}/reactivate")
+async def host_onboarding_media_reactivate(media_id: int, request: Request) -> Dict[str, Any]:
+    return await _host_onboarding_media_update_status_or_metadata(request, media_id, "reactivate")
 
 @app.post("/host-onboarding/session/{session_id}/derive")
 async def host_onboarding_derive(session_id: str, request: Request):
