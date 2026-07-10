@@ -946,20 +946,29 @@ function readCompanionListReturnContextFromUrl(): CompanionListReturnContext {
   if (typeof window === "undefined") return { enabled: false, count: 0, url: "" };
   try {
     const params = new URLSearchParams(window.location.search || "");
+    const sourceKey = firstQueryValue(params, ["source", "launchSource", "launch_source"])
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "");
+    const fromSummaryPublic = sourceKey === "summarypublic";
     const countRaw = firstQueryValue(params, [
       "selectableCompanionCount",
       "selectable_companion_count",
       "companionCount",
       "companion_count",
     ]);
-    const count = Math.max(0, Number.parseInt(countRaw || "0", 10) || 0);
+    const parsedCount = Math.max(0, Number.parseInt(countRaw || "0", 10) || 0);
+    const count = Math.max(parsedCount, fromSummaryPublic ? 2 : 0);
 
-    const wantsReturnButton = booleanFromQuery(firstQueryValue(params, [
+    const explicitWantsReturnButton = booleanFromQuery(firstQueryValue(params, [
       "returnToCompanions",
       "return_to_companions",
       "showCompanionListButton",
       "show_companion_list_button",
     ])) === true;
+    // Summary Public launches are single-profile pages, so they do not always carry
+    // the selector's companion-count handoff.  Treat source=summary-public as a
+    // valid return-to-list launch and build the same safe /my-elaralo fallback.
+    const wantsReturnButton = explicitWantsReturnButton || fromSummaryPublic;
 
     if (count <= 1 || !wantsReturnButton) return { enabled: false, count, url: "" };
 
@@ -1574,6 +1583,24 @@ function normalizeUploadedAttachment(raw: any): UploadedAttachment | null {
   return { url, name, size, contentType, container, blobName };
 }
 
+function isRequestedHumanPhotoDelivery(meta: any): boolean {
+  const delivery = meta?.contentDelivery || {};
+  const kind = String(delivery?.deliveryKind || delivery?.delivery_kind || "").trim().toLowerCase();
+  return (
+    kind === "requested_human_photo" ||
+    Boolean(delivery?.requestedHumanPhoto || delivery?.requested_human_photo || meta?.requestedHumanPhoto || meta?.requested_human_photo)
+  );
+}
+
+function platformContentLabel(meta: any): string {
+  return isRequestedHumanPhotoDelivery(meta) ? "Requested Human Companion photo" : "Scheduled content";
+}
+
+function isPlatformContentPlaceholderText(contentText: string): boolean {
+  const text = String(contentText || "").trim();
+  return /^(Scheduled content|Requested Human Companion photo) was delivered by the platform\b/i.test(text);
+}
+
 function extractPlatformContentFileName(contentText: string, meta: any): string {
   const fromMeta = String(meta?.attachment?.name || meta?.contentDelivery?.fileName || "").trim();
   if (fromMeta) return fromMeta;
@@ -1590,7 +1617,8 @@ function extractPlatformContentFileName(contentText: string, meta: any): string 
 
 function platformContentPlaceholder(contentText: string, meta: any): string {
   const fileName = extractPlatformContentFileName(contentText, meta);
-  return fileName ? `Scheduled content was delivered by the platform: ${fileName}.` : "Scheduled content was delivered by the platform.";
+  const label = platformContentLabel(meta);
+  return fileName ? `${label} was delivered by the platform: ${fileName}.` : `${label} was delivered by the platform.`;
 }
 
 function extractDeliveredContentFileNamesFromMessages(messages: Msg[]): string[] {
@@ -1604,7 +1632,7 @@ function extractDeliveredContentFileNamesFromMessages(messages: Msg[]): string[]
     const meta: any = (m as any).meta || {};
     const content = String((m as any).content || "");
     const isPlatformContent =
-      Boolean(meta?.contentDelivery) || /^Scheduled content was delivered by the platform\b/i.test(content.trim());
+      Boolean(meta?.contentDelivery) || isPlatformContentPlaceholderText(content);
     if (!isPlatformContent) continue;
 
     const fileName = extractPlatformContentFileName(content, meta);
@@ -1622,7 +1650,7 @@ function extractDeliveredContentFileNamesFromMessages(messages: Msg[]): string[]
 function normalizePlatformContentMessage(contentText: string, meta: any): string {
   const text = String(contentText || "").trim();
   if (!text) return platformContentPlaceholder(text, meta);
-  if (/^Scheduled content was delivered by the platform\.?$/i.test(text)) {
+  if (/^(Scheduled content|Requested Human Companion photo) was delivered by the platform\.?$/i.test(text)) {
     return platformContentPlaceholder(text, meta);
   }
   return text;
@@ -1636,11 +1664,19 @@ function buildContentAssistantMsg(rawContent: any): Msg | null {
 
   const meta: any = { sender: "ai" };
   if (att) meta.attachment = att;
+  const deliveryKind = String((rawContent as any).deliveryKind || (rawContent as any).delivery_kind || "").trim();
+  const requestedHumanPhoto =
+    deliveryKind === "requested_human_photo" ||
+    Boolean((rawContent as any).requestedHumanPhoto || (rawContent as any).requested_human_photo);
   meta.contentDelivery = {
     folder: String((rawContent as any).folder || ""),
     sequence: String((rawContent as any).sequence || ""),
     stage: String((rawContent as any).stage || ""),
     fileName: String((rawContent as any).fileName || (rawContent as any).filename || att?.name || ""),
+    deliveryKind,
+    delivery_kind: deliveryKind,
+    requestedHumanPhoto,
+    requested_human_photo: requestedHumanPhoto,
   };
 
   return {
@@ -1653,13 +1689,13 @@ function buildContentAssistantMsg(rawContent: any): Msg | null {
 function serializeMessageForBackend(m: Msg, opts?: { forSummary?: boolean }): Record<string, any> {
   const role = m.role;
   const meta: any = m.meta || {};
-  const isPlatformContent = Boolean(meta?.contentDelivery);
   let content = String(m.content || "");
+  const isPlatformContent = Boolean(meta?.contentDelivery) || isPlatformContentPlaceholderText(content);
 
   if (isPlatformContent) {
     // Always send the stable placeholder with filename so the backend can preserve the delivered file name
-    // without exposing raw /content URLs or re-feeding the descriptive delivery line into model context.
-    content = platformContentPlaceholder(content, meta);
+    // without exposing raw /content or /human-photo URLs or re-feeding the descriptive delivery line into model context.
+    content = Boolean(meta?.contentDelivery) ? platformContentPlaceholder(content, meta) : content.trim();
     return { role, content };
   }
 
@@ -10131,7 +10167,7 @@ const getAutoSaveSummaryContentDeliveryCount = useCallback((): number => {
     if ((m as any)?.role !== "assistant") return false;
     const meta: any = (m as any)?.meta || {};
     const content = String((m as any)?.content || "");
-    return Boolean(meta?.contentDelivery) || /^Scheduled content was delivered by the platform\b/i.test(content.trim());
+    return Boolean(meta?.contentDelivery) || isPlatformContentPlaceholderText(content);
   }).length;
 }, [getAutoSaveSummaryMessages]);
 

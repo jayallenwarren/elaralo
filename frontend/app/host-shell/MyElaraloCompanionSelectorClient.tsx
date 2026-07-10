@@ -751,6 +751,29 @@ export default function MyElaraloCompanionSelectorClient() {
     if (!url) return;
 
     url.searchParams.set("brand", url.searchParams.get("brand") || brand);
+    url.searchParams.set("loggedIn", loggedIn ? "1" : "0");
+    url.searchParams.set("logged_in", loggedIn ? "1" : "0");
+    if (memberId) {
+      url.searchParams.set("memberId", memberId);
+      url.searchParams.set("member_id", memberId);
+    }
+    if (displayName) {
+      url.searchParams.set("displayName", displayName);
+      url.searchParams.set("userName", displayName);
+    }
+    if (selectableCompanionCount > 1) {
+      const returnUrl = buildCompanionListReturnUrl(brand);
+      url.searchParams.set("returnToCompanions", "1");
+      url.searchParams.set("return_to_companions", "1");
+      url.searchParams.set("companionCount", String(selectableCompanionCount));
+      url.searchParams.set("companion_count", String(selectableCompanionCount));
+      url.searchParams.set("selectableCompanionCount", String(selectableCompanionCount));
+      url.searchParams.set("selectable_companion_count", String(selectableCompanionCount));
+      if (returnUrl) {
+        url.searchParams.set("companionListUrl", returnUrl);
+        url.searchParams.set("companion_list_url", returnUrl);
+      }
+    }
     const hasVersion = Boolean(url.searchParams.get("versionId") || url.searchParams.get("version_id"));
     if (!hasVersion && companionKey) {
       url.searchParams.set("avatar", companionKey);
@@ -764,7 +787,7 @@ export default function MyElaraloCompanionSelectorClient() {
     } catch {
       // ignore
     }
-  }, [brandName]);
+  }, [brandName, displayName, loggedIn, memberId, selectableCompanionCount]);
 
 
   useEffect(() => {

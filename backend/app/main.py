@@ -183,8 +183,8 @@ _CHAT_VISION_POLICY = (
     "Do not say that you cannot view attachments or images when the platform has provided image input."
 )
 _CHAT_CONTENT_DELIVERY_POLICY = (
-    "Content delivery rule: Never invent, promise, or format media attachments, filenames, file numbers, or /content/ links. "
-    "Only the platform may deliver scheduled photos or videos, and only when a real file exists in the active content library. "
+    "Content delivery rule: Never invent, promise, or format media attachments, filenames, file numbers, /content/ links, or /human-photo/ links. "
+    "Only the platform may deliver scheduled photos/videos or requested Elaralo Human Companion photos, and only when a real file exists in the active content library or approved Human Companion photo library. "
     "If the user asks for media, respond conversationally without URLs, without attachment blocks, and without claiming that content has been sent unless the platform actually attaches it."
 )
 
@@ -506,6 +506,26 @@ async def elaralo_ai_legacy_headshot_asset(request: Request, filename: str):
     headers = {
         "Content-Disposition": f'inline; filename="{resolved_name}"',
         "Cache-Control": "public, max-age=3600",
+    }
+    return FileResponse(path, media_type=media_type, headers=headers)
+
+
+@app.get("/human-photo/{token}", name="elaralo_human_requested_photo")
+async def elaralo_human_requested_photo(request: Request, token: str):
+    """Serve a previously authorized requested Elaralo Human Companion photo.
+
+    The URL carries an unguessable delivery token. Raw filesystem paths and
+    directory listings are never exposed to the browser.
+    """
+    _ = request
+    path, resolved_name = await run_in_threadpool(_human_photo_file_path_for_token_sync, token)
+    if not path or not resolved_name or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="human photo not found")
+    media_type = mimetypes.guess_type(path)[0] or "image/jpeg"
+    headers = {
+        "Content-Disposition": f'inline; filename="{resolved_name}"',
+        "Cache-Control": "private, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
     }
     return FileResponse(path, media_type=media_type, headers=headers)
 
@@ -1994,7 +2014,10 @@ def _load_companion_mappings_sync() -> None:
             return
 
         # Quote the table name to safely handle names with special characters.
-        cur.execute(f'SELECT * FROM "{table}"')
+        try:
+            cur.execute(f'SELECT rowid AS _rowid, * FROM "{table}"')
+        except Exception:
+            cur.execute(f'SELECT * FROM "{table}"')
         rows = cur.fetchall()
         table_name_for_source = str(table or "")
     finally:
@@ -2052,6 +2075,8 @@ def _load_companion_mappings_sync() -> None:
         d[key] = {
             "brand": brand,
             "avatar": avatar,
+            "id": str(get_col("id", "ID", "mapping_id", "mappingId", "_rowid", default="") or "").strip(),
+            "mapping_id": str(get_col("id", "ID", "mapping_id", "mappingId", "_rowid", default="") or "").strip(),
             "brand_id": brand_id_value,
             "eleven_voice_name": str(get_col("eleven_voice_name", "Eleven_Voice_Name", default="") or ""),
             # UI uses channel_cap to decide whether to show the video/play controls.
@@ -2060,6 +2085,7 @@ def _load_companion_mappings_sync() -> None:
             "live": str(get_col("live", "Live", default="") or "").strip(),
             "event_ref": str(get_col("event_ref", "eventRef", "EventRef", "EVENT_REF", default="") or ""),
             "host_member_id": str(get_col("host_member_id", "hostMemberId", "HOST_MEMBER_ID", default="") or ""),
+            "host_email": str(get_col("host_email", "hostEmail", "HOST_EMAIL", "email", "loginEmail", default="") or "").strip(),
             "companion_type": str(get_col("companion_type", "Companion_Type", "COMPANION_TYPE", "type", "Type", default="") or ""),
             "phonetic": str(get_col("phonetic", "Phonetic", default="") or "").strip(),
             "headshot_url": str(get_col("headshot_url", "headshotUrl", default="") or "").strip(),
@@ -6610,13 +6636,13 @@ def _sanitize_summary_for_safe_mode(text: str) -> str:
     return t
 
 
-_PLATFORM_CONTENT_URL_RE = re.compile(r'https?://[^\s"\'<>]+?/content/[^\s"\'<>]+', re.IGNORECASE)
+_PLATFORM_CONTENT_URL_RE = re.compile(r'https?://[^\s"\'<>]+?/(?:content|human-photo)/[^\s"\'<>]+', re.IGNORECASE)
 _PLATFORM_ATTACHMENT_BLOCK_RE = re.compile(
-    r'(?:^|\n)\s*Attachment:\s*[^\n]*\n\s*(?:https?://[^\s"\'<>]+?/content/[^\s"\'<>]+|/content/[^\s"\'<>]+)',
+    r'(?:^|\n)\s*Attachment:\s*[^\n]*\n\s*(?:https?://[^\s"\'<>]+?/(?:content|human-photo)/[^\s"\'<>]+|/(?:content|human-photo)/[^\s"\'<>]+)',
     re.IGNORECASE,
 )
 _PLATFORM_DELIVERY_LINE_RE = re.compile(
-    r'(?im)^\s*Delivering\s+(?:Photo|Video|content|scheduled\s+content)[^\n]*$'
+    r'(?im)^\s*Delivering\s+(?:Photo|Video|content|scheduled\s+content|requested\s+human\s+companion\s+photo)[^\n]*$'
 )
 _PLATFORM_FILENAME_IN_TEXT_RE = re.compile(
     r'(?im)(?:^|\n)\s*(?:Attachment|File(?:\s+name)?)\s*:\s*([^\n]+)$'
@@ -6625,10 +6651,10 @@ _PLATFORM_INLINE_FILENAME_RE = re.compile(
     r'(?i)\bFile(?:\s+name)?\s*:\s*([^\n]+)'
 )
 _PLATFORM_GENERIC_PLACEHOLDER_RE = re.compile(
-    r'(?i)^\s*Scheduled content was delivered by the platform\.?\s*$'
+    r'(?i)^\s*(?:Scheduled content|Requested Human Companion photo) was delivered by the platform\.?\s*$'
 )
 _PLATFORM_PLACEHOLDER_WITH_FILENAME_RE = re.compile(
-    r'(?i)^\s*Scheduled content was delivered by the platform\s*:\s*([^\n]+?)\s*\.?\s*$'
+    r'(?i)^\s*(?:Scheduled content|Requested Human Companion photo) was delivered by the platform\s*:\s*([^\n]+?)\s*\.?\s*$'
 )
 
 
@@ -6922,9 +6948,11 @@ def _sanitize_message_content_for_llm(role: str, content: str) -> str:
         if (
             "attachment:" in lowered
             or "/content/" in lowered
+            or "/human-photo/" in lowered
             or "delivering photo" in lowered
             or "delivering video" in lowered
             or "delivering scheduled content" in lowered
+            or "requested human companion photo" in lowered
         ) and not cleaned:
             file_name = _platform_content_filename_from_text(content)
             return _platform_content_placeholder(file_name) if file_name else ""
@@ -6965,7 +6993,7 @@ def _sanitize_assistant_reply_for_platform_content(text: str) -> str:
         return str(text or "").strip()
     cleaned = cleaned.strip()
     if not cleaned or len(cleaned) < 24 or cleaned.endswith(":"):
-        return "I can only share photos or videos when the platform delivers scheduled content that actually exists in the active library."
+        return "I can only share photos or videos when the platform delivers a real attachment that actually exists in an approved library."
     return cleaned
 
 
@@ -10922,6 +10950,62 @@ async def chat(request: Request):
     user_display_text = str(last_user_display_text or user_text).strip()
     normalized_text = user_text.lower().strip()
 
+    async def _human_photo_response_if_requested(
+        state_for_delivery: Dict[str, Any],
+        *,
+        status_mode: str,
+        relay_sender: str = "ai",
+    ) -> Optional[Dict[str, Any]]:
+        requested_human_photo: Optional[Dict[str, Any]] = None
+        try:
+            requested_human_photo = await run_in_threadpool(
+                _human_photo_requested_photo_turn_sync,
+                session_id=session_id,
+                session_state=state_for_delivery,
+                request_text=user_text,
+                viewer_key=identity_key,
+                member_id=member_id,
+                plan_name_raw=plan_name_raw,
+                plan_external=plan_external,
+                plan_map=plan_map,
+                plan_name_for_limits=plan_name_for_limits,
+                is_trial=is_trial,
+                base_url=str(request.base_url),
+            )
+        except Exception:
+            requested_human_photo = None
+        if not isinstance(requested_human_photo, dict):
+            return None
+
+        reply = str(requested_human_photo.get("reply") or "").strip() or HUMAN_PHOTO_CANNED_RESPONSE
+        raw_content = requested_human_photo.get("content")
+        content_payload = raw_content if isinstance(raw_content, dict) else None
+        response_payload = await _respond(reply, status_mode, state_for_delivery, content_payload)
+
+        # Keep the host relay transcript aware of deterministic platform photo turns.
+        try:
+            relay_text = str(response_payload.get("display_reply") or reply).strip()
+            relay_payload: Optional[Dict[str, Any]] = None
+            relay_kind = "message"
+            if content_payload:
+                relay_payload = content_payload
+                relay_kind = "user_content"
+            elif isinstance(response_payload.get("reply_translation"), dict):
+                relay_payload = response_payload.get("reply_translation")  # type: ignore[assignment]
+            if relay_text or relay_payload:
+                _ai_override_append_event(
+                    session_id,
+                    role="assistant",
+                    content=relay_text,
+                    sender=relay_sender or "ai",
+                    audience="all",
+                    kind=relay_kind,
+                    payload=relay_payload,
+                )
+        except Exception:
+            pass
+        return response_payload
+
     authoritative_phonetic_reply = _chat_authoritative_phonetic_reply(session_state, user_text)
     if authoritative_phonetic_reply:
         session_state_out = dict(session_state)
@@ -11158,6 +11242,15 @@ async def chat(request: Request):
         session_state_out["model"] = "host"
         session_state_out["host_override_active"] = True
         session_state_out["companion_meta"] = _parse_companion_meta(_extract_companion_raw(session_state_out))
+
+        requested_photo_response = await _human_photo_response_if_requested(
+            session_state_out,
+            status_mode=STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
+            relay_sender="host",
+        )
+        if requested_photo_response is not None:
+            return requested_photo_response
+
         # Universal first-turn friend photo is auto-delivered once per 24h.
         friend_first_turn_content: Optional[Dict[str, Any]] = None
         try:
@@ -11201,6 +11294,19 @@ async def chat(request: Request):
             session_state_out,
             friend_first_turn_content,
         )
+
+    session_state_out_photo = dict(session_state)
+    session_state_out_photo["mode"] = effective_mode
+    session_state_out_photo["pending_consent"] = None if intimate_allowed else session_state_out_photo.get("pending_consent")
+    session_state_out_photo["llm_provider"] = llm_provider
+    session_state_out_photo["model_provider"] = llm_provider
+    requested_photo_response = await _human_photo_response_if_requested(
+        session_state_out_photo,
+        status_mode=STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
+        relay_sender=("xai" if llm_provider == "xai" else "ai"),
+    )
+    if requested_photo_response is not None:
+        return requested_photo_response
 
     if llm_provider == "openai" and in_session_summaries:
         sanitized: List[str] = []
@@ -20766,6 +20872,1171 @@ def _content_mark_host_received(payload: Dict[str, Any]) -> None:
             pass
 
 
+# ---------------- Requested Elaralo Human Companion photo delivery ----------------
+
+HUMAN_PHOTO_CANNED_RESPONSE = "I do not take pictures often so will need to take some new ones when I have the chance"
+_HUMAN_PHOTO_FEATURE_ENABLED = str(os.getenv("ELARALO_HUMAN_REQUESTED_PHOTOS_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+_HUMAN_PHOTO_TRIAL_LIMIT = _env_int("ELARALO_HUMAN_PHOTO_TRIAL_LIMIT", 2)
+_HUMAN_PHOTO_TRIAL_WINDOW_DAYS = _env_int("ELARALO_HUMAN_PHOTO_TRIAL_WINDOW_DAYS", 30)
+_HUMAN_PHOTO_ALERT_EMAIL_ENABLED = str(os.getenv("HUMAN_PHOTO_ALERT_EMAIL_ENABLED", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+_HUMAN_PHOTO_ALERT_RECIPIENT_DEFAULT = (os.getenv("HUMAN_PHOTO_ALERT_DEFAULT_RECIPIENT", "info@elaralo.com") or "info@elaralo.com").strip()
+_HUMAN_PHOTO_ALERT_THRESHOLDS = (5, 1)
+_HUMAN_PHOTO_VALID_RE = re.compile(r"^IMG-(\d{9})\.(?:jpe?g|png|webp)$", re.IGNORECASE)
+_HUMAN_PHOTO_METADATA_FILENAMES = ("photo_metadata.json", "human_photo_metadata.json", "metadata.json")
+_HUMAN_PHOTO_DB_LOCK = threading.RLock()
+_HUMAN_PHOTO_DB_READY = False
+_HUMAN_PHOTO_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "can", "could", "do", "does", "for", "from", "got", "have",
+    "i", "image", "images", "in", "is", "it", "me", "my", "of", "on", "one", "photo", "photos", "pic", "pics",
+    "picture", "pictures", "please", "send", "share", "show", "snapshot", "selfie", "some", "that", "the", "them",
+    "to", "want", "with", "would", "you", "your", "see", "looking", "look", "give", "get", "take", "taking",
+    "new", "another", "more", "any", "something", "thing", "file", "attachment", "attached", "like", "looks",
+}
+_HUMAN_PHOTO_DELIVERY_KIND = "requested_human_photo"
+
+
+def _human_photo_root_dir() -> str:
+    candidates = [
+        os.getenv("ELARALO_HUMAN_COMPANION_PHOTO_ROOT", ""),
+        os.getenv("ELARALO_HUMAN_PHOTO_ROOT", ""),
+        os.getenv("HUMAN_COMPANION_PHOTO_ROOT", ""),
+        os.getenv("ELARALO_HUMAN_COMPANION_IMAGE_DIR", ""),
+        "/home/site/brand/elaralo/companion/human",
+    ]
+    for raw in candidates:
+        p = str(raw or "").strip()
+        if not p:
+            continue
+        return os.path.abspath(os.path.expanduser(p))
+    return "/home/site/brand/elaralo/companion/human"
+
+
+def _human_photo_companion_dir(companion_mapping_id: Any) -> str:
+    try:
+        mid = int(companion_mapping_id)
+    except Exception:
+        mid = 0
+    if mid <= 0:
+        return ""
+    return os.path.join(_human_photo_root_dir(), f"companion-id-{mid}")
+
+
+def _human_photo_is_valid_file_name(file_name: Any) -> Tuple[bool, int]:
+    name = os.path.basename(str(file_name or "").strip())
+    m = _HUMAN_PHOTO_VALID_RE.match(name)
+    if not m:
+        return False, 0
+    try:
+        return True, int(m.group(1))
+    except Exception:
+        return True, 0
+
+
+def _human_photo_safe_email(value: Any) -> str:
+    try:
+        return _stripe_paygo_email_norm(value)
+    except Exception:
+        s = str(value or "").strip().lower()
+        return s if ("@" in s and "." in s.split("@")[-1]) else ""
+
+
+def _human_photo_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (str(table_name or "").strip(),),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _human_photo_table_columns(conn: sqlite3.Connection, table_name: str) -> Set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except Exception:
+        return set()
+    out: Set[str] = set()
+    for row in rows:
+        try:
+            name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        except Exception:
+            name = ""
+        if name:
+            out.add(str(name).strip())
+    return out
+
+
+def _human_photo_ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
+    if column_name in _human_photo_table_columns(conn, table_name):
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+
+
+def _human_photo_db_ensure_schema(conn: sqlite3.Connection) -> None:
+    global _HUMAN_PHOTO_DB_READY
+    if _HUMAN_PHOTO_DB_READY:
+        return
+    with _HUMAN_PHOTO_DB_LOCK:
+        if _HUMAN_PHOTO_DB_READY:
+            return
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_companion_photo_inventory (
+              photo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              brand TEXT NOT NULL,
+              companion_mapping_id INTEGER NOT NULL,
+              host_member_id TEXT,
+              host_email TEXT,
+              source_dir TEXT,
+              file_name TEXT NOT NULL,
+              file_ext TEXT,
+              original_sequence INTEGER NOT NULL,
+              file_size INTEGER NOT NULL DEFAULT 0,
+              file_mtime REAL NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'available',
+              consumed_at_epoch REAL,
+              consumed_by_viewer_key TEXT,
+              delivery_token TEXT,
+              created_epoch REAL NOT NULL,
+              updated_epoch REAL NOT NULL,
+              UNIQUE(brand, companion_mapping_id, file_name)
+            )
+            """
+        )
+        for name, coldef in [
+            ("host_member_id", "host_member_id TEXT"),
+            ("host_email", "host_email TEXT"),
+            ("source_dir", "source_dir TEXT"),
+            ("file_ext", "file_ext TEXT"),
+            ("original_sequence", "original_sequence INTEGER NOT NULL DEFAULT 0"),
+            ("file_size", "file_size INTEGER NOT NULL DEFAULT 0"),
+            ("file_mtime", "file_mtime REAL NOT NULL DEFAULT 0"),
+            ("status", "status TEXT NOT NULL DEFAULT 'available'"),
+            ("consumed_at_epoch", "consumed_at_epoch REAL"),
+            ("consumed_by_viewer_key", "consumed_by_viewer_key TEXT"),
+            ("delivery_token", "delivery_token TEXT"),
+            ("created_epoch", "created_epoch REAL NOT NULL DEFAULT 0"),
+            ("updated_epoch", "updated_epoch REAL NOT NULL DEFAULT 0"),
+        ]:
+            _human_photo_ensure_column(conn, "human_companion_photo_inventory", name, coldef)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_human_photo_inventory_available ON human_companion_photo_inventory(brand, companion_mapping_id, status, original_sequence)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_human_photo_inventory_token ON human_companion_photo_inventory(delivery_token) WHERE delivery_token IS NOT NULL AND TRIM(delivery_token) <> ''"
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_companion_photo_metadata (
+              brand TEXT NOT NULL,
+              companion_mapping_id INTEGER NOT NULL,
+              file_name TEXT NOT NULL,
+              tags_json TEXT NOT NULL DEFAULT '[]',
+              description TEXT,
+              review_status TEXT,
+              reviewed_by TEXT,
+              reviewed_at_epoch REAL,
+              metadata_version TEXT,
+              updated_epoch REAL NOT NULL,
+              PRIMARY KEY(brand, companion_mapping_id, file_name)
+            )
+            """
+        )
+        for name, coldef in [
+            ("tags_json", "tags_json TEXT NOT NULL DEFAULT '[]'"),
+            ("description", "description TEXT"),
+            ("review_status", "review_status TEXT"),
+            ("reviewed_by", "reviewed_by TEXT"),
+            ("reviewed_at_epoch", "reviewed_at_epoch REAL"),
+            ("metadata_version", "metadata_version TEXT"),
+            ("updated_epoch", "updated_epoch REAL NOT NULL DEFAULT 0"),
+        ]:
+            _human_photo_ensure_column(conn, "human_companion_photo_metadata", name, coldef)
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_companion_photo_requests (
+              request_id TEXT PRIMARY KEY,
+              brand TEXT NOT NULL,
+              companion_mapping_id INTEGER NOT NULL,
+              host_member_id TEXT,
+              viewer_key TEXT NOT NULL,
+              member_id TEXT,
+              session_id TEXT,
+              plan_name TEXT,
+              plan_class TEXT,
+              request_text TEXT,
+              request_kind TEXT,
+              requested_tags_json TEXT NOT NULL DEFAULT '[]',
+              outcome TEXT NOT NULL,
+              delivered_file_name TEXT,
+              delivery_token TEXT,
+              remaining_after_delivery INTEGER,
+              created_epoch REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_human_photo_requests_viewer ON human_companion_photo_requests(brand, companion_mapping_id, viewer_key, created_epoch)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_human_photo_requests_companion ON human_companion_photo_requests(brand, companion_mapping_id, created_epoch)"
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_companion_photo_alerts (
+              alert_id TEXT PRIMARY KEY,
+              brand TEXT NOT NULL,
+              companion_mapping_id INTEGER NOT NULL,
+              threshold INTEGER NOT NULL,
+              inventory_generation TEXT NOT NULL,
+              remaining_count INTEGER NOT NULL,
+              host_email TEXT,
+              sent_to_json TEXT NOT NULL DEFAULT '[]',
+              send_status TEXT,
+              send_error TEXT,
+              sent_at_epoch REAL NOT NULL,
+              UNIQUE(brand, companion_mapping_id, threshold, inventory_generation)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_human_photo_alerts_companion ON human_companion_photo_alerts(brand, companion_mapping_id, threshold, sent_at_epoch)"
+        )
+        _HUMAN_PHOTO_DB_READY = True
+
+
+def _human_photo_safe_json_list(value: Any) -> List[str]:
+    raw = value
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = [part.strip() for part in re.split(r"[,;|]+", raw) if part.strip()]
+    else:
+        parsed = raw
+    if isinstance(parsed, dict):
+        parsed = list(parsed.values())
+    if not isinstance(parsed, list):
+        parsed = []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in parsed:
+        s = re.sub(r"\s+", " ", str(item or "").strip()).lower()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _human_photo_normalize_plan_token(value: Any) -> str:
+    try:
+        p = _normalize_plan_name_for_limits(str(value or "")).strip().lower()
+    except Exception:
+        p = str(value or "").strip().lower()
+    p = re.sub(r"\s+membership\s*$", "", p, flags=re.I).strip()
+    p = re.sub(r"^test\s*(?:-\s*)?", "", p, flags=re.I).strip()
+    p = re.sub(r"[^a-z0-9]+", " ", p).strip()
+    return p
+
+
+def _human_photo_is_paid_subscriber(*, is_trial: bool, plan_name_raw: Any, plan_external: Any, plan_map: Any, plan_name_for_limits: Any, session_state: Dict[str, Any]) -> bool:
+    if is_trial:
+        return False
+    candidates: List[Any] = [plan_external, plan_map, plan_name_raw, plan_name_for_limits]
+    if isinstance(session_state, dict):
+        for key in ("plan", "planName", "plan_name", "rebranding_plan", "rebrandingPlan", "elaralo_plan_map", "elaraloPlanMap"):
+            candidates.append(session_state.get(key))
+    for c in candidates:
+        token = _human_photo_normalize_plan_token(c)
+        if token in {"discover", "explore", "encounter"}:
+            return True
+    return False
+
+
+def _human_photo_request_terms(text: Any) -> List[str]:
+    raw = str(text or "").lower()
+    raw = re.sub(r"https?://\S+", " ", raw)
+    raw = re.sub(r"[^a-z0-9\s-]+", " ", raw)
+    tokens = [t.strip("- ") for t in re.split(r"\s+", raw) if t.strip("- ")]
+    terms: List[str] = []
+    seen: Set[str] = set()
+    for token in tokens:
+        if len(token) <= 1 or token in _HUMAN_PHOTO_STOPWORDS:
+            continue
+        if token not in seen:
+            seen.add(token)
+            terms.append(token)
+    # Add short adjacent phrases from meaningful tokens so requests like "yellow dress" score well.
+    for i in range(len(terms) - 1):
+        phrase = f"{terms[i]} {terms[i + 1]}".strip()
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            terms.append(phrase)
+    return terms[:12]
+
+
+def _human_photo_detect_request(text: Any) -> Tuple[bool, List[str]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return False, []
+    low = raw.lower()
+    has_media_word = bool(re.search(r"\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low))
+    if not has_media_word:
+        return False, []
+    delivery_intent = bool(
+        re.search(r"\b(send|show|share|give|text|post|upload|attach|display)\b.{0,80}\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low)
+        or re.search(r"\b(can|could|may|will|would)\s+(i|you)\b.{0,80}\b(see|get|have|send|show|share)\b.{0,80}\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low)
+        or re.search(r"\b(do|does|did)\s+you\b.{0,80}\b(have|send|share|show)\b.{0,80}\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low)
+        or re.search(r"\blet\s+me\s+see\b.{0,80}\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low)
+        or re.search(r"\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b.{0,40}\b(of|with|wearing|in|on|at|from)\b", low)
+    )
+    if not delivery_intent:
+        return False, []
+    return True, _human_photo_request_terms(low)
+
+
+def _human_photo_metadata_file_payload(photo_dir: str) -> Dict[str, Any]:
+    if not photo_dir or not os.path.isdir(photo_dir):
+        return {}
+    for name in _HUMAN_PHOTO_METADATA_FILENAMES:
+        path = os.path.join(photo_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            print(f"[human-photo] WARNING: failed reading metadata file {path}: {exc!r}")
+            return {}
+    return {}
+
+
+def _human_photo_metadata_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("photos") or payload.get("items") or payload.get("metadata") or []
+    out: List[Dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for file_name, meta in raw.items():
+            item = dict(meta or {}) if isinstance(meta, dict) else {"tags": meta}
+            item.setdefault("file_name", file_name)
+            out.append(item)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                out.append(dict(item))
+    return out
+
+
+def _human_photo_inventory_generation(files: List[Tuple[str, int, int, float]]) -> str:
+    h = hashlib.sha256()
+    for name, seq, size, mtime in sorted(files, key=lambda x: (x[1], x[0].lower())):
+        h.update(f"{name}|{seq}|{size}|{int(mtime)}\n".encode("utf-8", errors="ignore"))
+    return h.hexdigest()[:24]
+
+
+def _human_photo_sync_inventory_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    brand: str,
+    companion_mapping_id: int,
+    host_member_id: str = "",
+    host_email: str = "",
+) -> Dict[str, Any]:
+    _human_photo_db_ensure_schema(conn)
+    b = _stripe_paygo_brand(brand or "Elaralo")
+    photo_dir = _human_photo_companion_dir(companion_mapping_id)
+    now = time.time()
+    current: List[Tuple[str, int, int, float]] = []
+    if photo_dir and os.path.isdir(photo_dir):
+        try:
+            entries = os.listdir(photo_dir)
+        except Exception:
+            entries = []
+        for entry in entries:
+            if str(entry or "").startswith("."):
+                continue
+            ok, seq = _human_photo_is_valid_file_name(entry)
+            if not ok:
+                continue
+            full = os.path.join(photo_dir, entry)
+            if not os.path.isfile(full):
+                continue
+            try:
+                st = os.stat(full)
+                size = int(st.st_size or 0)
+                mtime = float(st.st_mtime or 0.0)
+            except Exception:
+                size = 0
+                mtime = 0.0
+            current.append((entry, seq, size, mtime))
+
+    generation = _human_photo_inventory_generation(current)
+    current_names = {name for name, _seq, _size, _mtime in current}
+    current_names_lc = {name.lower(): name for name in current_names}
+    host_email_norm = _human_photo_safe_email(host_email)
+
+    for file_name, seq, size, mtime in current:
+        ext = os.path.splitext(file_name)[1].lower().lstrip(".")
+        conn.execute(
+            """
+            INSERT INTO human_companion_photo_inventory
+            (brand, companion_mapping_id, host_member_id, host_email, source_dir, file_name, file_ext, original_sequence, file_size, file_mtime, status, created_epoch, updated_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?)
+            ON CONFLICT(brand, companion_mapping_id, file_name) DO UPDATE SET
+              host_member_id=COALESCE(NULLIF(excluded.host_member_id, ''), human_companion_photo_inventory.host_member_id),
+              host_email=COALESCE(NULLIF(excluded.host_email, ''), human_companion_photo_inventory.host_email),
+              source_dir=excluded.source_dir,
+              file_ext=excluded.file_ext,
+              original_sequence=excluded.original_sequence,
+              file_size=excluded.file_size,
+              file_mtime=excluded.file_mtime,
+              status=CASE WHEN human_companion_photo_inventory.status='missing' THEN 'available' ELSE human_companion_photo_inventory.status END,
+              updated_epoch=excluded.updated_epoch
+            """,
+            (b, int(companion_mapping_id), str(host_member_id or "").strip(), host_email_norm, photo_dir, file_name, ext, int(seq), int(size), float(mtime), now, now),
+        )
+
+    existing_rows = conn.execute(
+        "SELECT file_name, status FROM human_companion_photo_inventory WHERE brand=? AND companion_mapping_id=?",
+        (b, int(companion_mapping_id)),
+    ).fetchall()
+    for row in existing_rows:
+        fn = str(row["file_name"] or "").strip()
+        status = str(row["status"] or "").strip().lower()
+        if fn and fn not in current_names and status == "available":
+            conn.execute(
+                "UPDATE human_companion_photo_inventory SET status='missing', updated_epoch=? WHERE brand=? AND companion_mapping_id=? AND file_name=?",
+                (now, b, int(companion_mapping_id), fn),
+            )
+
+    metadata_payload = _human_photo_metadata_file_payload(photo_dir)
+    metadata_version = str(metadata_payload.get("metadata_version") or metadata_payload.get("version") or "").strip() if isinstance(metadata_payload, dict) else ""
+    reviewed_by = str(metadata_payload.get("reviewed_by") or "").strip() if isinstance(metadata_payload, dict) else ""
+    for item in _human_photo_metadata_items(metadata_payload):
+        file_name = str(item.get("file_name") or item.get("filename") or item.get("name") or "").strip()
+        if not file_name:
+            continue
+        file_name = current_names_lc.get(file_name.lower(), file_name)
+        ok, _seq = _human_photo_is_valid_file_name(file_name)
+        if not ok:
+            continue
+        tags = _human_photo_safe_json_list(item.get("tags") or item.get("labels") or [])
+        description = re.sub(r"\s+", " ", str(item.get("description") or item.get("caption") or "").strip())
+        review_status = str(item.get("review_status") or item.get("status") or "reviewed").strip().lower()
+        item_reviewed_by = str(item.get("reviewed_by") or reviewed_by or "").strip()
+        try:
+            reviewed_at = float(item.get("reviewed_at_epoch") or now)
+        except Exception:
+            reviewed_at = now
+        conn.execute(
+            """
+            INSERT INTO human_companion_photo_metadata
+            (brand, companion_mapping_id, file_name, tags_json, description, review_status, reviewed_by, reviewed_at_epoch, metadata_version, updated_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(brand, companion_mapping_id, file_name) DO UPDATE SET
+              tags_json=excluded.tags_json,
+              description=excluded.description,
+              review_status=excluded.review_status,
+              reviewed_by=excluded.reviewed_by,
+              reviewed_at_epoch=excluded.reviewed_at_epoch,
+              metadata_version=excluded.metadata_version,
+              updated_epoch=excluded.updated_epoch
+            """,
+            (b, int(companion_mapping_id), file_name, json.dumps(tags, separators=(",", ":")), description, review_status, item_reviewed_by, reviewed_at, metadata_version, now),
+        )
+
+    remaining = int(conn.execute(
+        "SELECT COUNT(1) FROM human_companion_photo_inventory WHERE brand=? AND companion_mapping_id=? AND status='available'",
+        (b, int(companion_mapping_id)),
+    ).fetchone()[0] or 0)
+    return {"photo_dir": photo_dir, "generation": generation, "total_files": len(current), "remaining": remaining}
+
+
+def _human_photo_companion_mapping_table_name(conn: sqlite3.Connection) -> str:
+    preferred = (str(_COMPANION_MAPPINGS_TABLE or "").strip(), "companion_mappings", "voice_video_mappings", "voice_video_mapping", "mappings")
+    names: Dict[str, str] = {}
+    try:
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+            name = str(row[0] if not isinstance(row, sqlite3.Row) else row["name"] or "").strip()
+            if name:
+                names[name.lower()] = name
+    except Exception:
+        return ""
+    for cand in preferred:
+        key = str(cand or "").strip().lower()
+        if key and key in names:
+            return names[key]
+    return ""
+
+
+def _human_photo_mapping_row_from_session_state(conn: sqlite3.Connection, session_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ss = session_state if isinstance(session_state, dict) else {}
+    brand = _brand_from_session_state(ss) or "Elaralo"
+    if not _is_elaralo_core_brand(brand):
+        return None
+    requested_type = _host_onboarding_safe_str(
+        ss.get("companionType") or ss.get("companion_type") or ss.get("type") or ""
+    ).lower()
+    if requested_type in ("human_companion", "human-host", "host"):
+        requested_type = "human"
+    if requested_type and requested_type not in {"human", ""}:
+        return None
+
+    avatar = _avatar_from_session_state(ss) or _extract_companion_raw(ss)
+    member_host = _host_onboarding_safe_str(ss.get("hostMemberId") or ss.get("host_member_id") or "")
+    table = _human_photo_companion_mapping_table_name(conn)
+    if not table:
+        return None
+    cols = _human_photo_table_columns(conn, table)
+    if not cols:
+        return None
+    id_expr = "id" if "id" in {c.lower() for c in cols} else "rowid"
+    host_email_expr = "host_email" if "host_email" in {c.lower() for c in cols} else "''"
+    host_member_expr = "host_member_id" if "host_member_id" in {c.lower() for c in cols} else "''"
+    companion_type_expr = "companion_type" if "companion_type" in {c.lower() for c in cols} else "''"
+    brand_expr = "brand" if "brand" in {c.lower() for c in cols} else "''"
+    avatar_expr = "avatar" if "avatar" in {c.lower() for c in cols} else "''"
+    base_select = f"SELECT {id_expr} AS mapping_id, {brand_expr} AS brand, {avatar_expr} AS avatar, {host_member_expr} AS host_member_id, {host_email_expr} AS host_email, {companion_type_expr} AS companion_type FROM {table}"
+
+    where_common = "lower(COALESCE(brand, 'Elaralo')) = lower(?) AND lower(COALESCE(companion_type, '')) = 'human'"
+    params: Tuple[Any, ...]
+    row = None
+    if avatar:
+        avatar_candidates = _companion_mapping_lookup_avatar_candidates(avatar)
+        for candidate in avatar_candidates:
+            row = conn.execute(
+                f"{base_select} WHERE {where_common} AND lower(COALESCE(avatar, '')) = lower(?) ORDER BY mapping_id DESC LIMIT 1",
+                (brand, candidate),
+            ).fetchone()
+            if row is not None:
+                break
+    if row is None and member_host:
+        row = conn.execute(
+            f"{base_select} WHERE {where_common} AND COALESCE(host_member_id, '') = ? ORDER BY mapping_id DESC LIMIT 1",
+            (brand, member_host),
+        ).fetchone()
+    if row is None:
+        # Last resort: use in-memory alias lookup, then re-query by resolved avatar to recover the numeric id.
+        mapping = _lookup_companion_mapping_with_aliases(brand, avatar, "human") if avatar else None
+        resolved_avatar = str((mapping or {}).get("avatar") or (mapping or {}).get("mapping_avatar") or "").strip()
+        if resolved_avatar:
+            row = conn.execute(
+                f"{base_select} WHERE {where_common} AND lower(COALESCE(avatar, '')) = lower(?) ORDER BY mapping_id DESC LIMIT 1",
+                (brand, resolved_avatar),
+            ).fetchone()
+    if row is None:
+        return None
+    out = dict(row)
+    try:
+        out["mapping_id"] = int(out.get("mapping_id") or 0)
+    except Exception:
+        out["mapping_id"] = 0
+    if int(out.get("mapping_id") or 0) <= 0:
+        return None
+    return out
+
+
+def _human_photo_persist_host_email_on_conn(conn: sqlite3.Connection, *, brand: Any, avatar: Any, member_id: Any, host_email: Any) -> bool:
+    email = _human_photo_safe_email(host_email)
+    if not email:
+        return False
+    table = _human_photo_companion_mapping_table_name(conn)
+    if not table:
+        return False
+    try:
+        if "host_email" not in {c.lower() for c in _human_photo_table_columns(conn, table)}:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN host_email TEXT")
+    except Exception:
+        return False
+    b = _host_onboarding_safe_str(brand) or "Elaralo"
+    a = _host_onboarding_safe_str(avatar)
+    mid = _host_onboarding_safe_str(member_id)
+    updated = 0
+    if a:
+        cur = conn.execute(
+            f"UPDATE {table} SET host_email=? WHERE lower(COALESCE(brand, 'Elaralo'))=lower(?) AND lower(COALESCE(avatar, ''))=lower(?) AND lower(COALESCE(companion_type, ''))='human'",
+            (email, b, a),
+        )
+        updated += int(cur.rowcount or 0)
+    if updated <= 0 and mid and "host_member_id" in {c.lower() for c in _human_photo_table_columns(conn, table)}:
+        cur = conn.execute(
+            f"UPDATE {table} SET host_email=? WHERE lower(COALESCE(brand, 'Elaralo'))=lower(?) AND COALESCE(host_member_id, '')=? AND lower(COALESCE(companion_type, ''))='human'",
+            (email, b, mid),
+        )
+        updated += int(cur.rowcount or 0)
+    return updated > 0
+
+
+def _human_photo_delivered_count_in_window(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int, viewer_key: str, now_epoch: float) -> int:
+    since = float(now_epoch) - (max(1, int(_HUMAN_PHOTO_TRIAL_WINDOW_DAYS or 30)) * 86400.0)
+    row = conn.execute(
+        """
+        SELECT COUNT(1)
+          FROM human_companion_photo_requests
+         WHERE brand=? AND companion_mapping_id=? AND viewer_key=?
+           AND outcome='delivered'
+           AND created_epoch >= ?
+        """,
+        (brand, int(companion_mapping_id), str(viewer_key or ""), since),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _human_photo_insert_request_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    brand: str,
+    companion_mapping_id: int,
+    host_member_id: str,
+    viewer_key: str,
+    member_id: str,
+    session_id: str,
+    plan_name: str,
+    plan_class: str,
+    request_text: str,
+    request_kind: str,
+    requested_tags: List[str],
+    outcome: str,
+    delivered_file_name: str = "",
+    delivery_token: str = "",
+    remaining_after_delivery: Optional[int] = None,
+    now_epoch: Optional[float] = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO human_companion_photo_requests
+        (request_id, brand, companion_mapping_id, host_member_id, viewer_key, member_id, session_id, plan_name, plan_class,
+         request_text, request_kind, requested_tags_json, outcome, delivered_file_name, delivery_token, remaining_after_delivery, created_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            uuid.uuid4().hex,
+            brand,
+            int(companion_mapping_id),
+            str(host_member_id or ""),
+            str(viewer_key or ""),
+            str(member_id or ""),
+            str(session_id or ""),
+            str(plan_name or ""),
+            str(plan_class or ""),
+            str(request_text or "")[:4000],
+            str(request_kind or ""),
+            json.dumps(list(requested_tags or []), separators=(",", ":")),
+            str(outcome or ""),
+            str(delivered_file_name or ""),
+            str(delivery_token or ""),
+            int(remaining_after_delivery) if remaining_after_delivery is not None else None,
+            float(now_epoch or time.time()),
+        ),
+    )
+
+
+def _human_photo_row_metadata_text(row: Dict[str, Any]) -> Tuple[List[str], str]:
+    tags = _human_photo_safe_json_list(row.get("tags_json") or "[]")
+    desc = re.sub(r"\s+", " ", str(row.get("description") or "").strip().lower())
+    return tags, desc
+
+
+def _human_photo_score_metadata_match(row: Dict[str, Any], terms: List[str]) -> int:
+    if not terms:
+        return 0
+    tags, desc = _human_photo_row_metadata_text(row)
+    if not tags and not desc:
+        return 0
+    tag_blob = " | ".join(tags)
+    text_blob = f"{tag_blob} | {desc}".lower()
+    score = 0
+    for term in terms:
+        t = str(term or "").strip().lower()
+        if not t:
+            continue
+        if t in tags:
+            score += 6
+        elif any(t == tag.replace("-", " ") for tag in tags):
+            score += 5
+        elif any(t in tag or tag in t for tag in tags if len(tag) >= 3 and len(t) >= 3):
+            score += 3
+        elif re.search(r"\b" + re.escape(t) + r"\b", desc):
+            score += 2
+        elif len(t) >= 4 and t in text_blob:
+            score += 1
+    return score
+
+
+def _human_photo_available_rows(conn: sqlite3.Connection, *, brand: str, companion_mapping_id: int) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT inv.*, meta.tags_json, meta.description, meta.review_status, meta.metadata_version
+          FROM human_companion_photo_inventory inv
+          LEFT JOIN human_companion_photo_metadata meta
+            ON meta.brand=inv.brand
+           AND meta.companion_mapping_id=inv.companion_mapping_id
+           AND meta.file_name=inv.file_name
+         WHERE inv.brand=?
+           AND inv.companion_mapping_id=?
+           AND inv.status='available'
+         ORDER BY inv.original_sequence ASC, inv.file_name ASC
+        """,
+        (brand, int(companion_mapping_id)),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _human_photo_choose_row(available: List[Dict[str, Any]], terms: List[str]) -> Tuple[Optional[Dict[str, Any]], str]:
+    if not available:
+        return None, "exhausted"
+    if terms:
+        scored: List[Tuple[int, int, str, Dict[str, Any]]] = []
+        for row in available:
+            status = str(row.get("review_status") or "").strip().lower()
+            # Metadata files authored for deployment default to reviewed. Blank metadata can still match if tags exist.
+            score = _human_photo_score_metadata_match(row, terms)
+            if score <= 0:
+                continue
+            if status and status not in {"reviewed", "approved", "active"}:
+                continue
+            try:
+                seq = int(row.get("original_sequence") or 0)
+            except Exception:
+                seq = 0
+            scored.append((score, seq, str(row.get("file_name") or ""), row))
+        if not scored:
+            return None, "no_match"
+        scored.sort(key=lambda item: (-item[0], item[1], item[2].lower()))
+        return scored[0][3], "delivered"
+    return available[0], "delivered"
+
+
+def _human_photo_build_url(token: str, base_url: str = "") -> str:
+    t = quote(str(token or "").strip(), safe="")
+    if not t:
+        return ""
+    base = str(base_url or "").strip()
+    if not base:
+        base = "/"
+    if not base.endswith("/"):
+        base += "/"
+    return base + f"human-photo/{t}"
+
+
+def _human_photo_content_payload(
+    *,
+    token: str,
+    file_name: str,
+    content_url: str,
+    companion_mapping_id: int,
+    sequence: int,
+    remaining: int,
+    size: int,
+) -> Dict[str, Any]:
+    mime = mimetypes.guess_type(file_name)[0] or "image/jpeg"
+    return {
+        "sequence": int(sequence or 0),
+        "filename": file_name,
+        "fileName": file_name,
+        "type": "image",
+        "kind": "image",
+        "stage": _HUMAN_PHOTO_DELIVERY_KIND,
+        "title": "Requested photo",
+        "message": "Here's one.",
+        "url": content_url,
+        "triggerMinute": 0,
+        "trigger_minute": 0,
+        "folder": "human_requested",
+        "deliveryKind": _HUMAN_PHOTO_DELIVERY_KIND,
+        "delivery_kind": _HUMAN_PHOTO_DELIVERY_KIND,
+        "requestedHumanPhoto": True,
+        "requested_human_photo": True,
+        "companionMappingId": int(companion_mapping_id or 0),
+        "companion_mapping_id": int(companion_mapping_id or 0),
+        "remaining": int(remaining or 0),
+        "remaining_after_delivery": int(remaining or 0),
+        "token": token,
+        "attachment": {
+            "url": content_url,
+            "name": file_name,
+            "contentType": mime,
+            "content_type": mime,
+            "size": int(size or 0),
+            "container": "elaralo_human_companion_photo",
+            "blobName": f"companion-id-{int(companion_mapping_id or 0)}/{file_name}",
+            "blob_name": f"companion-id-{int(companion_mapping_id or 0)}/{file_name}",
+        },
+    }
+
+
+def _human_photo_email_send_sync(to_email: str, subject: str, text_body: str, html_body: str, *, brand: Any = "Elaralo") -> Dict[str, Any]:
+    email = _human_photo_safe_email(to_email)
+    if not email:
+        return {"ok": False, "skipped": True, "error": "missing recipient email"}
+    if not _HUMAN_PHOTO_ALERT_EMAIL_ENABLED:
+        return {"ok": False, "skipped": True, "error": "HUMAN_PHOTO_ALERT_EMAIL_ENABLED is not enabled"}
+    provider = (PAYGO_EMAIL_PROVIDER or "sendgrid").strip().lower()
+    try:
+        if provider == "sendgrid":
+            return _paygo_email_send_sendgrid_sync(email, subject, text_body, html_body, brand=brand)
+        if provider == "smtp":
+            return _paygo_email_send_smtp_sync(email, subject, text_body, html_body, brand=brand)
+        return {"ok": False, "skipped": True, "error": f"unsupported PAYGO_EMAIL_PROVIDER: {provider}"}
+    except Exception as exc:
+        return {"ok": False, "provider": provider, "error": str(exc)}
+
+
+def _human_photo_alert_body(*, brand: str, companion_mapping_id: int, host_member_id: str, remaining: int, photo_dir: str) -> Tuple[str, str, str]:
+    subject = f"{brand} Human Companion photo inventory low: {remaining} remaining"
+    text = (
+        f"Human Companion photo inventory is low.\n\n"
+        f"Brand: {brand}\n"
+        f"Companion mapping id: {companion_mapping_id}\n"
+        f"Host member id: {host_member_id or 'unavailable'}\n"
+        f"Remaining available photo requests: {remaining}\n"
+        f"Photo directory: {photo_dir}\n\n"
+        f"Please upload additional reviewed photos when available."
+    )
+    html = (
+        "<div style='font-family:Arial,sans-serif;color:#111827'>"
+        f"<h2>{_paygo_email_html_escape(brand)} Human Companion photo inventory low</h2>"
+        "<table style='border-collapse:collapse'>"
+        f"<tr><td style='padding:6px 12px 6px 0;color:#6b7280'>Companion mapping id</td><td>{int(companion_mapping_id)}</td></tr>"
+        f"<tr><td style='padding:6px 12px 6px 0;color:#6b7280'>Remaining requests</td><td><strong>{int(remaining)}</strong></td></tr>"
+        f"<tr><td style='padding:6px 12px 6px 0;color:#6b7280'>Host member id</td><td>{_paygo_email_html_escape(host_member_id or 'unavailable')}</td></tr>"
+        f"<tr><td style='padding:6px 12px 6px 0;color:#6b7280'>Photo directory</td><td>{_paygo_email_html_escape(photo_dir)}</td></tr>"
+        "</table>"
+        "<p>Please upload additional reviewed photos when available.</p>"
+        "</div>"
+    )
+    return subject, text, html
+
+
+def _human_photo_maybe_send_inventory_alert_sync(
+    *,
+    brand: str,
+    companion_mapping_id: int,
+    host_member_id: str,
+    host_email: str,
+    remaining: int,
+    inventory_generation: str,
+    photo_dir: str,
+) -> None:
+    if int(remaining) not in _HUMAN_PHOTO_ALERT_THRESHOLDS:
+        return
+    conn = _econnect_conn()
+    alert_id = uuid.uuid4().hex
+    now = time.time()
+    recipients: List[str] = []
+    for email in (host_email, _HUMAN_PHOTO_ALERT_RECIPIENT_DEFAULT):
+        em = _human_photo_safe_email(email)
+        if em and em not in recipients:
+            recipients.append(em)
+    send_status = "pending"
+    send_error = ""
+    try:
+        _human_photo_db_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                INSERT INTO human_companion_photo_alerts
+                (alert_id, brand, companion_mapping_id, threshold, inventory_generation, remaining_count, host_email, sent_to_json, send_status, send_error, sent_at_epoch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (alert_id, brand, int(companion_mapping_id), int(remaining), str(inventory_generation or ""), int(remaining), _human_photo_safe_email(host_email), json.dumps(recipients), send_status, send_error, now),
+            )
+            inserted = True
+        except sqlite3.IntegrityError:
+            inserted = False
+        conn.commit()
+        if not inserted:
+            return
+
+        if not recipients:
+            send_status = "skipped"
+            send_error = "no valid recipients"
+        else:
+            subject, text_body, html_body = _human_photo_alert_body(
+                brand=brand,
+                companion_mapping_id=int(companion_mapping_id),
+                host_member_id=host_member_id,
+                remaining=int(remaining),
+                photo_dir=photo_dir,
+            )
+            results = []
+            for recipient in recipients:
+                results.append(_human_photo_email_send_sync(recipient, subject, text_body, html_body, brand=brand))
+            ok_count = sum(1 for r in results if isinstance(r, dict) and r.get("ok"))
+            if ok_count == len(recipients):
+                send_status = "sent"
+                send_error = ""
+            elif ok_count > 0:
+                send_status = "partial"
+                send_error = json.dumps(results, default=str)[:1000]
+            else:
+                send_status = "failed"
+                send_error = json.dumps(results, default=str)[:1000]
+
+        conn.execute(
+            "UPDATE human_companion_photo_alerts SET send_status=?, send_error=?, sent_to_json=? WHERE alert_id=?",
+            (send_status, send_error, json.dumps(recipients), alert_id),
+        )
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[human-photo] WARNING: inventory alert failed: {exc!r}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _human_photo_requested_photo_turn_sync(
+    *,
+    session_id: str,
+    session_state: Dict[str, Any],
+    request_text: str,
+    viewer_key: str,
+    member_id: str,
+    plan_name_raw: str,
+    plan_external: str,
+    plan_map: str,
+    plan_name_for_limits: str,
+    is_trial: bool,
+    base_url: str,
+) -> Optional[Dict[str, Any]]:
+    if not _HUMAN_PHOTO_FEATURE_ENABLED:
+        return None
+    is_request, terms = _human_photo_detect_request(request_text)
+    if not is_request:
+        return None
+
+    conn = _econnect_conn()
+    try:
+        _human_photo_db_ensure_schema(conn)
+        mapping = _human_photo_mapping_row_from_session_state(conn, session_state)
+        if not mapping:
+            return None
+        brand = _stripe_paygo_brand(mapping.get("brand") or _brand_from_session_state(session_state) or "Elaralo")
+        if _stripe_paygo_brand_key(brand) != "elaralo":
+            return None
+        companion_mapping_id = int(mapping.get("mapping_id") or 0)
+        host_member_id = _host_onboarding_safe_str(mapping.get("host_member_id") or "")
+        host_email = _human_photo_safe_email(mapping.get("host_email") or "")
+        viewer = str(viewer_key or "").strip() or str(member_id or "").strip() or f"session::{session_id}"
+        now = time.time()
+        # Paid-photo treatment is intentionally limited to real logged-in members
+        # with an active Discover, Explore, or Encounter plan.  Visitors and
+        # PayGo-only users remain on the two-photo rolling trial/visitor rule.
+        paid = bool(str(member_id or "").strip()) and _human_photo_is_paid_subscriber(
+            is_trial=bool(is_trial),
+            plan_name_raw=plan_name_raw,
+            plan_external=plan_external,
+            plan_map=plan_map,
+            plan_name_for_limits=plan_name_for_limits,
+            session_state=session_state,
+        )
+        plan_class = "paid" if paid else ("trial" if is_trial else "visitor")
+        request_kind = "specific" if terms else "generic"
+
+        conn.execute("BEGIN IMMEDIATE")
+        sync_info = _human_photo_sync_inventory_on_conn(
+            conn,
+            brand=brand,
+            companion_mapping_id=companion_mapping_id,
+            host_member_id=host_member_id,
+            host_email=host_email,
+        )
+
+        if not paid:
+            delivered_count = _human_photo_delivered_count_in_window(
+                conn,
+                brand=brand,
+                companion_mapping_id=companion_mapping_id,
+                viewer_key=viewer,
+                now_epoch=now,
+            )
+            if delivered_count >= max(0, int(_HUMAN_PHOTO_TRIAL_LIMIT or 2)):
+                _human_photo_insert_request_on_conn(
+                    conn,
+                    brand=brand,
+                    companion_mapping_id=companion_mapping_id,
+                    host_member_id=host_member_id,
+                    viewer_key=viewer,
+                    member_id=member_id,
+                    session_id=session_id,
+                    plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
+                    plan_class=plan_class,
+                    request_text=request_text,
+                    request_kind=request_kind,
+                    requested_tags=terms,
+                    outcome="capped",
+                    remaining_after_delivery=int(sync_info.get("remaining") or 0),
+                    now_epoch=now,
+                )
+                conn.commit()
+                return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": "capped"}
+
+        available = _human_photo_available_rows(conn, brand=brand, companion_mapping_id=companion_mapping_id)
+        chosen, outcome = _human_photo_choose_row(available, terms)
+        if not chosen:
+            remaining = len(available)
+            _human_photo_insert_request_on_conn(
+                conn,
+                brand=brand,
+                companion_mapping_id=companion_mapping_id,
+                host_member_id=host_member_id,
+                viewer_key=viewer,
+                member_id=member_id,
+                session_id=session_id,
+                plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
+                plan_class=plan_class,
+                request_text=request_text,
+                request_kind=request_kind,
+                requested_tags=terms,
+                outcome=outcome,
+                remaining_after_delivery=remaining,
+                now_epoch=now,
+            )
+            conn.commit()
+            return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": outcome}
+
+        file_name = str(chosen.get("file_name") or "").strip()
+        sequence = int(chosen.get("original_sequence") or 0)
+        size = int(chosen.get("file_size") or 0)
+        token = uuid.uuid4().hex + uuid.uuid4().hex[:8]
+        update_cur = conn.execute(
+            """
+            UPDATE human_companion_photo_inventory
+               SET status='consumed',
+                   consumed_at_epoch=?,
+                   consumed_by_viewer_key=?,
+                   delivery_token=?,
+                   updated_epoch=?
+             WHERE photo_id=? AND status='available'
+            """,
+            (now, viewer, token, now, int(chosen.get("photo_id") or 0)),
+        )
+        if int(update_cur.rowcount or 0) < 1:
+            conn.rollback()
+            return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": "race_lost"}
+        remaining = int(conn.execute(
+            "SELECT COUNT(1) FROM human_companion_photo_inventory WHERE brand=? AND companion_mapping_id=? AND status='available'",
+            (brand, companion_mapping_id),
+        ).fetchone()[0] or 0)
+        content_url = _human_photo_build_url(token, base_url)
+        content = _human_photo_content_payload(
+            token=token,
+            file_name=file_name,
+            content_url=content_url,
+            companion_mapping_id=companion_mapping_id,
+            sequence=sequence,
+            remaining=remaining,
+            size=size,
+        )
+        _human_photo_insert_request_on_conn(
+            conn,
+            brand=brand,
+            companion_mapping_id=companion_mapping_id,
+            host_member_id=host_member_id,
+            viewer_key=viewer,
+            member_id=member_id,
+            session_id=session_id,
+            plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
+            plan_class=plan_class,
+            request_text=request_text,
+            request_kind=request_kind,
+            requested_tags=terms,
+            outcome="delivered",
+            delivered_file_name=file_name,
+            delivery_token=token,
+            remaining_after_delivery=remaining,
+            now_epoch=now,
+        )
+        conn.commit()
+
+        try:
+            _human_photo_maybe_send_inventory_alert_sync(
+                brand=brand,
+                companion_mapping_id=companion_mapping_id,
+                host_member_id=host_member_id,
+                host_email=host_email,
+                remaining=remaining,
+                inventory_generation=str(sync_info.get("generation") or ""),
+                photo_dir=str(sync_info.get("photo_dir") or _human_photo_companion_dir(companion_mapping_id)),
+            )
+        except Exception:
+            pass
+
+        return {"reply": "Here's one.", "content": content, "outcome": "delivered", "remaining": remaining, "file_name": file_name}
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[human-photo] WARNING: requested photo flow failed: {exc!r}")
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _human_photo_file_path_for_token_sync(token: Any) -> Tuple[str, str]:
+    tok = str(token or "").strip()
+    if not re.match(r"^[A-Za-z0-9_-]{24,128}$", tok):
+        return "", ""
+    conn = _econnect_conn()
+    try:
+        _human_photo_db_ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT source_dir, file_name, status
+              FROM human_companion_photo_inventory
+             WHERE delivery_token=?
+             LIMIT 1
+            """,
+            (tok,),
+        ).fetchone()
+        if row is None:
+            return "", ""
+        status = str(row["status"] or "").strip().lower()
+        if status != "consumed":
+            return "", ""
+        source_dir = os.path.abspath(str(row["source_dir"] or "").strip())
+        file_name = os.path.basename(str(row["file_name"] or "").strip())
+        ok, _seq = _human_photo_is_valid_file_name(file_name)
+        if not ok or not source_dir:
+            return "", ""
+        root = os.path.abspath(_human_photo_root_dir())
+        candidate = os.path.abspath(os.path.join(source_dir, file_name))
+        try:
+            if os.path.commonpath([root, candidate]) != root:
+                return "", ""
+        except Exception:
+            return "", ""
+        if not os.path.isfile(candidate):
+            return "", ""
+        return candidate, file_name
+    except Exception:
+        return "", ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+
 def _usage_db_connect() -> sqlite3.Connection:
     path = _usage_db_path()
     conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
@@ -25715,6 +26986,11 @@ class HostOnboardingStartRequest(BaseModel):
     logged_in: Optional[bool] = None
     hostDisplayName: Optional[str] = None
     host_display_name: Optional[str] = None
+    hostEmail: Optional[str] = None
+    host_email: Optional[str] = None
+    email: Optional[str] = None
+    loginEmail: Optional[str] = None
+    login_email: Optional[str] = None
 
 
 class HostOnboardingBasicsRequest(BaseModel):
@@ -25785,6 +27061,7 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
     brand = _host_onboarding_safe_str(req.brand)
     avatar = _host_onboarding_safe_str(req.avatar)
     host_display_name = _host_onboarding_safe_str(req.hostDisplayName or req.host_display_name)
+    host_email = _stripe_paygo_email_norm(req.hostEmail or req.host_email or req.email or req.loginEmail or req.login_email or "")
     if not _host_profile_studio_enabled_for_brand(brand or "Elaralo"):
         raise HTTPException(status_code=403, detail="Host Profile Studio is disabled for this brand")
     if not member_id or not logged_in:
@@ -25796,6 +27073,11 @@ async def host_onboarding_session_start(req: HostOnboardingStartRequest):
         brand = brand or _host_onboarding_safe_str((resolved_ctx or {}).get("brand"))
         avatar = avatar or _host_onboarding_safe_str((resolved_ctx or {}).get("avatar"))
         conn.execute("BEGIN IMMEDIATE")
+        if host_email:
+            try:
+                _human_photo_persist_host_email_on_conn(conn, brand=brand, avatar=avatar, member_id=member_id, host_email=host_email)
+            except Exception:
+                pass
         existing = _host_onboarding_find_active_session(conn, member_id, brand, avatar)
         if existing is None:
             # If the exact brand/avatar lookup misses because avatar naming changed,

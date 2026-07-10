@@ -692,7 +692,7 @@ function queryContext(): Partial<HostOnboardingContext> {
     brand: String(qs.get("brand") || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME,
     avatar: String(qs.get("avatar") || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME,
     hostDisplayName: String(qs.get("displayName") || qs.get("display_name") || qs.get("user_name") || "").trim(),
-    email: String(qs.get("email") || "").trim(),
+    email: String(qs.get("email") || qs.get("loginEmail") || qs.get("login_email") || "").trim(),
     source: "query",
   };
 }
@@ -735,7 +735,7 @@ export default function HostProfileStudioClient() {
         brand: String((data as any).brand || DEFAULT_COMPANY_NAME).trim() || DEFAULT_COMPANY_NAME,
         avatar: String((data as any).avatar || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME,
         hostDisplayName: String((data as any).hostDisplayName || (data as any).displayName || (data as any).display_name || (data as any).user_name || "").trim(),
-        email: String((data as any).email || "").trim(),
+        email: String((data as any).email || (data as any).loginEmail || (data as any).login_email || "").trim(),
         source: "postMessage",
       };
       if (!next.memberId) return;
@@ -980,6 +980,9 @@ export default function HostProfileStudioClient() {
           avatar: context.avatar,
           loggedIn: true,
           hostDisplayName: context.hostDisplayName,
+          hostEmail: context.email,
+          email: context.email,
+          loginEmail: context.email,
         }),
       });
       const data = await res.json().catch(() => ({} as any));

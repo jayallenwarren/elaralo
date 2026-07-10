@@ -57,6 +57,46 @@ function queryParam(name: string): string {
   }
 }
 
+function firstQueryParam(names: string[]): string {
+  for (const name of names) {
+    const value = queryParam(name);
+    if (value) return value;
+  }
+  return "";
+}
+
+function booleanFromLooseString(value: any): boolean | null {
+  const v = safeText(value).toLowerCase();
+  if (!v) return null;
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off"].includes(v)) return false;
+  return null;
+}
+
+function buildSummaryCompanionListReturnUrl(brand: string, memberId?: string, displayName?: string): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const url = new URL("/my-elaralo", window.location.origin);
+    url.searchParams.set("brand", safeText(brand) || "Elaralo");
+    url.searchParams.set("forceSelector", "1");
+    url.searchParams.set("showCompanionList", "1");
+    url.searchParams.set("returningFromConnect", "1");
+    const mid = safeText(memberId);
+    if (mid) {
+      url.searchParams.set("memberId", mid);
+      url.searchParams.set("member_id", mid);
+    }
+    const name = safeText(displayName);
+    if (name) {
+      url.searchParams.set("displayName", name);
+      url.searchParams.set("userName", name);
+    }
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
 function listFromLooseValue(value: any): string[] {
   if (Array.isArray(value)) return value.map((x) => safeText(x)).filter(Boolean);
   const text = safeText(value);
@@ -282,6 +322,11 @@ export default function HostSummaryPublicClient() {
   const brand = queryParam("brand") || queryParam("brandId") || "Elaralo";
   const avatar = queryParam("avatar") || queryParam("companion") || queryParam("companionKey") || queryParam("companion_key");
   const headshot = queryParam("headshot") || queryParam("headshotFile") || queryParam("headshot_file");
+  const summaryReturnToCompanions = firstQueryParam(["returnToCompanions", "return_to_companions", "showCompanionListButton", "show_companion_list_button"]);
+  const summaryCompanionCount = firstQueryParam(["selectableCompanionCount", "selectable_companion_count", "companionCount", "companion_count"]);
+  const summaryCompanionListUrl = firstQueryParam(["companionListUrl", "companion_list_url", "returnUrl", "return_url"]);
+  const summaryLoggedIn = firstQueryParam(["loggedIn", "logged_in"]);
+  const summaryDisplayName = firstQueryParam(["displayName", "display_name", "userName", "user_name"]);
 
   useEffect(() => {
     let cancelled = false;
@@ -459,8 +504,42 @@ export default function HostSummaryPublicClient() {
       url.searchParams.set("photoUrl", headshotUrl);
       url.searchParams.set("photo_url", headshotUrl);
     }
+
+    const parsedCompanionCount = Math.max(0, Number.parseInt(summaryCompanionCount || "0", 10) || 0);
+    const shouldEnableSwap =
+      booleanFromLooseString(summaryReturnToCompanions) === true ||
+      parsedCompanionCount > 1 ||
+      Boolean(summaryCompanionListUrl) ||
+      normalizeRebrandingSlug(resolvedBrand) === "elaralo";
+    if (shouldEnableSwap) {
+      const count = Math.max(parsedCompanionCount, 2);
+      const returnUrl = summaryCompanionListUrl || buildSummaryCompanionListReturnUrl(resolvedBrand, memberId, summaryDisplayName || displayName);
+      url.searchParams.set("returnToCompanions", "1");
+      url.searchParams.set("return_to_companions", "1");
+      url.searchParams.set("companionCount", String(count));
+      url.searchParams.set("companion_count", String(count));
+      url.searchParams.set("selectableCompanionCount", String(count));
+      url.searchParams.set("selectable_companion_count", String(count));
+      if (returnUrl) {
+        url.searchParams.set("companionListUrl", returnUrl);
+        url.searchParams.set("companion_list_url", returnUrl);
+      }
+      if (summaryLoggedIn) {
+        url.searchParams.set("loggedIn", summaryLoggedIn);
+        url.searchParams.set("logged_in", summaryLoggedIn);
+      }
+      if (memberId) {
+        url.searchParams.set("memberId", memberId);
+        url.searchParams.set("member_id", memberId);
+      }
+      const viewerName = summaryDisplayName || displayName;
+      if (viewerName) {
+        url.searchParams.set("displayName", viewerName);
+        url.searchParams.set("userName", viewerName);
+      }
+    }
     return url.toString();
-  }, [brand, companionDisplayName, companionFirstName, companionKey, companionTypeValue, configuredConnectUrl, headshotUrl, mappingAvatar]);
+  }, [brand, companionDisplayName, companionFirstName, companionKey, companionTypeValue, configuredConnectUrl, headshotUrl, mappingAvatar, memberId, summaryCompanionCount, summaryCompanionListUrl, summaryDisplayName, summaryLoggedIn, summaryReturnToCompanions]);
 
   const connectLabel = `Connect with ${companionFirstName}`;
 
