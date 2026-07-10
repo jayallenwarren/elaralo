@@ -10977,6 +10977,12 @@ async def chat(request: Request):
         if not isinstance(requested_human_photo, dict):
             return None
 
+        state_updates = requested_human_photo.get("state_updates")
+        if isinstance(state_updates, dict):
+            for key, value in state_updates.items():
+                if isinstance(key, str) and key:
+                    state_for_delivery[key] = value
+
         reply = str(requested_human_photo.get("reply") or "").strip() or HUMAN_PHOTO_CANNED_RESPONSE
         raw_content = requested_human_photo.get("content")
         content_payload = raw_content if isinstance(raw_content, dict) else None
@@ -20901,6 +20907,11 @@ _HUMAN_PHOTO_STOPWORDS = {
     "yourself", "myself", "herself", "himself", "itself", "ourselves", "themselves",
 }
 _HUMAN_PHOTO_DELIVERY_KIND = "requested_human_photo"
+_HUMAN_PHOTO_CONFIRMATION_REPLY = (os.getenv("ELARALO_HUMAN_PHOTO_CONFIRMATION_REPLY", "Are you requesting a photo?") or "Are you requesting a photo?").strip()
+_HUMAN_PHOTO_PENDING_STATE_KEY = "pending_human_photo_confirmation"
+_HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL = "pendingHumanPhotoConfirmation"
+_HUMAN_PHOTO_LEARN_PHRASES_ENABLED = str(os.getenv("ELARALO_HUMAN_PHOTO_LEARN_CONFIRMED_PHRASES", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+_HUMAN_PHOTO_MEDIA_WORD_RE_SRC = r"(?:photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)"
 
 
 def _human_photo_root_dir() -> str:
@@ -21114,6 +21125,46 @@ def _human_photo_db_ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_human_photo_alerts_companion ON human_companion_photo_alerts(brand, companion_mapping_id, threshold, sent_at_epoch)"
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_companion_photo_request_phrases (
+              phrase_id TEXT PRIMARY KEY,
+              brand TEXT NOT NULL,
+              companion_mapping_id INTEGER NOT NULL DEFAULT 0,
+              normalized_phrase TEXT NOT NULL,
+              phrase_text TEXT NOT NULL,
+              requested_tags_json TEXT NOT NULL DEFAULT '[]',
+              status TEXT NOT NULL DEFAULT 'active',
+              confirmations INTEGER NOT NULL DEFAULT 1,
+              viewer_key TEXT,
+              member_id TEXT,
+              session_id TEXT,
+              created_epoch REAL NOT NULL,
+              last_confirmed_epoch REAL NOT NULL,
+              updated_epoch REAL NOT NULL,
+              UNIQUE(brand, companion_mapping_id, normalized_phrase)
+            )
+            """
+        )
+        for name, coldef in [
+            ("companion_mapping_id", "companion_mapping_id INTEGER NOT NULL DEFAULT 0"),
+            ("normalized_phrase", "normalized_phrase TEXT NOT NULL DEFAULT ''"),
+            ("phrase_text", "phrase_text TEXT NOT NULL DEFAULT ''"),
+            ("requested_tags_json", "requested_tags_json TEXT NOT NULL DEFAULT '[]'"),
+            ("status", "status TEXT NOT NULL DEFAULT 'active'"),
+            ("confirmations", "confirmations INTEGER NOT NULL DEFAULT 1"),
+            ("viewer_key", "viewer_key TEXT"),
+            ("member_id", "member_id TEXT"),
+            ("session_id", "session_id TEXT"),
+            ("created_epoch", "created_epoch REAL NOT NULL DEFAULT 0"),
+            ("last_confirmed_epoch", "last_confirmed_epoch REAL NOT NULL DEFAULT 0"),
+            ("updated_epoch", "updated_epoch REAL NOT NULL DEFAULT 0"),
+        ]:
+            _human_photo_ensure_column(conn, "human_companion_photo_request_phrases", name, coldef)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_human_photo_request_phrases_lookup ON human_companion_photo_request_phrases(brand, companion_mapping_id, normalized_phrase, status)"
+        )
         _HUMAN_PHOTO_DB_READY = True
 
 
@@ -21139,6 +21190,111 @@ def _human_photo_safe_json_list(value: Any) -> List[str]:
         seen.add(s)
         out.append(s)
     return out
+
+
+def _human_photo_normalize_phrase(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    raw = re.sub(r"https?://\S+", " ", raw)
+    raw = re.sub(r"[^a-z0-9'\s-]+", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw[:500]
+
+
+def _human_photo_has_media_word(text: Any) -> bool:
+    low = str(text or "").strip().lower()
+    if not low:
+        return False
+    return bool(re.search(r"\b" + _HUMAN_PHOTO_MEDIA_WORD_RE_SRC + r"\b", low))
+
+
+def _human_photo_clear_pending_updates() -> Dict[str, Any]:
+    return {
+        _HUMAN_PHOTO_PENDING_STATE_KEY: None,
+        _HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL: None,
+    }
+
+
+def _human_photo_pending_payload(text: Any, terms: Optional[List[str]] = None) -> Dict[str, Any]:
+    phrase = str(text or "").strip()[:500]
+    return {
+        "phrase": phrase,
+        "normalized_phrase": _human_photo_normalize_phrase(phrase),
+        "terms": list(terms or _human_photo_request_terms(phrase) or []),
+        "asked_at_epoch": time.time(),
+    }
+
+
+def _human_photo_pending_from_state(session_state: Dict[str, Any]) -> Dict[str, Any]:
+    ss = session_state if isinstance(session_state, dict) else {}
+    raw = ss.get(_HUMAN_PHOTO_PENDING_STATE_KEY)
+    if not isinstance(raw, dict):
+        raw = ss.get(_HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL)
+    if not isinstance(raw, dict):
+        return {}
+    phrase = str(raw.get("phrase") or raw.get("question") or "").strip()
+    normalized = _human_photo_normalize_phrase(raw.get("normalized_phrase") or phrase)
+    if not phrase and not normalized:
+        return {}
+    terms = raw.get("terms")
+    return {
+        "phrase": phrase or normalized,
+        "normalized_phrase": normalized,
+        "terms": _human_photo_safe_json_list(terms),
+        "asked_at_epoch": raw.get("asked_at_epoch"),
+    }
+
+
+def _human_photo_yes_no_intent(text: Any) -> str:
+    low = _human_photo_normalize_phrase(text)
+    if not low:
+        return ""
+    yes_values = {
+        "yes", "yes please", "yes i am", "yes i do", "yes i would", "yes send it", "yes send one",
+        "yeah", "yeah please", "yep", "yep please", "sure", "sure please", "ok", "okay", "okay yes",
+        "please", "please do", "send it", "send one", "show me", "show one", "that's right", "that is right",
+    }
+    no_values = {
+        "no", "no thanks", "no thank you", "nope", "nah", "not now", "not right now", "cancel", "never mind", "nevermind",
+        "i am not", "i do not", "i don't", "not a photo", "not requesting a photo",
+    }
+    if low in yes_values:
+        return "yes"
+    if low in no_values:
+        return "no"
+    if re.match(r"^(?:yes|yeah|yep|sure|ok|okay)\b", low):
+        return "yes"
+    if re.match(r"^(?:no|nope|nah|cancel|never\s+mind|nevermind)\b", low):
+        return "no"
+    return ""
+
+
+def _human_photo_is_meta_reference(text: Any) -> bool:
+    low = re.sub(r"\s+", " ", str(text or "").lower()).strip()
+    if not low or not _human_photo_has_media_word(low):
+        return False
+    media_word = _HUMAN_PHOTO_MEDIA_WORD_RE_SRC
+    patterns = [
+        r"\b(?:test|testing|tested|check|checking|confirm|verify|make\s+sure|making\s+sure|wanted\s+to\s+test|wanted\s+to\s+check)\b.{0,140}\b(?:able|ability|could|can|would|were|was)?\b.{0,80}\b(?:send|sent|sending|show|showed|showing|share|shared|sharing|deliver|delivered|delivering)\b.{0,80}\b" + media_word + r"\b",
+        r"\b(?:able|ability)\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
+        r"\b(?:you\s+were|you\s+are|you're)\s+able\s+to\s+(?:send|show|share|deliver)\b.{0,80}\b" + media_word + r"\b",
+        r"\b(?:not|wasn't|was\s+not|isn't|is\s+not)\s+(?:the\s+)?(?:question|request)\b.{0,120}\b" + media_word + r"\b",
+    ]
+    return any(re.search(pattern, low) for pattern in patterns)
+
+
+def _human_photo_is_ambiguous_photo_mention(text: Any) -> bool:
+    raw = str(text or "").strip()
+    if not raw or not _human_photo_has_media_word(raw):
+        return False
+    if _human_photo_is_meta_reference(raw):
+        return False
+    is_request, _terms = _human_photo_detect_request(raw)
+    if is_request:
+        return False
+    # A bare media mention, shorthand such as "photo of you", or a sentence that
+    # contains a media word but lacks a clear current-turn delivery verb is a good
+    # candidate for confirmation instead of the no-photo canned response.
+    return True
 
 
 def _human_photo_normalize_plan_token(value: Any) -> str:
@@ -21206,20 +21362,66 @@ def _human_photo_request_terms(text: Any) -> List[str]:
     return terms[:12]
 
 def _human_photo_detect_request(text: Any) -> Tuple[bool, List[str]]:
+    """Return True only for an explicit, current-turn photo-delivery request."""
     raw = str(text or "").strip()
     if not raw:
         return False, []
-    low = raw.lower()
-    has_media_word = bool(re.search(r"\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low))
-    if not has_media_word:
+
+    low = re.sub(r"\s+", " ", raw.lower()).strip()
+    media_word = _HUMAN_PHOTO_MEDIA_WORD_RE_SRC
+    if not re.search(r"\b" + media_word + r"\b", low):
         return False, []
-    delivery_intent = bool(
-        re.search(r"\b(send|show|share|give|text|post|upload|attach|display)\b.{0,80}\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low)
-        or re.search(r"\b(can|could|may|will|would)\s+(i|you)\b.{0,80}\b(see|get|have|send|show|share)\b.{0,80}\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low)
-        or re.search(r"\b(do|does|did)\s+you\b.{0,80}\b(have|send|share|show)\b.{0,80}\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low)
-        or re.search(r"\blet\s+me\s+see\b.{0,80}\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b", low)
-        or re.search(r"\b(photo|photos|picture|pictures|pic|pics|selfie|selfies|snapshot|snapshots|image|images)\b.{0,40}\b(of|with|wearing|in|on|at|from)\b", low)
+
+    if _human_photo_is_meta_reference(low):
+        return False, []
+
+    def _words(value: str) -> List[str]:
+        return [w for w in re.findall(r"[a-z0-9']+", value or "") if w]
+
+    words = _words(low)
+    media_only_words = {
+        "a", "an", "the", "my", "your", "you", "me", "of", "with", "for", "please",
+        "photo", "photos", "picture", "pictures", "pic", "pics", "image", "images",
+        "snapshot", "snapshots", "selfie", "selfies",
+    }
+
+    # "photo" / "a photo" / "photo of you" is ambiguous. Ask for confirmation
+    # instead of consuming inventory or returning the no-photo canned response.
+    if words and all(w in media_only_words for w in words):
+        return False, []
+
+    command_prefix = r"^(?:yes[,.! ]+|ok(?:ay)?[,.! ]+|sure[,.! ]+|please[,.! ]+|hey[,.! ]+|hi[,.! ]+|hello[,.! ]+)*"
+    direct_command = re.search(
+        command_prefix + r"(?:please\s+)?(?:send|show|share|give|text|post|upload|attach|display)\b.{0,100}\b" + media_word + r"\b",
+        low,
     )
+
+    polite_request = re.search(
+        r"\b(?:can|could|will|would)\s+you\b.{0,40}\b(?:send|sending|show|showing|share|sharing|give|text|post|upload|attach|display)\b.{0,100}\b" + media_word + r"\b",
+        low,
+    ) or re.search(
+        r"\bwould\s+you\s+mind\b.{0,40}\b(?:send|sending|show|showing|share|sharing|giving)\b.{0,100}\b" + media_word + r"\b",
+        low,
+    ) or re.search(
+        r"\b(?:can|could|may)\s+i\b.{0,40}\b(?:see|get|have|receive)\b.{0,100}\b" + media_word + r"\b",
+        low,
+    ) or re.search(
+        r"\b(?:do|does)\s+you\b.{0,40}\bhave\b.{0,100}\b" + media_word + r"\b",
+        low,
+    )
+
+    desire_request = re.search(
+        r"\b(?:i\s+want|i\s+would\s+like|i'd\s+like|i\s+need)\b.{0,100}\b" + media_word + r"\b",
+        low,
+    )
+
+    concise_specific = False
+    if len(words) <= 8:
+        terms = _human_photo_request_terms(low)
+        if terms:
+            concise_specific = True
+
+    delivery_intent = bool(direct_command or polite_request or desire_request or concise_specific)
     if not delivery_intent:
         return False, []
     return True, _human_photo_request_terms(low)
@@ -21563,6 +21765,86 @@ def _human_photo_insert_request_on_conn(
     )
 
 
+def _human_photo_learned_phrase_terms_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    brand: str,
+    companion_mapping_id: int,
+    phrase_text: Any,
+) -> Optional[List[str]]:
+    normalized = _human_photo_normalize_phrase(phrase_text)
+    if not normalized:
+        return None
+    rows = conn.execute(
+        """
+        SELECT requested_tags_json
+          FROM human_companion_photo_request_phrases
+         WHERE brand=?
+           AND companion_mapping_id IN (?, 0)
+           AND normalized_phrase=?
+           AND status='active'
+         ORDER BY companion_mapping_id DESC, confirmations DESC, updated_epoch DESC
+         LIMIT 1
+        """,
+        (brand, int(companion_mapping_id), normalized),
+    ).fetchall()
+    if not rows:
+        return None
+    return _human_photo_safe_json_list(rows[0]["requested_tags_json"] if isinstance(rows[0], sqlite3.Row) else rows[0][0])
+
+
+def _human_photo_record_learned_phrase_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    brand: str,
+    companion_mapping_id: int,
+    phrase_text: Any,
+    requested_tags: List[str],
+    viewer_key: str,
+    member_id: str,
+    session_id: str,
+    now_epoch: Optional[float] = None,
+) -> None:
+    if not _HUMAN_PHOTO_LEARN_PHRASES_ENABLED:
+        return
+    normalized = _human_photo_normalize_phrase(phrase_text)
+    if not normalized or not _human_photo_has_media_word(normalized):
+        return
+    now = float(now_epoch or time.time())
+    conn.execute(
+        """
+        INSERT INTO human_companion_photo_request_phrases
+        (phrase_id, brand, companion_mapping_id, normalized_phrase, phrase_text, requested_tags_json, status,
+         confirmations, viewer_key, member_id, session_id, created_epoch, last_confirmed_epoch, updated_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(brand, companion_mapping_id, normalized_phrase) DO UPDATE SET
+          phrase_text=excluded.phrase_text,
+          requested_tags_json=excluded.requested_tags_json,
+          status='active',
+          confirmations=human_companion_photo_request_phrases.confirmations + 1,
+          viewer_key=excluded.viewer_key,
+          member_id=excluded.member_id,
+          session_id=excluded.session_id,
+          last_confirmed_epoch=excluded.last_confirmed_epoch,
+          updated_epoch=excluded.updated_epoch
+        """,
+        (
+            uuid.uuid4().hex,
+            brand,
+            int(companion_mapping_id),
+            normalized,
+            str(phrase_text or "")[:500],
+            json.dumps(list(requested_tags or []), separators=(",", ":")),
+            str(viewer_key or ""),
+            str(member_id or ""),
+            str(session_id or ""),
+            now,
+            now,
+            now,
+        ),
+    )
+
+
 def _human_photo_row_metadata_text(row: Dict[str, Any]) -> Tuple[List[str], str]:
     tags = _human_photo_safe_json_list(row.get("tags_json") or "[]")
     desc = re.sub(r"\s+", " ", str(row.get("description") or "").strip().lower())
@@ -21840,8 +22122,22 @@ def _human_photo_requested_photo_turn_sync(
 ) -> Optional[Dict[str, Any]]:
     if not _HUMAN_PHOTO_FEATURE_ENABLED:
         return None
-    is_request, terms = _human_photo_detect_request(request_text)
-    if not is_request:
+
+    pending = _human_photo_pending_from_state(session_state)
+    pending_answer = _human_photo_yes_no_intent(request_text) if pending else ""
+    direct_request, terms = _human_photo_detect_request(request_text)
+    ambiguous_photo_mention = (not direct_request) and _human_photo_is_ambiguous_photo_mention(request_text)
+
+    if pending and pending_answer == "no":
+        return {
+            "reply": "No problem.",
+            "content": None,
+            "outcome": "confirmation_declined",
+            "state_updates": _human_photo_clear_pending_updates(),
+        }
+
+    possible_photo_turn = bool(direct_request or ambiguous_photo_mention or (pending and pending_answer == "yes"))
+    if not possible_photo_turn:
         return None
 
     conn = _econnect_conn()
@@ -21858,6 +22154,64 @@ def _human_photo_requested_photo_turn_sync(
         host_email = _human_photo_safe_email(mapping.get("host_email") or "")
         viewer = str(viewer_key or "").strip() or str(member_id or "").strip() or f"session::{session_id}"
         now = time.time()
+
+        if pending and pending_answer == "yes":
+            request_text_for_delivery = str(pending.get("phrase") or request_text or "").strip()
+            terms = _human_photo_safe_json_list(pending.get("terms") or []) or _human_photo_request_terms(request_text_for_delivery)
+            direct_request = True
+            learning_confirmed = True
+        else:
+            request_text_for_delivery = request_text
+            learning_confirmed = False
+            if not direct_request:
+                learned_terms = _human_photo_learned_phrase_terms_on_conn(
+                    conn,
+                    brand=brand,
+                    companion_mapping_id=companion_mapping_id,
+                    phrase_text=request_text,
+                )
+                if learned_terms is not None:
+                    terms = learned_terms
+                    direct_request = True
+
+        if not direct_request:
+            pending_payload = _human_photo_pending_payload(request_text, terms=[])
+            conn.execute("BEGIN IMMEDIATE")
+            sync_info = _human_photo_sync_inventory_on_conn(
+                conn,
+                brand=brand,
+                companion_mapping_id=companion_mapping_id,
+                host_member_id=host_member_id,
+                host_email=host_email,
+            )
+            _human_photo_insert_request_on_conn(
+                conn,
+                brand=brand,
+                companion_mapping_id=companion_mapping_id,
+                host_member_id=host_member_id,
+                viewer_key=viewer,
+                member_id=member_id,
+                session_id=session_id,
+                plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
+                plan_class="trial" if is_trial else "visitor",
+                request_text=request_text,
+                request_kind="ambiguous",
+                requested_tags=[],
+                outcome="confirmation_requested",
+                remaining_after_delivery=int(sync_info.get("remaining") or 0),
+                now_epoch=now,
+            )
+            conn.commit()
+            return {
+                "reply": _HUMAN_PHOTO_CONFIRMATION_REPLY,
+                "content": None,
+                "outcome": "confirmation_requested",
+                "state_updates": {
+                    _HUMAN_PHOTO_PENDING_STATE_KEY: pending_payload,
+                    _HUMAN_PHOTO_PENDING_STATE_KEY_CAMEL: pending_payload,
+                },
+            }
+
         # Paid-photo treatment is intentionally limited to real logged-in members
         # with an active Discover, Explore, or Encounter plan.  Visitors and
         # PayGo-only users remain on the two-photo rolling trial/visitor rule.
@@ -21871,6 +22225,7 @@ def _human_photo_requested_photo_turn_sync(
         )
         plan_class = "paid" if paid else ("trial" if is_trial else "visitor")
         request_kind = "specific" if terms else "generic"
+        clear_pending = _human_photo_clear_pending_updates()
 
         conn.execute("BEGIN IMMEDIATE")
         sync_info = _human_photo_sync_inventory_on_conn(
@@ -21880,6 +22235,19 @@ def _human_photo_requested_photo_turn_sync(
             host_member_id=host_member_id,
             host_email=host_email,
         )
+
+        if learning_confirmed:
+            _human_photo_record_learned_phrase_on_conn(
+                conn,
+                brand=brand,
+                companion_mapping_id=companion_mapping_id,
+                phrase_text=request_text_for_delivery,
+                requested_tags=terms,
+                viewer_key=viewer,
+                member_id=member_id,
+                session_id=session_id,
+                now_epoch=now,
+            )
 
         if not paid:
             delivered_count = _human_photo_delivered_count_in_window(
@@ -21900,7 +22268,7 @@ def _human_photo_requested_photo_turn_sync(
                     session_id=session_id,
                     plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
                     plan_class=plan_class,
-                    request_text=request_text,
+                    request_text=request_text_for_delivery,
                     request_kind=request_kind,
                     requested_tags=terms,
                     outcome="capped",
@@ -21908,7 +22276,7 @@ def _human_photo_requested_photo_turn_sync(
                     now_epoch=now,
                 )
                 conn.commit()
-                return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": "capped"}
+                return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": "capped", "state_updates": clear_pending}
 
         available = _human_photo_available_rows(conn, brand=brand, companion_mapping_id=companion_mapping_id)
         chosen, outcome = _human_photo_choose_row(available, terms)
@@ -21924,7 +22292,7 @@ def _human_photo_requested_photo_turn_sync(
                 session_id=session_id,
                 plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
                 plan_class=plan_class,
-                request_text=request_text,
+                request_text=request_text_for_delivery,
                 request_kind=request_kind,
                 requested_tags=terms,
                 outcome=outcome,
@@ -21932,7 +22300,7 @@ def _human_photo_requested_photo_turn_sync(
                 now_epoch=now,
             )
             conn.commit()
-            return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": outcome}
+            return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": outcome, "state_updates": clear_pending}
 
         file_name = str(chosen.get("file_name") or "").strip()
         sequence = int(chosen.get("original_sequence") or 0)
@@ -21952,7 +22320,7 @@ def _human_photo_requested_photo_turn_sync(
         )
         if int(update_cur.rowcount or 0) < 1:
             conn.rollback()
-            return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": "race_lost"}
+            return {"reply": HUMAN_PHOTO_CANNED_RESPONSE, "content": None, "outcome": "race_lost", "state_updates": clear_pending}
         remaining = int(conn.execute(
             "SELECT COUNT(1) FROM human_companion_photo_inventory WHERE brand=? AND companion_mapping_id=? AND status='available'",
             (brand, companion_mapping_id),
@@ -21977,7 +22345,7 @@ def _human_photo_requested_photo_turn_sync(
             session_id=session_id,
             plan_name=plan_name_for_limits or plan_name_raw or plan_external or "",
             plan_class=plan_class,
-            request_text=request_text,
+            request_text=request_text_for_delivery,
             request_kind=request_kind,
             requested_tags=terms,
             outcome="delivered",
@@ -22001,7 +22369,7 @@ def _human_photo_requested_photo_turn_sync(
         except Exception:
             pass
 
-        return {"reply": "Here's one.", "content": content, "outcome": "delivered", "remaining": remaining, "file_name": file_name}
+        return {"reply": "Here's one.", "content": content, "outcome": "delivered", "remaining": remaining, "file_name": file_name, "state_updates": clear_pending}
     except Exception as exc:
         try:
             conn.rollback()

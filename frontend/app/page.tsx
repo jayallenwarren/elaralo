@@ -1781,6 +1781,14 @@ function buildContentAssistantMsgs(rawPayload: any): Msg[] {
   return out;
 }
 
+function normalizeShortAssistantDeliveryText(value: any): string {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s.,!?;:]+$/g, "")
+    .replace(/\s+/g, " ");
+}
+
 function toWsBaseUrl(httpBase: string): string {
   const raw = String(httpBase || '').trim();
   if (!raw) return '';
@@ -6818,7 +6826,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
   }, []);
 
 const playLocalTtsUrl = useCallback(
-    async (url: string, hooks?: SpeakAssistantHooks) => {
+    async (url: string, hooks?: SpeakAssistantHooks, opts?: { playbackRate?: number }) => {
       const audioEl = localTtsAudioRef.current;
       const videoEl = localTtsVideoRef.current;
 
@@ -6897,13 +6905,16 @@ const playLocalTtsUrl = useCallback(
           m.volume = 1;
         } catch (e) {}
 
-        // Defensive pace reset for iOS/Safari hidden-media playback. The backend
-        // does not intentionally speed up ElevenLabs audio, but resetting the
-        // media element every time prevents a stale browser playbackRate from
-        // carrying into a new AI Representative response.
+        // Defensive pace reset for iOS/Safari hidden-media playback. Normal replies
+        // use 1.0. The initial greeting may pass a slightly slower rate because
+        // short ElevenLabs greetings can sound rushed even when later replies are fine.
+        const requestedPlaybackRate = Number(opts?.playbackRate ?? 1);
+        const safePlaybackRate = Number.isFinite(requestedPlaybackRate)
+          ? Math.min(1.25, Math.max(0.75, requestedPlaybackRate))
+          : 1;
         try {
-          m.defaultPlaybackRate = 1;
-          m.playbackRate = 1;
+          m.defaultPlaybackRate = safePlaybackRate;
+          m.playbackRate = safePlaybackRate;
           (m as any).preservesPitch = true;
           (m as any).mozPreservesPitch = true;
           (m as any).webkitPreservesPitch = true;
@@ -7130,7 +7141,7 @@ const playLocalTtsUrl = useCallback(
   }, []);
 
   const speakLocalTtsReply = useCallback(
-    async (replyText: string, voiceId: string, hooks?: SpeakAssistantHooks) => {
+    async (replyText: string, voiceId: string, hooks?: SpeakAssistantHooks, opts?: { playbackRate?: number }) => {
       const clean = (replyText || "").trim();
       if (!clean) {
         hooks?.onDidNotSpeak?.();
@@ -7168,7 +7179,7 @@ const playLocalTtsUrl = useCallback(
       try { primeLocalTtsAudio(true); } catch (e) {}
       try { void ensureIphoneAudioContextUnlocked(); } catch (e) {}
 
-      await playLocalTtsUrl(audioUrl, hooks);
+      await playLocalTtsUrl(audioUrl, hooks, opts);
     },
     [
       getTtsAudioUrl,
@@ -12514,12 +12525,32 @@ if (streamSessionActive) {
         assistantCommitted = true;
 
         const toAdd: Msg[] = [];
+        let remainingContentMsgs = contentMsgs;
         const assistantReplyMsg = buildAssistantTurnMsg(displayReplyText || replyText, replyTurnTranslation, "ai");
         if (assistantReplyMsg) {
-          toAdd.push(assistantReplyMsg);
+          const firstContent = remainingContentMsgs[0];
+          const firstMeta: any = (firstContent as any)?.meta || {};
+          const sameShortDeliveryText =
+            normalizeShortAssistantDeliveryText(firstContent?.content) &&
+            normalizeShortAssistantDeliveryText(firstContent?.content) === normalizeShortAssistantDeliveryText(assistantReplyMsg.content);
+
+          // Requested Human Companion photos already have a normal assistant reply
+          // ("Here's one.").  Merge the attachment into that same turn instead of
+          // rendering a duplicate "Here's one." line before the image.
+          if (firstContent && isRequestedHumanPhotoDelivery(firstMeta) && sameShortDeliveryText) {
+            const mergedMeta = {
+              ...(assistantReplyMsg as any).meta,
+              attachment: firstMeta.attachment,
+              contentDelivery: firstMeta.contentDelivery,
+            };
+            toAdd.push({ ...assistantReplyMsg, meta: mergedMeta });
+            remainingContentMsgs = remainingContentMsgs.slice(1);
+          } else {
+            toAdd.push(assistantReplyMsg);
+          }
         }
-        if (contentMsgs.length) {
-          toAdd.push(...contentMsgs);
+        if (remainingContentMsgs.length) {
+          toAdd.push(...remainingContentMsgs);
         }
         if (!toAdd.length) return;
 
@@ -13666,7 +13697,7 @@ const speakGreetingIfNeeded = useCallback(
         await speakAssistantReply(greetText);
       } else {
         // Local audio-only (video element on iOS; audio element on desktop)
-        await speakLocalTtsReply(greetText, voiceId, hooks);
+        await speakLocalTtsReply(greetText, voiceId, hooks, { playbackRate: 0.88 });
       }
 
       // Mark spoken ONLY after successful playback.
