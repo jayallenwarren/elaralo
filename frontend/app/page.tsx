@@ -5592,6 +5592,41 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 	        Boolean(payloadIsHostUser && payloadHostMemberId && memberId === payloadHostMemberId)
 	      )
 	  );
+
+	  const hostConsolePublicFirstName = useMemo(() => {
+	    const m: any = companionMapping || {};
+	    const candidates = [
+	      m.public_first_name,
+	      m.publicFirstName,
+	      m.public_name,
+	      m.publicName,
+	      m.public_display_name,
+	      m.publicDisplayName,
+	      m.stage_name,
+	      m.stageName,
+	      m.display_name,
+	      m.displayName,
+	      m.mappingAvatar,
+	      m.mapping_avatar,
+	      m.avatar,
+	      selectedMappingAvatar,
+	      companionName,
+	      companionKey,
+	    ];
+	    for (const raw of candidates) {
+	      const value = String(raw || "").trim();
+	      if (!value) continue;
+	      const base = splitCompanionKey(value).baseKey || value;
+	      const cleaned = stripExt(base).replace(/[_]+/g, " ").replace(/\s+/g, " ").trim();
+	      if (!cleaned) continue;
+	      const first = isAiCompanionFilenameKey(cleaned)
+	        ? aiFirstNameFromKey(cleaned)
+	        : (cleaned.split(/[\s-]+/, 1)[0] || "").trim();
+	      if (first) return first;
+	    }
+	    return "Companion";
+	  }, [companionMapping, selectedMappingAvatar, companionName, companionKey]);
+
 	  useEffect(() => {
 	    hostMemberIdRef.current = String(effectiveHostMemberIdForConsole || "");
 	  }, [effectiveHostMemberIdForConsole]);
@@ -5624,7 +5659,7 @@ const hostSttRecorderRef = useRef<MediaRecorder | null>(null);
 const hostSttStreamRef = useRef<MediaStream | null>(null);
 const hostSttChunksRef = useRef<BlobPart[]>([]);
 
-// Host Session Insights STT (speech-to-text) for the Ask Dulce question box.
+// Host Session Insights speech input for the Session Insights question box.
 const [hostInsightsSttEnabled, setHostInsightsSttEnabled] = useState<boolean>(false);
 const [hostInsightsSttRecording, setHostInsightsSttRecording] = useState<boolean>(false);
 const [hostInsightsSttError, setHostInsightsSttError] = useState<string>("");
@@ -16576,7 +16611,7 @@ const modePillControls = (
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                 <div style={{ fontSize: 16, fontWeight: 750 }}>Session Insights</div>
                 <div style={{ fontSize: 12, opacity: 0.78 }}>
-                  Ask Dulce about historical session summaries for members/visitors.
+                  Ask {hostConsolePublicFirstName} about historical session summaries for members/visitors.
                 </div>
               </div>
 
@@ -16861,7 +16896,7 @@ const modePillControls = (
                 </div>
 
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.82 }}>Ask Dulce</div>
+                  <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.82 }}>Ask {hostConsolePublicFirstName}</div>
                   <textarea
                     value={hostInsightsQuestion}
                     onChange={(e) => setHostInsightsQuestion(e.target.value)}
@@ -16893,7 +16928,7 @@ const modePillControls = (
 
                   {hostInsightsSttEnabled ? (
                     <div style={{ fontSize: 11, opacity: 0.72 }}>
-                      Hands-free STT is on. Speak naturally and Dulce will ask automatically after a short pause. Press Stop mic to switch back to typing.
+                      Hands-free STT is on. Speak naturally and {hostConsolePublicFirstName} will ask automatically after a short pause. Press Stop mic to switch back to typing.
                     </div>
                   ) : null}
 
@@ -17055,7 +17090,7 @@ const modePillControls = (
               fontWeight: 700,
               whiteSpace: "nowrap",
             }}
-            title="Ask Dulce about historical session summaries for visitors/members"
+            title={`Ask ${hostConsolePublicFirstName} about historical session summaries for visitors/members`}
           >
             Session Insights
           </button>
