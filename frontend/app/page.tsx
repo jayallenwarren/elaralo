@@ -5606,8 +5606,6 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 	      m.stageName,
 	      m.display_name,
 	      m.displayName,
-	      m.mappingAvatar,
-	      m.mapping_avatar,
 	      m.avatar,
 	      selectedMappingAvatar,
 	      companionName,
@@ -15193,7 +15191,20 @@ const modePillControls = (
           />
         </div>
         <div>
-          <h1 style={{ margin: 0, fontSize: ui.title }}>{companyName}</h1>
+          <h1 style={{ margin: 0, fontSize: ui.title }}>
+            {isElaraloBrandName(companyName) ? (
+              <a
+                href="https://www.elaralo.com/"
+                target="_top"
+                style={{ color: "inherit", textDecoration: "none", cursor: "pointer" }}
+                aria-label="Open Elaralo home page"
+              >
+                {companyName}
+              </a>
+            ) : (
+              companyName
+            )}
+          </h1>
           <div style={{ fontSize: ui.meta, color: "#666" }}>
             Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
             <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
