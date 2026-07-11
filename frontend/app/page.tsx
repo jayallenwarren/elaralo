@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.16: normalize compact companion-card layout across Wix embeds; protected STT/TTS/media behavior unchanged.
+// v10.0.0-alpha15.17: companion-card action column adds brand Spotlight, conditional Subscribe/Upgrade, reordered controls, and Switch label; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
@@ -14326,9 +14326,9 @@ const sttControls =
             justifyContent: "center",
             whiteSpace: "nowrap",
           }}
-          title="Swap companion"
+          title="Switch companion"
         >
-          Swap Companion
+          Switch
         </button>
       ) : null}
 </>
@@ -14363,6 +14363,25 @@ useEffect(() => {
   if (hideSetModeInStream && showModePicker) setShowModePicker(false);
 }, [hideSetModeInStream, showModePicker]);
 
+const normalizedCompanyNameForActions = String(companyName || "")
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, "");
+const spotlightHref = isElaraloBrandName(companyName)
+  ? "https://elaralo.com/#spotlights"
+  : normalizedCompanyNameForActions === "dulcemoon"
+    ? "https://dulcemoon.net/#spotlights"
+    : "";
+const hasSubscribedPlan = Boolean(
+  loggedIn &&
+  memberId &&
+  !isAnonMemberId(memberId) &&
+  planName &&
+  planName !== "Trial" &&
+  planName !== "Pay as You Go"
+);
+const subscriptionActionLabel = hasSubscribedPlan ? "Upgrade" : "Subscribe";
+
 const modePillControls = (
 
     <div
@@ -14386,23 +14405,53 @@ const modePillControls = (
             alignItems: useCompactCompanionCard ? "stretch" : "center",
             width: useCompactCompanionCard ? "100%" : "auto",
           }}
-        >{!hideSetModeInStream ? (
+        >
+          {spotlightHref ? (
+            <a
+              href={spotlightHref}
+              target="_top"
+              rel="noopener noreferrer"
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid #111",
+                background: "#fff",
+                color: "#111",
+                cursor: "pointer",
+                fontWeight: 400,
+                whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: useCompactCompanionCard ? "100%" : "auto",
+                minHeight: useCompactCompanionCard ? 44 : undefined,
+                boxSizing: "border-box",
+                textDecoration: "none",
+              }}
+              aria-label={`Open ${companyName} Spotlights`}
+            >
+              Go Spotlight
+            </a>
+          ) : null}
 
           <button
             type="button"
             onClick={() => {
-              setSetModeFlash(true);
-              window.setTimeout(() => {
-                setShowModePicker(true);
-                setSetModeFlash(false);
-              }, 120);
+              try {
+                openUpgradeUrl();
+              } catch (e) {}
+
+              // Start subscription/upgrade polling so plan changes apply without refresh.
+              try {
+                startUpgradeWatch("upgrade_button");
+              } catch (e) {}
             }}
             style={{
               padding: "10px 14px",
               borderRadius: 10,
               border: "1px solid #111",
-              background: setModeFlash ? "#111" : "#fff",
-              color: setModeFlash ? "#fff" : "#111",
+              background: "#fff",
+              color: "#111",
               cursor: "pointer",
               fontWeight: 400,
               whiteSpace: "nowrap",
@@ -14413,9 +14462,38 @@ const modePillControls = (
               minHeight: useCompactCompanionCard ? 44 : undefined,
             }}
           >
-            Set Mode
+            {subscriptionActionLabel}
           </button>
-) : null}
+
+          {!hideSetModeInStream ? (
+            <button
+              type="button"
+              onClick={() => {
+                setSetModeFlash(true);
+                window.setTimeout(() => {
+                  setShowModePicker(true);
+                  setSetModeFlash(false);
+                }, 120);
+              }}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid #111",
+                background: setModeFlash ? "#111" : "#fff",
+                color: setModeFlash ? "#fff" : "#111",
+                cursor: "pointer",
+                fontWeight: 400,
+                whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: useCompactCompanionCard ? "100%" : "auto",
+                minHeight: useCompactCompanionCard ? 44 : undefined,
+              }}
+            >
+              Set Mode
+            </button>
+          ) : null}
 
           <button
             type="button"
@@ -14440,39 +14518,6 @@ const modePillControls = (
           >
             Add Minutes
           </button>
-
-          {/* Persistent Upgrade button (always visible; uses rebrandingKey UpgradeLink override, else Elaralo default). */}
-          <button
-            type="button"
-            onClick={() => {
-              try {
-                openUpgradeUrl();
-              } catch (e) {}
-
-              // Start upgrade polling so plan changes apply without refresh.
-              try {
-                startUpgradeWatch("upgrade_button");
-              } catch (e) {}
-            }}
-            style={{
-              padding: "10px 14px",
-              borderRadius: 10,
-              border: "1px solid #111",
-              background: "#fff",
-              color: "#111",
-              cursor: "pointer",
-              fontWeight: 400,
-              whiteSpace: "nowrap",
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: useCompactCompanionCard ? "100%" : "auto",
-              minHeight: useCompactCompanionCard ? 44 : undefined,
-            }}
-          >
-            Upgrade
-          </button>
-
 
           {showBroadcastButton ? (
             <button
@@ -14506,6 +14551,63 @@ const modePillControls = (
         </div>
       ) : (
         <>
+          {spotlightHref ? (
+            <a
+              href={spotlightHref}
+              target="_top"
+              rel="noopener noreferrer"
+              style={{
+                padding: "8px 12px",
+                borderRadius: 999,
+                border: "1px solid #ddd",
+                background: "#fff",
+                color: "#111",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+                width: useCompactCompanionCard ? "100%" : "auto",
+                minHeight: useCompactCompanionCard ? 42 : undefined,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                boxSizing: "border-box",
+                textDecoration: "none",
+              }}
+              aria-label={`Open ${companyName} Spotlights`}
+            >
+              Go Spotlight
+            </a>
+          ) : null}
+
+          <button
+            key="subscription-action"
+            onClick={() => {
+              setShowModePicker(false);
+              try {
+                openUpgradeUrl();
+              } catch (e) {}
+
+              try {
+                startUpgradeWatch("upgrade_button");
+              } catch (e) {}
+            }}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 999,
+              border: "1px solid #ddd",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+              width: useCompactCompanionCard ? "100%" : "auto",
+              minHeight: useCompactCompanionCard ? 42 : undefined,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            {subscriptionActionLabel}
+          </button>
+
           {visibleModePills.map((m) => {
             const active = effectiveActiveMode === m;
             return (
@@ -14559,37 +14661,6 @@ const modePillControls = (
             Add Minutes
           </button>
 
-          {/* Upgrade is always available (white-label URL override via rebrandingKey). */}
-          <button
-            key="upgrade"
-            onClick={() => {
-              setShowModePicker(false);
-              try {
-                openUpgradeUrl();
-              } catch (e) {}
-
-              // Start upgrade polling so plan changes apply without refresh.
-              try {
-                startUpgradeWatch("upgrade_button");
-              } catch (e) {}
-            }}
-            style={{
-              padding: "8px 12px",
-              borderRadius: 999,
-              border: "1px solid #ddd",
-              background: "#fff",
-              color: "#111",
-              cursor: "pointer",
-              whiteSpace: "nowrap",
-              width: useCompactCompanionCard ? "100%" : "auto",
-              minHeight: useCompactCompanionCard ? 42 : undefined,
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
-            Upgrade
-          </button>
 
           {showBroadcastButton ? (
             <button
