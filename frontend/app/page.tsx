@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.14: mobile companion-card layout only; protected STT/TTS/media behavior unchanged.
+// v10.0.0-alpha15.16: normalize compact companion-card layout across Wix embeds; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
@@ -4212,6 +4212,10 @@ function ConnectPage() {
 
   const isMobileUI = viewportMode === "mobile";
   const isTabletUI = viewportMode === "tablet";
+  // Wix code-based embeds can report a tablet-width iframe on a phone.
+  // Use the same compact companion-card layout for both mobile and tablet-width embeds
+  // so Elaralo and DulceMoon render the card consistently.
+  const useCompactCompanionCard = viewportMode !== "desktop";
 
   // Icon sizing: on mobile, force all icons to the same pixel size (13.5px).
   const ICON_18 = isMobileUI ? 13.5 : 18;
@@ -14364,23 +14368,23 @@ const modePillControls = (
     <div
       style={{
         display: "flex",
-        flexDirection: isMobileUI ? "column" : "row",
+        flexDirection: useCompactCompanionCard ? "column" : "row",
         gap: 8,
-        flexWrap: isMobileUI ? "nowrap" : "wrap",
+        flexWrap: useCompactCompanionCard ? "nowrap" : "wrap",
         justifyContent: "flex-end",
-        alignItems: isMobileUI ? "stretch" : "center",
-        width: isMobileUI ? 140 : "auto",
+        alignItems: useCompactCompanionCard ? "stretch" : "center",
+        width: useCompactCompanionCard ? 140 : "auto",
       }}
     >
       {!showModePicker ? (
         <div
           style={{
             display: "flex",
-            flexDirection: isMobileUI ? "column" : "row",
+            flexDirection: useCompactCompanionCard ? "column" : "row",
             gap: 8,
             justifyContent: "flex-end",
-            alignItems: isMobileUI ? "stretch" : "center",
-            width: isMobileUI ? "100%" : "auto",
+            alignItems: useCompactCompanionCard ? "stretch" : "center",
+            width: useCompactCompanionCard ? "100%" : "auto",
           }}
         >{!hideSetModeInStream ? (
 
@@ -14405,8 +14409,8 @@ const modePillControls = (
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
-              width: isMobileUI ? "100%" : "auto",
-              minHeight: isMobileUI ? 44 : undefined,
+              width: useCompactCompanionCard ? "100%" : "auto",
+              minHeight: useCompactCompanionCard ? 44 : undefined,
             }}
           >
             Set Mode
@@ -14430,8 +14434,8 @@ const modePillControls = (
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
-              width: isMobileUI ? "100%" : "auto",
-              minHeight: isMobileUI ? 44 : undefined,
+              width: useCompactCompanionCard ? "100%" : "auto",
+              minHeight: useCompactCompanionCard ? 44 : undefined,
             }}
           >
             Add Minutes
@@ -14462,8 +14466,8 @@ const modePillControls = (
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
-              width: isMobileUI ? "100%" : "auto",
-              minHeight: isMobileUI ? 44 : undefined,
+              width: useCompactCompanionCard ? "100%" : "auto",
+              minHeight: useCompactCompanionCard ? 44 : undefined,
             }}
           >
             Upgrade
@@ -14488,8 +14492,8 @@ const modePillControls = (
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
-                width: isMobileUI ? "100%" : "auto",
-                minHeight: isMobileUI ? 44 : undefined,
+                width: useCompactCompanionCard ? "100%" : "auto",
+                minHeight: useCompactCompanionCard ? 44 : undefined,
                 opacity: broadcastPreparing ? 0.75 : 1,
               }}
               disabled={broadcastPreparing}
@@ -14519,8 +14523,8 @@ const modePillControls = (
                   color: active ? "#fff" : "#111",
                   cursor: "pointer",
                   whiteSpace: "nowrap",
-                  width: isMobileUI ? "100%" : "auto",
-                  minHeight: isMobileUI ? 42 : undefined,
+                  width: useCompactCompanionCard ? "100%" : "auto",
+                  minHeight: useCompactCompanionCard ? 42 : undefined,
                   display: "inline-flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -14545,8 +14549,8 @@ const modePillControls = (
               color: "#111",
               cursor: "pointer",
               whiteSpace: "nowrap",
-              width: isMobileUI ? "100%" : "auto",
-              minHeight: isMobileUI ? 42 : undefined,
+              width: useCompactCompanionCard ? "100%" : "auto",
+              minHeight: useCompactCompanionCard ? 42 : undefined,
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
@@ -14577,8 +14581,8 @@ const modePillControls = (
               color: "#111",
               cursor: "pointer",
               whiteSpace: "nowrap",
-              width: isMobileUI ? "100%" : "auto",
-              minHeight: isMobileUI ? 42 : undefined,
+              width: useCompactCompanionCard ? "100%" : "auto",
+              minHeight: useCompactCompanionCard ? 42 : undefined,
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
@@ -15241,16 +15245,16 @@ const modePillControls = (
       <header
         style={{
           display: "flex",
-          flexDirection: isMobileUI ? "column" : "row",
+          flexDirection: useCompactCompanionCard ? "column" : "row",
           alignItems: "flex-start",
-          gap: isMobileUI ? 10 : 12,
-          marginBottom: isMobileUI ? 10 : 10,
-          flexWrap: isMobileUI ? "nowrap" : "wrap",
-          rowGap: isMobileUI ? 8 : 0,
+          gap: useCompactCompanionCard ? 10 : 12,
+          marginBottom: 10,
+          flexWrap: useCompactCompanionCard ? "nowrap" : "wrap",
+          rowGap: useCompactCompanionCard ? 8 : 0,
           width: "100%",
         }}
       >
-        {isMobileUI ? (
+        {useCompactCompanionCard ? (
           <>
             <div style={{ width: "100%", minWidth: 0 }}>
               <div
@@ -15752,7 +15756,7 @@ const modePillControls = (
 
     {/* Right-justified Mode controls remain in this row on tablet/desktop.
         On mobile they are rendered beside the avatar in the companion card. */}
-    {!isMobileUI ? modePillControls : null}
+    {!useCompactCompanionCard ? modePillControls : null}
   </section>
 ) : null}
 
