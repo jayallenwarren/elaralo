@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.14: mobile companion-card layout only; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
@@ -14360,9 +14361,28 @@ useEffect(() => {
 
 const modePillControls = (
 
-    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: isMobileUI ? "column" : "row",
+        gap: 8,
+        flexWrap: isMobileUI ? "nowrap" : "wrap",
+        justifyContent: "flex-end",
+        alignItems: isMobileUI ? "stretch" : "center",
+        width: isMobileUI ? 140 : "auto",
+      }}
+    >
       {!showModePicker ? (
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>{!hideSetModeInStream ? (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: isMobileUI ? "column" : "row",
+            gap: 8,
+            justifyContent: "flex-end",
+            alignItems: isMobileUI ? "stretch" : "center",
+            width: isMobileUI ? "100%" : "auto",
+          }}
+        >{!hideSetModeInStream ? (
 
           <button
             type="button"
@@ -14384,6 +14404,9 @@ const modePillControls = (
               whiteSpace: "nowrap",
               display: "inline-flex",
               alignItems: "center",
+              justifyContent: "center",
+              width: isMobileUI ? "100%" : "auto",
+              minHeight: isMobileUI ? 44 : undefined,
             }}
           >
             Set Mode
@@ -14406,6 +14429,9 @@ const modePillControls = (
               whiteSpace: "nowrap",
               display: "inline-flex",
               alignItems: "center",
+              justifyContent: "center",
+              width: isMobileUI ? "100%" : "auto",
+              minHeight: isMobileUI ? 44 : undefined,
             }}
           >
             Add Minutes
@@ -14435,6 +14461,9 @@ const modePillControls = (
               whiteSpace: "nowrap",
               display: "inline-flex",
               alignItems: "center",
+              justifyContent: "center",
+              width: isMobileUI ? "100%" : "auto",
+              minHeight: isMobileUI ? 44 : undefined,
             }}
           >
             Upgrade
@@ -14458,6 +14487,9 @@ const modePillControls = (
                 whiteSpace: "nowrap",
                 display: "inline-flex",
                 alignItems: "center",
+                justifyContent: "center",
+                width: isMobileUI ? "100%" : "auto",
+                minHeight: isMobileUI ? 44 : undefined,
                 opacity: broadcastPreparing ? 0.75 : 1,
               }}
               disabled={broadcastPreparing}
@@ -14487,6 +14519,11 @@ const modePillControls = (
                   color: active ? "#fff" : "#111",
                   cursor: "pointer",
                   whiteSpace: "nowrap",
+                  width: isMobileUI ? "100%" : "auto",
+                  minHeight: isMobileUI ? 42 : undefined,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
                 }}
               >
                 {MODE_LABELS[m]}
@@ -14508,6 +14545,11 @@ const modePillControls = (
               color: "#111",
               cursor: "pointer",
               whiteSpace: "nowrap",
+              width: isMobileUI ? "100%" : "auto",
+              minHeight: isMobileUI ? 42 : undefined,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
             }}
           >
             Add Minutes
@@ -14535,6 +14577,11 @@ const modePillControls = (
               color: "#111",
               cursor: "pointer",
               whiteSpace: "nowrap",
+              width: isMobileUI ? "100%" : "auto",
+              minHeight: isMobileUI ? 42 : undefined,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
             }}
           >
             Upgrade
@@ -15154,116 +15201,282 @@ const modePillControls = (
         </div>
       ) : null}
 
-      <header style={{ display: "flex", alignItems: "flex-start", gap: isMobileUI ? 10 : 12, marginBottom: isMobileUI ? 8 : 10, flexWrap: "wrap", rowGap: isMobileUI ? 6 : 0 }}>
-        <div
-          aria-hidden
-          onClick={secretDebugTap}
-          style={{
-            // Match the image height to the information block: from the top of the brand name
-            // through the bottom of the Usage meter.  Keep the frame rectangular, not circular.
-            width: isMobileUI ? 74 : isTabletUI ? 84 : 92,
-            height: isMobileUI ? 104 : isTabletUI ? 112 : 118,
-            borderRadius: 14,
-            overflow: "hidden",
-            border: "1px solid rgba(17,17,17,0.14)",
-            background: "#fff",
-            boxSizing: "border-box",
-            flex: "0 0 auto",
-          }}
-        >
-          <img
-            // Prefer a companion headshot when available; otherwise show the current company logo (rebranded or default).
-            src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
-            alt={companyName}
-            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-            onError={(e) => {
-              const fallback = (companyLogoSrc || DEFAULT_AVATAR);
-              const current = String((e.currentTarget as HTMLImageElement).src || avatarSrc || "").trim();
-              (e.currentTarget as HTMLImageElement).src = fallback;
-
-              // Do not persist the logo over a selected companion image.  Elaralo AI
-              // headshots are API-served and can be restored by mapping/direct handoff
-              // state; persisting the logo here is what made the image disappear after
-              // a delayed static probe/render cycle.
-              if (isCompanionImageUrl(current)) return;
-              setAvatarSrc(fallback);
-            }}
-          />
-        </div>
-        <div>
-          <h1 style={{ margin: 0, fontSize: ui.title }}>
-            {isElaraloBrandName(companyName) ? (
-              <a
-                href="https://www.elaralo.com/"
-                target="_top"
-                style={{ color: "inherit", textDecoration: "none", cursor: "pointer" }}
-                aria-label="Open Elaralo home page"
+      <header
+        style={{
+          display: "flex",
+          flexDirection: isMobileUI ? "column" : "row",
+          alignItems: "flex-start",
+          gap: isMobileUI ? 10 : 12,
+          marginBottom: isMobileUI ? 10 : 10,
+          flexWrap: isMobileUI ? "nowrap" : "wrap",
+          rowGap: isMobileUI ? 8 : 0,
+          width: "100%",
+        }}
+      >
+        {isMobileUI ? (
+          <>
+            <div style={{ width: "100%", minWidth: 0 }}>
+              <div
+                style={{
+                  marginBottom: 2,
+                  fontSize: 13,
+                  fontWeight: 800,
+                  letterSpacing: 0.7,
+                  textTransform: "uppercase",
+                  color: "#666",
+                }}
               >
-                {companyName}
-              </a>
-            ) : (
-              companyName
-            )}
-          </h1>
-          <div style={{ fontSize: ui.meta, color: "#666" }}>
-            Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-            <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
-          </div>
-          <div style={{ fontSize: ui.meta, color: "#666" }}>
-            Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
-            {chatStatus === "explicit_allowed" ? (
-              <span style={{ marginLeft: 8, color: "#0a7a2f" }}>• Consent: Allowed</span>
-            ) : chatStatus === "explicit_blocked" ? (
-              <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
-            ) : null}
-          </div>
-          <div style={{ fontSize: ui.meta, color: "#666" }}>
-            {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}: {" "}
-            <b>{avatarStatus}</b>
-            {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
-          </div>
-	          {/* On mobile, push usage to the bottom to maximize above-the-fold space. */}
-	          {!isMobileUI && usageMeterEl}
-          {liveProvider === "stream" ? (
-            <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
-                <span
+                {isElaraloBrandName(companyName) ? (
+                  <a
+                    href="https://www.elaralo.com/"
+                    target="_top"
+                    style={{ color: "inherit", textDecoration: "none", cursor: "pointer" }}
+                    aria-label="Open Elaralo home page"
+                  >
+                    {companyName}
+                  </a>
+                ) : (
+                  companyName
+                )}
+              </div>
+              <h1 style={{ margin: 0, fontSize: Math.max(ui.title, 28), lineHeight: 1.08 }}>
+                {companionName || DEFAULT_COMPANION_NAME}
+              </h1>
+              <div style={{ marginTop: 5, fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
+                {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human"
+                  ? "Human Companion"
+                  : "AI Companion"}
+              </div>
+              <div style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
+                Plan: <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
+              </div>
+              <div style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
+                Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
+                {chatStatus === "explicit_allowed" ? (
+                  <span style={{ marginLeft: 8, color: "#0a7a2f" }}>• Consent: Allowed</span>
+                ) : chatStatus === "explicit_blocked" ? (
+                  <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
+                ) : null}
+              </div>
+              <div style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
+                {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human"
+                  ? "Live Companion"
+                  : "Live Avatar"}: {" "}
+                <b
                   style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 6,
-                    padding: "2px 8px",
-                    borderRadius: 999,
-                    background: "#e8f5e9",
-                    color: "#1b5e20",
-                    fontSize: 12,
-                    fontWeight: 700,
+                    color:
+                      avatarStatus === "connected"
+                        ? "#0a7a2f"
+                        : avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting"
+                          ? "#0d47a1"
+                          : avatarStatus === "error"
+                            ? "#b00020"
+                            : "#666",
                   }}
                 >
-                  ● Live {sessionKind === "conference" ? "private" : "stream"} active
-                </span>
-              ) : null}
+                  {avatarStatus}
+                </b>
+                {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+              </div>
+            </div>
 
-              {!!livekitToken ? (
-                <span
+            <div
+              style={{
+                width: "100%",
+                display: "flex",
+                alignItems: "flex-start",
+                justifyContent: "space-between",
+                gap: 16,
+              }}
+            >
+              <div style={{ flex: "1 1 auto", minWidth: 0, maxWidth: 180 }}>
+                <div
+                  aria-hidden
+                  onClick={secretDebugTap}
                   style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 6,
-                    padding: "2px 8px",
-                    borderRadius: 999,
-                    background: "#e3f2fd",
-                    color: "#0d47a1",
-                    fontSize: 12,
-                    fontWeight: 700,
+                    width: 118,
+                    height: 148,
+                    borderRadius: 16,
+                    overflow: "hidden",
+                    border: "1px solid rgba(17,17,17,0.14)",
+                    background: "#fff",
+                    boxSizing: "border-box",
                   }}
                 >
-					● {hostInStreamUi ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}` : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
-                </span>
+                  <img
+                    src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
+                    alt={companyName}
+                    style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+                    onError={(e) => {
+                      const fallback = (companyLogoSrc || DEFAULT_AVATAR);
+                      const current = String((e.currentTarget as HTMLImageElement).src || avatarSrc || "").trim();
+                      (e.currentTarget as HTMLImageElement).src = fallback;
+                      if (isCompanionImageUrl(current)) return;
+                      setAvatarSrc(fallback);
+                    }}
+                  />
+                </div>
+                <div style={{ marginTop: 2 }}>{usageMeterEl}</div>
+              </div>
+
+              <div
+                style={{
+                  flex: "0 0 140px",
+                  display: "flex",
+                  justifyContent: "flex-end",
+                  alignItems: "stretch",
+                }}
+              >
+                {modePillControls}
+              </div>
+            </div>
+
+            {liveProvider === "stream" ? (
+              <div style={{ marginTop: 2, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      background: "#e8f5e9",
+                      color: "#1b5e20",
+                      fontSize: 12,
+                      fontWeight: 700,
+                    }}
+                  >
+                    ● Live {sessionKind === "conference" ? "private" : "stream"} active
+                  </span>
+                ) : null}
+                {!!livekitToken ? (
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      background: "#e3f2fd",
+                      color: "#0d47a1",
+                      fontSize: 12,
+                      fontWeight: 700,
+                    }}
+                  >
+                    ● {hostInStreamUi
+                      ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`
+                      : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <div
+              aria-hidden
+              onClick={secretDebugTap}
+              style={{
+                width: isTabletUI ? 84 : 92,
+                height: isTabletUI ? 112 : 118,
+                borderRadius: 14,
+                overflow: "hidden",
+                border: "1px solid rgba(17,17,17,0.14)",
+                background: "#fff",
+                boxSizing: "border-box",
+                flex: "0 0 auto",
+              }}
+            >
+              <img
+                src={((avatarSrc && avatarSrc !== DEFAULT_AVATAR) ? avatarSrc : companyLogoSrc) || DEFAULT_AVATAR}
+                alt={companyName}
+                style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+                onError={(e) => {
+                  const fallback = (companyLogoSrc || DEFAULT_AVATAR);
+                  const current = String((e.currentTarget as HTMLImageElement).src || avatarSrc || "").trim();
+                  (e.currentTarget as HTMLImageElement).src = fallback;
+                  if (isCompanionImageUrl(current)) return;
+                  setAvatarSrc(fallback);
+                }}
+              />
+            </div>
+            <div>
+              <h1 style={{ margin: 0, fontSize: ui.title }}>
+                {isElaraloBrandName(companyName) ? (
+                  <a
+                    href="https://www.elaralo.com/"
+                    target="_top"
+                    style={{ color: "inherit", textDecoration: "none", cursor: "pointer" }}
+                    aria-label="Open Elaralo home page"
+                  >
+                    {companyName}
+                  </a>
+                ) : (
+                  companyName
+                )}
+              </h1>
+              <div style={{ fontSize: ui.meta, color: "#666" }}>
+                Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
+                <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
+              </div>
+              <div style={{ fontSize: ui.meta, color: "#666" }}>
+                Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
+                {chatStatus === "explicit_allowed" ? (
+                  <span style={{ marginLeft: 8, color: "#0a7a2f" }}>• Consent: Allowed</span>
+                ) : chatStatus === "explicit_blocked" ? (
+                  <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
+                ) : null}
+              </div>
+              <div style={{ fontSize: ui.meta, color: "#666" }}>
+                {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}: {" "}
+                <b>{avatarStatus}</b>
+                {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+              </div>
+              {usageMeterEl}
+              {liveProvider === "stream" ? (
+                <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
+                    <span
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        padding: "2px 8px",
+                        borderRadius: 999,
+                        background: "#e8f5e9",
+                        color: "#1b5e20",
+                        fontSize: 12,
+                        fontWeight: 700,
+                      }}
+                    >
+                      ● Live {sessionKind === "conference" ? "private" : "stream"} active
+                    </span>
+                  ) : null}
+                  {!!livekitToken ? (
+                    <span
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        padding: "2px 8px",
+                        borderRadius: 999,
+                        background: "#e3f2fd",
+                        color: "#0d47a1",
+                        fontSize: 12,
+                        fontWeight: 700,
+                      }}
+                    >
+                      ● {hostInStreamUi
+                        ? `Hosting ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`
+                        : `Joined ${sessionKind === "conference" ? "private" : "live"} ${sessionKind === "conference" ? "conference" : "stream"}`}
+                    </span>
+                  ) : null}
+                </div>
               ) : null}
             </div>
-          ) : null}
-        </div>
+          </>
+        )}
       </header>
 
 {companionMappingError ? (
@@ -15490,8 +15703,9 @@ const modePillControls = (
 
     </div>
 
-    {/* Right-justified Mode controls */}
-    {modePillControls}
+    {/* Right-justified Mode controls remain in this row on tablet/desktop.
+        On mobile they are rendered beside the avatar in the companion card. */}
+    {!isMobileUI ? modePillControls : null}
   </section>
 ) : null}
 
