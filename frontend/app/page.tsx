@@ -2822,6 +2822,22 @@ const HO_BADGE = (bg: string): React.CSSProperties => ({
   background: bg,
 });
 
+function readConnectHostQueryIdentity(): { memberId: string; hostMemberId: string; isHostUser: boolean } {
+  if (typeof window === "undefined") {
+    return { memberId: "", hostMemberId: "", isHostUser: false };
+  }
+  try {
+    const u = new URL(window.location.href);
+    const memberId = String(u.searchParams.get("memberId") || u.searchParams.get("member_id") || "").trim();
+    const hostMemberId = String(u.searchParams.get("hostMemberId") || u.searchParams.get("host_member_id") || "").trim();
+    const hostRaw = String(u.searchParams.get("isHostUser") || u.searchParams.get("is_host_user") || "").trim().toLowerCase();
+    const isHostUser = ["1", "true", "yes", "y", "on"].includes(hostRaw);
+    return { memberId, hostMemberId, isHostUser };
+  } catch {
+    return { memberId: "", hostMemberId: "", isHostUser: false };
+  }
+}
+
 function hoReadQueryIdentity() {
   if (typeof window === "undefined") {
     return { memberId: "", brand: "", avatar: "", displayName: "", loggedIn: false };
@@ -4396,7 +4412,7 @@ useEffect(() => {
 
   // Wix member id (empty for visitors). Declared early so it can be referenced
   // safely in dependency arrays above (prevents TS "used before its declaration").
-  const [memberId, setMemberId] = useState<string>("");
+  const [memberId, setMemberId] = useState<string>(() => readConnectHostQueryIdentity().memberId);
 
   const autoJoinStreamRef = useRef<boolean>(false);
 	// Prevent re-entrant Stop calls from overlapping (Stop must always fully reset state).
@@ -5566,8 +5582,11 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   useEffect(() => {
     sessionActiveRef.current = sessionActive;
   }, [sessionActive]);
-	  const [payloadHostMemberId, setPayloadHostMemberId] = useState<string>("");
-	  const [payloadIsHostUser, setPayloadIsHostUser] = useState<boolean>(false);
+	  // Seed the Host Console-only identity hint from selector URL parameters.
+	  // This removes device-dependent reliance on the first Wix MEMBER_PLAN relay.
+	  // Backend mapping remains authoritative for host actions and all non-console behavior.
+	  const [payloadHostMemberId, setPayloadHostMemberId] = useState<string>(() => readConnectHostQueryIdentity().hostMemberId);
+	  const [payloadIsHostUser, setPayloadIsHostUser] = useState<boolean>(() => readConnectHostQueryIdentity().isHostUser);
 
 	  const mappedHostMemberId = useMemo(() => {
 	    const v = (companionMapping as any)?.hostMemberId ?? (companionMapping as any)?.host_member_id ?? "";
