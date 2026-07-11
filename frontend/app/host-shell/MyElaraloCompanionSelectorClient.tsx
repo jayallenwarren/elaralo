@@ -8,6 +8,10 @@ type MemberPlanPayload = {
   logged_in?: boolean;
   memberId?: string;
   member_id?: string;
+  hostMemberId?: string;
+  host_member_id?: string;
+  isHostUser?: boolean;
+  is_host_user?: boolean;
   displayName?: string;
   display_name?: string;
   userName?: string;
@@ -39,6 +43,10 @@ type CatalogResponse = {
   ok?: boolean;
   brand?: string;
   member_id?: string;
+  hostMemberId?: string;
+  host_member_id?: string;
+  isHostUser?: boolean;
+  is_host_user?: boolean;
   count?: number;
   items?: any[];
   detail?: string;
@@ -124,6 +132,8 @@ function readQueryContext(): MemberPlanPayload {
     return {
       loggedIn: ["1", "true", "yes"].includes(safeLower(qs.get("loggedIn") || qs.get("logged_in"))),
       memberId: safeText(qs.get("memberId") || qs.get("member_id")),
+      hostMemberId: safeText(qs.get("hostMemberId") || qs.get("host_member_id")),
+      isHostUser: ["1", "true", "yes"].includes(safeLower(qs.get("isHostUser") || qs.get("is_host_user"))),
       displayName: safeText(qs.get("displayName") || qs.get("display_name") || qs.get("userName") || qs.get("user_name")),
       email: safeText(qs.get("email")),
       brand: safeText(qs.get("brand")),
@@ -155,6 +165,8 @@ function mergeMemberPayload(prev: MemberPlanPayload, incoming: MemberPlanPayload
     ...incoming,
     loggedIn: Boolean(incoming.loggedIn ?? incoming.logged_in ?? prev.loggedIn ?? prev.logged_in),
     memberId: safeText(incoming.memberId || incoming.member_id || prev.memberId || prev.member_id),
+    hostMemberId: safeText(incoming.hostMemberId || incoming.host_member_id || prev.hostMemberId || prev.host_member_id),
+    isHostUser: Boolean(incoming.isHostUser ?? incoming.is_host_user ?? prev.isHostUser ?? prev.is_host_user),
     displayName: safeText(
       incoming.displayName || incoming.display_name || incoming.userName || incoming.user_name || prev.displayName || prev.display_name || prev.userName || prev.user_name,
     ),
@@ -652,6 +664,20 @@ export default function MyElaraloCompanionSelectorClient() {
         if (memberId) {
           url.searchParams.set("memberId", memberId);
           url.searchParams.set("member_id", memberId);
+        }
+
+        // Preserve the Wix host identity hint through selector -> Connect navigation.
+        // Connect uses this only for immediate Host Console visibility; backend
+        // authorization and mapping-derived host checks remain authoritative.
+        const hostMemberId = safeText((memberPayload as any)?.hostMemberId || (memberPayload as any)?.host_member_id);
+        const isHostUser = Boolean((memberPayload as any)?.isHostUser === true || (memberPayload as any)?.is_host_user === true);
+        if (hostMemberId) {
+          url.searchParams.set("hostMemberId", hostMemberId);
+          url.searchParams.set("host_member_id", hostMemberId);
+        }
+        if (isHostUser) {
+          url.searchParams.set("isHostUser", "1");
+          url.searchParams.set("is_host_user", "1");
         }
         if (displayName) {
           url.searchParams.set("displayName", displayName);
