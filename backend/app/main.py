@@ -212,6 +212,93 @@ def _chat_provider_switch_policy_cached(llm_provider: str, effective_mode: str) 
         f"because the user is now in {mode_label} mode. "
         "Review any provided summaries and continue seamlessly while respecting the current mode's boundaries."
     )
+
+
+# ----------------------------
+# v10.0.0-alpha15.11 performance follow-up caches
+# ----------------------------
+# These caches implement the approved non-media optimization plan items:
+#   - /my-elaralo/companions/catalog response caching
+#   - /usage/status short fast-path caching + rebranding-upsert debounce
+#   - Host AI Guidelines / Host Profile Studio persona prompt-fragment caching
+# They are intentionally bounded, in-memory, TTL based, fail-open, and disabled only
+# by PERF_OPT_CACHE_ENABLED=0. They do not touch STT/TTS/audio/video playback paths.
+def _perf_opt_env_float(name: str, default: float, *, min_value: float = 0.0, max_value: float = 3600.0) -> float:
+    try:
+        val = float(os.getenv(name, str(default)) or str(default))
+    except Exception:
+        val = float(default)
+    try:
+        return max(float(min_value), min(float(max_value), float(val)))
+    except Exception:
+        return float(default)
+
+_PERF_OPT_CACHE_ENABLED = (os.getenv("PERF_OPT_CACHE_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+_CATALOG_CACHE_TTL_S = _perf_opt_env_float("CATALOG_CACHE_TTL_S", 30.0, max_value=600.0)
+_USAGE_STATUS_CACHE_TTL_S = _perf_opt_env_float("USAGE_STATUS_CACHE_TTL_S", 5.0, max_value=60.0)
+_MEMBER_REBRANDING_UPSERT_CACHE_TTL_S = _perf_opt_env_float("MEMBER_REBRANDING_UPSERT_CACHE_TTL_S", 30.0, max_value=600.0)
+_CHAT_COMPANION_PROMPT_BLOCK_CACHE_TTL_S = _perf_opt_env_float("CHAT_COMPANION_PROMPT_BLOCK_CACHE_TTL_S", 120.0, max_value=900.0)
+
+_CATALOG_RESPONSE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_CATALOG_RESPONSE_CACHE_LOCK = threading.RLock()
+_USAGE_STATUS_FAST_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_USAGE_STATUS_FAST_CACHE_LOCK = threading.RLock()
+_MEMBER_REBRANDING_UPSERT_CACHE: Dict[str, Tuple[float, str]] = {}
+_MEMBER_REBRANDING_UPSERT_CACHE_LOCK = threading.RLock()
+_CHAT_COMPANION_PROMPT_BLOCK_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+_CHAT_COMPANION_PROMPT_BLOCK_CACHE_LOCK = threading.RLock()
+
+def _perf_json_clone(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except Exception:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, list):
+            return list(value)
+        return value
+
+def _cache_safe_str(value: Any) -> str:
+    try:
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+def _clear_catalog_response_cache() -> None:
+    try:
+        with _CATALOG_RESPONSE_CACHE_LOCK:
+            _CATALOG_RESPONSE_CACHE.clear()
+    except Exception:
+        pass
+
+def _clear_usage_status_fast_cache(identity_key: str = "") -> None:
+    try:
+        with _USAGE_STATUS_FAST_CACHE_LOCK:
+            if identity_key:
+                needle = "|" + str(identity_key or "").strip().lower() + "|"
+                for key in list(_USAGE_STATUS_FAST_CACHE.keys()):
+                    if needle in key:
+                        _USAGE_STATUS_FAST_CACHE.pop(key, None)
+            else:
+                _USAGE_STATUS_FAST_CACHE.clear()
+    except Exception:
+        pass
+
+def _clear_chat_companion_prompt_block_cache(brand: str = "", avatar: str = "") -> None:
+    try:
+        b = _cache_safe_str(brand).lower()
+        a = _cache_safe_str(avatar).lower()
+        with _CHAT_COMPANION_PROMPT_BLOCK_CACHE_LOCK:
+            if b and a:
+                _CHAT_COMPANION_PROMPT_BLOCK_CACHE.pop((b, a), None)
+            elif b or a:
+                for key in list(_CHAT_COMPANION_PROMPT_BLOCK_CACHE.keys()):
+                    if (not b or key[0] == b) and (not a or key[1] == a):
+                        _CHAT_COMPANION_PROMPT_BLOCK_CACHE.pop(key, None)
+            else:
+                _CHAT_COMPANION_PROMPT_BLOCK_CACHE.clear()
+    except Exception:
+        pass
 # v9.2.56: Host-facing summaries/replies use public Intro/Mate/Mature labels; internal routing remains friend/romantic/intimate.
 # v9.2.28: Public Connect mode labels are Intro/Mate/Mature; internal routing remains friend/romantic/intimate.
 # v9.2.27: DulceMoon Discover/Explore/Encounter plan support.
@@ -583,6 +670,10 @@ async def usage_credit(request: Request):
     email = _stripe_paygo_email_norm(raw.get("email") or raw.get("customer_email") or "")
     identity_key = _usage_identity_key_for_brand(brand=brand, member_id=member_id, email=email, request=request)
     result = await run_in_threadpool(_usage_credit_minutes_sync, identity_key, minutes_i)
+    try:
+        _clear_usage_status_fast_cache(identity_key)
+    except Exception:
+        pass
     return result
 
 
@@ -622,7 +713,7 @@ async def usage_status(request: Request):
         session_state = {}
 
     try:
-        _member_rebranding_upsert_from_session_state(session_state)
+        _member_rebranding_upsert_from_session_state_cached(session_state)
     except Exception:
         pass
 
@@ -673,6 +764,26 @@ async def usage_status(request: Request):
 
     plan_name_for_limits = plan_map or plan_name_raw or ("Trial" if is_trial else "")
 
+    cache_key = "|".join([
+        "usage_status",
+        str(identity_key or "").strip().lower(),
+        "trial" if is_trial else "paid",
+        str(plan_name_for_limits or "").strip().lower(),
+        str(minutes_allowed_override if minutes_allowed_override is not None else ""),
+        str(cycle_days_override if cycle_days_override is not None else ""),
+    ])
+    if _PERF_OPT_CACHE_ENABLED and _USAGE_STATUS_CACHE_TTL_S > 0:
+        try:
+            with _USAGE_STATUS_FAST_CACHE_LOCK:
+                cached = _USAGE_STATUS_FAST_CACHE.get(cache_key)
+                if cached:
+                    ts, cached_payload = cached
+                    if (time.time() - float(ts)) < float(_USAGE_STATUS_CACHE_TTL_S):
+                        _perf_stage("usage.status.cache_hit", identity=str(identity_key or "")[:80])
+                        return _perf_json_clone(cached_payload)
+        except Exception:
+            pass
+
     usage_ok, usage_info = await run_in_threadpool(
         _usage_peek_sync,
         identity_key,
@@ -684,7 +795,7 @@ async def usage_status(request: Request):
 
     remaining_seconds = float(usage_info.get("remaining_seconds") or 0.0)
     minutes_remaining = int(usage_info.get("minutes_remaining") or _usage_minutes_remaining_display(remaining_seconds) or 0)
-    return {
+    payload = {
         "ok": bool(usage_ok),
         "minutes_used": int(usage_info.get("minutes_used") or 0),
         "minutes_allowed": int(usage_info.get("minutes_allowed") or 0),
@@ -696,6 +807,14 @@ async def usage_status(request: Request):
         "remaining_seconds": remaining_seconds,
         "total_seconds": float(usage_info.get("total_seconds") or 0.0),
     }
+    if _PERF_OPT_CACHE_ENABLED and _USAGE_STATUS_CACHE_TTL_S > 0:
+        try:
+            with _USAGE_STATUS_FAST_CACHE_LOCK:
+                _USAGE_STATUS_FAST_CACHE[cache_key] = (time.time(), _perf_json_clone(payload))
+            _perf_stage("usage.status.cache_store", identity=str(identity_key or "")[:80])
+        except Exception:
+            pass
+    return payload
 
 
 @app.get("/admin/usage/debug")
@@ -1437,6 +1556,52 @@ def _member_rebranding_upsert_from_session_state(session_state: Optional[Dict[st
             except Exception:
                 pass
 
+
+
+
+def _member_rebranding_upsert_signature(session_state: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+    ss = session_state if isinstance(session_state, dict) else {}
+    member_id = _cache_safe_str(ss.get("memberId") or ss.get("member_id") or ss.get("member"))
+    if not member_id or member_id.lower().startswith("anon:"):
+        return "", ""
+    try:
+        rebranding_key_raw = _extract_rebranding_key(ss)
+    except Exception:
+        rebranding_key_raw = ""
+    try:
+        rebranding_parsed = _parse_rebranding_key(rebranding_key_raw) if rebranding_key_raw else {}
+    except Exception:
+        rebranding_parsed = {}
+    fields = {
+        "rebranding_key": rebranding_key_raw,
+        "pay_go_minutes": _cache_safe_str(ss.get("pay_go_minutes") or ss.get("payGoMinutes") or rebranding_parsed.get("pay_go_minutes")),
+        "free_minutes": _cache_safe_str(ss.get("free_minutes") or ss.get("freeMinutes") or rebranding_parsed.get("free_minutes")),
+        "cycle_days": _cache_safe_str(ss.get("cycle_days") or ss.get("cycleDays") or rebranding_parsed.get("cycle_days")),
+        "plan": _cache_safe_str(ss.get("rebranding_plan") or ss.get("rebrandingPlan") or ss.get("planExternal") or ss.get("plan_external") or rebranding_parsed.get("plan")),
+        "plan_map": _cache_safe_str(ss.get("elaralo_plan_map") or ss.get("elaraloPlanMap") or rebranding_parsed.get("elaralo_plan_map")),
+    }
+    if not any(str(v or "").strip() for v in fields.values()):
+        return member_id, ""
+    payload = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return member_id, hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+def _member_rebranding_upsert_from_session_state_cached(session_state: Optional[Dict[str, Any]]) -> None:
+    if not _PERF_OPT_CACHE_ENABLED or _MEMBER_REBRANDING_UPSERT_CACHE_TTL_S <= 0:
+        _member_rebranding_upsert_from_session_state(session_state)
+        return
+    member_id, sig = _member_rebranding_upsert_signature(session_state)
+    if not member_id or not sig:
+        return
+    now = time.time()
+    with _MEMBER_REBRANDING_UPSERT_CACHE_LOCK:
+        cached = _MEMBER_REBRANDING_UPSERT_CACHE.get(member_id)
+        if cached:
+            ts, cached_sig = cached
+            if cached_sig == sig and (now - float(ts)) < float(_MEMBER_REBRANDING_UPSERT_CACHE_TTL_S):
+                return
+    _member_rebranding_upsert_from_session_state(session_state)
+    with _MEMBER_REBRANDING_UPSERT_CACHE_LOCK:
+        _MEMBER_REBRANDING_UPSERT_CACHE[member_id] = (now, sig)
 
 def _member_rebranding_get_paygo_config(member_id: str) -> Dict[str, Any]:
     mid = str(member_id or "").strip()
@@ -8824,6 +8989,105 @@ def _get_hco_system_blocks_cached_sync(avatar: str) -> List[str]:
     return blocks
 
 
+
+
+def _chat_companion_prompt_blocks_cached_sync(brand: str, avatar: str) -> Dict[str, Any]:
+    """Return cached Host Guidelines/reference/profile prompt fragments.
+
+    This preserves the exact prompt hierarchy used by /chat while avoiding repeated
+    SQLite/profile JSON work on every turn. Cache invalidation is explicit for Host
+    AI Guideline saves and TTL based for Host/Profile Studio approvals.
+    """
+    b = _cache_safe_str(brand)
+    a = _cache_safe_str(avatar)
+    if not b or not a:
+        return {"blocks": [], "has_guidelines": False, "has_profile": False, "reference_count": 0, "cache_hit": False}
+    key = (b.lower(), a.lower())
+    now = time.time()
+    if _PERF_OPT_CACHE_ENABLED and _CHAT_COMPANION_PROMPT_BLOCK_CACHE_TTL_S > 0:
+        try:
+            with _CHAT_COMPANION_PROMPT_BLOCK_CACHE_LOCK:
+                cached = _CHAT_COMPANION_PROMPT_BLOCK_CACHE.get(key)
+                if cached:
+                    ts, payload = cached
+                    if (now - float(ts)) < float(_CHAT_COMPANION_PROMPT_BLOCK_CACHE_TTL_S):
+                        out = _perf_json_clone(payload)
+                        if isinstance(out, dict):
+                            out["cache_hit"] = True
+                            return out
+        except Exception:
+            pass
+
+    blocks: List[str] = []
+    host_guidelines = ""
+    reference_count = 0
+    has_profile = False
+
+    try:
+        host_guidelines = _get_companion_guidelines_sync(b, a)
+    except Exception:
+        host_guidelines = ""
+
+    if host_guidelines:
+        blocks.append(
+            "Host AI guidelines (highest priority; set by the companion's human host). "
+            "If these guidelines conflict with other persona/onboarding text, follow THESE guidelines. "
+            "Always still follow platform safety policies.\n\n"
+            + str(host_guidelines).strip()
+        )
+        blocks.append(
+            "Guideline enforcement rule: Treat host AI guidelines as active instructions, not background suggestions. "
+            "If host guidelines identify specific public website pages, campaigns, FAQs, or resource paths, treat those as approved companion reference sources for this chat. "
+            "Do not say you cannot access a specifically referenced page. "
+            "Answer from the host guidelines plus any provided public-site reference blocks. "
+            "If a requested detail is not present in the provided reference material, say it is not stated in the provided companion references."
+        )
+
+        reference_site_url = ""
+        try:
+            reference_site_url = _get_public_website_url_for_avatar_sync(a)
+        except Exception:
+            reference_site_url = ""
+        if not reference_site_url:
+            try:
+                reference_site_url = _website_url_from_guidelines(host_guidelines)
+            except Exception:
+                reference_site_url = ""
+
+        try:
+            guideline_reference_blocks = _build_guideline_reference_page_blocks_sync(a, reference_site_url, host_guidelines)
+        except Exception:
+            guideline_reference_blocks = []
+        for block in guideline_reference_blocks or []:
+            if (block or "").strip():
+                blocks.append(str(block))
+                reference_count += 1
+
+    host_profile_block = ""
+    try:
+        host_profile_for_persona = _fetch_latest_host_profile_studio_profile_sync(b, a)
+        host_profile_block = _build_host_profile_studio_system_block(host_profile_for_persona)
+    except Exception:
+        host_profile_block = ""
+    if host_profile_block:
+        blocks.append(host_profile_block)
+        has_profile = True
+
+    payload = {
+        "blocks": blocks,
+        "has_guidelines": bool(host_guidelines),
+        "has_profile": bool(has_profile),
+        "reference_count": int(reference_count),
+        "cache_hit": False,
+    }
+    if _PERF_OPT_CACHE_ENABLED and _CHAT_COMPANION_PROMPT_BLOCK_CACHE_TTL_S > 0:
+        try:
+            with _CHAT_COMPANION_PROMPT_BLOCK_CACHE_LOCK:
+                _CHAT_COMPANION_PROMPT_BLOCK_CACHE[key] = (now, _perf_json_clone(payload))
+        except Exception:
+            pass
+    return payload
+
 # ---------------------------------------------------------------------------
 # Chat summary history (per save) in econnect.sqlite3
 # ---------------------------------------------------------------------------
@@ -10451,7 +10715,7 @@ async def chat(request: Request):
     voice_id = _extract_voice_id(raw)
 
     try:
-        _member_rebranding_upsert_from_session_state(session_state)
+        _member_rebranding_upsert_from_session_state_cached(session_state)
     except Exception:
         pass
 
@@ -10586,6 +10850,10 @@ async def chat(request: Request):
         minutes_allowed_override=minutes_allowed_override,
         cycle_days_override=cycle_days_override,
     )
+    try:
+        _clear_usage_status_fast_cache(identity_key)
+    except Exception:
+        pass
     _perf_stage("chat.usage_charge_check", usage_ok=bool(usage_ok), plan=plan_name_for_limits, brand=brand_for_usage)
 
 
@@ -11362,82 +11630,24 @@ async def chat(request: Request):
             llm_messages.insert(insert_at, {"role": "system", "content": block})
             insert_at += 1
 
-        # Host companion guidelines (highest priority).
-        # These are authored by the human companion (host) and should override onboarding text if conflicts exist.
+        # Host companion guidelines + approved Host Profile Studio persona block.
+        # v10.0.0-alpha15.11 caches these hot-path prompt fragments while preserving
+        # the same prompt hierarchy and insertion order.
         brand_name = _brand_from_session_state(session_state)
-        host_guidelines = ""
-        if brand_name and avatar_name:
-            try:
-                host_guidelines = await run_in_threadpool(_get_companion_guidelines_sync, brand_name, avatar_name)
-                _perf_stage("chat.guidelines_loaded", has_guidelines=bool(host_guidelines))
-            except Exception:
-                host_guidelines = ""
-        if host_guidelines:
-            llm_messages.insert(
-                insert_at,
-                {
-                    "role": "system",
-                    "content": (
-                        "Host AI guidelines (highest priority; set by the companion's human host). "
-                        "If these guidelines conflict with other persona/onboarding text, follow THESE guidelines. "
-                        "Always still follow platform safety policies.\n\n"
-                        + str(host_guidelines).strip()
-                    ),
-                },
-            )
-            insert_at += 1
-
-            guideline_enforcement_policy = (
-                "Guideline enforcement rule: Treat host AI guidelines as active instructions, not background suggestions. "
-                "If host guidelines identify specific public website pages, campaigns, FAQs, or resource paths, treat those as approved companion reference sources for this chat. "
-                "Do not say you cannot access a specifically referenced page. "
-                "Answer from the host guidelines plus any provided public-site reference blocks. "
-                "If a requested detail is not present in the provided reference material, say it is not stated in the provided companion references."
-            )
-            llm_messages.insert(insert_at, {"role": "system", "content": guideline_enforcement_policy})
-            insert_at += 1
-
-            reference_site_url = ""
-            try:
-                reference_site_url = await run_in_threadpool(_get_public_website_url_for_avatar_sync, avatar_name)
-            except Exception:
-                reference_site_url = ""
-            if not reference_site_url:
-                try:
-                    reference_site_url = _website_url_from_guidelines(host_guidelines)
-                except Exception:
-                    reference_site_url = ""
-
-            guideline_reference_blocks: List[str] = []
-            try:
-                guideline_reference_blocks = await run_in_threadpool(
-                    _build_guideline_reference_page_blocks_sync,
-                    avatar_name,
-                    reference_site_url,
-                    host_guidelines,
-                )
-            except Exception:
-                guideline_reference_blocks = []
-
-            for block in guideline_reference_blocks:
-                llm_messages.insert(insert_at, {"role": "system", "content": block})
+        prompt_fragments = await run_in_threadpool(_chat_companion_prompt_blocks_cached_sync, brand_name, avatar_name)
+        for block in list((prompt_fragments or {}).get("blocks") or []):
+            if (block or "").strip():
+                llm_messages.insert(insert_at, {"role": "system", "content": str(block)})
                 insert_at += 1
-
-
-        # Host Profile Studio persona block (second-line source of truth after Host AI Guidelines).
-        # This keeps the deployed AI Guidelines as the canonical rule source while allowing
-        # approved Host Profile Studio data to ground identity/persona consistently.
-        try:
-            host_profile_for_persona = await run_in_threadpool(_fetch_latest_host_profile_studio_profile_sync, brand_name, avatar_name)
-            host_profile_block = await run_in_threadpool(_build_host_profile_studio_system_block, host_profile_for_persona)
-        except Exception:
-            host_profile_block = ""
-        if host_profile_block:
-            llm_messages.insert(insert_at, {"role": "system", "content": host_profile_block})
-            insert_at += 1
-            _perf_stage("chat.host_profile_studio_persona_loaded", has_profile=True)
-        else:
-            _perf_stage("chat.host_profile_studio_persona_loaded", has_profile=False)
+        _perf_stage(
+            "chat.companion_prompt_fragments_loaded",
+            has_guidelines=bool((prompt_fragments or {}).get("has_guidelines")),
+            has_profile=bool((prompt_fragments or {}).get("has_profile")),
+            reference_count=int((prompt_fragments or {}).get("reference_count") or 0),
+            cache_hit=bool((prompt_fragments or {}).get("cache_hit")),
+        )
+        _perf_stage("chat.guidelines_loaded", has_guidelines=bool((prompt_fragments or {}).get("has_guidelines")))
+        _perf_stage("chat.host_profile_studio_persona_loaded", has_profile=bool((prompt_fragments or {}).get("has_profile")))
 
         identity_blocks = _chat_identity_system_blocks(session_state)
         for block in identity_blocks:
@@ -11683,71 +11893,13 @@ async def llm_warm(raw: Dict[str, Any] = Body(...)):
             pass
 
     brand_name = _brand_from_session_state(session_state)
-    host_guidelines = ""
-    if brand_name and avatar_name:
-        try:
-            host_guidelines = await run_in_threadpool(_get_companion_guidelines_sync, brand_name, avatar_name)
-        except Exception:
-            host_guidelines = ""
-    if host_guidelines:
-        warm_messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Host AI guidelines (highest priority; set by the companion's human host). "
-                    "If these guidelines conflict with other persona/onboarding text, follow THESE guidelines. "
-                    "Always still follow platform safety policies.\n\n"
-                    + str(host_guidelines).strip()
-                ),
-            }
-        )
-        warm_messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Guideline enforcement rule: Treat host AI guidelines as active instructions, not background suggestions. "
-                    "If host guidelines identify specific public website pages, campaigns, FAQs, or resource paths, treat those as approved companion reference sources for this chat. "
-                    "Do not say you cannot access a specifically referenced page. "
-                    "Answer from the host guidelines plus any provided public-site reference blocks. "
-                    "If a requested detail is not present in the provided reference material, say it is not stated in the provided companion references."
-                ),
-            }
-        )
-
-        reference_site_url = ""
-        try:
-            reference_site_url = await run_in_threadpool(_get_public_website_url_for_avatar_sync, avatar_name)
-        except Exception:
-            reference_site_url = ""
-        if not reference_site_url:
-            try:
-                reference_site_url = _website_url_from_guidelines(host_guidelines)
-            except Exception:
-                reference_site_url = ""
-
-        try:
-            guideline_reference_blocks = await run_in_threadpool(
-                _build_guideline_reference_page_blocks_sync,
-                avatar_name,
-                reference_site_url,
-                host_guidelines,
-            )
-        except Exception:
-            guideline_reference_blocks = []
-        for block in guideline_reference_blocks or []:
-            if (block or "").strip():
-                warm_messages.append({"role": "system", "content": block})
-
-    # Host Profile Studio runtime persona block for warm/opening response path.
-    # Keeps Host AI Guidelines as highest authority while giving openings/greetings
-    # the same approved persona grounding as standard chat turns.
     try:
-        host_profile_for_persona = await run_in_threadpool(_fetch_latest_host_profile_studio_profile_sync, brand_name, avatar_name)
-        host_profile_block = await run_in_threadpool(_build_host_profile_studio_system_block, host_profile_for_persona)
+        prompt_fragments = await run_in_threadpool(_chat_companion_prompt_blocks_cached_sync, brand_name, avatar_name)
     except Exception:
-        host_profile_block = ""
-    if host_profile_block:
-        warm_messages.append({"role": "system", "content": host_profile_block})
+        prompt_fragments = {"blocks": []}
+    for block in list((prompt_fragments or {}).get("blocks") or []):
+        if (block or "").strip():
+            warm_messages.append({"role": "system", "content": str(block)})
 
     for block in _chat_identity_system_blocks(session_state):
         if (block or "").strip():
@@ -17406,6 +17558,10 @@ async def host_companion_guidelines_set(req: HostCompanionGuidelinesSetRequest):
     b = (req.brand or "").strip()
     a = (req.avatar or "").strip()
     text = await run_in_threadpool(_set_companion_guidelines_sync, b, a, host_id, req.guidelines)
+    try:
+        _clear_chat_companion_prompt_block_cache(b, a)
+    except Exception:
+        pass
     return {"ok": True, "hostMemberId": host_id, "guidelines": text}
 
 
@@ -23490,6 +23646,11 @@ def _usage_credit_minutes_sync(identity_key: str, add_minutes: int) -> Dict[str,
             conn.commit()
 
             row2 = _usage_db_get_row(conn, member_id)
+            try:
+                _clear_usage_status_fast_cache(identity_key or member_id)
+                _clear_usage_status_fast_cache(member_id)
+            except Exception:
+                pass
             if row2 is None:
                 return {"ok": True, "member_id": member_id, "added_minutes": add_minutes_i}
             info = _usage_info_from_row(row2)
@@ -29600,22 +29761,58 @@ async def my_elaralo_companions_catalog(
     # hidden Host owner cards still require memberId and are only included when
     # resolved_member_id is present; public/visitor catalog calls receive AI
     # cards plus any explicitly visible Human cards.
-    items = _my_elaralo_companion_cards_sync(
+    companion_type_filter = _host_onboarding_safe_str(companionType or companion_type)
+    generation_filter = _host_onboarding_safe_str(generation)
+    ethnicity_filter = _host_onboarding_safe_str(ethnicity)
+    gender_filter = _host_onboarding_safe_str(gender)
+    public_base_url = _companion_public_api_base_url(request=request)
+    cache_key = "|".join([
+        "catalog",
+        brand_name.strip().lower(),
+        resolved_member_id.strip().lower(),
+        companion_type_filter.strip().lower(),
+        generation_filter.strip().lower(),
+        ethnicity_filter.strip().lower(),
+        gender_filter.strip().lower(),
+        str(public_base_url or "").strip().lower(),
+    ])
+    if _PERF_OPT_CACHE_ENABLED and _CATALOG_CACHE_TTL_S > 0:
+        try:
+            with _CATALOG_RESPONSE_CACHE_LOCK:
+                cached = _CATALOG_RESPONSE_CACHE.get(cache_key)
+                if cached:
+                    ts, payload = cached
+                    if (time.time() - float(ts)) < float(_CATALOG_CACHE_TTL_S):
+                        _perf_stage("catalog.cache_hit", brand=brand_name, member=bool(resolved_member_id))
+                        return _perf_json_clone(payload)
+        except Exception:
+            pass
+
+    items = await run_in_threadpool(
+        _my_elaralo_companion_cards_sync,
         brand=brand_name,
         member_id=resolved_member_id,
-        companion_type=_host_onboarding_safe_str(companionType or companion_type),
-        generation=_host_onboarding_safe_str(generation),
-        ethnicity=_host_onboarding_safe_str(ethnicity),
-        gender=_host_onboarding_safe_str(gender),
-        public_base_url=_companion_public_api_base_url(request=request),
+        companion_type=companion_type_filter,
+        generation=generation_filter,
+        ethnicity=ethnicity_filter,
+        gender=gender_filter,
+        public_base_url=public_base_url,
     )
-    return {
+    payload = {
         "ok": True,
         "brand": brand_name,
         "member_id": resolved_member_id,
         "count": len(items),
         "items": items,
     }
+    if _PERF_OPT_CACHE_ENABLED and _CATALOG_CACHE_TTL_S > 0:
+        try:
+            with _CATALOG_RESPONSE_CACHE_LOCK:
+                _CATALOG_RESPONSE_CACHE[cache_key] = (time.time(), _perf_json_clone(payload))
+            _perf_stage("catalog.cache_store", brand=brand_name, member=bool(resolved_member_id), count=len(items))
+        except Exception:
+            pass
+    return payload
 
 
 @app.post("/host-onboarding/catalog-visibility")
@@ -29760,6 +29957,10 @@ async def host_onboarding_catalog_visibility(request: Request):
 
     try:
         _load_companion_mappings_sync()
+    except Exception:
+        pass
+    try:
+        _clear_catalog_response_cache()
     except Exception:
         pass
 
@@ -29920,6 +30121,11 @@ async def host_onboarding_approve(session_id: str, req: HostOnboardingApproveReq
         conn.commit()
         try:
             _load_companion_mappings_sync()
+        except Exception:
+            pass
+        try:
+            _clear_catalog_response_cache()
+            _clear_chat_companion_prompt_block_cache(_host_onboarding_safe_str(exported_session.get("brand") or session.get("brand")), _host_onboarding_safe_str(exported_session.get("avatar") or session.get("avatar")))
         except Exception:
             pass
         return {
