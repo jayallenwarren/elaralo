@@ -14695,6 +14695,43 @@ const modePillControls = (
     ui.usageBarHeight,
   ]);
 
+  const normalizedCompanyNameForLink = String(companyName || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+  const companyHomeHref = isElaraloBrandName(companyName)
+    ? "https://www.elaralo.com/"
+    : normalizedCompanyNameForLink === "dulcemoon"
+      ? "https://www.dulcemoon.net/"
+      : "";
+  const companionTypeBadgeLabel =
+    String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human"
+      ? "Human"
+      : "AI";
+  const companionTypeBadge = (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        marginLeft: 8,
+        padding: "2px 8px",
+        borderRadius: 999,
+        border: "1px solid rgba(17,17,17,0.18)",
+        background: companionTypeBadgeLabel === "Human" ? "#f3f4f6" : "#eef4ff",
+        color: companionTypeBadgeLabel === "Human" ? "#374151" : "#1d4ed8",
+        fontSize: 12,
+        fontWeight: 800,
+        lineHeight: 1.25,
+        verticalAlign: "middle",
+        whiteSpace: "nowrap",
+      }}
+      aria-label={`${companionTypeBadgeLabel} companion`}
+    >
+      {companionTypeBadgeLabel}
+    </span>
+  );
+
   const topupMinutesTotal = Math.max(1, Number(topupUnits || 1) || 1) * Math.max(1, Number(topupMinutesPerUnit || 30) || 30);
   const topupEstimatedUnitAmountCents = /dulcemoon/i.test(String(companyName || rebranding || "")) ? 699 : 499;
   const topupPriceText = formatCents(
@@ -15226,12 +15263,12 @@ const modePillControls = (
                   color: "#666",
                 }}
               >
-                {isElaraloBrandName(companyName) ? (
+                {companyHomeHref ? (
                   <a
-                    href="https://www.elaralo.com/"
+                    href={companyHomeHref}
                     target="_top"
                     style={{ color: "inherit", textDecoration: "none", cursor: "pointer" }}
-                    aria-label="Open Elaralo home page"
+                    aria-label={`Open ${companyName} home page`}
                   >
                     {companyName}
                   </a>
@@ -15239,14 +15276,19 @@ const modePillControls = (
                   companyName
                 )}
               </div>
-              <h1 style={{ margin: 0, fontSize: Math.max(ui.title, 28), lineHeight: 1.08 }}>
-                {companionName || DEFAULT_COMPANION_NAME}
+              <h1
+                style={{
+                  margin: 0,
+                  fontSize: Math.max(ui.title, 28),
+                  lineHeight: 1.08,
+                  display: "flex",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                }}
+              >
+                <span>{companionName || DEFAULT_COMPANION_NAME}</span>
+                {companionTypeBadge}
               </h1>
-              <div style={{ marginTop: 5, fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
-                {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human"
-                  ? "Human Companion"
-                  : "AI Companion"}
-              </div>
               <div style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
                 Plan: <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
               </div>
@@ -15403,12 +15445,12 @@ const modePillControls = (
             </div>
             <div>
               <h1 style={{ margin: 0, fontSize: ui.title }}>
-                {isElaraloBrandName(companyName) ? (
+                {companyHomeHref ? (
                   <a
-                    href="https://www.elaralo.com/"
+                    href={companyHomeHref}
                     target="_top"
                     style={{ color: "inherit", textDecoration: "none", cursor: "pointer" }}
-                    aria-label="Open Elaralo home page"
+                    aria-label={`Open ${companyName} home page`}
                   >
                     {companyName}
                   </a>
@@ -15416,9 +15458,14 @@ const modePillControls = (
                   companyName
                 )}
               </h1>
-              <div style={{ fontSize: ui.meta, color: "#666" }}>
-                Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-                <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
+              <div style={{ fontSize: ui.meta, color: "#666", display: "flex", alignItems: "center", flexWrap: "wrap" }}>
+                <span>
+                  Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b>
+                </span>
+                {companionTypeBadge}
+                <span style={{ marginLeft: 8 }}>
+                  • Plan: <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
+                </span>
               </div>
               <div style={{ fontSize: ui.meta, color: "#666" }}>
                 Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
