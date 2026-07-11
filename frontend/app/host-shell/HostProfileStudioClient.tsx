@@ -1506,18 +1506,15 @@ export default function HostProfileStudioClient() {
     setMediaLoading(true);
     setMediaStatusMessage("");
     try {
-      const res = await fetch(`${API_BASE}/host-onboarding/media/sync`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ memberId: context.memberId, sessionId: session.session_id }),
-      });
+      const qs = new URLSearchParams({ memberId: context.memberId, sessionId: session.session_id });
+      const res = await fetch(`${API_BASE}/host-onboarding/media/list?${qs.toString()}`);
       const data = await res.json().catch(() => ({} as any));
       if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
       setMediaItems((Array.isArray(data?.items) ? data.items : []).map(normalizeMediaItem));
       setMediaContext((prev) => ({ ...(prev || {}), available: true, counts: data?.counts || prev?.counts || {} }));
-      setMediaStatusMessage("Media library synced.");
+      setMediaStatusMessage("Media list refreshed.");
     } catch (err: any) {
-      setError(String(err?.message || "Unable to sync Media library."));
+      setError(String(err?.message || "Unable to refresh Media list."));
     } finally {
       setMediaLoading(false);
     }
@@ -2041,7 +2038,7 @@ export default function HostProfileStudioClient() {
         <div style={{ ...cardStyle, padding: 14, display: "grid", gap: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
             <div style={{ fontWeight: 800 }}>Media Library</div>
-            <button type="button" style={secondaryButtonStyle} onClick={() => void refreshMediaList()} disabled={mediaLoading}>{mediaLoading ? "Syncing…" : "Sync Media Library"}</button>
+            <button type="button" style={secondaryButtonStyle} onClick={() => void refreshMediaList()} disabled={mediaLoading} title="Reload the latest Media Library list from the server without running maintenance sync.">{mediaLoading ? "Refreshing…" : "Refresh Media List"}</button>
           </div>
           {mediaStatusMessage ? <div style={{ color: "#065f46", fontWeight: 700 }}>{mediaStatusMessage}</div> : null}
           {mediaItems.length ? (

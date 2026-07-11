@@ -28214,11 +28214,7 @@ async def host_onboarding_media_context(memberId: str = "", member_id: str = "",
             raise
         brand = _host_onboarding_safe_str(mapping.get("brand") or "Elaralo")
         companion_mapping_id = int(mapping.get("mapping_id") or 0)
-        conn.execute("BEGIN IMMEDIATE")
-        sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=_host_onboarding_safe_str(mapping.get("host_member_id") or member), host_email=_human_media_safe_email(mapping.get("host_email") or ""))
-        _human_media_migrate_old_photo_runtime_state_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
-        _human_media_drop_legacy_photo_tables_on_conn(conn)
-        conn.commit()
+        counts = _human_media_counts_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
         return {
             "ok": True,
             "available": True,
@@ -28231,7 +28227,7 @@ async def host_onboarding_media_context(memberId: str = "", member_id: str = "",
             "photos_dir": _human_media_photos_dir(companion_mapping_id),
             "videos_dir": _human_media_videos_dir(companion_mapping_id),
             "metadata_file": _human_media_metadata_path(companion_mapping_id),
-            "counts": sync_info,
+            "counts": counts,
         }
     finally:
         try:
@@ -28253,13 +28249,9 @@ async def host_onboarding_media_list(memberId: str = "", member_id: str = "", se
         mapping = _human_media_authorize_host_on_conn(conn, member_id=member, session_id=sid)
         brand = _host_onboarding_safe_str(mapping.get("brand") or "Elaralo")
         companion_mapping_id = int(mapping.get("mapping_id") or 0)
-        conn.execute("BEGIN IMMEDIATE")
-        sync_info = _human_media_sync_inventory_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, host_member_id=_host_onboarding_safe_str(mapping.get("host_member_id") or member), host_email=_human_media_safe_email(mapping.get("host_email") or ""))
-        _human_media_migrate_old_photo_runtime_state_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
-        _human_media_drop_legacy_photo_tables_on_conn(conn)
-        conn.commit()
         items = _human_media_list_rows_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id, member_id=member, session_id=sid)
-        return {"ok": True, "items": items, "counts": sync_info, "companion_mapping_id": companion_mapping_id, "companionMappingId": companion_mapping_id}
+        counts = _human_media_counts_on_conn(conn, brand=brand, companion_mapping_id=companion_mapping_id)
+        return {"ok": True, "items": items, "counts": counts, "companion_mapping_id": companion_mapping_id, "companionMappingId": companion_mapping_id}
     finally:
         try:
             conn.close()
@@ -28308,6 +28300,15 @@ async def host_onboarding_media_file(media_id: int, memberId: str = "", member_i
 
 @app.post("/host-onboarding/media/sync")
 async def host_onboarding_media_sync(request: Request) -> Dict[str, Any]:
+    """Admin/internal reconciliation for Host Profile Studio Media libraries.
+
+    This endpoint can move files, migrate metadata, reconcile inventory, mark missing rows,
+    migrate legacy photo runtime state, and drop legacy alpha15 photo tables. It is not a
+    host-facing action and must not be called by Host Profile Studio UI controls.
+    """
+    token = (request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token") or "").strip()
+    if not USAGE_ADMIN_TOKEN or token != USAGE_ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
     raw = await request.json()
     member = _host_onboarding_normalize_member_id((raw or {}).get("memberId") or (raw or {}).get("member_id"))
     sid = _host_onboarding_safe_str((raw or {}).get("sessionId") or (raw or {}).get("session_id"))
