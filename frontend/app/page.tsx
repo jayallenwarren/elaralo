@@ -14348,6 +14348,21 @@ const spotlightHref = isElaraloBrandName(companyName)
   : normalizedCompanyNameForActions === "dulcemoon"
     ? "https://dulcemoon.net/#spotlight"
     : "";
+const siteFaqHref = isElaraloBrandName(companyName)
+  ? "https://elaralo.com/faqs"
+  : normalizedCompanyNameForActions === "dulcemoon"
+    ? "https://dulcemoon.net/faqs"
+    : "";
+// Forward-compatible Persona FAQ resolution. Until a Persona-specific URL is
+// provided by its mapping/profile, the button falls back to the brand site FAQ.
+const personaFaqHref = String(
+  (companionMapping as any)?.faq_url ??
+  (companionMapping as any)?.faqUrl ??
+  (companionMapping as any)?.public_faq_url ??
+  (companionMapping as any)?.publicFaqUrl ??
+  ""
+).trim();
+const faqHref = personaFaqHref || siteFaqHref;
 const hasSubscribedPlan = Boolean(
   loggedIn &&
   memberId &&
@@ -14382,34 +14397,6 @@ const modePillControls = (
             width: useCompactCompanionCard ? "100%" : "auto",
           }}
         >
-          {spotlightHref ? (
-            <a
-              href={spotlightHref}
-              target="_top"
-              rel="noopener noreferrer"
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: "#fff",
-                color: "#111",
-                cursor: "pointer",
-                fontWeight: 400,
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                width: useCompactCompanionCard ? "100%" : "auto",
-                minHeight: useCompactCompanionCard ? 44 : undefined,
-                boxSizing: "border-box",
-                textDecoration: "none",
-              }}
-              aria-label={`Open ${companyName} Spotlights`}
-            >
-              Spotlights
-            </a>
-          ) : null}
-
           <button
             type="button"
             onClick={() => {
@@ -14527,33 +14514,6 @@ const modePillControls = (
         </div>
       ) : (
         <>
-          {spotlightHref ? (
-            <a
-              href={spotlightHref}
-              target="_top"
-              rel="noopener noreferrer"
-              style={{
-                padding: "8px 12px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                background: "#fff",
-                color: "#111",
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-                width: useCompactCompanionCard ? "100%" : "auto",
-                minHeight: useCompactCompanionCard ? 42 : undefined,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                boxSizing: "border-box",
-                textDecoration: "none",
-              }}
-              aria-label={`Open ${companyName} Spotlights`}
-            >
-              Spotlights
-            </a>
-          ) : null}
-
           <button
             key="subscription-action"
             onClick={() => {
@@ -14745,6 +14705,70 @@ const modePillControls = (
     ui.meta,
     ui.usageBarHeight,
   ]);
+
+  const experienceNavigationButtons = spotlightHref || faqHref ? (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: spotlightHref && faqHref ? "repeat(2, minmax(0, 1fr))" : "minmax(0, 1fr)",
+        gap: 8,
+        width: "100%",
+        marginTop: 10,
+      }}
+      aria-label="Connect navigation"
+    >
+      {spotlightHref ? (
+        <a
+          href={spotlightHref}
+          target="_top"
+          rel="noopener noreferrer"
+          style={{
+            minHeight: 42,
+            padding: "9px 12px",
+            borderRadius: 10,
+            border: "1px solid #111",
+            background: "#fff",
+            color: "#111",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            boxSizing: "border-box",
+            textDecoration: "none",
+            fontWeight: 500,
+            whiteSpace: "nowrap",
+          }}
+          aria-label={`Open ${companyName} Spotlights`}
+        >
+          Spotlights
+        </a>
+      ) : null}
+      {faqHref ? (
+        <a
+          href={faqHref}
+          target="_top"
+          rel="noopener noreferrer"
+          style={{
+            minHeight: 42,
+            padding: "9px 12px",
+            borderRadius: 10,
+            border: "1px solid #111",
+            background: "#fff",
+            color: "#111",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            boxSizing: "border-box",
+            textDecoration: "none",
+            fontWeight: 500,
+            whiteSpace: "nowrap",
+          }}
+          aria-label={`Open ${companyName} FAQs`}
+        >
+          FAQs
+        </a>
+      ) : null}
+    </div>
+  ) : null;
 
   const normalizedCompanyNameForLink = String(companyName || "")
     .trim()
@@ -15516,6 +15540,7 @@ const modePillControls = (
 
             <div style={{ width: "100%", marginTop: 2 }}>
               {usageMeterEl}
+              {experienceNavigationButtons}
             </div>
 
             {!isMobileUI && canReturnToCompanionList ? (
@@ -15658,6 +15683,7 @@ const modePillControls = (
                 {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
               </div>
               {usageMeterEl}
+              {experienceNavigationButtons}
               {liveProvider === "stream" ? (
                 <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {sessionActive && !hostInStreamUi && !viewerInStreamUi ? (
