@@ -14276,37 +14276,6 @@ const sttControls =
         </button>
       )}
 
-      {isMobileUI && canReturnToCompanionList ? (
-        <button
-          type="button"
-          onClick={() => {
-            setSwitchCompanionFlash(true);
-            window.setTimeout(() => {
-              goToCompanionList();
-              setSwitchCompanionFlash(false);
-            }, 120);
-          }}
-          style={{
-            height: ICON_BTN_SIZE,
-            minHeight: ICON_BTN_SIZE,
-            padding: "0 12px",
-            borderRadius: 10,
-            border: "1px solid #111",
-            boxSizing: "border-box",
-            background: switchCompanionFlash ? "#111" : "#fff",
-            color: switchCompanionFlash ? "#fff" : "#111",
-            cursor: "pointer",
-            fontWeight: 700,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            whiteSpace: "nowrap",
-          }}
-          title="Switch companion"
-        >
-          Switch
-        </button>
-      ) : null}
 </>
   );
 
@@ -14372,6 +14341,79 @@ const hasSubscribedPlan = Boolean(
   planName !== "Pay as You Go"
 );
 const subscriptionActionLabel = hasSubscribedPlan ? "Upgrade" : "Subscribe";
+
+const normalizedAvatarStatus = String(avatarStatus || "idle").trim().toLowerCase();
+const experienceStatusLabel = (() => {
+  if (liveProvider === "stream") {
+    if (sessionKind === "conference" && (sessionActive || Boolean(livekitToken))) return "Private Session";
+    if (sessionActive || Boolean(livekitToken)) return "Live Stream";
+  }
+  switch (normalizedAvatarStatus) {
+    case "connected":
+      return "Connected";
+    case "connecting":
+    case "reconnecting":
+      return "Connecting";
+    case "waiting":
+      return "Waiting";
+    case "error":
+      return "Unavailable";
+    case "offline":
+    case "disconnected":
+      return "Offline";
+    case "idle":
+    case "ready":
+    case "":
+      return "Ready";
+    default:
+      return normalizedAvatarStatus
+        .replace(/[_-]+/g, " ")
+        .replace(/\b\w/g, (character) => character.toUpperCase());
+  }
+})();
+const experienceStatusColor =
+  experienceStatusLabel === "Connected" ||
+  experienceStatusLabel === "Ready" ||
+  experienceStatusLabel === "Live Stream"
+    ? "#0a7a2f"
+    : experienceStatusLabel === "Connecting" ||
+        experienceStatusLabel === "Waiting" ||
+        experienceStatusLabel === "Private Session"
+      ? "#0d47a1"
+      : experienceStatusLabel === "Unavailable"
+        ? "#b00020"
+        : "#666";
+
+const switchPersonaButton = canReturnToCompanionList ? (
+  <button
+    type="button"
+    onClick={() => {
+      setSwitchCompanionFlash(true);
+      window.setTimeout(() => {
+        goToCompanionList();
+        setSwitchCompanionFlash(false);
+      }, 120);
+    }}
+    style={{
+      padding: "10px 14px",
+      borderRadius: 10,
+      border: "1px solid #111",
+      background: switchCompanionFlash ? "#111" : "#fff",
+      color: switchCompanionFlash ? "#fff" : "#111",
+      cursor: "pointer",
+      fontWeight: 400,
+      whiteSpace: "nowrap",
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      width: useCompactCompanionCard ? "100%" : "auto",
+      minHeight: useCompactCompanionCard ? 44 : undefined,
+    }}
+    title="Switch persona"
+  >
+    Switch
+  </button>
+) : null;
 
 const modePillControls = (
 
@@ -14457,6 +14499,8 @@ const modePillControls = (
               Set Mode
             </button>
           ) : null}
+
+          {switchPersonaButton}
 
           <button
             type="button"
@@ -14572,6 +14616,8 @@ const modePillControls = (
               </button>
             );
           })}
+
+          {switchPersonaButton}
 
           <button
             key="add-minutes"
@@ -15467,22 +15513,10 @@ const modePillControls = (
                 ) : null}
               </div>
               <div style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
-                {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human"
-                  ? "Live Companion"
-                  : "Live Avatar"}: {" "}
-                <b
-                  style={{
-                    color:
-                      avatarStatus === "connected"
-                        ? "#0a7a2f"
-                        : avatarStatus === "connecting" || avatarStatus === "reconnecting" || avatarStatus === "waiting"
-                          ? "#0d47a1"
-                          : avatarStatus === "error"
-                            ? "#b00020"
-                            : "#666",
-                  }}
-                >
-                  {avatarStatus}
+                Status: {" "}
+                <b style={{ color: experienceStatusColor }}>
+                  <span aria-hidden style={{ marginRight: 5 }}>●</span>
+                  {experienceStatusLabel}
                 </b>
                 {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
               </div>
@@ -15542,38 +15576,6 @@ const modePillControls = (
               {usageMeterEl}
               {experienceNavigationButtons}
             </div>
-
-            {!isMobileUI && canReturnToCompanionList ? (
-              <button
-                type="button"
-                onClick={() => {
-                  setSwitchCompanionFlash(true);
-                  window.setTimeout(() => {
-                    goToCompanionList();
-                    setSwitchCompanionFlash(false);
-                  }, 120);
-                }}
-                style={{
-                  minHeight: 42,
-                  padding: "0 14px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  boxSizing: "border-box",
-                  background: switchCompanionFlash ? "#111" : "#fff",
-                  color: switchCompanionFlash ? "#fff" : "#111",
-                  cursor: "pointer",
-                  fontWeight: 700,
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  whiteSpace: "nowrap",
-                  alignSelf: "flex-start",
-                }}
-                title="Switch persona"
-              >
-                Switch
-              </button>
-            ) : null}
 
             {liveProvider === "stream" ? (
               <div style={{ marginTop: 2, display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -15678,8 +15680,11 @@ const modePillControls = (
                 ) : null}
               </div>
               <div style={{ fontSize: ui.meta, color: "#666" }}>
-                {String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human" ? "Live Companion" : "Live Avatar"}: {" "}
-                <b>{avatarStatus}</b>
+                Status: {" "}
+                <b style={{ color: experienceStatusColor }}>
+                  <span aria-hidden style={{ marginRight: 5 }}>●</span>
+                  {experienceStatusLabel}
+                </b>
                 {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
               </div>
               {usageMeterEl}
