@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.17: companion-card action column adds brand Spotlight, conditional Subscribe/Upgrade, reordered controls, and Switch label; protected STT/TTS/media behavior unchanged.
+// v10.0.0-alpha15.18: companion-card Spotlight button label and brand anchors updated; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
@@ -14368,9 +14368,9 @@ const normalizedCompanyNameForActions = String(companyName || "")
   .toLowerCase()
   .replace(/[^a-z0-9]+/g, "");
 const spotlightHref = isElaraloBrandName(companyName)
-  ? "https://elaralo.com/#spotlights"
+  ? "https://elaralo.com/#spotlight"
   : normalizedCompanyNameForActions === "dulcemoon"
-    ? "https://dulcemoon.net/#spotlights"
+    ? "https://dulcemoon.net/#spotlight"
     : "";
 const hasSubscribedPlan = Boolean(
   loggedIn &&
@@ -14430,7 +14430,7 @@ const modePillControls = (
               }}
               aria-label={`Open ${companyName} Spotlights`}
             >
-              Go Spotlight
+              Spotlights
             </a>
           ) : null}
 
@@ -14574,7 +14574,7 @@ const modePillControls = (
               }}
               aria-label={`Open ${companyName} Spotlights`}
             >
-              Go Spotlight
+              Spotlights
             </a>
           ) : null}
 
