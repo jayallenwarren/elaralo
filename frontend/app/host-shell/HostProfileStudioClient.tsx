@@ -1,5 +1,6 @@
 
 "use client";
+// v10.0.0-alpha15.19: user-facing Host Profile Studio terminology updated to Persona Studio; routes and API contracts unchanged.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -1323,7 +1324,7 @@ export default function HostProfileStudioClient() {
       if (!res.ok || !data?.session) throw new Error(String(data?.detail || `HTTP ${res.status}`));
       hydrateFromSession(data.session as HostOnboardingSession, (data?.readiness || {}) as HostOnboardingReadiness);
       setStep("completion");
-      setNotice("Derived review accepted. Complete or intentionally skip the remaining profile sections.");
+      setNotice("Derived review accepted. Complete or intentionally skip the remaining persona sections.");
     } catch (err: any) {
       setError(String(err?.message || "Unable to save review changes."));
     } finally {
@@ -1359,10 +1360,10 @@ export default function HostProfileStudioClient() {
       if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
       setNotice(
         data?.mapping_missing
-          ? "Catalog visibility preference saved. The public catalog row will be updated after this Host profile is exported."
+          ? "Catalog visibility preference saved. The public catalog row will be updated after this Persona is exported."
           : Boolean(nextVisible)
-            ? "Your Host profile will be listed in the Companion catalog."
-            : "Your Host profile is hidden from the Companion catalog."
+            ? "Your Persona will be listed in the Companion catalog."
+            : "Your Persona is hidden from the Companion catalog."
       );
     } catch (err: any) {
       setCompletionForm((p) => ({ ...p, list_in_companion_catalog: !Boolean(nextVisible) }));
@@ -1655,10 +1656,10 @@ export default function HostProfileStudioClient() {
       hydrateFromSession(data.session as HostOnboardingSession, (data?.readiness || {}) as HostOnboardingReadiness);
       setPreviewData(data.preview || null);
       if (scope === "full") setLocalProfileDirty(false);
-      setNotice(scope === "full" ? "Full profile approved." : "Limited profile approved.");
+      setNotice(scope === "full" ? "Full persona approved." : "Limited persona approved.");
       setStep("preview");
     } catch (err: any) {
-      setError(String(err?.message || "Unable to approve profile."));
+      setError(String(err?.message || "Unable to approve persona."));
     } finally {
       setSaving(false);
     }
@@ -2122,18 +2123,18 @@ export default function HostProfileStudioClient() {
   }, [localProfileDirty, readiness.full_publish_ready, session?.approved_version_id, session?.publish_status, session?.workflow_state]);
 
   const fullProfileApprovalButtonLabel = fullProfileApprovalIsCurrent
-    ? "✓ Profile approved"
+    ? "✓ Persona approved"
     : saving
       ? "Saving…"
       : session?.approved_version_id
         ? "Approve again"
-        : "Approve full profile";
+        : "Approve full persona";
 
   const fullProfileApprovalButtonTitle = fullProfileApprovalIsCurrent
-    ? "Profile is approved. Edit any field to approve again."
+    ? "Persona is approved. Edit any field to approve again."
     : session?.approved_version_id
       ? "Approve again to publish the latest edits."
-      : "Approve the full profile.";
+      : "Approve the full persona.";
 
   const handleApproveLimitedClick = useCallback(() => {
     if (saving) return;
@@ -2143,7 +2144,7 @@ export default function HostProfileStudioClient() {
         : ["Basics", "required photos", "derived review", `Voice capture (minimum ${voiceCaptureMinSeconds} seconds)`];
       const voiceDetails = voiceCaptureBlockers.length ? ` ${voiceCaptureBlockers.join(" ")}` : "";
       setNotice("");
-      setError(`Approve Limited Profile requires: ${missing.join(", ")}.${voiceDetails}`);
+      setError(`Approve Limited Persona requires: ${missing.join(", ")}.${voiceDetails}`);
       if (!voiceCaptureMeetsMinimum || missing.some((item) => String(item || "").toLowerCase().includes("voice"))) {
         setStep("completion");
       } else if (missing.some((item) => String(item || "").toLowerCase().includes("photo"))) {
@@ -2166,8 +2167,8 @@ export default function HostProfileStudioClient() {
       setNotice("");
       setError(
         missing.length
-          ? `Approve Full Profile requires these requirements to be completed and not skipped: ${missing.join(", ")}.${voiceDetails}`
-          : "Approve Full Profile requires all profile requirements, including a validated voice capture, to be completed and not skipped.",
+          ? `Approve Full Persona requires these requirements to be completed and not skipped: ${missing.join(", ")}.${voiceDetails}`
+          : "Approve Full Persona requires all persona requirements, including a validated voice capture, to be completed and not skipped.",
       );
       setStep("completion");
       return;
@@ -2179,9 +2180,9 @@ export default function HostProfileStudioClient() {
     return (
       <main style={{ maxWidth: 900, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
         <div style={cardStyle}>
-          <h1 style={{ marginTop: 0 }}>Host Profile Studio</h1>
+          <h1 style={{ marginTop: 0 }}>Persona Studio</h1>
           <p style={{ color: "#444", lineHeight: 1.6 }}>
-            Waiting for host context from the Elaralo master site…
+            Waiting for Persona Studio context from the Elaralo master site…
           </p>
         </div>
       </main>
@@ -2192,9 +2193,9 @@ export default function HostProfileStudioClient() {
     return (
       <main style={{ maxWidth: 900, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
         <div style={cardStyle}>
-          <h1 style={{ marginTop: 0 }}>Host Profile Studio</h1>
+          <h1 style={{ marginTop: 0 }}>Persona Studio</h1>
           <p style={{ color: "#444", lineHeight: 1.6 }}>
-            Host Onboarding requires a logged-in host member session. Open this page from the Elaralo member area after sign-in.
+            Persona Studio requires a logged-in host member session. Open this page from the Elaralo member area after sign-in.
           </p>
         </div>
       </main>
@@ -2212,9 +2213,9 @@ export default function HostProfileStudioClient() {
           <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
             <div>
               <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "#6b7280" }}>
-                Host Onboarding / Host Profile Studio
+                Host Onboarding / Persona Studio
               </div>
-              <h1 style={{ margin: "4px 0 0 0", fontSize: 30 }}>Build your Host Human Companion Profile</h1>
+              <h1 style={{ margin: "4px 0 0 0", fontSize: 30 }}>Build your Human Companion Persona</h1>
               <div style={{ marginTop: 6, color: "#4b5563", fontSize: 14 }}>
                 {context.brand} • {context.avatar} • English-only intake for this iteration
               </div>
@@ -2256,12 +2257,12 @@ export default function HostProfileStudioClient() {
         </div>
 
         {loading ? (
-          <div style={cardStyle}>Loading Host Onboarding…</div>
+          <div style={cardStyle}>Loading Persona Studio…</div>
         ) : step === "welcome" ? (
           <div style={{ ...cardStyle, display: "grid", gap: 16 }}>
             <h2 style={{ margin: 0 }}>Welcome and requirements</h2>
             <p style={{ margin: 0, lineHeight: 1.6, color: "#374151" }}>
-              This staged workflow starts with the minimum structured information needed to derive an initial Host Human Companion Profile, then lets you review, correct, and complete the remaining sections before publishing an approved version.
+              This staged workflow starts with the minimum structured information needed to derive an initial Human Companion Persona, then lets you review, correct, and complete the remaining sections before publishing an approved version.
             </p>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
               <div style={cardStyle}>
@@ -2463,7 +2464,7 @@ export default function HostProfileStudioClient() {
           <div style={{ ...cardStyle, display: "grid", gap: 16 }}>
             <h2 style={{ margin: 0 }}>Progressive completion</h2>
             <div style={{ color: "#4b5563", lineHeight: 1.6 }}>
-              Complete the remaining profile sections or intentionally skip them for a limited publish. Estimated income is private and will be derived from the current job title if left blank.
+              Complete the remaining persona sections or intentionally skip them for a limited publish. Estimated income is private and will be derived from the current job title if left blank.
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
               <div style={{ display: "grid", gap: 12, gridColumn: "1 / -1" }}>
@@ -2548,10 +2549,10 @@ export default function HostProfileStudioClient() {
                 onClick={(e) => e.stopPropagation()}
                 onChange={(e) => handleCatalogVisibilityChange(e.currentTarget.checked)}
                 style={{ ...checkboxStyle, marginTop: 3 }}
-                aria-label="List my Host profile in the Companion catalog"
+                aria-label="List my Persona in the Companion catalog"
               />
               <span style={{ display: "grid", gap: 4 }}>
-                <span style={{ fontWeight: 800 }}>List my Host profile in the Companion catalog</span>
+                <span style={{ fontWeight: 800 }}>List my Persona in the Companion catalog</span>
                 <span style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
                   Optional and off by default. When unchecked, your Human Companion remains available to you for management/testing, but ordinary members and visitors will not see it on the Companion page.
                 </span>
@@ -2563,7 +2564,7 @@ export default function HostProfileStudioClient() {
                 <div>
                   <div style={{ fontWeight: 800 }}>Voice capture (minimum 30 seconds)</div>
                   <div style={{ fontSize: 13, color: "#4b5563", lineHeight: 1.6 }}>
-                    Record or upload a voice sample that is at least {voiceCaptureMinSeconds} seconds long. The guided script below is written to run about {voiceCaptureTargetSeconds} seconds at a natural pace. This clip is required for limited and full profile approval and is exported with the approved Elaralo companion assets.
+                    Record or upload a voice sample that is at least {voiceCaptureMinSeconds} seconds long. The guided script below is written to run about {voiceCaptureTargetSeconds} seconds at a natural pace. This clip is required for limited and full persona approval and is exported with the approved Elaralo companion assets.
                   </div>
                 </div>
                 <div style={{ fontSize: 13, color: "#6b7280" }}>
@@ -2627,7 +2628,7 @@ export default function HostProfileStudioClient() {
                   ) : null}
                   {!voiceCaptureMeetsMinimum ? (
                     <div style={{ color: "#92400e", fontSize: 13, lineHeight: 1.6 }}>
-                      Limited and full profile approval require one accepted voice capture that is at least {voiceCaptureMinSeconds} seconds long.
+                      Limited and full persona approval require one accepted voice capture that is at least {voiceCaptureMinSeconds} seconds long.
                     </div>
                   ) : null}
                 </div>
@@ -2690,7 +2691,7 @@ export default function HostProfileStudioClient() {
             {previewPanel === "media" && mediaTabAvailable ? renderMediaPanel() : (
               <>
             <div style={{ color: "#4b5563", lineHeight: 1.6 }}>
-              Review the compiled profile. Legal/private information is separated from the public/persona profile, and you can jump back to update any section before approval.
+              Review the compiled persona. Legal/private information is separated from the public/persona profile, and you can jump back to update any section before approval.
             </div>
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
               <button type="button" style={secondaryButtonStyle} onClick={() => void loadPreview()} disabled={saving}>{saving ? "Refreshing…" : "Refresh preview"}</button>
@@ -2746,7 +2747,7 @@ export default function HostProfileStudioClient() {
                   Public gallery images currently selected: {publicGalleryAssetsForEditor.length}. The headshot remains the primary public portrait and is not included in this gallery.
                 </div>
                 <div style={{ fontSize: 13, color: "#6b7280", lineHeight: 1.6 }}>
-                  Uploaded changes are saved to the current onboarding session immediately. Re-approve the profile when you are ready for the Summary Public Page to reflect the latest gallery.
+                  Uploaded changes are saved to the current onboarding session immediately. Re-approve the persona when you are ready for the Summary Public Page to reflect the latest gallery.
                 </div>
               </div>
               {publicGalleryAssetsForEditor.length ? (
@@ -2826,7 +2827,7 @@ export default function HostProfileStudioClient() {
               <button type="button" style={secondaryButtonStyle} onClick={() => setStep("completion")}>Back</button>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                 <button type="button" style={secondaryButtonStyle} onClick={handleApproveLimitedClick} disabled={saving}>
-                  {saving ? "Saving…" : "Approve limited profile"}
+                  {saving ? "Saving…" : "Approve limited persona"}
                 </button>
                 <button
                   type="button"

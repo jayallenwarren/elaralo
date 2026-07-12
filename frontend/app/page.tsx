@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.18: companion-card Spotlight button label and brand anchors updated; protected STT/TTS/media behavior unchanged.
+// v10.0.0-alpha15.19: Experience Panel (Persona/Video) responsive layout + Persona Studio terminology; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
@@ -3447,7 +3447,7 @@ function HostOnboardingApp() {
 
   const WelcomeScreen = () => (
     <div style={{ ...HO_CARD, padding: 26 }}>
-      <div style={{ fontSize: 30, fontWeight: 900, marginBottom: 10 }}>Complete Your Host Profile</div>
+      <div style={{ fontSize: 30, fontWeight: 900, marginBottom: 10 }}>Complete Your Persona</div>
       <div style={{ fontSize: 15, lineHeight: 1.65, color: "rgba(0,0,0,0.76)", marginBottom: 16 }}>
         This onboarding is staged. You can save and return later. For this release, all entries must be in English.
       </div>
@@ -3869,8 +3869,8 @@ function HostOnboardingApp() {
       <div style={{ maxWidth: 1360, margin: "0 auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginBottom: 20, flexWrap: "wrap" }}>
           <div>
-            <div style={{ fontSize: 12, letterSpacing: 1.2, textTransform: "uppercase", color: "rgba(0,0,0,0.45)", fontWeight: 800 }}>Host Onboarding / Host Profile Studio</div>
-            <div style={{ fontSize: 32, fontWeight: 900, color: "#111", marginTop: 4 }}>Build your Host Human Companion Profile</div>
+            <div style={{ fontSize: 12, letterSpacing: 1.2, textTransform: "uppercase", color: "rgba(0,0,0,0.45)", fontWeight: 800 }}>Host Onboarding / Persona Studio</div>
+            <div style={{ fontSize: 32, fontWeight: 900, color: "#111", marginTop: 4 }}>Build your Human Companion Persona</div>
             <div style={{ fontSize: 14, color: "rgba(0,0,0,0.64)", marginTop: 6 }}>
               Host: {identity.displayName || basicForm.stage_name || identity.memberId || "Unknown"}{identity.brand ? ` · Brand: ${identity.brand}` : ""}{identity.avatar ? ` · Avatar: ${identity.avatar}` : ""}
             </div>
@@ -4181,6 +4181,7 @@ function ConnectPage() {
   // Primary optimization target = mobile.
   // -----------------------
   type ViewportMode = "mobile" | "tablet" | "desktop";
+  type ExperienceView = "persona" | "video";
 
   const getViewportMode = useCallback((): ViewportMode => {
     if (typeof window === "undefined") return "desktop";
@@ -4197,6 +4198,10 @@ function ConnectPage() {
     if (w <= 1024) return "tablet";
     return "desktop";
   });
+  // Layout-only view selector for the Experience Panel. This is initialized
+  // without browser-derived state so the protected media hydration sequence
+  // remains identical across server and client rendering.
+  const [experienceView, setExperienceView] = useState<ExperienceView>("persona");
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -4212,10 +4217,9 @@ function ConnectPage() {
 
   const isMobileUI = viewportMode === "mobile";
   const isTabletUI = viewportMode === "tablet";
-  // Wix code-based embeds can report a tablet-width iframe on a phone.
-  // Use the same compact companion-card layout for both mobile and tablet-width embeds
-  // so Elaralo and DulceMoon render the card consistently.
-  const useCompactCompanionCard = viewportMode !== "desktop";
+  // Persona uses one consistent companion-card structure on every device.
+  // The surrounding Experience/Conversation grid handles responsive layout.
+  const useCompactCompanionCard = true;
 
   // Icon sizing: on mobile, force all icons to the same pixel size (13.5px).
   const ICON_18 = isMobileUI ? 13.5 : 18;
@@ -4244,7 +4248,7 @@ function ConnectPage() {
           title: 22,
           meta: 12,
           usageBarHeight: 10,
-          mainMaxWidth: 980,
+          mainMaxWidth: 1180,
           mainMargin: "18px auto",
           mainPadding: "0 14px",
         };
@@ -4254,7 +4258,7 @@ function ConnectPage() {
         title: 24,
         meta: 13,
         usageBarHeight: 8,
-        mainMaxWidth: 1120,
+        mainMaxWidth: 1440,
         mainMargin: "24px auto",
         mainPadding: "0 16px",
       };
@@ -6185,6 +6189,21 @@ const livekitUiActive =
 const showAvatarFrame =
   (liveProvider === "stream" && livekitUiActive) ||
   (Boolean(didAvatarMedia) && liveProvider === "d-id" && avatarStatus !== "idle");
+
+// When the existing media subsystem opens a video surface, select the Video
+// presentation in the Experience Panel. This effect changes layout state only.
+useEffect(() => {
+  if (showAvatarFrame) setExperienceView("video");
+}, [showAvatarFrame]);
+
+const videoExperienceAvailable = Boolean(showPlayButton || showAvatarFrame);
+const experienceVideoSelected = experienceView === "video" && videoExperienceAvailable;
+const experienceVideoHeight = isMobileUI ? 320 : isTabletUI ? 480 : 560;
+const experienceGridTemplateColumns = isMobileUI
+  ? "minmax(0, 1fr)"
+  : experienceVideoSelected
+    ? "minmax(360px, 3fr) max-content minmax(280px, 2fr)"
+    : "minmax(300px, 35fr) max-content minmax(320px, 65fr)";
 
   // Viewer-only: treat any active LegacyStream embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
@@ -14300,7 +14319,7 @@ const sttControls =
         </button>
       )}
 
-      {canReturnToCompanionList ? (
+      {isMobileUI && canReturnToCompanionList ? (
         <button
           type="button"
           onClick={() => {
@@ -15313,8 +15332,99 @@ const modePillControls = (
         </div>
       ) : null}
 
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: experienceGridTemplateColumns,
+          gridTemplateRows: isMobileUI ? "auto auto auto auto auto" : "auto auto auto",
+          columnGap: isMobileUI ? 0 : 14,
+          rowGap: 12,
+          alignItems: "start",
+          width: "100%",
+          minWidth: 0,
+          position: "relative",
+          transition: "grid-template-columns 300ms ease",
+        }}
+      >
+        <div
+          role="tablist"
+          aria-label="Experience Panel"
+          style={{
+            gridColumn: "1",
+            gridRow: "1",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            width: "100%",
+            minWidth: 0,
+            paddingBottom: 2,
+          }}
+        >
+          <span
+            style={{
+              marginRight: "auto",
+              fontSize: 12,
+              fontWeight: 800,
+              letterSpacing: 0.7,
+              textTransform: "uppercase",
+              color: "#666",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Experience Panel
+          </span>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={experienceView === "persona"}
+            onClick={() => setExperienceView("persona")}
+            style={{
+              padding: "8px 14px",
+              borderRadius: 999,
+              border: "1px solid #111",
+              background: experienceView === "persona" ? "#111" : "#fff",
+              color: experienceView === "persona" ? "#fff" : "#111",
+              cursor: "pointer",
+              fontWeight: 800,
+              whiteSpace: "nowrap",
+            }}
+          >
+            Persona
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={experienceView === "video"}
+            aria-disabled={!videoExperienceAvailable}
+            disabled={!videoExperienceAvailable}
+            onClick={() => {
+              if (videoExperienceAvailable) setExperienceView("video");
+            }}
+            style={{
+              padding: "8px 14px",
+              borderRadius: 999,
+              border: "1px solid #111",
+              background: experienceView === "video" ? "#111" : "#fff",
+              color: experienceView === "video" ? "#fff" : "#111",
+              cursor: videoExperienceAvailable ? "pointer" : "not-allowed",
+              fontWeight: 800,
+              whiteSpace: "nowrap",
+              opacity: videoExperienceAvailable ? 1 : 0.45,
+            }}
+            title={videoExperienceAvailable ? "Open video experience" : "Video is not available for this persona"}
+          >
+            Video
+          </button>
+        </div>
+
       <header
         style={{
+          gridColumn: "1",
+          gridRow: "2",
+          visibility: experienceView === "persona" ? "visible" : "hidden",
+          opacity: experienceView === "persona" ? 1 : 0,
+          pointerEvents: experienceView === "persona" ? "auto" : "none",
+          transition: "opacity 220ms ease",
           display: "flex",
           flexDirection: useCompactCompanionCard ? "column" : "row",
           alignItems: "flex-start",
@@ -15447,6 +15557,38 @@ const modePillControls = (
                 {modePillControls}
               </div>
             </div>
+
+            {!isMobileUI && canReturnToCompanionList ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setSwitchCompanionFlash(true);
+                  window.setTimeout(() => {
+                    goToCompanionList();
+                    setSwitchCompanionFlash(false);
+                  }, 120);
+                }}
+                style={{
+                  minHeight: 42,
+                  padding: "0 14px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  boxSizing: "border-box",
+                  background: switchCompanionFlash ? "#111" : "#fff",
+                  color: switchCompanionFlash ? "#fff" : "#111",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  whiteSpace: "nowrap",
+                  alignSelf: "flex-start",
+                }}
+                title="Switch persona"
+              >
+                Switch
+              </button>
+            ) : null}
 
             {liveProvider === "stream" ? (
               <div style={{ marginTop: 2, display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -15604,6 +15746,8 @@ const modePillControls = (
 {companionMappingError ? (
   <div
     style={{
+      gridColumn: "1 / -1",
+      gridRow: "3",
       margin: "10px 0",
       padding: "10px 12px",
       borderRadius: 10,
@@ -15621,15 +15765,29 @@ const modePillControls = (
 {showConnectControls ? (
   <section
     style={{
+      gridColumn: isMobileUI ? "1" : "2",
+      gridRow: isMobileUI ? "4" : "2",
       display: "flex",
+      flexDirection: isMobileUI ? "row" : "column",
       alignItems: "center",
-      justifyContent: "space-between",
-      gap: 12,
-      marginBottom: 12,
-      flexWrap: "wrap",
+      justifyContent: isMobileUI ? "space-between" : "flex-start",
+      gap: isMobileUI ? 12 : 8,
+      marginBottom: isMobileUI ? 12 : 0,
+      flexWrap: isMobileUI ? "wrap" : "nowrap",
+      alignSelf: "start",
+      minWidth: isMobileUI ? 0 : ICON_BTN_SIZE,
+      zIndex: 2,
     }}
   >
-    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: isMobileUI ? "row" : "column",
+        alignItems: "center",
+        gap: isMobileUI ? 12 : 8,
+        flexWrap: isMobileUI ? "wrap" : "nowrap",
+      }}
+    >
       {showPlayButton ? (
       <button
         onClick={() => {
@@ -15727,7 +15885,7 @@ const modePillControls = (
       ) : null}
 
       
-      {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
+      {/* Preserve the existing mic/stop controls immediately after Play in the control rail. */}
       {sttControls}
 	      {liveProvider === "stream" &&
 	        ((isHost &&
@@ -15761,7 +15919,7 @@ const modePillControls = (
 	          </button>
 	        ) : null}
 
-	      {liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
+	      {isMobileUI && liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
 	        <button
 	          type="button"
 	          onClick={() => {
@@ -15801,6 +15959,83 @@ const modePillControls = (
         </button>
       ) : null}
 
+      {!isMobileUI ? (
+        <>
+          <button
+            type="button"
+            onClick={openUploadPicker}
+            disabled={attachmentButtonDisabled}
+            title={
+              uploadsDisabled || hostInStreamUi || viewerInStreamUi
+                ? "Attachments are disabled during Shared Live streaming."
+                : "Attach a file"
+            }
+            aria-label="Attach a file"
+            style={{
+              width: ICON_BTN_SIZE,
+              height: ICON_BTN_SIZE,
+              minWidth: ICON_BTN_SIZE,
+              padding: 0,
+              borderRadius: 10,
+              border: "1px solid #bbb",
+              boxSizing: "border-box",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: attachmentButtonDisabled ? "#e5e5e5" : "#fff",
+              cursor: attachmentButtonDisabled ? "not-allowed" : "pointer",
+              opacity: attachmentButtonDisabled ? 0.6 : 1,
+              lineHeight: "18px",
+              fontSize: 18,
+            }}
+          >
+            {uploadingAttachment ? "⏳" : "📎"}
+          </button>
+          <button
+            type="button"
+            onClick={requestClearMessages}
+            title="Clear"
+            aria-label="Delete"
+            style={{
+              width: ICON_BTN_SIZE,
+              height: ICON_BTN_SIZE,
+              minWidth: ICON_BTN_SIZE,
+              borderRadius: 10,
+              border: "1px solid #bbb",
+              boxSizing: "border-box",
+              background: "#fff",
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <TrashIcon size={ICON_18} />
+          </button>
+        </>
+      ) : null}
+
+      {!isMobileUI && liveProvider === "stream" && sessionKind === "conference" && Boolean(livekitToken) ? (
+        <button
+          type="button"
+          onClick={() => {
+            setConferenceViewMode((v) => (v === "split" ? "focus" : "split"));
+          }}
+          style={{
+            ...smallBtn,
+            background: conferenceViewMode === "focus" ? "#111" : "#eee",
+            color: conferenceViewMode === "focus" ? "#fff" : "#222",
+          }}
+          title={
+            conferenceViewMode === "focus"
+              ? "Show split view (both participants)"
+              : "Show full view (other participant only)"
+          }
+        >
+          {conferenceViewMode === "focus" ? "👥 Split View" : "🖥️ Full View"}
+        </button>
+      ) : null}
+
       {liveProvider === "stream" && !isHost ? (
         <button
           type="button"
@@ -15831,33 +16066,26 @@ const modePillControls = (
   </section>
 ) : null}
 
-      <section style={{ marginTop: 18 }}>
-        <div
-          style={{
-            display: "flex",
-            gap: 18,
-            marginTop: 18,
-            flexWrap: "wrap",
-            alignItems: "flex-start",
-          }}
-        >
-          {showAvatarFrame ? (
+      <section style={{ display: "contents" }}>
+        <div style={{ display: "contents" }}>
+          {(showAvatarFrame || experienceView === "video") ? (
             <div
-	              style={{
-	                flex:
-	                  liveProvider === "stream" && sessionKind === "conference"
-	                    ? "2 1 0"
-	                    : liveProvider === "stream" && !isHost
-	                      ? "2 1 0"
-	                      : "0 0 360px",
-                minWidth: liveProvider === "stream" && !isHost ? 320 : 280,
+              style={{
+                gridColumn: "1",
+                gridRow: "2",
+                width: "100%",
+                minWidth: 0,
                 maxWidth: "100%",
+                visibility: experienceView === "video" ? "visible" : "hidden",
+                opacity: experienceView === "video" ? 1 : 0,
+                pointerEvents: experienceView === "video" ? "auto" : "none",
+                transition: "opacity 220ms ease",
               }}
             >
               <div
                 style={{
                   width: "100%",
-                  height: 440,
+                  height: experienceVideoHeight,
                   background: "#000",
                   border: "1px solid #e5e5e5",
                   borderRadius: 12,
@@ -15865,7 +16093,28 @@ const modePillControls = (
                   position: "relative",
                 }}
               >
-                {livekitToken ? (
+                {!showAvatarFrame ? (
+                  <div
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: 10,
+                      padding: 20,
+                      textAlign: "center",
+                      color: "#fff",
+                      background: "linear-gradient(145deg, #111827, #000)",
+                    }}
+                  >
+                    <div style={{ fontSize: 18, fontWeight: 900 }}>Video Experience</div>
+                    <div style={{ maxWidth: 360, fontSize: 13, lineHeight: 1.45, opacity: 0.82 }}>
+                      Press Play beside the Conversation panel to start the available live or animated video experience.
+                    </div>
+                  </div>
+                ) : livekitToken ? (
                   <LiveKitRoom
                     token={livekitToken}
                     serverUrl={livekitServerUrl || LIVEKIT_URL}
@@ -16123,21 +16372,17 @@ const modePillControls = (
           ) : null}
 
           <div
-                    style={{
-	                    flex: showAvatarFrame
-	                      ? (liveProvider === "stream" && sessionKind === "conference"
-	                          ? "1 1 0"
-	                          : liveProvider === "stream" && Boolean(streamEventRef) && !streamCanStart
-	                            ? "1 1 0"
-	                            : "2 1 0")
-	                      : "1 1 0",
-                      minWidth: 280,
-                      height: conversationHeight,
-                      display: "flex",
-                      flexDirection: "column",
-                      position: "relative",
-                    }}
-                  >
+            style={{
+              gridColumn: isMobileUI ? "1" : "3",
+              gridRow: isMobileUI ? "5" : "2",
+              minWidth: 0,
+              width: "100%",
+              height: conversationHeight,
+              display: "flex",
+              flexDirection: "column",
+              position: "relative",
+            }}
+          >
                     <div
                       ref={messagesBoxRef}
                       style={{
@@ -16204,7 +16449,23 @@ const modePillControls = (
                       ) : null}
                     </div>
 
-                    <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center", position: "sticky", bottom: 0, background: "#fff", paddingTop: 10, paddingBottom: 10, zIndex: 20, borderTop: "1px solid #eee" }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        marginTop: 12,
+                        flexWrap: isMobileUI || (isTabletUI && experienceVideoSelected) ? "wrap" : "nowrap",
+                        alignItems: "center",
+                        position: "sticky",
+                        bottom: 0,
+                        background: "#fff",
+                        paddingTop: 10,
+                        paddingBottom: 10,
+                        zIndex: 20,
+                        borderTop: "1px solid #eee",
+                        minWidth: 0,
+                      }}
+                    >
                       {/** Input line with mode pills moved to the right (layout-only). */}
 
 {isHostConsoleUser ? (
@@ -16228,6 +16489,7 @@ const modePillControls = (
   </button>
 ) : null}
 
+                      {(isMobileUI || !showConnectControls) ? (
                           <button
                             type="button"
                             onClick={requestClearMessages}
@@ -16249,8 +16511,9 @@ const modePillControls = (
                           >
                             <TrashIcon size={ICON_18} />
                           </button>
+                      ) : null}
 
-                      {/* Attachment upload (images only) */}
+                      {/* Attachment upload */}
                       <input
                         ref={uploadInputRef}
                         type="file"
@@ -16258,6 +16521,7 @@ const modePillControls = (
                         style={{ display: "none" }}
                         onChange={onAttachmentSelected}
                       />
+                      {(isMobileUI || !showConnectControls) ? (
 	                  <button
 	                    onClick={openUploadPicker}
 	                    disabled={attachmentButtonDisabled}
@@ -16287,6 +16551,7 @@ const modePillControls = (
                       >
                         {uploadingAttachment ? "⏳" : "📎"}
                       </button>
+                      ) : null}
 
                       {pendingAttachment && !uploadsDisabled && !hostInStreamUi && !viewerInStreamUi ? (
                         <div
@@ -16406,7 +16671,8 @@ const modePillControls = (
                             : "Click microphone or type message to talk with me…"
                         }
                         style={{
-                          flex: 1,
+                          flex: "1 1 180px",
+                          minWidth: 0,
                           padding: "10px 12px",
                           borderRadius: 10,
                           border: "1px solid #ddd",
@@ -16571,6 +16837,7 @@ const modePillControls = (
       
         </div>
       </section>
+      </div>
 
       {/* Clear Messages confirmation overlay */}
       {showClearMessagesConfirm && (
