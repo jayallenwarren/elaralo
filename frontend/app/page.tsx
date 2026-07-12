@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.19: Experience Panel (Persona/Video) responsive layout + Persona Studio terminology; protected STT/TTS/media behavior unchanged.
+// v10.0.0-alpha15.21: Experience Panel portrait/usage refinement + persistent Posting-as control; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
@@ -4220,6 +4220,8 @@ function ConnectPage() {
   // Persona uses one consistent companion-card structure on every device.
   // The surrounding Experience/Conversation grid handles responsive layout.
   const useCompactCompanionCard = true;
+  const personaPortraitWidth = isMobileUI ? 136 : 150;
+  const personaPortraitHeight = isMobileUI ? 170 : 188;
 
   // Icon sizing: on mobile, force all icons to the same pixel size (13.5px).
   const ICON_18 = isMobileUI ? 13.5 : 18;
@@ -4971,13 +4973,24 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   const [selectedMappingAvatar, setSelectedMappingAvatar] = useState<string>("");
   const [selectedCompanionType, setSelectedCompanionType] = useState<"AI" | "Human" | "">("");
 
-  // Viewer-only: display name used in the shared in-stream chat.
-  // - Stored locally so we only prompt once per (brand, companion).
-  const liveChatUsernameStorageKey = useMemo(() => {
+  // Viewer/member display name used in Connect and shared live chat.
+  // The canonical key is scoped by brand and member identity; visitors receive
+  // a brand-scoped visitor key. The legacy per-companion key is read only once
+  // as a migration source so existing local preferences are not discarded.
+  const legacyLiveChatUsernameStorageKey = useMemo(() => {
     const b = safeBrandKey(String(companyName || "").trim() || "core") || "core";
     const a = safeBrandKey(String(companionName || "").trim() || "companion") || "companion";
     return `livekit_livechat_username:${b}:${a}`;
   }, [companyName, companionName]);
+
+  const liveChatUsernameStorageKey = useMemo(() => {
+    const b = safeBrandKey(String(companyName || "").trim() || "core") || "core";
+    const rawMemberId = String(memberId || "").trim();
+    const memberScope = rawMemberId
+      ? `member:${safeBrandKey(rawMemberId) || rawMemberId}`
+      : "visitor";
+    return `connect_username:${b}:${memberScope}`;
+  }, [companyName, memberId]);
 
   const [viewerLiveChatName, setViewerLiveChatName] = useState<string>("");
   const [payloadUserDisplayName, setPayloadUserDisplayName] = useState<string>("");
@@ -4989,6 +5002,13 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     if (payloadLabel) return payloadLabel;
     return "";
   }, [viewerLiveChatName, payloadUserDisplayName]);
+
+  // Keep a current username reference for live-chat connection setup without
+  // making a username edit tear down and recreate the live-chat websocket.
+  const preferredViewerDisplayNameRef = useRef<string>("");
+  useEffect(() => {
+    preferredViewerDisplayNameRef.current = String(preferredViewerDisplayName || "").trim();
+  }, [preferredViewerDisplayName]);
 
   const transcriptViewerLabel = useMemo(() => {
     return preferredViewerDisplayName || "You";
@@ -5003,40 +5023,117 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     return `Viewer - ${shortId || "Anon"}`;
   }, [preferredViewerDisplayName]);
 
+  const postingAsViewerName = useMemo(() => {
+    return buildHostReadableViewerName(String(memberId || "").trim());
+  }, [buildHostReadableViewerName, memberId]);
+
+  const sanitizeViewerUsername = useCallback((value: unknown): string => {
+    return String(value ?? "")
+      .replace(/[\r\n\t]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 50);
+  }, []);
+
+  const readViewerUsernameFromWindowName = useCallback((keys: string[]): string => {
+    if (typeof window === "undefined") return "";
+    try {
+      const raw = String(window.name || "");
+      const legacyPrefix = "lcname:";
+      if (raw.startsWith(legacyPrefix)) {
+        return sanitizeViewerUsername(raw.slice(legacyPrefix.length));
+      }
+
+      const prefix = "__DM_KV__=";
+      const idx = raw.indexOf(prefix);
+      if (idx === -1) return "";
+      const encoded = raw.substring(idx + prefix.length);
+      if (!encoded) return "";
+      const parsed = JSON.parse(decodeURIComponent(encoded));
+      if (!parsed || typeof parsed !== "object") return "";
+      for (const key of keys) {
+        const value = sanitizeViewerUsername((parsed as Record<string, string>)[key]);
+        if (value) return value;
+      }
+    } catch {}
+    return "";
+  }, [sanitizeViewerUsername]);
+
+  const writeViewerUsernameToWindowName = useCallback((key: string, value: string) => {
+    if (typeof window === "undefined") return;
+    const cleaned = sanitizeViewerUsername(value);
+    if (!key || !cleaned) return;
+    try {
+      const prefix = "__DM_KV__=";
+      const raw = String(window.name || "");
+      const idx = raw.indexOf(prefix);
+      const base = idx === -1 ? raw : raw.slice(0, idx);
+      let values: Record<string, string> = {};
+      if (idx !== -1) {
+        try {
+          const encoded = raw.substring(idx + prefix.length);
+          const parsed = JSON.parse(decodeURIComponent(encoded));
+          if (parsed && typeof parsed === "object") values = parsed as Record<string, string>;
+        } catch {}
+      }
+      values[key] = cleaned;
+      window.name = `${base}${prefix}${encodeURIComponent(JSON.stringify(values))}`;
+    } catch {}
+  }, [sanitizeViewerUsername]);
+
+  const persistViewerLiveChatName = useCallback((value: string): string => {
+    const cleaned = sanitizeViewerUsername(value);
+    if (!cleaned) return "";
+    try { window.localStorage.setItem(liveChatUsernameStorageKey, cleaned); } catch {}
+    try { window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned); } catch {}
+    writeViewerUsernameToWindowName(liveChatUsernameStorageKey, cleaned);
+    setViewerLiveChatName(cleaned);
+    return cleaned;
+  }, [liveChatUsernameStorageKey, sanitizeViewerUsername, writeViewerUsernameToWindowName]);
+
   useEffect(() => {
-    // Keep state in sync with persistent storage as the user switches companions/brands.
-    // NOTE: In embedded/iframe contexts, localStorage may be partitioned or blocked; we keep fallbacks.
+    // Keep state in sync with persistent storage as member/brand identity resolves.
+    // localStorage is canonical; sessionStorage and window.name are iframe fallbacks.
     try {
       if (typeof window === "undefined") return;
+      const keys = Array.from(new Set([
+        liveChatUsernameStorageKey,
+        legacyLiveChatUsernameStorageKey,
+      ].filter(Boolean)));
 
-      const GLOBAL_LIVECHAT_KEY = "dm_livechat_username";
-
-      const tryGet = (k: string): string => {
-        try {
-          const v = window.localStorage.getItem(k);
-          if (v && String(v).trim()) return String(v).trim();
-        } catch {}
-        try {
-          const v2 = window.sessionStorage.getItem(k);
-          if (v2 && String(v2).trim()) return String(v2).trim();
-        } catch {}
+      const readStorage = (storage: Storage): string => {
+        for (const key of keys) {
+          try {
+            const value = sanitizeViewerUsername(storage.getItem(key));
+            if (value) return value;
+          } catch {}
+        }
         return "";
       };
 
-      let stored = tryGet(liveChatUsernameStorageKey) || tryGet(GLOBAL_LIVECHAT_KEY);
-
+      let stored = "";
+      try { stored = readStorage(window.localStorage); } catch {}
       if (!stored) {
-        try {
-          const nm = String((window as any).name || "");
-          if (nm.startsWith("lcname:")) stored = nm.slice("lcname:".length).trim();
-        } catch {}
+        try { stored = readStorage(window.sessionStorage); } catch {}
       }
+      if (!stored) stored = readViewerUsernameFromWindowName(keys);
 
-      setViewerLiveChatName(String(stored || "").trim());
+      if (stored) {
+        // Persist under the new brand/member-scoped key when loaded from a legacy key.
+        persistViewerLiveChatName(stored);
+      } else {
+        setViewerLiveChatName("");
+      }
     } catch {
       setViewerLiveChatName("");
     }
-  }, [liveChatUsernameStorageKey]);
+  }, [
+    liveChatUsernameStorageKey,
+    legacyLiveChatUsernameStorageKey,
+    persistViewerLiveChatName,
+    readViewerUsernameFromWindowName,
+    sanitizeViewerUsername,
+  ]);
 
 
   // LiveKit identity conventions used by the backend:
@@ -5065,221 +5162,72 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   const ensureViewerLiveChatName = useCallback((opts?: { promptText?: string }): string => {
     if (typeof window === "undefined") return "";
 
-    const current = String(viewerLiveChatName || "").trim();
+    const current = sanitizeViewerUsername(viewerLiveChatName);
     if (current) return current;
 
-    const payloadPreferred = String(payloadUserDisplayName || "").trim();
+    const payloadPreferred = sanitizeViewerUsername(payloadUserDisplayName);
     if (payloadPreferred) return payloadPreferred;
 
-    // NOTE: In restrictive iframe environments (e.g., some mobile browsers), localStorage can be
-    // unavailable or non-persistent. We therefore try: localStorage -> sessionStorage -> window.name.
-    const WINDOW_NAME_PREFIX = "__DM_KV__=";
+    const keys = Array.from(new Set([
+      liveChatUsernameStorageKey,
+      legacyLiveChatUsernameStorageKey,
+    ].filter(Boolean)));
 
-    const readWindowNameKV = (): Record<string, string> => {
-      try {
-        const raw = String(window.name || "");
-        const idx = raw.indexOf(WINDOW_NAME_PREFIX);
-        if (idx === -1) return {};
-        const encoded = raw.substring(idx + WINDOW_NAME_PREFIX.length);
-        if (!encoded) return {};
-        const json = decodeURIComponent(encoded);
-        const obj = JSON.parse(json);
-        return obj && typeof obj === "object" ? (obj as Record<string, string>) : {};
-      } catch {
-        return {};
-      }
-    };
-
-    const writeWindowNameKV = (kv: Record<string, string>) => {
-      try {
-        const raw = String(window.name || "");
-        const base = raw.split(WINDOW_NAME_PREFIX)[0]; // preserve any pre-existing prefix
-        window.name = `${base}${WINDOW_NAME_PREFIX}${encodeURIComponent(JSON.stringify(kv))}`;
-      } catch {
-        // ignore
-      }
-    };
-
-    // Per-device, we want to prompt *once*, even if brand/companion identifiers change
-    // (common during rebrand flows or when companionName loads asynchronously).
-    const GLOBAL_LIVECHAT_KEY = "dm_livechat_username";
-
-    const keysToTry = (() => {
-      const keys: string[] = [];
-      if (liveChatUsernameStorageKey) keys.push(liveChatUsernameStorageKey);
-
-      // Global fallback (per-device) so we don't keep re-prompting in restrictive iframe contexts.
-      keys.push(GLOBAL_LIVECHAT_KEY);
-
-      // Legacy (older builds may have used a key without companionKey)
-      const legacyBase = `${safeBrandKey(companyName)}_${safeBrandKey(companionName)}_livechat_username`;
-      if (legacyBase) keys.push(legacyBase);
-
-      // Very old fallback (in case safeBrandKey or naming changed)
-      const veryOld = `dulcemoon_${safeBrandKey(companionName || "companion")}_livechat_username`;
-      if (veryOld) keys.push(veryOld);
-
-      // De-dup + remove empties
-      return Array.from(new Set(keys.filter(Boolean)));
-    })();
-
-    const tryGet = (fn: (k: string) => string | null): string => {
-      for (const k of keysToTry) {
+    const readStorage = (storage: Storage): string => {
+      for (const key of keys) {
         try {
-          const v = fn(k);
-          const s = String(v || "").trim();
-          if (s) return s;
-        } catch {
-          // ignore and keep trying
-        }
+          const value = sanitizeViewerUsername(storage.getItem(key));
+          if (value) return value;
+        } catch {}
       }
       return "";
     };
 
-    const storeEverywhere = (value: string) => {
-      const v = String(value || "").trim().slice(0, 50);
-      if (!v) return;
-
-      // Always write back to the primary key (current build)
-      try {
-        if (liveChatUsernameStorageKey) {
-          window.localStorage.setItem(liveChatUsernameStorageKey, v);
-        }
-        window.localStorage.setItem(GLOBAL_LIVECHAT_KEY, v);
-      } catch {
-        // ignore
-      }
-      try {
-        if (liveChatUsernameStorageKey) {
-          window.sessionStorage.setItem(liveChatUsernameStorageKey, v);
-        }
-        window.sessionStorage.setItem(GLOBAL_LIVECHAT_KEY, v);
-      } catch {
-        // ignore
-      }
-      try {
-        const kv = readWindowNameKV();
-        if (liveChatUsernameStorageKey) {
-          kv[liveChatUsernameStorageKey] = v;
-        }
-        kv[GLOBAL_LIVECHAT_KEY] = v;
-        writeWindowNameKV(kv);
-      } catch {
-        // ignore
-      }
-    };
-
-    // 1) localStorage
     let stored = "";
-    try {
-      stored = tryGet((k) => window.localStorage.getItem(k));
-    } catch {
-      // ignore
-    }
-
-    // 2) sessionStorage
+    try { stored = readStorage(window.localStorage); } catch {}
     if (!stored) {
-      try {
-        stored = tryGet((k) => window.sessionStorage.getItem(k));
-      } catch {
-        // ignore
-      }
+      try { stored = readStorage(window.sessionStorage); } catch {}
     }
-
-    // 3) window.name (fallback)
-    if (!stored) {
-      try {
-        const kv = readWindowNameKV();
-        for (const k of keysToTry) {
-          const s = String(kv[k] || "").trim();
-          if (s) {
-            stored = s;
-            break;
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    if (stored) {
-      const cleaned = stored.trim().slice(0, 50);
-      setViewerLiveChatName(cleaned);
-      storeEverywhere(cleaned);
-      return cleaned;
-    }
+    if (!stored) stored = readViewerUsernameFromWindowName(keys);
+    if (stored) return persistViewerLiveChatName(stored);
 
     const systemId = getLivekitSystemIdentity();
-
     const memberIdRaw = String(memberId || "").trim();
     const memberIdClean = memberIdRaw.replace(/^Anon:\s*/i, "").trim();
     const idForFallback = String(memberIdClean || memberIdRaw || systemId)
       .replace(/^(user:|anon:)/i, "")
       .replace(/^Anon:\s*/i, "")
       .trim();
-    const shortId = idForFallback.slice(0, 4);
-    const fallbackName = `Viewer - ${shortId || "Anon"}`;
+    const fallbackName = `Viewer - ${idForFallback.slice(0, 4) || "Anon"}`;
 
-    const suggested = "";
-    const promptText =
-      opts?.promptText || "Choose a name to display during the live session:";
-    const name = window.prompt(promptText, suggested);
-
-    // Requirement: if the viewer does not enter a name (blank or cancel), use a stable fallback like "Viewer - 1234".
-
-    const cleaned =
-      String(name ?? "")
-        .replace(/[\r\n\t]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 50) || fallbackName;
-
-    setViewerLiveChatName(cleaned);
-    storeEverywhere(cleaned);
-    return cleaned;
-  }, [viewerLiveChatName, payloadUserDisplayName, liveChatUsernameStorageKey, companyName, companionName, companionKey, memberId, getLivekitSystemIdentity]);
+    const promptText = opts?.promptText || "Choose a name to display during this Connect session:";
+    const requested = window.prompt(promptText, "");
+    const cleaned = sanitizeViewerUsername(requested) || fallbackName;
+    return persistViewerLiveChatName(cleaned);
+  }, [
+    viewerLiveChatName,
+    payloadUserDisplayName,
+    liveChatUsernameStorageKey,
+    legacyLiveChatUsernameStorageKey,
+    sanitizeViewerUsername,
+    readViewerUsernameFromWindowName,
+    persistViewerLiveChatName,
+    getLivekitSystemIdentity,
+    memberId,
+  ]);
 
 
   const changeViewerLiveChatName = useCallback(() => {
     try {
       if (typeof window === "undefined") return;
-      const existing =
-        String(viewerLiveChatName || "").trim() ||
-        String((() => {
-          try {
-            const v = window.localStorage.getItem(liveChatUsernameStorageKey);
-            if (v && String(v).trim()) return v;
-          } catch (e) {}
-          try {
-            const v2 = window.sessionStorage.getItem(liveChatUsernameStorageKey);
-            if (v2 && String(v2).trim()) return v2;
-          } catch (e) {}
-          return "";
-        })() || "").trim();
-
-      const raw =
-        window.prompt("Change your username for the live session:", existing) || "";
-
-      const cleaned = raw
-        .replace(/[\r\n\t]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 32);
-
+      const raw = window.prompt("Change your Connect username:", postingAsViewerName) || "";
+      const cleaned = sanitizeViewerUsername(raw);
       if (!cleaned) return;
-
-      try {
-        window.localStorage.setItem(liveChatUsernameStorageKey, cleaned);
-      } catch (e) {
-        try {
-          window.sessionStorage.setItem(liveChatUsernameStorageKey, cleaned);
-        } catch (e) {}
-      }
-      setViewerLiveChatName(cleaned);
-    } catch (e) {
+      persistViewerLiveChatName(cleaned);
+    } catch {
       // ignore
     }
-  }, [viewerLiveChatName, liveChatUsernameStorageKey]);
+  }, [postingAsViewerName, sanitizeViewerUsername, persistViewerLiveChatName]);
 
 
   // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
@@ -9766,7 +9714,9 @@ useEffect(() => {
 
     const role = isHost ? "host" : "viewer";
     const name =
-      role === "host" ? String(companionName || "Host") : String(preferredViewerDisplayName || "").trim() || "Viewer";
+      role === "host"
+        ? String(companionName || "Host")
+        : String(preferredViewerDisplayNameRef.current || "").trim() || "Viewer";
     const memberIdForWs = String(memberIdForLiveChat || "").trim();
 
     if (
@@ -9774,8 +9724,7 @@ useEffect(() => {
       liveChatWsRef.current.readyState === WebSocket.OPEN &&
       liveChatEventRefRef.current === eventRef &&
       liveChatMemberIdRef.current === memberIdForWs &&
-      liveChatRoleRef.current === role &&
-      liveChatNameRef.current === name
+      liveChatRoleRef.current === role
     ) {
       return;
     }
@@ -9867,7 +9816,6 @@ useEffect(() => {
     isHost,
     memberIdForLiveChat,
     companionName,
-    preferredViewerDisplayName,
     appendLiveChatMessage,
     sessionKind,
     sessionRoom,
@@ -9966,7 +9914,7 @@ useEffect(() => {
 // LegacyStream "live session" gating (global per companion)
 // - While the host is streaming, we must NOT generate AI responses for anyone.
 // - We queue user messages locally and flush them once the host stops streaming.
-const streamDeferredQueueRef = useRef<Array<{ text: string; state: SessionState; queuedAt: number; noticeIndex: number; clientTurnId?: string }>>([]);
+const streamDeferredQueueRef = useRef<Array<{ text: string; state: SessionState; queuedAt: number; noticeIndex: number; clientTurnId?: string; displayName?: string }>>([]);
 const streamDeferredFlushInFlightRef = useRef<boolean>(false);
 const streamPreSessionHistoryRef = useRef<Msg[] | null>(null);
 const prevSessionActiveRef = useRef<boolean>(false);
@@ -12364,7 +12312,10 @@ const outgoingText = (detectedMode ? cleaned : rawText).trim();
 let userMsg: Msg = {
       role: "user",
       content: finalUserContent,
-      meta: { clientTurnId: turnClientId },
+      meta: {
+        clientTurnId: turnClientId,
+        ...(!isHost ? { name: buildHostReadableViewerName(memberIdForLiveChat || memberId || "") } : {}),
+      },
     };
     if (translatorEnabled && finalUserContent) {
       userMsg = applyTranslationMetaToMsg(
@@ -12500,6 +12451,7 @@ if (streamSessionActive) {
     queuedAt: Date.now(),
     noticeIndex,
     clientTurnId: turnClientId,
+    displayName: !isHost ? buildHostReadableViewerName(memberIdForLiveChat || memberId || "") : "",
   });
 
   setMessages([...nextMessages, { role: "assistant", content: notice }]);
@@ -12781,7 +12733,12 @@ const flushQueuedStreamMessages = useCallback(async () => {
       let userMsg: Msg = {
         role: "user",
         content: String(item?.text || "").trim(),
-        meta: { clientTurnId: String((item as any)?.clientTurnId || "").trim() },
+        meta: {
+          clientTurnId: String((item as any)?.clientTurnId || "").trim(),
+          ...(String((item as any)?.displayName || "").trim()
+            ? { name: String((item as any).displayName).trim() }
+            : {}),
+        },
       };
       if (translatorEnabled && userMsg.content) {
         userMsg = applyTranslationMetaToMsg(
@@ -15513,16 +15470,16 @@ const modePillControls = (
                 display: "flex",
                 alignItems: "flex-start",
                 justifyContent: "space-between",
-                gap: 16,
+                gap: isMobileUI ? 12 : 16,
               }}
             >
-              <div style={{ flex: "1 1 auto", minWidth: 0, maxWidth: 180 }}>
+              <div style={{ flex: "0 0 auto", minWidth: 0 }}>
                 <div
                   aria-hidden
                   onClick={secretDebugTap}
                   style={{
-                    width: 118,
-                    height: 148,
+                    width: personaPortraitWidth,
+                    height: personaPortraitHeight,
                     borderRadius: 16,
                     overflow: "hidden",
                     border: "1px solid rgba(17,17,17,0.14)",
@@ -15543,12 +15500,11 @@ const modePillControls = (
                     }}
                   />
                 </div>
-                <div style={{ marginTop: 2 }}>{usageMeterEl}</div>
               </div>
 
               <div
                 style={{
-                  flex: "0 0 140px",
+                  flex: isMobileUI ? "0 0 132px" : "0 0 140px",
                   display: "flex",
                   justifyContent: "flex-end",
                   alignItems: "stretch",
@@ -15556,6 +15512,10 @@ const modePillControls = (
               >
                 {modePillControls}
               </div>
+            </div>
+
+            <div style={{ width: "100%", marginTop: 2 }}>
+              {usageMeterEl}
             </div>
 
             {!isMobileUI && canReturnToCompanionList ? (
@@ -16036,28 +15996,6 @@ const modePillControls = (
         </button>
       ) : null}
 
-      {liveProvider === "stream" && !isHost ? (
-        <button
-          type="button"
-          onClick={changeViewerLiveChatName}
-          style={{
-            border: "none",
-            background: "transparent",
-            padding: 0,
-            margin: 0,
-            fontSize: 12,
-            color: "#111",
-            textDecoration: "underline",
-            cursor: "pointer",
-            whiteSpace: "nowrap",
-          }}
-          aria-label="Change username"
-          title="Change the name shown to others during the live session"
-        >
-          {String(preferredViewerDisplayName || "").trim() ? "Change username" : "Set username"}
-        </button>
-      ) : null}
-
     </div>
 
     {/* Right-justified Mode controls remain in this row on tablet/desktop.
@@ -16429,7 +16367,7 @@ const modePillControls = (
                               : isHostMsg
                                 ? `${(companionName || DEFAULT_COMPANION_NAME)} (Host)`
                                 : (companionName || DEFAULT_COMPANION_NAME)
-                            : transcriptViewerLabel;
+                            : String(meta?.name || "").trim() || transcriptViewerLabel;
 
                         return (
                           <div
@@ -16651,48 +16589,117 @@ const modePillControls = (
                         </div>
                       ) : null}
 
-                      <input
-                        ref={inputElRef}
-                        value={input}
-                        onChange={(e) => setInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.preventDefault();
-                            send();
-                          }
-                        }}
-                        placeholder={
-                          sttEnabled
-                            ? "Listening…"
-                            : !isHost && sessionActive && sessionKind === "conference" && !conferenceJoined
-                            ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
-                            : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
-                            ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
-                            : "Click microphone or type message to talk with me…"
-                        }
+                      <div
                         style={{
-                          flex: "1 1 180px",
+                          flex: "1 1 220px",
                           minWidth: 0,
-                          padding: "10px 12px",
-                          borderRadius: 10,
-                          border: "1px solid #ddd",
-                        }}
-                      />
-
-                      <button
-                        onClick={() => send()}
-                        disabled={loading || uploadingAttachment}
-                        style={{
-                          padding: "10px 14px",
-                          borderRadius: 10,
-                          border: "1px solid #111",
-                          background: "#111",
-                          color: "#fff",
-                          cursor: "pointer",
+                          display: "grid",
+                          gridTemplateColumns: "minmax(0, 1fr) auto",
+                          columnGap: 8,
+                          rowGap: 4,
+                          alignItems: "center",
                         }}
                       >
-                        Send
-                      </button>
+                        <input
+                          ref={inputElRef}
+                          value={input}
+                          onChange={(e) => setInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              send();
+                            }
+                          }}
+                          placeholder={
+                            sttEnabled
+                              ? "Listening…"
+                              : !isHost && sessionActive && sessionKind === "conference" && !conferenceJoined
+                              ? `${(companionName || "Host").trim() || "Host"} is in a private session — press Play to join.`
+                              : !isHost && sessionActive && sessionKind !== "conference" && !viewerHasJoinedStream
+                              ? `${(companionName || "Host").trim() || "Host"} is live — press Play to join.`
+                              : "Click microphone or type message to talk with me…"
+                          }
+                          style={{
+                            gridColumn: "1",
+                            gridRow: "1",
+                            width: "100%",
+                            minWidth: 0,
+                            boxSizing: "border-box",
+                            padding: "10px 12px",
+                            borderRadius: 10,
+                            border: "1px solid #ddd",
+                          }}
+                        />
+
+                        <button
+                          onClick={() => send()}
+                          disabled={loading || uploadingAttachment}
+                          style={{
+                            gridColumn: "2",
+                            gridRow: "1",
+                            padding: "10px 14px",
+                            borderRadius: 10,
+                            border: "1px solid #111",
+                            background: "#111",
+                            color: "#fff",
+                            cursor: "pointer",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          Send
+                        </button>
+
+                        {!isHost && !isHostConsoleUser ? (
+                          <div
+                            style={{
+                              gridColumn: "1",
+                              gridRow: "2",
+                              minWidth: 0,
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 4,
+                              marginTop: 0,
+                              fontSize: 12,
+                              lineHeight: "16px",
+                              color: "#666",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            <span
+                              style={{
+                                minWidth: 0,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                              title={`Posting as: ${postingAsViewerName}`}
+                            >
+                              Posting as: <b>{postingAsViewerName}</b>
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <button
+                              type="button"
+                              onClick={changeViewerLiveChatName}
+                              style={{
+                                flex: "0 0 auto",
+                                border: "none",
+                                background: "transparent",
+                                padding: 0,
+                                margin: 0,
+                                color: "#111",
+                                font: "inherit",
+                                fontWeight: 700,
+                                textDecoration: "underline",
+                                cursor: "pointer",
+                                whiteSpace: "nowrap",
+                              }}
+                              aria-label="Change username"
+                              title="Change the name shown during Connect sessions"
+                            >
+                              Change username
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
 
                     </div>
 
@@ -16700,8 +16707,6 @@ const modePillControls = (
           	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
           	          ) : null}
 
-	          {/* Mobile: move the usage meter below the input box to maximize above-the-fold space. */}
-	          {isMobileUI ? usageMeterEl : null}
 
                     {/* LiveKit Broadcast overlay (Host-only) */}
                     {showBroadcastButton && showBroadcasterOverlay ? (
