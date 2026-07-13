@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.25: restore true mobile single-column Experience/Conversation stacking and preserve Elaralo Switch fallback; protected media behavior unchanged.
+// v10.0.0-alpha15.26: enforce stacked phone/portrait-tablet layout and show Switch only when selectable companion count is greater than one; protected media behavior unchanged.
 // v10.0.0-alpha15.24: runtime brand public-link configuration for Spotlights; protected media behavior unchanged.
 // v10.0.0-alpha15.21: Experience Panel portrait/usage refinement + persistent Posting-as control; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
@@ -978,7 +978,10 @@ function readCompanionListReturnContextFromUrl(): CompanionListReturnContext {
     // valid return-to-list launch and build the same safe /my-elaralo fallback.
     const wantsReturnButton = explicitWantsReturnButton || fromSummaryPublic;
 
-    if (count <= 1 || !wantsReturnButton) return { enabled: false, count, url: "" };
+    // The selectable companion count is authoritative. If more than one
+    // companion is available, expose Switch regardless of companion type or
+    // brand. The optional return flags remain backward-compatible hints only.
+    if (count <= 1) return { enabled: false, count, url: "" };
 
     const rawUrl = firstQueryValue(params, ["companionListUrl", "companion_list_url", "returnUrl", "return_url"]);
     let target: URL | null = null;
@@ -992,7 +995,7 @@ function readCompanionListReturnContextFromUrl(): CompanionListReturnContext {
     }
 
     if (!target) {
-      target = new URL("/my-elaralo", window.location.origin);
+      target = new URL("/myelaralo/companion", window.location.origin);
       const brand = firstQueryValue(params, ["brand", "rebranding", "companyName", "company_name", "company"]) || DEFAULT_COMPANY_NAME;
       target.searchParams.set("brand", brand);
       const loggedInRaw = firstQueryValue(params, ["loggedIn", "logged_in"]);
@@ -4129,7 +4132,8 @@ function ConnectPage() {
   // apply to the Elaralo app-sourced handoff.
   const directCompanionHandoff = useMemo(() => readDirectCompanionHandoffFromUrl(), []);
   const companionListReturnContext = useMemo(() => readCompanionListReturnContextFromUrl(), []);
-  const canReturnToCompanionList = companionListReturnContext.enabled && companionListReturnContext.count > 1;
+  const hasMultipleSelectableCompanions = companionListReturnContext.count > 1;
+  const canReturnToCompanionList = companionListReturnContext.enabled && hasMultipleSelectableCompanions;
 
   const isDirectElaraloConnectLaunch = useMemo(() => {
     const handoff = directCompanionHandoff || {};
@@ -4209,7 +4213,7 @@ function ConnectPage() {
 
   const getViewportMode = useCallback((): ViewportMode => {
     const w = getEffectiveViewportWidth();
-    if (w <= 640) return "mobile";
+    if (w <= 900) return "mobile";
     if (w <= 1024) return "tablet";
     return "desktop";
   }, [getEffectiveViewportWidth]);
@@ -4223,7 +4227,7 @@ function ConnectPage() {
       Number(window.screen?.width || 0),
     ].filter((value) => Number.isFinite(value) && value > 0);
     const w = candidates.length ? Math.min(...candidates) : 1024;
-    if (w <= 640) return "mobile";
+    if (w <= 900) return "mobile";
     if (w <= 1024) return "tablet";
     return "desktop";
   });
@@ -14438,7 +14442,7 @@ const experienceStatusColor =
         ? "#b00020"
         : "#666";
 
-const showSwitchPersonaButton = canReturnToCompanionList || isElaraloBrandName(companyName);
+const showSwitchPersonaButton = hasMultipleSelectableCompanions;
 const switchPersonaButton = showSwitchPersonaButton ? (
   <button
     type="button"
@@ -14447,15 +14451,6 @@ const switchPersonaButton = showSwitchPersonaButton ? (
       window.setTimeout(() => {
         if (canReturnToCompanionList) {
           goToCompanionList();
-        } else {
-          // Direct/static Elaralo launches may not include the selector return
-          // query context. Preserve the Elaralo Switch control with the
-          // canonical companion-selector fallback.
-          try {
-            window.open("https://www.elaralo.com/myelaralo/companion", "_top");
-          } catch {
-            window.location.href = "https://www.elaralo.com/myelaralo/companion";
-          }
         }
         setSwitchCompanionFlash(false);
       }, 120);
@@ -15417,7 +15412,37 @@ const modePillControls = (
         </div>
       ) : null}
 
+      <style>{`
+        @media (max-width: 900px) {
+          .connect-experience-grid {
+            grid-template-columns: minmax(0, 1fr) !important;
+            grid-template-rows: auto auto auto auto auto !important;
+            column-gap: 0 !important;
+          }
+          .connect-control-rail {
+            grid-column: 1 !important;
+            grid-row: 4 !important;
+            flex-direction: row !important;
+            justify-content: flex-start !important;
+            flex-wrap: wrap !important;
+            gap: 12px !important;
+            margin-bottom: 12px !important;
+            min-width: 0 !important;
+          }
+          .connect-control-rail-inner {
+            flex-direction: row !important;
+            flex-wrap: wrap !important;
+            gap: 12px !important;
+          }
+          .connect-conversation-panel {
+            grid-column: 1 !important;
+            grid-row: 5 !important;
+          }
+        }
+      `}</style>
+
       <div
+        className="connect-experience-grid"
         style={{
           display: "grid",
           gridTemplateColumns: experienceGridTemplateColumns,
@@ -15813,6 +15838,7 @@ const modePillControls = (
 
 {showConnectControls ? (
   <section
+    className="connect-control-rail"
     style={{
       gridColumn: isMobileUI ? "1" : "2",
       gridRow: isMobileUI ? "4" : "2",
@@ -15829,6 +15855,7 @@ const modePillControls = (
     }}
   >
     <div
+      className="connect-control-rail-inner"
       style={{
         display: "flex",
         flexDirection: isMobileUI ? "row" : "column",
@@ -16399,6 +16426,7 @@ const modePillControls = (
           ) : null}
 
           <div
+            className="connect-conversation-panel"
             style={{
               gridColumn: isMobileUI ? "1" : "3",
               gridRow: isMobileUI ? "5" : "2",
