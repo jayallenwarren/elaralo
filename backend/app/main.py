@@ -499,6 +499,91 @@ def health():
 
 
 
+# ----------------------------
+# v10.0.0-alpha15.24 Connect public brand-link configuration
+# ----------------------------
+_CONNECT_BRAND_PUBLIC_DEFAULTS: Dict[str, Dict[str, str]] = {
+    "elaralo": {
+        "brand": "Elaralo",
+        "home_url": "https://www.elaralo.com/",
+        "faq_url": "https://elaralo.com/faqs",
+        "spotlight_url": "https://elaralo.com/#spotlight",
+        "spotlight_env": "SPOTLIGHT_ELARALO",
+    },
+    "dulcemoon": {
+        "brand": "DulceMoon",
+        "home_url": "https://www.dulcemoon.net/",
+        "faq_url": "https://dulcemoon.net/faqs",
+        "spotlight_url": "https://dulcemoon.net/#spotlight",
+        "spotlight_env": "SPOTLIGHT_DULCEMOON",
+    },
+}
+
+def _connect_brand_public_key(value: Any) -> str:
+    token = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    if token == "elaralo":
+        return "elaralo"
+    if token == "dulcemoon":
+        return "dulcemoon"
+    return ""
+
+def _connect_public_http_url(value: Any, fallback: str) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return fallback
+    if re.match(r"^[a-z][a-z0-9+.-]*:", candidate, flags=re.IGNORECASE) and not re.match(
+        r"^https?://", candidate, flags=re.IGNORECASE
+    ):
+        return fallback
+    if not re.match(r"^https?://", candidate, flags=re.IGNORECASE):
+        candidate = "https://" + candidate.lstrip("/")
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(candidate)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return fallback
+        return candidate
+    except Exception:
+        return fallback
+
+def _connect_brand_public_config(brand: Any) -> Dict[str, Any]:
+    key = _connect_brand_public_key(brand)
+    if not key:
+        return {
+            "brand": str(brand or "").strip(),
+            "brand_key": "",
+            "home_url": "",
+            "faq_url": "",
+            "spotlight_url": "",
+            "spotlight_source": "default",
+        }
+
+    defaults = _CONNECT_BRAND_PUBLIC_DEFAULTS[key]
+    env_name = defaults["spotlight_env"]
+    env_value = str(os.getenv(env_name, "") or "").strip()
+    environment_spotlight = _connect_public_http_url(env_value, "")
+    resolved_spotlight = environment_spotlight or defaults["spotlight_url"]
+    return {
+        "brand": defaults["brand"],
+        "brand_key": key,
+        "home_url": defaults["home_url"],
+        "faq_url": defaults["faq_url"],
+        "spotlight_url": resolved_spotlight,
+        "spotlight_source": "environment" if environment_spotlight else "default",
+    }
+
+@app.get("/connect/brand-config")
+async def connect_brand_config(brand: str = "Elaralo"):
+    """Return non-secret, runtime-configurable public links for Connect.
+
+    Spotlight links are resolved from SPOTLIGHT_ELARALO or
+    SPOTLIGHT_DULCEMOON and fall back to deterministic brand URLs. Keeping
+    the values in the backend lets operations change them without rebuilding
+    the Static Web App.
+    """
+    return {"ok": True, **_connect_brand_public_config(brand)}
+
+
 @app.get("/brand/trial-config")
 async def brand_trial_config(brand: str = "Elaralo"):
     """Return runtime Trial minute configuration for a brand.

@@ -1,9 +1,15 @@
 "use client";
+// v10.0.0-alpha15.24: runtime brand public-link configuration for Spotlights; protected media behavior unchanged.
 // v10.0.0-alpha15.21: Experience Panel portrait/usage refinement + persistent Posting-as control; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  fetchConnectBrandPublicConfig,
+  getConnectBrandPublicConfigDefaults,
+  type ConnectBrandPublicConfig,
+} from "./connectBrandConfig";
 // v9.1.38: immediate DulceMoon Host Console plan handling + public Intro/Mate/Mature label sanitation for Host Console.
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track, RoomEvent } from "livekit-client";
@@ -4968,6 +4974,39 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     ).trim();
     return derived || DEFAULT_COMPANY_NAME;
   }, [rebrandingName, payloadBrandName, rebrandingKey]);
+
+  // Public brand links are centralized in connectBrandConfig.ts. The page renders
+  // deterministic defaults immediately, then refreshes from the backend runtime
+  // configuration so SPOTLIGHT_ELARALO / SPOTLIGHT_DULCEMOON can change without
+  // rebuilding the Static Web App.
+  const defaultConnectBrandConfig = useMemo(
+    () => getConnectBrandPublicConfigDefaults(companyName),
+    [companyName]
+  );
+  const [runtimeConnectBrandConfig, setRuntimeConnectBrandConfig] =
+    useState<ConnectBrandPublicConfig | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+
+    setRuntimeConnectBrandConfig(null);
+    void fetchConnectBrandPublicConfig(API_BASE, companyName, controller?.signal).then((config) => {
+      if (active) setRuntimeConnectBrandConfig(config);
+    });
+
+    return () => {
+      active = false;
+      try { controller?.abort(); } catch {}
+    };
+  }, [companyName]);
+
+  const connectBrandConfig = useMemo(() => {
+    if (runtimeConnectBrandConfig?.brandKey === defaultConnectBrandConfig.brandKey) {
+      return runtimeConnectBrandConfig;
+    }
+    return defaultConnectBrandConfig;
+  }, [defaultConnectBrandConfig, runtimeConnectBrandConfig]);
   const [companionKey, setCompanionKey] = useState<string>("");
   const [companionKeyRaw, setCompanionKeyRaw] = useState<string>("");
   const [selectedMappingAvatar, setSelectedMappingAvatar] = useState<string>("");
@@ -14308,20 +14347,8 @@ useEffect(() => {
   if (hideSetModeInStream && showModePicker) setShowModePicker(false);
 }, [hideSetModeInStream, showModePicker]);
 
-const normalizedCompanyNameForActions = String(companyName || "")
-  .trim()
-  .toLowerCase()
-  .replace(/[^a-z0-9]+/g, "");
-const spotlightHref = isElaraloBrandName(companyName)
-  ? "https://elaralo.com/#spotlight"
-  : normalizedCompanyNameForActions === "dulcemoon"
-    ? "https://dulcemoon.net/#spotlight"
-    : "";
-const siteFaqHref = isElaraloBrandName(companyName)
-  ? "https://elaralo.com/faqs"
-  : normalizedCompanyNameForActions === "dulcemoon"
-    ? "https://dulcemoon.net/faqs"
-    : "";
+const spotlightHref = connectBrandConfig.spotlightUrl;
+const siteFaqHref = connectBrandConfig.faqUrl;
 // Forward-compatible Persona FAQ resolution. Until a Persona-specific URL is
 // provided by its mapping/profile, the button falls back to the brand site FAQ.
 const personaFaqHref = String(
@@ -14816,15 +14843,7 @@ const modePillControls = (
     </div>
   ) : null;
 
-  const normalizedCompanyNameForLink = String(companyName || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
-  const companyHomeHref = isElaraloBrandName(companyName)
-    ? "https://www.elaralo.com/"
-    : normalizedCompanyNameForLink === "dulcemoon"
-      ? "https://www.dulcemoon.net/"
-      : "";
+  const companyHomeHref = connectBrandConfig.homeUrl;
   const companionTypeBadgeLabel =
     String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human"
       ? "Human"
