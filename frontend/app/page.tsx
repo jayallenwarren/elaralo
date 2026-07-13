@@ -4198,15 +4198,13 @@ function ConnectPage() {
   const getEffectiveViewportWidth = useCallback((): number => {
     if (typeof window === "undefined") return 1024;
 
-    // Some iOS/Safari and iframe combinations report a desktop-layout
-    // window.innerWidth even while the visible device viewport is phone-sized.
-    // Use the smallest reliable viewport signal so mobile always stacks the
-    // Conversation Panel beneath the Experience Panel.
+    // Use the rendered viewport signals for layout width. Do not include
+    // screen.width here: on iPad Safari it can remain the portrait width while
+    // the device is in landscape, which incorrectly forced the phone layout.
     const candidates = [
       Number(window.visualViewport?.width || 0),
       Number(document?.documentElement?.clientWidth || 0),
       Number(window.innerWidth || 0),
-      Number(window.screen?.width || 0),
     ].filter((value) => Number.isFinite(value) && value > 0);
 
     return candidates.length ? Math.min(...candidates) : 1024;
@@ -4214,8 +4212,17 @@ function ConnectPage() {
 
   const getViewportMode = useCallback((): ViewportMode => {
     const w = getEffectiveViewportWidth();
-    if (w <= 900) return "mobile";
-    if (w <= 1024) return "tablet";
+    const screenWidth = Number(window.screen?.width || 0);
+    const screenHeight = Number(window.screen?.height || 0);
+    const shortestScreenSide =
+      screenWidth > 0 && screenHeight > 0 ? Math.min(screenWidth, screenHeight) : 0;
+
+    // Phones use the stacked Experience-then-Conversation layout. Tablets,
+    // including iPad portrait and landscape, share the desktop two-column
+    // layout and the vertical control rail beside the Conversation panel.
+    const phoneLikeScreen = shortestScreenSide > 0 && shortestScreenSide <= 600;
+    if (phoneLikeScreen || w <= 600) return "mobile";
+    if (w <= 1180) return "tablet";
     return "desktop";
   }, [getEffectiveViewportWidth]);
 
@@ -4225,11 +4232,15 @@ function ConnectPage() {
       Number(window.visualViewport?.width || 0),
       Number(document?.documentElement?.clientWidth || 0),
       Number(window.innerWidth || 0),
-      Number(window.screen?.width || 0),
     ].filter((value) => Number.isFinite(value) && value > 0);
     const w = candidates.length ? Math.min(...candidates) : 1024;
-    if (w <= 900) return "mobile";
-    if (w <= 1024) return "tablet";
+    const screenWidth = Number(window.screen?.width || 0);
+    const screenHeight = Number(window.screen?.height || 0);
+    const shortestScreenSide =
+      screenWidth > 0 && screenHeight > 0 ? Math.min(screenWidth, screenHeight) : 0;
+    const phoneLikeScreen = shortestScreenSide > 0 && shortestScreenSide <= 600;
+    if (phoneLikeScreen || w <= 600) return "mobile";
+    if (w <= 1180) return "tablet";
     return "desktop";
   });
   // Layout-only view selector for the Experience Panel. This is initialized
@@ -15414,7 +15425,7 @@ const modePillControls = (
       ) : null}
 
       <style>{`
-        @media (max-width: 900px) {
+        @media (max-width: 600px) {
           .connect-experience-grid {
             grid-template-columns: minmax(0, 1fr) !important;
             grid-template-rows: auto auto auto auto auto !important;
