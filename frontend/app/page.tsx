@@ -1,6 +1,7 @@
 "use client";
 // v10.0.0-alpha15.26: enforce stacked phone/portrait-tablet layout and show Switch only when selectable companion count is greater than one; protected media behavior unchanged.
 // v10.0.0-alpha15.24: runtime brand public-link configuration for Spotlights; protected media behavior unchanged.
+// v10.0.0-alpha15.27: halve the stacked mobile gap between Experience navigation and Play controls; protected media behavior unchanged.
 // v10.0.0-alpha15.21: Experience Panel portrait/usage refinement + persistent Posting-as control; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
@@ -15418,6 +15419,10 @@ const modePillControls = (
             grid-template-columns: minmax(0, 1fr) !important;
             grid-template-rows: auto auto auto auto auto !important;
             column-gap: 0 !important;
+            row-gap: 6px !important;
+          }
+          .connect-persona-panel {
+            margin-bottom: 5px !important;
           }
           .connect-control-rail {
             grid-column: 1 !important;
@@ -15528,6 +15533,7 @@ const modePillControls = (
         </div>
 
       <header
+        className="connect-persona-panel"
         style={{
           gridColumn: "1",
           gridRow: "2",
