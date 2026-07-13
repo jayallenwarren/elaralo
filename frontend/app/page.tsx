@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.25: restore true mobile single-column Experience/Conversation stacking and preserve Elaralo Switch fallback; protected media behavior unchanged.
 // v10.0.0-alpha15.24: runtime brand public-link configuration for Spotlights; protected media behavior unchanged.
 // v10.0.0-alpha15.21: Experience Panel portrait/usage refinement + persistent Posting-as control; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
@@ -4189,17 +4190,39 @@ function ConnectPage() {
   type ViewportMode = "mobile" | "tablet" | "desktop";
   type ExperienceView = "persona" | "video";
 
+  const getEffectiveViewportWidth = useCallback((): number => {
+    if (typeof window === "undefined") return 1024;
+
+    // Some iOS/Safari and iframe combinations report a desktop-layout
+    // window.innerWidth even while the visible device viewport is phone-sized.
+    // Use the smallest reliable viewport signal so mobile always stacks the
+    // Conversation Panel beneath the Experience Panel.
+    const candidates = [
+      Number(window.visualViewport?.width || 0),
+      Number(document?.documentElement?.clientWidth || 0),
+      Number(window.innerWidth || 0),
+      Number(window.screen?.width || 0),
+    ].filter((value) => Number.isFinite(value) && value > 0);
+
+    return candidates.length ? Math.min(...candidates) : 1024;
+  }, []);
+
   const getViewportMode = useCallback((): ViewportMode => {
-    if (typeof window === "undefined") return "desktop";
-    const w = window.innerWidth || 1024;
+    const w = getEffectiveViewportWidth();
     if (w <= 640) return "mobile";
     if (w <= 1024) return "tablet";
     return "desktop";
-  }, []);
+  }, [getEffectiveViewportWidth]);
 
   const [viewportMode, setViewportMode] = useState<ViewportMode>(() => {
     if (typeof window === "undefined") return "desktop";
-    const w = window.innerWidth || 1024;
+    const candidates = [
+      Number(window.visualViewport?.width || 0),
+      Number(document?.documentElement?.clientWidth || 0),
+      Number(window.innerWidth || 0),
+      Number(window.screen?.width || 0),
+    ].filter((value) => Number.isFinite(value) && value > 0);
+    const w = candidates.length ? Math.min(...candidates) : 1024;
     if (w <= 640) return "mobile";
     if (w <= 1024) return "tablet";
     return "desktop";
@@ -4215,9 +4238,13 @@ function ConnectPage() {
     onResize();
     window.addEventListener("resize", onResize as any, { passive: true } as any);
     window.addEventListener("orientationchange", onResize as any);
+    window.visualViewport?.addEventListener("resize", onResize as any, { passive: true } as any);
+    window.visualViewport?.addEventListener("scroll", onResize as any, { passive: true } as any);
     return () => {
       window.removeEventListener("resize", onResize as any);
       window.removeEventListener("orientationchange", onResize as any);
+      window.visualViewport?.removeEventListener("resize", onResize as any);
+      window.visualViewport?.removeEventListener("scroll", onResize as any);
     };
   }, [getViewportMode]);
 
@@ -14411,13 +14438,25 @@ const experienceStatusColor =
         ? "#b00020"
         : "#666";
 
-const switchPersonaButton = canReturnToCompanionList ? (
+const showSwitchPersonaButton = canReturnToCompanionList || isElaraloBrandName(companyName);
+const switchPersonaButton = showSwitchPersonaButton ? (
   <button
     type="button"
     onClick={() => {
       setSwitchCompanionFlash(true);
       window.setTimeout(() => {
-        goToCompanionList();
+        if (canReturnToCompanionList) {
+          goToCompanionList();
+        } else {
+          // Direct/static Elaralo launches may not include the selector return
+          // query context. Preserve the Elaralo Switch control with the
+          // canonical companion-selector fallback.
+          try {
+            window.open("https://www.elaralo.com/myelaralo/companion", "_top");
+          } catch {
+            window.location.href = "https://www.elaralo.com/myelaralo/companion";
+          }
+        }
         setSwitchCompanionFlash(false);
       }, 120);
     }}
