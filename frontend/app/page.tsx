@@ -3,7 +3,7 @@
 // v10.0.0-alpha15.26: enforce stacked phone/portrait-tablet layout and show Switch only when selectable companion count is greater than one; protected media behavior unchanged.
 // v10.0.0-alpha15.24: runtime brand public-link configuration for Spotlights; protected media behavior unchanged.
 // v10.0.0-alpha15.27: halve the stacked mobile gap between Experience navigation and Play controls; protected media behavior unchanged.
-// v10.0.0-alpha15.30: Align Conversation Panel header/tabs with Experience Panel on desktop and iPad; shift conversation content upward.
+// v10.0.0-alpha15.31: Align Experience and Conversation panel top and bottom boundaries on desktop and iPad.
 // v10.0.0-alpha15.21: Experience Panel portrait/usage refinement + persistent Posting-as control; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
@@ -15708,6 +15708,9 @@ const modePillControls = (
           flexWrap: useCompactCompanionCard ? "nowrap" : "wrap",
           rowGap: useCompactCompanionCard ? 8 : 0,
           width: "100%",
+          height: isMobileUI ? "auto" : conversationHeight,
+          minHeight: isMobileUI ? 0 : conversationHeight,
+          boxSizing: "border-box",
         }}
       >
         {useCompactCompanionCard ? (
@@ -15820,7 +15823,7 @@ const modePillControls = (
               </div>
             </div>
 
-            <div style={{ width: "100%", marginTop: 2 }}>
+            <div style={{ width: "100%", marginTop: isMobileUI ? 2 : "auto" }}>
               {usageMeterEl}
               {experienceNavigationButtons}
             </div>
