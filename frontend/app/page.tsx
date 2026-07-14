@@ -3,7 +3,9 @@
 // v10.0.0-alpha15.26: enforce stacked phone/portrait-tablet layout and show Switch only when selectable companion count is greater than one; protected media behavior unchanged.
 // v10.0.0-alpha15.24: runtime brand public-link configuration for Spotlights; protected media behavior unchanged.
 // v10.0.0-alpha15.27: halve the stacked mobile gap between Experience navigation and Play controls; protected media behavior unchanged.
-// v10.0.0-alpha15.31: Align Experience and Conversation panel top and bottom boundaries on desktop and iPad.
+// v10.0.0-alpha15.30: Align Conversation Panel header/tabs with Experience Panel on desktop and iPad; shift conversation content upward.
+// v10.0.0-alpha15.31: unify desktop/iPad panel geometry and compact same-row mobile panel tabs; preserve protected media behavior.
+// v10.0.0-alpha15.32: remove fixed desktop/iPad panel height; let Experience content define the shared row and stretch Conversation to match.
 // v10.0.0-alpha15.21: Experience Panel portrait/usage refinement + persistent Posting-as control; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
@@ -6318,7 +6320,6 @@ const showConnectControls = useMemo(() => {
 
 
   // UI layout
-  const conversationHeight = 520;
   // UI: show the video frame whenever the user is in a Live Video session.
 // For Stream (LegacyStream): show the frame immediately on Play (connecting/waiting), even before embedUrl exists,
 // so the click is never perceived as a no-op and the viewer can always press Stop to exit waiting.
@@ -6353,6 +6354,57 @@ const experienceGridTemplateColumns = isMobileUI
   : experienceVideoSelected
     ? "minmax(360px, 3fr) max-content minmax(280px, 2fr)"
     : "minmax(300px, 35fr) max-content minmax(320px, 65fr)";
+
+const sharedPanelHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  flexWrap: "nowrap",
+  gap: isMobileUI ? 6 : 8,
+  width: "100%",
+  minWidth: 0,
+  minHeight: isMobileUI ? 32 : 38,
+  paddingBottom: 2,
+  boxSizing: "border-box",
+};
+
+const sharedPanelTitleStyle: React.CSSProperties = {
+  flex: "0 1 auto",
+  minWidth: 0,
+  fontSize: isMobileUI ? 10 : 12,
+  fontWeight: 800,
+  letterSpacing: isMobileUI ? 0.45 : 0.7,
+  textTransform: "uppercase",
+  color: "#666",
+  whiteSpace: "nowrap",
+};
+
+const sharedPanelTabsStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "flex-end",
+  gap: isMobileUI ? 4 : 8,
+  flex: "0 0 auto",
+  minWidth: 0,
+  whiteSpace: "nowrap",
+};
+
+const sharedPanelTabStyle = (active: boolean, disabled = false): React.CSSProperties => ({
+  minWidth: 0,
+  minHeight: isMobileUI ? 30 : 36,
+  padding: isMobileUI ? "5px 8px" : "8px 14px",
+  borderRadius: 999,
+  border: "1px solid #111",
+  background: active ? "#111" : "#fff",
+  color: active ? "#fff" : "#111",
+  cursor: disabled ? "not-allowed" : "pointer",
+  fontSize: isMobileUI ? 11 : 13,
+  lineHeight: 1,
+  fontWeight: 800,
+  whiteSpace: "nowrap",
+  opacity: disabled ? 0.45 : 1,
+  boxSizing: "border-box",
+});
 
   // Viewer-only: treat any active LegacyStream embed as "Live Streaming".
   // Used to hide controls that must not be available to viewers during the stream.
@@ -15581,10 +15633,12 @@ const modePillControls = (
         style={{
           display: "grid",
           gridTemplateColumns: experienceGridTemplateColumns,
-          gridTemplateRows: isMobileUI ? "auto auto auto auto auto" : "auto auto auto",
+          gridTemplateRows: isMobileUI
+            ? "auto auto auto auto auto"
+            : "auto auto auto",
           columnGap: isMobileUI ? 0 : 14,
           rowGap: 12,
-          alignItems: "start",
+          alignItems: isMobileUI ? "start" : "stretch",
           width: "100%",
           minWidth: 0,
           position: "relative",
@@ -15592,102 +15646,82 @@ const modePillControls = (
         }}
       >
         <div
-          role="tablist"
-          aria-label="Experience Panel"
+          className="connect-panel-header-row connect-experience-panel-header"
           style={{
+            ...sharedPanelHeaderStyle,
             gridColumn: "1",
             gridRow: "1",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            width: "100%",
-            minWidth: 0,
-            paddingBottom: 2,
           }}
         >
-          <span
-            style={{
-              marginRight: "auto",
-              fontSize: 12,
-              fontWeight: 800,
-              letterSpacing: 0.7,
-              textTransform: "uppercase",
-              color: "#666",
-              whiteSpace: "nowrap",
-            }}
-          >
-            Experience Panel
-          </span>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={experienceView === "persona"}
-            onClick={() => setExperienceView("persona")}
-            style={{
-              padding: "8px 14px",
-              borderRadius: 999,
-              border: "1px solid #111",
-              background: experienceView === "persona" ? "#111" : "#fff",
-              color: experienceView === "persona" ? "#fff" : "#111",
-              cursor: "pointer",
-              fontWeight: 800,
-              whiteSpace: "nowrap",
-            }}
-          >
-            Persona
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={experienceView === "video"}
-            aria-disabled={!videoExperienceAvailable}
-            disabled={!videoExperienceAvailable}
-            onClick={() => {
-              if (videoExperienceAvailable) setExperienceView("video");
-            }}
-            style={{
-              padding: "8px 14px",
-              borderRadius: 999,
-              border: "1px solid #111",
-              background: experienceView === "video" ? "#111" : "#fff",
-              color: experienceView === "video" ? "#fff" : "#111",
-              cursor: videoExperienceAvailable ? "pointer" : "not-allowed",
-              fontWeight: 800,
-              whiteSpace: "nowrap",
-              opacity: videoExperienceAvailable ? 1 : 0.45,
-            }}
-            title={videoExperienceAvailable ? "Open video experience" : "Video is not available for this persona"}
-          >
-            Video
-          </button>
+          <span style={sharedPanelTitleStyle}>Experience Panel</span>
+          <div role="tablist" aria-label="Experience Panel" style={sharedPanelTabsStyle}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={experienceView === "persona"}
+              onClick={() => setExperienceView("persona")}
+              style={sharedPanelTabStyle(experienceView === "persona")}
+            >
+              Persona
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={experienceView === "video"}
+              aria-disabled={!videoExperienceAvailable}
+              disabled={!videoExperienceAvailable}
+              onClick={() => {
+                if (videoExperienceAvailable) setExperienceView("video");
+              }}
+              style={sharedPanelTabStyle(experienceView === "video", !videoExperienceAvailable)}
+              title={videoExperienceAvailable ? "Open video experience" : "Video is not available for this persona"}
+            >
+              Video
+            </button>
+          </div>
         </div>
 
         {!isMobileUI ? (
           <div
-            role="tablist"
-            aria-label="Conversation Panel"
+            className="connect-panel-header-row connect-conversation-panel-header"
             style={{
+              ...sharedPanelHeaderStyle,
               gridColumn: "3",
               gridRow: "1",
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              width: "100%",
-              minWidth: 0,
-              paddingBottom: 2,
             }}
           >
-            <span style={{ marginRight: "auto", fontSize: 12, fontWeight: 800, letterSpacing: 0.7, textTransform: "uppercase", color: "#666", whiteSpace: "nowrap" }}>
-              Conversation Panel
-            </span>
-            <button type="button" role="tab" aria-selected={conversationPanelTab === "convo"} onClick={() => setConversationPanelTab("convo")}
-              style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "convo" ? "#111" : "#fff", color: conversationPanelTab === "convo" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Convo</button>
-            <button type="button" role="tab" aria-selected={conversationPanelTab === "email"} onClick={() => setConversationPanelTab("email")}
-              style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "email" ? "#111" : "#fff", color: conversationPanelTab === "email" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Email</button>
-            {isHostConsoleUser ? (
-              <button type="button" role="tab" aria-selected={hostConsoleOpen} onClick={() => { setHostConsoleOpen(true); setHostNotice(""); }}
-                style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: hostConsoleOpen ? "#111" : "#fff", color: hostConsoleOpen ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Host</button>
-            ) : null}
+            <span style={sharedPanelTitleStyle}>Conversation Panel</span>
+            <div role="tablist" aria-label="Conversation Panel" style={sharedPanelTabsStyle}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={conversationPanelTab === "convo"}
+                onClick={() => setConversationPanelTab("convo")}
+                style={sharedPanelTabStyle(conversationPanelTab === "convo")}
+              >
+                Convo
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={conversationPanelTab === "email"}
+                onClick={() => setConversationPanelTab("email")}
+                style={sharedPanelTabStyle(conversationPanelTab === "email")}
+              >
+                Email
+              </button>
+              {isHostConsoleUser ? (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={hostConsoleOpen}
+                  onClick={() => { setHostConsoleOpen(true); setHostNotice(""); }}
+                  style={sharedPanelTabStyle(hostConsoleOpen)}
+                >
+                  Host
+                </button>
+              ) : null}
+            </div>
           </div>
         ) : null}
 
@@ -15704,12 +15738,16 @@ const modePillControls = (
           flexDirection: useCompactCompanionCard ? "column" : "row",
           alignItems: "flex-start",
           gap: useCompactCompanionCard ? 10 : 12,
-          marginBottom: 10,
+          marginBottom: isMobileUI ? 5 : 0,
           flexWrap: useCompactCompanionCard ? "nowrap" : "wrap",
           rowGap: useCompactCompanionCard ? 8 : 0,
           width: "100%",
-          height: isMobileUI ? "auto" : conversationHeight,
-          minHeight: isMobileUI ? 0 : conversationHeight,
+          minHeight: 0,
+          height: "auto",
+          alignSelf: isMobileUI ? "start" : "stretch",
+          justifyContent: "flex-start",
+          alignContent: "flex-start",
+          overflow: "visible",
           boxSizing: "border-box",
         }}
       >
@@ -15779,7 +15817,7 @@ const modePillControls = (
                 display: "flex",
                 alignItems: "flex-start",
                 justifyContent: "space-between",
-                gap: isMobileUI ? 12 : 16,
+                gap: isMobileUI ? 12 : isTabletUI ? 10 : 16,
               }}
             >
               <div style={{ flex: "0 0 auto", minWidth: 0 }}>
@@ -15813,7 +15851,7 @@ const modePillControls = (
 
               <div
                 style={{
-                  flex: isMobileUI ? "0 0 132px" : "0 0 140px",
+                  flex: isMobileUI ? "0 0 132px" : isTabletUI ? "0 0 132px" : "0 0 140px",
                   display: "flex",
                   justifyContent: "flex-end",
                   alignItems: "stretch",
@@ -15823,7 +15861,16 @@ const modePillControls = (
               </div>
             </div>
 
-            <div style={{ width: "100%", marginTop: isMobileUI ? 2 : "auto" }}>
+            <div
+              style={{
+                width: "100%",
+                marginTop: 2,
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "flex-start",
+                alignItems: "stretch",
+              }}
+            >
               {usageMeterEl}
               {experienceNavigationButtons}
             </div>
@@ -16298,6 +16345,8 @@ const modePillControls = (
                 width: "100%",
                 minWidth: 0,
                 maxWidth: "100%",
+                height: isMobileUI ? "auto" : experienceVideoHeight,
+                alignSelf: isMobileUI ? "start" : "stretch",
                 visibility: experienceView === "video" ? "visible" : "hidden",
                 opacity: experienceView === "video" ? 1 : 0,
                 pointerEvents: experienceView === "video" ? "auto" : "none",
@@ -16600,29 +16649,52 @@ const modePillControls = (
               gridRow: isMobileUI ? "5" : "2",
               minWidth: 0,
               width: "100%",
-              height: conversationHeight,
+              height: isMobileUI ? 520 : "100%",
+              minHeight: isMobileUI ? 520 : 0,
+              alignSelf: isMobileUI ? "start" : "stretch",
               display: "flex",
               flexDirection: "column",
               position: "relative",
+              boxSizing: "border-box",
             }}
           >
             {isMobileUI ? (
               <div
-                role="tablist"
-                aria-label="Conversation Panel"
-                style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, minHeight: 38 }}
+                className="connect-panel-header-row connect-conversation-panel-header"
+                style={{ ...sharedPanelHeaderStyle, marginBottom: 8 }}
               >
-                <span style={{ marginRight: "auto", fontSize: 12, fontWeight: 800, letterSpacing: 0.7, textTransform: "uppercase", color: "#666", whiteSpace: "nowrap" }}>
-                  Conversation Panel
-                </span>
-                <button type="button" role="tab" aria-selected={conversationPanelTab === "convo"} onClick={() => setConversationPanelTab("convo")}
-                  style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "convo" ? "#111" : "#fff", color: conversationPanelTab === "convo" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Convo</button>
-                <button type="button" role="tab" aria-selected={conversationPanelTab === "email"} onClick={() => setConversationPanelTab("email")}
-                  style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "email" ? "#111" : "#fff", color: conversationPanelTab === "email" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Email</button>
-                {isHostConsoleUser ? (
-                  <button type="button" role="tab" aria-selected={hostConsoleOpen} onClick={() => { setHostConsoleOpen(true); setHostNotice(""); }}
-                    style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: hostConsoleOpen ? "#111" : "#fff", color: hostConsoleOpen ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Host</button>
-                ) : null}
+                <span style={sharedPanelTitleStyle}>Conversation Panel</span>
+                <div role="tablist" aria-label="Conversation Panel" style={sharedPanelTabsStyle}>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={conversationPanelTab === "convo"}
+                    onClick={() => setConversationPanelTab("convo")}
+                    style={sharedPanelTabStyle(conversationPanelTab === "convo")}
+                  >
+                    Convo
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={conversationPanelTab === "email"}
+                    onClick={() => setConversationPanelTab("email")}
+                    style={sharedPanelTabStyle(conversationPanelTab === "email")}
+                  >
+                    Email
+                  </button>
+                  {isHostConsoleUser ? (
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={hostConsoleOpen}
+                      onClick={() => { setHostConsoleOpen(true); setHostNotice(""); }}
+                      style={sharedPanelTabStyle(hostConsoleOpen)}
+                    >
+                      Host
+                    </button>
+                  ) : null}
+                </div>
               </div>
             ) : null}
 
