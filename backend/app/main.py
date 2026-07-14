@@ -7,6 +7,7 @@ import re
 import uuid
 import json
 import hashlib
+import html
 import base64
 import mimetypes
 import math
@@ -21631,7 +21632,19 @@ def _human_media_has_current_delivery_request(low: str) -> Tuple[bool, str]:
     polite = bool(re.search(r"\b(?:can|could|would|will|may)\b.{0,80}\b(?:send|show|share|see|get)\b", value))
     desire = bool(re.search(r"\b(?:i\s+want|i\s+would\s+like|i'd\s+like|let\s+me\s+see)\b", value))
     possible = bool(re.search(r"\b(?:is\s+it\s+possible|would\s+it\s+be\s+possible)\b.{0,80}\b(?:send|show|share|get|see)\b", value))
-    if (photo or video or generic) and (command or polite or desire or possible):
+    # Natural-language follow-up requests must be treated as current delivery requests.
+    # Examples: "send me a photo", "OK send me a photo", "could you send one",
+    # and "it would be better if you could send me a photo".
+    followup = bool(re.search(
+        r"\b(?:ok(?:ay)?\s+)?(?:please\s+)?(?:send|show|share|give)\s+(?:me\s+)?(?:one|another|some|a|an|your)?\s*(?:photo|picture|pic|selfie|image|video|clip)s?\b",
+        value,
+        re.IGNORECASE,
+    )) or bool(re.search(
+        r"\b(?:better|great|nice|happy|love|like)\b.{0,100}\b(?:if\s+)?(?:you\s+)?(?:could|would|can|will)\s+(?:please\s+)?(?:send|show|share|give)\b.{0,60}\b(?:photo|picture|pic|selfie|image|video|clip)s?\b",
+        value,
+        re.IGNORECASE,
+    ))
+    if (photo or video or generic) and (command or polite or desire or possible or followup):
         if photo and not video:
             return True, "photo"
         if video and not photo:
@@ -30230,3 +30243,324 @@ async def host_onboarding_approve(session_id: str, req: HostOnboardingApproveReq
             conn.close()
         except Exception:
             pass
+
+
+# ---------------- Connect Email Center (alpha15.29) ----------------
+# Logical mailbox shared by visitors/members and the mapped Host. Messages are
+# retained physically for audit/continuity; per-party deletion only hides them.
+_CONNECT_MAIL_SCHEMA_LOCK = threading.Lock()
+_CONNECT_MAIL_SCHEMA_READY = False
+_CONNECT_MAIL_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _connect_mail_clean(value: Any, limit: int = 4000) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())[:limit]
+
+
+def _connect_mail_email(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text[:320] if _CONNECT_MAIL_EMAIL_RE.match(text) else ""
+
+
+def _connect_mail_conn() -> sqlite3.Connection:
+    conn = _econnect_conn()
+    conn.row_factory = sqlite3.Row
+    _connect_mail_ensure_schema(conn)
+    return conn
+
+
+def _connect_mail_ensure_schema(conn: sqlite3.Connection) -> None:
+    global _CONNECT_MAIL_SCHEMA_READY
+    if _CONNECT_MAIL_SCHEMA_READY:
+        return
+    with _CONNECT_MAIL_SCHEMA_LOCK:
+        if _CONNECT_MAIL_SCHEMA_READY:
+            return
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS connect_email_threads (
+              thread_id TEXT PRIMARY KEY,
+              brand TEXT NOT NULL,
+              companion_name TEXT NOT NULL,
+              host_member_id TEXT,
+              host_email TEXT,
+              host_first_name TEXT,
+              user_member_id TEXT,
+              user_email TEXT,
+              user_display_name TEXT,
+              subject TEXT NOT NULL,
+              created_epoch REAL NOT NULL,
+              updated_epoch REAL NOT NULL,
+              host_deleted INTEGER NOT NULL DEFAULT 0,
+              user_deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_connect_email_threads_host
+              ON connect_email_threads(host_member_id, brand, companion_name, updated_epoch DESC);
+            CREATE INDEX IF NOT EXISTS idx_connect_email_threads_user
+              ON connect_email_threads(user_member_id, user_email, brand, companion_name, updated_epoch DESC);
+
+            CREATE TABLE IF NOT EXISTS connect_email_messages (
+              message_id TEXT PRIMARY KEY,
+              thread_id TEXT NOT NULL,
+              sender_role TEXT NOT NULL,
+              sender_member_id TEXT,
+              sender_email TEXT,
+              sender_display_name TEXT,
+              body TEXT NOT NULL,
+              created_epoch REAL NOT NULL,
+              host_deleted INTEGER NOT NULL DEFAULT 0,
+              user_deleted INTEGER NOT NULL DEFAULT 0,
+              FOREIGN KEY(thread_id) REFERENCES connect_email_threads(thread_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_connect_email_messages_thread
+              ON connect_email_messages(thread_id, created_epoch ASC);
+            """
+        )
+        conn.commit()
+        _CONNECT_MAIL_SCHEMA_READY = True
+
+
+def _connect_mail_mapping(conn: sqlite3.Connection, brand: str, companion_name: str) -> Dict[str, str]:
+    brand_l = _connect_mail_clean(brand, 100)
+    avatar_l = _connect_mail_clean(companion_name, 160)
+    row = None
+    try:
+        row = conn.execute(
+            "SELECT * FROM companion_mappings WHERE lower(trim(brand))=lower(trim(?)) AND lower(trim(avatar))=lower(trim(?)) LIMIT 1",
+            (brand_l, avatar_l),
+        ).fetchone()
+    except Exception:
+        row = None
+    data = dict(row) if row is not None else {}
+    host_member_id = _connect_mail_clean(data.get("host_member_id") or data.get("member_id"), 200)
+    host_email = _connect_mail_email(data.get("host_email") or data.get("email"))
+    host_first_name = _connect_mail_clean(data.get("host_first_name") or data.get("first_name") or avatar_l.split(" ")[0], 100)
+    # Onboarding is the fallback source for host contact data.
+    if (not host_email or not host_member_id) and host_member_id:
+        try:
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(human_companion_onboarding)").fetchall()}
+            select_cols = [c for c in ["host_member_id", "member_id", "host_email", "email", "first_name", "host_first_name"] if c in cols]
+            if select_cols:
+                key_col = "host_member_id" if "host_member_id" in cols else ("member_id" if "member_id" in cols else "")
+                if key_col:
+                    r2 = conn.execute(f"SELECT {','.join(select_cols)} FROM human_companion_onboarding WHERE {key_col}=? LIMIT 1", (host_member_id,)).fetchone()
+                    if r2:
+                        d2 = dict(r2)
+                        host_email = host_email or _connect_mail_email(d2.get("host_email") or d2.get("email"))
+                        host_first_name = host_first_name or _connect_mail_clean(d2.get("host_first_name") or d2.get("first_name"), 100)
+        except Exception:
+            pass
+    return {
+        "host_member_id": host_member_id,
+        "host_email": host_email,
+        "host_first_name": host_first_name or (avatar_l.split(" ")[0] if avatar_l else "Host"),
+    }
+
+
+def _connect_mail_send_alert(to_email: str, subject: str, text_body: str, brand: str) -> None:
+    target = _connect_mail_email(to_email)
+    if not target:
+        return
+    try:
+        html_body = "<p>" + html.escape(text_body).replace("\n", "<br>") + "</p>"
+        _paygo_email_send_sendgrid_sync(target, subject, text_body, html_body, brand=brand)
+    except Exception as exc:
+        print(f"[connect-mail] alert failed: {exc!r}")
+
+
+def _connect_mail_thread_public(row: sqlite3.Row, role: str) -> Dict[str, Any]:
+    d = dict(row)
+    return {
+        "thread_id": d.get("thread_id"),
+        "subject": d.get("subject") or "Connect message",
+        "user_display_name": d.get("user_display_name") or "Connect user",
+        "host_first_name": d.get("host_first_name") or "Host",
+        "updated_epoch": float(d.get("updated_epoch") or 0),
+        "created_epoch": float(d.get("created_epoch") or 0),
+        "counterparty": (d.get("user_display_name") or "Connect user") if role == "host" else (d.get("host_first_name") or "Host"),
+    }
+
+
+@app.post("/connect/email/send")
+async def connect_email_send(request: Request):
+    payload = await request.json()
+    brand = _connect_mail_clean(payload.get("brand"), 100) or "Elaralo"
+    companion = _connect_mail_clean(payload.get("companion_name") or payload.get("companion"), 160)
+    member_id = _connect_mail_clean(payload.get("member_id"), 200)
+    user_email = _connect_mail_email(payload.get("user_email") or payload.get("email"))
+    username = _connect_mail_clean(payload.get("username") or payload.get("display_name"), 100)
+    subject = _connect_mail_clean(payload.get("subject"), 240) or "Connect message"
+    body = str(payload.get("body") or "").strip()[:12000]
+    if not companion or not user_email or not body:
+        raise HTTPException(status_code=400, detail="companion_name, a valid user_email, and body are required")
+    now = time.time()
+    thread_id = uuid.uuid4().hex
+    message_id = uuid.uuid4().hex
+    conn = _connect_mail_conn()
+    try:
+        mapping = _connect_mail_mapping(conn, brand, companion)
+        if not mapping.get("host_member_id"):
+            raise HTTPException(status_code=404, detail="Host mapping not found")
+        conn.execute(
+            """INSERT INTO connect_email_threads
+            (thread_id,brand,companion_name,host_member_id,host_email,host_first_name,user_member_id,user_email,user_display_name,subject,created_epoch,updated_epoch)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (thread_id, brand, companion, mapping.get("host_member_id"), mapping.get("host_email"), mapping.get("host_first_name"), member_id, user_email, username or "Connect user", subject, now, now),
+        )
+        conn.execute(
+            """INSERT INTO connect_email_messages
+            (message_id,thread_id,sender_role,sender_member_id,sender_email,sender_display_name,body,created_epoch)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (message_id, thread_id, "user", member_id, user_email, username or "Connect user", body, now),
+        )
+        conn.commit()
+        if mapping.get("host_email"):
+            _connect_mail_send_alert(
+                mapping["host_email"],
+                f"New Connect email from {username or 'Connect user'}",
+                f"An email message from {username or 'Connect user'} has been received. Log into Connect and select Email to read and reply.",
+                brand,
+            )
+        return {"ok": True, "thread_id": thread_id, "message_id": message_id}
+    finally:
+        conn.close()
+
+
+@app.get("/connect/email/list")
+def connect_email_list(brand: str, companion_name: str, member_id: str = "", user_email: str = "", role: str = "user"):
+    role_n = "host" if str(role).lower() == "host" else "user"
+    conn = _connect_mail_conn()
+    try:
+        if role_n == "host":
+            mapping = _connect_mail_mapping(conn, brand, companion_name)
+            if not mapping.get("host_member_id") or _connect_mail_clean(member_id, 200) != mapping.get("host_member_id"):
+                raise HTTPException(status_code=403, detail="Host access required")
+            rows = conn.execute(
+                """SELECT * FROM connect_email_threads WHERE host_member_id=? AND lower(brand)=lower(?)
+                   AND lower(companion_name)=lower(?) AND host_deleted=0 ORDER BY updated_epoch DESC""",
+                (mapping["host_member_id"], brand, companion_name),
+            ).fetchall()
+        else:
+            email_n = _connect_mail_email(user_email)
+            member_n = _connect_mail_clean(member_id, 200)
+            if not email_n and not member_n:
+                return {"ok": True, "threads": []}
+            rows = conn.execute(
+                """SELECT * FROM connect_email_threads WHERE lower(brand)=lower(?) AND lower(companion_name)=lower(?)
+                   AND user_deleted=0 AND ((?<>'' AND user_member_id=?) OR (?<>'' AND lower(user_email)=lower(?)))
+                   ORDER BY updated_epoch DESC""",
+                (brand, companion_name, member_n, member_n, email_n, email_n),
+            ).fetchall()
+        return {"ok": True, "threads": [_connect_mail_thread_public(r, role_n) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.get("/connect/email/thread/{thread_id}")
+def connect_email_thread(thread_id: str, member_id: str = "", user_email: str = "", role: str = "user"):
+    role_n = "host" if str(role).lower() == "host" else "user"
+    conn = _connect_mail_conn()
+    try:
+        t = conn.execute("SELECT * FROM connect_email_threads WHERE thread_id=? LIMIT 1", (thread_id,)).fetchone()
+        if not t:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        td = dict(t)
+        if role_n == "host":
+            if _connect_mail_clean(member_id, 200) != _connect_mail_clean(td.get("host_member_id"), 200) or int(td.get("host_deleted") or 0):
+                raise HTTPException(status_code=403, detail="Host access required")
+            deleted_col = "host_deleted"
+        else:
+            member_ok = bool(member_id and _connect_mail_clean(member_id,200) == _connect_mail_clean(td.get("user_member_id"),200))
+            email_ok = bool(user_email and _connect_mail_email(user_email) == _connect_mail_email(td.get("user_email")))
+            if not (member_ok or email_ok) or int(td.get("user_deleted") or 0):
+                raise HTTPException(status_code=403, detail="Mailbox access required")
+            deleted_col = "user_deleted"
+        rows = conn.execute(f"SELECT * FROM connect_email_messages WHERE thread_id=? AND {deleted_col}=0 ORDER BY created_epoch ASC", (thread_id,)).fetchall()
+        return {
+            "ok": True,
+            "thread": _connect_mail_thread_public(t, role_n),
+            "messages": [dict(r) for r in rows],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/connect/email/reply")
+async def connect_email_reply(request: Request):
+    payload = await request.json()
+    thread_id = _connect_mail_clean(payload.get("thread_id"), 100)
+    role_n = "host" if str(payload.get("role") or "user").lower() == "host" else "user"
+    member_id = _connect_mail_clean(payload.get("member_id"), 200)
+    user_email = _connect_mail_email(payload.get("user_email") or payload.get("email"))
+    username = _connect_mail_clean(payload.get("username") or payload.get("display_name"), 100)
+    body = str(payload.get("body") or "").strip()[:12000]
+    if not thread_id or not body:
+        raise HTTPException(status_code=400, detail="thread_id and body are required")
+    conn = _connect_mail_conn()
+    try:
+        t = conn.execute("SELECT * FROM connect_email_threads WHERE thread_id=? LIMIT 1", (thread_id,)).fetchone()
+        if not t:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        td = dict(t)
+        if role_n == "host":
+            if member_id != _connect_mail_clean(td.get("host_member_id"), 200):
+                raise HTTPException(status_code=403, detail="Host access required")
+            sender_email = _connect_mail_email(td.get("host_email"))
+            sender_name = _connect_mail_clean(td.get("host_first_name"),100) or "Host"
+            alert_to = _connect_mail_email(td.get("user_email"))
+        else:
+            member_ok = bool(member_id and member_id == _connect_mail_clean(td.get("user_member_id"),200))
+            email_ok = bool(user_email and user_email == _connect_mail_email(td.get("user_email")))
+            if not (member_ok or email_ok):
+                raise HTTPException(status_code=403, detail="Mailbox access required")
+            sender_email = user_email or _connect_mail_email(td.get("user_email"))
+            sender_name = username or _connect_mail_clean(td.get("user_display_name"),100) or "Connect user"
+            alert_to = _connect_mail_email(td.get("host_email"))
+        now = time.time()
+        message_id = uuid.uuid4().hex
+        conn.execute(
+            """INSERT INTO connect_email_messages
+            (message_id,thread_id,sender_role,sender_member_id,sender_email,sender_display_name,body,created_epoch)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (message_id, thread_id, role_n, member_id, sender_email, sender_name, body, now),
+        )
+        conn.execute("UPDATE connect_email_threads SET updated_epoch=?, host_deleted=0, user_deleted=0 WHERE thread_id=?", (now, thread_id))
+        conn.commit()
+        if role_n == "host":
+            _connect_mail_send_alert(alert_to, f"{sender_name} replied to your Connect email", f"{sender_name} has replied to your email. Log into Connect to see the reply.", td.get("brand") or "Elaralo")
+        else:
+            _connect_mail_send_alert(alert_to, f"Connect email reply from {sender_name}", f"An email message from {sender_name} has been received. Log into Connect and select Email to read and reply.", td.get("brand") or "Elaralo")
+        return {"ok": True, "message_id": message_id}
+    finally:
+        conn.close()
+
+
+@app.post("/connect/email/delete")
+async def connect_email_delete(request: Request):
+    payload = await request.json()
+    thread_id = _connect_mail_clean(payload.get("thread_id"),100)
+    role_n = "host" if str(payload.get("role") or "user").lower() == "host" else "user"
+    member_id = _connect_mail_clean(payload.get("member_id"),200)
+    user_email = _connect_mail_email(payload.get("user_email") or payload.get("email"))
+    conn = _connect_mail_conn()
+    try:
+        t = conn.execute("SELECT * FROM connect_email_threads WHERE thread_id=? LIMIT 1", (thread_id,)).fetchone()
+        if not t:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        td = dict(t)
+        if role_n == "host":
+            if member_id != _connect_mail_clean(td.get("host_member_id"),200):
+                raise HTTPException(status_code=403, detail="Host access required")
+            conn.execute("UPDATE connect_email_threads SET host_deleted=1 WHERE thread_id=?", (thread_id,))
+            conn.execute("UPDATE connect_email_messages SET host_deleted=1 WHERE thread_id=?", (thread_id,))
+        else:
+            member_ok = bool(member_id and member_id == _connect_mail_clean(td.get("user_member_id"),200))
+            email_ok = bool(user_email and user_email == _connect_mail_email(td.get("user_email")))
+            if not (member_ok or email_ok):
+                raise HTTPException(status_code=403, detail="Mailbox access required")
+            conn.execute("UPDATE connect_email_threads SET user_deleted=1 WHERE thread_id=?", (thread_id,))
+            conn.execute("UPDATE connect_email_messages SET user_deleted=1 WHERE thread_id=?", (thread_id,))
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()

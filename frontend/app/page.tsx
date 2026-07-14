@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.29.1: move Connect Email hooks after host/email state declarations to satisfy Next.js TypeScript build order; no protected media behavior changed.
 // v10.0.0-alpha15.26: enforce stacked phone/portrait-tablet layout and show Switch only when selectable companion count is greater than one; protected media behavior unchanged.
 // v10.0.0-alpha15.24: runtime brand public-link configuration for Spotlights; protected media behavior unchanged.
 // v10.0.0-alpha15.27: halve the stacked mobile gap between Experience navigation and Play controls; protected media behavior unchanged.
@@ -5315,105 +5316,6 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
 
 
 
-  const connectEmailRole = isHostConsoleUser ? "host" : "user";
-  const connectEmailStorageKey = useMemo(() => {
-    const b = safeBrandKey(String(companyName || "core")) || "core";
-    const m = safeBrandKey(String(memberId || "visitor")) || "visitor";
-    return `connect_email:${b}:${m}`;
-  }, [companyName, memberId]);
-
-  useEffect(() => {
-    try { setConnectEmailAddress(String(window.localStorage.getItem(connectEmailStorageKey) || "")); } catch {}
-  }, [connectEmailStorageKey]);
-
-  const ensureConnectEmailAddress = useCallback((): string => {
-    if (connectEmailRole === "host") return connectEmailAddress;
-    const current = String(connectEmailAddress || "").trim().toLowerCase();
-    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(current)) return current;
-    const entered = String(window.prompt("Enter your email address to send and receive Connect email messages:", current) || "").trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(entered)) {
-      setConnectEmailError("A valid email address is required.");
-      return "";
-    }
-    setConnectEmailAddress(entered);
-    try { window.localStorage.setItem(connectEmailStorageKey, entered); } catch {}
-    return entered;
-  }, [connectEmailAddress, connectEmailRole, connectEmailStorageKey]);
-
-  const loadConnectEmailThreads = useCallback(async () => {
-    if (conversationPanelTab !== "email") return;
-    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
-    if (connectEmailRole !== "host" && !email) return;
-    setConnectEmailLoading(true); setConnectEmailError("");
-    try {
-      const q = new URLSearchParams({
-        brand: String(companyName || "Elaralo"),
-        companion_name: String(companionName || DEFAULT_COMPANION_NAME),
-        member_id: String(memberId || ""),
-        user_email: email || "",
-        role: connectEmailRole,
-      });
-      const r = await fetch(`${API_BASE}/connect/email/list?${q.toString()}`);
-      const d = await r.json();
-      if (!r.ok) throw new Error(String(d?.detail || "Unable to load Connect email."));
-      setConnectEmailThreads(Array.isArray(d?.threads) ? d.threads : []);
-    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
-    finally { setConnectEmailLoading(false); }
-  }, [API_BASE, companyName, companionName, memberId, connectEmailAddress, connectEmailRole, conversationPanelTab, ensureConnectEmailAddress]);
-
-  useEffect(() => { void loadConnectEmailThreads(); }, [loadConnectEmailThreads]);
-
-  const openConnectEmailThread = useCallback(async (threadId: string) => {
-    setConnectEmailSelectedThreadId(threadId); setConnectEmailLoading(true); setConnectEmailError("");
-    try {
-      const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
-      const q = new URLSearchParams({ member_id: String(memberId || ""), user_email: email || "", role: connectEmailRole });
-      const r = await fetch(`${API_BASE}/connect/email/thread/${encodeURIComponent(threadId)}?${q.toString()}`);
-      const d = await r.json();
-      if (!r.ok) throw new Error(String(d?.detail || "Unable to load message."));
-      setConnectEmailMessages(Array.isArray(d?.messages) ? d.messages : []);
-      if (d?.thread?.subject) setConnectEmailSubject(String(d.thread.subject));
-    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
-    finally { setConnectEmailLoading(false); }
-  }, [API_BASE, memberId, connectEmailAddress, connectEmailRole, ensureConnectEmailAddress]);
-
-  const sendConnectEmail = useCallback(async () => {
-    const body = String(connectEmailDraft || "").trim();
-    if (!body) return;
-    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
-    if (connectEmailRole !== "host" && !email) return;
-    setConnectEmailLoading(true); setConnectEmailError("");
-    try {
-      const endpoint = connectEmailSelectedThreadId ? "/connect/email/reply" : "/connect/email/send";
-      const payload = connectEmailSelectedThreadId ? {
-        thread_id: connectEmailSelectedThreadId, role: connectEmailRole, member_id: String(memberId || ""),
-        user_email: email || "", username: postingAsViewerName, body,
-      } : {
-        brand: String(companyName || "Elaralo"), companion_name: String(companionName || DEFAULT_COMPANION_NAME),
-        member_id: String(memberId || ""), user_email: email || "", username: postingAsViewerName,
-        subject: String(connectEmailSubject || "Connect message"), body,
-      };
-      const r = await fetch(`${API_BASE}${endpoint}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-      const d = await r.json();
-      if (!r.ok) throw new Error(String(d?.detail || "Unable to send message."));
-      setConnectEmailDraft("");
-      const threadId = String(d?.thread_id || connectEmailSelectedThreadId || "");
-      await loadConnectEmailThreads();
-      if (threadId) await openConnectEmailThread(threadId);
-    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
-    finally { setConnectEmailLoading(false); }
-  }, [API_BASE, companyName, companionName, memberId, postingAsViewerName, connectEmailAddress, connectEmailDraft, connectEmailRole, connectEmailSelectedThreadId, connectEmailSubject, ensureConnectEmailAddress, loadConnectEmailThreads, openConnectEmailThread]);
-
-  const deleteConnectEmailThread = useCallback(async (threadId: string) => {
-    if (!threadId || !window.confirm("Delete this message from your Connect mailbox?")) return;
-    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
-    try {
-      const r = await fetch(`${API_BASE}/connect/email/delete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ thread_id: threadId, role: connectEmailRole, member_id: String(memberId || ""), user_email: email || "" }) });
-      const d = await r.json(); if (!r.ok) throw new Error(String(d?.detail || "Unable to delete message."));
-      if (connectEmailSelectedThreadId === threadId) { setConnectEmailSelectedThreadId(""); setConnectEmailMessages([]); }
-      await loadConnectEmailThreads();
-    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
-  }, [API_BASE, memberId, connectEmailAddress, connectEmailRole, connectEmailSelectedThreadId, ensureConnectEmailAddress, loadConnectEmailThreads]);
 
   // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
   const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
@@ -5788,6 +5690,106 @@ const [hostConsoleOpen, setHostConsoleOpen] = useState<boolean>(false);
   const [connectEmailDraft, setConnectEmailDraft] = useState<string>("");
   const [connectEmailLoading, setConnectEmailLoading] = useState<boolean>(false);
   const [connectEmailError, setConnectEmailError] = useState<string>("");
+
+  const connectEmailRole = isHostConsoleUser ? "host" : "user";
+  const connectEmailStorageKey = useMemo(() => {
+    const b = safeBrandKey(String(companyName || "core")) || "core";
+    const m = safeBrandKey(String(memberId || "visitor")) || "visitor";
+    return `connect_email:${b}:${m}`;
+  }, [companyName, memberId]);
+
+  useEffect(() => {
+    try { setConnectEmailAddress(String(window.localStorage.getItem(connectEmailStorageKey) || "")); } catch {}
+  }, [connectEmailStorageKey]);
+
+  const ensureConnectEmailAddress = useCallback((): string => {
+    if (connectEmailRole === "host") return connectEmailAddress;
+    const current = String(connectEmailAddress || "").trim().toLowerCase();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(current)) return current;
+    const entered = String(window.prompt("Enter your email address to send and receive Connect email messages:", current) || "").trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(entered)) {
+      setConnectEmailError("A valid email address is required.");
+      return "";
+    }
+    setConnectEmailAddress(entered);
+    try { window.localStorage.setItem(connectEmailStorageKey, entered); } catch {}
+    return entered;
+  }, [connectEmailAddress, connectEmailRole, connectEmailStorageKey]);
+
+  const loadConnectEmailThreads = useCallback(async () => {
+    if (conversationPanelTab !== "email") return;
+    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
+    if (connectEmailRole !== "host" && !email) return;
+    setConnectEmailLoading(true); setConnectEmailError("");
+    try {
+      const q = new URLSearchParams({
+        brand: String(companyName || "Elaralo"),
+        companion_name: String(companionName || DEFAULT_COMPANION_NAME),
+        member_id: String(memberId || ""),
+        user_email: email || "",
+        role: connectEmailRole,
+      });
+      const r = await fetch(`${API_BASE}/connect/email/list?${q.toString()}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(String(d?.detail || "Unable to load Connect email."));
+      setConnectEmailThreads(Array.isArray(d?.threads) ? d.threads : []);
+    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
+    finally { setConnectEmailLoading(false); }
+  }, [API_BASE, companyName, companionName, memberId, connectEmailAddress, connectEmailRole, conversationPanelTab, ensureConnectEmailAddress]);
+
+  useEffect(() => { void loadConnectEmailThreads(); }, [loadConnectEmailThreads]);
+
+  const openConnectEmailThread = useCallback(async (threadId: string) => {
+    setConnectEmailSelectedThreadId(threadId); setConnectEmailLoading(true); setConnectEmailError("");
+    try {
+      const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
+      const q = new URLSearchParams({ member_id: String(memberId || ""), user_email: email || "", role: connectEmailRole });
+      const r = await fetch(`${API_BASE}/connect/email/thread/${encodeURIComponent(threadId)}?${q.toString()}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(String(d?.detail || "Unable to load message."));
+      setConnectEmailMessages(Array.isArray(d?.messages) ? d.messages : []);
+      if (d?.thread?.subject) setConnectEmailSubject(String(d.thread.subject));
+    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
+    finally { setConnectEmailLoading(false); }
+  }, [API_BASE, memberId, connectEmailAddress, connectEmailRole, ensureConnectEmailAddress]);
+
+  const sendConnectEmail = useCallback(async () => {
+    const body = String(connectEmailDraft || "").trim();
+    if (!body) return;
+    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
+    if (connectEmailRole !== "host" && !email) return;
+    setConnectEmailLoading(true); setConnectEmailError("");
+    try {
+      const endpoint = connectEmailSelectedThreadId ? "/connect/email/reply" : "/connect/email/send";
+      const payload = connectEmailSelectedThreadId ? {
+        thread_id: connectEmailSelectedThreadId, role: connectEmailRole, member_id: String(memberId || ""),
+        user_email: email || "", username: postingAsViewerName, body,
+      } : {
+        brand: String(companyName || "Elaralo"), companion_name: String(companionName || DEFAULT_COMPANION_NAME),
+        member_id: String(memberId || ""), user_email: email || "", username: postingAsViewerName,
+        subject: String(connectEmailSubject || "Connect message"), body,
+      };
+      const r = await fetch(`${API_BASE}${endpoint}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const d = await r.json();
+      if (!r.ok) throw new Error(String(d?.detail || "Unable to send message."));
+      setConnectEmailDraft("");
+      const threadId = String(d?.thread_id || connectEmailSelectedThreadId || "");
+      await loadConnectEmailThreads();
+      if (threadId) await openConnectEmailThread(threadId);
+    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
+    finally { setConnectEmailLoading(false); }
+  }, [API_BASE, companyName, companionName, memberId, postingAsViewerName, connectEmailAddress, connectEmailDraft, connectEmailRole, connectEmailSelectedThreadId, connectEmailSubject, ensureConnectEmailAddress, loadConnectEmailThreads, openConnectEmailThread]);
+
+  const deleteConnectEmailThread = useCallback(async (threadId: string) => {
+    if (!threadId || !window.confirm("Delete this message from your Connect mailbox?")) return;
+    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
+    try {
+      const r = await fetch(`${API_BASE}/connect/email/delete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ thread_id: threadId, role: connectEmailRole, member_id: String(memberId || ""), user_email: email || "" }) });
+      const d = await r.json(); if (!r.ok) throw new Error(String(d?.detail || "Unable to delete message."));
+      if (connectEmailSelectedThreadId === threadId) { setConnectEmailSelectedThreadId(""); setConnectEmailMessages([]); }
+      await loadConnectEmailThreads();
+    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
+  }, [API_BASE, memberId, connectEmailAddress, connectEmailRole, connectEmailSelectedThreadId, ensureConnectEmailAddress, loadConnectEmailThreads]);
 
 const [hostActiveChats, setHostActiveChats] = useState<HostActiveChat[]>([]);
 const [hostActiveLoading, setHostActiveLoading] = useState<boolean>(false);
