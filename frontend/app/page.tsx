@@ -3,6 +3,7 @@
 // v10.0.0-alpha15.26: enforce stacked phone/portrait-tablet layout and show Switch only when selectable companion count is greater than one; protected media behavior unchanged.
 // v10.0.0-alpha15.24: runtime brand public-link configuration for Spotlights; protected media behavior unchanged.
 // v10.0.0-alpha15.27: halve the stacked mobile gap between Experience navigation and Play controls; protected media behavior unchanged.
+// v10.0.0-alpha15.30: Align Conversation Panel header/tabs with Experience Panel on desktop and iPad; shift conversation content upward.
 // v10.0.0-alpha15.21: Experience Panel portrait/usage refinement + persistent Posting-as control; protected STT/TTS/media behavior unchanged.
 // v9.1.17: Preserve v9.1.16 auto-mode behavior and add DulceMoon/white-label
 // hyphenated companion-key -> SQL avatar aliasing for mapping lookup.
@@ -15661,6 +15662,35 @@ const modePillControls = (
           </button>
         </div>
 
+        {!isMobileUI ? (
+          <div
+            role="tablist"
+            aria-label="Conversation Panel"
+            style={{
+              gridColumn: "3",
+              gridRow: "1",
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              width: "100%",
+              minWidth: 0,
+              paddingBottom: 2,
+            }}
+          >
+            <span style={{ marginRight: "auto", fontSize: 12, fontWeight: 800, letterSpacing: 0.7, textTransform: "uppercase", color: "#666", whiteSpace: "nowrap" }}>
+              Conversation Panel
+            </span>
+            <button type="button" role="tab" aria-selected={conversationPanelTab === "convo"} onClick={() => setConversationPanelTab("convo")}
+              style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "convo" ? "#111" : "#fff", color: conversationPanelTab === "convo" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Convo</button>
+            <button type="button" role="tab" aria-selected={conversationPanelTab === "email"} onClick={() => setConversationPanelTab("email")}
+              style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "email" ? "#111" : "#fff", color: conversationPanelTab === "email" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Email</button>
+            {isHostConsoleUser ? (
+              <button type="button" role="tab" aria-selected={hostConsoleOpen} onClick={() => { setHostConsoleOpen(true); setHostNotice(""); }}
+                style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: hostConsoleOpen ? "#111" : "#fff", color: hostConsoleOpen ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Host</button>
+            ) : null}
+          </div>
+        ) : null}
+
       <header
         className="connect-persona-panel"
         style={{
@@ -16573,23 +16603,25 @@ const modePillControls = (
               position: "relative",
             }}
           >
-            <div
-              role="tablist"
-              aria-label="Conversation Panel"
-              style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, minHeight: 38 }}
-            >
-              <span style={{ marginRight: "auto", fontSize: 12, fontWeight: 800, letterSpacing: 0.7, textTransform: "uppercase", color: "#666", whiteSpace: "nowrap" }}>
-                Conversation Panel
-              </span>
-              <button type="button" role="tab" aria-selected={conversationPanelTab === "convo"} onClick={() => setConversationPanelTab("convo")}
-                style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "convo" ? "#111" : "#fff", color: conversationPanelTab === "convo" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Convo</button>
-              <button type="button" role="tab" aria-selected={conversationPanelTab === "email"} onClick={() => setConversationPanelTab("email")}
-                style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "email" ? "#111" : "#fff", color: conversationPanelTab === "email" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Email</button>
-              {isHostConsoleUser ? (
-                <button type="button" role="tab" aria-selected={hostConsoleOpen} onClick={() => { setHostConsoleOpen(true); setHostNotice(""); }}
-                  style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: hostConsoleOpen ? "#111" : "#fff", color: hostConsoleOpen ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Host</button>
-              ) : null}
-            </div>
+            {isMobileUI ? (
+              <div
+                role="tablist"
+                aria-label="Conversation Panel"
+                style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, minHeight: 38 }}
+              >
+                <span style={{ marginRight: "auto", fontSize: 12, fontWeight: 800, letterSpacing: 0.7, textTransform: "uppercase", color: "#666", whiteSpace: "nowrap" }}>
+                  Conversation Panel
+                </span>
+                <button type="button" role="tab" aria-selected={conversationPanelTab === "convo"} onClick={() => setConversationPanelTab("convo")}
+                  style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "convo" ? "#111" : "#fff", color: conversationPanelTab === "convo" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Convo</button>
+                <button type="button" role="tab" aria-selected={conversationPanelTab === "email"} onClick={() => setConversationPanelTab("email")}
+                  style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "email" ? "#111" : "#fff", color: conversationPanelTab === "email" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Email</button>
+                {isHostConsoleUser ? (
+                  <button type="button" role="tab" aria-selected={hostConsoleOpen} onClick={() => { setHostConsoleOpen(true); setHostNotice(""); }}
+                    style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: hostConsoleOpen ? "#111" : "#fff", color: hostConsoleOpen ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Host</button>
+                ) : null}
+              </div>
+            ) : null}
 
             {conversationPanelTab === "email" ? (
               <div style={{ flex: "1 1 auto", minHeight: 0, border: "1px solid #e5e5e5", borderRadius: 12, background: "#fff", display: "grid", gridTemplateColumns: isMobileUI ? "1fr" : "minmax(190px, 34%) 1fr", overflow: "hidden" }}>
