@@ -5092,6 +5092,8 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     preferredViewerDisplayNameRef.current = String(preferredViewerDisplayName || "").trim();
   }, [preferredViewerDisplayName]);
 
+  // Display-name precedence is deliberate: persisted/session username first,
+  // then the member/payload first name, then the anonymous viewer fallback.
   const transcriptViewerLabel = useMemo(() => {
     return preferredViewerDisplayName || "You";
   }, [preferredViewerDisplayName]);
@@ -5311,6 +5313,107 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     }
   }, [postingAsViewerName, sanitizeViewerUsername, persistViewerLiveChatName]);
 
+
+
+  const connectEmailRole = isHostConsoleUser ? "host" : "user";
+  const connectEmailStorageKey = useMemo(() => {
+    const b = safeBrandKey(String(companyName || "core")) || "core";
+    const m = safeBrandKey(String(memberId || "visitor")) || "visitor";
+    return `connect_email:${b}:${m}`;
+  }, [companyName, memberId]);
+
+  useEffect(() => {
+    try { setConnectEmailAddress(String(window.localStorage.getItem(connectEmailStorageKey) || "")); } catch {}
+  }, [connectEmailStorageKey]);
+
+  const ensureConnectEmailAddress = useCallback((): string => {
+    if (connectEmailRole === "host") return connectEmailAddress;
+    const current = String(connectEmailAddress || "").trim().toLowerCase();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(current)) return current;
+    const entered = String(window.prompt("Enter your email address to send and receive Connect email messages:", current) || "").trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(entered)) {
+      setConnectEmailError("A valid email address is required.");
+      return "";
+    }
+    setConnectEmailAddress(entered);
+    try { window.localStorage.setItem(connectEmailStorageKey, entered); } catch {}
+    return entered;
+  }, [connectEmailAddress, connectEmailRole, connectEmailStorageKey]);
+
+  const loadConnectEmailThreads = useCallback(async () => {
+    if (conversationPanelTab !== "email") return;
+    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
+    if (connectEmailRole !== "host" && !email) return;
+    setConnectEmailLoading(true); setConnectEmailError("");
+    try {
+      const q = new URLSearchParams({
+        brand: String(companyName || "Elaralo"),
+        companion_name: String(companionName || DEFAULT_COMPANION_NAME),
+        member_id: String(memberId || ""),
+        user_email: email || "",
+        role: connectEmailRole,
+      });
+      const r = await fetch(`${API_BASE}/connect/email/list?${q.toString()}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(String(d?.detail || "Unable to load Connect email."));
+      setConnectEmailThreads(Array.isArray(d?.threads) ? d.threads : []);
+    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
+    finally { setConnectEmailLoading(false); }
+  }, [API_BASE, companyName, companionName, memberId, connectEmailAddress, connectEmailRole, conversationPanelTab, ensureConnectEmailAddress]);
+
+  useEffect(() => { void loadConnectEmailThreads(); }, [loadConnectEmailThreads]);
+
+  const openConnectEmailThread = useCallback(async (threadId: string) => {
+    setConnectEmailSelectedThreadId(threadId); setConnectEmailLoading(true); setConnectEmailError("");
+    try {
+      const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
+      const q = new URLSearchParams({ member_id: String(memberId || ""), user_email: email || "", role: connectEmailRole });
+      const r = await fetch(`${API_BASE}/connect/email/thread/${encodeURIComponent(threadId)}?${q.toString()}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(String(d?.detail || "Unable to load message."));
+      setConnectEmailMessages(Array.isArray(d?.messages) ? d.messages : []);
+      if (d?.thread?.subject) setConnectEmailSubject(String(d.thread.subject));
+    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
+    finally { setConnectEmailLoading(false); }
+  }, [API_BASE, memberId, connectEmailAddress, connectEmailRole, ensureConnectEmailAddress]);
+
+  const sendConnectEmail = useCallback(async () => {
+    const body = String(connectEmailDraft || "").trim();
+    if (!body) return;
+    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
+    if (connectEmailRole !== "host" && !email) return;
+    setConnectEmailLoading(true); setConnectEmailError("");
+    try {
+      const endpoint = connectEmailSelectedThreadId ? "/connect/email/reply" : "/connect/email/send";
+      const payload = connectEmailSelectedThreadId ? {
+        thread_id: connectEmailSelectedThreadId, role: connectEmailRole, member_id: String(memberId || ""),
+        user_email: email || "", username: postingAsViewerName, body,
+      } : {
+        brand: String(companyName || "Elaralo"), companion_name: String(companionName || DEFAULT_COMPANION_NAME),
+        member_id: String(memberId || ""), user_email: email || "", username: postingAsViewerName,
+        subject: String(connectEmailSubject || "Connect message"), body,
+      };
+      const r = await fetch(`${API_BASE}${endpoint}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const d = await r.json();
+      if (!r.ok) throw new Error(String(d?.detail || "Unable to send message."));
+      setConnectEmailDraft("");
+      const threadId = String(d?.thread_id || connectEmailSelectedThreadId || "");
+      await loadConnectEmailThreads();
+      if (threadId) await openConnectEmailThread(threadId);
+    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
+    finally { setConnectEmailLoading(false); }
+  }, [API_BASE, companyName, companionName, memberId, postingAsViewerName, connectEmailAddress, connectEmailDraft, connectEmailRole, connectEmailSelectedThreadId, connectEmailSubject, ensureConnectEmailAddress, loadConnectEmailThreads, openConnectEmailThread]);
+
+  const deleteConnectEmailThread = useCallback(async (threadId: string) => {
+    if (!threadId || !window.confirm("Delete this message from your Connect mailbox?")) return;
+    const email = connectEmailRole === "host" ? connectEmailAddress : ensureConnectEmailAddress();
+    try {
+      const r = await fetch(`${API_BASE}/connect/email/delete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ thread_id: threadId, role: connectEmailRole, member_id: String(memberId || ""), user_email: email || "" }) });
+      const d = await r.json(); if (!r.ok) throw new Error(String(d?.detail || "Unable to delete message."));
+      if (connectEmailSelectedThreadId === threadId) { setConnectEmailSelectedThreadId(""); setConnectEmailMessages([]); }
+      await loadConnectEmailThreads();
+    } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
+  }, [API_BASE, memberId, connectEmailAddress, connectEmailRole, connectEmailSelectedThreadId, ensureConnectEmailAddress, loadConnectEmailThreads]);
 
   // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
   const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
@@ -5673,6 +5776,19 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 // Host override console (AI chat takeover)
 // ----------------------------
 const [hostConsoleOpen, setHostConsoleOpen] = useState<boolean>(false);
+  type ConversationPanelTab = "convo" | "email";
+  type ConnectEmailThread = { thread_id: string; subject: string; counterparty: string; updated_epoch: number; user_display_name?: string; host_first_name?: string };
+  type ConnectEmailMessage = { message_id: string; sender_role: "user" | "host"; sender_display_name?: string; body: string; created_epoch: number };
+  const [conversationPanelTab, setConversationPanelTab] = useState<ConversationPanelTab>("convo");
+  const [connectEmailAddress, setConnectEmailAddress] = useState<string>("");
+  const [connectEmailThreads, setConnectEmailThreads] = useState<ConnectEmailThread[]>([]);
+  const [connectEmailSelectedThreadId, setConnectEmailSelectedThreadId] = useState<string>("");
+  const [connectEmailMessages, setConnectEmailMessages] = useState<ConnectEmailMessage[]>([]);
+  const [connectEmailSubject, setConnectEmailSubject] = useState<string>("Connect message");
+  const [connectEmailDraft, setConnectEmailDraft] = useState<string>("");
+  const [connectEmailLoading, setConnectEmailLoading] = useState<boolean>(false);
+  const [connectEmailError, setConnectEmailError] = useState<string>("");
+
 const [hostActiveChats, setHostActiveChats] = useState<HostActiveChat[]>([]);
 const [hostActiveLoading, setHostActiveLoading] = useState<boolean>(false);
 const [hostActiveError, setHostActiveError] = useState<string>("");
@@ -16455,9 +16571,64 @@ const modePillControls = (
               position: "relative",
             }}
           >
+            <div
+              role="tablist"
+              aria-label="Conversation Panel"
+              style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, minHeight: 38 }}
+            >
+              <span style={{ marginRight: "auto", fontSize: 12, fontWeight: 800, letterSpacing: 0.7, textTransform: "uppercase", color: "#666", whiteSpace: "nowrap" }}>
+                Conversation Panel
+              </span>
+              <button type="button" role="tab" aria-selected={conversationPanelTab === "convo"} onClick={() => setConversationPanelTab("convo")}
+                style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "convo" ? "#111" : "#fff", color: conversationPanelTab === "convo" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Convo</button>
+              <button type="button" role="tab" aria-selected={conversationPanelTab === "email"} onClick={() => setConversationPanelTab("email")}
+                style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: conversationPanelTab === "email" ? "#111" : "#fff", color: conversationPanelTab === "email" ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Email</button>
+              {isHostConsoleUser ? (
+                <button type="button" role="tab" aria-selected={hostConsoleOpen} onClick={() => { setHostConsoleOpen(true); setHostNotice(""); }}
+                  style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #111", background: hostConsoleOpen ? "#111" : "#fff", color: hostConsoleOpen ? "#fff" : "#111", fontWeight: 800, cursor: "pointer" }}>Host</button>
+              ) : null}
+            </div>
+
+            {conversationPanelTab === "email" ? (
+              <div style={{ flex: "1 1 auto", minHeight: 0, border: "1px solid #e5e5e5", borderRadius: 12, background: "#fff", display: "grid", gridTemplateColumns: isMobileUI ? "1fr" : "minmax(190px, 34%) 1fr", overflow: "hidden" }}>
+                <div style={{ borderRight: isMobileUI ? "none" : "1px solid #e5e5e5", borderBottom: isMobileUI ? "1px solid #e5e5e5" : "none", overflowY: "auto", maxHeight: isMobileUI ? 150 : undefined }}>
+                  <div style={{ padding: 10, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, borderBottom: "1px solid #eee" }}>
+                    <b>{connectEmailRole === "host" ? "Received" : "Messages"}</b>
+                    <button type="button" onClick={() => { setConnectEmailSelectedThreadId(""); setConnectEmailMessages([]); setConnectEmailSubject("Connect message"); setConnectEmailDraft(""); }} style={{ border: "1px solid #bbb", borderRadius: 8, background: "#fff", padding: "5px 8px", cursor: "pointer" }}>New</button>
+                  </div>
+                  {connectEmailLoading && !connectEmailThreads.length ? <div style={{ padding: 12, color: "#666" }}>Loading…</div> : null}
+                  {!connectEmailLoading && !connectEmailThreads.length ? <div style={{ padding: 12, color: "#666" }}>No email messages yet.</div> : null}
+                  {connectEmailThreads.map((t) => (
+                    <div key={t.thread_id} style={{ borderBottom: "1px solid #eee", background: connectEmailSelectedThreadId === t.thread_id ? "#f3f3f3" : "#fff", display: "flex", alignItems: "stretch" }}>
+                      <button type="button" onClick={() => void openConnectEmailThread(t.thread_id)} style={{ flex: 1, border: 0, background: "transparent", textAlign: "left", padding: 10, cursor: "pointer", minWidth: 0 }}>
+                        <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.counterparty || t.subject}</div>
+                        <div style={{ fontSize: 12, color: "#666", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.subject}</div>
+                      </button>
+                      <button type="button" onClick={() => void deleteConnectEmailThread(t.thread_id)} aria-label="Delete email" title="Delete" style={{ width: 38, border: 0, background: "transparent", cursor: "pointer" }}><TrashIcon size={16} /></button>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", minWidth: 0, minHeight: 0 }}>
+                  {!connectEmailSelectedThreadId ? (
+                    <input value={connectEmailSubject} onChange={(e) => setConnectEmailSubject(e.target.value)} placeholder="Subject" style={{ margin: 10, marginBottom: 0, border: "1px solid #ccc", borderRadius: 8, padding: 10 }} />
+                  ) : null}
+                  <div style={{ flex: "1 1 auto", overflowY: "auto", padding: 12, minHeight: 120 }}>
+                    {connectEmailMessages.map((m) => <div key={m.message_id} style={{ marginBottom: 12 }}><b>{m.sender_display_name || (m.sender_role === "host" ? companionName : postingAsViewerName)}:</b> {m.body}</div>)}
+                    {!connectEmailSelectedThreadId && !connectEmailMessages.length ? <div style={{ color: "#666" }}>Write a message to the Host.</div> : null}
+                  </div>
+                  {connectEmailError ? <div style={{ color: "#b00020", padding: "0 12px 8px", fontSize: 12 }}>{connectEmailError}</div> : null}
+                  <div style={{ display: "flex", gap: 8, padding: 10, borderTop: "1px solid #eee" }}>
+                    <textarea value={connectEmailDraft} onChange={(e) => setConnectEmailDraft(e.target.value)} placeholder="Write an email message…" rows={2} style={{ flex: 1, resize: "vertical", border: "1px solid #ccc", borderRadius: 8, padding: 10, minWidth: 0 }} />
+                    <button type="button" disabled={connectEmailLoading || !connectEmailDraft.trim()} onClick={() => void sendConnectEmail()} style={{ border: 0, borderRadius: 10, background: "#111", color: "#fff", padding: "10px 16px", cursor: connectEmailLoading ? "wait" : "pointer" }}>{connectEmailLoading ? "Sending…" : "Send"}</button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
                     <div
                       ref={messagesBoxRef}
                       style={{
+                        display: conversationPanelTab === "convo" ? "block" : "none",
                         flex: "1 1 auto",
                         border: "1px solid #e5e5e5",
                         borderRadius: 12,
@@ -16523,7 +16694,7 @@ const modePillControls = (
 
                     <div
                       style={{
-                        display: "flex",
+                        display: conversationPanelTab === "convo" ? "flex" : "none",
                         gap: 8,
                         marginTop: 12,
                         flexWrap: isMobileUI || (isTabletUI && experienceVideoSelected) ? "wrap" : "nowrap",
@@ -16540,26 +16711,6 @@ const modePillControls = (
                     >
                       {/** Input line with mode pills moved to the right (layout-only). */}
 
-{isHostConsoleUser ? (
-  <button
-    type="button"
-    onClick={() => {
-      setHostConsoleOpen(true);
-      setHostNotice("");
-    }}
-    style={{
-      padding: "10px 12px",
-      borderRadius: 10,
-      border: "1px solid rgba(255,255,255,0.35)",
-      background: "rgba(0,0,0,0.22)",
-      color: "white",
-      cursor: "pointer",
-    }}
-    title="Host console (AI chat takeover)"
-  >
-    Host Console
-  </button>
-) : null}
 
                       {(isMobileUI || !showConnectControls) ? (
                           <button
