@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
 // v10.0.0-alpha15.32: remove fixed desktop/iPad panel height; let Persona/Video content define the shared row and stretch the live conversation workspace to match.
 // v10.0.0-alpha15.31: unified Connect View workspace (Persona, Video, Email, Host) with view-aware modules and responsive interaction rails; no protected media behavior changed.
@@ -4215,21 +4216,26 @@ function ConnectPage() {
     return candidates.length ? Math.min(...candidates) : 1024;
   }, []);
 
-  const getViewportMode = useCallback((): ViewportMode => {
-    const w = getEffectiveViewportWidth();
+  const getDeviceShortSide = useCallback((): number => {
+    if (typeof window === "undefined") return 0;
     const screenWidth = Number(window.screen?.width || 0);
     const screenHeight = Number(window.screen?.height || 0);
-    const shortestScreenSide =
-      screenWidth > 0 && screenHeight > 0 ? Math.min(screenWidth, screenHeight) : 0;
+    if (!(screenWidth > 0) || !(screenHeight > 0)) return 0;
+    return Math.min(screenWidth, screenHeight);
+  }, []);
 
-    // Phones use the stacked Experience-then-Conversation layout. Tablets,
-    // including iPad portrait and landscape, share the desktop two-column
-    // layout and the vertical control rail beside the Conversation panel.
+  const getViewportMode = useCallback((): ViewportMode => {
+    const w = getEffectiveViewportWidth();
+    const shortestScreenSide = getDeviceShortSide();
+
+    // Phones use the stacked Persona/Video presentation followed by a shared
+    // conversation workspace. Tablets, including iPad portrait and landscape,
+    // share the desktop two-column layout.
     const phoneLikeScreen = shortestScreenSide > 0 && shortestScreenSide <= 600;
     if (phoneLikeScreen || w <= 600) return "mobile";
     if (w <= 1180) return "tablet";
     return "desktop";
-  }, [getEffectiveViewportWidth]);
+  }, [getDeviceShortSide, getEffectiveViewportWidth]);
 
   const [viewportMode, setViewportMode] = useState<ViewportMode>(() => {
     if (typeof window === "undefined") return "desktop";
@@ -4248,6 +4254,12 @@ function ConnectPage() {
     if (w <= 1180) return "tablet";
     return "desktop";
   });
+  const [deviceShortSide, setDeviceShortSide] = useState<number>(() => {
+    if (typeof window === "undefined") return 0;
+    const screenWidth = Number(window.screen?.width || 0);
+    const screenHeight = Number(window.screen?.height || 0);
+    return screenWidth > 0 && screenHeight > 0 ? Math.min(screenWidth, screenHeight) : 0;
+  });
   // Layout-only view selector for the Experience Panel. This is initialized
   // without browser-derived state so the protected media hydration sequence
   // remains identical across server and client rendering.
@@ -4255,7 +4267,10 @@ function ConnectPage() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const onResize = () => setViewportMode(getViewportMode());
+    const onResize = () => {
+      setViewportMode(getViewportMode());
+      setDeviceShortSide(getDeviceShortSide());
+    };
     onResize();
     window.addEventListener("resize", onResize as any, { passive: true } as any);
     window.addEventListener("orientationchange", onResize as any);
@@ -4267,23 +4282,27 @@ function ConnectPage() {
       window.visualViewport?.removeEventListener("resize", onResize as any);
       window.visualViewport?.removeEventListener("scroll", onResize as any);
     };
-  }, [getViewportMode]);
+  }, [getDeviceShortSide, getViewportMode]);
 
   const isMobileUI = viewportMode === "mobile";
   const isTabletUI = viewportMode === "tablet";
-  // Persona uses one consistent companion-card structure on every device.
-  // The surrounding Experience/Conversation grid handles responsive layout.
+  // Persona uses one standardized geometry system for every brand. The only
+  // mobile variation is a narrow-phone fallback driven by physical viewport,
+  // never by brand.
   const useCompactCompanionCard = true;
-  const personaPortraitWidth = isMobileUI ? 136 : 150;
-  const personaPortraitHeight = isMobileUI ? 170 : 188;
+  const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
+  const useVerticalMobileSessionRail = isMobileUI && !isNarrowPhone;
+  const personaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 160) : 150;
+  const personaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 200) : 188;
+  const personaActionColumnWidth = isMobileUI ? (isNarrowPhone ? 132 : 136) : isTabletUI ? 132 : 140;
 
-  // Icon sizing: on mobile, force all icons to the same pixel size (13.5px).
+  // Icon sizing: on mobile, force all icons to the same pixel size.
   const ICON_18 = isMobileUI ? 13.5 : 18;
   const ICON_20 = isMobileUI ? 13.5 : 20;
 
-  // Keep icon buttons compact on mobile so the chat input and controls fit without scrolling.
-  // (Action buttons like Set Mode / Upgrade are shorter than the square icon buttons by default.)
-  const ICON_BTN_SIZE = isMobileUI ? 40 : 44;
+  // A 44px mobile Session Rail preserves touch-target size and aligns with the
+  // standardized 44px Persona action buttons.
+  const ICON_BTN_SIZE = 44;
 
   const ui = useMemo(
     () => {
@@ -6351,7 +6370,9 @@ const videoExperienceAvailable = Boolean(showPlayButton || showAvatarFrame);
 const experienceVideoSelected = experienceView === "video" && videoExperienceAvailable;
 const experienceVideoHeight = isMobileUI ? 320 : isTabletUI ? 480 : 560;
 const experienceGridTemplateColumns = isMobileUI
-  ? "minmax(0, 1fr)"
+  ? useVerticalMobileSessionRail
+    ? `${ICON_BTN_SIZE}px minmax(0, 1fr)`
+    : "minmax(0, 1fr)"
   : experienceVideoSelected
     ? "minmax(360px, 3fr) max-content minmax(280px, 2fr)"
     : "minmax(300px, 35fr) max-content minmax(320px, 65fr)";
@@ -14619,7 +14640,7 @@ const modePillControls = (
         flexWrap: useCompactCompanionCard ? "nowrap" : "wrap",
         justifyContent: "flex-end",
         alignItems: useCompactCompanionCard ? "stretch" : "center",
-        width: useCompactCompanionCard ? 140 : "auto",
+        width: useCompactCompanionCard ? personaActionColumnWidth : "auto",
       }}
     >
       {!showModePicker ? (
@@ -14773,7 +14794,7 @@ const modePillControls = (
               cursor: "pointer",
               whiteSpace: "nowrap",
               width: useCompactCompanionCard ? "100%" : "auto",
-              minHeight: useCompactCompanionCard ? 42 : undefined,
+              minHeight: useCompactCompanionCard ? 44 : undefined,
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
@@ -14800,7 +14821,7 @@ const modePillControls = (
                   cursor: "pointer",
                   whiteSpace: "nowrap",
                   width: useCompactCompanionCard ? "100%" : "auto",
-                  minHeight: useCompactCompanionCard ? 42 : undefined,
+                  minHeight: useCompactCompanionCard ? 44 : undefined,
                   display: "inline-flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -14828,7 +14849,7 @@ const modePillControls = (
               cursor: "pointer",
               whiteSpace: "nowrap",
               width: useCompactCompanionCard ? "100%" : "auto",
-              minHeight: useCompactCompanionCard ? 42 : undefined,
+              minHeight: useCompactCompanionCard ? 44 : undefined,
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
@@ -15547,16 +15568,18 @@ const modePillControls = (
 
       <style>{`
         @media (max-width: 600px) {
-          .connect-experience-grid {
+          .connect-experience-grid.connect-mobile-horizontal-rail {
             grid-template-columns: minmax(0, 1fr) !important;
             grid-template-rows: auto auto auto auto !important;
             column-gap: 0 !important;
             row-gap: 6px !important;
           }
-          .connect-persona-panel {
-            margin-bottom: 5px !important;
+          .connect-experience-grid.connect-mobile-horizontal-rail .connect-persona-panel,
+          .connect-experience-grid.connect-mobile-horizontal-rail .connect-video-panel {
+            grid-column: 1 !important;
+            grid-row: 2 !important;
           }
-          .connect-control-rail {
+          .connect-experience-grid.connect-mobile-horizontal-rail .connect-control-rail {
             grid-column: 1 !important;
             grid-row: 3 !important;
             flex-direction: row !important;
@@ -15566,30 +15589,71 @@ const modePillControls = (
             margin-bottom: 12px !important;
             min-width: 0 !important;
           }
-          .connect-control-rail-inner {
+          .connect-experience-grid.connect-mobile-horizontal-rail .connect-control-rail-inner {
             flex-direction: row !important;
             flex-wrap: wrap !important;
             gap: 12px !important;
           }
-          .connect-conversation-panel {
+          .connect-experience-grid.connect-mobile-horizontal-rail .connect-conversation-panel {
             grid-column: 1 !important;
             grid-row: 4 !important;
           }
+
+          .connect-experience-grid.connect-mobile-vertical-rail {
+            grid-template-columns: 44px minmax(0, 1fr) !important;
+            grid-template-rows: auto auto auto !important;
+            column-gap: 8px !important;
+            row-gap: 6px !important;
+          }
+          .connect-experience-grid.connect-mobile-vertical-rail .connect-persona-panel,
+          .connect-experience-grid.connect-mobile-vertical-rail .connect-video-panel {
+            grid-column: 1 / -1 !important;
+            grid-row: 2 !important;
+          }
+          .connect-experience-grid.connect-mobile-vertical-rail .connect-control-rail {
+            grid-column: 1 !important;
+            grid-row: 3 !important;
+            flex-direction: column !important;
+            justify-content: flex-start !important;
+            align-items: stretch !important;
+            flex-wrap: nowrap !important;
+            gap: 8px !important;
+            margin-bottom: 0 !important;
+            min-width: 44px !important;
+          }
+          .connect-experience-grid.connect-mobile-vertical-rail .connect-control-rail-inner {
+            flex-direction: column !important;
+            align-items: stretch !important;
+            flex-wrap: nowrap !important;
+            gap: 8px !important;
+          }
+          .connect-experience-grid.connect-mobile-vertical-rail .connect-conversation-panel {
+            grid-column: 2 !important;
+            grid-row: 3 !important;
+          }
+
+          .connect-persona-panel {
+            margin-bottom: 5px !important;
+          }
           .connect-experience-grid.connect-workspace-email {
+            grid-template-columns: minmax(0, 1fr) !important;
             grid-template-rows: auto auto !important;
+            column-gap: 0 !important;
           }
           .connect-experience-grid.connect-workspace-email .connect-conversation-panel {
             grid-column: 1 !important;
             grid-row: 2 !important;
           }
           .connect-experience-grid.connect-workspace-host {
+            grid-template-columns: minmax(0, 1fr) !important;
             grid-template-rows: auto !important;
+            column-gap: 0 !important;
           }
         }
       `}</style>
 
       <div
-        className={`connect-experience-grid${conversationPanelTab === "email" ? " connect-workspace-email" : ""}${hostConsoleOpen ? " connect-workspace-host" : ""}`}
+        className={`connect-experience-grid${isMobileUI ? (useVerticalMobileSessionRail ? " connect-mobile-vertical-rail" : " connect-mobile-horizontal-rail") : ""}${conversationPanelTab === "email" ? " connect-workspace-email" : ""}${hostConsoleOpen ? " connect-workspace-host" : ""}`}
         style={{
           display: "grid",
           gridTemplateColumns: conversationPanelTab === "email" || hostConsoleOpen ? "minmax(0, 1fr)" : experienceGridTemplateColumns,
@@ -15598,10 +15662,12 @@ const modePillControls = (
             : conversationPanelTab === "email"
               ? "auto auto"
               : isMobileUI
-                ? "auto auto auto auto"
+                ? useVerticalMobileSessionRail
+                  ? "auto auto auto"
+                  : "auto auto auto auto"
                 : "auto auto",
-          columnGap: isMobileUI ? 0 : 14,
-          rowGap: 12,
+          columnGap: isMobileUI ? (useVerticalMobileSessionRail ? 8 : 0) : 14,
+          rowGap: isMobileUI ? 6 : 12,
           alignItems: isMobileUI ? "start" : "stretch",
           width: "100%",
           minWidth: 0,
@@ -15703,7 +15769,7 @@ const modePillControls = (
       <header
         className="connect-persona-panel"
         style={{
-          gridColumn: "1",
+          gridColumn: isMobileUI && useVerticalMobileSessionRail ? "1 / -1" : "1",
           gridRow: "2",
           visibility: !hostConsoleOpen && conversationPanelTab === "convo" && experienceView === "persona" ? "visible" : "hidden",
           opacity: !hostConsoleOpen && conversationPanelTab === "convo" && experienceView === "persona" ? 1 : 0,
@@ -15792,7 +15858,7 @@ const modePillControls = (
                 display: "flex",
                 alignItems: "flex-start",
                 justifyContent: "space-between",
-                gap: isMobileUI ? 12 : isTabletUI ? 10 : 16,
+                gap: isMobileUI ? (isNarrowPhone ? 8 : 12) : isTabletUI ? 10 : 16,
               }}
             >
               <div style={{ flex: "0 0 auto", minWidth: 0 }}>
@@ -15826,7 +15892,7 @@ const modePillControls = (
 
               <div
                 style={{
-                  flex: isMobileUI ? "0 0 132px" : isTabletUI ? "0 0 132px" : "0 0 140px",
+                  flex: `0 0 ${personaActionColumnWidth}px`,
                   display: "flex",
                   justifyContent: "flex-end",
                   alignItems: "stretch",
@@ -16033,14 +16099,14 @@ const modePillControls = (
       gridColumn: isMobileUI ? "1" : "2",
       gridRow: isMobileUI ? "3" : "2",
       display: "flex",
-      flexDirection: isMobileUI ? "row" : "column",
+      flexDirection: isMobileUI && !useVerticalMobileSessionRail ? "row" : "column",
       alignItems: "center",
-      justifyContent: isMobileUI ? "space-between" : "flex-start",
-      gap: isMobileUI ? 12 : 8,
-      marginBottom: isMobileUI ? 12 : 0,
-      flexWrap: isMobileUI ? "wrap" : "nowrap",
+      justifyContent: "flex-start",
+      gap: isMobileUI && !useVerticalMobileSessionRail ? 12 : 8,
+      marginBottom: isMobileUI && !useVerticalMobileSessionRail ? 12 : 0,
+      flexWrap: isMobileUI && !useVerticalMobileSessionRail ? "wrap" : "nowrap",
       alignSelf: "start",
-      minWidth: isMobileUI ? 0 : ICON_BTN_SIZE,
+      minWidth: isMobileUI && !useVerticalMobileSessionRail ? 0 : ICON_BTN_SIZE,
       zIndex: 2,
     }}
   >
@@ -16048,10 +16114,10 @@ const modePillControls = (
       className="connect-control-rail-inner"
       style={{
         display: "flex",
-        flexDirection: isMobileUI ? "row" : "column",
+        flexDirection: isMobileUI && !useVerticalMobileSessionRail ? "row" : "column",
         alignItems: "center",
-        gap: isMobileUI ? 12 : 8,
-        flexWrap: isMobileUI ? "wrap" : "nowrap",
+        gap: isMobileUI && !useVerticalMobileSessionRail ? 12 : 8,
+        flexWrap: isMobileUI && !useVerticalMobileSessionRail ? "wrap" : "nowrap",
       }}
     >
       {showPlayButton ? (
@@ -16314,8 +16380,9 @@ const modePillControls = (
         <div style={{ display: "contents" }}>
           {(showAvatarFrame || experienceView === "video") ? (
             <div
+              className="connect-video-panel"
               style={{
-                gridColumn: "1",
+                gridColumn: isMobileUI && useVerticalMobileSessionRail ? "1 / -1" : "1",
                 gridRow: "2",
                 width: "100%",
                 minWidth: 0,
@@ -16621,8 +16688,16 @@ const modePillControls = (
           <div
             className="connect-conversation-panel"
             style={{
-              gridColumn: conversationPanelTab === "email" ? "1 / -1" : (isMobileUI ? "1" : "3"),
-              gridRow: conversationPanelTab === "email" ? "2" : (isMobileUI ? "4" : "2"),
+              gridColumn: conversationPanelTab === "email"
+                ? "1 / -1"
+                : isMobileUI
+                  ? useVerticalMobileSessionRail ? "2" : "1"
+                  : "3",
+              gridRow: conversationPanelTab === "email"
+                ? "2"
+                : isMobileUI
+                  ? useVerticalMobileSessionRail ? "3" : "4"
+                  : "2",
               minWidth: 0,
               width: "100%",
               height: conversationPanelTab === "email" ? (isMobileUI ? 600 : 640) : (isMobileUI ? 520 : "100%"),
