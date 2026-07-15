@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
 // v10.0.0-alpha15.32: remove fixed desktop/iPad panel height; let Persona/Video content define the shared row and stretch the live conversation workspace to match.
@@ -4204,13 +4205,15 @@ function ConnectPage() {
   const getEffectiveViewportWidth = useCallback((): number => {
     if (typeof window === "undefined") return 1024;
 
-    // Use the rendered viewport signals for layout width. Do not include
-    // screen.width here: on iPad Safari it can remain the portrait width while
-    // the device is in landscape, which incorrectly forced the phone layout.
+    // Restore the defensive alpha15.26 viewport calculation. Some iOS/Safari
+    // and nested Wix iframe combinations report a desktop-like innerWidth even
+    // while the visible device viewport is phone-sized. Using the smallest
+    // reliable signal keeps every brand on the same shared mobile CSS path.
     const candidates = [
       Number(window.visualViewport?.width || 0),
       Number(document?.documentElement?.clientWidth || 0),
       Number(window.innerWidth || 0),
+      Number(window.screen?.width || 0),
     ].filter((value) => Number.isFinite(value) && value > 0);
 
     return candidates.length ? Math.min(...candidates) : 1024;
@@ -4226,16 +4229,14 @@ function ConnectPage() {
 
   const getViewportMode = useCallback((): ViewportMode => {
     const w = getEffectiveViewportWidth();
-    const shortestScreenSide = getDeviceShortSide();
 
-    // Phones use the stacked Persona/Video presentation followed by a shared
-    // conversation workspace. Tablets, including iPad portrait and landscape,
-    // share the desktop two-column layout.
-    const phoneLikeScreen = shortestScreenSide > 0 && shortestScreenSide <= 600;
-    if (phoneLikeScreen || w <= 600) return "mobile";
+    // alpha15.26 classified embedded layouts up to 900 CSS pixels as mobile.
+    // This protects phone-sized Wix embeds that expose an inflated iframe
+    // innerWidth while retaining the current desktop/iPad breakpoint above it.
+    if (w <= 900) return "mobile";
     if (w <= 1180) return "tablet";
     return "desktop";
-  }, [getDeviceShortSide, getEffectiveViewportWidth]);
+  }, [getEffectiveViewportWidth]);
 
   const [viewportMode, setViewportMode] = useState<ViewportMode>(() => {
     if (typeof window === "undefined") return "desktop";
@@ -4243,14 +4244,10 @@ function ConnectPage() {
       Number(window.visualViewport?.width || 0),
       Number(document?.documentElement?.clientWidth || 0),
       Number(window.innerWidth || 0),
+      Number(window.screen?.width || 0),
     ].filter((value) => Number.isFinite(value) && value > 0);
     const w = candidates.length ? Math.min(...candidates) : 1024;
-    const screenWidth = Number(window.screen?.width || 0);
-    const screenHeight = Number(window.screen?.height || 0);
-    const shortestScreenSide =
-      screenWidth > 0 && screenHeight > 0 ? Math.min(screenWidth, screenHeight) : 0;
-    const phoneLikeScreen = shortestScreenSide > 0 && shortestScreenSide <= 600;
-    if (phoneLikeScreen || w <= 600) return "mobile";
+    if (w <= 900) return "mobile";
     if (w <= 1180) return "tablet";
     return "desktop";
   });
@@ -15567,7 +15564,7 @@ const modePillControls = (
       ) : null}
 
       <style>{`
-        @media (max-width: 600px) {
+        @media (max-width: 900px) {
           .connect-experience-grid.connect-mobile-horizontal-rail {
             grid-template-columns: minmax(0, 1fr) !important;
             grid-template-rows: auto auto auto auto !important;
