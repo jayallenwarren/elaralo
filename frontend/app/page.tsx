@@ -1,6 +1,6 @@
 "use client";
-// v10.0.0-alpha15.36-diag: diagnostic-only inner/outer viewport and workspace geometry capture; no layout or media behavior changes.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.36-diag";
+// v10.0.0-alpha15.37: make measured viewport geometry authoritative for the shared mobile workspace; preserve enhanced diagnostics and protected media behavior.
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.37";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4204,6 +4204,12 @@ function ConnectPage() {
   type ViewportMode = "mobile" | "tablet" | "desktop";
   type ExperienceView = "persona" | "video";
 
+  // Layout-only root reference. The legacy Wix runtime can report a phone-sized
+  // JavaScript viewport while evaluating CSS media queries against a wider
+  // layout canvas. We mirror the measured mode onto the DOM so one shared CSS
+  // path remains authoritative for every brand and editor generation.
+  const connectRootRef = useRef<HTMLElement | null>(null);
+
   const getEffectiveViewportWidth = useCallback((): number => {
     if (typeof window === "undefined") return 1024;
 
@@ -4231,14 +4237,15 @@ function ConnectPage() {
 
   const getViewportMode = useCallback((): ViewportMode => {
     const w = getEffectiveViewportWidth();
+    const shortestScreenSide = getDeviceShortSide();
 
-    // alpha15.26 classified embedded layouts up to 900 CSS pixels as mobile.
-    // This protects phone-sized Wix embeds that expose an inflated iframe
-    // innerWidth while retaining the current desktop/iPad breakpoint above it.
-    if (w <= 900) return "mobile";
+    // Phones use the shared mobile workspace. iPad and desktop retain the
+    // desktop/iPad workspace. This is driven only by measured geometry.
+    const phoneLikeScreen = shortestScreenSide > 0 && shortestScreenSide <= 600;
+    if (phoneLikeScreen || w <= 600) return "mobile";
     if (w <= 1180) return "tablet";
     return "desktop";
-  }, [getEffectiveViewportWidth]);
+  }, [getDeviceShortSide, getEffectiveViewportWidth]);
 
   const [viewportMode, setViewportMode] = useState<ViewportMode>(() => {
     if (typeof window === "undefined") return "desktop";
@@ -4249,7 +4256,11 @@ function ConnectPage() {
       Number(window.screen?.width || 0),
     ].filter((value) => Number.isFinite(value) && value > 0);
     const w = candidates.length ? Math.min(...candidates) : 1024;
-    if (w <= 900) return "mobile";
+    const screenWidth = Number(window.screen?.width || 0);
+    const screenHeight = Number(window.screen?.height || 0);
+    const shortestScreenSide = screenWidth > 0 && screenHeight > 0 ? Math.min(screenWidth, screenHeight) : 0;
+    const phoneLikeScreen = shortestScreenSide > 0 && shortestScreenSide <= 600;
+    if (phoneLikeScreen || w <= 600) return "mobile";
     if (w <= 1180) return "tablet";
     return "desktop";
   });
@@ -4267,21 +4278,41 @@ function ConnectPage() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     const onResize = () => {
-      setViewportMode(getViewportMode());
-      setDeviceShortSide(getDeviceShortSide());
+      const nextMode = getViewportMode();
+      const nextShortSide = getDeviceShortSide();
+      setViewportMode(nextMode);
+      setDeviceShortSide(nextShortSide);
+
+      // Apply the measured layout mode directly to the mounted workspace root.
+      // This is intentionally independent of brand and does not alter any
+      // STT/TTS, microphone, audio, video, LiveKit, or D-ID lifecycle.
+      const root = connectRootRef.current;
+      if (root) {
+        const railOrientation =
+          nextMode === "mobile" && nextShortSide > 0 && nextShortSide <= 360
+            ? "horizontal"
+            : "vertical";
+        root.dataset.connectLayoutMode = nextMode;
+        root.dataset.connectRailOrientation = railOrientation;
+        root.style.setProperty("--connect-effective-viewport-width", `${getEffectiveViewportWidth()}px`);
+      }
     };
     onResize();
+    const initialTimer = window.setTimeout(onResize, 0);
     window.addEventListener("resize", onResize as any, { passive: true } as any);
     window.addEventListener("orientationchange", onResize as any);
+    window.addEventListener("pageshow", onResize as any);
     window.visualViewport?.addEventListener("resize", onResize as any, { passive: true } as any);
     window.visualViewport?.addEventListener("scroll", onResize as any, { passive: true } as any);
     return () => {
+      window.clearTimeout(initialTimer);
       window.removeEventListener("resize", onResize as any);
       window.removeEventListener("orientationchange", onResize as any);
+      window.removeEventListener("pageshow", onResize as any);
       window.visualViewport?.removeEventListener("resize", onResize as any);
       window.visualViewport?.removeEventListener("scroll", onResize as any);
     };
-  }, [getDeviceShortSide, getViewportMode]);
+  }, [getDeviceShortSide, getEffectiveViewportWidth, getViewportMode]);
 
   const isMobileUI = viewportMode === "mobile";
   const isTabletUI = viewportMode === "tablet";
@@ -15115,6 +15146,7 @@ const modePillControls = (
       if (!el) return null;
       const cs = window.getComputedStyle(el);
       return {
+        className: String(el.className || ""), inlineStyle: String(el.getAttribute("style") || ""),
         display: cs.display, position: cs.position, width: cs.width, maxWidth: cs.maxWidth, minWidth: cs.minWidth,
         gridTemplateColumns: cs.gridTemplateColumns, gridTemplateRows: cs.gridTemplateRows, overflowX: cs.overflowX,
         overflowY: cs.overflowY, transform: cs.transform, boxSizing: cs.boxSizing, zoom: (cs as any).zoom || "",
@@ -15155,6 +15187,9 @@ const modePillControls = (
         effectiveViewportWidth: round(effectiveWidth), viewportMode, isMobileUI, isTabletUI, isDesktopUI: viewportMode === "desktop",
         deviceShortSide: round(deviceShortSide), isNarrowPhone, useVerticalMobileSessionRail,
         personaPortraitWidth, personaPortraitHeight, personaActionColumnWidth, iconButtonSize: ICON_BTN_SIZE,
+        rootLayoutModeAttribute: connectRootRef.current?.dataset?.connectLayoutMode || "",
+        rootRailOrientationAttribute: connectRootRef.current?.dataset?.connectRailOrientation || "",
+        workspaceClassName: String((document.querySelector(".connect-experience-grid") as HTMLElement | null)?.className || ""),
       },
       workspace: {
         activeView, companyName, rebranding: String(rebranding || ""), rebrandingKeyPresent: Boolean(rebrandingKey),
@@ -15191,7 +15226,17 @@ const modePillControls = (
   }, [debugOpen, debugBridgeDiagnostics, captureConnectDiagnostics]);
 
   return (
-    <main data-connect-debug="root" onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={mainContainerStyle}>
+    <main
+      ref={connectRootRef}
+      className="connect-root"
+      data-connect-debug="root"
+      data-connect-layout-mode={viewportMode}
+      data-connect-rail-orientation={useVerticalMobileSessionRail ? "vertical" : "horizontal"}
+      onPointerDown={handleAnyUserGesture}
+      onTouchStart={handleAnyUserGesture}
+      onClick={handleAnyUserGesture}
+      style={mainContainerStyle}
+    >
 
 {startupOverlayOpen ? (
   <div
@@ -15773,6 +15818,203 @@ const modePillControls = (
             column-gap: 0 !important;
           }
         }
+
+        /*
+          Measured-layout fallback for modern and legacy Wix runtimes.
+          The legacy editor can evaluate CSS media queries against a wider
+          layout canvas even when JavaScript correctly identifies a phone.
+          These rules are keyed to a DOM attribute populated from measured
+          viewport geometry, never to brand names.
+        */
+        .connect-root[data-connect-layout-mode="mobile"] {
+          max-width: 100% !important;
+          margin: 12px auto !important;
+          padding: 0 10px !important;
+          box-sizing: border-box !important;
+          overflow-x: hidden !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid {
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          overflow-x: hidden !important;
+          grid-template-columns: 44px minmax(0, 1fr) !important;
+          grid-template-rows: auto auto 520px !important;
+          column-gap: 8px !important;
+          row-gap: 6px !important;
+          align-items: start !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="view-selector"] {
+          grid-column: 1 / -1 !important;
+          grid-row: 1 !important;
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          height: 32px !important;
+          box-sizing: border-box !important;
+          overflow-x: auto !important;
+          overflow-y: hidden !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="view-selector"] > span {
+          font-size: 11px !important;
+          letter-spacing: 0.35px !important;
+          margin-right: 2px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="view-selector"] button {
+          height: 30px !important;
+          min-height: 30px !important;
+          padding: 0 8px !important;
+          font-size: 11px !important;
+          flex: 0 0 auto !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-persona-panel,
+        .connect-root[data-connect-layout-mode="mobile"] .connect-video-panel {
+          grid-column: 1 / -1 !important;
+          grid-row: 2 !important;
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          margin-bottom: 5px !important;
+          align-self: start !important;
+          box-sizing: border-box !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-brand-label {
+          font-size: 13px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-persona-name {
+          font-size: 28px !important;
+          line-height: 1.08 !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-persona-meta {
+          font-size: 12px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="persona-image"] {
+          width: 160px !important;
+          height: 200px !important;
+          flex: 0 0 160px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] {
+          width: 136px !important;
+          max-width: 136px !important;
+          min-width: 136px !important;
+          flex: 0 0 136px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] button,
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] a {
+          min-height: 44px !important;
+          box-sizing: border-box !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="usage"],
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="navigation-row"] {
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="session-rail"] {
+          grid-column: 1 !important;
+          grid-row: 3 !important;
+          width: 44px !important;
+          max-width: 44px !important;
+          min-width: 44px !important;
+          height: auto !important;
+          flex-direction: column !important;
+          justify-content: flex-start !important;
+          align-items: stretch !important;
+          flex-wrap: nowrap !important;
+          gap: 8px !important;
+          margin-bottom: 0 !important;
+          align-self: start !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-control-rail-inner {
+          width: 44px !important;
+          flex-direction: column !important;
+          align-items: stretch !important;
+          flex-wrap: nowrap !important;
+          gap: 8px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="session-rail"] button {
+          width: 44px !important;
+          height: 44px !important;
+          min-width: 44px !important;
+          min-height: 44px !important;
+          padding: 0 !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-conversation-panel {
+          grid-column: 2 !important;
+          grid-row: 3 !important;
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          height: 520px !important;
+          min-height: 520px !important;
+          box-sizing: border-box !important;
+          overflow-x: hidden !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] {
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          box-sizing: border-box !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-email,
+        .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-host {
+          grid-template-columns: minmax(0, 1fr) !important;
+          grid-template-rows: auto auto !important;
+          column-gap: 0 !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-email .connect-conversation-panel,
+        .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-host .connect-conversation-panel {
+          grid-column: 1 !important;
+          grid-row: 2 !important;
+          width: 100% !important;
+          max-width: 100% !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-email .connect-conversation-panel {
+          height: 600px !important;
+          min-height: 600px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-host .connect-conversation-panel {
+          height: auto !important;
+          min-height: 0 !important;
+        }
+
+        /* Narrow phones keep the existing horizontal Session Rail fallback. */
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-rail-orientation="horizontal"] .connect-experience-grid:not(.connect-workspace-email):not(.connect-workspace-host) {
+          grid-template-columns: minmax(0, 1fr) !important;
+          grid-template-rows: auto auto auto 520px !important;
+          column-gap: 0 !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-rail-orientation="horizontal"] [data-connect-debug="persona-image"] {
+          width: 150px !important;
+          height: 188px !important;
+          flex-basis: 150px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-rail-orientation="horizontal"] [data-connect-debug="action-column"] {
+          width: 132px !important;
+          max-width: 132px !important;
+          min-width: 132px !important;
+          flex-basis: 132px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-rail-orientation="horizontal"] [data-connect-debug="session-rail"] {
+          grid-column: 1 !important;
+          grid-row: 3 !important;
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          flex-direction: row !important;
+          flex-wrap: wrap !important;
+          gap: 12px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-rail-orientation="horizontal"] .connect-control-rail-inner {
+          width: auto !important;
+          flex-direction: row !important;
+          flex-wrap: wrap !important;
+          gap: 12px !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-rail-orientation="horizontal"] .connect-conversation-panel {
+          grid-column: 1 !important;
+          grid-row: 4 !important;
+        }
       `}</style>
 
       <div
@@ -15921,6 +16163,7 @@ const modePillControls = (
           <>
             <div style={{ width: "100%", minWidth: 0 }}>
               <div
+                className="connect-brand-label"
                 style={{
                   marginBottom: 2,
                   fontSize: 13,
@@ -15944,6 +16187,7 @@ const modePillControls = (
                 )}
               </div>
               <h1
+                className="connect-persona-name"
                 style={{
                   margin: 0,
                   fontSize: Math.max(ui.title, 28),
@@ -15956,10 +16200,10 @@ const modePillControls = (
                 <span>{companionName || DEFAULT_COMPANION_NAME}</span>
                 {companionTypeBadge}
               </h1>
-              <div style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
+              <div className="connect-persona-meta" style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
                 Plan: <b>{displayPlanLabel(planName, memberId, planLabelOverride, loggedIn)}</b>
               </div>
-              <div style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
+              <div className="connect-persona-meta" style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
                 Mode: <b>{MODE_LABELS[effectiveActiveMode]}</b>
                 {chatStatus === "explicit_allowed" ? (
                   <span style={{ marginLeft: 8, color: "#0a7a2f" }}>• Consent: Allowed</span>
@@ -15967,7 +16211,7 @@ const modePillControls = (
                   <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
                 ) : null}
               </div>
-              <div style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
+              <div className="connect-persona-meta" style={{ fontSize: ui.meta, color: "#666", lineHeight: 1.35 }}>
                 Status: {" "}
                 <b style={{ color: experienceStatusColor }}>
                   <span aria-hidden style={{ marginRight: 5 }}>●</span>
