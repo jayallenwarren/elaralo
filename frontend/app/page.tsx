@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.38: standardize the shared mobile Persona portrait at 170x213 and lock all View tabs to the compact Elaralo geometry across every brand.
+// v10.0.0-alpha15.39: standardize the apparent mobile Persona portrait size across modern and legacy Wix iframe runtimes using measured viewport-scale compensation; no brand-specific CSS.
 const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.38";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
@@ -4270,6 +4270,10 @@ function ConnectPage() {
     const screenHeight = Number(window.screen?.height || 0);
     return screenWidth > 0 && screenHeight > 0 ? Math.min(screenWidth, screenHeight) : 0;
   });
+  const [layoutViewportWidth, setLayoutViewportWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return 0;
+    return Number(window.innerWidth || document?.documentElement?.clientWidth || 0);
+  });
   // Layout-only view selector for the Experience Panel. This is initialized
   // without browser-derived state so the protected media hydration sequence
   // remains identical across server and client rendering.
@@ -4282,6 +4286,7 @@ function ConnectPage() {
       const nextShortSide = getDeviceShortSide();
       setViewportMode(nextMode);
       setDeviceShortSide(nextShortSide);
+      setLayoutViewportWidth(Number(window.innerWidth || document?.documentElement?.clientWidth || 0));
 
       // Apply the measured layout mode directly to the mounted workspace root.
       // This is intentionally independent of brand and does not alter any
@@ -4322,8 +4327,19 @@ function ConnectPage() {
   const useCompactCompanionCard = true;
   const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
   const useVerticalMobileSessionRail = isMobileUI && !isNarrowPhone;
-  const personaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
-  const personaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
+
+  // Wix Studio and legacy Wix can expose different CSS layout widths for the
+  // same physical phone. Compensate only the Persona portrait so its apparent
+  // on-screen size is identical across runtimes. This is geometry-driven and
+  // contains no brand-specific branches.
+  const effectiveViewportWidth = typeof window === "undefined" ? 0 : getEffectiveViewportWidth();
+  const portraitScaleCompensation = isMobileUI && effectiveViewportWidth > 0 && layoutViewportWidth > effectiveViewportWidth
+    ? Math.min(1.25, Math.max(1, layoutViewportWidth / effectiveViewportWidth))
+    : 1;
+  const basePersonaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
+  const basePersonaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
+  const personaPortraitWidth = Math.round(basePersonaPortraitWidth * portraitScaleCompensation);
+  const personaPortraitHeight = Math.round(basePersonaPortraitHeight * portraitScaleCompensation);
   const personaActionColumnWidth = isMobileUI ? (isNarrowPhone ? 132 : 136) : isTabletUI ? 132 : 140;
 
   // Icon sizing: on mobile, force all icons to the same pixel size.
@@ -4378,8 +4394,10 @@ function ConnectPage() {
         margin: ui.mainMargin,
         padding: ui.mainPadding,
         fontFamily: "system-ui",
+        ["--connect-persona-portrait-width" as any]: `${personaPortraitWidth}px`,
+        ["--connect-persona-portrait-height" as any]: `${personaPortraitHeight}px`,
       } as React.CSSProperties),
-    [ui]
+    [ui, personaPortraitWidth, personaPortraitHeight]
   );
 
   // Normalize LiveKit server URL into ws/wss (client expects a websocket scheme)
@@ -15892,9 +15910,9 @@ const modePillControls = (
           font-size: 12px !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="persona-image"] {
-          width: 170px !important;
-          height: 213px !important;
-          flex: 0 0 170px !important;
+          width: var(--connect-persona-portrait-width, 170px) !important;
+          height: var(--connect-persona-portrait-height, 213px) !important;
+          flex: 0 0 var(--connect-persona-portrait-width, 170px) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] {
           width: 136px !important;
