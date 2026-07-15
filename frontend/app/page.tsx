@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.39: standardize the apparent mobile Persona portrait size across modern and legacy Wix iframe runtimes using measured viewport-scale compensation; no brand-specific CSS.
+// v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
 const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.38";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
@@ -4328,18 +4328,13 @@ function ConnectPage() {
   const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
   const useVerticalMobileSessionRail = isMobileUI && !isNarrowPhone;
 
-  // Wix Studio and legacy Wix can expose different CSS layout widths for the
-  // same physical phone. Compensate only the Persona portrait so its apparent
-  // on-screen size is identical across runtimes. This is geometry-driven and
-  // contains no brand-specific branches.
+  // One exact Persona portrait geometry is used across every brand and Wix
+  // runtime. Do not compensate from iframe layout width: the legacy bridge may
+  // scale the entire document, and compensating here makes modern-editor
+  // portraits larger than legacy-editor portraits.
   const effectiveViewportWidth = typeof window === "undefined" ? 0 : getEffectiveViewportWidth();
-  const portraitScaleCompensation = isMobileUI && effectiveViewportWidth > 0 && layoutViewportWidth > effectiveViewportWidth
-    ? Math.min(1.25, Math.max(1, layoutViewportWidth / effectiveViewportWidth))
-    : 1;
-  const basePersonaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
-  const basePersonaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
-  const personaPortraitWidth = Math.round(basePersonaPortraitWidth * portraitScaleCompensation);
-  const personaPortraitHeight = Math.round(basePersonaPortraitHeight * portraitScaleCompensation);
+  const personaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
+  const personaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
   const personaActionColumnWidth = isMobileUI ? (isNarrowPhone ? 132 : 136) : isTabletUI ? 132 : 140;
 
   // Icon sizing: on mobile, force all icons to the same pixel size.
@@ -16684,7 +16679,7 @@ const modePillControls = (
         </button>
       ) : null}
 
-      {!isMobileUI ? (
+      {(!isMobileUI || useVerticalMobileSessionRail) ? (
         <>
           <button
             type="button"
@@ -17212,7 +17207,11 @@ const modePillControls = (
                         display: conversationPanelTab === "convo" ? "flex" : "none",
                         gap: 8,
                         marginTop: 12,
-                        flexWrap: isMobileUI || (isTabletUI && experienceVideoSelected) ? "wrap" : "nowrap",
+                        flexWrap:
+                          (isMobileUI && !useVerticalMobileSessionRail) ||
+                          (isTabletUI && experienceVideoSelected)
+                            ? "wrap"
+                            : "nowrap",
                         alignItems: "center",
                         position: "sticky",
                         bottom: 0,
@@ -17227,7 +17226,7 @@ const modePillControls = (
                       {/** Input line with mode pills moved to the right (layout-only). */}
 
 
-                      {(isMobileUI || !showConnectControls) ? (
+                      {((isMobileUI && !useVerticalMobileSessionRail) || !showConnectControls) ? (
                           <button
                             type="button"
                             onClick={requestClearMessages}
@@ -17259,7 +17258,7 @@ const modePillControls = (
                         style={{ display: "none" }}
                         onChange={onAttachmentSelected}
                       />
-                      {(isMobileUI || !showConnectControls) ? (
+                      {((isMobileUI && !useVerticalMobileSessionRail) || !showConnectControls) ? (
 	                  <button
 	                    onClick={openUploadPicker}
 	                    disabled={attachmentButtonDisabled}
