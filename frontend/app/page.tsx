@@ -1,6 +1,7 @@
 "use client";
+// v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.38";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.41";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4328,14 +4329,46 @@ function ConnectPage() {
   const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
   const useVerticalMobileSessionRail = isMobileUI && !isNarrowPhone;
 
-  // One exact Persona portrait geometry is used across every brand and Wix
-  // runtime. Do not compensate from iframe layout width: the legacy bridge may
-  // scale the entire document, and compensating here makes modern-editor
-  // portraits larger than legacy-editor portraits.
+  // Standardize apparent mobile geometry across Wix runtimes without using
+  // brand names. The modern editor can expose a wider internal layout canvas,
+  // while the legacy editor can expose a device-width canvas inside a scaled
+  // 320px HTML component. These calculations normalize only the requested
+  // visual tokens (portrait and View tabs); workspace structure remains shared.
   const effectiveViewportWidth = typeof window === "undefined" ? 0 : getEffectiveViewportWidth();
-  const personaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
-  const personaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
+  const mobileCanvasRatio =
+    isMobileUI && deviceShortSide > 0 && layoutViewportWidth > 0
+      ? Math.max(1, layoutViewportWidth / deviceShortSide)
+      : 1;
+  const CANONICAL_MODERN_MOBILE_CANVAS_RATIO = 1.2;
+  const usesExpandedMobileCanvas = isMobileUI && mobileCanvasRatio > 1.05;
+  const modernVisibleScale =
+    usesExpandedMobileCanvas && layoutViewportWidth > 0
+      ? deviceShortSide / layoutViewportWidth
+      : 1;
+  const legacyVisibleScale =
+    isMobileUI && deviceShortSide > 0
+      ? Math.min(1, 320 / deviceShortSide)
+      : 1;
+  const portraitRuntimeScale = usesExpandedMobileCanvas
+    ? Math.min(1, Math.max(0.9, legacyVisibleScale / Math.max(0.01, modernVisibleScale)))
+    : 1;
+  const basePersonaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
+  const basePersonaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
+  const personaPortraitWidth = Math.round(basePersonaPortraitWidth * portraitRuntimeScale);
+  const personaPortraitHeight = Math.round(basePersonaPortraitHeight * portraitRuntimeScale);
   const personaActionColumnWidth = isMobileUI ? (isNarrowPhone ? 132 : 136) : isTabletUI ? 132 : 140;
+
+  // Match the apparent compact View-tab geometry of the expanded modern canvas
+  // when the same application is rendered in a device-width legacy canvas.
+  const mobileViewTabRuntimeScale = isMobileUI
+    ? Math.min(1, mobileCanvasRatio / CANONICAL_MODERN_MOBILE_CANVAS_RATIO)
+    : 1;
+  const mobileViewTabHeight = Math.max(25, Math.round(30 * mobileViewTabRuntimeScale));
+  const mobileViewTabFontSize = Math.max(9, Math.round(11 * mobileViewTabRuntimeScale));
+  const mobileViewTabPaddingX = Math.max(6, Math.round(8 * mobileViewTabRuntimeScale));
+  const mobileViewTabGap = Math.max(3, Math.round(4 * mobileViewTabRuntimeScale));
+  const mobileViewLabelFontSize = Math.max(9, Math.round(11 * mobileViewTabRuntimeScale));
+  const mobileViewSelectorHeight = mobileViewTabHeight + 2;
 
   // Icon sizing: on mobile, force all icons to the same pixel size.
   const ICON_18 = isMobileUI ? 13.5 : 18;
@@ -4391,8 +4424,24 @@ function ConnectPage() {
         fontFamily: "system-ui",
         ["--connect-persona-portrait-width" as any]: `${personaPortraitWidth}px`,
         ["--connect-persona-portrait-height" as any]: `${personaPortraitHeight}px`,
+        ["--connect-view-selector-height" as any]: `${mobileViewSelectorHeight}px`,
+        ["--connect-view-tab-height" as any]: `${mobileViewTabHeight}px`,
+        ["--connect-view-tab-font-size" as any]: `${mobileViewTabFontSize}px`,
+        ["--connect-view-tab-padding-x" as any]: `${mobileViewTabPaddingX}px`,
+        ["--connect-view-tab-gap" as any]: `${mobileViewTabGap}px`,
+        ["--connect-view-label-font-size" as any]: `${mobileViewLabelFontSize}px`,
       } as React.CSSProperties),
-    [ui, personaPortraitWidth, personaPortraitHeight]
+    [
+      ui,
+      personaPortraitWidth,
+      personaPortraitHeight,
+      mobileViewSelectorHeight,
+      mobileViewTabHeight,
+      mobileViewTabFontSize,
+      mobileViewTabPaddingX,
+      mobileViewTabGap,
+      mobileViewLabelFontSize,
+    ]
   );
 
   // Normalize LiveKit server URL into ws/wss (client expects a websocket scheme)
@@ -15863,21 +15912,22 @@ const modePillControls = (
           width: 100% !important;
           max-width: 100% !important;
           min-width: 0 !important;
-          height: 32px !important;
+          height: var(--connect-view-selector-height, 32px) !important;
+          gap: var(--connect-view-tab-gap, 4px) !important;
           box-sizing: border-box !important;
           overflow-x: auto !important;
           overflow-y: hidden !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="view-selector"] > span {
-          font-size: 11px !important;
+          font-size: var(--connect-view-label-font-size, 11px) !important;
           letter-spacing: 0.35px !important;
           margin-right: 2px !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="view-selector"] button {
-          height: 30px !important;
-          min-height: 30px !important;
-          padding: 0 8px !important;
-          font-size: 11px !important;
+          height: var(--connect-view-tab-height, 30px) !important;
+          min-height: var(--connect-view-tab-height, 30px) !important;
+          padding: 0 var(--connect-view-tab-padding-x, 8px) !important;
+          font-size: var(--connect-view-tab-font-size, 11px) !important;
           line-height: 1 !important;
           border-width: 1px !important;
           box-sizing: border-box !important;
@@ -15932,17 +15982,21 @@ const modePillControls = (
           width: 44px !important;
           max-width: 44px !important;
           min-width: 44px !important;
-          height: auto !important;
+          height: 520px !important;
+          min-height: 520px !important;
+          box-sizing: border-box !important;
           flex-direction: column !important;
           justify-content: flex-start !important;
           align-items: stretch !important;
           flex-wrap: nowrap !important;
           gap: 8px !important;
           margin-bottom: 0 !important;
-          align-self: start !important;
+          align-self: stretch !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-control-rail-inner {
           width: 44px !important;
+          height: 100% !important;
+          box-sizing: border-box !important;
           flex-direction: column !important;
           align-items: stretch !important;
           flex-wrap: nowrap !important;
@@ -16017,6 +16071,9 @@ const modePillControls = (
           width: 100% !important;
           max-width: 100% !important;
           min-width: 0 !important;
+          height: auto !important;
+          min-height: 0 !important;
+          align-self: start !important;
           flex-direction: row !important;
           flex-wrap: wrap !important;
           gap: 12px !important;
@@ -16066,7 +16123,7 @@ const modePillControls = (
             display: "flex",
             alignItems: "center",
             justifyContent: "flex-start",
-            gap: isMobileUI ? 4 : 8,
+            gap: isMobileUI ? mobileViewTabGap : 8,
             width: "100%",
             minWidth: 0,
             paddingBottom: 2,
@@ -16076,7 +16133,7 @@ const modePillControls = (
         >
           <span
             style={{
-              fontSize: isMobileUI ? 11 : 12,
+              fontSize: isMobileUI ? mobileViewLabelFontSize : 12,
               fontWeight: 800,
               letterSpacing: isMobileUI ? 0.35 : 0.7,
               textTransform: "uppercase",
@@ -16127,15 +16184,18 @@ const modePillControls = (
                   setExperienceView(item.key);
                 }}
                 style={{
-                  height: isMobileUI ? 30 : 34,
-                  padding: isMobileUI ? "0 8px" : "0 14px",
+                  height: isMobileUI ? mobileViewTabHeight : 34,
+                  minHeight: isMobileUI ? mobileViewTabHeight : 34,
+                  padding: isMobileUI ? `0 ${mobileViewTabPaddingX}px` : "0 14px",
                   borderRadius: 999,
                   border: "1px solid #111",
                   background: selected ? "#111" : "#fff",
                   color: selected ? "#fff" : "#111",
                   cursor: item.enabled ? "pointer" : "not-allowed",
                   fontWeight: 800,
-                  fontSize: isMobileUI ? 11 : 13,
+                  fontSize: isMobileUI ? mobileViewTabFontSize : 13,
+                  lineHeight: 1,
+                  boxSizing: "border-box",
                   whiteSpace: "nowrap",
                   opacity: item.enabled ? 1 : 0.45,
                   flex: "0 0 auto",
@@ -16493,8 +16553,11 @@ const modePillControls = (
       gap: isMobileUI && !useVerticalMobileSessionRail ? 12 : 8,
       marginBottom: isMobileUI && !useVerticalMobileSessionRail ? 12 : 0,
       flexWrap: isMobileUI && !useVerticalMobileSessionRail ? "wrap" : "nowrap",
-      alignSelf: "start",
+      alignSelf: isMobileUI && useVerticalMobileSessionRail ? "stretch" : "start",
       minWidth: isMobileUI && !useVerticalMobileSessionRail ? 0 : ICON_BTN_SIZE,
+      height: isMobileUI && useVerticalMobileSessionRail ? 520 : undefined,
+      minHeight: isMobileUI && useVerticalMobileSessionRail ? 520 : undefined,
+      boxSizing: "border-box",
       zIndex: 2,
     }}
   >
@@ -16506,6 +16569,13 @@ const modePillControls = (
         alignItems: "center",
         gap: isMobileUI && !useVerticalMobileSessionRail ? 12 : 8,
         flexWrap: isMobileUI && !useVerticalMobileSessionRail ? "wrap" : "nowrap",
+        width: isMobileUI && useVerticalMobileSessionRail ? ICON_BTN_SIZE : undefined,
+        height: isMobileUI && useVerticalMobileSessionRail ? "100%" : undefined,
+        boxSizing: "border-box",
+        paddingBottom:
+          isMobileUI && useVerticalMobileSessionRail
+            ? (!isHost && !isHostConsoleUser ? 30 : 10)
+            : 0,
       }}
     >
       {showPlayButton ? (
@@ -16707,6 +16777,7 @@ const modePillControls = (
               opacity: attachmentButtonDisabled ? 0.6 : 1,
               lineHeight: "18px",
               fontSize: 18,
+              marginTop: isMobileUI && useVerticalMobileSessionRail ? "auto" : 0,
             }}
           >
             {uploadingAttachment ? "⏳" : "📎"}
@@ -17390,7 +17461,8 @@ const modePillControls = (
 
                       <div
                         style={{
-                          flex: "1 1 220px",
+                          flex: "1 1 auto",
+                          width: "100%",
                           minWidth: 0,
                           display: "grid",
                           gridTemplateColumns: "minmax(0, 1fr) auto",
@@ -17424,7 +17496,8 @@ const modePillControls = (
                             width: "100%",
                             minWidth: 0,
                             boxSizing: "border-box",
-                            padding: "10px 12px",
+                            height: ICON_BTN_SIZE,
+                            padding: "0 12px",
                             borderRadius: 10,
                             border: "1px solid #ddd",
                           }}
@@ -17436,7 +17509,9 @@ const modePillControls = (
                           style={{
                             gridColumn: "2",
                             gridRow: "1",
-                            padding: "10px 14px",
+                            height: ICON_BTN_SIZE,
+                            padding: "0 14px",
+                            boxSizing: "border-box",
                             borderRadius: 10,
                             border: "1px solid #111",
                             background: "#111",
