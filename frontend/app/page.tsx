@@ -1,4 +1,6 @@
 "use client";
+// v10.0.0-alpha15.36-diag: diagnostic-only inner/outer viewport and workspace geometry capture; no layout or media behavior changes.
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.36-diag";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4494,6 +4496,8 @@ useEffect(() => {
   const [debugEnabled, setDebugEnabled] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
+  const [debugDiagnostics, setDebugDiagnostics] = useState<any>(null);
+  const [debugBridgeDiagnostics, setDebugBridgeDiagnostics] = useState<any>(null);
   const debugEnabledRef = useRef(false);
   const debugTapCountRef = useRef(0);
   const debugTapTimerRef = useRef<number | null>(null);
@@ -4526,6 +4530,33 @@ useEffect(() => {
       // ignore
     }
   }, [debugEnabled]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onBridgeDiagnostics = (event: MessageEvent) => {
+      const raw = event.data;
+      let data: any = raw;
+      if (typeof raw === "string") {
+        try { data = JSON.parse(raw); } catch { return; }
+      }
+      if (!data || typeof data !== "object") return;
+      if (String(data.type || "") !== "CONNECT_BRIDGE_DIAGNOSTICS_RESPONSE") return;
+      setDebugBridgeDiagnostics(data.payload || data);
+    };
+    window.addEventListener("message", onBridgeDiagnostics);
+    return () => window.removeEventListener("message", onBridgeDiagnostics);
+  }, []);
+
+  const requestBridgeDiagnostics = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const request = {
+      type: "CONNECT_BRIDGE_DIAGNOSTICS_REQUEST",
+      requestId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      childBuild: CONNECT_BUILD_VERSION,
+    };
+    try { window.parent?.postMessage(request, "*"); } catch {}
+    try { window.parent?.postMessage(JSON.stringify(request), "*"); } catch {}
+  }, []);
 
   const pushDebug = useCallback((level: "log" | "warn" | "error", ...args: any[]) => {
     if (!debugEnabledRef.current) return;
@@ -4583,6 +4614,7 @@ useEffect(() => {
 
     try {
       pushDebug("log", "Debug enabled", {
+        build: CONNECT_BUILD_VERSION,
         href: window.location.href,
         embedded: isEmbedded,
         ua: navigator.userAgent,
@@ -14915,7 +14947,7 @@ const modePillControls = (
     const pctLabel = `${Math.round(pct * 100)}%`;
 
     return (
-      <div style={{ marginTop: 8, maxWidth: isMobileUI ? "100%" : 440 }}>
+      <div data-connect-debug="usage" style={{ marginTop: 8, maxWidth: isMobileUI ? "100%" : 440 }}>
         <div
           style={{
             display: "flex",
@@ -14966,6 +14998,7 @@ const modePillControls = (
 
   const experienceNavigationButtons = spotlightHref || faqHref ? (
     <div
+      data-connect-debug="navigation-row"
       style={{
         display: "grid",
         gridTemplateColumns: spotlightHref && faqHref ? "repeat(2, minmax(0, 1fr))" : "minmax(0, 1fr)",
@@ -15064,8 +15097,101 @@ const modePillControls = (
     topupCurrency || "usd"
   );
 
+  const captureConnectDiagnostics = useCallback(() => {
+    if (typeof window === "undefined") return null;
+
+    const round = (value: any) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
+    };
+    const rectFor = (selector: string) => {
+      const el = document.querySelector(selector) as HTMLElement | null;
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: round(r.x), y: round(r.y), width: round(r.width), height: round(r.height), right: round(r.right), bottom: round(r.bottom) };
+    };
+    const cssFor = (selector: string) => {
+      const el = document.querySelector(selector) as HTMLElement | null;
+      if (!el) return null;
+      const cs = window.getComputedStyle(el);
+      return {
+        display: cs.display, position: cs.position, width: cs.width, maxWidth: cs.maxWidth, minWidth: cs.minWidth,
+        gridTemplateColumns: cs.gridTemplateColumns, gridTemplateRows: cs.gridTemplateRows, overflowX: cs.overflowX,
+        overflowY: cs.overflowY, transform: cs.transform, boxSizing: cs.boxSizing, zoom: (cs as any).zoom || "",
+      };
+    };
+    const effectiveWidth = getEffectiveViewportWidth();
+    const activeView = hostConsoleOpen ? "host" : conversationPanelTab === "email" ? "email" : experienceView;
+    const selectors: Record<string, string> = {
+      root: '[data-connect-debug="root"]',
+      workspace: '.connect-experience-grid',
+      viewSelector: '[data-connect-debug="view-selector"]',
+      personaPanel: '[data-connect-debug="persona-panel"]',
+      personaImage: '[data-connect-debug="persona-image"]',
+      actionColumn: '[data-connect-debug="action-column"]',
+      usage: '[data-connect-debug="usage"]',
+      navigationRow: '[data-connect-debug="navigation-row"]',
+      sessionRail: '[data-connect-debug="session-rail"]',
+      conversationPanel: '[data-connect-debug="conversation-panel"]',
+      composerRow: '[data-connect-debug="composer-row"]',
+    };
+    const elements: Record<string, any> = {};
+    const css: Record<string, any> = {};
+    Object.entries(selectors).forEach(([key, selector]) => { elements[key] = rectFor(selector); css[key] = cssFor(selector); });
+
+    const report = {
+      capturedAt: new Date().toISOString(),
+      build: { frontend: CONNECT_BUILD_VERSION, apiBase: API_BASE || "", href: window.location.href, referrer: document.referrer || "" },
+      viewport: {
+        innerWidth: round(window.innerWidth), innerHeight: round(window.innerHeight),
+        documentClientWidth: round(document.documentElement?.clientWidth), documentClientHeight: round(document.documentElement?.clientHeight),
+        documentScrollWidth: round(document.documentElement?.scrollWidth), documentScrollHeight: round(document.documentElement?.scrollHeight),
+        bodyClientWidth: round(document.body?.clientWidth), bodyScrollWidth: round(document.body?.scrollWidth),
+        visualViewportWidth: round(window.visualViewport?.width), visualViewportHeight: round(window.visualViewport?.height),
+        visualViewportScale: round(window.visualViewport?.scale), screenWidth: round(window.screen?.width), screenHeight: round(window.screen?.height),
+        devicePixelRatio: round(window.devicePixelRatio), orientation: String(window.screen?.orientation?.type || ""),
+      },
+      responsiveState: {
+        effectiveViewportWidth: round(effectiveWidth), viewportMode, isMobileUI, isTabletUI, isDesktopUI: viewportMode === "desktop",
+        deviceShortSide: round(deviceShortSide), isNarrowPhone, useVerticalMobileSessionRail,
+        personaPortraitWidth, personaPortraitHeight, personaActionColumnWidth, iconButtonSize: ICON_BTN_SIZE,
+      },
+      workspace: {
+        activeView, companyName, rebranding: String(rebranding || ""), rebrandingKeyPresent: Boolean(rebrandingKey),
+        companionName, companionType: companionTypeBadgeLabel, selectableCompanionCount: companionListReturnContext.count,
+        hostAuthorized: Boolean(isHostConsoleUser), hostConsoleOpen: Boolean(hostConsoleOpen), conversationPanelTab, experienceView,
+      },
+      overflow: {
+        bodyWiderThanWindow: Number(document.body?.scrollWidth || 0) > Number(window.innerWidth || 0),
+        documentWiderThanWindow: Number(document.documentElement?.scrollWidth || 0) > Number(window.innerWidth || 0),
+      },
+      elements, css, bridge: debugBridgeDiagnostics,
+      userAgent: navigator.userAgent, platform: navigator.platform || "", maxTouchPoints: navigator.maxTouchPoints || 0,
+    };
+    setDebugDiagnostics(report);
+    requestBridgeDiagnostics();
+    return report;
+  }, [
+    getEffectiveViewportWidth, viewportMode, isMobileUI, isTabletUI, deviceShortSide, isNarrowPhone, useVerticalMobileSessionRail,
+    personaPortraitWidth, personaPortraitHeight, personaActionColumnWidth, hostConsoleOpen, conversationPanelTab, experienceView,
+    companyName, rebranding, rebrandingKey, companionName, companionTypeBadgeLabel, companionListReturnContext.count,
+    isHostConsoleUser, debugBridgeDiagnostics, requestBridgeDiagnostics,
+  ]);
+
+  useEffect(() => {
+    if (!debugOpen) return;
+    requestBridgeDiagnostics();
+    const timer = window.setTimeout(() => captureConnectDiagnostics(), 120);
+    return () => window.clearTimeout(timer);
+  }, [debugOpen, requestBridgeDiagnostics, captureConnectDiagnostics]);
+
+  useEffect(() => {
+    if (!debugOpen || !debugBridgeDiagnostics) return;
+    captureConnectDiagnostics();
+  }, [debugOpen, debugBridgeDiagnostics, captureConnectDiagnostics]);
+
   return (
-    <main onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={mainContainerStyle}>
+    <main data-connect-debug="root" onPointerDown={handleAnyUserGesture} onTouchStart={handleAnyUserGesture} onClick={handleAnyUserGesture} style={mainContainerStyle}>
 
 {startupOverlayOpen ? (
   <div
@@ -15673,6 +15799,7 @@ const modePillControls = (
         }}
       >
         <div
+          data-connect-debug="view-selector"
           role="tablist"
           aria-label="Connect view"
           style={{
@@ -15764,6 +15891,7 @@ const modePillControls = (
         </div>
 
       <header
+        data-connect-debug="persona-panel"
         className="connect-persona-panel"
         style={{
           gridColumn: isMobileUI && useVerticalMobileSessionRail ? "1 / -1" : "1",
@@ -15860,6 +15988,7 @@ const modePillControls = (
             >
               <div style={{ flex: "0 0 auto", minWidth: 0 }}>
                 <div
+                  data-connect-debug="persona-image"
                   aria-hidden
                   onClick={secretDebugTap}
                   style={{
@@ -15888,6 +16017,7 @@ const modePillControls = (
               </div>
 
               <div
+                data-connect-debug="action-column"
                 style={{
                   flex: `0 0 ${personaActionColumnWidth}px`,
                   display: "flex",
@@ -16091,6 +16221,7 @@ const modePillControls = (
 
 {showConnectControls && !hostConsoleOpen && conversationPanelTab === "convo" ? (
   <section
+    data-connect-debug="session-rail"
     className="connect-control-rail"
     style={{
       gridColumn: isMobileUI ? "1" : "2",
@@ -16683,6 +16814,7 @@ const modePillControls = (
           ) : null}
 
           <div
+            data-connect-debug="conversation-panel"
             className="connect-conversation-panel"
             style={{
               gridColumn: conversationPanelTab === "email"
@@ -16810,6 +16942,7 @@ const modePillControls = (
                     </div>
 
                     <div
+                      data-connect-debug="composer-row"
                       style={{
                         display: conversationPanelTab === "convo" ? "flex" : "none",
                         gap: 8,
@@ -18585,15 +18718,17 @@ const modePillControls = (
             borderRadius: 12,
             padding: 10,
             boxShadow: "0 10px 24px rgba(0,0,0,0.35)",
-            maxHeight: "35vh",
+            maxHeight: "72vh",
             overflow: "hidden",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <div style={{ fontWeight: 700, fontSize: 13 }}>Debug Logs ({debugLogs.length})</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+            <div style={{ fontWeight: 700, fontSize: 13 }}>Connect Diagnostics · {CONNECT_BUILD_VERSION}</div>
+            <button type="button" onClick={() => captureConnectDiagnostics()} style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "rgba(255,255,255,0.10)", color: "#fff", cursor: "pointer" }}>Refresh</button>
             <button
               onClick={async () => {
-                const textToCopy = debugLogs.join("\n");
+                const snapshot = captureConnectDiagnostics() || debugDiagnostics || {};
+                const textToCopy = JSON.stringify({ ...snapshot, bridge: debugBridgeDiagnostics || snapshot.bridge || null, logs: debugLogs }, null, 2);
                 let copied = false;
 
                 // Try modern Clipboard API first.
@@ -18630,11 +18765,11 @@ const modePillControls = (
 
                 if (copied) {
                   // eslint-disable-next-line no-alert
-                  alert("Copied debug logs to clipboard.");
+                  alert("Copied Connect diagnostics to clipboard.");
                 } else {
                   // Last resort: show a prompt with selectable text so the user can copy manually.
                   // eslint-disable-next-line no-alert
-                  window.prompt("Copy debug logs:", textToCopy);
+                  window.prompt("Copy Connect diagnostics:", textToCopy);
                 }
               }}
               style={{
@@ -18647,7 +18782,7 @@ const modePillControls = (
                 cursor: "pointer",
               }}
             >
-              Copy
+              Copy Diagnostics
             </button>
             <button
               onClick={() => setDebugLogs([])}
@@ -18702,18 +18837,17 @@ const modePillControls = (
               whiteSpace: "pre-wrap",
               wordBreak: "break-word",
               overflowY: "auto",
-              maxHeight: "26vh",
+              maxHeight: "58vh",
               borderRadius: 10,
               padding: 8,
               background: "rgba(255,255,255,0.06)",
               border: "1px solid rgba(255,255,255,0.12)",
             }}
           >
-            {debugLogs.length === 0 ? (
-              <div style={{ opacity: 0.8 }}>No logs yet. Tap around, then press Copy.</div>
-            ) : (
-              debugLogs.map((l, i) => <div key={i}>{l}</div>)
-            )}
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>Snapshot</div>
+            <div>{JSON.stringify(debugDiagnostics || { status: "Press Refresh to capture" }, null, 2)}</div>
+            <div style={{ fontWeight: 700, margin: "10px 0 6px" }}>Logs ({debugLogs.length})</div>
+            {debugLogs.length === 0 ? <div style={{ opacity: 0.8 }}>No logs yet.</div> : debugLogs.map((l, i) => <div key={i}>{l}</div>)}
           </div>
 
           <div style={{ marginTop: 8, fontSize: 11, opacity: 0.85 }}>
