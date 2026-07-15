@@ -1,6 +1,6 @@
 "use client";
-// v10.0.0-alpha15.37: make measured viewport geometry authoritative for the shared mobile workspace; preserve enhanced diagnostics and protected media behavior.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.37";
+// v10.0.0-alpha15.38: standardize the shared mobile Persona portrait at 170x213 and lock all View tabs to the compact Elaralo geometry across every brand.
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.38";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4322,8 +4322,8 @@ function ConnectPage() {
   const useCompactCompanionCard = true;
   const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
   const useVerticalMobileSessionRail = isMobileUI && !isNarrowPhone;
-  const personaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 160) : 150;
-  const personaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 200) : 188;
+  const personaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
+  const personaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
   const personaActionColumnWidth = isMobileUI ? (isNarrowPhone ? 132 : 136) : isTabletUI ? 132 : 140;
 
   // Icon sizing: on mobile, force all icons to the same pixel size.
@@ -15865,6 +15865,9 @@ const modePillControls = (
           min-height: 30px !important;
           padding: 0 8px !important;
           font-size: 11px !important;
+          line-height: 1 !important;
+          border-width: 1px !important;
+          box-sizing: border-box !important;
           flex: 0 0 auto !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-persona-panel,
@@ -15889,9 +15892,9 @@ const modePillControls = (
           font-size: 12px !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="persona-image"] {
-          width: 160px !important;
-          height: 200px !important;
-          flex: 0 0 160px !important;
+          width: 170px !important;
+          height: 213px !important;
+          flex: 0 0 170px !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] {
           width: 136px !important;
