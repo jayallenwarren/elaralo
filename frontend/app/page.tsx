@@ -1,7 +1,9 @@
 "use client";
+// v10.0.0-alpha15.45: place the mobile message input and Send button immediately against the bottom edge of the conversation box, with no vertical gap, padding offset, sticky displacement, or separator; no protected media behavior changed.
+// v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.41";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.44";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4327,7 +4329,7 @@ function ConnectPage() {
   // never by brand.
   const useCompactCompanionCard = true;
   const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
-  const useVerticalMobileSessionRail = isMobileUI && !isNarrowPhone;
+  const useVerticalMobileSessionRail = isMobileUI;
 
   // Standardize apparent mobile geometry across Wix runtimes without using
   // brand names. The modern editor can expose a wider internal layout canvas,
@@ -15901,7 +15903,7 @@ const modePillControls = (
           min-width: 0 !important;
           overflow-x: hidden !important;
           grid-template-columns: 44px minmax(0, 1fr) !important;
-          grid-template-rows: auto auto 520px !important;
+          grid-template-rows: auto auto auto !important;
           column-gap: 8px !important;
           row-gap: 6px !important;
           align-items: start !important;
@@ -15982,8 +15984,8 @@ const modePillControls = (
           width: 44px !important;
           max-width: 44px !important;
           min-width: 44px !important;
-          height: 520px !important;
-          min-height: 520px !important;
+          height: auto !important;
+          min-height: 0 !important;
           box-sizing: border-box !important;
           flex-direction: column !important;
           justify-content: flex-start !important;
@@ -15995,7 +15997,7 @@ const modePillControls = (
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-control-rail-inner {
           width: 44px !important;
-          height: 100% !important;
+          height: auto !important;
           box-sizing: border-box !important;
           flex-direction: column !important;
           align-items: stretch !important;
@@ -16015,15 +16017,28 @@ const modePillControls = (
           width: 100% !important;
           max-width: 100% !important;
           min-width: 0 !important;
-          height: 520px !important;
-          min-height: 520px !important;
+          height: auto !important;
+          min-height: 0 !important;
           box-sizing: border-box !important;
           overflow-x: hidden !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="messages-box"] {
+          flex: 0 0 252px !important;
+          height: 252px !important;
+          min-height: 252px !important;
+          max-height: 252px !important;
+          box-sizing: border-box !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] {
           width: 100% !important;
           max-width: 100% !important;
           min-width: 0 !important;
+          margin-top: 0 !important;
+          padding-top: 0 !important;
+          padding-bottom: 0 !important;
+          border-top: 0 !important;
+          position: static !important;
+          bottom: auto !important;
           box-sizing: border-box !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-email,
@@ -16555,8 +16570,8 @@ const modePillControls = (
       flexWrap: isMobileUI && !useVerticalMobileSessionRail ? "wrap" : "nowrap",
       alignSelf: isMobileUI && useVerticalMobileSessionRail ? "stretch" : "start",
       minWidth: isMobileUI && !useVerticalMobileSessionRail ? 0 : ICON_BTN_SIZE,
-      height: isMobileUI && useVerticalMobileSessionRail ? 520 : undefined,
-      minHeight: isMobileUI && useVerticalMobileSessionRail ? 520 : undefined,
+      height: undefined,
+      minHeight: undefined,
       boxSizing: "border-box",
       zIndex: 2,
     }}
@@ -16570,12 +16585,9 @@ const modePillControls = (
         gap: isMobileUI && !useVerticalMobileSessionRail ? 12 : 8,
         flexWrap: isMobileUI && !useVerticalMobileSessionRail ? "wrap" : "nowrap",
         width: isMobileUI && useVerticalMobileSessionRail ? ICON_BTN_SIZE : undefined,
-        height: isMobileUI && useVerticalMobileSessionRail ? "100%" : undefined,
+        height: undefined,
         boxSizing: "border-box",
-        paddingBottom:
-          isMobileUI && useVerticalMobileSessionRail
-            ? (!isHost && !isHostConsoleUser ? 30 : 10)
-            : 0,
+        paddingBottom: 0,
       }}
     >
       {showPlayButton ? (
@@ -16777,7 +16789,7 @@ const modePillControls = (
               opacity: attachmentButtonDisabled ? 0.6 : 1,
               lineHeight: "18px",
               fontSize: 18,
-              marginTop: isMobileUI && useVerticalMobileSessionRail ? "auto" : 0,
+              marginTop: 0,
             }}
           >
             {uploadingAttachment ? "⏳" : "📎"}
@@ -17160,8 +17172,8 @@ const modePillControls = (
                   : "2",
               minWidth: 0,
               width: "100%",
-              height: conversationPanelTab === "email" ? (isMobileUI ? 600 : 640) : (isMobileUI ? 520 : "100%"),
-              minHeight: conversationPanelTab === "email" ? (isMobileUI ? 600 : 640) : (isMobileUI ? 520 : 0),
+              height: conversationPanelTab === "email" ? (isMobileUI ? 600 : 640) : (isMobileUI ? "auto" : "100%"),
+              minHeight: conversationPanelTab === "email" ? (isMobileUI ? 600 : 640) : 0,
               alignSelf: isMobileUI ? "start" : "stretch",
               display: hostConsoleOpen ? "none" : "flex",
               flexDirection: "column",
@@ -17207,6 +17219,7 @@ const modePillControls = (
 
                     <div
                       ref={messagesBoxRef}
+                      data-connect-debug="messages-box"
                       style={{
                         display: conversationPanelTab === "convo" ? "block" : "none",
                         flex: "1 1 auto",
