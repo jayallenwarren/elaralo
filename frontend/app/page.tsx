@@ -1,11 +1,13 @@
 "use client";
-// v10.0.0-alpha15.49: prevent-scroll focus activation for the mobile composer, preserve the conversation box as the only chat scroll surface, and compensate shared portrait/tab geometry for measured legacy-Wix bridge scale; no protected media behavior changed.
+// v10.0.0-alpha15.50: coordinate native mobile composer focus through React -> Wix bridge -> Velo, hold the outer Wix page at its pre-focus scroll position, dock the approved interaction area above the iOS keyboard while only the conversation scrolls, and normalize apparent portrait/tab geometry from measured Wix runtime scaling; no protected media behavior changed.
+// v10.0.0-alpha15.49: prevent-scroll focus activation for the mobile composer and initial legacy-Wix scale compensation; superseded by the coordinated alpha15.50 React/bridge/Velo implementation.
+// v10.0.0-alpha15.48: freeze the mobile document during composer focus, force 16px iOS input text, keep the conversation box as the scroll surface, and normalize mobile portrait height and View-tab dimensions across Wix runtimes; no protected media behavior changed.
 // v10.0.0-alpha15.46: implement the approved mobile Persona layout across all brands: add a 16px conversation-to-composer gap; normalize legacy Wix mobile View tabs and Persona portrait to the same apparent scale as the Elaralo modern runtime; no protected media behavior changed.
 // v10.0.0-alpha15.45: place the mobile message input and Send button immediately against the bottom edge of the conversation box, with no vertical gap, padding offset, sticky displacement, or separator; no protected media behavior changed.
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.49";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.50";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4202,60 +4204,363 @@ function ConnectPage() {
     return `ELARALO_MEMBER_PLAN_CACHE::${safeBrandKey(basis)}`;
   }, [getEmbedContext]);
 
-  const composerDocumentLockRef = useRef<{ scrollX: number; scrollY: number } | null>(null);
+  // The root and interaction refs are shared by measured responsive layout and
+  // mobile keyboard docking. Keeping these refs in the React document avoids
+  // changing STT/TTS, microphone, LiveKit, or message-delivery behavior.
+  const connectRootRef = useRef<HTMLElement | null>(null);
+  const composerConversationPanelRef = useRef<HTMLDivElement | null>(null);
+  const composerSessionRailRef = useRef<HTMLElement | null>(null);
+  const composerRowRef = useRef<HTMLDivElement | null>(null);
 
-  const restoreComposerDocumentPosition = useCallback((scrollX: number, scrollY: number) => {
-    if (typeof window === "undefined") return;
-    const restore = () => {
-      try { window.scrollTo({ left: scrollX, top: scrollY, behavior: "auto" }); } catch { window.scrollTo(scrollX, scrollY); }
-    };
-    restore();
-    window.requestAnimationFrame(restore);
-    window.setTimeout(restore, 40);
-    window.setTimeout(restore, 120);
+  const composerFocusedRef = useRef(false);
+  const composerDockBaseRef = useRef<{ conversationLeft: number; conversationWidth: number; railLeft: number; composerHeight: number } | null>(null);
+  const composerDockRafRef = useRef<number | null>(null);
+  const composerLockIdRef = useRef("");
+  const composerFocusStartedAtRef = useRef(0);
+  const bridgeLayoutScaleRef = useRef(1);
+  const bridgeVisualScaleRef = useRef(1);
+  const bridgeRuntimeModeRef = useRef("");
+  const bridgeViewportBaselineHeightRef = useRef(0);
+  const outerViewportRef = useRef<{ baselineWindowHeight: number; windowHeight: number; scrollX: number; scrollY: number }>({
+    baselineWindowHeight: 0,
+    windowHeight: 0,
+    scrollX: 0,
+    scrollY: 0,
+  });
+  const [bridgeLayoutScale, setBridgeLayoutScale] = useState(1);
+  const [bridgeVisualScale, setBridgeVisualScale] = useState(1);
+  const [bridgeRuntimeMode, setBridgeRuntimeMode] = useState("");
+
+  const parseConnectWindowMessage = useCallback((raw: any): any => {
+    if (typeof raw !== "string") return raw;
+    try { return JSON.parse(raw); } catch { return raw; }
   }, []);
 
-  const lockDocumentForComposer = useCallback(() => {
+  const postConnectBridgeMessage = useCallback((payload: Record<string, any>) => {
     if (typeof window === "undefined") return;
-    const scrollX = composerDocumentLockRef.current?.scrollX ?? (window.scrollX || 0);
-    const scrollY = composerDocumentLockRef.current?.scrollY ?? (window.scrollY || 0);
-    composerDocumentLockRef.current = { scrollX, scrollY };
+    try { window.parent?.postMessage(payload, "*"); } catch {}
+  }, []);
+
+  const isPhoneLikeComposerEnvironment = useCallback(() => {
+    if (typeof window === "undefined") return false;
+    const sw = Number(window.screen?.width || 0);
+    const sh = Number(window.screen?.height || 0);
+    const shortSide = sw > 0 && sh > 0 ? Math.min(sw, sh) : 0;
+    const viewportWidth = Math.min(
+      ...[
+        Number(window.visualViewport?.width || 0),
+        Number(document.documentElement?.clientWidth || 0),
+        Number(window.innerWidth || 0),
+      ].filter((value) => Number.isFinite(value) && value > 0)
+    );
+    return (shortSide > 0 && shortSide <= 600) || (Number.isFinite(viewportWidth) && viewportWidth <= 600);
+  }, []);
+
+  const captureComposerDockBase = useCallback(() => {
+    const conversation = composerConversationPanelRef.current;
+    const rail = composerSessionRailRef.current;
+    const composer = composerRowRef.current;
+    if (!conversation || !rail || !composer) return;
+    const conversationRect = conversation.getBoundingClientRect();
+    const railRect = rail.getBoundingClientRect();
+    const composerRect = composer.getBoundingClientRect();
+    composerDockBaseRef.current = {
+      conversationLeft: conversationRect.left,
+      conversationWidth: conversationRect.width,
+      railLeft: railRect.left,
+      composerHeight: Math.max(44, composerRect.height || 44),
+    };
+  }, []);
+
+  const clearComposerDock = useCallback(() => {
+    const root = connectRootRef.current;
+    if (!root) return;
+    root.dataset.connectKeyboardDocked = "false";
+    [
+      "--connect-keyboard-dock-top",
+      "--connect-keyboard-dock-height",
+      "--connect-keyboard-messages-height",
+      "--connect-keyboard-conversation-left",
+      "--connect-keyboard-conversation-width",
+      "--connect-keyboard-rail-left",
+    ].forEach((name) => root.style.removeProperty(name));
+  }, []);
+
+  const updateComposerDockGeometry = useCallback(() => {
+    const root = connectRootRef.current;
+    if (!root || !composerFocusedRef.current || !isPhoneLikeComposerEnvironment()) {
+      clearComposerDock();
+      return;
+    }
+
+    if (!composerDockBaseRef.current) captureComposerDockBase();
+    const base = composerDockBaseRef.current;
+    if (!base) return;
+
+    const innerHeight = Number(window.innerHeight || document.documentElement?.clientHeight || 0);
+    if (!(innerHeight > 0)) return;
+
+    const vv = window.visualViewport;
+    let visibleTop = Number(vv?.offsetTop || 0);
+    let visibleHeight = Number(vv?.height || innerHeight);
+    if (!(visibleHeight > 0)) visibleHeight = innerHeight;
+    let visibleBottom = Math.min(innerHeight, visibleTop + visibleHeight);
+
+    const internalKeyboardInset = Math.max(0, innerHeight - visibleBottom);
+    const outer = outerViewportRef.current;
+    const visualScale = Math.max(0.65, Math.min(1.25, Number(bridgeVisualScaleRef.current || 1)));
+    const outerKeyboardInset =
+      outer.baselineWindowHeight > 0 && outer.windowHeight > 0
+        ? Math.max(0, (outer.baselineWindowHeight - outer.windowHeight) / visualScale)
+        : 0;
+    const keyboardInset = Math.max(internalKeyboardInset, outerKeyboardInset);
+    let keyboardOpen = keyboardInset >= 80 || visibleHeight <= innerHeight * 0.78;
+
+    if (outerKeyboardInset > internalKeyboardInset) {
+      visibleTop = 0;
+      visibleBottom = Math.max(0, innerHeight - outerKeyboardInset);
+      visibleHeight = visibleBottom;
+    }
+
+    // Some iOS/Wix iframe combinations keep both nested visualViewport.height
+    // and wixWindowFrontend's reported height unchanged while the keyboard is
+    // visible. After the focus transition has had time to start, use a bounded
+    // phone-geometry fallback so the interaction area docks above the keyboard
+    // instead of allowing Safari to pan the entire Wix page.
+    const focusAgeMs = Math.max(0, Date.now() - Number(composerFocusStartedAtRef.current || 0));
+    const isiOSLike = /iPad|iPhone|iPod/i.test(String(navigator.userAgent || "")) ||
+      (String(navigator.platform || "") === "MacIntel" && Number(navigator.maxTouchPoints || 0) > 1);
+    if (!keyboardOpen && isiOSLike && focusAgeMs >= 120) {
+      const screenLongSide = Math.max(Number(window.screen?.width || 0), Number(window.screen?.height || 0));
+      const physicalVisibleHeight = Math.max(320, Math.min(420, screenLongSide * 0.40));
+      const fallbackChildVisibleHeight = physicalVisibleHeight / visualScale;
+      visibleTop = 0;
+      visibleHeight = Math.min(visibleHeight, fallbackChildVisibleHeight);
+      visibleBottom = Math.min(innerHeight, visibleHeight);
+      keyboardOpen = true;
+    }
+
+    if (!keyboardOpen) {
+      clearComposerDock();
+      return;
+    }
+
+    const composerHeight = Math.max(44, Math.round(base.composerHeight));
+    const approvedGap = 16;
+    const viewportPadding = 8;
+    const availableMessagesHeight = Math.floor(
+      Math.max(96, visibleHeight - viewportPadding * 2 - approvedGap - composerHeight)
+    );
+    const messagesHeight = Math.min(252, availableMessagesHeight);
+    const dockHeight = messagesHeight + approvedGap + composerHeight;
+    const dockTop = Math.max(visibleTop + viewportPadding, visibleBottom - viewportPadding - dockHeight);
+
+    root.style.setProperty("--connect-keyboard-dock-top", `${Math.round(dockTop)}px`);
+    root.style.setProperty("--connect-keyboard-dock-height", `${Math.round(dockHeight)}px`);
+    root.style.setProperty("--connect-keyboard-messages-height", `${Math.round(messagesHeight)}px`);
+    root.style.setProperty("--connect-keyboard-conversation-left", `${Math.round(base.conversationLeft * 100) / 100}px`);
+    root.style.setProperty("--connect-keyboard-conversation-width", `${Math.round(base.conversationWidth * 100) / 100}px`);
+    root.style.setProperty("--connect-keyboard-rail-left", `${Math.round(base.railLeft * 100) / 100}px`);
+    root.dataset.connectKeyboardDocked = "true";
+  }, [captureComposerDockBase, clearComposerDock, isPhoneLikeComposerEnvironment]);
+
+  const queueComposerDockUpdate = useCallback(() => {
+    if (typeof window === "undefined") return;
+    if (composerDockRafRef.current !== null) window.cancelAnimationFrame(composerDockRafRef.current);
+    composerDockRafRef.current = window.requestAnimationFrame(() => {
+      composerDockRafRef.current = null;
+      updateComposerDockGeometry();
+    });
+  }, [updateComposerDockGeometry]);
+
+  const prepareComposerFocus = useCallback((event: React.PointerEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    if (!isPhoneLikeComposerEnvironment() || document.activeElement === input) return;
+
+    // Pointer-down precedes the browser's native focus transition. Send PREPARE
+    // without cancelling that transition so iOS keeps the keyboard request in
+    // the original user gesture while Velo activates the outer-page scroll lock.
+    captureComposerDockBase();
+    const lockId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    composerLockIdRef.current = lockId;
+
+    const composerRect = composerRowRef.current?.getBoundingClientRect();
+    const conversationRect = composerConversationPanelRef.current?.getBoundingClientRect();
+    postConnectBridgeMessage({
+      type: "CONNECT_COMPOSER_PREPARE",
+      lockId,
+      childBuild: CONNECT_BUILD_VERSION,
+      composerRect: composerRect ? { top: composerRect.top, bottom: composerRect.bottom, height: composerRect.height } : null,
+      conversationRect: conversationRect ? { top: conversationRect.top, bottom: conversationRect.bottom, height: conversationRect.height } : null,
+      childViewport: {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        visualViewportHeight: window.visualViewport?.height || 0,
+        visualViewportOffsetTop: window.visualViewport?.offsetTop || 0,
+      },
+    });
+  }, [captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage]);
+
+  const lockDocumentForComposer = useCallback(() => {
+    if (typeof window === "undefined" || !isPhoneLikeComposerEnvironment()) return;
+    composerFocusedRef.current = true;
+    composerFocusStartedAtRef.current = Date.now();
     document.documentElement.dataset.connectComposerFocused = "true";
-    restoreComposerDocumentPosition(scrollX, scrollY);
-    try { window.parent.postMessage({ type: "CONNECT_COMPOSER_FOCUS", scrollX, scrollY }, "*"); } catch {}
-  }, [restoreComposerDocumentPosition]);
+    const root = connectRootRef.current;
+    if (root) root.dataset.connectComposerFocused = "true";
+    captureComposerDockBase();
+
+    // Accessibility activation, keyboard navigation, and programmatic focus can
+    // bypass pointer-down. Establish the same lock transaction before FOCUS.
+    if (!composerLockIdRef.current) {
+      composerLockIdRef.current = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      postConnectBridgeMessage({
+        type: "CONNECT_COMPOSER_PREPARE",
+        lockId: composerLockIdRef.current,
+        childBuild: CONNECT_BUILD_VERSION,
+        fallback: true,
+      });
+    }
+
+    postConnectBridgeMessage({
+      type: "CONNECT_COMPOSER_FOCUS",
+      lockId: composerLockIdRef.current,
+      childBuild: CONNECT_BUILD_VERSION,
+    });
+    postConnectBridgeMessage({ type: "CONNECT_BRIDGE_CONTEXT_REQUEST", childBuild: CONNECT_BUILD_VERSION });
+    queueComposerDockUpdate();
+    window.setTimeout(queueComposerDockUpdate, 40);
+    window.setTimeout(queueComposerDockUpdate, 140);
+    window.setTimeout(queueComposerDockUpdate, 320);
+    window.setTimeout(queueComposerDockUpdate, 650);
+  }, [captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage, queueComposerDockUpdate]);
 
   const unlockDocumentForComposer = useCallback(() => {
     if (typeof window === "undefined") return;
-    const saved = composerDocumentLockRef.current;
+    composerFocusedRef.current = false;
+    composerFocusStartedAtRef.current = 0;
     delete document.documentElement.dataset.connectComposerFocused;
-    composerDocumentLockRef.current = null;
-    if (saved) restoreComposerDocumentPosition(saved.scrollX, saved.scrollY);
-    try { window.parent.postMessage({ type: "CONNECT_COMPOSER_BLUR", scrollX: saved?.scrollX || 0, scrollY: saved?.scrollY || 0 }, "*"); } catch {}
-  }, [restoreComposerDocumentPosition]);
-
-  const focusComposerWithoutScroll = useCallback((event: React.PointerEvent<HTMLInputElement>) => {
-    const input = event.currentTarget;
-    if (typeof document === "undefined" || document.activeElement === input) return;
-    event.preventDefault();
-    const scrollX = window.scrollX || 0;
-    const scrollY = window.scrollY || 0;
-    composerDocumentLockRef.current = { scrollX, scrollY };
-    try { input.focus({ preventScroll: true }); } catch { input.focus(); }
-    try {
-      const end = input.value.length;
-      input.setSelectionRange(end, end);
-    } catch {}
-    restoreComposerDocumentPosition(scrollX, scrollY);
-  }, [restoreComposerDocumentPosition]);
+    const root = connectRootRef.current;
+    if (root) {
+      delete root.dataset.connectComposerFocused;
+      root.dataset.connectKeyboardDocked = "false";
+    }
+    clearComposerDock();
+    composerDockBaseRef.current = null;
+    postConnectBridgeMessage({
+      type: "CONNECT_COMPOSER_BLUR",
+      lockId: composerLockIdRef.current,
+      childBuild: CONNECT_BUILD_VERSION,
+    });
+    composerLockIdRef.current = "";
+  }, [clearComposerDock, postConnectBridgeMessage]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
     let viewport = document.querySelector('meta[name="viewport"]') as HTMLMetaElement | null;
     if (!viewport) { viewport = document.createElement("meta"); viewport.name = "viewport"; document.head.appendChild(viewport); }
     viewport.content = "width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover";
-    return () => unlockDocumentForComposer();
-  }, [unlockDocumentForComposer]);
+
+    const onBridgeMessage = (event: MessageEvent) => {
+      const data = parseConnectWindowMessage(event.data);
+      if (!data || typeof data !== "object") return;
+      const type = String(data.type || "").trim();
+
+      if (type === "CONNECT_COMPOSER_LOCK_READY") {
+        queueComposerDockUpdate();
+        return;
+      }
+
+      if (type === "CONNECT_BRIDGE_CONTEXT" || type === "CONNECT_BRIDGE_LAYOUT") {
+        const rawScale = Number(data.layoutScale || data.scale || 1);
+        const scale = Number.isFinite(rawScale) && rawScale >= 0.65 && rawScale <= 1 ? rawScale : 1;
+        const rawVisualScale = Number(data.estimatedChildVisualScale || data.visualScale || scale);
+        const visualScale = Number.isFinite(rawVisualScale) && rawVisualScale >= 0.65 && rawVisualScale <= 1.25
+          ? rawVisualScale
+          : scale;
+        const runtimeMode = String(data.runtimeMode || "").trim();
+        bridgeLayoutScaleRef.current = scale;
+        bridgeVisualScaleRef.current = visualScale;
+        bridgeRuntimeModeRef.current = runtimeMode;
+        setBridgeLayoutScale(scale);
+        setBridgeVisualScale(visualScale);
+        setBridgeRuntimeMode(runtimeMode);
+
+        const bridgeReportedBaseline = Number(data.baselineVisualViewportHeight || 0);
+        if (Number.isFinite(bridgeReportedBaseline) && bridgeReportedBaseline > 0) {
+          bridgeViewportBaselineHeightRef.current = Math.max(
+            bridgeViewportBaselineHeightRef.current,
+            bridgeReportedBaseline
+          );
+        }
+        const bridgeVisibleHeight = Number(data.visualViewportHeight || data.outerHeight || 0);
+        if (Number.isFinite(bridgeVisibleHeight) && bridgeVisibleHeight > 0) {
+          if (!composerFocusedRef.current) {
+            bridgeViewportBaselineHeightRef.current = Math.max(
+              bridgeViewportBaselineHeightRef.current,
+              bridgeVisibleHeight
+            );
+          } else {
+            const baseline = Math.max(
+              outerViewportRef.current.baselineWindowHeight,
+              bridgeViewportBaselineHeightRef.current,
+              bridgeVisibleHeight
+            );
+            outerViewportRef.current = {
+              ...outerViewportRef.current,
+              baselineWindowHeight: baseline,
+              windowHeight: bridgeVisibleHeight,
+            };
+          }
+        }
+
+        const root = connectRootRef.current;
+        if (root) {
+          root.dataset.connectBridgeScale = scale.toFixed(6);
+          root.dataset.connectBridgeVisualScale = visualScale.toFixed(6);
+          root.dataset.connectBridgeRuntimeMode = runtimeMode;
+          root.style.setProperty("--connect-bridge-layout-scale", String(scale));
+          root.style.setProperty("--connect-bridge-visual-scale", String(visualScale));
+        }
+        queueComposerDockUpdate();
+        return;
+      }
+
+      if (type === "CONNECT_OUTER_VIEWPORT") {
+        const baselineWindowHeight = Number(data.baselineWindowHeight || 0);
+        const windowHeight = Number(data.windowHeight || 0);
+        const resolvedBaseline = Math.max(
+          Number.isFinite(baselineWindowHeight) ? baselineWindowHeight : 0,
+          outerViewportRef.current.baselineWindowHeight,
+          bridgeViewportBaselineHeightRef.current
+        );
+        outerViewportRef.current = {
+          baselineWindowHeight: resolvedBaseline,
+          windowHeight: Number.isFinite(windowHeight) ? windowHeight : 0,
+          scrollX: Number(data.scrollX || 0) || 0,
+          scrollY: Number(data.scrollY || 0) || 0,
+        };
+        queueComposerDockUpdate();
+      }
+    };
+
+    const onViewportChange = () => queueComposerDockUpdate();
+    window.addEventListener("message", onBridgeMessage);
+    window.addEventListener("resize", onViewportChange, { passive: true });
+    window.visualViewport?.addEventListener("resize", onViewportChange, { passive: true });
+    window.visualViewport?.addEventListener("scroll", onViewportChange, { passive: true });
+
+    postConnectBridgeMessage({ type: "CONNECT_BRIDGE_CONTEXT_REQUEST", childBuild: CONNECT_BUILD_VERSION });
+
+    return () => {
+      window.removeEventListener("message", onBridgeMessage);
+      window.removeEventListener("resize", onViewportChange);
+      window.visualViewport?.removeEventListener("resize", onViewportChange);
+      window.visualViewport?.removeEventListener("scroll", onViewportChange);
+      if (composerDockRafRef.current !== null) window.cancelAnimationFrame(composerDockRafRef.current);
+      unlockDocumentForComposer();
+    };
+  }, [parseConnectWindowMessage, postConnectBridgeMessage, queueComposerDockUpdate, unlockDocumentForComposer]);
 
   // -----------------------
   // Responsive layout mode: mobile / tablet / desktop
@@ -4264,11 +4569,9 @@ function ConnectPage() {
   type ViewportMode = "mobile" | "tablet" | "desktop";
   type ExperienceView = "persona" | "video";
 
-  // Layout-only root reference. The legacy Wix runtime can report a phone-sized
-  // JavaScript viewport while evaluating CSS media queries against a wider
-  // layout canvas. We mirror the measured mode onto the DOM so one shared CSS
-  // path remains authoritative for every brand and editor generation.
-  const connectRootRef = useRef<HTMLElement | null>(null);
+  // The legacy Wix runtime can report a phone-sized JavaScript viewport while
+  // evaluating CSS media queries against a wider layout canvas. The root ref
+  // declared above remains the single measured-layout authority.
 
   const getEffectiveViewportWidth = useCallback((): number => {
     if (typeof window === "undefined") return 1024;
@@ -4388,29 +4691,64 @@ function ConnectPage() {
   const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
   const useVerticalMobileSessionRail = isMobileUI;
 
-  // Canonical mobile geometry is now expressed directly in child-document CSS pixels.
-  // The portrait height and View-tab tokens are fixed across Wix runtimes. Width
-  // may vary with the source portrait/aspect treatment, but height cannot push
-  // Usage or any later section lower on one brand than another.
+  // Normalize apparent mobile geometry from measured bridge/runtime scaling.
+  // The modern Elaralo runtime displays the approved 170 x 213 child portrait
+  // through the bridge's phone scale. The legacy 320px Wix canvas is enlarged by
+  // Wix itself, so the child dimensions must be reduced by the measured net scale
+  // to produce the same apparent height. This is geometry-driven and brand-neutral.
   const effectiveViewportWidth = typeof window === "undefined" ? 0 : getEffectiveViewportWidth();
-  const bridgeLayoutScale = useMemo(() => {
-    if (typeof window === "undefined") return 1;
-    const raw = Number(new URLSearchParams(window.location.search).get("connectBridgeScale") || "1");
-    return Number.isFinite(raw) && raw >= 0.65 && raw <= 1 ? raw : 1;
-  }, []);
-  const apparentScaleCompensation = isMobileUI && bridgeLayoutScale < 0.999999 ? 1 / bridgeLayoutScale : 1;
-  const basePersonaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
-  const basePersonaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
-  const personaPortraitWidth = Math.round(basePersonaPortraitWidth * apparentScaleCompensation);
-  const personaPortraitHeight = Math.round(basePersonaPortraitHeight * apparentScaleCompensation);
-  const personaActionColumnWidth = isMobileUI ? (isNarrowPhone ? 132 : 136) : isTabletUI ? 132 : 140;
+  const mobileRuntimeNormalization = isMobileUI
+    ? Math.max(0.72, Math.min(1, bridgeLayoutScale / Math.max(0.65, bridgeVisualScale)))
+    : 1;
+  const personaPortraitWidth = isMobileUI
+    ? Math.max(150, Math.round(170 * mobileRuntimeNormalization))
+    : 150;
+  const personaPortraitHeight = isMobileUI
+    ? Math.max(164, Math.round(213 * mobileRuntimeNormalization))
+    : 188;
+  const personaActionColumnWidth = isMobileUI ? 136 : isTabletUI ? 132 : 140;
 
-  const mobileViewTabHeight = Math.round(30 * apparentScaleCompensation);
-  const mobileViewTabFontSize = Math.round(11 * apparentScaleCompensation * 10) / 10;
-  const mobileViewTabPaddingX = Math.round(8 * apparentScaleCompensation);
-  const mobileViewTabGap = Math.round(4 * apparentScaleCompensation);
-  const mobileViewLabelFontSize = Math.round(11 * apparentScaleCompensation * 10) / 10;
-  const mobileViewSelectorHeight = Math.round(32 * apparentScaleCompensation);
+  const mobileViewTabHeight = Math.max(24, Math.round(30 * mobileRuntimeNormalization));
+  const mobileViewTabFontSize = Math.max(9, Math.round(11 * mobileRuntimeNormalization));
+  const mobileViewTabPaddingX = Math.max(6, Math.round(8 * mobileRuntimeNormalization));
+  const mobileViewTabGap = Math.max(3, Math.round(4 * mobileRuntimeNormalization));
+  const mobileViewLabelFontSize = Math.max(9, Math.round(11 * mobileRuntimeNormalization));
+  const mobileViewSelectorHeight = Math.max(26, Math.round(32 * mobileRuntimeNormalization));
+
+  // React can hydrate before a legacy Wix iframe reports its phone geometry.
+  // Reapply the canonical tokens directly after measured mode changes so the
+  // mounted DOM cannot retain the server/desktop 150 x 188 portrait values.
+  useEffect(() => {
+    const root = connectRootRef.current;
+    if (!root) return;
+    root.style.setProperty("--connect-persona-portrait-width", `${personaPortraitWidth}px`);
+    root.style.setProperty("--connect-persona-portrait-height", `${personaPortraitHeight}px`);
+    root.style.setProperty("--connect-view-selector-height", `${mobileViewSelectorHeight}px`);
+    root.style.setProperty("--connect-view-tab-height", `${mobileViewTabHeight}px`);
+    root.style.setProperty("--connect-view-tab-font-size", `${mobileViewTabFontSize}px`);
+    root.style.setProperty("--connect-view-tab-padding-x", `${mobileViewTabPaddingX}px`);
+    root.style.setProperty("--connect-view-tab-gap", `${mobileViewTabGap}px`);
+    root.style.setProperty("--connect-view-label-font-size", `${mobileViewLabelFontSize}px`);
+    root.style.setProperty("--connect-bridge-layout-scale", String(bridgeLayoutScale));
+    root.style.setProperty("--connect-bridge-visual-scale", String(bridgeVisualScale));
+    root.style.setProperty("--connect-mobile-runtime-normalization", String(mobileRuntimeNormalization));
+    root.dataset.connectBridgeScale = Number(bridgeLayoutScale || 1).toFixed(6);
+    root.dataset.connectBridgeVisualScale = Number(bridgeVisualScale || 1).toFixed(6);
+    root.dataset.connectBridgeRuntimeMode = bridgeRuntimeMode;
+  }, [
+    personaPortraitWidth,
+    personaPortraitHeight,
+    mobileViewSelectorHeight,
+    mobileViewTabHeight,
+    mobileViewTabFontSize,
+    mobileViewTabPaddingX,
+    mobileViewTabGap,
+    mobileViewLabelFontSize,
+    bridgeLayoutScale,
+    bridgeVisualScale,
+    bridgeRuntimeMode,
+    mobileRuntimeNormalization,
+  ]);
 
   // Icon sizing: on mobile, force all icons to the same pixel size.
   const ICON_18 = isMobileUI ? 13.5 : 18;
@@ -15269,6 +15607,7 @@ const modePillControls = (
       navigationRow: '[data-connect-debug="navigation-row"]',
       sessionRail: '[data-connect-debug="session-rail"]',
       conversationPanel: '[data-connect-debug="conversation-panel"]',
+      messagesBox: '[data-connect-debug="messages-box"]',
       composerRow: '[data-connect-debug="composer-row"]',
     };
     const elements: Record<string, any> = {};
@@ -15284,6 +15623,7 @@ const modePillControls = (
         documentScrollWidth: round(document.documentElement?.scrollWidth), documentScrollHeight: round(document.documentElement?.scrollHeight),
         bodyClientWidth: round(document.body?.clientWidth), bodyScrollWidth: round(document.body?.scrollWidth),
         visualViewportWidth: round(window.visualViewport?.width), visualViewportHeight: round(window.visualViewport?.height),
+        visualViewportOffsetTop: round(window.visualViewport?.offsetTop), visualViewportOffsetLeft: round(window.visualViewport?.offsetLeft),
         visualViewportScale: round(window.visualViewport?.scale), screenWidth: round(window.screen?.width), screenHeight: round(window.screen?.height),
         devicePixelRatio: round(window.devicePixelRatio), orientation: String(window.screen?.orientation?.type || ""),
       },
@@ -15291,6 +15631,20 @@ const modePillControls = (
         effectiveViewportWidth: round(effectiveWidth), viewportMode, isMobileUI, isTabletUI, isDesktopUI: viewportMode === "desktop",
         deviceShortSide: round(deviceShortSide), isNarrowPhone, useVerticalMobileSessionRail,
         personaPortraitWidth, personaPortraitHeight, personaActionColumnWidth, iconButtonSize: ICON_BTN_SIZE,
+        apparentPersonaPortraitWidth: round(personaPortraitWidth * bridgeVisualScale),
+        apparentPersonaPortraitHeight: round(personaPortraitHeight * bridgeVisualScale),
+        apparentViewTabHeight: round(mobileViewTabHeight * bridgeVisualScale),
+        bridgeLayoutScale: round(bridgeLayoutScale),
+        bridgeVisualScale: round(bridgeVisualScale),
+        bridgeRuntimeMode,
+        mobileRuntimeNormalization: round(mobileRuntimeNormalization),
+        bridgeViewportBaselineHeight: round(bridgeViewportBaselineHeightRef.current),
+        outerViewportBaselineHeight: round(outerViewportRef.current.baselineWindowHeight),
+        outerViewportHeight: round(outerViewportRef.current.windowHeight),
+        outerScrollX: round(outerViewportRef.current.scrollX),
+        outerScrollY: round(outerViewportRef.current.scrollY),
+        composerFocused: composerFocusedRef.current,
+        keyboardDocked: connectRootRef.current?.dataset?.connectKeyboardDocked === "true",
         rootLayoutModeAttribute: connectRootRef.current?.dataset?.connectLayoutMode || "",
         rootRailOrientationAttribute: connectRootRef.current?.dataset?.connectRailOrientation || "",
         workspaceClassName: String((document.querySelector(".connect-experience-grid") as HTMLElement | null)?.className || ""),
@@ -15312,7 +15666,8 @@ const modePillControls = (
     return report;
   }, [
     getEffectiveViewportWidth, viewportMode, isMobileUI, isTabletUI, deviceShortSide, isNarrowPhone, useVerticalMobileSessionRail,
-    personaPortraitWidth, personaPortraitHeight, personaActionColumnWidth, hostConsoleOpen, conversationPanelTab, experienceView,
+    personaPortraitWidth, personaPortraitHeight, personaActionColumnWidth, mobileViewTabHeight, bridgeLayoutScale, bridgeVisualScale, bridgeRuntimeMode,
+    mobileRuntimeNormalization, hostConsoleOpen, conversationPanelTab, experienceView,
     companyName, rebranding, rebrandingKey, companionName, companionTypeBadgeLabel, companionListReturnContext.count,
     isHostConsoleUser, debugBridgeDiagnostics, requestBridgeDiagnostics,
   ]);
@@ -16062,6 +16417,9 @@ const modePillControls = (
           box-sizing: border-box !important;
           overflow-x: hidden !important;
         }
+        .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid:not(.connect-workspace-email):not(.connect-workspace-host) .connect-conversation-panel {
+          overflow-y: visible !important;
+        }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="messages-box"] {
           flex: 0 0 252px !important;
           height: 252px !important;
@@ -16075,14 +16433,8 @@ const modePillControls = (
         }
         html[data-connect-composer-focused="true"],
         html[data-connect-composer-focused="true"] body {
-          overflow-x: hidden !important;
+          overflow: hidden !important;
           overscroll-behavior: none !important;
-          overflow-anchor: none !important;
-        }
-        .connect-root[data-connect-layout-mode="mobile"] .connect-conversation-panel,
-        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="messages-box"],
-        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] {
-          overflow-anchor: none !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] input {
           font-size: 16px !important;
@@ -16100,6 +16452,63 @@ const modePillControls = (
           position: static !important;
           bottom: auto !important;
           box-sizing: border-box !important;
+        }
+        /*
+          iOS keyboard focus mode: the approved interaction area is docked as
+          one unit above the visual keyboard. The five-button rail remains
+          aligned with the internally scrollable conversation box; the 16px
+          conversation-to-composer gap and composer geometry do not change.
+        */
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] .connect-conversation-panel {
+          position: fixed !important;
+          left: var(--connect-keyboard-conversation-left, 70px) !important;
+          top: var(--connect-keyboard-dock-top, 8px) !important;
+          width: var(--connect-keyboard-conversation-width, calc(100vw - 88px)) !important;
+          height: var(--connect-keyboard-dock-height, 312px) !important;
+          min-height: 0 !important;
+          max-height: none !important;
+          z-index: 2147482000 !important;
+          display: flex !important;
+          flex-direction: column !important;
+          overflow: visible !important;
+          background: #fff !important;
+          box-sizing: border-box !important;
+          transform: none !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="messages-box"] {
+          flex: 0 0 var(--connect-keyboard-messages-height, 252px) !important;
+          height: var(--connect-keyboard-messages-height, 252px) !important;
+          min-height: var(--connect-keyboard-messages-height, 252px) !important;
+          max-height: var(--connect-keyboard-messages-height, 252px) !important;
+          overflow-y: auto !important;
+          overflow-x: hidden !important;
+          overscroll-behavior: contain !important;
+          -webkit-overflow-scrolling: touch !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="composer-row"] {
+          position: static !important;
+          left: auto !important;
+          right: auto !important;
+          top: auto !important;
+          bottom: auto !important;
+          width: 100% !important;
+          margin-top: 16px !important;
+          z-index: 2147482001 !important;
+          background: #fff !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="session-rail"] {
+          position: fixed !important;
+          left: var(--connect-keyboard-rail-left, 18px) !important;
+          top: var(--connect-keyboard-dock-top, 8px) !important;
+          width: 44px !important;
+          min-width: 44px !important;
+          max-width: 44px !important;
+          height: 252px !important;
+          min-height: 252px !important;
+          max-height: 252px !important;
+          z-index: 2147482001 !important;
+          overflow: visible !important;
+          transform: none !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-email,
         .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-host {
@@ -16616,6 +17025,7 @@ const modePillControls = (
 
 {showConnectControls && !hostConsoleOpen && conversationPanelTab === "convo" ? (
   <section
+    ref={composerSessionRailRef}
     data-connect-debug="session-rail"
     className="connect-control-rail"
     style={{
@@ -17217,6 +17627,7 @@ const modePillControls = (
           ) : null}
 
           <div
+            ref={composerConversationPanelRef}
             data-connect-debug="conversation-panel"
             className="connect-conversation-panel"
             style={{
@@ -17346,6 +17757,7 @@ const modePillControls = (
                     </div>
 
                     <div
+                      ref={composerRowRef}
                       data-connect-debug="composer-row"
                       style={{
                         display: conversationPanelTab === "convo" ? "flex" : "none",
@@ -17548,7 +17960,7 @@ const modePillControls = (
                           ref={inputElRef}
                           value={input}
                           onChange={(e) => setInput(e.target.value)}
-                          onPointerDown={focusComposerWithoutScroll}
+                          onPointerDown={prepareComposerFocus}
                           onFocus={lockDocumentForComposer}
                           onBlur={unlockDocumentForComposer}
                           onKeyDown={(e) => {
