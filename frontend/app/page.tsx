@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.56: preserve the accepted alpha15.54 initial mobile geometry; before iOS focuses the message input, move the existing rail, conversation, and composer into a bounded keyboard-safe child-viewport dock while the shared Wix coordinator holds the original page position; no protected media behavior changed.
 // v10.0.0-alpha15.54: match the approved measured mobile geometry across responsive and classic Wix runtimes, preserve DulceMoon's wider portrait at the same apparent height, keep the conversation as the only chat-scroll surface, and let iOS settle to a visible composer focus position instead of pinning the outer page before the keyboard opens; no protected media behavior changed.
 // v10.0.0-alpha15.49: prevent-scroll focus activation for the mobile composer and initial legacy-Wix scale compensation; superseded by the coordinated alpha15.50 React/bridge/Velo implementation.
 // v10.0.0-alpha15.48: freeze the mobile document during composer focus, force 16px iOS input text, keep the conversation box as the scroll surface, and normalize mobile portrait height and View-tab dimensions across Wix runtimes; no protected media behavior changed.
@@ -7,7 +8,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.54";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.56";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4213,10 +4214,19 @@ function ConnectPage() {
   const composerRowRef = useRef<HTMLDivElement | null>(null);
 
   const composerFocusedRef = useRef(false);
-  const composerDockBaseRef = useRef<{ conversationLeft: number; conversationWidth: number; railLeft: number; composerHeight: number } | null>(null);
+  const composerDockBaseRef = useRef<{
+    conversationLeft: number;
+    conversationWidth: number;
+    railLeft: number;
+    railWidth: number;
+    composerHeight: number;
+    messagesHeight: number;
+  } | null>(null);
   const composerDockRafRef = useRef<number | null>(null);
   const composerLockIdRef = useRef("");
   const composerFocusStartedAtRef = useRef(0);
+  const composerViewportBaselineHeightRef = useRef(0);
+  const composerChildScrollBaseRef = useRef<{ x: number; y: number } | null>(null);
   const bridgeLayoutScaleRef = useRef(1);
   const bridgeVisualScaleRef = useRef(1);
   const bridgeRuntimeModeRef = useRef("");
@@ -4260,17 +4270,22 @@ function ConnectPage() {
     const conversation = composerConversationPanelRef.current;
     const rail = composerSessionRailRef.current;
     const composer = composerRowRef.current;
-    if (!conversation || !rail || !composer) return;
+    const messagesBox = messagesBoxRef.current;
+    if (!conversation || !rail || !composer || !messagesBox) return;
     const conversationRect = conversation.getBoundingClientRect();
     const railRect = rail.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
+    const messagesRect = messagesBox.getBoundingClientRect();
     composerDockBaseRef.current = {
       conversationLeft: conversationRect.left,
       conversationWidth: conversationRect.width,
       railLeft: railRect.left,
-      composerHeight: Math.max(44, composerRect.height || 44),
+      railWidth: Math.max(1, railRect.width || 35),
+      composerHeight: Math.max(35, composerRect.height || 35),
+      messagesHeight: Math.max(96, messagesRect.height || 199),
     };
   }, []);
+
 
   const clearComposerDock = useCallback(() => {
     const root = connectRootRef.current;
@@ -4280,11 +4295,14 @@ function ConnectPage() {
       "--connect-keyboard-dock-top",
       "--connect-keyboard-dock-height",
       "--connect-keyboard-messages-height",
+      "--connect-keyboard-composer-height",
       "--connect-keyboard-conversation-left",
       "--connect-keyboard-conversation-width",
       "--connect-keyboard-rail-left",
+      "--connect-keyboard-rail-width",
     ].forEach((name) => root.style.removeProperty(name));
   }, []);
+
 
   const updateComposerDockGeometry = useCallback(() => {
     const root = connectRootRef.current;
@@ -4293,17 +4311,73 @@ function ConnectPage() {
       return;
     }
 
-    // alpha15.54 deliberately keeps the interaction area in normal document
-    // flow. The shared Wix coordinator now allows Safari to settle on a visible
-    // composer position and holds that focused position; fixing the rail or
-    // conversation inside the child iframe caused the Persona-overlap failures
-    // seen in alpha15.50-alpha15.53.
-    clearComposerDock();
-    root.dataset.connectKeyboardDocked = 'false';
+    if (!composerDockBaseRef.current) captureComposerDockBase();
+    const base = composerDockBaseRef.current;
+    if (!base) return;
+
+    const viewport = window.visualViewport;
+    const viewportTop = Math.max(0, Number(viewport?.offsetTop || 0));
+    const visualViewportHeight = Number(viewport?.height || 0);
+    const measuredViewportHeight = visualViewportHeight > 0
+      ? visualViewportHeight
+      : Math.max(
+          1,
+          Number(document.documentElement?.clientHeight || 0),
+          Number(window.innerHeight || 0)
+        );
+    composerViewportBaselineHeightRef.current = Math.max(
+      composerViewportBaselineHeightRef.current,
+      measuredViewportHeight
+    );
+    const baselineViewportHeight = Math.max(
+      measuredViewportHeight,
+      composerViewportBaselineHeightRef.current
+    );
+    const keyboardShrink = Math.max(0, baselineViewportHeight - measuredViewportHeight);
+
+    // Pointer-down occurs before the software keyboard has resized the visual
+    // viewport. Use the typical remaining iPhone typing height until the real
+    // reduced viewport arrives, then follow the measured visual viewport.
+    const effectiveVisibleHeight = keyboardShrink >= 80
+      ? measuredViewportHeight
+      : Math.min(
+          measuredViewportHeight,
+          Math.max(360, Math.round(baselineViewportHeight * 0.52))
+        );
+
+    const computed = window.getComputedStyle(root);
+    const gapRaw = Number.parseFloat(computed.getPropertyValue("--connect-mobile-composer-gap"));
+    const composerGap = Number.isFinite(gapRaw) && gapRaw >= 0 ? gapRaw : 13;
+    const topInset = 8;
+    const bottomInset = 8;
+    const availableHeight = Math.max(1, effectiveVisibleHeight - topInset - bottomInset);
+    const messagesHeight = Math.max(
+      96,
+      Math.min(
+        base.messagesHeight,
+        availableHeight - composerGap - base.composerHeight
+      )
+    );
+    const dockHeight = messagesHeight + composerGap + base.composerHeight;
+    const dockTop = viewportTop + Math.max(
+      topInset,
+      effectiveVisibleHeight - dockHeight - bottomInset
+    );
+
+    root.dataset.connectKeyboardDocked = "true";
+    root.style.setProperty("--connect-keyboard-dock-top", `${Math.round(dockTop)}px`);
+    root.style.setProperty("--connect-keyboard-dock-height", `${Math.round(dockHeight)}px`);
+    root.style.setProperty("--connect-keyboard-messages-height", `${Math.round(messagesHeight)}px`);
+    root.style.setProperty("--connect-keyboard-composer-height", `${Math.round(base.composerHeight)}px`);
+    root.style.setProperty("--connect-keyboard-conversation-left", `${Math.round(base.conversationLeft)}px`);
+    root.style.setProperty("--connect-keyboard-conversation-width", `${Math.round(base.conversationWidth)}px`);
+    root.style.setProperty("--connect-keyboard-rail-left", `${Math.round(base.railLeft)}px`);
+    root.style.setProperty("--connect-keyboard-rail-width", `${Math.round(base.railWidth)}px`);
 
     const messages = messagesBoxRef.current;
     if (messages) messages.scrollTop = messages.scrollHeight;
-  }, [clearComposerDock, isPhoneLikeComposerEnvironment]);
+  }, [captureComposerDockBase, clearComposerDock, isPhoneLikeComposerEnvironment]);
+
 
   const queueComposerDockUpdate = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -4314,67 +4388,114 @@ function ConnectPage() {
     });
   }, [updateComposerDockGeometry]);
 
+  const buildComposerFocusGeometry = useCallback(() => {
+    const composerRect = composerRowRef.current?.getBoundingClientRect();
+    const conversationRect = composerConversationPanelRef.current?.getBoundingClientRect();
+    return {
+      composerRect: composerRect ? {
+        top: composerRect.top,
+        bottom: composerRect.bottom,
+        left: composerRect.left,
+        right: composerRect.right,
+        width: composerRect.width,
+        height: composerRect.height,
+      } : null,
+      conversationRect: conversationRect ? {
+        top: conversationRect.top,
+        bottom: conversationRect.bottom,
+        left: conversationRect.left,
+        right: conversationRect.right,
+        width: conversationRect.width,
+        height: conversationRect.height,
+      } : null,
+      childViewport: {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        documentClientWidth: document.documentElement?.clientWidth || 0,
+        documentClientHeight: document.documentElement?.clientHeight || 0,
+        visualViewportWidth: window.visualViewport?.width || 0,
+        visualViewportHeight: window.visualViewport?.height || 0,
+        visualViewportOffsetTop: window.visualViewport?.offsetTop || 0,
+      },
+    };
+  }, []);
+
   const prepareComposerFocus = useCallback((event: React.PointerEvent<HTMLInputElement>) => {
     const input = event.currentTarget;
     if (!isPhoneLikeComposerEnvironment() || document.activeElement === input) return;
 
-    // Pointer-down precedes the browser's native focus transition. Send PREPARE
-    // without cancelling that transition so iOS keeps the keyboard request in
-    // the original user gesture while Velo activates the outer-page scroll lock.
-    captureComposerDockBase();
-    const lockId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    composerLockIdRef.current = lockId;
-
-    const composerRect = composerRowRef.current?.getBoundingClientRect();
-    const conversationRect = composerConversationPanelRef.current?.getBoundingClientRect();
-    postConnectBridgeMessage({
-      type: "CONNECT_COMPOSER_PREPARE",
-      lockId,
-      childBuild: CONNECT_BUILD_VERSION,
-      composerRect: composerRect ? { top: composerRect.top, bottom: composerRect.bottom, height: composerRect.height } : null,
-      conversationRect: conversationRect ? { top: conversationRect.top, bottom: conversationRect.bottom, height: conversationRect.height } : null,
-      childViewport: {
-        innerWidth: window.innerWidth,
-        innerHeight: window.innerHeight,
-        visualViewportHeight: window.visualViewport?.height || 0,
-        visualViewportOffsetTop: window.visualViewport?.offsetTop || 0,
-      },
-    });
-  }, [captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage]);
-
-  const lockDocumentForComposer = useCallback(() => {
-    if (typeof window === "undefined" || !isPhoneLikeComposerEnvironment()) return;
+    // Dock the real controls before focus and focus in the same user gesture.
+    // This makes the input visible before iOS decides whether the Wix page must
+    // scroll, while preserving the accepted alpha15.54 layout when unfocused.
+    event.preventDefault();
     composerFocusedRef.current = true;
     composerFocusStartedAtRef.current = Date.now();
+    composerViewportBaselineHeightRef.current = Math.max(
+      Number(window.visualViewport?.height || 0),
+      Number(document.documentElement?.clientHeight || 0),
+      Number(window.innerHeight || 0)
+    );
+    composerChildScrollBaseRef.current = { x: window.scrollX || 0, y: window.scrollY || 0 };
     document.documentElement.dataset.connectComposerFocused = "true";
     const root = connectRootRef.current;
     if (root) root.dataset.connectComposerFocused = "true";
     captureComposerDockBase();
+    updateComposerDockGeometry();
 
-    // Accessibility activation, keyboard navigation, and programmatic focus can
-    // bypass pointer-down. Establish the same lock transaction before FOCUS.
-    if (!composerLockIdRef.current) {
-      composerLockIdRef.current = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      postConnectBridgeMessage({
-        type: "CONNECT_COMPOSER_PREPARE",
-        lockId: composerLockIdRef.current,
-        childBuild: CONNECT_BUILD_VERSION,
-        fallback: true,
-      });
+    const lockId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    composerLockIdRef.current = lockId;
+    postConnectBridgeMessage({
+      type: "CONNECT_COMPOSER_PREPARE",
+      lockId,
+      childBuild: CONNECT_BUILD_VERSION,
+      dockedBeforeFocus: true,
+      ...buildComposerFocusGeometry(),
+    });
+
+    // Force layout resolution before focus so Safari evaluates the docked input.
+    void input.getBoundingClientRect();
+    try { input.focus({ preventScroll: true }); }
+    catch { input.focus(); }
+    try {
+      const end = input.value.length;
+      input.setSelectionRange(end, end);
+    } catch {}
+  }, [buildComposerFocusGeometry, captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage, updateComposerDockGeometry]);
+
+
+  const lockDocumentForComposer = useCallback(() => {
+    if (typeof window === "undefined" || !isPhoneLikeComposerEnvironment()) return;
+    const wasFocused = composerFocusedRef.current;
+    composerFocusedRef.current = true;
+    composerFocusStartedAtRef.current = composerFocusStartedAtRef.current || Date.now();
+    document.documentElement.dataset.connectComposerFocused = "true";
+    const root = connectRootRef.current;
+    if (root) root.dataset.connectComposerFocused = "true";
+
+    if (!wasFocused) {
+      composerViewportBaselineHeightRef.current = Math.max(
+        Number(window.visualViewport?.height || 0),
+        Number(document.documentElement?.clientHeight || 0),
+        Number(window.innerHeight || 0)
+      );
+      composerChildScrollBaseRef.current = { x: window.scrollX || 0, y: window.scrollY || 0 };
     }
+    if (!composerDockBaseRef.current) captureComposerDockBase();
+    updateComposerDockGeometry();
 
+    if (!composerLockIdRef.current) composerLockIdRef.current = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     postConnectBridgeMessage({
       type: "CONNECT_COMPOSER_FOCUS",
       lockId: composerLockIdRef.current,
       childBuild: CONNECT_BUILD_VERSION,
+      dockedBeforeFocus: true,
+      ...buildComposerFocusGeometry(),
     });
-    postConnectBridgeMessage({ type: "CONNECT_BRIDGE_CONTEXT_REQUEST", childBuild: CONNECT_BUILD_VERSION });
+
     queueComposerDockUpdate();
-    window.setTimeout(queueComposerDockUpdate, 40);
-    window.setTimeout(queueComposerDockUpdate, 140);
-    window.setTimeout(queueComposerDockUpdate, 320);
-    window.setTimeout(queueComposerDockUpdate, 650);
-  }, [captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage, queueComposerDockUpdate]);
+    [40, 140, 320, 650, 1000].forEach((delayMs) => window.setTimeout(queueComposerDockUpdate, delayMs));
+  }, [buildComposerFocusGeometry, captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage, queueComposerDockUpdate, updateComposerDockGeometry]);
+
 
   const unlockDocumentForComposer = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -4388,13 +4509,25 @@ function ConnectPage() {
     }
     clearComposerDock();
     composerDockBaseRef.current = null;
+    composerViewportBaselineHeightRef.current = 0;
+
     postConnectBridgeMessage({
       type: "CONNECT_COMPOSER_BLUR",
       lockId: composerLockIdRef.current,
       childBuild: CONNECT_BUILD_VERSION,
     });
     composerLockIdRef.current = "";
+
+    const childScroll = composerChildScrollBaseRef.current;
+    composerChildScrollBaseRef.current = null;
+    if (childScroll) {
+      window.setTimeout(() => {
+        try { window.scrollTo({ left: childScroll.x, top: childScroll.y, behavior: "auto" }); }
+        catch { window.scrollTo(childScroll.x, childScroll.y); }
+      }, 0);
+    }
   }, [clearComposerDock, postConnectBridgeMessage]);
+
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -16451,17 +16584,17 @@ const modePillControls = (
           box-sizing: border-box !important;
         }
         /*
-          alpha15.54 keyboard focus mode intentionally leaves the interaction
-          area in normal document flow. Safari is allowed to bring the composer
-          into view; the shared Wix coordinator then holds that focused scroll
-          position and restores the original page position on blur.
+          alpha15.56 typing mode moves the existing rail, conversation, and
+          composer into a bounded fixed dock before focus. The unfocused
+          alpha15.54 layout is untouched; while typing, only the messages box
+          scrolls and the real input remains above the iOS keyboard.
         */
         .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] .connect-conversation-panel {
           position: fixed !important;
           left: var(--connect-keyboard-conversation-left, 70px) !important;
           top: var(--connect-keyboard-dock-top, 8px) !important;
           width: var(--connect-keyboard-conversation-width, calc(100vw - 88px)) !important;
-          height: var(--connect-keyboard-dock-height, 312px) !important;
+          height: var(--connect-keyboard-dock-height, 247px) !important;
           min-height: 0 !important;
           max-height: none !important;
           z-index: 2147482000 !important;
@@ -16473,10 +16606,10 @@ const modePillControls = (
           transform: none !important;
         }
         .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="messages-box"] {
-          flex: 0 0 var(--connect-keyboard-messages-height, 252px) !important;
-          height: var(--connect-keyboard-messages-height, 252px) !important;
-          min-height: var(--connect-keyboard-messages-height, 252px) !important;
-          max-height: var(--connect-keyboard-messages-height, 252px) !important;
+          flex: 0 0 var(--connect-keyboard-messages-height, 199px) !important;
+          height: var(--connect-keyboard-messages-height, 199px) !important;
+          min-height: var(--connect-keyboard-messages-height, 199px) !important;
+          max-height: var(--connect-keyboard-messages-height, 199px) !important;
           overflow-y: auto !important;
           overflow-x: hidden !important;
           overscroll-behavior: contain !important;
@@ -16497,53 +16630,22 @@ const modePillControls = (
           position: fixed !important;
           left: var(--connect-keyboard-rail-left, 18px) !important;
           top: var(--connect-keyboard-dock-top, 8px) !important;
-          width: 44px !important;
-          min-width: 44px !important;
-          max-width: 44px !important;
-          height: 252px !important;
-          min-height: 252px !important;
-          max-height: 252px !important;
+          width: var(--connect-keyboard-rail-width, var(--connect-mobile-control-size, 35px)) !important;
+          min-width: var(--connect-keyboard-rail-width, var(--connect-mobile-control-size, 35px)) !important;
+          max-width: var(--connect-keyboard-rail-width, var(--connect-mobile-control-size, 35px)) !important;
+          height: var(--connect-keyboard-messages-height, 199px) !important;
+          min-height: var(--connect-keyboard-messages-height, 199px) !important;
+          max-height: var(--connect-keyboard-messages-height, 199px) !important;
           z-index: 2147482001 !important;
           overflow: visible !important;
           transform: none !important;
         }
-        /* alpha15.54: neutralize every fixed-position keyboard overlay from the
-           prior experiments. The outer Wix page owns focused scrolling. */
-        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] .connect-conversation-panel,
-        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="session-rail"] {
-          position: static !important;
-          left: auto !important;
-          top: auto !important;
-          width: auto !important;
-          z-index: auto !important;
-          transform: none !important;
-        }
         .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] .connect-conversation-panel {
-          width: 100% !important;
-          height: auto !important;
-        }
-        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="session-rail"] {
-          width: var(--connect-mobile-control-size, 35px) !important;
-          min-width: var(--connect-mobile-control-size, 35px) !important;
-          max-width: var(--connect-mobile-control-size, 35px) !important;
-          height: auto !important;
-          min-height: 0 !important;
-          max-height: none !important;
-        }
-        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="messages-box"] {
-          flex: 0 0 var(--connect-mobile-conversation-height, 199px) !important;
-          height: var(--connect-mobile-conversation-height, 199px) !important;
-          min-height: var(--connect-mobile-conversation-height, 199px) !important;
-          max-height: var(--connect-mobile-conversation-height, 199px) !important;
+          border-radius: 10px !important;
+          box-shadow: 0 8px 28px rgba(0, 0, 0, 0.14) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="composer-row"] {
-          position: static !important;
-          width: 100% !important;
-          margin-top: var(--connect-mobile-composer-gap, 13px) !important;
-          padding-top: 0 !important;
-          padding-bottom: 0 !important;
-          border-top: 0 !important;
-          z-index: auto !important;
+          min-height: var(--connect-keyboard-composer-height, 35px) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-email,
         .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-host {
