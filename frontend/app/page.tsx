@@ -1,11 +1,11 @@
 "use client";
-// v10.0.0-alpha15.47: freeze the mobile composer geometry during iOS input focus, keep the conversation pane internally scrollable, prevent Safari input auto-zoom, and enforce one shared mobile portrait height while retaining runtime-normalized width and View tabs; no protected media behavior changed.
+// v10.0.0-alpha15.48: freeze the mobile document during composer focus, force 16px iOS input text, keep the conversation box as the scroll surface, and normalize mobile portrait height and View-tab dimensions across Wix runtimes; no protected media behavior changed.
 // v10.0.0-alpha15.46: implement the approved mobile Persona layout across all brands: add a 16px conversation-to-composer gap; normalize legacy Wix mobile View tabs and Persona portrait to the same apparent scale as the Elaralo modern runtime; no protected media behavior changed.
 // v10.0.0-alpha15.45: place the mobile message input and Send button immediately against the bottom edge of the conversation box, with no vertical gap, padding offset, sticky displacement, or separator; no protected media behavior changed.
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.47";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.48";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4202,6 +4202,48 @@ function ConnectPage() {
     return `ELARALO_MEMBER_PLAN_CACHE::${safeBrandKey(basis)}`;
   }, [getEmbedContext]);
 
+  const composerDocumentLockRef = useRef<{ scrollX: number; scrollY: number; bodyPosition: string; bodyTop: string; bodyLeft: string; bodyRight: string; bodyWidth: string } | null>(null);
+
+  const lockDocumentForComposer = useCallback(() => {
+    if (typeof window === "undefined" || composerDocumentLockRef.current) return;
+    const body = document.body;
+    const scrollX = window.scrollX || 0;
+    const scrollY = window.scrollY || 0;
+    composerDocumentLockRef.current = {
+      scrollX, scrollY,
+      bodyPosition: body.style.position, bodyTop: body.style.top, bodyLeft: body.style.left,
+      bodyRight: body.style.right, bodyWidth: body.style.width,
+    };
+    body.style.position = "fixed";
+    body.style.top = `-${scrollY}px`;
+    body.style.left = `-${scrollX}px`;
+    body.style.right = "0";
+    body.style.width = "100%";
+    document.documentElement.dataset.connectComposerFocused = "true";
+    try { window.parent.postMessage({ type: "CONNECT_COMPOSER_FOCUS", scrollX, scrollY }, "*"); } catch {}
+  }, []);
+
+  const unlockDocumentForComposer = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const saved = composerDocumentLockRef.current;
+    if (!saved) return;
+    const body = document.body;
+    body.style.position = saved.bodyPosition; body.style.top = saved.bodyTop; body.style.left = saved.bodyLeft;
+    body.style.right = saved.bodyRight; body.style.width = saved.bodyWidth;
+    delete document.documentElement.dataset.connectComposerFocused;
+    composerDocumentLockRef.current = null;
+    window.requestAnimationFrame(() => window.scrollTo(saved.scrollX, saved.scrollY));
+    try { window.parent.postMessage({ type: "CONNECT_COMPOSER_BLUR", scrollX: saved.scrollX, scrollY: saved.scrollY }, "*"); } catch {}
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    let viewport = document.querySelector('meta[name="viewport"]') as HTMLMetaElement | null;
+    if (!viewport) { viewport = document.createElement("meta"); viewport.name = "viewport"; document.head.appendChild(viewport); }
+    viewport.content = "width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover";
+    return () => unlockDocumentForComposer();
+  }, [unlockDocumentForComposer]);
+
   // -----------------------
   // Responsive layout mode: mobile / tablet / desktop
   // Primary optimization target = mobile.
@@ -4325,53 +4367,6 @@ function ConnectPage() {
   }, [getDeviceShortSide, getEffectiveViewportWidth, getViewportMode]);
 
   const isMobileUI = viewportMode === "mobile";
-
-  const restoreMobileComposerScroll = useCallback(() => {
-    if (typeof window === "undefined") return;
-    const lock = mobileComposerFocusLockRef.current;
-    if (!lock.active) return;
-    window.scrollTo(lock.scrollX, lock.scrollY);
-    const root = connectRootRef.current;
-    if (root) root.scrollTop = lock.rootScrollTop;
-  }, []);
-
-  const lockMobileComposerOnFocus = useCallback(() => {
-    if (!isMobileUI || typeof window === "undefined") return;
-    const lock = mobileComposerFocusLockRef.current;
-    lock.active = true;
-    lock.scrollX = Number(window.scrollX || 0);
-    lock.scrollY = Number(window.scrollY || 0);
-    lock.rootScrollTop = Number(connectRootRef.current?.scrollTop || 0);
-    lock.timers.forEach((timer) => window.clearTimeout(timer));
-    lock.timers = [0, 50, 150, 300, 500].map((delay) =>
-      window.setTimeout(restoreMobileComposerScroll, delay)
-    );
-    connectRootRef.current?.setAttribute("data-connect-composer-focused", "true");
-  }, [isMobileUI, restoreMobileComposerScroll]);
-
-  const releaseMobileComposerFocusLock = useCallback(() => {
-    if (typeof window === "undefined") return;
-    const lock = mobileComposerFocusLockRef.current;
-    lock.timers.forEach((timer) => window.clearTimeout(timer));
-    lock.timers = [];
-    lock.active = false;
-    connectRootRef.current?.removeAttribute("data-connect-composer-focused");
-  }, []);
-
-  useEffect(() => {
-    if (!isMobileUI || typeof window === "undefined") return;
-    const viewport = window.visualViewport;
-    const keepComposerGeometry = () => restoreMobileComposerScroll();
-    window.addEventListener("scroll", keepComposerGeometry, { passive: true });
-    viewport?.addEventListener("resize", keepComposerGeometry, { passive: true });
-    viewport?.addEventListener("scroll", keepComposerGeometry, { passive: true });
-    return () => {
-      window.removeEventListener("scroll", keepComposerGeometry);
-      viewport?.removeEventListener("resize", keepComposerGeometry);
-      viewport?.removeEventListener("scroll", keepComposerGeometry);
-      releaseMobileComposerFocusLock();
-    };
-  }, [isMobileUI, releaseMobileComposerFocusLock, restoreMobileComposerScroll]);
   const isTabletUI = viewportMode === "tablet";
   // Persona uses one standardized geometry system for every brand. The only
   // mobile variation is a narrow-phone fallback driven by physical viewport,
@@ -4380,51 +4375,22 @@ function ConnectPage() {
   const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
   const useVerticalMobileSessionRail = isMobileUI;
 
-  // Standardize apparent mobile geometry across Wix runtimes without using
-  // brand names. The modern editor can expose a wider internal layout canvas,
-  // while the legacy editor can expose a device-width canvas inside a scaled
-  // 320px HTML component. These calculations normalize only the requested
-  // visual tokens (portrait and View tabs); workspace structure remains shared.
+  // Canonical mobile geometry is now expressed directly in child-document CSS pixels.
+  // The portrait height and View-tab tokens are fixed across Wix runtimes. Width
+  // may vary with the source portrait/aspect treatment, but height cannot push
+  // Usage or any later section lower on one brand than another.
   const effectiveViewportWidth = typeof window === "undefined" ? 0 : getEffectiveViewportWidth();
-  const mobileCanvasRatio =
-    isMobileUI && deviceShortSide > 0 && layoutViewportWidth > 0
-      ? Math.max(1, layoutViewportWidth / deviceShortSide)
-      : 1;
-  const CANONICAL_MODERN_MOBILE_CANVAS_RATIO = 1.2;
-  const usesExpandedMobileCanvas = isMobileUI && mobileCanvasRatio > 1.05;
-  const modernVisibleScale =
-    usesExpandedMobileCanvas && layoutViewportWidth > 0
-      ? deviceShortSide / layoutViewportWidth
-      : 1;
-  const legacyVisibleScale =
-    isMobileUI && deviceShortSide > 0
-      ? Math.min(1, 320 / deviceShortSide)
-      : 1;
-  const portraitRuntimeScale = usesExpandedMobileCanvas
-    ? Math.min(1, Math.max(0.9, legacyVisibleScale / Math.max(0.01, modernVisibleScale)))
-    : isMobileUI
-      ? Math.min(1, Math.max(0.82, mobileCanvasRatio / CANONICAL_MODERN_MOBILE_CANVAS_RATIO))
-      : 1;
   const basePersonaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
-  const basePersonaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
-  const personaPortraitWidth = Math.round(basePersonaPortraitWidth * portraitRuntimeScale);
-  // Height is the canonical cross-brand alignment token. Width may retain the
-  // runtime compensation needed by different Wix canvases, but the portrait
-  // height itself is identical for every brand on the same phone class.
-  const personaPortraitHeight = basePersonaPortraitHeight;
+  const personaPortraitWidth = basePersonaPortraitWidth;
+  const personaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
   const personaActionColumnWidth = isMobileUI ? (isNarrowPhone ? 132 : 136) : isTabletUI ? 132 : 140;
 
-  // Match the apparent compact View-tab geometry of the expanded modern canvas
-  // when the same application is rendered in a device-width legacy canvas.
-  const mobileViewTabRuntimeScale = isMobileUI
-    ? Math.min(1, mobileCanvasRatio / CANONICAL_MODERN_MOBILE_CANVAS_RATIO)
-    : 1;
-  const mobileViewTabHeight = Math.max(25, Math.round(30 * mobileViewTabRuntimeScale));
-  const mobileViewTabFontSize = Math.max(9, Math.round(11 * mobileViewTabRuntimeScale));
-  const mobileViewTabPaddingX = Math.max(6, Math.round(8 * mobileViewTabRuntimeScale));
-  const mobileViewTabGap = Math.max(3, Math.round(4 * mobileViewTabRuntimeScale));
-  const mobileViewLabelFontSize = Math.max(9, Math.round(11 * mobileViewTabRuntimeScale));
-  const mobileViewSelectorHeight = mobileViewTabHeight + 2;
+  const mobileViewTabHeight = 30;
+  const mobileViewTabFontSize = 11;
+  const mobileViewTabPaddingX = 8;
+  const mobileViewTabGap = 4;
+  const mobileViewLabelFontSize = 11;
+  const mobileViewSelectorHeight = 32;
 
   // Icon sizing: on mobile, force all icons to the same pixel size.
   const ICON_18 = isMobileUI ? 13.5 : 18;
@@ -7779,15 +7745,6 @@ const speakAssistantReply = useCallback(
 
   const [input, setInput] = useState("");
   const inputElRef = useRef<HTMLInputElement | null>(null);
-  // Layout-only iOS focus guard. This does not participate in microphone, STT,
-  // TTS, LiveKit, media, or message-delivery lifecycle.
-  const mobileComposerFocusLockRef = useRef<{
-    active: boolean;
-    scrollX: number;
-    scrollY: number;
-    rootScrollTop: number;
-    timers: number[];
-  }>({ active: false, scrollX: 0, scrollY: 0, rootScrollTop: 0, timers: [] });
   // Attachments (image uploads to Azure Blob via backend)
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const [pendingAttachment, setPendingAttachment] = useState<UploadedAttachment | null>(null);
@@ -16092,13 +16049,19 @@ const modePillControls = (
           max-height: 252px !important;
           box-sizing: border-box !important;
           overflow-y: auto !important;
+          overflow-x: hidden !important;
           overscroll-behavior: contain !important;
           -webkit-overflow-scrolling: touch !important;
-          touch-action: pan-y !important;
         }
-        .connect-root[data-connect-layout-mode="mobile"][data-connect-composer-focused="true"] {
+        html[data-connect-composer-focused="true"],
+        html[data-connect-composer-focused="true"] body {
           overflow: hidden !important;
           overscroll-behavior: none !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] input {
+          font-size: 16px !important;
+          line-height: 20px !important;
+          -webkit-text-size-adjust: 100% !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] {
           width: 100% !important;
@@ -17298,9 +17261,6 @@ const modePillControls = (
                         borderRadius: 12,
                         padding: 12,
                         overflowY: "auto",
-                        overscrollBehavior: "contain",
-                        WebkitOverflowScrolling: "touch",
-                        touchAction: "pan-y",
                         background: "#fff",
                       }}
                     >
@@ -17562,8 +17522,8 @@ const modePillControls = (
                           ref={inputElRef}
                           value={input}
                           onChange={(e) => setInput(e.target.value)}
-                          onFocus={lockMobileComposerOnFocus}
-                          onBlur={releaseMobileComposerFocusLock}
+                          onFocus={lockDocumentForComposer}
+                          onBlur={unlockDocumentForComposer}
                           onKeyDown={(e) => {
                             if (e.key === "Enter") {
                               e.preventDefault();
@@ -17589,7 +17549,9 @@ const modePillControls = (
                             padding: "0 12px",
                             borderRadius: 10,
                             border: "1px solid #ddd",
-                            fontSize: isMobileUI ? 16 : undefined,
+                            fontSize: 16,
+                            lineHeight: "20px",
+                            WebkitTextSizeAdjust: "100%",
                           }}
                         />
 
