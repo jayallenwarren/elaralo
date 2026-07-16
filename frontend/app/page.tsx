@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.53: restore the compact approved mobile Persona geometry and use a bounded keyboard-safe interaction dock so typing remains visible while only the conversation history scrolls; no protected media behavior changed.
+// v10.0.0-alpha15.54: match the approved measured mobile geometry across responsive and classic Wix runtimes, preserve DulceMoon's wider portrait at the same apparent height, keep the conversation as the only chat-scroll surface, and let iOS settle to a visible composer focus position instead of pinning the outer page before the keyboard opens; no protected media behavior changed.
 // v10.0.0-alpha15.49: prevent-scroll focus activation for the mobile composer and initial legacy-Wix scale compensation; superseded by the coordinated alpha15.50 React/bridge/Velo implementation.
 // v10.0.0-alpha15.48: freeze the mobile document during composer focus, force 16px iOS input text, keep the conversation box as the scroll surface, and normalize mobile portrait height and View-tab dimensions across Wix runtimes; no protected media behavior changed.
 // v10.0.0-alpha15.46: implement the approved mobile Persona layout across all brands: add a 16px conversation-to-composer gap; normalize legacy Wix mobile View tabs and Persona portrait to the same apparent scale as the Elaralo modern runtime; no protected media behavior changed.
@@ -7,7 +7,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.53";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.54";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4288,40 +4288,22 @@ function ConnectPage() {
 
   const updateComposerDockGeometry = useCallback(() => {
     const root = connectRootRef.current;
-    const conversation = composerConversationPanelRef.current;
-    const rail = composerSessionRailRef.current;
-    const composer = composerRowRef.current;
-    if (!root || !conversation || !rail || !composer || !composerFocusedRef.current || !isPhoneLikeComposerEnvironment()) {
+    if (!root || !composerFocusedRef.current || !isPhoneLikeComposerEnvironment()) {
       clearComposerDock();
       return;
     }
 
-    // iOS may scroll the outer Wix page when the keyboard opens. Keep the
-    // interaction unit bounded to the child visual viewport so the input stays
-    // visible. Only the messages box is allowed to scroll. This is deliberately
-    // compact; it does not resize or remount Persona/media content.
-    if (!composerDockBaseRef.current) captureComposerDockBase();
-    const base = composerDockBaseRef.current;
-    if (!base) return;
-
-    const vv = window.visualViewport;
-    const visibleTop = Math.max(8, Number(vv?.offsetTop || 0) + 8);
-    const visibleHeight = Math.max(260, Number(vv?.height || window.innerHeight || 0));
-    const composerHeight = Math.max(44, base.composerHeight || 44);
-    const dockHeight = Math.max(220, Math.min(300, visibleHeight - 24));
-    const messagesHeight = Math.max(140, dockHeight - composerHeight - 16);
-
-    root.style.setProperty('--connect-keyboard-dock-top', `${Math.round(visibleTop)}px`);
-    root.style.setProperty('--connect-keyboard-dock-height', `${Math.round(dockHeight)}px`);
-    root.style.setProperty('--connect-keyboard-messages-height', `${Math.round(messagesHeight)}px`);
-    root.style.setProperty('--connect-keyboard-conversation-left', `${Math.round(base.conversationLeft)}px`);
-    root.style.setProperty('--connect-keyboard-conversation-width', `${Math.round(base.conversationWidth)}px`);
-    root.style.setProperty('--connect-keyboard-rail-left', `${Math.round(base.railLeft)}px`);
-    root.dataset.connectKeyboardDocked = 'true';
+    // alpha15.54 deliberately keeps the interaction area in normal document
+    // flow. The shared Wix coordinator now allows Safari to settle on a visible
+    // composer position and holds that focused position; fixing the rail or
+    // conversation inside the child iframe caused the Persona-overlap failures
+    // seen in alpha15.50-alpha15.53.
+    clearComposerDock();
+    root.dataset.connectKeyboardDocked = 'false';
 
     const messages = messagesBoxRef.current;
     if (messages) messages.scrollTop = messages.scrollHeight;
-  }, [captureComposerDockBase, clearComposerDock, isPhoneLikeComposerEnvironment]);
+  }, [clearComposerDock, isPhoneLikeComposerEnvironment]);
 
   const queueComposerDockUpdate = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -4650,22 +4632,36 @@ function ConnectPage() {
   const isNarrowPhone = isMobileUI && deviceShortSide > 0 && deviceShortSide <= 360;
   const useVerticalMobileSessionRail = isMobileUI;
 
-  // Canonical compact phone geometry. Both Wix runtimes now receive the same
-  // child dimensions; the bridge may scale the complete canvas, but React does
-  // not enlarge the Persona card or tabs in response. This restores the approved
-  // initial viewport composition and keeps Usage/navigation/interaction aligned.
+  // Approved apparent phone geometry measured from the accepted alpha15.48
+  // Elaralo rendering. The responsive Wix canvas needs the full 0.796 compacting
+  // in React. The classic 320px canvas already produced the approved wider
+  // DulceMoon portrait, so it retains that width while sharing the same height.
+  // Runtime geometry—not the brand name—selects the wider classic-canvas frame.
   const effectiveViewportWidth = typeof window === "undefined" ? 0 : getEffectiveViewportWidth();
-  const mobileRuntimeNormalization = 1;
-  const personaPortraitWidth = 150;
-  const personaPortraitHeight = 188;
-  const personaActionColumnWidth = isMobileUI ? 136 : isTabletUI ? 132 : 140;
+  const MOBILE_APPROVED_SCALE = 0.796;
+  const isClassicMeasuredMobileRuntime = Boolean(
+    isMobileUI &&
+      (String(bridgeRuntimeMode || "").toLowerCase().includes("classic") ||
+        (Number.isFinite(bridgeLayoutScale) && bridgeLayoutScale > 0 && bridgeLayoutScale < 0.9))
+  );
+  const mobileRuntimeNormalization = isMobileUI ? MOBILE_APPROVED_SCALE : 1;
+  const personaPortraitWidth = isMobileUI
+    ? (isClassicMeasuredMobileRuntime ? 150 : Math.round(170 * MOBILE_APPROVED_SCALE))
+    : 150;
+  const personaPortraitHeight = isMobileUI ? Math.round(213 * MOBILE_APPROVED_SCALE) : 188;
+  const personaActionColumnWidth = isMobileUI ? Math.round(136 * MOBILE_APPROVED_SCALE) : isTabletUI ? 132 : 140;
 
-  const mobileViewTabHeight = 30;
-  const mobileViewTabFontSize = 11;
-  const mobileViewTabPaddingX = 8;
-  const mobileViewTabGap = 4;
-  const mobileViewLabelFontSize = 11;
-  const mobileViewSelectorHeight = 32;
+  const mobileViewTabHeight = Math.round(30 * MOBILE_APPROVED_SCALE);
+  const mobileViewTabFontSize = Math.max(9, Math.round(11 * MOBILE_APPROVED_SCALE));
+  const mobileViewTabPaddingX = Math.max(6, Math.round(8 * MOBILE_APPROVED_SCALE));
+  const mobileViewTabGap = Math.max(3, Math.round(4 * MOBILE_APPROVED_SCALE));
+  const mobileViewLabelFontSize = Math.max(9, Math.round(11 * MOBILE_APPROVED_SCALE));
+  const mobileViewSelectorHeight = Math.ceil(32 * MOBILE_APPROVED_SCALE);
+  const mobileControlSize = Math.round(44 * MOBILE_APPROVED_SCALE);
+  const mobileControlGap = Math.max(5, Math.round(8 * MOBILE_APPROVED_SCALE));
+  const mobileConversationHeight = mobileControlSize * 5 + mobileControlGap * 4;
+  const mobileComposerGap = Math.round(16 * MOBILE_APPROVED_SCALE);
+  const mobileNavigationHeight = Math.ceil(42 * MOBILE_APPROVED_SCALE);
 
   // React can hydrate before a legacy Wix iframe reports its phone geometry.
   // Reapply the canonical tokens directly after measured mode changes so the
@@ -4681,6 +4677,12 @@ function ConnectPage() {
     root.style.setProperty("--connect-view-tab-padding-x", `${mobileViewTabPaddingX}px`);
     root.style.setProperty("--connect-view-tab-gap", `${mobileViewTabGap}px`);
     root.style.setProperty("--connect-view-label-font-size", `${mobileViewLabelFontSize}px`);
+    root.style.setProperty("--connect-mobile-control-size", `${mobileControlSize}px`);
+    root.style.setProperty("--connect-mobile-control-gap", `${mobileControlGap}px`);
+    root.style.setProperty("--connect-mobile-conversation-height", `${mobileConversationHeight}px`);
+    root.style.setProperty("--connect-mobile-composer-gap", `${mobileComposerGap}px`);
+    root.style.setProperty("--connect-mobile-action-column-width", `${personaActionColumnWidth}px`);
+    root.style.setProperty("--connect-mobile-navigation-height", `${mobileNavigationHeight}px`);
     root.style.setProperty("--connect-bridge-layout-scale", String(bridgeLayoutScale));
     root.style.setProperty("--connect-bridge-visual-scale", String(bridgeVisualScale));
     root.style.setProperty("--connect-mobile-runtime-normalization", String(mobileRuntimeNormalization));
@@ -4696,19 +4698,22 @@ function ConnectPage() {
     mobileViewTabPaddingX,
     mobileViewTabGap,
     mobileViewLabelFontSize,
+    mobileControlSize,
+    mobileControlGap,
+    mobileConversationHeight,
+    mobileComposerGap,
+    mobileNavigationHeight,
     bridgeLayoutScale,
     bridgeVisualScale,
     bridgeRuntimeMode,
     mobileRuntimeNormalization,
   ]);
 
-  // Icon sizing: on mobile, force all icons to the same pixel size.
-  const ICON_18 = isMobileUI ? 13.5 : 18;
-  const ICON_20 = isMobileUI ? 13.5 : 20;
-
-  // A 44px mobile Session Rail preserves touch-target size and aligns with the
-  // standardized 44px Persona action buttons.
-  const ICON_BTN_SIZE = 44;
+  // Icon and control geometry follows the approved apparent 0.796 mobile scale.
+  // Desktop/iPad retain the prior dimensions.
+  const ICON_18 = isMobileUI ? Math.max(10, Math.round(13.5 * MOBILE_APPROVED_SCALE)) : 18;
+  const ICON_20 = isMobileUI ? Math.max(10, Math.round(13.5 * MOBILE_APPROVED_SCALE)) : 20;
+  const ICON_BTN_SIZE = isMobileUI ? mobileControlSize : 44;
 
   const ui = useMemo(
     () => {
@@ -4717,7 +4722,7 @@ function ConnectPage() {
           avatar: 48,
           title: 20,
           meta: 12,
-          usageBarHeight: 10,
+          usageBarHeight: 8,
           mainMaxWidth: "100%",
           mainMargin: "12px auto",
           mainPadding: "0 10px",
@@ -4762,6 +4767,12 @@ function ConnectPage() {
         ["--connect-view-tab-padding-x" as any]: `${mobileViewTabPaddingX}px`,
         ["--connect-view-tab-gap" as any]: `${mobileViewTabGap}px`,
         ["--connect-view-label-font-size" as any]: `${mobileViewLabelFontSize}px`,
+        ["--connect-mobile-control-size" as any]: `${mobileControlSize}px`,
+        ["--connect-mobile-control-gap" as any]: `${mobileControlGap}px`,
+        ["--connect-mobile-conversation-height" as any]: `${mobileConversationHeight}px`,
+        ["--connect-mobile-composer-gap" as any]: `${mobileComposerGap}px`,
+        ["--connect-mobile-action-column-width" as any]: `${personaActionColumnWidth}px`,
+        ["--connect-mobile-navigation-height" as any]: `${mobileNavigationHeight}px`,
       } as React.CSSProperties),
     [
       ui,
@@ -4773,6 +4784,12 @@ function ConnectPage() {
       mobileViewTabPaddingX,
       mobileViewTabGap,
       mobileViewLabelFontSize,
+      mobileControlSize,
+      mobileControlGap,
+      mobileConversationHeight,
+      mobileComposerGap,
+      personaActionColumnWidth,
+      mobileNavigationHeight,
     ]
   );
 
@@ -15372,14 +15389,14 @@ const modePillControls = (
     const pctLabel = `${Math.round(pct * 100)}%`;
 
     return (
-      <div data-connect-debug="usage" style={{ marginTop: 8, maxWidth: isMobileUI ? "100%" : 440 }}>
+      <div data-connect-debug="usage" style={{ marginTop: isMobileUI ? 6 : 8, maxWidth: isMobileUI ? "100%" : 440 }}>
         <div
           style={{
             display: "flex",
             alignItems: "baseline",
             justifyContent: "space-between",
-            gap: 10,
-            fontSize: 16,
+            gap: isMobileUI ? 8 : 10,
+            fontSize: isMobileUI ? 13 : 16,
             color: "#666",
           }}
         >
@@ -15427,9 +15444,9 @@ const modePillControls = (
       style={{
         display: "grid",
         gridTemplateColumns: spotlightHref && faqHref ? "repeat(2, minmax(0, 1fr))" : "minmax(0, 1fr)",
-        gap: 8,
+        gap: isMobileUI ? mobileControlGap : 8,
         width: "100%",
-        marginTop: 10,
+        marginTop: isMobileUI ? 8 : 10,
       }}
       aria-label="Connect navigation"
     >
@@ -15439,9 +15456,10 @@ const modePillControls = (
           target="_top"
           rel="noopener noreferrer"
           style={{
-            minHeight: 42,
-            padding: "9px 12px",
-            borderRadius: 10,
+            minHeight: isMobileUI ? mobileNavigationHeight : 42,
+            height: isMobileUI ? mobileNavigationHeight : undefined,
+            padding: isMobileUI ? "6px 10px" : "9px 12px",
+            borderRadius: isMobileUI ? 8 : 10,
             border: "1px solid #111",
             background: "#fff",
             color: "#111",
@@ -15451,6 +15469,7 @@ const modePillControls = (
             boxSizing: "border-box",
             textDecoration: "none",
             fontWeight: 500,
+            fontSize: isMobileUI ? 14 : undefined,
             whiteSpace: "nowrap",
           }}
           aria-label={`Open ${companyName} Spotlights`}
@@ -15464,9 +15483,10 @@ const modePillControls = (
           target="_top"
           rel="noopener noreferrer"
           style={{
-            minHeight: 42,
-            padding: "9px 12px",
-            borderRadius: 10,
+            minHeight: isMobileUI ? mobileNavigationHeight : 42,
+            height: isMobileUI ? mobileNavigationHeight : undefined,
+            padding: isMobileUI ? "6px 10px" : "9px 12px",
+            borderRadius: isMobileUI ? 8 : 10,
             border: "1px solid #111",
             background: "#fff",
             color: "#111",
@@ -15476,6 +15496,7 @@ const modePillControls = (
             boxSizing: "border-box",
             textDecoration: "none",
             fontWeight: 500,
+            fontSize: isMobileUI ? 14 : undefined,
             whiteSpace: "nowrap",
           }}
           aria-label={`Open ${companyName} FAQs`}
@@ -15590,6 +15611,11 @@ const modePillControls = (
         bridgeVisualScale: round(bridgeVisualScale),
         bridgeRuntimeMode,
         mobileRuntimeNormalization: round(mobileRuntimeNormalization),
+        isClassicMeasuredMobileRuntime,
+        mobileControlSize,
+        mobileControlGap,
+        mobileConversationHeight,
+        mobileComposerGap,
         bridgeViewportBaselineHeight: round(bridgeViewportBaselineHeightRef.current),
         outerViewportBaselineHeight: round(outerViewportRef.current.baselineWindowHeight),
         outerViewportHeight: round(outerViewportRef.current.windowHeight),
@@ -15619,7 +15645,8 @@ const modePillControls = (
   }, [
     getEffectiveViewportWidth, viewportMode, isMobileUI, isTabletUI, deviceShortSide, isNarrowPhone, useVerticalMobileSessionRail,
     personaPortraitWidth, personaPortraitHeight, personaActionColumnWidth, mobileViewTabHeight, bridgeLayoutScale, bridgeVisualScale, bridgeRuntimeMode,
-    mobileRuntimeNormalization, hostConsoleOpen, conversationPanelTab, experienceView,
+    mobileRuntimeNormalization, isClassicMeasuredMobileRuntime, mobileControlSize, mobileControlGap,
+    mobileConversationHeight, mobileComposerGap, hostConsoleOpen, conversationPanelTab, experienceView,
     companyName, rebranding, rebrandingKey, companionName, companionTypeBadgeLabel, companionListReturnContext.count,
     isHostConsoleUser, debugBridgeDiagnostics, requestBridgeDiagnostics,
   ]);
@@ -16164,14 +16191,14 @@ const modePillControls = (
             flex-direction: row !important;
             justify-content: flex-start !important;
             flex-wrap: wrap !important;
-            gap: 12px !important;
-            margin-bottom: 12px !important;
+            gap: var(--connect-mobile-control-gap, 6px) !important;
+            margin-bottom: var(--connect-mobile-control-gap, 6px) !important;
             min-width: 0 !important;
           }
           .connect-experience-grid.connect-mobile-horizontal-rail .connect-control-rail-inner {
             flex-direction: row !important;
             flex-wrap: wrap !important;
-            gap: 12px !important;
+            gap: var(--connect-mobile-control-gap, 6px) !important;
           }
           .connect-experience-grid.connect-mobile-horizontal-rail .connect-conversation-panel {
             grid-column: 1 !important;
@@ -16179,10 +16206,10 @@ const modePillControls = (
           }
 
           .connect-experience-grid.connect-mobile-vertical-rail {
-            grid-template-columns: 44px minmax(0, 1fr) !important;
+            grid-template-columns: var(--connect-mobile-control-size, 35px) minmax(0, 1fr) !important;
             grid-template-rows: auto auto auto !important;
-            column-gap: 8px !important;
-            row-gap: 6px !important;
+            column-gap: var(--connect-mobile-control-gap, 6px) !important;
+            row-gap: 5px !important;
           }
           .connect-experience-grid.connect-mobile-vertical-rail .connect-persona-panel,
           .connect-experience-grid.connect-mobile-vertical-rail .connect-video-panel {
@@ -16196,15 +16223,15 @@ const modePillControls = (
             justify-content: flex-start !important;
             align-items: stretch !important;
             flex-wrap: nowrap !important;
-            gap: 8px !important;
+            gap: var(--connect-mobile-control-gap, 6px) !important;
             margin-bottom: 0 !important;
-            min-width: 44px !important;
+            min-width: var(--connect-mobile-control-size, 35px) !important;
           }
           .connect-experience-grid.connect-mobile-vertical-rail .connect-control-rail-inner {
             flex-direction: column !important;
             align-items: stretch !important;
             flex-wrap: nowrap !important;
-            gap: 8px !important;
+            gap: var(--connect-mobile-control-gap, 6px) !important;
           }
           .connect-experience-grid.connect-mobile-vertical-rail .connect-conversation-panel {
             grid-column: 2 !important;
@@ -16212,7 +16239,7 @@ const modePillControls = (
           }
 
           .connect-persona-panel {
-            margin-bottom: 5px !important;
+            margin-bottom: 4px !important;
           }
           .connect-experience-grid.connect-workspace-email {
             grid-template-columns: minmax(0, 1fr) !important;
@@ -16249,10 +16276,10 @@ const modePillControls = (
           max-width: 100% !important;
           min-width: 0 !important;
           overflow-x: hidden !important;
-          grid-template-columns: 44px minmax(0, 1fr) !important;
+          grid-template-columns: var(--connect-mobile-control-size, 35px) minmax(0, 1fr) !important;
           grid-template-rows: auto auto auto !important;
-          column-gap: 8px !important;
-          row-gap: 6px !important;
+          column-gap: var(--connect-mobile-control-gap, 6px) !important;
+          row-gap: 5px !important;
           align-items: start !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="view-selector"] {
@@ -16289,15 +16316,15 @@ const modePillControls = (
           width: 100% !important;
           max-width: 100% !important;
           min-width: 0 !important;
-          margin-bottom: 5px !important;
+          margin-bottom: 4px !important;
           align-self: start !important;
           box-sizing: border-box !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-brand-label {
-          font-size: 13px !important;
+          font-size: 10px !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-persona-name {
-          font-size: 28px !important;
+          font-size: 22px !important;
           line-height: 1.08 !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-persona-meta {
@@ -16309,15 +16336,23 @@ const modePillControls = (
           flex: 0 0 var(--connect-persona-portrait-width, 170px) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] {
-          width: 136px !important;
-          max-width: 136px !important;
-          min-width: 136px !important;
-          flex: 0 0 136px !important;
+          width: var(--connect-mobile-action-column-width, 108px) !important;
+          max-width: var(--connect-mobile-action-column-width, 108px) !important;
+          min-width: var(--connect-mobile-action-column-width, 108px) !important;
+          flex: 0 0 var(--connect-mobile-action-column-width, 108px) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] button,
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] a {
-          min-height: 44px !important;
+          height: var(--connect-mobile-control-size, 35px) !important;
+          min-height: var(--connect-mobile-control-size, 35px) !important;
+          padding: 0 10px !important;
+          border-radius: 8px !important;
+          font-size: 13px !important;
           box-sizing: border-box !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] > div,
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="action-column"] > div > div {
+          gap: var(--connect-mobile-control-gap, 6px) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="usage"],
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="navigation-row"] {
@@ -16328,9 +16363,9 @@ const modePillControls = (
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="session-rail"] {
           grid-column: 1 !important;
           grid-row: 3 !important;
-          width: 44px !important;
-          max-width: 44px !important;
-          min-width: 44px !important;
+          width: var(--connect-mobile-control-size, 35px) !important;
+          max-width: var(--connect-mobile-control-size, 35px) !important;
+          min-width: var(--connect-mobile-control-size, 35px) !important;
           height: auto !important;
           min-height: 0 !important;
           box-sizing: border-box !important;
@@ -16338,24 +16373,24 @@ const modePillControls = (
           justify-content: flex-start !important;
           align-items: stretch !important;
           flex-wrap: nowrap !important;
-          gap: 8px !important;
+          gap: var(--connect-mobile-control-gap, 6px) !important;
           margin-bottom: 0 !important;
           align-self: stretch !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-control-rail-inner {
-          width: 44px !important;
+          width: var(--connect-mobile-control-size, 35px) !important;
           height: auto !important;
           box-sizing: border-box !important;
           flex-direction: column !important;
           align-items: stretch !important;
           flex-wrap: nowrap !important;
-          gap: 8px !important;
+          gap: var(--connect-mobile-control-gap, 6px) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="session-rail"] button {
-          width: 44px !important;
-          height: 44px !important;
-          min-width: 44px !important;
-          min-height: 44px !important;
+          width: var(--connect-mobile-control-size, 35px) !important;
+          height: var(--connect-mobile-control-size, 35px) !important;
+          min-width: var(--connect-mobile-control-size, 35px) !important;
+          min-height: var(--connect-mobile-control-size, 35px) !important;
           padding: 0 !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-conversation-panel {
@@ -16373,15 +16408,17 @@ const modePillControls = (
           overflow-y: visible !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="messages-box"] {
-          flex: 0 0 252px !important;
-          height: 252px !important;
-          min-height: 252px !important;
-          max-height: 252px !important;
+          flex: 0 0 var(--connect-mobile-conversation-height, 199px) !important;
+          height: var(--connect-mobile-conversation-height, 199px) !important;
+          min-height: var(--connect-mobile-conversation-height, 199px) !important;
+          max-height: var(--connect-mobile-conversation-height, 199px) !important;
           box-sizing: border-box !important;
           overflow-y: auto !important;
           overflow-x: hidden !important;
           overscroll-behavior: contain !important;
           -webkit-overflow-scrolling: touch !important;
+          padding: 10px !important;
+          border-radius: 10px !important;
         }
         html[data-connect-composer-focused="true"],
         html[data-connect-composer-focused="true"] body {
@@ -16393,11 +16430,19 @@ const modePillControls = (
           line-height: 20px !important;
           -webkit-text-size-adjust: 100% !important;
         }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] > div {
+          column-gap: var(--connect-mobile-control-gap, 6px) !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] input,
+        .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] > div > button {
+          height: var(--connect-mobile-control-size, 35px) !important;
+          min-height: var(--connect-mobile-control-size, 35px) !important;
+        }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] {
           width: 100% !important;
           max-width: 100% !important;
           min-width: 0 !important;
-          margin-top: 16px !important;
+          margin-top: var(--connect-mobile-composer-gap, 13px) !important;
           padding-top: 0 !important;
           padding-bottom: 0 !important;
           border-top: 0 !important;
@@ -16406,10 +16451,10 @@ const modePillControls = (
           box-sizing: border-box !important;
         }
         /*
-          iOS keyboard focus mode: the approved interaction area is docked as
-          one unit above the visual keyboard. The five-button rail remains
-          aligned with the internally scrollable conversation box; the 16px
-          conversation-to-composer gap and composer geometry do not change.
+          alpha15.54 keyboard focus mode intentionally leaves the interaction
+          area in normal document flow. Safari is allowed to bring the composer
+          into view; the shared Wix coordinator then holds that focused scroll
+          position and restores the original page position on blur.
         */
         .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] .connect-conversation-panel {
           position: fixed !important;
@@ -16444,7 +16489,7 @@ const modePillControls = (
           top: auto !important;
           bottom: auto !important;
           width: 100% !important;
-          margin-top: 16px !important;
+          margin-top: var(--connect-mobile-composer-gap, 13px) !important;
           z-index: 2147482001 !important;
           background: #fff !important;
         }
@@ -16462,12 +16507,43 @@ const modePillControls = (
           overflow: visible !important;
           transform: none !important;
         }
-        /* alpha15.53 keyboard-safe dock: messages scroll internally; the composer
-           remains visible during text entry and returns to normal flow on blur. */
+        /* alpha15.54: neutralize every fixed-position keyboard overlay from the
+           prior experiments. The outer Wix page owns focused scrolling. */
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] .connect-conversation-panel,
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="session-rail"] {
+          position: static !important;
+          left: auto !important;
+          top: auto !important;
+          width: auto !important;
+          z-index: auto !important;
+          transform: none !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] .connect-conversation-panel {
+          width: 100% !important;
+          height: auto !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="session-rail"] {
+          width: var(--connect-mobile-control-size, 35px) !important;
+          min-width: var(--connect-mobile-control-size, 35px) !important;
+          max-width: var(--connect-mobile-control-size, 35px) !important;
+          height: auto !important;
+          min-height: 0 !important;
+          max-height: none !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="messages-box"] {
+          flex: 0 0 var(--connect-mobile-conversation-height, 199px) !important;
+          height: var(--connect-mobile-conversation-height, 199px) !important;
+          min-height: var(--connect-mobile-conversation-height, 199px) !important;
+          max-height: var(--connect-mobile-conversation-height, 199px) !important;
+        }
         .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="composer-row"] {
+          position: static !important;
+          width: 100% !important;
+          margin-top: var(--connect-mobile-composer-gap, 13px) !important;
           padding-top: 0 !important;
           padding-bottom: 0 !important;
           border-top: 0 !important;
+          z-index: auto !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-email,
         .connect-root[data-connect-layout-mode="mobile"] .connect-experience-grid.connect-workspace-host {
@@ -16519,13 +16595,13 @@ const modePillControls = (
           align-self: start !important;
           flex-direction: row !important;
           flex-wrap: wrap !important;
-          gap: 12px !important;
+          gap: var(--connect-mobile-control-gap, 6px) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"][data-connect-rail-orientation="horizontal"] .connect-control-rail-inner {
           width: auto !important;
           flex-direction: row !important;
           flex-wrap: wrap !important;
-          gap: 12px !important;
+          gap: var(--connect-mobile-control-gap, 6px) !important;
         }
         .connect-root[data-connect-layout-mode="mobile"][data-connect-rail-orientation="horizontal"] .connect-conversation-panel {
           grid-column: 1 !important;
@@ -16547,8 +16623,8 @@ const modePillControls = (
                   ? "auto auto auto"
                   : "auto auto auto auto"
                 : "auto auto",
-          columnGap: isMobileUI ? (useVerticalMobileSessionRail ? 8 : 0) : 14,
-          rowGap: isMobileUI ? 6 : 12,
+          columnGap: isMobileUI ? (useVerticalMobileSessionRail ? mobileControlGap : 0) : 14,
+          rowGap: isMobileUI ? 5 : 12,
           alignItems: isMobileUI ? "start" : "stretch",
           width: "100%",
           minWidth: 0,
@@ -16664,10 +16740,10 @@ const modePillControls = (
           display: !hostConsoleOpen && conversationPanelTab === "convo" ? "flex" : "none",
           flexDirection: useCompactCompanionCard ? "column" : "row",
           alignItems: "flex-start",
-          gap: useCompactCompanionCard ? 10 : 12,
-          marginBottom: isMobileUI ? 5 : 0,
+          gap: useCompactCompanionCard ? (isMobileUI ? 6 : 10) : 12,
+          marginBottom: isMobileUI ? 4 : 0,
           flexWrap: useCompactCompanionCard ? "nowrap" : "wrap",
-          rowGap: useCompactCompanionCard ? 8 : 0,
+          rowGap: useCompactCompanionCard ? (isMobileUI ? 6 : 8) : 0,
           width: "100%",
           minHeight: 0,
           height: "auto",
@@ -17720,8 +17796,8 @@ const modePillControls = (
                       data-connect-debug="composer-row"
                       style={{
                         display: conversationPanelTab === "convo" ? "flex" : "none",
-                        gap: 8,
-                        marginTop: 12,
+                        gap: isMobileUI ? mobileControlGap : 8,
+                        marginTop: isMobileUI ? mobileComposerGap : 12,
                         flexWrap:
                           (isMobileUI && !useVerticalMobileSessionRail) ||
                           (isTabletUI && experienceVideoSelected)
@@ -17910,7 +17986,7 @@ const modePillControls = (
                           minWidth: 0,
                           display: "grid",
                           gridTemplateColumns: "minmax(0, 1fr) auto",
-                          columnGap: 8,
+                          columnGap: isMobileUI ? mobileControlGap : 8,
                           rowGap: 4,
                           alignItems: "center",
                         }}
@@ -17944,8 +18020,8 @@ const modePillControls = (
                             minWidth: 0,
                             boxSizing: "border-box",
                             height: ICON_BTN_SIZE,
-                            padding: "0 12px",
-                            borderRadius: 10,
+                            padding: isMobileUI ? "0 10px" : "0 12px",
+                            borderRadius: isMobileUI ? 8 : 10,
                             border: "1px solid #ddd",
                             fontSize: 16,
                             lineHeight: "20px",
@@ -17960,9 +18036,9 @@ const modePillControls = (
                             gridColumn: "2",
                             gridRow: "1",
                             height: ICON_BTN_SIZE,
-                            padding: "0 14px",
+                            padding: isMobileUI ? "0 11px" : "0 14px",
                             boxSizing: "border-box",
-                            borderRadius: 10,
+                            borderRadius: isMobileUI ? 8 : 10,
                             border: "1px solid #111",
                             background: "#111",
                             color: "#fff",
@@ -17983,8 +18059,8 @@ const modePillControls = (
                               alignItems: "center",
                               gap: 4,
                               marginTop: 0,
-                              fontSize: 12,
-                              lineHeight: "16px",
+                              fontSize: isMobileUI ? 10 : 12,
+                              lineHeight: isMobileUI ? "14px" : "16px",
                               color: "#666",
                               whiteSpace: "nowrap",
                             }}
