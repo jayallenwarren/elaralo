@@ -1,9 +1,10 @@
 "use client";
+// v10.0.0-alpha15.46: implement the approved mobile Persona layout across all brands: add a 16px conversation-to-composer gap; normalize legacy Wix mobile View tabs and Persona portrait to the same apparent scale as the Elaralo modern runtime; no protected media behavior changed.
 // v10.0.0-alpha15.45: place the mobile message input and Send button immediately against the bottom edge of the conversation box, with no vertical gap, padding offset, sticky displacement, or separator; no protected media behavior changed.
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.44";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.46";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4353,7 +4354,9 @@ function ConnectPage() {
       : 1;
   const portraitRuntimeScale = usesExpandedMobileCanvas
     ? Math.min(1, Math.max(0.9, legacyVisibleScale / Math.max(0.01, modernVisibleScale)))
-    : 1;
+    : isMobileUI
+      ? Math.min(1, Math.max(0.82, mobileCanvasRatio / CANONICAL_MODERN_MOBILE_CANVAS_RATIO))
+      : 1;
   const basePersonaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
   const basePersonaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
   const personaPortraitWidth = Math.round(basePersonaPortraitWidth * portraitRuntimeScale);
@@ -16033,7 +16036,7 @@ const modePillControls = (
           width: 100% !important;
           max-width: 100% !important;
           min-width: 0 !important;
-          margin-top: 0 !important;
+          margin-top: 16px !important;
           padding-top: 0 !important;
           padding-bottom: 0 !important;
           border-top: 0 !important;
