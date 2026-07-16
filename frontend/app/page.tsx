@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.56: preserve the accepted alpha15.54 initial mobile geometry; before iOS focuses the message input, move the existing rail, conversation, and composer into a bounded keyboard-safe child-viewport dock while the shared Wix coordinator holds the original page position; no protected media behavior changed.
+// v10.0.0-alpha15.57: preserve the accepted alpha15.54 initial mobile geometry and native input selection; allow iOS to complete the real focus gesture first, then move the existing rail, conversation, and composer into a bounded keyboard-safe child-viewport dock while the shared Wix coordinator settles and holds the focused page position; no protected media behavior changed.
 // v10.0.0-alpha15.54: match the approved measured mobile geometry across responsive and classic Wix runtimes, preserve DulceMoon's wider portrait at the same apparent height, keep the conversation as the only chat-scroll surface, and let iOS settle to a visible composer focus position instead of pinning the outer page before the keyboard opens; no protected media behavior changed.
 // v10.0.0-alpha15.49: prevent-scroll focus activation for the mobile composer and initial legacy-Wix scale compensation; superseded by the coordinated alpha15.50 React/bridge/Velo implementation.
 // v10.0.0-alpha15.48: freeze the mobile document during composer focus, force 16px iOS input text, keep the conversation box as the scroll surface, and normalize mobile portrait height and View-tab dimensions across Wix runtimes; no protected media behavior changed.
@@ -8,7 +8,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.56";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.57";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4424,50 +4424,30 @@ function ConnectPage() {
     const input = event.currentTarget;
     if (!isPhoneLikeComposerEnvironment() || document.activeElement === input) return;
 
-    // Dock the real controls before focus and focus in the same user gesture.
-    // This makes the input visible before iOS decides whether the Wix page must
-    // scroll, while preserving the accepted alpha15.54 layout when unfocused.
-    event.preventDefault();
-    composerFocusedRef.current = true;
-    composerFocusStartedAtRef.current = Date.now();
-    composerViewportBaselineHeightRef.current = Math.max(
-      Number(window.visualViewport?.height || 0),
-      Number(document.documentElement?.clientHeight || 0),
-      Number(window.innerHeight || 0)
-    );
-    composerChildScrollBaseRef.current = { x: window.scrollX || 0, y: window.scrollY || 0 };
-    document.documentElement.dataset.connectComposerFocused = "true";
-    const root = connectRootRef.current;
-    if (root) root.dataset.connectComposerFocused = "true";
+    // Do not cancel or replace the native pointer-to-focus gesture. Alpha15.56
+    // prevented the default action and moved the input before Safari completed
+    // focus, which caused the screen to reset and left the input unselectable.
+    // PREPARE only records geometry and arms the Wix coordinator.
     captureComposerDockBase();
-    updateComposerDockGeometry();
-
+    composerChildScrollBaseRef.current = { x: window.scrollX || 0, y: window.scrollY || 0 };
     const lockId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     composerLockIdRef.current = lockId;
     postConnectBridgeMessage({
       type: "CONNECT_COMPOSER_PREPARE",
       lockId,
       childBuild: CONNECT_BUILD_VERSION,
-      dockedBeforeFocus: true,
+      dockedBeforeFocus: false,
+      nativeFocusPreserved: true,
       ...buildComposerFocusGeometry(),
     });
-
-    // Force layout resolution before focus so Safari evaluates the docked input.
-    void input.getBoundingClientRect();
-    try { input.focus({ preventScroll: true }); }
-    catch { input.focus(); }
-    try {
-      const end = input.value.length;
-      input.setSelectionRange(end, end);
-    } catch {}
-  }, [buildComposerFocusGeometry, captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage, updateComposerDockGeometry]);
+  }, [buildComposerFocusGeometry, captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage]);
 
 
   const lockDocumentForComposer = useCallback(() => {
     if (typeof window === "undefined" || !isPhoneLikeComposerEnvironment()) return;
     const wasFocused = composerFocusedRef.current;
     composerFocusedRef.current = true;
-    composerFocusStartedAtRef.current = composerFocusStartedAtRef.current || Date.now();
+    composerFocusStartedAtRef.current = Date.now();
     document.documentElement.dataset.connectComposerFocused = "true";
     const root = connectRootRef.current;
     if (root) root.dataset.connectComposerFocused = "true";
@@ -4478,23 +4458,42 @@ function ConnectPage() {
         Number(document.documentElement?.clientHeight || 0),
         Number(window.innerHeight || 0)
       );
-      composerChildScrollBaseRef.current = { x: window.scrollX || 0, y: window.scrollY || 0 };
+      if (!composerChildScrollBaseRef.current) {
+        composerChildScrollBaseRef.current = { x: window.scrollX || 0, y: window.scrollY || 0 };
+      }
     }
     if (!composerDockBaseRef.current) captureComposerDockBase();
-    updateComposerDockGeometry();
 
-    if (!composerLockIdRef.current) composerLockIdRef.current = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    if (!composerLockIdRef.current) {
+      composerLockIdRef.current = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      postConnectBridgeMessage({
+        type: "CONNECT_COMPOSER_PREPARE",
+        lockId: composerLockIdRef.current,
+        childBuild: CONNECT_BUILD_VERSION,
+        fallback: true,
+        dockedBeforeFocus: false,
+        nativeFocusPreserved: true,
+        ...buildComposerFocusGeometry(),
+      });
+    }
+
     postConnectBridgeMessage({
       type: "CONNECT_COMPOSER_FOCUS",
       lockId: composerLockIdRef.current,
       childBuild: CONNECT_BUILD_VERSION,
-      dockedBeforeFocus: true,
+      dockedBeforeFocus: false,
+      dockedAfterNativeFocus: true,
       ...buildComposerFocusGeometry(),
     });
+    postConnectBridgeMessage({ type: "CONNECT_BRIDGE_CONTEXT_REQUEST", childBuild: CONNECT_BUILD_VERSION });
 
-    queueComposerDockUpdate();
-    [40, 140, 320, 650, 1000].forEach((delayMs) => window.setTimeout(queueComposerDockUpdate, delayMs));
-  }, [buildComposerFocusGeometry, captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage, queueComposerDockUpdate, updateComposerDockGeometry]);
+    // Native focus is now established. Delay the first dock update long enough
+    // for Safari to commit focus and begin the keyboard transition; subsequent
+    // passes follow visualViewport as the keyboard finishes opening.
+    [90, 180, 320, 520, 800, 1100].forEach((delayMs) =>
+      window.setTimeout(queueComposerDockUpdate, delayMs)
+    );
+  }, [buildComposerFocusGeometry, captureComposerDockBase, isPhoneLikeComposerEnvironment, postConnectBridgeMessage, queueComposerDockUpdate]);
 
 
   const unlockDocumentForComposer = useCallback(() => {
@@ -4517,17 +4516,8 @@ function ConnectPage() {
       childBuild: CONNECT_BUILD_VERSION,
     });
     composerLockIdRef.current = "";
-
-    const childScroll = composerChildScrollBaseRef.current;
     composerChildScrollBaseRef.current = null;
-    if (childScroll) {
-      window.setTimeout(() => {
-        try { window.scrollTo({ left: childScroll.x, top: childScroll.y, behavior: "auto" }); }
-        catch { window.scrollTo(childScroll.x, childScroll.y); }
-      }, 0);
-    }
   }, [clearComposerDock, postConnectBridgeMessage]);
-
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -16584,10 +16574,11 @@ const modePillControls = (
           box-sizing: border-box !important;
         }
         /*
-          alpha15.56 typing mode moves the existing rail, conversation, and
-          composer into a bounded fixed dock before focus. The unfocused
-          alpha15.54 layout is untouched; while typing, only the messages box
-          scrolls and the real input remains above the iOS keyboard.
+          alpha15.57 typing mode preserves the native pointer-to-focus gesture,
+          then moves the existing rail, conversation, and composer into a bounded
+          fixed dock after focus is established. The unfocused alpha15.54 layout
+          is untouched; while typing, only the messages box scrolls and the real
+          input remains above the iOS keyboard.
         */
         .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] .connect-conversation-panel {
           position: fixed !important;
