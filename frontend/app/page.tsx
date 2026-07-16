@@ -1,10 +1,11 @@
 "use client";
+// v10.0.0-alpha15.47: freeze the mobile composer geometry during iOS input focus, keep the conversation pane internally scrollable, prevent Safari input auto-zoom, and enforce one shared mobile portrait height while retaining runtime-normalized width and View tabs; no protected media behavior changed.
 // v10.0.0-alpha15.46: implement the approved mobile Persona layout across all brands: add a 16px conversation-to-composer gap; normalize legacy Wix mobile View tabs and Persona portrait to the same apparent scale as the Elaralo modern runtime; no protected media behavior changed.
 // v10.0.0-alpha15.45: place the mobile message input and Send button immediately against the bottom edge of the conversation box, with no vertical gap, padding offset, sticky displacement, or separator; no protected media behavior changed.
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.46";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.47";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4324,6 +4325,53 @@ function ConnectPage() {
   }, [getDeviceShortSide, getEffectiveViewportWidth, getViewportMode]);
 
   const isMobileUI = viewportMode === "mobile";
+
+  const restoreMobileComposerScroll = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const lock = mobileComposerFocusLockRef.current;
+    if (!lock.active) return;
+    window.scrollTo(lock.scrollX, lock.scrollY);
+    const root = connectRootRef.current;
+    if (root) root.scrollTop = lock.rootScrollTop;
+  }, []);
+
+  const lockMobileComposerOnFocus = useCallback(() => {
+    if (!isMobileUI || typeof window === "undefined") return;
+    const lock = mobileComposerFocusLockRef.current;
+    lock.active = true;
+    lock.scrollX = Number(window.scrollX || 0);
+    lock.scrollY = Number(window.scrollY || 0);
+    lock.rootScrollTop = Number(connectRootRef.current?.scrollTop || 0);
+    lock.timers.forEach((timer) => window.clearTimeout(timer));
+    lock.timers = [0, 50, 150, 300, 500].map((delay) =>
+      window.setTimeout(restoreMobileComposerScroll, delay)
+    );
+    connectRootRef.current?.setAttribute("data-connect-composer-focused", "true");
+  }, [isMobileUI, restoreMobileComposerScroll]);
+
+  const releaseMobileComposerFocusLock = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const lock = mobileComposerFocusLockRef.current;
+    lock.timers.forEach((timer) => window.clearTimeout(timer));
+    lock.timers = [];
+    lock.active = false;
+    connectRootRef.current?.removeAttribute("data-connect-composer-focused");
+  }, []);
+
+  useEffect(() => {
+    if (!isMobileUI || typeof window === "undefined") return;
+    const viewport = window.visualViewport;
+    const keepComposerGeometry = () => restoreMobileComposerScroll();
+    window.addEventListener("scroll", keepComposerGeometry, { passive: true });
+    viewport?.addEventListener("resize", keepComposerGeometry, { passive: true });
+    viewport?.addEventListener("scroll", keepComposerGeometry, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", keepComposerGeometry);
+      viewport?.removeEventListener("resize", keepComposerGeometry);
+      viewport?.removeEventListener("scroll", keepComposerGeometry);
+      releaseMobileComposerFocusLock();
+    };
+  }, [isMobileUI, releaseMobileComposerFocusLock, restoreMobileComposerScroll]);
   const isTabletUI = viewportMode === "tablet";
   // Persona uses one standardized geometry system for every brand. The only
   // mobile variation is a narrow-phone fallback driven by physical viewport,
@@ -4360,7 +4408,10 @@ function ConnectPage() {
   const basePersonaPortraitWidth = isMobileUI ? (isNarrowPhone ? 150 : 170) : 150;
   const basePersonaPortraitHeight = isMobileUI ? (isNarrowPhone ? 188 : 213) : 188;
   const personaPortraitWidth = Math.round(basePersonaPortraitWidth * portraitRuntimeScale);
-  const personaPortraitHeight = Math.round(basePersonaPortraitHeight * portraitRuntimeScale);
+  // Height is the canonical cross-brand alignment token. Width may retain the
+  // runtime compensation needed by different Wix canvases, but the portrait
+  // height itself is identical for every brand on the same phone class.
+  const personaPortraitHeight = basePersonaPortraitHeight;
   const personaActionColumnWidth = isMobileUI ? (isNarrowPhone ? 132 : 136) : isTabletUI ? 132 : 140;
 
   // Match the apparent compact View-tab geometry of the expanded modern canvas
@@ -7728,6 +7779,15 @@ const speakAssistantReply = useCallback(
 
   const [input, setInput] = useState("");
   const inputElRef = useRef<HTMLInputElement | null>(null);
+  // Layout-only iOS focus guard. This does not participate in microphone, STT,
+  // TTS, LiveKit, media, or message-delivery lifecycle.
+  const mobileComposerFocusLockRef = useRef<{
+    active: boolean;
+    scrollX: number;
+    scrollY: number;
+    rootScrollTop: number;
+    timers: number[];
+  }>({ active: false, scrollX: 0, scrollY: 0, rootScrollTop: 0, timers: [] });
   // Attachments (image uploads to Azure Blob via backend)
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const [pendingAttachment, setPendingAttachment] = useState<UploadedAttachment | null>(null);
@@ -16031,6 +16091,14 @@ const modePillControls = (
           min-height: 252px !important;
           max-height: 252px !important;
           box-sizing: border-box !important;
+          overflow-y: auto !important;
+          overscroll-behavior: contain !important;
+          -webkit-overflow-scrolling: touch !important;
+          touch-action: pan-y !important;
+        }
+        .connect-root[data-connect-layout-mode="mobile"][data-connect-composer-focused="true"] {
+          overflow: hidden !important;
+          overscroll-behavior: none !important;
         }
         .connect-root[data-connect-layout-mode="mobile"] [data-connect-debug="composer-row"] {
           width: 100% !important;
@@ -17230,6 +17298,9 @@ const modePillControls = (
                         borderRadius: 12,
                         padding: 12,
                         overflowY: "auto",
+                        overscrollBehavior: "contain",
+                        WebkitOverflowScrolling: "touch",
+                        touchAction: "pan-y",
                         background: "#fff",
                       }}
                     >
@@ -17491,6 +17562,8 @@ const modePillControls = (
                           ref={inputElRef}
                           value={input}
                           onChange={(e) => setInput(e.target.value)}
+                          onFocus={lockMobileComposerOnFocus}
+                          onBlur={releaseMobileComposerFocusLock}
                           onKeyDown={(e) => {
                             if (e.key === "Enter") {
                               e.preventDefault();
@@ -17516,6 +17589,7 @@ const modePillControls = (
                             padding: "0 12px",
                             borderRadius: 10,
                             border: "1px solid #ddd",
+                            fontSize: isMobileUI ? 16 : undefined,
                           }}
                         />
 
