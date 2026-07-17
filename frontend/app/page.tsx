@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.59: preserve the accepted alpha15.54 initial geometry; overlay the focused interim composer exactly on the normal target composer slot; submit on the first mobile Send pointer interaction before iOS blur/viewport restoration; suppress the follow-on synthetic click; Enter/Return remains dismissal-only; no protected media behavior changed.
 // v10.0.0-alpha15.58: preserve the accepted alpha15.54 initial geometry; keep native input focus; dock only the real composer row above the iOS keyboard without moving the conversation panel or rail; stop Enter/Return from sending so only the Send button starts a conversation; no protected media behavior changed.
 // v10.0.0-alpha15.54: match the approved measured mobile geometry across responsive and classic Wix runtimes, preserve DulceMoon's wider portrait at the same apparent height, keep the conversation as the only chat-scroll surface, and let iOS settle to a visible composer focus position instead of pinning the outer page before the keyboard opens; no protected media behavior changed.
 // v10.0.0-alpha15.49: prevent-scroll focus activation for the mobile composer and initial legacy-Wix scale compensation; superseded by the coordinated alpha15.50 React/bridge/Velo implementation.
@@ -8,7 +9,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.58";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.59";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -4219,6 +4220,7 @@ function ConnectPage() {
     conversationWidth: number;
     railLeft: number;
     railWidth: number;
+    composerTop: number;
     composerLeft: number;
     composerWidth: number;
     composerHeight: number;
@@ -4283,6 +4285,7 @@ function ConnectPage() {
       conversationWidth: conversationRect.width,
       railLeft: railRect.left,
       railWidth: Math.max(1, railRect.width || 35),
+      composerTop: composerRect.top,
       composerLeft: composerRect.left,
       composerWidth: Math.max(1, composerRect.width || conversationRect.width),
       composerHeight: Math.max(35, composerRect.height || 35),
@@ -4322,43 +4325,12 @@ function ConnectPage() {
     const base = composerDockBaseRef.current;
     if (!base) return;
 
-    const viewport = window.visualViewport;
-    const viewportTop = Math.max(0, Number(viewport?.offsetTop || 0));
-    const visualViewportHeight = Number(viewport?.height || 0);
-    const measuredViewportHeight = visualViewportHeight > 0
-      ? visualViewportHeight
-      : Math.max(
-          1,
-          Number(document.documentElement?.clientHeight || 0),
-          Number(window.innerHeight || 0)
-        );
-
-    composerViewportBaselineHeightRef.current = Math.max(
-      composerViewportBaselineHeightRef.current,
-      measuredViewportHeight
-    );
-    const baselineViewportHeight = Math.max(
-      measuredViewportHeight,
-      composerViewportBaselineHeightRef.current
-    );
-    const keyboardShrink = Math.max(0, baselineViewportHeight - measuredViewportHeight);
-
-    // Some nested Wix/iOS combinations do not immediately expose the reduced
-    // visual viewport to the child iframe. Until they do, use a conservative
-    // keyboard-open estimate. Only the composer is docked; the conversation and
-    // rail stay in normal flow, preventing the full-screen flash/blank cycle.
-    const effectiveVisibleHeight = keyboardShrink >= 80
-      ? measuredViewportHeight
-      : Math.min(
-          measuredViewportHeight,
-          Math.max(340, Math.round(baselineViewportHeight * 0.52))
-        );
-
-    const bottomInset = 8;
-    const composerTop = viewportTop + Math.max(
-      8,
-      effectiveVisibleHeight - base.composerHeight - bottomInset
-    );
+    // Overlay the focused interim composer on the exact normal-flow composer
+    // slot captured before focus. The outer Wix/Safari page may move the iframe
+    // to reveal that slot, but the child must not independently move the composer
+    // to an estimated keyboard coordinate. This keeps the interim input directly
+    // over the target input instead of covering Usage or the navigation buttons.
+    const composerTop = Math.max(0, Number(base.composerTop || 0));
 
     root.dataset.connectKeyboardDocked = "true";
     root.style.setProperty("--connect-keyboard-composer-top", `${Math.round(composerTop)}px`);
@@ -8187,6 +8159,8 @@ const speakAssistantReply = useCallback(
 
   const [input, setInput] = useState("");
   const inputElRef = useRef<HTMLInputElement | null>(null);
+  const composerSendPointerInFlightRef = useRef(false);
+  const composerSendSuppressClickUntilRef = useRef(0);
   // Attachments (image uploads to Azure Blob via backend)
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const [pendingAttachment, setPendingAttachment] = useState<UploadedAttachment | null>(null);
@@ -16561,10 +16535,10 @@ const modePillControls = (
           box-sizing: border-box !important;
         }
         /*
-          alpha15.58 typing mode keeps the accepted alpha15.54 page geometry and
-          native iOS focus. Only the real composer row is docked inside the child
-          visual viewport. The rail and conversation remain in normal flow, so a
-          React keystroke re-render cannot blank or flash the entire interaction area.
+          alpha15.59 typing mode keeps the accepted alpha15.54 page geometry and
+          native iOS focus. The real composer row overlays its own normal target slot
+          instead of moving to an estimated keyboard coordinate. The rail and
+          conversation remain in normal flow.
         */
         .connect-root[data-connect-layout-mode="mobile"][data-connect-keyboard-docked="true"] [data-connect-debug="composer-row"] {
           position: fixed !important;
@@ -18043,9 +18017,13 @@ const modePillControls = (
                           enterKeyHint="done"
                           onKeyDown={(e) => {
                             if (e.key === "Enter") {
-                              // Only the visible Send button may start a conversation.
+                              // Enter/Return is dismissal-only. It must never submit.
                               e.preventDefault();
                               e.stopPropagation();
+                              const inputNode = e.currentTarget;
+                              window.setTimeout(() => {
+                                try { inputNode.blur(); } catch {}
+                              }, 0);
                             }
                           }}
                           placeholder={
@@ -18074,7 +18052,40 @@ const modePillControls = (
                         />
 
                         <button
-                          onClick={() => send()}
+                          onPointerDown={(event) => {
+                            if (!isPhoneLikeComposerEnvironment() || event.pointerType === "mouse") return;
+                            if (loading || uploadingAttachment || composerSendPointerInFlightRef.current) return;
+
+                            const capturedText = String(inputElRef.current?.value ?? input);
+                            if (!capturedText.trim() && !pendingAttachment) return;
+
+                            // iOS may dismiss the keyboard and relocate the composer before
+                            // a normal click is delivered. Submit during pointerdown while the
+                            // live input value and button target are still intact.
+                            event.preventDefault();
+                            event.stopPropagation();
+                            composerSendPointerInFlightRef.current = true;
+                            composerSendSuppressClickUntilRef.current = Date.now() + 1200;
+
+                            const inputNode = inputElRef.current;
+                            const submission = send(capturedText);
+                            window.setTimeout(() => {
+                              try { inputNode?.blur(); } catch {}
+                            }, 0);
+                            void Promise.resolve(submission).finally(() => {
+                              window.setTimeout(() => {
+                                composerSendPointerInFlightRef.current = false;
+                              }, 350);
+                            });
+                          }}
+                          onClick={(event) => {
+                            if (Date.now() < composerSendSuppressClickUntilRef.current) {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              return;
+                            }
+                            void send();
+                          }}
                           disabled={loading || uploadingAttachment}
                           style={{
                             gridColumn: "2",
