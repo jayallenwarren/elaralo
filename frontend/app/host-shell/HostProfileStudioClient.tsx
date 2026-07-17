@@ -1342,27 +1342,36 @@ export default function HostProfileStudioClient() {
     setCatalogVisibilitySaving(true);
     setError("");
     try {
-      const res = await fetch(`${API_BASE}/host-onboarding/catalog-visibility`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const requestId = `principal-catalog-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const data = await new Promise<any>((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          window.removeEventListener("message", onMessage);
+          reject(new Error("Persona Studio could not verify the active subscription."));
+        }, 15000);
+        const onMessage = (event: MessageEvent) => {
+          const msg = event?.data || {};
+          if (msg?.type !== "PRINCIPAL_CATALOG_PUBLICATION_RESULT" || msg?.requestId !== requestId) return;
+          window.clearTimeout(timeout);
+          window.removeEventListener("message", onMessage);
+          if (msg?.ok === false) reject(new Error(String(msg?.detail || msg?.message || "Unable to update catalog visibility.")));
+          else resolve(msg);
+        };
+        window.addEventListener("message", onMessage);
+        window.parent?.postMessage({
+          type: "PRINCIPAL_CATALOG_PUBLICATION_REQUEST",
+          requestId,
           memberId: context.memberId,
           brand: context.brand,
           avatar: context.avatar,
           sessionId: session?.session_id || "",
           visible: Boolean(nextVisible),
-          list_in_companion_catalog: Boolean(nextVisible),
-          catalog_visible: Boolean(nextVisible),
-          show_in_companion_catalog: Boolean(nextVisible),
-        }),
+        }, "*");
       });
-      const data = await res.json().catch(() => ({} as any));
-      if (!res.ok || data?.ok === false) throw new Error(String(data?.detail || data?.message || `HTTP ${res.status}`));
       setNotice(
         data?.mapping_missing
           ? "Catalog visibility preference saved. The public catalog row will be updated after this Persona is exported."
           : Boolean(nextVisible)
-            ? "Your Persona will be listed in the Companion catalog."
+            ? (data?.bonus_granted ? `Your Persona is listed in the Companion catalog. ${data.bonus_minutes} bonus minutes were added.` : "Your Persona will be listed in the Companion catalog.")
             : "Your Persona is hidden from the Companion catalog."
       );
     } catch (err: any) {
