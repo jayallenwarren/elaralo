@@ -5977,6 +5977,11 @@ useEffect(() => {
           params.set("brand", brand);
           params.set("avatar", lookupAvatar);
           if (requestedType) params.set("companionType", requestedType);
+          // Carry the selected companion identity separately from the SQL avatar.
+          // This lets the backend recover safely when a stale Wix payload supplies
+          // the default AI avatar (Elara) for an explicitly Human companion.
+          if (displayAvatar) params.set("companion", displayAvatar);
+          if (fullKey) params.set("companionKey", fullKey);
           const url = `${API_BASE}/mappings/companion?${params.toString()}`;
           const res = await fetch(url, { method: "GET" });
           const json: any = await res.json().catch(() => ({}));
@@ -12306,10 +12311,17 @@ useEffect(() => {
         resolvedStartupName = resolvedCompanionName;
         const resolvedCompanionMetaKey = parsed.key || resolvedCompanionKey;
         const filenameKeyLooksLikeAi = isAiCompanionFilenameKey(resolvedCompanionKey);
+        const humanCompanionIdentity =
+          incomingCompanion || incomingCompanionDisplayName || resolvedCompanionName || resolvedCompanionKey;
+        const staleHumanDefaultAiAvatar =
+          incomingCompanionType === "Human" &&
+          /^elara$/i.test(String(explicitIncomingMappingAvatar || incomingAvatarName || "").trim()) &&
+          !/^elara$/i.test(String(humanCompanionIdentity || "").trim());
         const resolvedMappingAvatar =
-          explicitIncomingMappingAvatar ||
+          (staleHumanDefaultAiAvatar ? "" : explicitIncomingMappingAvatar) ||
+          (incomingCompanionType === "Human" ? humanCompanionIdentity : "") ||
           (filenameKeyLooksLikeAi ? (parsed.first || aiFirstNameFromKey(resolvedCompanionKey)) : "") ||
-          incomingAvatarName ||
+          (staleHumanDefaultAiAvatar ? "" : incomingAvatarName) ||
           incomingCompanion ||
           resolvedCompanionName;
         setCompanionKey(resolvedCompanionMetaKey);
