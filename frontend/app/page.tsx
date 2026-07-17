@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.59: preserve the accepted alpha15.54 initial geometry; overlay the focused interim composer exactly on the normal target composer slot; submit on the first mobile Send pointer interaction before iOS blur/viewport restoration; suppress the follow-on synthetic click; Enter/Return remains dismissal-only; no protected media behavior changed.
+// v10.0.0-alpha15.60: preserve alpha15.59 first-tap Send and accepted mobile geometry; restore the existing iOS TTS audio-route priming synchronously on the Send pointer gesture before propagation is stopped; no TTS gain, voice, endpoint, media playback, STT, microphone, LiveKit, attachment, charging, or PayGo implementation changed.
 // v10.0.0-alpha15.58: preserve the accepted alpha15.54 initial geometry; keep native input focus; dock only the real composer row above the iOS keyboard without moving the conversation panel or rail; stop Enter/Return from sending so only the Send button starts a conversation; no protected media behavior changed.
 // v10.0.0-alpha15.54: match the approved measured mobile geometry across responsive and classic Wix runtimes, preserve DulceMoon's wider portrait at the same apparent height, keep the conversation as the only chat-scroll surface, and let iOS settle to a visible composer focus position instead of pinning the outer page before the keyboard opens; no protected media behavior changed.
 // v10.0.0-alpha15.49: prevent-scroll focus activation for the mobile composer and initial legacy-Wix scale compensation; superseded by the coordinated alpha15.50 React/bridge/Velo implementation.
@@ -9,7 +9,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.59";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.60";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -16535,7 +16535,7 @@ const modePillControls = (
           box-sizing: border-box !important;
         }
         /*
-          alpha15.59 typing mode keeps the accepted alpha15.54 page geometry and
+          alpha15.60 typing mode keeps the accepted alpha15.54 page geometry and
           native iOS focus. The real composer row overlays its own normal target slot
           instead of moving to an estimated keyboard coordinate. The rail and
           conversation remain in normal flow.
@@ -18060,8 +18060,10 @@ const modePillControls = (
                             if (!capturedText.trim() && !pendingAttachment) return;
 
                             // iOS may dismiss the keyboard and relocate the composer before
-                            // a normal click is delivered. Submit during pointerdown while the
-                            // live input value and button target are still intact.
+                            // a normal click is delivered. Restore the existing synchronous
+                            // iOS audio-route priming before stopping propagation, then submit
+                            // while the live input value and button target are still intact.
+                            handleAnyUserGesture();
                             event.preventDefault();
                             event.stopPropagation();
                             composerSendPointerInFlightRef.current = true;
