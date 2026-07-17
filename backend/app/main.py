@@ -10142,27 +10142,87 @@ def _chat_phonetic_guidance_block(session_state: Dict[str, Any]) -> str:
         f"- Display name: {name}\n"
         f"- Phonetic pronunciation: {phonetic}\n"
         "Use the display name in normal visible chat text. "
+        "Before answering any pronunciation question, resolve whose name the user means from pronouns and role words such as my, your, host, user, companion, his, her, or their. "
+        "Only treat the question as being about your own name when the user clearly refers to your name or the companion's name. "
+        "If the user refers to their own name, the host's name, or another person's name, answer about that person and do not redirect the answer to your own name. "
+        "If the user corrects the referent or says they did not ask about your name, acknowledge the correction warmly and do not repeat the prior canned answer. "
+        "When two people share the same name or pronunciation, explain that connection naturally instead of merely repeating your own pronunciation. "
         "If the user asks how to pronounce your name, answer using the phonetic pronunciation exactly as written. "
         "Do not invent, vary, reinterpret, or provide alternate pronunciations. "
-        "This phonetic value comes from the companion_mappings.phonetic field and is the only allowed pronunciation answer."
+        "This phonetic value comes from the companion_mappings.phonetic field and is the only allowed pronunciation answer for your own name."
     )
 
 
 
 def _chat_user_asks_companion_name_pronunciation(text: str) -> bool:
-    """Detect direct pronunciation questions for the companion's own name."""
-    t = str(text or "").strip().lower()
+    """Detect an unambiguous pronunciation question about the companion's own name.
+
+    The previous detector treated any message containing ``name`` plus a
+    pronunciation term as a request about the companion.  That incorrectly
+    intercepted questions such as ``How do you pronounce the host name?`` and
+    clarification turns such as ``I asked about my name, not your name.``
+    Ambiguous, third-person, host, user, and corrective turns must reach the LLM
+    so normal conversational reference resolution can occur.
+    """
+    t = re.sub(r"\s+", " ", str(text or "").strip().lower())
     if not t:
         return False
-    if not any(k in t for k in ("pronounce", "pronunciation", "say your name", "saying your name")):
+
+    pronunciation_terms = (
+        "pronounce",
+        "pronounced",
+        "pronunciation",
+        "say your name",
+        "saying your name",
+    )
+    if not any(term in t for term in pronunciation_terms):
         return False
-    return any(k in t for k in ("your name", "name", "you pronounced", "you pronounce"))
+
+    # Do not take the deterministic companion shortcut when the user identifies
+    # another referent or is correcting a prior misunderstanding.
+    non_companion_referents = (
+        "my name",
+        "host name",
+        "host's name",
+        "hosts name",
+        "user name",
+        "user's name",
+        "their name",
+        "his name",
+        "her name",
+        "that name",
+        "another name",
+        "not your name",
+        "didn't ask",
+        "did not ask",
+        "i asked you for",
+        "i was asking",
+        "you are confused",
+        "you're confused",
+    )
+    if any(term in t for term in non_companion_referents):
+        return False
+
+    # Require an explicit companion-self referent.  A bare ``name`` is not
+    # sufficient because it may refer to the host or another person.
+    companion_referents = (
+        "your name",
+        "companion name",
+        "companion's name",
+        "companions name",
+        "your first name",
+        "you pronounce your",
+        "you pronounced your",
+    )
+    return any(term in t for term in companion_referents)
 
 
 def _chat_authoritative_phonetic_reply(session_state: Dict[str, Any], user_text: str) -> str:
-    """Return a deterministic pronunciation answer when the user asks directly.
+    """Return a warm deterministic answer for a clear own-name question.
 
-    This avoids the LLM inventing variants such as ah-LEE-yah vs uh-LEE-yah.
+    Ambiguous and corrective pronunciation turns intentionally bypass this
+    shortcut and proceed through the normal LLM path with the authoritative
+    pronunciation guidance block.
     """
     if not _chat_user_asks_companion_name_pronunciation(user_text):
         return ""
@@ -10171,7 +10231,7 @@ def _chat_authoritative_phonetic_reply(session_state: Dict[str, Any], user_text:
     phonetic = str(ctx.get("phonetic") or "").strip()
     if not name or not phonetic:
         return ""
-    return f'My name, {name}, is pronounced "{phonetic}."'
+    return f'Sure—my name is {name}, pronounced "{phonetic}."'
 
 
 
