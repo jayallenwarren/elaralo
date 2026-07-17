@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.65: hide Connect Email for every AI Companion; preserve Email for Human Companions; surface the D-ID allowed-domain failure in the Video panel instead of leaving a black frame; no STT, TTS, microphone, audio playback, LiveKit, attachment, charging, or PayGo behavior changed.
 // v10.0.0-alpha15.60: preserve alpha15.59 first-tap Send and accepted mobile geometry; restore the existing iOS TTS audio-route priming synchronously on the Send pointer gesture before propagation is stopped; no TTS gain, voice, endpoint, media playback, STT, microphone, LiveKit, attachment, charging, or PayGo implementation changed.
 // v10.0.0-alpha15.58: preserve the accepted alpha15.54 initial geometry; keep native input focus; dock only the real composer row above the iOS keyboard without moving the conversation panel or rail; stop Enter/Return from sending so only the Send button starts a conversation; no protected media behavior changed.
 // v10.0.0-alpha15.54: match the approved measured mobile geometry across responsive and classic Wix runtimes, preserve DulceMoon's wider portrait at the same apparent height, keep the conversation as the only chat-scroll surface, and let iOS settle to a visible composer focus position instead of pinning the outer page before the keyboard opens; no protected media behavior changed.
@@ -9,7 +10,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.60";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.65";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -1934,6 +1935,25 @@ function formatDidError(err: any): string {
   } catch (e) {
     return String(err);
   }
+}
+
+function formatDidConnectionError(err: any): string {
+  const raw = formatDidError(err).trim();
+  const lower = raw.toLowerCase();
+  const looksLikeBrowserAuthorizationFailure =
+    lower.includes("failed to fetch") ||
+    lower.includes("cors") ||
+    lower.includes("access-control-allow-origin") ||
+    lower.includes("networkerror");
+
+  if (!looksLikeBrowserAuthorizationFailure) return raw || "Failed to start Live Avatar.";
+
+  let origin = "this application origin";
+  try {
+    if (typeof window !== "undefined" && window.location?.origin) origin = window.location.origin;
+  } catch {}
+
+  return `D-ID has not authorized ${origin}. Add this exact origin to the Agent client key's allowed domains, then try Video again.`;
 }
 
 const UPGRADE_URL = process.env.NEXT_PUBLIC_UPGRADE_URL || "https://www.elaralo.com/pricing-plans/list";
@@ -6218,6 +6238,24 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 	      )
 	  );
 
+
+  const resolvedCompanionType = useMemo<"AI" | "Human">(() => {
+    const mapped = normalizeCompanionTypeHint(
+      (companionMapping as any)?.companion_type ?? (companionMapping as any)?.companionType ?? ""
+    );
+    if (mapped) return mapped;
+
+    const selected = normalizeCompanionTypeHint(selectedCompanionType);
+    if (selected) return selected;
+
+    if (isAiCompanionFilenameKey(companionKey || selectedMappingAvatar || companionName)) return "AI";
+
+    // Preserve the existing display fallback while mapping data is still loading.
+    return "AI";
+  }, [companionMapping, selectedCompanionType, companionKey, selectedMappingAvatar, companionName]);
+
+  const isAiCompanion = resolvedCompanionType === "AI";
+
 	  const hostConsolePublicFirstName = useMemo(() => {
 	    const m: any = companionMapping || {};
 	    const candidates = [
@@ -6263,6 +6301,15 @@ const [hostConsoleOpen, setHostConsoleOpen] = useState<boolean>(false);
   type ConnectEmailThread = { thread_id: string; subject: string; counterparty: string; updated_epoch: number; user_display_name?: string; host_first_name?: string };
   type ConnectEmailMessage = { message_id: string; sender_role: "user" | "host"; sender_display_name?: string; body: string; created_epoch: number };
   const [conversationPanelTab, setConversationPanelTab] = useState<ConversationPanelTab>("convo");
+
+  useEffect(() => {
+    // Product rule: Connect Email is a Human Companion / Host capability.
+    // If the user switches from a Human Companion while Email is open, return
+    // immediately to the AI Companion's Persona conversation workspace.
+    if (!isAiCompanion || conversationPanelTab !== "email") return;
+    setConversationPanelTab("convo");
+    setExperienceView("persona");
+  }, [isAiCompanion, conversationPanelTab]);
   const [connectEmailAddress, setConnectEmailAddress] = useState<string>("");
   const [connectEmailThreads, setConnectEmailThreads] = useState<ConnectEmailThread[]>([]);
   const [connectEmailSelectedThreadId, setConnectEmailSelectedThreadId] = useState<string>("");
@@ -7179,7 +7226,7 @@ const reconnectLiveAvatar = useCallback(async () => {
   } catch (err: any) {
     console.error("D-ID reconnect failed", err);
     setAvatarStatus("idle");
-    setAvatarError(`Live Avatar reconnect failed: ${formatDidError(err)}`);
+    setAvatarError(`Live Avatar reconnect failed: ${formatDidConnectionError(err)}`);
   } finally {
     didReconnectInFlightRef.current = false;
   }
@@ -7456,7 +7503,7 @@ if (!didAvatarMedia) {
             return;
           }
           setAvatarStatus("error");
-          setAvatarError(formatDidError(err));
+          setAvatarError(formatDidConnectionError(err));
         },
       },
       streamOptions: { compatibilityMode: "auto", streamWarmup: true },
@@ -7466,8 +7513,9 @@ if (!didAvatarMedia) {
     didAgentMgrRef.current = mgr;
     await mgr.connect();
   } catch (e) {
+    console.error("D-ID Live Avatar start failed", e);
     setAvatarStatus("error");
-    setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
+    setAvatarError(formatDidConnectionError(e));
     didAgentMgrRef.current = null;
   }
 }, [didAvatarMedia, avatarStatus, liveProvider, streamUrl, companyName, companionName, reconnectLiveAvatar, ensureIphoneAudioContextUnlocked, applyIphoneLiveAvatarAudioBoost, requestLivekitAvPermissions]);
@@ -15597,10 +15645,7 @@ const modePillControls = (
   ) : null;
 
   const companyHomeHref = connectBrandConfig.homeUrl;
-  const companionTypeBadgeLabel =
-    String((companionMapping?.companion_type ?? companionMapping?.companionType ?? "") || "").toLowerCase() === "human"
-      ? "Human"
-      : "AI";
+  const companionTypeBadgeLabel = resolvedCompanionType;
   const companionTypeBadge = (
     <span
       style={{
@@ -16683,7 +16728,7 @@ const modePillControls = (
           {([
             { key: "persona", label: "Persona", enabled: true },
             { key: "video", label: "Video", enabled: videoExperienceAvailable },
-            { key: "email", label: "Email", enabled: true },
+            ...(!isAiCompanion ? [{ key: "email", label: "Email", enabled: true }] : []),
             ...(isHostConsoleUser ? [{ key: "host", label: "Host", enabled: true }] : []),
           ] as Array<{ key: "persona" | "video" | "email" | "host"; label: string; enabled: boolean }>).map((item) => {
             const selected =
@@ -17649,7 +17694,31 @@ const modePillControls = (
                   ) : null
                 ) : null}
 
-				{showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
+				{showAvatarFrame && liveProvider === "d-id" && avatarStatus === "error" && avatarError ? (
+                  <div
+                    role="alert"
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      background: "rgba(0,0,0,0.82)",
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      color: "#fff",
+                      padding: 24,
+                      textAlign: "center",
+                      gap: 10,
+                    }}
+                  >
+                    <div style={{ fontSize: 18, fontWeight: 900 }}>Live Avatar unavailable</div>
+                    <div style={{ maxWidth: 520, fontSize: 13, lineHeight: 1.5, opacity: 0.92 }}>
+                      {avatarError}
+                    </div>
+                  </div>
+                ) : null}
+
+                {showAvatarFrame && (avatarStatus === "connecting" || avatarStatus === "waiting" || avatarStatus === "reconnecting") && !(liveProvider === "stream" && sessionKind === "conference" && livekitRole === "viewer" && Boolean(livekitJoinRequestId)) ? (
                   <div
                     style={{
                       position: "absolute",
