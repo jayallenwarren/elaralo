@@ -1,7 +1,9 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-// v9.2.21: honor payloadPending/waitForPayload so DulceMoon paid members do not auto-open as Trial before Wix plan payload arrives.
+// v9.2.21: honor payloadPending/waitForPayload so paid members do not auto-open as Trial before Wix plan payload arrives.
+// v9.2.28: count only selectable Human and AI companions together for every brand. Exactly one combined Human+AI companion auto-opens; zero or more than one remains on the selector.
+// v9.2.29: distinguish the true zero-companion state from a no-filter-match state so users always receive an explicit availability message.
 
 type MemberPlanPayload = {
   loggedIn?: boolean;
@@ -403,8 +405,9 @@ function buildCompanionListReturnUrl(brand: string): string {
   try {
     const url = new URL(window.location.href);
 
-    // Returning from Connect should show the list and must not immediately
-    // auto-open the same single human companion again.
+    // Preserve an explicit selector-return marker. The catalog count remains
+    // authoritative: exactly one selectable companion still opens directly,
+    // while more than one companion remains on the selector.
     for (const name of ["autoOpenSingle", "auto_open_single", "autoOpen", "auto_open"]) {
       url.searchParams.delete(name);
     }
@@ -441,8 +444,6 @@ export default function MyElaraloCompanionSelectorClient() {
   const [externalPayloadSeen, setExternalPayloadSeen] = useState<boolean>(false);
   const [contextGraceElapsed, setContextGraceElapsed] = useState<boolean>(false);
   const autoOpenedSingleRef = useRef<boolean>(false);
-  const autoOpenSingle = useMemo(() => readQueryFlag("autoOpenSingle", "auto_open_single", "autoOpen", "auto_open"), []);
-  const forceSelector = useMemo(() => readQueryFlag("forceSelector", "force_selector", "showSelector", "show_selector", "showCompanionList", "show_companion_list"), []);
   const payloadPending = useMemo(() => readQueryFlag("payloadPending", "payload_pending", "waitForPayload", "wait_for_payload"), []);
   const [payloadPendingGraceElapsed, setPayloadPendingGraceElapsed] = useState<boolean>(!payloadPending);
 
@@ -502,10 +503,9 @@ export default function MyElaraloCompanionSelectorClient() {
   const brandName = safeText(memberPayload.brand) || "Elaralo";
   const brandKey = safeLower(brandName || "Elaralo").replace(/[^a-z0-9]+/g, "");
   const isElaraloCoreBrand = brandKey === "elaralo";
-  // DulceMoon should behave like the Elaralo companion architecture while
-  // preserving the current product UX: when there is only one visible
-  // companion, open Connect directly for both members and visitors.
-  const shouldAutoOpenSingle = !forceSelector && (autoOpenSingle || (!isElaraloCoreBrand && brandKey === "dulcemoon"));
+  // Brand-neutral selector rule: the loaded catalog decides whether the
+  // selector is bypassed. Provider flags, brand names, and stale return-query
+  // parameters must not override a single selectable companion.
   const sessionDisplayName = displayName || (memberId && !isAnonMemberId(memberId) ? memberId : "");
 
   useEffect(() => {
@@ -533,15 +533,6 @@ export default function MyElaraloCompanionSelectorClient() {
         // the viewer is logged in but member context has not arrived yet, wait
         // briefly; otherwise treat the request as a visitor/free-trial session.
         if (isElaraloCoreBrand && loggedIn && !externalPayloadSeen && !contextGraceElapsed) {
-          setError("");
-          setLoading(true);
-          return;
-        }
-        // White-label brands such as DulceMoon must support visitor/free-trial
-        // access.  When auto-opening a single companion, briefly wait for the
-        // Wix MEMBER_PLAN payload so the Connect handoff carries plan minutes,
-        // mode entitlement, rebrandingKey, and member/visitor identity.
-        if (shouldAutoOpenSingle && !externalPayloadSeen && !contextGraceElapsed) {
           setError("");
           setLoading(true);
           return;
@@ -578,42 +569,42 @@ export default function MyElaraloCompanionSelectorClient() {
     return () => {
       cancelled = true;
     };
-  }, [API_BASE, brandName, contextGraceElapsed, externalPayloadSeen, isElaraloCoreBrand, loggedIn, memberId, payloadPending, payloadPendingGraceElapsed, shouldAutoOpenSingle]);
+  }, [API_BASE, brandName, contextGraceElapsed, externalPayloadSeen, isElaraloCoreBrand, loggedIn, memberId, payloadPending, payloadPendingGraceElapsed]);
 
-  const companionTypeOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.companionType).filter(Boolean))).sort(), [cards]);
-  const generationOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.generation).filter(Boolean))).sort(), [cards]);
-  const ethnicityOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.ethnicity).filter(Boolean))).sort(), [cards]);
-  const genderOptions = useMemo(() => Array.from(new Set(cards.map((card) => card.gender).filter(Boolean))).sort(), [cards]);
+  // Only selectable Human and AI companions count toward selection. Human and
+  // AI are combined into one total, which is the single source of truth for
+  // auto-open, Switch visibility, and return-to-selector metadata.
+  const selectableCards = useMemo(
+    () =>
+      cards.filter((card) => {
+        if (card.catalogHidden) return false;
+        const companionType = safeLower(card.companionType);
+        return companionType === "human" || companionType === "ai";
+      }),
+    [cards],
+  );
+
+  const companionTypeOptions = useMemo(() => Array.from(new Set(selectableCards.map((card) => card.companionType).filter(Boolean))).sort(), [selectableCards]);
+  const generationOptions = useMemo(() => Array.from(new Set(selectableCards.map((card) => card.generation).filter(Boolean))).sort(), [selectableCards]);
+  const ethnicityOptions = useMemo(() => Array.from(new Set(selectableCards.map((card) => card.ethnicity).filter(Boolean))).sort(), [selectableCards]);
+  const genderOptions = useMemo(() => Array.from(new Set(selectableCards.map((card) => card.gender).filter(Boolean))).sort(), [selectableCards]);
 
   const filteredCards = useMemo(() => {
-    return cards.filter((card) => {
+    return selectableCards.filter((card) => {
       if (companionTypeFilter && safeLower(card.companionType) !== safeLower(companionTypeFilter)) return false;
       if (generationFilter && safeLower(card.generation) !== safeLower(generationFilter)) return false;
       if (ethnicityFilter && safeLower(card.ethnicity) !== safeLower(ethnicityFilter)) return false;
       if (genderFilter && safeLower(card.gender) !== safeLower(genderFilter)) return false;
       return true;
     });
-  }, [cards, companionTypeFilter, ethnicityFilter, genderFilter, generationFilter]);
+  }, [selectableCards, companionTypeFilter, ethnicityFilter, genderFilter, generationFilter]);
 
   const companionPayloadHeadshotUrl = useMemo(() => payloadHeadshotUrl(memberPayload), [memberPayload]);
-  const selectableCompanionCount = useMemo(() => cards.length, [cards]);
+  const selectableCompanionCount = selectableCards.length;
 
   const autoOpenCard = useMemo(() => {
-    if (!shouldAutoOpenSingle) return null;
-    const visibleCards = filteredCards.filter((card) => !card.catalogHidden);
-    if (visibleCards.length === 1) return visibleCards[0];
-
-    // DulceMoon product rule: while only one Human companion exists for the
-    // brand, open that Human companion directly for both members and visitors.
-    // This keeps the current one-companion DulceMoon UX while still allowing a
-    // selector when more visible Human companions are added later.
-    if (brandKey === "dulcemoon") {
-      const visibleHumans = visibleCards.filter((card) => safeLower(card.companionType) === "human");
-      if (visibleHumans.length === 1) return visibleHumans[0];
-    }
-
-    return null;
-  }, [brandKey, filteredCards, shouldAutoOpenSingle]);
+    return selectableCompanionCount === 1 ? selectableCards[0] : null;
+  }, [selectableCards, selectableCompanionCount]);
 
   const imageUrlForCard = useCallback(
     (card: CompanionCardItem) => {
@@ -817,12 +808,12 @@ export default function MyElaraloCompanionSelectorClient() {
 
 
   useEffect(() => {
-    if (!shouldAutoOpenSingle || loading || error || autoOpenedSingleRef.current) return;
-    if (!autoOpenCard) return;
+    if (loading || error || autoOpenedSingleRef.current) return;
+    if (selectableCompanionCount !== 1 || !autoOpenCard) return;
     autoOpenedSingleRef.current = true;
     const timer = window.setTimeout(() => openConnect(autoOpenCard), 80);
     return () => window.clearTimeout(timer);
-  }, [shouldAutoOpenSingle, autoOpenCard, error, loading, openConnect]);
+  }, [autoOpenCard, error, loading, openConnect, selectableCompanionCount]);
 
   const containerStyle: React.CSSProperties = {
     minHeight: "100vh",
@@ -985,10 +976,15 @@ export default function MyElaraloCompanionSelectorClient() {
             <div style={{ fontSize: 16, fontWeight: 700, color: "#991b1b", marginBottom: 8 }}>Unable to load {isElaraloCoreBrand ? "My Elaralo" : brandName} companions</div>
             <div style={{ fontSize: 14, color: "#7f1d1d" }}>{error}</div>
           </section>
+        ) : selectableCompanionCount === 0 ? (
+          <section style={heroStyle}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>No companions are currently available.</div>
+            <div style={{ fontSize: 14, color: "#475569" }}>Please check back soon after companions have been published for this brand.</div>
+          </section>
         ) : filteredCards.length === 0 ? (
           <section style={heroStyle}>
             <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>No companions matched these filters.</div>
-            <div style={{ fontSize: 14, color: "#475569" }}>Adjust the filters or return after additional companions have been published.</div>
+            <div style={{ fontSize: 14, color: "#475569" }}>Adjust or clear the filters to view the available companions.</div>
           </section>
         ) : (
           <section style={gridStyle}>
