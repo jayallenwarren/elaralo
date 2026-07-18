@@ -1,3 +1,4 @@
+# alpha15.69: Elaralo Human Host Console uses canonical companion mapping identity.
 from __future__ import annotations
 
 import os
@@ -17551,6 +17552,18 @@ class ChatRelayPollRequest(BaseModel):
     session_state: Dict[str, Any] = {}
 
 
+def _canonical_host_avatar(brand: str, avatar: str) -> str:
+    """Resolve public/persona aliases to companion_mappings.avatar for host-scoped data."""
+    brand_s = (brand or "").strip()
+    avatar_s = (avatar or "").strip()
+    mapping = (
+        _lookup_companion_mapping_with_aliases(brand_s, avatar_s, "human")
+        or _lookup_companion_mapping_with_aliases(brand_s, avatar_s)
+        or {}
+    )
+    return str(mapping.get("avatar") or avatar_s).strip()
+
+
 def _require_host_member(brand: str, avatar: str, member_id: str) -> str:
     brand_s = (brand or "").strip()
     avatar_s = (avatar or "").strip()
@@ -17780,8 +17793,9 @@ def _dedupe_host_active_session_rows(rows: List[Dict[str, Any]]) -> List[Dict[st
 @app.post("/host/ai-chats/active")
 async def host_ai_chats_active(req: HostAiChatsActiveRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    canonical_avatar = _canonical_host_avatar(req.brand, req.avatar)
 
-    recs = _ai_override_list_active_sessions(req.brand, req.avatar, limit=int(req.limit or 50))
+    recs = _ai_override_list_active_sessions(req.brand, canonical_avatar, limit=int(req.limit or 50))
 
     sessions_out: List[Dict[str, Any]] = []
     for rec in recs:
@@ -18450,17 +18464,19 @@ def _host_insights_list_summaries_sync(
 @app.post("/host/session-insights/users")
 async def host_session_insights_users(req: HostSessionInsightsUsersRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
-    users = await run_in_threadpool(_host_insights_list_users_sync, req.brand, req.avatar, int(req.limit or 100))
+    canonical_avatar = _canonical_host_avatar(req.brand, req.avatar)
+    users = await run_in_threadpool(_host_insights_list_users_sync, req.brand, canonical_avatar, int(req.limit or 100))
     return {"ok": True, "hostMemberId": host_id, "users": users}
 
 
 @app.post("/host/session-insights/summaries")
 async def host_session_insights_summaries(req: HostSessionInsightsSummariesRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    canonical_avatar = _canonical_host_avatar(req.brand, req.avatar)
     rows = await run_in_threadpool(
         _host_insights_list_summaries_sync,
         req.brand,
-        req.avatar,
+        canonical_avatar,
         (req.targetMemberId or ""),
         int(req.limit or 50),
     )
@@ -18470,6 +18486,7 @@ async def host_session_insights_summaries(req: HostSessionInsightsSummariesReque
 @app.post("/host/session-insights/ask")
 async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
+    canonical_avatar = _canonical_host_avatar(req.brand, req.avatar)
 
     question = (req.question or "").strip()
     if not question:
@@ -18483,7 +18500,7 @@ async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
         summaries = await run_in_threadpool(
             _host_insights_list_summaries_sync,
             req.brand,
-            req.avatar,
+            canonical_avatar,
             target_member,
             max(10, min(int(req.limit or 60), 120)),
         )
@@ -18496,7 +18513,7 @@ async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
         users = await run_in_threadpool(
             _host_insights_list_users_sync,
             req.brand,
-            req.avatar,
+            canonical_avatar,
             max(10, min(int(req.limit or 80), 200)),
         )
         # Provide a light-weight overview (last summary per member) to keep tokens down.

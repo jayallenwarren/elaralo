@@ -31,6 +31,7 @@ import {
   getConnectBrandPublicConfigDefaults,
   type ConnectBrandPublicConfig,
 } from "./connectBrandConfig";
+// alpha15.69: canonical Human mapping identity for Elaralo Host Console tracking and Session Insights.
 // v9.1.38: immediate DulceMoon Host Console plan handling + public Intro/Mate/Mature label sanitation for Host Console.
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track, RoomEvent } from "livekit-client";
@@ -6230,6 +6231,14 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 	    return mapped || hinted;
 	  }, [mappedHostMemberId, payloadHostMemberId]);
 
+	  // Host tracking, override, and Session Insights must use the canonical
+	  // companion_mappings.avatar key. The public display name may be different
+	  // (for example, "Sierra Sun" versus canonical mapping key "Sierra").
+	  const hostConsoleMappingAvatar = useMemo(() =>
+	    String(selectedMappingAvatar || companionName || "").trim(),
+	    [selectedMappingAvatar, companionName]
+	  );
+
 	  // Keep the existing mapping-based host flag unchanged for non-console behavior.
 	  // Host Console uses the Wix MEMBER_PLAN host hint so it can appear before
 	  // the async companion_mappings lookup completes.
@@ -6577,14 +6586,14 @@ const saveHostGuidelines = useCallback(async () => {
 
 
 const loadHostInsightsUsers = useCallback(async () => {
-  if (!API_BASE || !isHostConsoleUser || !companyName || !companionName || !memberId) return;
+  if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleMappingAvatar || !memberId) return;
   setHostInsightsLoading(true);
   setHostInsightsError("");
   try {
     const res = await fetch(`${API_BASE}/host/session-insights/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand: companyName, avatar: companionName, memberId }),
+      body: JSON.stringify({ brand: companyName, avatar: hostConsoleMappingAvatar, memberId }),
     });
     const json = await res.json().catch(() => ({}));
     if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
@@ -6594,18 +6603,18 @@ const loadHostInsightsUsers = useCallback(async () => {
   } finally {
     setHostInsightsLoading(false);
   }
-}, [API_BASE, isHostConsoleUser, companyName, companionName, memberId]);
+}, [API_BASE, isHostConsoleUser, companyName, hostConsoleMappingAvatar, memberId]);
 
 const loadHostInsightsSummaries = useCallback(
   async (targetMemberId: string) => {
-    if (!API_BASE || !isHostConsoleUser || !companyName || !companionName || !memberId) return;
+    if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleMappingAvatar || !memberId) return;
     setHostInsightsLoading(true);
     setHostInsightsError("");
     try {
       const res = await fetch(`${API_BASE}/host/session-insights/summaries`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ brand: companyName, avatar: companionName, memberId, targetMemberId }),
+        body: JSON.stringify({ brand: companyName, avatar: hostConsoleMappingAvatar, memberId, targetMemberId }),
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
@@ -6616,11 +6625,11 @@ const loadHostInsightsSummaries = useCallback(
       setHostInsightsLoading(false);
     }
   },
-  [API_BASE, isHostConsoleUser, companyName, companionName, memberId]
+  [API_BASE, isHostConsoleUser, companyName, hostConsoleMappingAvatar, memberId]
 );
 
 const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
-  if (!API_BASE || !isHostConsoleUser || !companyName || !companionName || !memberId) return false;
+  if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleMappingAvatar || !memberId) return false;
   const q = String(rawQuestion || "").trim();
   if (!q) return false;
   setHostInsightsLoading(true);
@@ -6631,7 +6640,7 @@ const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         brand: companyName,
-        avatar: companionName,
+        avatar: hostConsoleMappingAvatar,
         memberId,
         question: q,
         targetMemberId: hostInsightsSelectedMemberId || undefined,
@@ -6647,7 +6656,7 @@ const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
   } finally {
     setHostInsightsLoading(false);
   }
-}, [API_BASE, isHostConsoleUser, companyName, companionName, memberId, hostInsightsSelectedMemberId]);
+}, [API_BASE, isHostConsoleUser, companyName, hostConsoleMappingAvatar, memberId, hostInsightsSelectedMemberId]);
 
 const askHostInsights = useCallback(async () => {
   const q = (hostInsightsQuestion || "").trim();
@@ -8513,7 +8522,7 @@ useEffect(() => {
   const fetchActive = async () => {
     try {
       const brand = (companyName || "").trim();
-      const avatar = (companionName || "").trim();
+      const avatar = hostConsoleMappingAvatar;
       const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
 
       if (!brand || !avatar || !memberId) return;
@@ -8614,7 +8623,7 @@ useEffect(() => {
   const pollSelected = async () => {
     try {
       const brand = (companyName || "").trim();
-      const avatar = (companionName || "").trim();
+      const avatar = hostConsoleMappingAvatar;
       const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
 
       if (!brand || !avatar || !memberId) return;
@@ -8729,7 +8738,7 @@ useEffect(() => {
   hostConsoleOpen,
   isHostConsoleUser,
   companyName,
-  companionName,
+  hostConsoleMappingAvatar,
   hostSelectedSessionId,
   adaptiveHostTranscriptPollDelayMs,
 ]);
@@ -8748,7 +8757,7 @@ const hostSelectSession = (sid: string) => {
 const hostSetOverride = async (enabled: boolean) => {
   try {
     const brand = (companyName || "").trim();
-    const avatar = (companionName || "").trim();
+    const avatar = hostConsoleMappingAvatar;
     const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     const session_id = String(hostSelectedSessionId || "").trim();
 
@@ -8777,7 +8786,7 @@ const hostSendMessage = async () => {
     if (!text) return;
 
     const brand = (companyName || "").trim();
-    const avatar = (companionName || "").trim();
+    const avatar = hostConsoleMappingAvatar;
     const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     const session_id = String(hostSelectedSessionId || "").trim();
 
@@ -9215,7 +9224,7 @@ useEffect(() => {
 
     try {
       const brand = (companyName || "").trim();
-      const avatar = (companionName || "").trim();
+      const avatar = hostConsoleMappingAvatar;
       const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
       const session_id = String(hostSelectedSessionId || "").trim();
 
@@ -10025,7 +10034,7 @@ useEffect(() => {
     topupUnits,
     persistTopupEmail,
     selectedMappingAvatar,
-    companionName,
+    hostConsoleMappingAvatar,
     companionKey,
     selectedCompanionType,
   ]);
@@ -10652,7 +10661,7 @@ useEffect(() => {
     streamEventRef,
     isHost,
     memberIdForLiveChat,
-    companionName,
+    hostConsoleMappingAvatar,
     appendLiveChatMessage,
     sessionKind,
     sessionRoom,
