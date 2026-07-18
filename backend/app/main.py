@@ -1,4 +1,4 @@
-# alpha15.70: Host Console canonical identity and current-user identity isolation.
+# alpha15.73: restore Host Console active-chat and Session Insights brand scoping; repair affected monitoring history; retain alpha15.70 identity isolation.
 from __future__ import annotations
 
 import os
@@ -12681,6 +12681,8 @@ def _ai_override_db_upsert_session(rec: Dict[str, Any]) -> None:
         _ai_override_db_ensure_schema(conn)
         usage_ctx = rec.get("usage_ctx") if isinstance(rec.get("usage_ctx"), dict) else {}
         in_session = rec.get("in_session_summaries") if isinstance(rec.get("in_session_summaries"), list) else []
+        identity_key_value = str(rec.get("identity_key") or "").strip()
+        brand_value = str(rec.get("brand") or "").strip() or _usage_brand_from_identity_key(identity_key_value)
         now = float(rec.get("updated_epoch") or rec.get("last_seen") or time.time())
         conn.execute(
             """
@@ -12692,8 +12694,14 @@ def _ai_override_db_upsert_session(rec: Dict[str, Any]) -> None:
                     WHEN ai_override_sessions.seq IS NULL OR ai_override_sessions.seq < excluded.seq THEN excluded.seq
                     ELSE ai_override_sessions.seq
                   END,
-              brand=excluded.brand,
-              avatar=excluded.avatar,
+              brand=CASE
+                      WHEN trim(COALESCE(excluded.brand, '')) <> '' THEN excluded.brand
+                      ELSE ai_override_sessions.brand
+                    END,
+              avatar=CASE
+                       WHEN trim(COALESCE(excluded.avatar, '')) <> '' THEN excluded.avatar
+                       ELSE ai_override_sessions.avatar
+                     END,
               member_id=excluded.member_id,
               identity_key=excluded.identity_key,
               companion_key=excluded.companion_key,
@@ -12722,10 +12730,10 @@ def _ai_override_db_upsert_session(rec: Dict[str, Any]) -> None:
             (
                 sid,
                 int(rec.get("seq") or 0),
-                str(rec.get("brand") or "").strip(),
+                brand_value,
                 str(rec.get("avatar") or "").strip(),
                 str(rec.get("member_id") or "").strip(),
-                str(rec.get("identity_key") or "").strip(),
+                identity_key_value,
                 str(rec.get("companion_key") or "").strip(),
                 str(rec.get("mode") or "").strip(),
                 1 if bool(rec.get("override_active") is True) else 0,
@@ -12861,9 +12869,40 @@ def _ai_override_get_host(session_id: str) -> str:
 
 
 
+def _monitoring_brand_from_session_state(session_state: Dict[str, Any]) -> str:
+    """Resolve brand scope for Host Console monitoring only.
+
+    This intentionally does not change the shared brand resolver used by
+    protected media paths. An explicit-but-empty RebrandingKey means the default
+    Elaralo brand, but an explicit brand field is honored first for white-label
+    safety.
+    """
+    s = session_state if isinstance(session_state, dict) else {}
+    rk = _extract_rebranding_key(s)
+    if rk:
+        parsed = _parse_rebranding_key(rk) if rk else {}
+        from_key = _normalize_rebranding_key_value(parsed.get("rebranding"))
+        if from_key:
+            return from_key
+
+    explicit = _normalize_rebranding_key_value(
+        _session_get_str(s, "brand", "brandName", "companyName", "company_name", "company")
+    )
+    if explicit:
+        return explicit
+
+    legacy = _normalize_rebranding_key_value(
+        _session_get_str(s, "rebranding", "rebrand", "rebrandingName")
+    )
+    if legacy:
+        return legacy
+
+    return "Elaralo"
+
+
 def _brand_avatar_from_session_state(session_state: Dict[str, Any]) -> Tuple[str, str]:
     s = session_state if isinstance(session_state, dict) else {}
-    brand = _brand_from_session_state(s)
+    brand = _monitoring_brand_from_session_state(s)
     avatar = str(s.get("avatar") or s.get("avatarName") or s.get("avatar_name") or "").strip()
     if not avatar:
         avatar = _avatar_from_session_state(s)
@@ -12909,6 +12948,9 @@ def _ai_override_touch_from_chat(
         return {}
 
     brand, avatar = _brand_avatar_from_session_state(session_state)
+    identity_brand = _usage_brand_from_identity_key(identity_key)
+    if identity_brand:
+        brand = identity_brand
     member_id = _extract_member_id(session_state) or ""
     user_name = _extract_user_name(session_state)
     companion_key = _normalize_companion_key(_extract_companion_raw(session_state))
@@ -13174,7 +13216,10 @@ def _ai_override_list_active_sessions(brand: str, avatar: str, *, limit: int = 5
     out_by_sid: Dict[str, Dict[str, Any]] = {}
     with _AI_OVERRIDE_LOCK:
         mem_items = list(_AI_OVERRIDE_SESSIONS.values())
-    db_items = _ai_override_db_list_sessions(b, a, limit=max(1, min(int(limit or 50) * 3, 200)))
+    # Query by canonical avatar without pre-filtering on brand. Historical
+    # records affected by the explicit-empty RebrandingKey defect have brand=''
+    # but still carry the correct brand inside identity_key.
+    db_items = _ai_override_db_list_sessions("", a, limit=max(1, min(int(limit or 50) * 3, 200)))
 
     for rec in db_items:
         if isinstance(rec, dict):
@@ -13197,9 +13242,21 @@ def _ai_override_list_active_sessions(brand: str, avatar: str, *, limit: int = 5
         last_seen = float(rec.get("last_seen") or 0.0)
         if not last_seen or (now - last_seen) > float(_AI_OVERRIDE_ACTIVE_WINDOW_S or 0):
             continue
-        if b and str(rec.get("brand") or "").strip() != b:
+
+        effective_brand = str(rec.get("brand") or "").strip()
+        if not effective_brand:
+            effective_brand = _usage_brand_from_identity_key(rec.get("identity_key"))
+        if not effective_brand and b and str(rec.get("avatar") or "").strip().lower() == a.lower():
+            # The request has already been authorized against the brand/avatar
+            # mapping, so this is a safe recovery path for legacy blank-brand
+            # records that predate brand-scoped identity keys.
+            effective_brand = b
+        if effective_brand:
+            rec["brand"] = effective_brand
+
+        if b and effective_brand.lower() != b.lower():
             continue
-        if a and str(rec.get("avatar") or "").strip() != a:
+        if a and str(rec.get("avatar") or "").strip().lower() != a.lower():
             continue
         out.append(rec)
 
@@ -13839,11 +13896,34 @@ async def save_chat_summary(request: Request):
     _CHAT_SUMMARY_STORE[key] = record
     _persist_summary_store()
 
-    # Persist each saved summary snapshot for Host session insights
+    # Persist each saved summary snapshot for Host session insights. Prefer the
+    # durable active-session scope because it includes the brand-scoped identity
+    # key and canonical mapping avatar used by Host Console.
     try:
+        monitoring_rec = _ai_override_get_session(session_id) or {}
+        monitoring_identity_brand = _usage_brand_from_identity_key(monitoring_rec.get("identity_key"))
+        monitoring_brand = (
+            str(monitoring_rec.get("brand") or "").strip()
+            or monitoring_identity_brand
+            or _monitoring_brand_from_session_state(session_state)
+            or "Elaralo"
+        )
+        state_avatar = _avatar_from_session_state(session_state)
+        session_avatar = str(monitoring_rec.get("avatar") or "").strip()
+        monitoring_avatar = state_avatar or session_avatar
+        if (
+            session_avatar
+            and session_avatar.lower() != "elara"
+            and str(state_avatar or "").strip().lower() == "elara"
+        ):
+            # Elara is the default fallback avatar. If the durable session says
+            # the conversation is with a different companion, use that canonical
+            # avatar so the Principal sees the summary in the correct console.
+            monitoring_avatar = session_avatar
+
         _summary_history_insert(
-            brand=_brand_from_session_state(session_state),
-            avatar=_avatar_from_session_state(session_state),
+            brand=monitoring_brand,
+            avatar=monitoring_avatar,
             member_id=str(session_state.get("memberId") or session_state.get("member_id") or ""),
             user_name=_extract_user_name(session_state),
             session_id=session_id,
@@ -26496,6 +26576,7 @@ _STARTUP_MIGRATION_COMPANION_AVATAR_IDENTITY_V9_2_18 = "v9_2_18_companion_avatar
 _STARTUP_MIGRATION_AI_ROW_OWNERSHIP_HYGIENE_V9_2_22 = "v9_2_22_companion_ai_row_ownership_hygiene"
 _STARTUP_MIGRATION_COMPANION_CATALOG_VISIBILITY_V9_2_30 = "v9_2_30_companion_catalog_visibility_defaults"
 _STARTUP_MIGRATION_HUMAN_MAPPING_BRAND_HOST_DEDUPE_V10_ALPHA7 = "v10_0_0_alpha7_human_mapping_brand_host_dedupe"
+_STARTUP_MIGRATION_HOST_MONITORING_SCOPE_REPAIR_ALPHA15_73 = "v10_0_0_alpha15_73_host_monitoring_scope_repair"
 
 
 def _startup_migrations_ensure_table_on_conn(conn: sqlite3.Connection) -> None:
@@ -26998,6 +27079,158 @@ def _startup_run_human_mapping_brand_host_dedupe_on_conn(conn: sqlite3.Connectio
         changes.append({"action": "unique_index_create_failed", "error": repr(exc)})
     return {"changes": changes, "change_count": len(changes)}
 
+
+
+def _startup_run_host_monitoring_scope_repair_on_conn(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Repair Host Console monitoring rows written with an empty brand.
+
+    The affected records are not missing: their brand-scoped identity keys and
+    session IDs still identify the correct Elaralo conversation. This migration
+    restores that scope in ai_override_sessions and chat_summary_history so
+    active monitoring and Prepared AI history become visible again.
+    """
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    table_names = {
+        str(row[0] or "").strip()
+        for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    details: Dict[str, Any] = {
+        "session_brand_updates": 0,
+        "summary_brand_updates": 0,
+        "summary_default_avatar_updates": 0,
+        "session_updates": [],
+        "summary_updates": [],
+    }
+
+    def unique_mapping_brand(avatar: Any) -> str:
+        avatar_s = str(avatar or "").strip()
+        if not avatar_s or "companion_mappings" not in table_names:
+            return ""
+        rows = cur.execute(
+            """
+            SELECT DISTINCT trim(COALESCE(brand, '')) AS brand
+              FROM companion_mappings
+             WHERE lower(trim(COALESCE(avatar, ''))) = lower(?)
+               AND trim(COALESCE(brand, '')) <> ''
+            """,
+            (avatar_s,),
+        ).fetchall()
+        brands = [str(row[0] or "").strip() for row in rows or [] if str(row[0] or "").strip()]
+        return brands[0] if len(brands) == 1 else ""
+
+    blank_summary_ids: Set[int] = set()
+
+    if "ai_override_sessions" in table_names:
+        session_rows = cur.execute(
+            """
+            SELECT session_id, avatar, identity_key
+              FROM ai_override_sessions
+             WHERE trim(COALESCE(brand, '')) = ''
+            """
+        ).fetchall()
+        for row in session_rows or []:
+            sid = str(row["session_id"] or "").strip()
+            avatar = str(row["avatar"] or "").strip()
+            brand = _usage_brand_from_identity_key(row["identity_key"]) or unique_mapping_brand(avatar)
+            if not sid or not brand:
+                continue
+            cur.execute(
+                """
+                UPDATE ai_override_sessions
+                   SET brand = ?
+                 WHERE session_id = ?
+                   AND trim(COALESCE(brand, '')) = ''
+                """,
+                (brand, sid),
+            )
+            if cur.rowcount:
+                details["session_brand_updates"] += int(cur.rowcount or 0)
+                details["session_updates"].append({"session_id": sid, "brand": brand, "avatar": avatar})
+
+    if "chat_summary_history" in table_names:
+        summary_rows = cur.execute(
+            """
+            SELECT id, session_id, avatar
+              FROM chat_summary_history
+             WHERE trim(COALESCE(brand, '')) = ''
+            """
+        ).fetchall()
+        blank_summary_ids = {int(row["id"]) for row in summary_rows or []}
+
+        for row in summary_rows or []:
+            row_id = int(row["id"])
+            sid = str(row["session_id"] or "").strip()
+            avatar = str(row["avatar"] or "").strip()
+            brand = ""
+            if sid and "ai_override_sessions" in table_names:
+                session_row = cur.execute(
+                    """
+                    SELECT brand, identity_key
+                      FROM ai_override_sessions
+                     WHERE session_id = ?
+                     LIMIT 1
+                    """,
+                    (sid,),
+                ).fetchone()
+                if session_row:
+                    brand = (
+                        str(session_row["brand"] or "").strip()
+                        or _usage_brand_from_identity_key(session_row["identity_key"])
+                    )
+            if not brand:
+                brand = unique_mapping_brand(avatar)
+            if not brand:
+                continue
+            cur.execute(
+                """
+                UPDATE chat_summary_history
+                   SET brand = ?
+                 WHERE id = ?
+                   AND trim(COALESCE(brand, '')) = ''
+                """,
+                (brand, row_id),
+            )
+            if cur.rowcount:
+                details["summary_brand_updates"] += int(cur.rowcount or 0)
+                details["summary_updates"].append({"id": row_id, "brand": brand, "avatar": avatar, "session_id": sid})
+
+        # One affected Site Admin summary was stored under the default Elara
+        # fallback even though the durable session was canonically Sierra. Repair
+        # only originally blank-brand rows and only this default-avatar pattern;
+        # do not rewrite legitimate multi-companion sessions.
+        if blank_summary_ids and "ai_override_sessions" in table_names:
+            placeholders = ",".join(["?"] * len(blank_summary_ids))
+            avatar_rows = cur.execute(
+                f"""
+                SELECT h.id, h.avatar AS summary_avatar, s.avatar AS session_avatar
+                  FROM chat_summary_history h
+                  JOIN ai_override_sessions s ON s.session_id = h.session_id
+                 WHERE h.id IN ({placeholders})
+                   AND lower(trim(COALESCE(h.avatar, ''))) = 'elara'
+                   AND trim(COALESCE(s.avatar, '')) <> ''
+                   AND lower(trim(COALESCE(s.avatar, ''))) <> 'elara'
+                """,
+                tuple(sorted(blank_summary_ids)),
+            ).fetchall()
+            for row in avatar_rows or []:
+                row_id = int(row["id"])
+                session_avatar = str(row["session_avatar"] or "").strip()
+                if not session_avatar:
+                    continue
+                cur.execute(
+                    "UPDATE chat_summary_history SET avatar = ? WHERE id = ?",
+                    (session_avatar, row_id),
+                )
+                if cur.rowcount:
+                    details["summary_default_avatar_updates"] += int(cur.rowcount or 0)
+
+    # Keep migration details bounded in unusually large databases.
+    details["session_updates"] = details["session_updates"][:100]
+    details["summary_updates"] = details["summary_updates"][:100]
+    return details
+
 def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
     """Run deployment-time DB migrations once per DB.
 
@@ -27041,6 +27274,10 @@ def _deployment_run_startup_migrations_sync() -> Dict[str, Any]:
                     (
                         _STARTUP_MIGRATION_HUMAN_MAPPING_BRAND_HOST_DEDUPE_V10_ALPHA7,
                         lambda c: _startup_run_human_mapping_brand_host_dedupe_on_conn(c),
+                    ),
+                    (
+                        _STARTUP_MIGRATION_HOST_MONITORING_SCOPE_REPAIR_ALPHA15_73,
+                        lambda c: _startup_run_host_monitoring_scope_repair_on_conn(c),
                     ),
                 ]
 

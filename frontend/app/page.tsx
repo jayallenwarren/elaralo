@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.72: correct frontend declaration order for the Host Console identity repair; retain alpha15.70 monitoring and identity isolation behavior; no protected media behavior changed.
+// v10.0.0-alpha15.73: restore Host Console active-chat and Session Insights brand scoping by always sending the resolved runtime brand for chat, relay, usage, and summary state; retain alpha15.72 declaration-order and identity-isolation fixes; no protected media behavior changed.
 // v10.0.0-alpha15.66: restore the visible D-ID live-avatar <video> element inside the dedicated Video panel; retain alpha15.65 AI Email-tab hiding and D-ID error messaging; no STT, TTS, microphone, audio-routing, LiveKit, attachment, charging, or PayGo logic changed.
 // v10.0.0-alpha15.60: preserve alpha15.59 first-tap Send and accepted mobile geometry; restore the existing iOS TTS audio-route priming synchronously on the Send pointer gesture before propagation is stopped; no TTS gain, voice, endpoint, media playback, STT, microphone, LiveKit, attachment, charging, or PayGo implementation changed.
 // v10.0.0-alpha15.58: preserve the accepted alpha15.54 initial geometry; keep native input focus; dock only the real composer row above the iOS keyboard without moving the conversation panel or rail; stop Enter/Return from sending so only the Send button starts a conversation; no protected media behavior changed.
@@ -8342,7 +8342,7 @@ useEffect(() => {
         companion_name: companionForBackend,
 
         // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
-        brand: (companyName || "").trim(),
+        brand: (rawBrand || DEFAULT_COMPANY_NAME).trim(),
         avatar: (selectedMappingAvatar || companionName || "").trim(),
         mappingAvatar: (selectedMappingAvatar || companionName || "").trim(),
         mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
@@ -9800,7 +9800,7 @@ useEffect(() => {
         companionName: companionForBackend,
         companion_name: companionForBackend,
   // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
-  brand: (companyName || "").trim(),
+  brand: (rawBrand || DEFAULT_COMPANY_NAME).trim(),
   avatar: (selectedMappingAvatar || companionName || "").trim(),
         mappingAvatar: (selectedMappingAvatar || companionName || "").trim(),
         mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
@@ -12639,7 +12639,7 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
   companionName: companionForBackend,
   companion_name: companionForBackend,
   // Brand/avatar are used by the backend for host override scoping and (optionally) TTS.
-  brand: (companyName || "").trim(),
+  brand: (rawBrand || DEFAULT_COMPANY_NAME).trim(),
   avatar: (selectedMappingAvatar || companionName || "").trim(),
         mappingAvatar: (selectedMappingAvatar || companionName || "").trim(),
         mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
@@ -12825,7 +12825,7 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
       companion: companionForBackend,
       companionName: companionForBackend,
       companion_name: companionForBackend,
-      brand: (companyName || "").trim(),
+      brand: (rawBrand || DEFAULT_COMPANY_NAME).trim(),
       avatar: (selectedMappingAvatar || companionName || "").trim(),
         mappingAvatar: (selectedMappingAvatar || companionName || "").trim(),
         mapping_avatar: (selectedMappingAvatar || companionName || "").trim(),
