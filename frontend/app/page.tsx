@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.70: restore canonical Host Console monitoring identity and prevent companion-name leakage into current-user identity; no protected media behavior changed.
 // v10.0.0-alpha15.66: restore the visible D-ID live-avatar <video> element inside the dedicated Video panel; retain alpha15.65 AI Email-tab hiding and D-ID error messaging; no STT, TTS, microphone, audio-routing, LiveKit, attachment, charging, or PayGo logic changed.
 // v10.0.0-alpha15.60: preserve alpha15.59 first-tap Send and accepted mobile geometry; restore the existing iOS TTS audio-route priming synchronously on the Send pointer gesture before propagation is stopped; no TTS gain, voice, endpoint, media playback, STT, microphone, LiveKit, attachment, charging, or PayGo implementation changed.
 // v10.0.0-alpha15.58: preserve the accepted alpha15.54 initial geometry; keep native input focus; dock only the real composer row above the iOS keyboard without moving the conversation panel or rail; stop Enter/Return from sending so only the Send button starts a conversation; no protected media behavior changed.
@@ -10,7 +11,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.66";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.70";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -31,7 +32,6 @@ import {
   getConnectBrandPublicConfigDefaults,
   type ConnectBrandPublicConfig,
 } from "./connectBrandConfig";
-// alpha15.69: canonical Human mapping identity for Elaralo Host Console tracking and Session Insights.
 // v9.1.38: immediate DulceMoon Host Console plan handling + public Intro/Mate/Mature label sanitation for Host Console.
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track, RoomEvent } from "livekit-client";
@@ -5701,14 +5701,28 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
     return preferredViewerDisplayName || "You";
   }, [preferredViewerDisplayName]);
 
+  const currentUserDisplayName = useMemo(() => {
+    const candidate = String(preferredViewerDisplayName || "").trim();
+    const companionNames = [companionName, companionKey, selectedMappingAvatar]
+      .map((v) => String(v || "").trim().toLowerCase())
+      .filter(Boolean);
+    const collidesWithCompanion = Boolean(candidate) && companionNames.some((name) => {
+      const c = candidate.toLowerCase();
+      return c === name || c === name.split(/[\s-]+/, 1)[0];
+    });
+    if (candidate && !collidesWithCompanion) return candidate;
+    if (isHostConsoleUser) return "Site Admin";
+    return "";
+  }, [preferredViewerDisplayName, companionName, companionKey, selectedMappingAvatar, isHostConsoleUser]);
+
   const buildHostReadableViewerName = useCallback((identityValue?: string) => {
-    if (preferredViewerDisplayName) return preferredViewerDisplayName;
+    if (currentUserDisplayName) return currentUserDisplayName;
     const raw = String(identityValue || "").trim();
     const cleaned = raw.replace(/^Anon:\s*/i, "").trim();
     const base = cleaned || raw;
     const shortId = base ? base.slice(0, 4) : "";
     return `Viewer - ${shortId || "Anon"}`;
-  }, [preferredViewerDisplayName]);
+  }, [currentUserDisplayName]);
 
   const postingAsViewerName = useMemo(() => {
     return buildHostReadableViewerName(String(memberId || "").trim());
@@ -5978,11 +5992,6 @@ useEffect(() => {
           params.set("brand", brand);
           params.set("avatar", lookupAvatar);
           if (requestedType) params.set("companionType", requestedType);
-          // Carry the selected companion identity separately from the SQL avatar.
-          // This lets the backend recover safely when a stale Wix payload supplies
-          // the default AI avatar (Elara) for an explicitly Human companion.
-          if (displayAvatar) params.set("companion", displayAvatar);
-          if (fullKey) params.set("companionKey", fullKey);
           const url = `${API_BASE}/mappings/companion?${params.toString()}`;
           const res = await fetch(url, { method: "GET" });
           const json: any = await res.json().catch(() => ({}));
@@ -6231,14 +6240,6 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 	    return mapped || hinted;
 	  }, [mappedHostMemberId, payloadHostMemberId]);
 
-	  // Host tracking, override, and Session Insights must use the canonical
-	  // companion_mappings.avatar key. The public display name may be different
-	  // (for example, "Sierra Sun" versus canonical mapping key "Sierra").
-	  const hostConsoleMappingAvatar = useMemo(() =>
-	    String(selectedMappingAvatar || companionName || "").trim(),
-	    [selectedMappingAvatar, companionName]
-	  );
-
 	  // Keep the existing mapping-based host flag unchanged for non-console behavior.
 	  // Host Console uses the Wix MEMBER_PLAN host hint so it can appear before
 	  // the async companion_mappings lookup completes.
@@ -6301,6 +6302,11 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 	    }
 	    return "Companion";
 	  }, [companionMapping, selectedMappingAvatar, companionName, companionKey]);
+
+      const hostConsoleCanonicalAvatar = useMemo(() => {
+        const mapped = String((companionMapping as any)?.avatar || selectedMappingAvatar || "").trim();
+        return mapped || String(companionName || companionKey || "").trim();
+      }, [companionMapping, selectedMappingAvatar, companionName, companionKey]);
 
 	  useEffect(() => {
 	    hostMemberIdRef.current = String(effectiveHostMemberIdForConsole || "");
@@ -6377,7 +6383,7 @@ const [hostConsoleOpen, setHostConsoleOpen] = useState<boolean>(false);
       setConnectEmailThreads(Array.isArray(d?.threads) ? d.threads : []);
     } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
     finally { setConnectEmailLoading(false); }
-  }, [API_BASE, companyName, companionName, memberId, connectEmailAddress, connectEmailRole, conversationPanelTab, ensureConnectEmailAddress]);
+  }, [API_BASE, companyName, hostConsoleCanonicalAvatar, memberId, connectEmailAddress, connectEmailRole, conversationPanelTab, ensureConnectEmailAddress]);
 
   useEffect(() => { void loadConnectEmailThreads(); }, [loadConnectEmailThreads]);
 
@@ -6420,7 +6426,7 @@ const [hostConsoleOpen, setHostConsoleOpen] = useState<boolean>(false);
       if (threadId) await openConnectEmailThread(threadId);
     } catch (e: any) { setConnectEmailError(String(e?.message || e)); }
     finally { setConnectEmailLoading(false); }
-  }, [API_BASE, companyName, companionName, memberId, postingAsViewerName, connectEmailAddress, connectEmailDraft, connectEmailRole, connectEmailSelectedThreadId, connectEmailSubject, ensureConnectEmailAddress, loadConnectEmailThreads, openConnectEmailThread]);
+  }, [API_BASE, companyName, hostConsoleCanonicalAvatar, memberId, postingAsViewerName, connectEmailAddress, connectEmailDraft, connectEmailRole, connectEmailSelectedThreadId, connectEmailSubject, ensureConnectEmailAddress, loadConnectEmailThreads, openConnectEmailThread]);
 
   const deleteConnectEmailThread = useCallback(async (threadId: string) => {
     if (!threadId || !window.confirm("Delete this message from your Connect mailbox?")) return;
@@ -6512,7 +6518,7 @@ const loadHostGuidelines = useCallback(async () => {
     if (!API_BASE) return;
 
     const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
+    const avatar = String(hostConsoleCanonicalAvatar || "").trim();
     const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     if (!brand || !avatar || !memberId) return;
 
@@ -6551,7 +6557,7 @@ const saveHostGuidelines = useCallback(async () => {
     if (!API_BASE) return;
 
     const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
+    const avatar = String(hostConsoleCanonicalAvatar || "").trim();
     const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     if (!brand || !avatar || !memberId) return;
 
@@ -6586,14 +6592,14 @@ const saveHostGuidelines = useCallback(async () => {
 
 
 const loadHostInsightsUsers = useCallback(async () => {
-  if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleMappingAvatar || !memberId) return;
+  if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleCanonicalAvatar || !memberId) return;
   setHostInsightsLoading(true);
   setHostInsightsError("");
   try {
     const res = await fetch(`${API_BASE}/host/session-insights/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brand: companyName, avatar: hostConsoleMappingAvatar, memberId }),
+      body: JSON.stringify({ brand: companyName, avatar: hostConsoleCanonicalAvatar, memberId }),
     });
     const json = await res.json().catch(() => ({}));
     if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
@@ -6603,18 +6609,18 @@ const loadHostInsightsUsers = useCallback(async () => {
   } finally {
     setHostInsightsLoading(false);
   }
-}, [API_BASE, isHostConsoleUser, companyName, hostConsoleMappingAvatar, memberId]);
+}, [API_BASE, isHostConsoleUser, companyName, hostConsoleCanonicalAvatar, memberId]);
 
 const loadHostInsightsSummaries = useCallback(
   async (targetMemberId: string) => {
-    if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleMappingAvatar || !memberId) return;
+    if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleCanonicalAvatar || !memberId) return;
     setHostInsightsLoading(true);
     setHostInsightsError("");
     try {
       const res = await fetch(`${API_BASE}/host/session-insights/summaries`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ brand: companyName, avatar: hostConsoleMappingAvatar, memberId, targetMemberId }),
+        body: JSON.stringify({ brand: companyName, avatar: hostConsoleCanonicalAvatar, memberId, targetMemberId }),
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
@@ -6625,11 +6631,11 @@ const loadHostInsightsSummaries = useCallback(
       setHostInsightsLoading(false);
     }
   },
-  [API_BASE, isHostConsoleUser, companyName, hostConsoleMappingAvatar, memberId]
+  [API_BASE, isHostConsoleUser, companyName, hostConsoleCanonicalAvatar, memberId]
 );
 
 const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
-  if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleMappingAvatar || !memberId) return false;
+  if (!API_BASE || !isHostConsoleUser || !companyName || !hostConsoleCanonicalAvatar || !memberId) return false;
   const q = String(rawQuestion || "").trim();
   if (!q) return false;
   setHostInsightsLoading(true);
@@ -6640,7 +6646,7 @@ const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         brand: companyName,
-        avatar: hostConsoleMappingAvatar,
+        avatar: companionName,
         memberId,
         question: q,
         targetMemberId: hostInsightsSelectedMemberId || undefined,
@@ -6656,7 +6662,7 @@ const submitHostInsightsQuestion = useCallback(async (rawQuestion: string) => {
   } finally {
     setHostInsightsLoading(false);
   }
-}, [API_BASE, isHostConsoleUser, companyName, hostConsoleMappingAvatar, memberId, hostInsightsSelectedMemberId]);
+}, [API_BASE, isHostConsoleUser, companyName, hostConsoleCanonicalAvatar, memberId, hostInsightsSelectedMemberId]);
 
 const askHostInsights = useCallback(async () => {
   const q = (hostInsightsQuestion || "").trim();
@@ -6815,7 +6821,7 @@ const askHostInsights = useCallback(async () => {
     await fetch(`${API_BASE}/livekit/admit`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requestId: rid, brand: companyName, avatar: companionName, memberId: memberIdRef.current || "" }),
+      body: JSON.stringify({ requestId: rid, brand: companyName, avatar: hostConsoleCanonicalAvatar, memberId: memberIdRef.current || "" }),
     }).catch(() => {});
   }, [API_BASE, companyName, companionName]);
 
@@ -6825,7 +6831,7 @@ const askHostInsights = useCallback(async () => {
     await fetch(`${API_BASE}/livekit/deny`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requestId: rid, brand: companyName, avatar: companionName, memberId: memberIdRef.current || "" }),
+      body: JSON.stringify({ requestId: rid, brand: companyName, avatar: hostConsoleCanonicalAvatar, memberId: memberIdRef.current || "" }),
     }).catch(() => {});
   }, [API_BASE, companyName, companionName]);
 
@@ -8522,7 +8528,7 @@ useEffect(() => {
   const fetchActive = async () => {
     try {
       const brand = (companyName || "").trim();
-      const avatar = hostConsoleMappingAvatar;
+      const avatar = (hostConsoleCanonicalAvatar || "").trim();
       const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
 
       if (!brand || !avatar || !memberId) return;
@@ -8623,7 +8629,7 @@ useEffect(() => {
   const pollSelected = async () => {
     try {
       const brand = (companyName || "").trim();
-      const avatar = hostConsoleMappingAvatar;
+      const avatar = (hostConsoleCanonicalAvatar || "").trim();
       const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
 
       if (!brand || !avatar || !memberId) return;
@@ -8738,7 +8744,7 @@ useEffect(() => {
   hostConsoleOpen,
   isHostConsoleUser,
   companyName,
-  hostConsoleMappingAvatar,
+  companionName,
   hostSelectedSessionId,
   adaptiveHostTranscriptPollDelayMs,
 ]);
@@ -8757,7 +8763,7 @@ const hostSelectSession = (sid: string) => {
 const hostSetOverride = async (enabled: boolean) => {
   try {
     const brand = (companyName || "").trim();
-    const avatar = hostConsoleMappingAvatar;
+    const avatar = (hostConsoleCanonicalAvatar || "").trim();
     const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     const session_id = String(hostSelectedSessionId || "").trim();
 
@@ -8786,7 +8792,7 @@ const hostSendMessage = async () => {
     if (!text) return;
 
     const brand = (companyName || "").trim();
-    const avatar = hostConsoleMappingAvatar;
+    const avatar = (hostConsoleCanonicalAvatar || "").trim();
     const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
     const session_id = String(hostSelectedSessionId || "").trim();
 
@@ -9224,7 +9230,7 @@ useEffect(() => {
 
     try {
       const brand = (companyName || "").trim();
-      const avatar = hostConsoleMappingAvatar;
+      const avatar = (hostConsoleCanonicalAvatar || "").trim();
       const memberId = String(hostMemberIdRef.current || memberIdRef.current || "").trim();
       const session_id = String(hostSelectedSessionId || "").trim();
 
@@ -9477,7 +9483,7 @@ useEffect(() => {
       String(companionKey || "").trim() || String(companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
     const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
     const planNameForBackend = planName;
-    const userDisplayNameForBackend = buildHostReadableViewerName(mid);
+    const userDisplayNameForBackend = currentUserDisplayName || buildHostReadableViewerName(mid);
     const hostMemberIdForBackend = String(mappedHostMemberId || "").trim();
 
     return {
@@ -9535,7 +9541,7 @@ useEffect(() => {
       assistant_source_language_name: assistantSpeechLanguageName,
       assistantSourceLanguageName: assistantSpeechLanguageName,
     };
-  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, selectedMappingAvatar, selectedCompanionType, companionPhonetic, rebrandingKey, planName, buildHostReadableViewerName, mappedHostMemberId, isHost, loggedIn, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
+  }, [sessionState, companyName, rebranding, memberId, companionKey, companionName, selectedMappingAvatar, selectedCompanionType, companionPhonetic, rebrandingKey, planName, buildHostReadableViewerName, currentUserDisplayName, mappedHostMemberId, isHost, loggedIn, translatorEnabled, userLanguageCode, userLanguageName, userLanguagePreferenceKnown, sttLanguageHintCode, assistantConversationLanguageCode, assistantConversationLanguageName]);
 
   useEffect(() => {
     if (!API_BASE) return;
@@ -10034,7 +10040,7 @@ useEffect(() => {
     topupUnits,
     persistTopupEmail,
     selectedMappingAvatar,
-    hostConsoleMappingAvatar,
+    companionName,
     companionKey,
     selectedCompanionType,
   ]);
@@ -10661,7 +10667,7 @@ useEffect(() => {
     streamEventRef,
     isHost,
     memberIdForLiveChat,
-    hostConsoleMappingAvatar,
+    companionName,
     appendLiveChatMessage,
     sessionKind,
     sessionRoom,
@@ -12320,17 +12326,10 @@ useEffect(() => {
         resolvedStartupName = resolvedCompanionName;
         const resolvedCompanionMetaKey = parsed.key || resolvedCompanionKey;
         const filenameKeyLooksLikeAi = isAiCompanionFilenameKey(resolvedCompanionKey);
-        const humanCompanionIdentity =
-          incomingCompanion || incomingCompanionDisplayName || resolvedCompanionName || resolvedCompanionKey;
-        const staleHumanDefaultAiAvatar =
-          incomingCompanionType === "Human" &&
-          /^elara$/i.test(String(explicitIncomingMappingAvatar || incomingAvatarName || "").trim()) &&
-          !/^elara$/i.test(String(humanCompanionIdentity || "").trim());
         const resolvedMappingAvatar =
-          (staleHumanDefaultAiAvatar ? "" : explicitIncomingMappingAvatar) ||
-          (incomingCompanionType === "Human" ? humanCompanionIdentity : "") ||
+          explicitIncomingMappingAvatar ||
           (filenameKeyLooksLikeAi ? (parsed.first || aiFirstNameFromKey(resolvedCompanionKey)) : "") ||
-          (staleHumanDefaultAiAvatar ? "" : incomingAvatarName) ||
+          incomingAvatarName ||
           incomingCompanion ||
           resolvedCompanionName;
         setCompanionKey(resolvedCompanionMetaKey);
@@ -12921,7 +12920,7 @@ const uploadAttachment = useCallback(
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const brand = String(companyName || "").trim();
-    const avatar = String(companionName || "").trim();
+    const avatar = String(hostConsoleCanonicalAvatar || "").trim();
     const member = String(memberIdForLiveChat || "").trim();
 
     if (!brand || !avatar) throw new Error("Missing brand/avatar for upload");
@@ -12969,7 +12968,7 @@ const uploadAttachment = useCallback(
       blobName: json?.blobName,
     };
   },
-  [API_BASE, companyName, companionName, memberIdForLiveChat]
+  [API_BASE, companyName, hostConsoleCanonicalAvatar, memberIdForLiveChat]
 );
 
 const openUploadPicker = useCallback(() => {

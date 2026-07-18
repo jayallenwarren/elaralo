@@ -1,4 +1,4 @@
-# alpha15.69: Elaralo Human Host Console uses canonical companion mapping identity.
+# alpha15.70: Host Console canonical identity and current-user identity isolation.
 from __future__ import annotations
 
 import os
@@ -1146,6 +1146,99 @@ _PAYG_PAYLINK_MINUTES_MAP = _parse_payg_paylink_minutes_map(_PAYG_PAYLINK_MINUTE
 
 # Admin token for server-side minute credits (payment webhook can call this)
 USAGE_ADMIN_TOKEN = (os.getenv("USAGE_ADMIN_TOKEN", "") or "").strip()
+
+
+# v10.0.0-alpha15.67 Principal / Representative publication benefit
+PRINCIPAL_BENEFIT_ENABLED_ELARALO = str(os.getenv("PRINCIPAL_BENEFIT_ENABLED_ELARALO", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+PRINCIPAL_BENEFIT_ENABLED_AIHAVEN4U = str(os.getenv("PRINCIPAL_BENEFIT_ENABLED_AIHAVEN4U", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+PRINCIPAL_BENEFIT_NOTIFICATION_EMAIL = (os.getenv("PRINCIPAL_BENEFIT_NOTIFICATION_EMAIL", "info@elaralo.com") or "info@elaralo.com").strip()
+PRINCIPAL_BENEFIT_TYPE = "catalog_publication_plan_match"
+
+def _principal_brand_enabled(brand: Any) -> bool:
+    key = re.sub(r"[^a-z0-9]+", "", str(brand or "").lower())
+    if key == "elaralo":
+        return bool(PRINCIPAL_BENEFIT_ENABLED_ELARALO)
+    if key in {"aihaven4u", "aihaven"}:
+        return bool(PRINCIPAL_BENEFIT_ENABLED_AIHAVEN4U)
+    return False
+
+def _principal_qualifying_plan(plan_name: Any) -> str:
+    normalized = _normalize_plan_name_for_limits(str(plan_name or "")).strip()
+    compact = re.sub(r"[^a-z0-9]+", "", normalized.lower())
+    return normalized if compact in {"discover", "explore", "encounter"} else ""
+
+def _principal_ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS principal_publication_benefits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        brand TEXT NOT NULL,
+        member_id TEXT NOT NULL,
+        email TEXT,
+        benefit_type TEXT NOT NULL,
+        plan_name TEXT NOT NULL,
+        bonus_minutes INTEGER NOT NULL,
+        granted_epoch INTEGER NOT NULL,
+        source_event_id TEXT,
+        UNIQUE(brand, member_id, benefit_type)
+      )
+    """)
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS principal_subscription_state (
+        brand TEXT NOT NULL,
+        member_id TEXT NOT NULL,
+        email TEXT,
+        plan_name TEXT,
+        active INTEGER NOT NULL DEFAULT 0,
+        free_offset_applied INTEGER NOT NULL DEFAULT 0,
+        updated_epoch INTEGER NOT NULL,
+        source_event_id TEXT,
+        PRIMARY KEY(brand, member_id)
+      )
+    """)
+
+def _principal_apply_first_paid_transition_sync(identity_key: str, brand: str, plan_name: str) -> Dict[str, Any]:
+    now = time.time()
+    free_minutes = max(0, int(_trial_minutes_for_brand(brand)))
+    with _USAGE_LOCK:
+        store = _load_usage_store()
+        rec = store.get(identity_key)
+        if not isinstance(rec, dict): rec = {}
+        already = bool(rec.get("free_minutes_offset_applied"))
+        before = float(rec.get("used_seconds") or 0.0)
+        after = before
+        if not already:
+            after = max(0.0, before - float(free_minutes * 60))
+            rec["used_seconds"] = after
+            rec["free_minutes_offset_applied"] = True
+            rec["free_minutes_offset_seconds"] = float(free_minutes * 60)
+            rec["free_minutes_offset_applied_at"] = int(now)
+        rec["is_trial"] = False
+        rec["plan_name"] = plan_name
+        rec.setdefault("cycle_start", now)
+        rec["last_seen"] = now
+        store[identity_key] = rec
+        _save_usage_store(store)
+    return {"applied": not already, "free_minutes": free_minutes, "used_seconds_before": before, "used_seconds_after": after}
+
+def _principal_set_catalog_visibility_sync(*, brand: str, member_id: str, visible: bool, reason: str) -> int:
+    conn = _econnect_conn()
+    try:
+        _host_onboarding_ensure_schema(conn)
+        _host_onboarding_ensure_companion_export_columns_on_conn(conn)
+        cur = conn.execute("""
+          UPDATE companion_mappings
+             SET list_in_companion_catalog=?,
+                 catalog_hidden_reason=?,
+                 catalog_visibility_updated_at=?,
+                 catalog_visibility_updated_by=?
+           WHERE lower(COALESCE(brand,''))=lower(?)
+             AND lower(COALESCE(companion_type,''))='human'
+             AND lower(COALESCE(host_member_id,''))=lower(?)
+        """, (1 if visible else 0, None if visible else reason, int(time.time()), member_id, brand, member_id))
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
 
 
 # ----------------------------
@@ -2735,9 +2828,6 @@ async def get_companion_mapping(
     avatar: str = "",
     companionType: str = "",
     companion_type: str = "",
-    companion: str = "",
-    companionKey: str = "",
-    companion_key: str = "",
 ) -> Dict[str, Any]:
     """Lookup a companion mapping row by (brand, avatar).
 
@@ -2771,26 +2861,10 @@ async def get_companion_mapping(
     ai_asset = _elaralo_ai_companion_asset_for_key(b, resolved_ai_key or a, public_base_url=public_base) if is_elaralo else {}
     is_elaralo_ai_media = bool(is_elaralo and (requested_type == "ai" or (requested_type != "human" and (ai_asset or _ai_companion_key_has_metadata(resolved_ai_key or a)))))
 
-    selected_companion = _host_onboarding_safe_str(companion or companionKey or companion_key).strip()
-
     if is_elaralo_ai_media:
         m = _lookup_companion_mapping_for_ai_media(b, a)
     else:
         m = _lookup_companion_mapping_with_aliases(b, a, requested_type) or {}
-
-    # Defensive identity recovery for Human selections. A stale Wix handoff can
-    # carry the default AI avatar (Elara) while correctly carrying the selected
-    # Human companion name. Resolve only within companion_type=Human; never allow
-    # this fallback to cross into an AI mapping row.
-    if not m and requested_type == "human" and selected_companion:
-        m = _lookup_companion_mapping_with_aliases(b, selected_companion, "human") or {}
-        if m:
-            print(
-                "[mappings] recovered Human companion identity "
-                f"brand={b!r} stale_avatar={a!r} companion={selected_companion!r} "
-                f"resolved_avatar={_host_onboarding_safe_str(m.get('avatar'))!r}"
-            )
-
     if not m:
         alias_candidates = _companion_mapping_lookup_avatar_candidates(a)
         candidate_note = ""
@@ -13553,7 +13627,9 @@ def _chat_identity_system_blocks(session_state: Dict[str, Any]) -> List[str]:
               "If the current user asks for their username or display name, answer with this exact value. "
               "Use this value for account/session identification only. Host AI guidelines remain the primary reference for identity facts, including real name, stage name, preferred persona name, and relationship framing. "
               "Do not replace identity facts that the user directly provides or that host AI guidelines explicitly provide. "
-              "Do not claim that you cannot access the current user's username when this note is present."
+              "Do not claim that you cannot access the current user's username when this note is present. "
+              "Never address the current user by the companion, avatar, public persona, Principal, or Representative name unless that exact name was independently supplied as the current user's display name. "
+              "The companion identity and current-user identity are separate roles."
         )
 
     if is_host:
@@ -17552,16 +17628,22 @@ class ChatRelayPollRequest(BaseModel):
     session_state: Dict[str, Any] = {}
 
 
-def _canonical_host_avatar(brand: str, avatar: str) -> str:
-    """Resolve public/persona aliases to companion_mappings.avatar for host-scoped data."""
+def _resolve_host_console_mapping(brand: str, avatar: str) -> Dict[str, Any]:
+    """Resolve a Host Console caller's public alias to the canonical mapping row."""
     brand_s = (brand or "").strip()
     avatar_s = (avatar or "").strip()
-    mapping = (
+    if not brand_s or not avatar_s:
+        return {}
+    return (
         _lookup_companion_mapping_with_aliases(brand_s, avatar_s, "human")
         or _lookup_companion_mapping_with_aliases(brand_s, avatar_s)
         or {}
     )
-    return str(mapping.get("avatar") or avatar_s).strip()
+
+
+def _canonical_host_console_avatar(brand: str, avatar: str) -> str:
+    mapping = _resolve_host_console_mapping(brand, avatar)
+    return str(mapping.get("avatar") or avatar or "").strip()
 
 
 def _require_host_member(brand: str, avatar: str, member_id: str) -> str:
@@ -17576,11 +17658,7 @@ def _require_host_member(brand: str, avatar: str, member_id: str) -> str:
     # provider key/first name such as "Sierra". Host authorization should
     # resolve through the same alias-aware mapping helper used by runtime
     # companion resolution instead of requiring an exact display-name match.
-    mapping = (
-        _lookup_companion_mapping_with_aliases(brand_s, avatar_s, "human")
-        or _lookup_companion_mapping_with_aliases(brand_s, avatar_s)
-        or {}
-    )
+    mapping = _resolve_host_console_mapping(brand_s, avatar_s)
     host_id = str(mapping.get("host_member_id") or mapping.get("hostMemberId") or "").strip()
     if not host_id:
         raise HTTPException(status_code=404, detail="No host_member_id configured for this companion mapping")
@@ -17793,8 +17871,8 @@ def _dedupe_host_active_session_rows(rows: List[Dict[str, Any]]) -> List[Dict[st
 @app.post("/host/ai-chats/active")
 async def host_ai_chats_active(req: HostAiChatsActiveRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
-    canonical_avatar = _canonical_host_avatar(req.brand, req.avatar)
 
+    canonical_avatar = _canonical_host_console_avatar(req.brand, req.avatar)
     recs = _ai_override_list_active_sessions(req.brand, canonical_avatar, limit=int(req.limit or 50))
 
     sessions_out: List[Dict[str, Any]] = []
@@ -18464,7 +18542,7 @@ def _host_insights_list_summaries_sync(
 @app.post("/host/session-insights/users")
 async def host_session_insights_users(req: HostSessionInsightsUsersRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
-    canonical_avatar = _canonical_host_avatar(req.brand, req.avatar)
+    canonical_avatar = _canonical_host_console_avatar(req.brand, req.avatar)
     users = await run_in_threadpool(_host_insights_list_users_sync, req.brand, canonical_avatar, int(req.limit or 100))
     return {"ok": True, "hostMemberId": host_id, "users": users}
 
@@ -18472,11 +18550,10 @@ async def host_session_insights_users(req: HostSessionInsightsUsersRequest):
 @app.post("/host/session-insights/summaries")
 async def host_session_insights_summaries(req: HostSessionInsightsSummariesRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
-    canonical_avatar = _canonical_host_avatar(req.brand, req.avatar)
     rows = await run_in_threadpool(
         _host_insights_list_summaries_sync,
         req.brand,
-        canonical_avatar,
+        _canonical_host_console_avatar(req.brand, req.avatar),
         (req.targetMemberId or ""),
         int(req.limit or 50),
     )
@@ -18486,7 +18563,6 @@ async def host_session_insights_summaries(req: HostSessionInsightsSummariesReque
 @app.post("/host/session-insights/ask")
 async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
     host_id = _require_host_member(req.brand, req.avatar, req.memberId)
-    canonical_avatar = _canonical_host_avatar(req.brand, req.avatar)
 
     question = (req.question or "").strip()
     if not question:
@@ -18500,7 +18576,7 @@ async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
         summaries = await run_in_threadpool(
             _host_insights_list_summaries_sync,
             req.brand,
-            canonical_avatar,
+            _canonical_host_console_avatar(req.brand, req.avatar),
             target_member,
             max(10, min(int(req.limit or 60), 120)),
         )
@@ -18513,7 +18589,7 @@ async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
         users = await run_in_threadpool(
             _host_insights_list_users_sync,
             req.brand,
-            canonical_avatar,
+            _canonical_host_console_avatar(req.brand, req.avatar),
             max(10, min(int(req.limit or 80), 200)),
         )
         # Provide a light-weight overview (last summary per member) to keep tokens down.
@@ -30008,6 +30084,82 @@ async def my_elaralo_companions_catalog(
             pass
     return payload
 
+
+@app.post("/principal/subscription-state")
+async def principal_subscription_state(request: Request):
+    token=(request.headers.get("x-api-key") or "").strip()
+    if not WIX_API_KEY or token != WIX_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    raw=await request.json()
+    brand=_stripe_paygo_brand(raw.get("brand") or "Elaralo")
+    member_id=_host_onboarding_safe_str(raw.get("memberId") or raw.get("member_id"))
+    email=_stripe_paygo_email_norm(raw.get("email"))
+    plan_name=_principal_qualifying_plan(raw.get("planName") or raw.get("plan_name"))
+    active=bool(_bool_from_any(raw.get("active"), default=False)) and bool(plan_name)
+    event_id=_host_onboarding_safe_str(raw.get("eventId") or raw.get("event_id"))
+    if not member_id: raise HTTPException(status_code=400, detail="memberId is required")
+    identity_key=_usage_identity_key_for_brand(brand=brand, member_id=member_id, email=email)
+    transition={"applied": False}
+    if active:
+        transition=await run_in_threadpool(_principal_apply_first_paid_transition_sync, identity_key, brand, plan_name)
+    conn=_econnect_conn()
+    try:
+        _principal_ensure_schema(conn)
+        conn.execute("""INSERT INTO principal_subscription_state(brand,member_id,email,plan_name,active,free_offset_applied,updated_epoch,source_event_id)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(brand,member_id) DO UPDATE SET email=excluded.email,plan_name=excluded.plan_name,active=excluded.active,free_offset_applied=MAX(principal_subscription_state.free_offset_applied,excluded.free_offset_applied),updated_epoch=excluded.updated_epoch,source_event_id=excluded.source_event_id""",
+        (brand,member_id,email,plan_name,1 if active else 0,1 if transition.get("applied") else 0,int(time.time()),event_id))
+        conn.commit()
+    finally: conn.close()
+    hidden=0
+    if not active:
+        hidden=await run_in_threadpool(_principal_set_catalog_visibility_sync, brand=brand, member_id=member_id, visible=False, reason="inactive_subscription")
+        _clear_catalog_response_cache()
+    _clear_usage_status_fast_cache(identity_key)
+    return {"ok":True,"active":active,"plan_name":plan_name,"member_id":member_id,"free_minutes_transition":transition,"profiles_hidden":hidden}
+
+@app.post("/principal/catalog-publication")
+async def principal_catalog_publication(request: Request):
+    token=(request.headers.get("x-api-key") or "").strip()
+    if not WIX_API_KEY or token != WIX_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    raw=await request.json()
+    brand=_stripe_paygo_brand(raw.get("brand") or "Elaralo")
+    member_id=_host_onboarding_safe_str(raw.get("memberId") or raw.get("member_id"))
+    email=_stripe_paygo_email_norm(raw.get("email"))
+    plan_name=_principal_qualifying_plan(raw.get("planName") or raw.get("plan_name"))
+    active=bool(_bool_from_any(raw.get("active"), default=False)) and bool(plan_name)
+    visible=bool(_bool_from_any(raw.get("visible"), default=False))
+    event_id=_host_onboarding_safe_str(raw.get("eventId") or raw.get("event_id"))
+    if not member_id: raise HTTPException(status_code=400, detail="memberId is required")
+    if visible and not active:
+        await run_in_threadpool(_principal_set_catalog_visibility_sync, brand=brand, member_id=member_id, visible=False, reason="inactive_subscription")
+        raise HTTPException(status_code=403, detail="An active Discover, Explore, or Encounter subscription is required.")
+    updated=await run_in_threadpool(_principal_set_catalog_visibility_sync, brand=brand, member_id=member_id, visible=visible, reason="principal_unlisted")
+    bonus_minutes=0; bonus_granted=False; already_granted=False
+    if visible and _principal_brand_enabled(brand):
+        bonus_minutes=max(0,int(_included_minutes_for_plan(plan_name)))
+        conn=_econnect_conn()
+        try:
+            _principal_ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            row=conn.execute("SELECT id,bonus_minutes FROM principal_publication_benefits WHERE lower(brand)=lower(?) AND member_id=? AND benefit_type=? LIMIT 1",(brand,member_id,PRINCIPAL_BENEFIT_TYPE)).fetchone()
+            if row: already_granted=True
+            elif bonus_minutes>0:
+                conn.execute("INSERT INTO principal_publication_benefits(brand,member_id,email,benefit_type,plan_name,bonus_minutes,granted_epoch,source_event_id) VALUES(?,?,?,?,?,?,?,?)",(brand,member_id,email,PRINCIPAL_BENEFIT_TYPE,plan_name,bonus_minutes,int(time.time()),event_id))
+                identity_key=_usage_identity_key_for_brand(brand=brand, member_id=member_id, email=email)
+                credit=_usage_credit_minutes_sync(identity_key,bonus_minutes)
+                if not credit.get("ok"):
+                    raise RuntimeError("Minute credit failed")
+                bonus_granted=True
+                _clear_usage_status_fast_cache(identity_key)
+            conn.commit()
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+            raise
+        finally: conn.close()
+    _clear_catalog_response_cache()
+    return {"ok":True,"visible":visible,"mapping_updated":updated,"bonus_granted":bonus_granted,"already_granted":already_granted,"bonus_minutes":bonus_minutes if bonus_granted else 0,"plan_name":plan_name,"principal":visible and active}
 
 @app.post("/host-onboarding/catalog-visibility")
 async def host_onboarding_catalog_visibility(request: Request):
