@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.71: restore canonical Host Console monitoring identity and prevent companion-name leakage into current-user identity; no protected media behavior changed.
+// v10.0.0-alpha15.72: correct frontend declaration order for the Host Console identity repair; retain alpha15.70 monitoring and identity isolation behavior; no protected media behavior changed.
 // v10.0.0-alpha15.66: restore the visible D-ID live-avatar <video> element inside the dedicated Video panel; retain alpha15.65 AI Email-tab hiding and D-ID error messaging; no STT, TTS, microphone, audio-routing, LiveKit, attachment, charging, or PayGo logic changed.
 // v10.0.0-alpha15.60: preserve alpha15.59 first-tap Send and accepted mobile geometry; restore the existing iOS TTS audio-route priming synchronously on the Send pointer gesture before propagation is stopped; no TTS gain, voice, endpoint, media playback, STT, microphone, LiveKit, attachment, charging, or PayGo implementation changed.
 // v10.0.0-alpha15.58: preserve the accepted alpha15.54 initial geometry; keep native input focus; dock only the real composer row above the iOS keyboard without moving the conversation panel or rail; stop Enter/Return from sending so only the Send button starts a conversation; no protected media behavior changed.
@@ -11,7 +11,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.71";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.72";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -5891,20 +5891,6 @@ const rebrandingName = useMemo(() => (rebrandingInfo?.rebranding || "").trim(), 
   ]);
 
 
-  const changeViewerLiveChatName = useCallback(() => {
-    try {
-      if (typeof window === "undefined") return;
-      const raw = window.prompt("Change your Connect username:", postingAsViewerName) || "";
-      const cleaned = sanitizeViewerUsername(raw);
-      if (!cleaned) return;
-      persistViewerLiveChatName(cleaned);
-    } catch {
-      // ignore
-    }
-  }, [postingAsViewerName, sanitizeViewerUsername, persistViewerLiveChatName]);
-
-
-
 
   // DB-driven companion mapping (brand+avatar), loaded from the API (sqlite preloaded at startup).
   const [companionMapping, setCompanionMapping] = useState<CompanionMappingRow | null>(null);
@@ -6252,6 +6238,19 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
   const postingAsViewerName = useMemo(() => {
     return buildHostReadableViewerName(String(memberId || "").trim());
   }, [buildHostReadableViewerName, memberId]);
+
+
+  const changeViewerLiveChatName = useCallback(() => {
+    try {
+      if (typeof window === "undefined") return;
+      const raw = window.prompt("Change your Connect username:", postingAsViewerName) || "";
+      const cleaned = sanitizeViewerUsername(raw);
+      if (!cleaned) return;
+      persistViewerLiveChatName(cleaned);
+    } catch {
+      // ignore
+    }
+  }, [postingAsViewerName, sanitizeViewerUsername, persistViewerLiveChatName]);
 
 
 
