@@ -301,8 +301,8 @@ def _clear_chat_companion_prompt_block_cache(brand: str = "", avatar: str = "") 
                 _CHAT_COMPANION_PROMPT_BLOCK_CACHE.clear()
     except Exception:
         pass
-# v9.2.56: Host-facing summaries/replies use public Intro/Mate/Mature labels; internal routing remains friend/romantic/intimate.
-# v9.2.28: Public Connect mode labels are Intro/Mate/Mature; internal routing remains friend/romantic/intimate.
+# v9.2.56: Host-facing summaries/replies use public Start/Grow/Mature labels; internal routing remains friend/romantic/intimate.
+# v9.2.28: Public Connect mode labels are Start/Grow/Mature; internal routing remains friend/romantic/intimate.
 # v9.2.27: DulceMoon Discover/Explore/Encounter plan support.
 # v9.2.26: v9.2.25 plus /chat persistent Mature-consent initialization fix.
 # Keeps DulceMoon mapping alias behavior and automatic context-mode switching.
@@ -1069,7 +1069,7 @@ INCLUDED_MINUTES_FRIEND = _env_int("INCLUDED_MINUTES_FRIEND", 0)
 INCLUDED_MINUTES_ROMANTIC = _env_int("INCLUDED_MINUTES_ROMANTIC", 0)
 INCLUDED_MINUTES_INTIMATE = _env_int("INCLUDED_MINUTES_INTIMATE", 0)
 # DulceMoon current public plans. These intentionally map to Elaralo mode entitlements:
-#   Discover / Explore / Encounter -> Mature entitlement (Intro + Mate + Mature)
+#   Discover / Explore / Encounter -> Mature entitlement (Start + Grow + Mature)
 INCLUDED_MINUTES_DISCOVER = _env_int("INCLUDED_MINUTES_DISCOVER", 30)
 INCLUDED_MINUTES_EXPLORE = _env_int("INCLUDED_MINUTES_EXPLORE", 60)
 INCLUDED_MINUTES_ENCOUNTER = _env_int("INCLUDED_MINUTES_ENCOUNTER", 90)
@@ -5458,14 +5458,14 @@ def _usage_credit_minutes_sync(identity_key: str, minutes: int) -> Dict[str, Any
 def _normalize_mode(raw: str) -> str:
     t = (raw or "").strip().lower()
     t = re.sub(r"[\s_\-]+", " ", t).strip()
-    # Public mode labels are Intro/Mate/Mature.
+    # Public mode labels are Start/Grow/Mature.
     # Internal routing remains friend/romantic/intimate to preserve content folders,
     # model routing, consent gates, and provider behavior.
     if t in {"mature", "mature 18+", "intimate", "intimate 18+", "explicit", "18+", "adult"}:
         return "intimate"
-    if t in {"mate", "romance", "romantic"}:
+    if t in {"grow", "mate", "romance", "romantic"}:
         return "romantic"
-    if t in {"intro", "friend", "friendly"}:
+    if t in {"start", "intro", "friend", "friendly"}:
         return "friend"
     return "friend"
 
@@ -5477,14 +5477,14 @@ def _public_mode_label(mode: Any) -> str:
 
     Internal mode keys remain friend/romantic/intimate for routing, content
     folders, provider selection, and consent gates.  User-facing text must use
-    Intro/Mate/Mature.
+    Start/Grow/Mature.
     """
     m = _normalize_mode(str(mode or "friend"))
     if m == "intimate":
         return "Mature"
     if m == "romantic":
-        return "Mate"
-    return "Intro"
+        return "Grow"
+    return "Start"
 
 
 def _sanitize_public_mode_labels_text(text: Any) -> str:
@@ -5497,10 +5497,12 @@ def _sanitize_public_mode_labels_text(text: Any) -> str:
     if not body:
         return body
     replacements = [
-        (r"\bfriend\s+mode\b", "Intro mode"),
-        (r"\bfriendly\s+mode\b", "Intro mode"),
-        (r"\bromantic\s+mode\b", "Mate mode"),
-        (r"\bromance\s+mode\b", "Mate mode"),
+        (r"\bintro\s+mode\b", "Start mode"),
+        (r"\bmate\s+mode\b", "Grow mode"),
+        (r"\bfriend\s+mode\b", "Start mode"),
+        (r"\bfriendly\s+mode\b", "Start mode"),
+        (r"\bromantic\s+mode\b", "Grow mode"),
+        (r"\bromance\s+mode\b", "Grow mode"),
         (r"\bintimate\s*(?:\(\s*18\+\s*\))?\s+mode\b", "Mature mode"),
         (r"\bexplicit\s+mode\b", "Mature mode"),
         (r"\badult\s+mode\b", "Mature mode"),
@@ -5857,8 +5859,8 @@ def _fallback_mode_for_allowed_modes(allowed_modes: Optional[List[str]], preferr
 
 def _intimate_unavailable_response_text(is_anon: bool) -> str:
     if is_anon:
-        return "Mature mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Mate mode."
-    return "Mature mode is not available on your current plan. We’ll keep things in Mate mode."
+        return "Mature mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Grow mode."
+    return "Mature mode is not available on your current plan. We’ll keep things in Grow mode."
 
 
 def _mode_consent_db_path() -> str:
@@ -6866,7 +6868,7 @@ def _call_gpt4o_with_options(
 
 # ----------------------------
 # Multi-provider LLM routing
-#   - Intro/Mate -> OpenAI
+#   - Start/Grow -> OpenAI
 #   - Mature -> xAI
 # ----------------------------
 
@@ -6964,7 +6966,7 @@ def _extract_in_session_summaries(session_state: Dict[str, Any]) -> List[str]:
 
 
 def _sanitize_summary_for_safe_mode(text: str) -> str:
-    """Sanitize a summary for Intro/Mate (OpenAI) context.
+    """Sanitize a summary for Start/Grow (OpenAI) context.
 
     If the summary appears intimate/explicit, replace it with a high-level, non-explicit note.
     """
@@ -6974,7 +6976,7 @@ def _sanitize_summary_for_safe_mode(text: str) -> str:
     if _looks_intimate(t):
         return (
             "Earlier conversation included a Mature segment with consent. "
-            "Details are intentionally omitted in Intro/Mate mode."
+            "Details are intentionally omitted in Start/Grow mode."
         )
 
     max_chars = int(os.getenv("SAFE_MODE_SUMMARY_MAX_CHARS", "2500") or "2500")
@@ -7429,7 +7431,7 @@ def _filter_history_for_safe_mode(messages: List[Dict[str, str]]) -> Tuple[List[
         return messages, None
 
     note = (
-        f"Context note: {omitted} earlier message(s) from a Mature segment were omitted because the current mode is Intro/Mate. "
+        f"Context note: {omitted} earlier message(s) from a Mature segment were omitted because the current mode is Start/Grow. "
         "Assume consent had been established and an intimate conversation occurred, but do not reference explicit details. "
         "Continue naturally from the remaining chat context and any provided summaries."
     )
@@ -11606,7 +11608,7 @@ async def chat(request: Request):
         session_state_out["pending_consent"] = None
         session_state_out["mode"] = _safe_non_intimate_mode(session_state_out.get("mode") or "romantic")
         return await _respond(
-            "Mature mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Mate mode.",
+            "Mature mode is not available for visitors. Please sign in with a member account to access it. We’ll keep things in Grow mode.",
             STATUS_SAFE,
             session_state_out,
         )
@@ -11639,7 +11641,7 @@ async def chat(request: Request):
             session_state_out["explicit_consented"] = False
             session_state_out["mode"] = "friend"
             return await _respond(
-                "No problem — we’ll keep things in Intro mode.",
+                "No problem — we’ll keep things in Start mode.",
                 STATUS_SAFE,
                 session_state_out,
             )
@@ -11679,7 +11681,7 @@ async def chat(request: Request):
         f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending} voice_id={'yes' if voice_id else 'no'}",
     )
 
-    # call model (provider-routing: Mature -> xAI, Intro/Mate -> OpenAI)
+    # call model (provider-routing: Mature -> xAI, Start/Grow -> OpenAI)
     llm_provider = "xai" if effective_mode == "intimate" else "openai"
 
     # Detect provider switches so we can encourage the model to rely on summaries for continuity.
@@ -11691,7 +11693,7 @@ async def chat(request: Request):
     ).strip().lower()
     provider_switched = bool(prev_provider) and (prev_provider != llm_provider)
 
-    # In Intro/Mate mode, never send explicit/intimate content to OpenAI.
+    # In Start/Grow mode, never send explicit/intimate content to OpenAI.
     # If the browser is still holding prior Mature messages, omit them and provide a safe handoff note.
     history_for_llm = messages
     handoff_note: str | None = None
@@ -13856,8 +13858,8 @@ async def save_chat_summary(request: Request):
         "You are a concise assistant that creates a server-side chat summary for future context. "
         "Write a compact summary in English that captures: relationship tone, key facts, user preferences/boundaries, "
         "names/roles, and any commitments or plans. Avoid quoting long passages. "
-        "Use only the customer-facing mode labels Intro, Mate, and Mature. "
-        "Never write Friend mode, Romantic mode, Romance mode, Intimate mode, Explicit mode, or Adult mode; rewrite them as Intro mode, Mate mode, or Mature mode as appropriate. "
+        "Use only the customer-facing mode labels Start, Grow, and Mature. "
+        "Never write Friend mode, Romantic mode, Romance mode, Intimate mode, Explicit mode, or Adult mode; rewrite them as Start mode, Grow mode, or Mature mode as appropriate. "
         "If scheduled/platform content was delivered during the session, explicitly mention the delivered file name(s). "
         "Output plain text only."
     )
@@ -18682,7 +18684,7 @@ async def host_session_insights_ask(req: HostSessionInsightsAskRequest):
         f"You are {companion_label}, the AI Companion. You are helping the HOST review historical session summaries. "
         "You will be given a JSON object containing saved session summaries. "
         "Answer the host's question using ONLY the provided summaries. "
-        "Use only the customer-facing mode labels Intro, Mate, and Mature. "
+        "Use only the customer-facing mode labels Start, Grow, and Mature. "
         "Never use Friend mode, Romantic mode, Romance mode, Intimate mode, Explicit mode, or Adult mode in host-facing answers. "
         "If the summaries do not contain enough information, say so clearly. "
         "If asked to list members/visitors, produce a clean bullet list. "

@@ -1,5 +1,5 @@
 "use client";
-// v10.0.0-alpha15.74: route the Connect Switch button through brand-specific NEXT_PUBLIC switch URLs while preserving explicit session return URLs and the legacy fallback; cross-origin configured routes leave the iframe cleanly; no protected media behavior changed.
+// v10.0.0-alpha15.75: route the Connect Switch button through brand-specific NEXT_PUBLIC switch URLs while preserving explicit session return URLs and the legacy fallback; cross-origin configured routes leave the iframe cleanly; no protected media behavior changed.
 // v10.0.0-alpha15.73: restore Host Console active-chat and Session Insights brand scoping by always sending the resolved runtime brand for chat, relay, usage, and summary state; retain alpha15.72 declaration-order and identity-isolation fixes; no protected media behavior changed.
 // v10.0.0-alpha15.66: restore the visible D-ID live-avatar <video> element inside the dedicated Video panel; retain alpha15.65 AI Email-tab hiding and D-ID error messaging; no STT, TTS, microphone, audio-routing, LiveKit, attachment, charging, or PayGo logic changed.
 // v10.0.0-alpha15.60: preserve alpha15.59 first-tap Send and accepted mobile geometry; restore the existing iOS TTS audio-route priming synchronously on the Send pointer gesture before propagation is stopped; no TTS gain, voice, endpoint, media playback, STT, microphone, LiveKit, attachment, charging, or PayGo implementation changed.
@@ -12,7 +12,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.74";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.75";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -33,7 +33,7 @@ import {
   getConnectBrandPublicConfigDefaults,
   type ConnectBrandPublicConfig,
 } from "./connectBrandConfig";
-// v9.1.38: immediate DulceMoon Host Console plan handling + public Intro/Mate/Mature label sanitation for Host Console.
+// v9.1.38: immediate DulceMoon Host Console plan handling + public Start/Grow/Mature label sanitation for Host Console.
 import { LiveKitRoom, VideoConference, GridLayout, ParticipantTile, useTracks, RoomAudioRenderer, StartAudio, useRoomContext } from "@livekit/components-react";
 import { Track, RoomEvent } from "livekit-client";
 import "@livekit/components-styles";
@@ -919,8 +919,8 @@ function modeFromElaraloPlanMap(raw: unknown): Mode | null {
   const s = String(raw ?? "").trim().toLowerCase();
   if (!s) return null;
   if (s.includes("mature") || s.includes("intimate")) return "intimate";
-  if (s.includes("mate") || s.includes("romantic")) return "romantic";
-  if (s.includes("intro") || s.includes("friend")) return "friend";
+  if (s.includes("grow") || s.includes("mate") || s.includes("romantic")) return "romantic";
+  if (s.includes("start") || s.includes("intro") || s.includes("friend")) return "friend";
   return null;
 }
 
@@ -931,8 +931,8 @@ function modeFromModePill(raw: unknown): Mode | null {
   const s = String(raw ?? "").trim().toLowerCase();
   if (!s) return null;
   if (s.includes("mature") || s.includes("intimate")) return "intimate";
-  if (s.includes("mate") || s.includes("romantic")) return "romantic";
-  if (s.includes("intro") || s.includes("friend")) return "friend";
+  if (s.includes("grow") || s.includes("mate") || s.includes("romantic")) return "romantic";
+  if (s.includes("start") || s.includes("intro") || s.includes("friend")) return "friend";
   return null;
 }
 
@@ -1254,8 +1254,8 @@ function readDirectCompanionHandoffFromUrl(): Record<string, any> | null {
         payload.cycle_days = cycleDays;
       }
       if (!modePill) {
-        payload.modePill = "Mate";
-        payload.mode_pill = "Mate";
+        payload.modePill = "Grow";
+        payload.mode_pill = "Grow";
       }
     }
 
@@ -2026,8 +2026,8 @@ const UPGRADE_URL = process.env.NEXT_PUBLIC_UPGRADE_URL || "https://www.elaralo.
 const STREAM_URL = process.env.NEXT_PUBLIC_STREAM_URL || "";
 
 const MODE_LABELS: Record<Mode, string> = {
-  friend: "Intro",
-  romantic: "Mate",
+  friend: "Start",
+  romantic: "Grow",
   intimate: "Mature",
 };
 
@@ -2036,10 +2036,12 @@ function sanitizePublicModeLabelsText(value: any): string {
   if (!body) return body;
 
   const replacements: Array<[RegExp, string]> = [
-    [/\bfriend\s+mode\b/gi, "Intro mode"],
-    [/\bfriendly\s+mode\b/gi, "Intro mode"],
-    [/\bromantic\s+mode\b/gi, "Mate mode"],
-    [/\bromance\s+mode\b/gi, "Mate mode"],
+    [/\bintro\s+mode\b/gi, "Start mode"],
+    [/\bmate\s+mode\b/gi, "Grow mode"],
+    [/\bfriend\s+mode\b/gi, "Start mode"],
+    [/\bfriendly\s+mode\b/gi, "Start mode"],
+    [/\bromantic\s+mode\b/gi, "Grow mode"],
+    [/\bromance\s+mode\b/gi, "Grow mode"],
     [/\bintimate\s*(?:\(\s*18\+\s*\))?\s+mode\b/gi, "Mature mode"],
     [/\bexplicit\s+mode\b/gi, "Mature mode"],
     [/\badult\s+mode\b/gi, "Mature mode"],
@@ -2054,13 +2056,13 @@ function sanitizePublicModeLabelsText(value: any): string {
 
 // Plan → mode availability mapping (UI pills)
 // Public labels shown in the UI:
-// - Intro  = internal friend
-// - Mate   = internal romantic
+// - Start  = internal friend
+// - Grow   = internal romantic
 // - Mature = internal intimate
 // DulceMoon current public plans:
-// - Free Trial -> Intro + Mate only; Mature is excluded
-// - Discover / Explore / Encounter -> Intro + Mate + Mature
-// Legacy Intro/Mate/Intimate plan names are retained as hidden/backward-compatible aliases.
+// - Free Trial -> Start + Grow only; Mature is excluded
+// - Discover / Explore / Encounter -> Start + Grow + Mature
+// Legacy Start/Grow/Intimate plan names are retained as hidden/backward-compatible aliases.
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Trial",
   "Discover",
@@ -2126,9 +2128,9 @@ function allowedModesForPlan(planName: PlanName): Mode[] {
 // White-label support:
 // The companion page provides an Elaralo entitlement plan name via RebrandingKey.elaraloPlanMap.
 // That plan name determines how many Mode pills are available:
-//   Intro  -> [Intro]
-//   Mate   -> [Intro, Mate]
-//   Mature -> [Intro, Mate, Mature]
+//   Start  -> [Start]
+//   Grow   -> [Start, Grow]
+//   Mature -> [Start, Grow, Mature]
 // We keep a fallback to the legacy PlanName mapping when elaraloPlanMap is missing/unknown.
 function allowedModesFromElaraloPlanMap(rawPlanMap: unknown, fallbackPlan: PlanName): Mode[] {
   const topMode = modeFromElaraloPlanMap(rawPlanMap);
@@ -2488,8 +2490,8 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   let tokenMode: Mode | null = null;
   let cleaned = raw.replace(tokenRe, (m) => {
     const mm = m.toLowerCase();
-    if (mm.includes("intro") || mm.includes("friend")) tokenMode = "friend";
-    else if (mm.includes("mate") || mm.includes("romantic") || mm.includes("romance")) tokenMode = "romantic";
+    if (mm.includes("start") || mm.includes("intro") || mm.includes("friend")) tokenMode = "friend";
+    else if (mm.includes("grow") || mm.includes("mate") || mm.includes("romantic") || mm.includes("romance")) tokenMode = "romantic";
     else if (mm.includes("mature") || mm.includes("intimate") || mm.includes("explicit")) tokenMode = "intimate";
     return "";
   });
@@ -2502,18 +2504,18 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   const soft = t.trim();
 
   const wantsFriend =
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(intro|friend)\b/.test(soft) ||
-    /\b(intro|friend) mode\b/.test(soft);
+    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(start|intro|friend)\b/.test(soft) ||
+    /\b(start|intro|friend) mode\b/.test(soft);
 
   const wantsRomantic =
     // "mate mode" / legacy "romantic mode" / "romance mode"
-    /\b(mate|romantic|romance) mode\b/.test(soft) ||
+    /\b(grow|mate|romantic|romance) mode\b/.test(soft) ||
     // switch/set/back/go/turn ... mate/romantic
-    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(mate|romantic|romance)\b/.test(soft) ||
+    /\b(switch|set|turn|go|back|change|move|make|put)\b.*\b(grow|mate|romantic|romance)\b/.test(soft) ||
     // natural phrasing users actually type
     /\b(let['’]?s|lets)\b.*\b(mate|romantic|romance)\b/.test(soft) ||
-    /\b(be|being|try|trying|have|having)\b.*\b(mate|romantic|romance)\b/.test(soft) ||
-    /\b(mate|romantic) conversation\b/.test(soft) ||
+    /\b(be|being|try|trying|have|having)\b.*\b(grow|mate|romantic|romance)\b/.test(soft) ||
+    /\b(grow|mate|romantic) conversation\b/.test(soft) ||
     /\bromance again\b/.test(soft) ||
     /\btry romance again\b/.test(soft);
 
@@ -2532,8 +2534,8 @@ function normalizeMode(raw: any): Mode | null {
   const t = String(raw ?? "").trim().toLowerCase();
   if (!t) return null;
 
-  if (t === "friend") return "friend";
-  if (t === "romantic" || t === "romance") return "romantic";
+  if (t === "friend" || t === "start" || t === "intro") return "friend";
+  if (t === "romantic" || t === "romance" || t === "grow" || t === "mate") return "romantic";
   if (t === "intimate" || t === "explicit" || t === "adult" || t === "18+" || t === "18") return "intimate";
 
   return null;
@@ -12068,7 +12070,7 @@ useEffect(() => {
     const isVisitorNow = !midNow || isAnonMemberId(midNow);
     const msg = requestedMode === "intimate"
       ? isVisitorNow
-        ? "Mature mode is available only to signed-in members. Visitors can use Intro and Mate modes."
+        ? "Mature mode is available only to signed-in members. Visitors can use Start and Grow modes."
         : "Mature is not available on your current plan. Please select the Upgrade button to change plans."
       : `The requested mode (${modeLabel}) is not available on your current plan. Please select the Upgrade button to change plans.`;
 
@@ -12471,7 +12473,7 @@ useEffect(() => {
 
       // Brand-default starting mode:
       // - For DulceMoon (and any white-label that sends elaraloPlanMap), we start in the mode encoded in the key.
-      // - Fallback: entitled plans default to Mature internally, Trial/visitors default to Mate internally.
+      // - Fallback: entitled plans default to Mature internally, Trial/visitors default to Grow internally.
       const incomingModePillRaw =
         typeof (data as any).modePill === "string"
           ? String((data as any).modePill)
@@ -12777,7 +12779,7 @@ const rebrandingKeyForBackend = normalizeRebrandingKeyValue(rebrandingKey);
 
   // Entitlement modes for backend context-mode automation.  The UI remains the
   // primary plan gate, but the backend needs the same list when it auto-detects
-  // Mate/Mature context from conversation text.
+  // Grow/Mature context from conversation text.
   allowed_modes: allowedModes,
   allowedModes,
 
@@ -13458,7 +13460,7 @@ if (streamSessionActive) {
             merged.pending_consent = null;
           }
 
-          // If the backend sent a mode (in session state OR top-level), normalize it so Mate always highlights
+          // If the backend sent a mode (in session state OR top-level), normalize it so Grow always highlights
           const backendMode = normalizeMode((serverSessionState as any)?.mode ?? (data as any)?.mode);
           if (backendMode && data.mode !== "explicit_blocked") {
             merged.mode = backendMode;
