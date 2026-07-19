@@ -1,4 +1,5 @@
 "use client";
+// v10.0.0-alpha15.74: route the Connect Switch button through brand-specific NEXT_PUBLIC switch URLs while preserving explicit session return URLs and the legacy fallback; cross-origin configured routes leave the iframe cleanly; no protected media behavior changed.
 // v10.0.0-alpha15.73: restore Host Console active-chat and Session Insights brand scoping by always sending the resolved runtime brand for chat, relay, usage, and summary state; retain alpha15.72 declaration-order and identity-isolation fixes; no protected media behavior changed.
 // v10.0.0-alpha15.66: restore the visible D-ID live-avatar <video> element inside the dedicated Video panel; retain alpha15.65 AI Email-tab hiding and D-ID error messaging; no STT, TTS, microphone, audio-routing, LiveKit, attachment, charging, or PayGo logic changed.
 // v10.0.0-alpha15.60: preserve alpha15.59 first-tap Send and accepted mobile geometry; restore the existing iOS TTS audio-route priming synchronously on the Send pointer gesture before propagation is stopped; no TTS gain, voice, endpoint, media playback, STT, microphone, LiveKit, attachment, charging, or PayGo implementation changed.
@@ -11,7 +12,7 @@
 // v10.0.0-alpha15.44: implement the canonical mobile Persona/Video interaction composition across all brands: one contiguous Play/Mic/Stop/Attach/Trash rail beside the conversation box, with the composer and Posting-as line directly below the conversation column; remove the oversized fixed-height mobile interaction panel; no protected media behavior changed.
 // v10.0.0-alpha15.41: normalize apparent portrait and View-tab sizing across measured Wix runtimes; align the expanded composer with the vertical rail Trash control; no brand-specific CSS.
 // v10.0.0-alpha15.40: standardize one exact mobile Persona portrait size across all Wix runtimes; move Attach and Trash into the vertical mobile Interaction Rail and expand the composer input; no brand-specific CSS.
-const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.72";
+const CONNECT_BUILD_VERSION = "v10.0.0-alpha15.74";
 // v10.0.0-alpha15.35: restore alpha15.26 defensive mobile viewport classification while retaining the alpha15.34 unified View workspace, standardized Persona geometry, and vertical mobile Session Rail. One shared responsive path applies to every brand; no protected media behavior changed.
 // v10.0.0-alpha15.34: standardize mobile Persona geometry across brands, use a larger 4:5 portrait with compact controls, and place the mobile Session Rail vertically beside the conversation on normal phone widths with a narrow-phone horizontal fallback. No protected media behavior changed.
 // v10.0.0-alpha15.33: rebase the unified Connect View workspace onto the deployed alpha15.32 baseline; Persona/Video/Email/Host share one View row, Email and Host use the full workspace, rails remain view/device aware, and desktop/iPad height follows content. No protected media behavior changed.
@@ -971,6 +972,29 @@ type CompanionListReturnContext = {
   url: string;
 };
 
+const BRAND_SWITCH_URLS = {
+  elaralo: String(process.env.NEXT_PUBLIC_ELARALO_SWITCH_URL || "").trim(),
+  dulcemoon: String(process.env.NEXT_PUBLIC_DULCEMOON_SWITCH_URL || "").trim(),
+  aihaven4u: String(process.env.NEXT_PUBLIC_AIHAVEN4U_SWITCH_URL || "").trim(),
+} as const;
+
+type BrandSwitchUrlKey = keyof typeof BRAND_SWITCH_URLS;
+
+function normalizeBrandSwitchUrlKey(rawBrand: string): BrandSwitchUrlKey {
+  const normalized = String(rawBrand || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+
+  if (normalized.includes("dulcemoon")) return "dulcemoon";
+  if (normalized.includes("aihaven4u") || normalized.includes("aihaven")) return "aihaven4u";
+  return "elaralo";
+}
+
+function configuredSwitchUrlForBrand(rawBrand: string): string {
+  return BRAND_SWITCH_URLS[normalizeBrandSwitchUrlKey(rawBrand)] || "";
+}
+
 function readCompanionListReturnContextFromUrl(): CompanionListReturnContext {
   if (typeof window === "undefined") return { enabled: false, count: 0, url: "" };
   try {
@@ -1004,20 +1028,61 @@ function readCompanionListReturnContextFromUrl(): CompanionListReturnContext {
     // brand. The optional return flags remain backward-compatible hints only.
     if (count <= 1) return { enabled: false, count, url: "" };
 
+    const brand = firstQueryValue(params, ["brand", "rebranding", "companyName", "company_name", "company"]) || DEFAULT_COMPANY_NAME;
     const rawUrl = firstQueryValue(params, ["companionListUrl", "companion_list_url", "returnUrl", "return_url"]);
+    const configuredBrandUrl = configuredSwitchUrlForBrand(brand);
+    let sessionReturnUrl: URL | null = null;
+    let configuredTarget: URL | null = null;
     let target: URL | null = null;
+    let appendLaunchContext = false;
+
+    // The selector-generated URL carries member/session context. Preserve the
+    // existing same-origin validation because this value arrives through the
+    // browser query string.
     if (rawUrl) {
       try {
         const candidate = new URL(rawUrl, window.location.origin);
-        if (candidate.origin === window.location.origin) target = candidate;
+        if (candidate.origin === window.location.origin) sessionReturnUrl = candidate;
       } catch {
-        target = null;
+        sessionReturnUrl = null;
       }
     }
 
-    if (!target) {
+    // The brand-specific build variable is authoritative for the destination.
+    // Absolute cross-origin URLs and relative routes are both supported.
+    if (configuredBrandUrl) {
+      try {
+        const candidate = new URL(configuredBrandUrl, window.location.origin);
+        if (candidate.protocol === "http:" || candidate.protocol === "https:") {
+          configuredTarget = candidate;
+        }
+      } catch {
+        configuredTarget = null;
+      }
+    }
+
+    if (configuredTarget) {
+      target = configuredTarget;
+      appendLaunchContext = true;
+
+      // Carry forward all selector-generated state while allowing the configured
+      // environment URL to own the destination origin and pathname.
+      if (sessionReturnUrl) {
+        sessionReturnUrl.searchParams.forEach((value, key) => {
+          target?.searchParams.set(key, value);
+        });
+      }
+    } else if (sessionReturnUrl) {
+      // Backward compatibility until a brand variable is configured.
+      target = sessionReturnUrl;
+    } else {
+      // Final safety net. Once all three build variables are set, this legacy
+      // route is no longer used.
       target = new URL("/myelaralo/companion", window.location.origin);
-      const brand = firstQueryValue(params, ["brand", "rebranding", "companyName", "company_name", "company"]) || DEFAULT_COMPANY_NAME;
+      appendLaunchContext = true;
+    }
+
+    if (appendLaunchContext) {
       target.searchParams.set("brand", brand);
       const loggedInRaw = firstQueryValue(params, ["loggedIn", "logged_in"]);
       if (loggedInRaw) target.searchParams.set("loggedIn", loggedInRaw);
@@ -11476,6 +11541,35 @@ const goToMyElaralo = useCallback(() => {
   const goToCompanionList = useCallback(() => {
     const target = String(companionListReturnContext.url || "").trim();
     if (!canReturnToCompanionList || !target) return;
+
+    let isCrossOrigin = false;
+    try {
+      isCrossOrigin = new URL(target, window.location.origin).origin !== window.location.origin;
+    } catch {
+      isCrossOrigin = false;
+    }
+
+    // Brand URLs may point back to a Wix page outside the Static Web App iframe.
+    // In that case, leave the iframe so the selector does not render with stacked
+    // site headers. Same-origin selector routes retain the prior in-frame behavior.
+    if (isCrossOrigin) {
+      try {
+        if (window.top && window.top !== window.self) {
+          window.top.location.href = target;
+          return;
+        }
+      } catch {
+        // Cross-origin access to window.top can throw; use _top next.
+      }
+
+      try {
+        window.open(target, "_top");
+        return;
+      } catch {
+        // Fall through to current-frame navigation.
+      }
+    }
+
     try {
       window.location.assign(target);
       return;
